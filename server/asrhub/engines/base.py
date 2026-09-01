@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -109,6 +110,10 @@ class Engine(ABC):
         self._model: Any = None
         self._loaded_key: str = ""
         self.last_used: float = time.time()
+        # Экземпляр движка общий для всех воркеров, а модели PyTorch и
+        # CTranslate2 не рассчитаны на одновременный вызов из нескольких
+        # потоков. Блокировку берёт EngineRegistry.lease().
+        self.lock = threading.RLock()
 
     # --- проверка доступности -------------------------------------------
 

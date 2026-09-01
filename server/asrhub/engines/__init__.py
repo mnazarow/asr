@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from ..catalog import ModelSpec, get_engine, get_model
@@ -105,6 +107,9 @@ class EngineRegistry:
         self.idle_unload_s = int(idle_unload_s)
         self._cache: dict[str, Engine] = {}
         self._lock = threading.RLock()
+        # Сколько заданий прямо сейчас работает с движком: занятый движок
+        # не выгружается ни по простою, ни при вытеснении из кеша.
+        self._busy: dict[int, int] = {}
 
     def configure(self, max_size: int, idle_unload_s: int) -> None:
         with self._lock:
@@ -128,6 +133,7 @@ class EngineRegistry:
         return spec, engine_id
 
     def get(self, settings: dict[str, Any]) -> Engine:
+        """Отдаёт движок из кеша. Для работы пользуйтесь `lease()`."""
         spec, engine_id = self.resolve(settings)
         cls = ENGINE_CLASSES[engine_id]
         available, reason = cls.check_available()
@@ -142,12 +148,50 @@ class EngineRegistry:
                 engine = cls(spec, settings)
                 self._cache[key] = engine
                 self._evict_if_needed(protect=key)
+                # Число загрузок, близкое к числу заданий, — прямое
+                # доказательство, что кеш моделей не работает.
+                from ..monitoring.collector import RUNTIME
+
+                RUNTIME.inc("asrhub_model_loads_total", {"model": spec.id})
             engine.last_used = time.time()
             return engine
 
+    @contextmanager
+    def lease(self, settings: dict[str, Any]) -> Iterator[Engine]:
+        """Выдаёт движок во временное пользование.
+
+        Пока движок занят, его нельзя ни выгрузить по простою, ни вытеснить
+        из кеша. Без этого джанитор выгружал модель прямо посреди
+        распознавания часовой записи: `last_used` обновляется только на
+        границах, а простой в 900 секунд короче самой записи.
+
+        Дополнительно движок держится под собственной блокировкой: один
+        экземпляр общий для всех воркеров, а модели в PyTorch и CTranslate2
+        не рассчитаны на одновременный вызов из нескольких потоков.
+        """
+        engine = self.get(settings)
+        with self._lock:
+            self._busy[id(engine)] = self._busy.get(id(engine), 0) + 1
+        try:
+            with engine.lock:
+                engine.last_used = time.time()
+                yield engine
+        finally:
+            with self._lock:
+                remaining = self._busy.get(id(engine), 1) - 1
+                if remaining <= 0:
+                    self._busy.pop(id(engine), None)
+                else:
+                    self._busy[id(engine)] = remaining
+                engine.last_used = time.time()
+
+    def _is_busy(self, engine: Engine) -> bool:
+        return self._busy.get(id(engine), 0) > 0
+
     def _evict_if_needed(self, protect: str = "") -> None:
         while len(self._cache) > self.max_size:
-            candidates = [(k, e) for k, e in self._cache.items() if k != protect]
+            candidates = [(k, e) for k, e in self._cache.items()
+                          if k != protect and not self._is_busy(e)]
             if not candidates:
                 break
             oldest_key, oldest = min(candidates, key=lambda item: item[1].last_used)
@@ -166,6 +210,8 @@ class EngineRegistry:
         removed = 0
         with self._lock:
             for key, engine in list(self._cache.items()):
+                if self._is_busy(engine):
+                    continue                # занятую модель выгружать нельзя
                 if engine.last_used < cutoff and engine.is_loaded:
                     log.info("Выгрузка модели «%s» после простоя", engine.spec.id)
                     try:

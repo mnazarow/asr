@@ -8,6 +8,8 @@
 
 const state = {
   view: 'transcribe',
+  viewTimers: [],
+  hashGoing: false,
   catalog: null,
   params: null,
   presets: [],
@@ -294,6 +296,7 @@ const VIEWS = {
   compare:    { title: 'Сравнение моделей', subtitle: 'Качество, скорость и лицензии рядом' },
   settings:   { title: 'Настройки', subtitle: 'Все параметры с описаниями, рекомендациями и примерами' },
   system:     { title: 'Сервер', subtitle: 'Оборудование, движки, хранилище, ключи доступа' },
+  monitoring: { title: 'Мониторинг', subtitle: 'Метрики наружу, пороги тревог, приёмники телеметрии' },
   logs:       { title: 'Журнал', subtitle: 'События сервера и заданий' },
   help:       { title: 'Справка', subtitle: 'Как пользоваться, программный интерфейс, устранение неполадок' },
 };
@@ -304,11 +307,17 @@ function go(view) {
   const meta = VIEWS[view] || { title: view, subtitle: '' };
   qs('#view-title').textContent = meta.title;
   qs('#view-subtitle').textContent = meta.subtitle;
-  location.hash = view;
+  // Смена hash сама по себе вызовет render(); флаг гасит повторную отрисовку,
+  // иначе каждый переход слал все запросы раздела дважды.
+  if (location.hash.replace('#', '') !== view) {
+    state.hashGoing = true;
+    location.hash = view;
+  }
   renderView();
 }
 
 function render() {
+  if (state.hashGoing) { state.hashGoing = false; return; }
   const hash = location.hash.replace('#', '');
   go(VIEWS[hash] ? hash : 'transcribe');
 }
@@ -318,8 +327,45 @@ function renderView(soft) {
   const renderer = RENDERERS[state.view];
   if (!renderer) { content.innerHTML = ''; return; }
   if (soft && renderer.soft) { renderer.soft(); return; }
+
+  // Отменяем таймеры и подписки предыдущего раздела: без этого при каждом
+  // возврате в «Журнал» добавлялся ещё один опрос, и вкладка сама себя
+  // упирала в ограничение частоты запросов.
+  stopViewTimers();
   content.innerHTML = '';
-  renderer.render(content);
+  try {
+    const result = renderer.render(content);
+    if (result && typeof result.catch === 'function') {
+      result.catch((err) => showViewFailure(content, err));
+    }
+  } catch (err) {
+    showViewFailure(content, err);
+  }
+}
+
+/** Таймеры текущего раздела: заводятся через viewTimer, гасятся при уходе. */
+function viewTimer(fn, intervalMs) {
+  const handle = setInterval(fn, intervalMs);
+  state.viewTimers.push(handle);
+  return handle;
+}
+
+function stopViewTimers() {
+  (state.viewTimers || []).forEach(clearInterval);
+  state.viewTimers = [];
+}
+
+function showViewFailure(content, err) {
+  const message = (err && (err.message || err.detail)) || 'Не удалось загрузить раздел';
+  const hint = (err && err.hint) || 'Проверьте, что сервер запущен и доступен по сети.';
+  content.innerHTML = `<section class="card">
+    <div class="card-head"><h3 style="color:var(--err)">Раздел не загрузился</h3></div>
+    <p>${esc(String(message))}</p>
+    <p class="small dim">${esc(String(hint))}</p>
+    <button class="primary" id="view-retry">Повторить</button>
+  </section>`;
+  const retry = qs('#view-retry');
+  if (retry) retry.onclick = () => renderView();
 }
 
 window.addEventListener('hashchange', render);
@@ -346,7 +392,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // --------------------------------------------------------------------------
 
 const HOTKEY_VIEWS = ['transcribe', 'queue', 'results', 'analytics', 'models',
-                      'compare', 'settings', 'system', 'logs', 'help'];
+                      'compare', 'settings', 'system', 'monitoring', 'logs'];
 
 const HOTKEY_HELP = [
   ['1 … 0', 'переход к разделу по номеру'],
@@ -2268,6 +2314,286 @@ window.__asrhub.revokeKey = async (preview) => {
 // Вид: Журнал
 // ==========================================================================
 
+
+// ==========================================================================
+// Мониторинг
+// ==========================================================================
+
+const ALERT_STATE_LABEL = { ok: 'норма', pending: 'наблюдение', firing: 'тревога' };
+const ALERT_STATE_CLASS = { ok: 'ok', pending: 'warn', firing: 'err' };
+const TARGET_KIND_LABEL = {
+  prometheus_pushgateway: 'Prometheus Pushgateway',
+  influxdb: 'InfluxDB',
+  otlp: 'OpenTelemetry (OTLP)',
+  statsd: 'StatsD / Graphite',
+  webhook: 'Webhook (JSON)',
+};
+
+RENDERERS.monitoring = {
+  async render(root) {
+    root.innerHTML = '<div class="empty">Опрос метрик…</div>';
+    let health;
+    let info;
+    let alerts;
+    let targets;
+    try {
+      [health, info, alerts, targets] = await Promise.all([
+        API.get('/api/monitoring/health'),
+        API.get('/api/monitoring/info'),
+        API.get('/api/monitoring/alerts'),
+        API.get('/api/monitoring/targets'),
+      ]);
+    } catch (err) { fail(err); return; }
+
+    state.monitoring = { health, info, alerts, targets };
+    const summary = alerts.summary || {};
+    const worstClass = summary.worst === 'critical' ? 'err'
+      : summary.worst === 'warning' ? 'warn' : 'ok';
+
+    root.innerHTML = `
+      <div class="grid cols-4" style="margin-bottom:16px">
+        ${kpi('Состояние', `<span class="chip ${worstClass}">${
+          esc(healthLabel(health.status))}</span>`, `работает ${fmtDur(health.uptime_s)}`)}
+        ${kpi('Тревог сейчас', summary.firing || 0,
+              `${summary.critical || 0} критических, ${summary.warning || 0} предупреждений`)}
+        ${kpi('Метрик в снимке', info.samples || 0, `правил: ${summary.rules || 0}`)}
+        ${kpi('Опросов', info.scrapes || 0, `кеш ${info.cache_ttl_s} с`)}
+      </div>
+
+      ${(info.collection_errors || []).length ? `<section class="card" style="border-color:var(--warn)">
+        <div class="card-head"><h3 style="color:var(--warn)">Источники, которые не опрашиваются</h3>
+          <span class="hint">остальные метрики собираются как обычно</span></div>
+        <ul style="margin:0;padding-left:18px" class="small">
+          ${info.collection_errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></section>` : ''}
+
+      ${card('Пробы состояния',
+             'liveness — перезапустить контейнер; readiness — снять нагрузку',
+             `<div class="grid cols-3">${
+               ['liveness', 'readiness', 'startup'].map((probe) => probeCard(probe, health[probe])).join('')
+             }</div>`)}
+
+      ${card('Тревоги', 'пороги берутся из каталога метрик и правятся в настройках',
+             alertsTable(alerts.alerts || []),
+             `<button class="ghost" id="mon-reset-rules">Вернуть пороги по умолчанию</button>`)}
+
+      ${card('Куда отправляются метрики',
+             'нужно там, где до сервера не достучаться снаружи',
+             targetsTable(targets),
+             `<button class="ghost" id="mon-add-target">Добавить приёмник</button>`)}
+
+      ${card('Как забрать метрики', 'адреса относительно этого сервера',
+             endpointsTable())}
+
+      ${card('Готовые настройки для систем мониторинга',
+             'собираются из каталога метрик, поэтому не расходятся с ним',
+             `<div class="row" style="gap:8px;flex-wrap:wrap">
+                <a class="btn ghost" href="/api/monitoring/config/prometheus" download>Правила Prometheus</a>
+                <a class="btn ghost" href="/api/monitoring/config/prometheus-scrape" download>Блок scrape_configs</a>
+                <a class="btn ghost" href="/api/monitoring/config/grafana" download>Панель Grafana</a>
+                <a class="btn ghost" href="/api/monitoring/config/zabbix" download>Шаблон Zabbix</a>
+              </div>
+              <p class="small dim" style="margin-top:10px">Пороги в этих файлах — отправная
+              точка. Подгоняйте под свой поток: очередь из ста заданий бывает и нормой,
+              и аварией.</p>`)}
+
+      ${card('Справочник метрик', `${info.samples || 0} значений в снимке`,
+             `<div class="settings-toolbar" style="position:static;padding:0 0 10px">
+                <input type="search" id="mon-search" placeholder="поиск по метрикам"
+                       style="width:280px">
+                <span class="spacer"></span>
+                <span class="small faint" id="mon-count"></span>
+              </div>
+              <div id="mon-catalog"><div class="empty">Загрузка справочника…</div></div>`)}
+    `;
+
+    qs('#mon-reset-rules').onclick = async () => {
+      try {
+        await API.post('/api/monitoring/alerts/rules/reset');
+        toast('Пороги возвращены к значениям каталога');
+        renderView();
+      } catch (err) { fail(err); }
+    };
+    qs('#mon-add-target').onclick = () => targetDialog(targets);
+    this.loadCatalog();
+  },
+
+  async loadCatalog() {
+    let data;
+    try { data = await API.get('/api/monitoring/catalog'); } catch (err) { return; }
+    state.metricCatalog = data;
+    const box = qs('#mon-catalog');
+    const search = qs('#mon-search');
+    const draw = () => {
+      const needle = (search.value || '').toLowerCase().trim();
+      const items = data.metrics.filter((m) => !needle
+        || m.name.toLowerCase().includes(needle)
+        || m.label.toLowerCase().includes(needle)
+        || m.description.toLowerCase().includes(needle));
+      qs('#mon-count').textContent = `${items.length} из ${data.metrics.length}`;
+      box.innerHTML = data.groups.map((group) => {
+        const inGroup = items.filter((m) => m.group === group.id);
+        if (!inGroup.length) return '';
+        return `<h4 style="margin:16px 0 8px">${esc(group.title)}
+            <span class="small dim" style="font-weight:400">${esc(group.description)}</span></h4>
+          ${inGroup.map(metricCard).join('')}`;
+      }).join('') || '<div class="empty">Ничего не найдено</div>';
+    };
+    search.oninput = draw;
+    draw();
+  },
+};
+
+function healthLabel(status) {
+  return { ok: 'норма', warning: 'внимание', degraded: 'деградация',
+           critical: 'авария' }[status] || status;
+}
+
+function probeCard(name, probe) {
+  if (!probe) return '';
+  const title = { liveness: 'Живость', readiness: 'Готовность',
+                  startup: 'Запуск' }[name] || name;
+  const cls = probe.status === 'ok' ? 'ok' : probe.status === 'warn' ? 'warn' : 'err';
+  return `<div class="card" style="margin:0">
+    <div class="card-head"><h3>${title}</h3><span class="spacer"></span>
+      <span class="chip ${cls}">${esc(probe.status)}</span></div>
+    <table class="small">${(probe.checks || []).map((c) => `<tr>
+      <td class="dim">${esc(c.name)}</td>
+      <td><span class="chip ${c.status === 'ok' ? 'ok' : c.status === 'warn' ? 'warn' : 'err'}"
+          >${esc(c.status)}</span></td>
+      <td>${esc(c.detail)}${c.hint ? `<div class="small dim">${esc(c.hint)}</div>` : ''}</td>
+    </tr>`).join('')}</table></div>`;
+}
+
+function alertsTable(alerts) {
+  const active = alerts.filter((a) => a.state !== 'ok');
+  const rows = (active.length ? active : alerts.slice(0, 12)).map((a) => `<tr>
+    <td><span class="chip ${ALERT_STATE_CLASS[a.state] || ''}">${
+      esc(ALERT_STATE_LABEL[a.state] || a.state)}</span></td>
+    <td><b>${esc(a.label)}</b><div class="small dim">${esc(a.metric)}</div></td>
+    <td>${num(a.value, 3)}${a.unit ? ' ' + esc(a.unit) : ''}</td>
+    <td class="dim">${a.direction === 'above' ? '>' : '<'} ${num(a.threshold, 3)}</td>
+    <td class="small">${esc(a.severity)}</td>
+    <td class="small dim">${esc(a.hint || '')}</td></tr>`).join('');
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Состояние</th><th>Метрика</th><th>Значение</th><th>Порог</th>
+      <th>Важность</th><th>Что делать</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="empty">Тревог нет</td></tr>'}</tbody>
+  </table></div>${active.length ? '' :
+    '<p class="small dim" style="margin-top:8px">Показаны первые правила; все они в норме.</p>'}`;
+}
+
+function targetsTable(data) {
+  const rows = (data.targets || []).map((t) => `<tr>
+    <td><b>${esc(t.name)}</b></td>
+    <td>${esc(TARGET_KIND_LABEL[t.kind] || t.kind)}</td>
+    <td class="small">${esc(t.url)}</td>
+    <td>${t.interval_s} с</td>
+    <td><span class="chip ${t.healthy ? 'ok' : 'err'}">${t.healthy ? 'доставляется' : 'нет'}</span>
+      ${t.last_error ? `<div class="small dim">${esc(t.last_error)}</div>` : ''}</td>
+    <td class="small dim">отправлено ${t.sent}, ошибок ${t.failed}</td></tr>`).join('');
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Имя</th><th>Тип</th><th>Адрес</th><th>Интервал</th>
+      <th>Доставка</th><th>Счётчики</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="6" class="empty">
+      Приёмники не настроены — метрики забирает система сбора сама
+      </td></tr>`}</tbody></table></div>`;
+}
+
+function endpointsTable() {
+  const rows = [
+    ['/api/monitoring/metrics', 'Все метрики. Формат задаётся ?format=prometheus|openmetrics|json|otlp|influx|graphite|zabbix|csv'],
+    ['/api/monitoring/metrics.json', 'Снимок с описанием и порогами каждой метрики'],
+    ['/api/monitoring/health', 'Сводное состояние: живость, готовность, тревоги'],
+    ['/api/monitoring/live', 'Проба живости — провал означает «перезапусти контейнер»'],
+    ['/api/monitoring/ready', 'Проба готовности — провал означает «не шли запросы»'],
+    ['/api/monitoring/catalog', 'Справочник метрик с рекомендациями'],
+    ['/api/monitoring/alerts', 'Состояние тревог'],
+  ];
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Адрес</th><th>Что отдаёт</th></tr></thead>
+    <tbody>${rows.map(([path, what]) => `<tr>
+      <td><a href="${path}" target="_blank"><code>${path}</code></a></td>
+      <td class="small">${esc(what)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function metricCard(m) {
+  const threshold = m.threshold;
+  return `<details class="help" style="margin-bottom:6px">
+    <summary><b>${esc(m.label)}</b> <code class="small">${esc(m.name)}</code>
+      <span class="small dim">${esc(m.type)}${m.unit ? ', ' + esc(m.unit) : ''}</span></summary>
+    <div class="small" style="padding:8px 0 4px">
+      <p>${esc(m.description)}</p>
+      ${m.normal ? `<p class="dim">Обычное значение: ${esc(m.normal)}</p>` : ''}
+      ${m.recommendation ? `<div class="param-rec"><b>Рекомендация.</b> ${esc(m.recommendation)}</div>` : ''}
+      ${threshold ? `<p class="dim">Порог: ${threshold.direction === 'above' ? 'выше' : 'ниже'}
+        ${threshold.warning ?? '—'} — предупреждение, ${threshold.critical ?? '—'} — критично,
+        выдержка ${threshold.for_seconds} с.
+        ${threshold.note ? esc(threshold.note) : ''}</p>` : ''}
+      ${m.troubleshooting ? `<p><b>Что делать:</b> ${esc(m.troubleshooting)}</p>` : ''}
+      ${(m.labels || []).length ? `<p class="dim">Метки: ${m.labels.map(
+        (l) => `<code>${esc(l)}</code>`).join(', ')}</p>` : ''}
+    </div></details>`;
+}
+
+function targetDialog(existing) {
+  const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:560px">
+    <div class="modal-head"><b>Новый приёмник метрик</b><span class="spacer"></span>
+      <button class="ghost icon" id="tg-close">✕</button></div>
+    <div class="modal-body">
+      <label class="mon-field"><span>Тип</span>
+        <select id="tg-kind">${Object.entries(TARGET_KIND_LABEL).map(
+          ([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select></label>
+      <label class="mon-field"><span>Адрес</span>
+        <input type="text" id="tg-url" placeholder="http://pushgw:9091"></label>
+      <label class="mon-field"><span>Интервал, секунд</span>
+        <input type="number" id="tg-interval" value="60" min="10"></label>
+      <p class="small dim">Проверка отправляет текущий снимок немедленно и показывает
+        результат — настройку видно до того, как она сохранена.</p>
+      <div id="tg-result" class="small"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" id="tg-test">Проверить</button>
+      <span class="spacer"></span>
+      <button class="primary" id="tg-save">Добавить</button>
+    </div></div></div>`);
+  document.body.appendChild(backdrop);
+  const close = () => backdrop.remove();
+  qs('#tg-close', backdrop).onclick = close;
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+
+  const collect = () => ({
+    kind: qs('#tg-kind', backdrop).value,
+    url: qs('#tg-url', backdrop).value.trim(),
+    interval_s: Number(qs('#tg-interval', backdrop).value) || 60,
+  });
+
+  qs('#tg-test', backdrop).onclick = async () => {
+    const box = qs('#tg-result', backdrop);
+    box.innerHTML = 'Отправка…';
+    try {
+      const result = await API.post('/api/monitoring/targets/test', collect());
+      box.innerHTML = result.ok
+        ? `<span class="chip ok">доставлено</span> метрик: ${result.sent_metrics}`
+        : `<span class="chip err">не доставлено</span> ${esc(result.error || '')}`;
+    } catch (err) {
+      box.innerHTML = `<span class="chip err">ошибка</span> ${esc(err.message || '')}`;
+    }
+  };
+
+  qs('#tg-save', backdrop).onclick = async () => {
+    const list = (existing.targets || []).map((t) => ({
+      kind: t.kind, url: t.url, interval_s: t.interval_s, name: t.name,
+    }));
+    list.push(collect());
+    try {
+      await API.put('/api/monitoring/targets', list);
+      toast('Приёмник добавлен');
+      close();
+      renderView();
+    } catch (err) { fail(err); }
+  };
+}
+
 RENDERERS.logs = {
   render(root) {
     root.innerHTML = `
@@ -2293,9 +2619,10 @@ RENDERERS.logs = {
     let timer;
     qs('#log-search').oninput = () => { clearTimeout(timer); timer = setTimeout(() => this.load(), 300); };
     this.load();
-    this.interval = setInterval(() => {
-      if (state.view === 'logs' && qs('#log-auto') && qs('#log-auto').checked) this.load();
-      else if (state.view !== 'logs') clearInterval(this.interval);
+    // Таймер регистрируется за разделом: при уходе он гасится сам, иначе при
+    // каждом возврате добавлялся ещё один опрос.
+    viewTimer(() => {
+      if (qs('#log-auto') && qs('#log-auto').checked) this.load();
     }, 5000);
   },
 
@@ -2341,7 +2668,15 @@ RENDERERS.logs = {
                 onclick="__asrhub.openJob('${esc(e.job_id)}')">задание</button>` : ''}</td>
           </tr>`).join('')}</tbody></table>` : '<div class="empty small">Событий нет</div>';
       }
-    } catch (err) { /* журнал не критичен */ }
+    } catch (err) {
+      // Молча пустой журнал выглядит как «ошибок нет», хотя на деле мы просто
+      // не смогли их получить. Показываем причину.
+      const table = qs('#log-table');
+      if (table) {
+        table.innerHTML = `<div class="empty small">Журнал недоступен: ${
+          esc(String(err.message || err))}</div>`;
+      }
+    }
   },
 };
 

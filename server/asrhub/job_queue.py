@@ -27,6 +27,7 @@ from .db import Database, new_id, now
 from .engines import EngineRegistry
 from .errors import (
     ASRHubError,
+    ConfigError,
     JobNotFound,
     JobTimeout,
     OutOfMemoryError,
@@ -35,6 +36,11 @@ from .errors import (
     classify_exception,
 )
 from .logging_setup import get_logger
+from .monitoring.collector import (
+    JOB_DURATION_BUCKETS,
+    MEDIA_DURATION_BUCKETS,
+    RUNTIME,
+)
 from .processor import cleanup_workdir, process_job, safe_workdir, settings_digest
 
 log = get_logger("queue")
@@ -143,6 +149,8 @@ class JobQueue:
                tags: str = "", deadline: float | None = None,
                reference_text: str = "", webhook_url: str = "") -> dict[str, Any]:
         """Ставит файл в очередь. Возвращает описание задания."""
+        if webhook_url:
+            webhook_url = self._check_webhook_url(webhook_url)
         depth = self.db.count_jobs(status=[STATUS_QUEUED, STATUS_RETRY])
         if depth >= self._max_queue:
             raise QueueFull(f"В очереди уже {depth} заданий (предел {self._max_queue}).")
@@ -168,6 +176,7 @@ class JobQueue:
             if cached is not None:
                 job_id = self._clone_cached(cached, filename, str(path), owner,
                                             group_id, settings)
+                RUNTIME.inc("asrhub_cached_jobs_total")
                 self._emit("job.cached", {"id": job_id, "source": cached["id"]})
                 return self.get(job_id)
 
@@ -399,6 +408,48 @@ class JobQueue:
                                    chosen.get("queued_at") or chosen.get("created_at") or now())))
             return self.db.get_job(chosen["id"])
 
+    def _check_webhook_url(self, url: str) -> str:
+        """Проверяет адрес уведомления.
+
+        Адрес приходит из запроса и уходит в urlopen, поэтому без проверки
+        сервер становится инструментом обращения к внутренней сети от своего
+        имени: file:// читает диск, а http://169.254.169.254 достаёт учётные
+        данные облака. Пропускаем только http и https и запрещаем адреса,
+        которые заведомо указывают внутрь.
+        """
+        import ipaddress
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ConfigError(
+                f"Адрес уведомления должен начинаться с http:// или https:// "
+                f"(получено «{parsed.scheme or url[:20]}»).",
+                hint="Другие схемы запрещены: через них сервер читал бы "
+                     "собственные файлы вместо отправки уведомления.")
+        host = (parsed.hostname or "").strip()
+        if not host:
+            raise ConfigError("В адресе уведомления не указан узел.")
+
+        if self.settings.get("webhook_allow_internal", False):
+            return url
+
+        lowered = host.lower()
+        if lowered in ("localhost", "localhost.localdomain") or lowered.endswith(".localhost"):
+            raise ConfigError(
+                "Адрес уведомления указывает на сам сервер.",
+                hint="Если это намеренно, включите webhook_allow_internal.")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return url                      # доменное имя — проверять некому
+        if (address.is_loopback or address.is_private or address.is_link_local
+                or address.is_reserved or address.is_multicast):
+            raise ConfigError(
+                f"Адрес уведомления {host} находится во внутренней сети.",
+                hint="Если это намеренно, включите webhook_allow_internal.")
+        return url
+
     def _check_disk_space(self) -> None:
         """Отказывает в приёме, пока на диске меньше порога свободного места.
 
@@ -556,6 +607,16 @@ class JobQueue:
             wer=accuracy.get("wer"), cer=accuracy.get("cer"),
         )
         self.db.save_segments(job_id, outcome.segments)
+
+        RUNTIME.inc("asrhub_jobs_total", {"status": "completed"})
+        RUNTIME.inc("asrhub_audio_seconds_total",
+                    value=float(job.get("media_duration_s") or 0))
+        RUNTIME.inc("asrhub_words_total", value=float(outcome.stats.get("words") or 0))
+        RUNTIME.observe("asrhub_job_duration_seconds", elapsed, buckets=JOB_DURATION_BUCKETS)
+        if job.get("media_duration_s"):
+            RUNTIME.observe("asrhub_media_duration_seconds",
+                            float(job["media_duration_s"]), buckets=MEDIA_DURATION_BUCKETS)
+
         self.db.bump_model_stats(
             str(job.get("model") or ""), str(job.get("engine") or ""), ok=True,
             audio_s=float(job.get("media_duration_s") or 0.0),
@@ -594,6 +655,7 @@ class JobQueue:
         if was_cancelled:
             self.db.update_job(job_id, status=STATUS_CANCELLED, finished_at=now(),
                                stage="отменено")
+            RUNTIME.inc("asrhub_jobs_total", {"status": "cancelled"})
             return
 
         retries = int(job.get("retries") or 0)
@@ -621,6 +683,7 @@ class JobQueue:
                               f"{error.message}")
             log.warning("Задание %s: %s — повтор через %.0f с", job_id, error.message, delay,
                         extra={"job_id": job_id, "error_code": error.code})
+            RUNTIME.inc("asrhub_retries_total")
             self._emit("job.retry", {"id": job_id, "attempt": retries + 1,
                                      "delay_s": round(delay, 1), "error": error.message})
             return
@@ -631,6 +694,10 @@ class JobQueue:
             error_hint=error.hint)
         self.db.bump_model_stats(str(job.get("model") or ""), str(job.get("engine") or ""),
                                  ok=False)
+        RUNTIME.inc("asrhub_jobs_total", {"status": "failed"})
+        RUNTIME.note_error(error.code, error.retryable)
+        if error.code == "no_speech":
+            RUNTIME.inc("asrhub_no_speech_total")
         self.db.add_event(job_id, "failed", error.message, error.to_dict())
         log.error("Задание %s провалено: %s", job_id, error.message,
                   extra={"job_id": job_id, "error_code": error.code})
@@ -666,19 +733,23 @@ class JobQueue:
         if secret:
             headers["X-ASRHub-Signature"] = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
-        for attempt in range(5):
+        attempts = 5
+        for attempt in range(attempts):
             try:
                 request = urllib.request.Request(job["webhook_url"], data=payload,
                                                  headers=headers, method="POST")
                 with urllib.request.urlopen(request, timeout=15) as response:
                     if 200 <= response.status < 300:
                         self.db.update_job(job["id"], webhook_status=f"ok:{response.status}")
+                        RUNTIME.inc("asrhub_webhooks_total", {"result": "ok"})
                         return
             except (urllib.error.URLError, OSError, ValueError) as exc:
-                log.info("Уведомление для %s не доставлено (попытка %d): %s",
-                         job["id"], attempt + 1, exc)
-            time.sleep(min(60, 2 ** attempt))
+                log.info("Уведомление для %s не доставлено (попытка %d из %d): %s",
+                         job["id"], attempt + 1, attempts, exc)
+            if attempt < attempts - 1:      # после последней попытки ждать незачем
+                time.sleep(min(60, 2 ** attempt))
         self.db.update_job(job["id"], webhook_status="failed")
+        RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
 
     def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.on_event is None:
@@ -761,7 +832,8 @@ class JobQueue:
                   for status in (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY,
                                  STATUS_PAUSED, STATUS_COMPLETED, STATUS_FAILED,
                                  STATUS_CANCELLED)}
-        queued = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY], limit=500)
+        queued = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY], limit=500,
+                                   light=True)
         pending_audio = sum(float(j.get("media_duration_s") or 0) for j in queued)
         stats = self.db.model_stats()
         rtf_values = [s["rtf_avg"] for s in stats if s.get("rtf_avg")]

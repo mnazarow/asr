@@ -163,8 +163,6 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
 
         # ---- 3. Распознавание -------------------------------------------
         check_cancel()
-        timer.start("inference")
-        engine = registry.get(settings)
 
         def make_progress(index: int, total: int):
             # Индекс канала связываем явно, чтобы замыкание не смотрело
@@ -175,9 +173,17 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
                 report(base + width * value, stage)
             return engine_progress
 
-        result = engine.transcribe(prepared, settings,
-                                   make_progress(channel_index, len(channels)))
-        timer.stop()
+        # lease() держит модель занятой: пока идёт распознавание, её не
+        # выгрузит ни сборщик простоя, ни вытеснение из кеша.
+        with registry.lease(settings) as engine:
+            timer.start("inference")
+            result = engine.transcribe(prepared, settings,
+                                       make_progress(channel_index, len(channels)))
+            timer.stop()
+        # Загрузка весов происходит внутри transcribe(), поэтому вычитаем её
+        # из времени распознавания: иначе она считалась бы дважды и завышала RTF.
+        timer.values["inference"] = max(
+            0.0, timer.values.get("inference", 0.0) - result.model_load_s)
         timer.values["model_load"] = timer.values.get("model_load", 0.0) + result.model_load_s
 
         engine_meta = dict(result.meta)
@@ -190,7 +196,26 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
 
     all_segments.sort(key=lambda s: s.start)
 
-    # ---- 4. Диаризация ---------------------------------------------------
+    # ---- 4. Принудительное выравнивание ----------------------------------
+    # Идёт до диаризации: та опирается на границы сегментов, и чем они точнее,
+    # тем меньше реплик достаётся не тому говорящему.
+    if str(settings.get("alignment_backend") or "none") != "none" and all_segments:
+        check_cancel()
+        timer.start("alignment")
+        report(0.80, "уточнение границ слов")
+        try:
+            from .pipeline.alignment import align_segments
+
+            all_segments = align_segments(channels[0][1], all_segments, settings)
+        except ASRHubError as exc:
+            # Выравнивание — улучшение, а не обязательный этап: при неудаче
+            # остаются модельные таймкоды, а задание доводится до конца.
+            outcome.warnings.append(f"Выравнивание не выполнено: {exc.message}")
+        except Exception as exc:
+            outcome.warnings.append(f"Выравнивание не выполнено: {exc}")
+        timer.stop()
+
+    # ---- 5. Диаризация ---------------------------------------------------
     if settings.get("diarization_enabled") and not any(s.speaker for s in all_segments):
         check_cancel()
         timer.start("diarization")
@@ -205,7 +230,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             outcome.warnings.append(f"Диаризация не выполнена: {exc}")
         timer.stop()
 
-    # ---- 5. Постобработка -------------------------------------------------
+    # ---- 6. Постобработка -------------------------------------------------
     check_cancel()
     timer.start("postprocess")
     report(0.90, "постобработка текста")
@@ -238,7 +263,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         detail = metrics.detailed(reference, outcome.text)
         outcome.stats["accuracy"] = detail
 
-    # ---- 6. Выгрузка ------------------------------------------------------
+    # ---- 7. Выгрузка ------------------------------------------------------
     check_cancel()
     timer.start("export")
     report(0.96, "сохранение результатов")

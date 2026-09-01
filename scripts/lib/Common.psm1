@@ -385,4 +385,151 @@ function Set-Quiet     { param([bool]$Value) $script:Quiet = $Value }
 function Get-DryRun    { return $script:DryRun }
 function Get-LogFile   { return $script:LogFile }
 
+
+# ---------------------------------------------------------------------------
+# Интерактивные диалоги мастера установки
+# ---------------------------------------------------------------------------
+#
+# Ведут себя так же, как их аналоги в scripts/lib/wizard.sh: при -Yes или при
+# запуске без консоли берётся значение по умолчанию, вопрос не задаётся.
+
+function Test-Interactive {
+    <#
+        .SYNOPSIS
+        Можно ли задавать вопросы: есть консоль и не задан -Yes.
+    #>
+    if ($script:AssumeYes) { return $false }
+    try { if ([Console]::IsInputRedirected) { return $false } } catch { return $false }
+    return $true
+}
+
+function Write-WizardStep {
+    param([string]$Title, [string]$Subtitle = '')
+    Write-Host ''
+    Write-Host $Title -ForegroundColor Blue
+    if ($Subtitle) { Write-Host $Subtitle -ForegroundColor DarkGray }
+    Write-Host ('─' * 68) -ForegroundColor DarkGray
+}
+
+function Select-WizardOption {
+    <#
+        .SYNOPSIS
+        Выбор одного пункта из списка.
+
+        .PARAMETER Options
+        Массив хеш-таблиц: @{ Value = 'cpu'; Label = 'Без видеокарты'; Note = '…' }
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Question,
+        [Parameter(Mandatory)][array]$Options,
+        [int]$DefaultIndex = 1
+    )
+    if (-not (Test-Interactive)) {
+        $chosen = $Options[$DefaultIndex - 1]
+        Write-Info "$Question → $($chosen.Label) (по умолчанию)"
+        return $chosen.Value
+    }
+
+    Write-Host ''
+    Write-Host $Question
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        $mark = if (($i + 1) -eq $DefaultIndex) { '>' } else { ' ' }
+        Write-Host ("{0} {1,2}) {2}" -f $mark, ($i + 1), $Options[$i].Label)
+        if ($Options[$i].Note) {
+            Write-Host ("      " + $Options[$i].Note) -ForegroundColor DarkGray
+        }
+    }
+    while ($true) {
+        $answer = Read-Host ("Выбор [{0}]" -f $DefaultIndex)
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $DefaultIndex }
+        $number = 0
+        if ([int]::TryParse($answer, [ref]$number) -and $number -ge 1 -and $number -le $Options.Count) {
+            Write-Ok $Options[$number - 1].Label
+            return $Options[$number - 1].Value
+        }
+        Write-Warn "Введите число от 1 до $($Options.Count)."
+    }
+}
+
+function Select-WizardMany {
+    <#
+        .SYNOPSIS
+        Отметить несколько пунктов. Возвращает массив выбранных значений.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Question,
+        [Parameter(Mandatory)][array]$Options,
+        [string]$Default = '1'
+    )
+    $picked = @()
+    if (-not (Test-Interactive)) {
+        $answer = $Default
+    } else {
+        Write-Host ''
+        Write-Host $Question
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $mark = if (",$Default," -like "*,$($i + 1),*") { '>' } else { ' ' }
+            Write-Host ("{0} {1,2}) {2}" -f $mark, ($i + 1), $Options[$i].Label)
+            if ($Options[$i].Note) {
+                Write-Host ("      " + $Options[$i].Note) -ForegroundColor DarkGray
+            }
+        }
+        Write-Host '   номера через запятую, «все» — всё, «нет» — ничего' -ForegroundColor DarkGray
+        $answer = Read-Host ("Выбор [{0}]" -f $Default)
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
+    }
+
+    if ($answer -match '^(все|всё|all)$') { return $Options.Value }
+    if ($answer -match '^(нет|none|-)$') { return @() }
+    foreach ($part in $answer -split ',') {
+        $number = 0
+        if ([int]::TryParse($part.Trim(), [ref]$number) -and
+            $number -ge 1 -and $number -le $Options.Count) {
+            $picked += $Options[$number - 1].Value
+        }
+    }
+    return $picked
+}
+
+function Read-WizardValue {
+    <#
+        .SYNOPSIS
+        Свободный ввод с необязательной проверкой.
+
+        .PARAMETER Validator
+        Блок скрипта: принимает введённое значение, возвращает $true или $false.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Question,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Default,
+        [scriptblock]$Validator = $null,
+        [string]$Note = ''
+    )
+    if (-not (Test-Interactive)) { return $Default }
+    if ($Note) { Write-Host ''; Write-Host $Note -ForegroundColor DarkGray }
+    while ($true) {
+        $answer = Read-Host ("{0} [{1}]" -f $Question, $Default)
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
+        if ($null -eq $Validator -or (& $Validator $answer)) { return $answer }
+    }
+}
+
+function Show-WizardSummary {
+    <#
+        .SYNOPSIS
+        Сводка перед началом работы.
+
+        .PARAMETER Rows
+        Упорядоченный словарь «ключ — значение».
+    #>
+    param([Parameter(Mandatory)]$Rows)
+    Write-Host ''
+    Write-Host 'Что будет сделано'
+    Write-Host ('─' * 68) -ForegroundColor DarkGray
+    foreach ($key in $Rows.Keys) {
+        Write-Host ("  {0} {1}" -f $key.PadRight(24), $Rows[$key])
+    }
+    Write-Host ''
+}
+
 Export-ModuleMember -Function *

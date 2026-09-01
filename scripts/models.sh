@@ -10,15 +10,24 @@
 #   bash scripts/models.sh verify <модель>       проверить целостность
 #   bash scripts/models.sh engines               состояние движков
 #   bash scripts/models.sh install-engine nemo   установить движок
+#   bash scripts/models.sh install-engine mfa    выравнивание (conda + модели)
 #   bash scripts/models.sh disk                  сколько занято на диске
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/detect.sh"
 
+usage() {
+  # Справка — это шапка файла: печатаем комментарии до первой строки кода,
+  # чтобы добавленная команда попадала в справку сама собой.
+  awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+}
+
 PREFIX=""
 DATA_DIR="${ASRHUB_DATA_DIR:-}"
 ACTION="${1:-list}"; shift || true
+[[ "${ACTION}" == "-h" || "${ACTION}" == "--help" || "${ACTION}" == "help" ]] \
+  && { usage; exit 0; }
 FILTER_INSTALLED=0
 FILTER_LANGUAGE=""
 FORCE=0
@@ -34,8 +43,7 @@ while [[ $# -gt 0 ]]; do
     --yes|-y) ASRHUB_ASSUME_YES=1; shift ;;
     --quiet|-q) ASRHUB_QUIET=1; shift ;;
     -h|--help)
-      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
-      exit 0 ;;
+      usage; exit 0 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
@@ -378,6 +386,39 @@ install-engine)
     hint "Если после установки перестанут работать другие движки — используйте отдельное окружение."
     install_system_packages $(system_package_names sndfile) ffmpeg 2>/dev/null || true
   fi
+  # MFA живёт в conda-forge: Kaldi и OpenFst в PyPI отсутствуют, поэтому
+  # обычной установкой пакетов Python здесь не обойтись.
+  if [[ "${ENGINE}" == "mfa" ]]; then
+    if have mfa; then
+      ok "MFA уже установлен: $(mfa version 2>/dev/null | head -1)"
+    else
+      MAMBA=""
+      for candidate in micromamba mamba conda; do have "${candidate}" && { MAMBA="${candidate}"; break; }; done
+      if [[ -z "${MAMBA}" ]]; then
+        error "Для MFA нужен conda, mamba или micromamba — в PyPI его нет."
+        hint "Быстрая установка micromamba:"
+        hint "  curl -Ls https://micro.mamba.pm/api/micromamba/\$(uname -s | tr A-Z a-z)-64/latest \\"
+        hint "    | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba"
+        hint "Затем повторите: bash scripts/models.sh install-engine mfa"
+        exit 127
+      fi
+      info "Установка MFA через ${MAMBA} (около 2–3 ГБ)…"
+      run "${MAMBA}" create -y -n mfa -c conda-forge montreal-forced-aligner || {
+        error "Не удалось создать окружение MFA."
+        exit 1
+      }
+      MFA_BIN="$(${MAMBA} run -n mfa which mfa 2>/dev/null || true)"
+      [[ -n "${MFA_BIN}" ]] && info "MFA установлен: ${MFA_BIN}"
+      hint "Добавьте каталог MFA в PATH службы, иначе сервер его не найдёт:"
+      hint "  export PATH=\"\$(dirname ${MFA_BIN:-<путь>}):\${PATH}\""
+    fi
+
+    LANG_MODEL="${ARGS[1]:-russian_mfa}"
+    info "Загрузка акустической модели и словаря «${LANG_MODEL}»…"
+    run mfa model download acoustic "${LANG_MODEL}" || warn "Модель не загружена — загрузите вручную."
+    run mfa model download dictionary "${LANG_MODEL}" || warn "Словарь не загружен — загрузите вручную."
+  fi
+
   if [[ "${ENGINE}" == "whisperx" ]]; then
     warn "WhisperX жёстко фиксирует версию torch и может сломать другие движки."
     confirm "Всё равно установить в общее окружение?" "n" || exit 0

@@ -596,6 +596,121 @@ def diagram_errors() -> None:
     c.save("diag-06-errors")
 
 
+
+# ===========================================================================
+# Схема 7. Мониторинг
+# ===========================================================================
+
+def diagram_monitoring() -> None:
+    c = Canvas(1560, 960, "Мониторинг ASR Hub",
+               "Один сбор — семь форматов; забирают метрики опросом либо сервер шлёт их сам")
+
+    # Источники
+    c.group(30, 100, 330, 420, "ИСТОЧНИКИ ДАННЫХ")
+    sources = [
+        ("Очередь и задания", ["глубина, ожидание, статусы", "разрезы по моделям"], BLUE),
+        ("Аналитика", ["RTF и перцентили", "время по стадиям, WER"], AQUA),
+        ("Оборудование", ["процессор, память", "видеокарта, диск"], GREEN),
+        ("Счётчики в памяти", ["запросы к API", "ошибки, повторы"], VIOLET),
+    ]
+    for index, (title, items, colour) in enumerate(sources):
+        c.box(50, 140 + index * 92, 290, 76, title, items, accent=colour)
+
+    # Сборщик
+    c.box(400, 190, 300, 240, "Сборщик",
+          ["каждый источник опрашивается",
+           "отдельно: сбой одного не лишает",
+           "остальных метрик",
+           "",
+           "снимок кешируется на 5 секунд",
+           "дорогие замеры — раз в 5 минут",
+           "",
+           "63 метрики, 11 групп"], accent=ORANGE)
+    for index in range(4):
+        c.arrow(340, 178 + index * 92, 400, 290, stroke=FAINT, width=1.2)
+
+    # Каталог метрик
+    c.box(400, 470, 300, 130, "Каталог метрик",
+          ["описание, единица, порог,",
+           "рекомендация, что делать",
+           "— один источник для API,",
+           "документации и правил"], accent=MAGENTA)
+    c.arrow(550, 470, 550, 434, stroke=MAGENTA, width=1.4, dash="4 3")
+
+    # Форматы
+    c.group(740, 100, 380, 300, "ФОРМАТЫ ВЫГРУЗКИ")
+    formats = [
+        "Prometheus · OpenMetrics",
+        "JSON с описаниями метрик",
+        "OTLP — OpenTelemetry",
+        "InfluxDB line protocol",
+        "Graphite · StatsD",
+        "Zabbix sender · CSV",
+    ]
+    for index, name in enumerate(formats):
+        y = 140 + index * 40
+        c.rect(760, y, 340, 32, fill=SURFACE, stroke=LINE, rx=6, width=1)
+        c.rect(760, y, 3, 32, fill=BLUE, stroke=BLUE, rx=2)
+        c.text(776, y + 21, name, size=12, fill=INK)
+    c.arrow(700, 300, 740, 250, stroke=ORANGE, width=1.6)
+
+    # Способы доставки
+    c.group(740, 430, 380, 170, "ДВА СПОСОБА ДОСТАВКИ")
+    c.box(760, 466, 340, 56, "Опрос: система сбора приходит сама",
+          ["надёжнее — молчание сервера заметно"], accent=GREEN)
+    c.box(760, 532, 340, 56, "Отправка: сервер шлёт сам",
+          ["для закрытого контура и NAT"], accent=YELLOW)
+
+    # Потребители
+    c.group(1160, 100, 370, 500, "ПОТРЕБИТЕЛИ")
+    consumers = [
+        ("Prometheus + Grafana", ["готовые правила и панель", "отдаются самим сервером"], BLUE),
+        ("Zabbix", ["шаблон с 58 элементами"], ORANGE),
+        ("OpenTelemetry Collector", ["общая телеметрия"], VIOLET),
+        ("Kubernetes", ["liveness, readiness, startup"], AQUA),
+        ("Своя система", ["JSON или webhook"], FAINT),
+    ]
+    for index, (title, items, colour) in enumerate(consumers):
+        c.box(1180, 140 + index * 92, 330, 76, title, items, accent=colour)
+    c.arrow(1120, 250, 1160, 300, stroke=FAINT, width=1.4)
+    c.arrow(1120, 520, 1160, 430, stroke=FAINT, width=1.4)
+
+    # Тревоги
+    c.text(30, 648, "Тревоги считаются и внутри сервера — на случай, когда внешнего "
+                    "мониторинга нет", size=12, fill=DIM)
+    states = [("норма", GREEN), ("наблюдение", YELLOW), ("тревога", RED), ("снята", GREEN)]
+    x = 30
+    for index, (label, colour) in enumerate(states):
+        c.rect(x, 668, 150, 34, fill=PANEL, stroke=colour, rx=6, width=1.4)
+        c.text(x + 75, 690, label, size=12, fill=INK, anchor="middle", weight=600)
+        if index < len(states) - 1:
+            c.arrow(x + 150, 685, x + 190, 685, stroke=FAINT, width=1.2)
+        x += 190
+    c.text(30, 726, "Промежуточное состояние «наблюдение» существует, чтобы одиночный "
+                    "всплеск не будил дежурного:", size=11.5, fill=DIM)
+    c.text(30, 744, "тревога поднимается, только если условие держится дольше выдержки.",
+           size=11.5, fill=DIM)
+
+    c.text(30, 790, "Что помнить", size=13, weight=600, fill=INK)
+    rows = [
+        ("Метрики закрывают на прокси, а не ключом",
+         "Prometheus не умеет обновлять истекающие ключи — ограничьте путь по адресу сети", BLUE),
+        ("Сбор чаще 15 секунд бессмыслен",
+         "Замеры железа обновляются раз в 20 секунд служебным циклом сервера", AQUA),
+        ("Пороги из каталога — отправная точка",
+         "Очередь из ста заданий бывает и нормой, и аварией: зависит от вашего потока", YELLOW),
+        ("Молчащий приёмник опаснее тревоги",
+         "asrhub_push_targets_healthy показывает, что вы перестали видеть проблемы", ORANGE),
+    ]
+    for index, (question, answer, colour) in enumerate(rows):
+        y = 810 + index * 32
+        c.rect(30, y, 1500, 28, fill=PANEL, stroke=LINE, rx=6, width=1)
+        c.rect(30, y, 4, 28, fill=colour, stroke=colour, rx=2)
+        c.text(46, y + 18, question, size=11.5, fill=INK)
+        c.text(560, y + 18, answer, size=11.5, fill=DIM)
+    c.save("diag-07-monitoring")
+
+
 def main() -> int:
     print("Сборка схем для документации:")
     diagram_architecture()
@@ -604,6 +719,7 @@ def main() -> int:
     diagram_deployment()
     diagram_model_choice()
     diagram_errors()
+    diagram_monitoring()
     print(f"Готово: {OUT}")
     return 0
 

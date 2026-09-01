@@ -250,7 +250,7 @@ for host in pypi.org huggingface.co github.com; do
   fi
 done
 
-PORT="$(grep -E '^\s*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
+PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
 PORT="${PORT:-8080}"
 if check_port_free "${PORT}"; then
   check "Порт ${PORT}" warn "свободен — сервер не запущен" \

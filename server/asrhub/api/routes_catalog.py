@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 
 from .. import catalog
 from ..engines import ENGINE_CLASSES, engine_status
-from ..errors import ASRHubError, ModelNotFound
+from ..errors import ASRHubError, ModelNotFound, PresetNotFound
 from ..logging_setup import get_logger
 from .deps import Principal, authenticate, error_response, get_state, require_admin
 
@@ -225,7 +225,7 @@ def apply_preset(request: Request, preset_id: str,
     require_admin(principal)
     preset = catalog.get_preset(preset_id)
     if preset is None:
-        raise error_response(ASRHubError(f"Пресет «{preset_id}» не найден."))
+        raise error_response(PresetNotFound(preset_id, [p.id for p in catalog.PRESETS]))
     applied: dict[str, Any] = {}
     for key, value in preset.values.items():
         try:

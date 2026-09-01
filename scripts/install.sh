@@ -19,6 +19,8 @@ source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/detect.sh"
 # shellcheck source=lib/whispercpp.sh
 source "${SCRIPT_DIR}/lib/whispercpp.sh"
+# shellcheck source=lib/wizard.sh
+source "${SCRIPT_DIR}/lib/wizard.sh"
 
 # ---------------------------------------------------------------------------
 # Значения по умолчанию
@@ -38,6 +40,11 @@ OFFLINE=0
 FORCE=0
 SKIP_MODELS=0
 KEEP_DATA=1
+INTERACTIVE=auto
+ENGINES_EXPLICIT=""
+MODELS_EXPLICIT=""
+ALIGNMENT=""
+MONITORING=""
 
 usage() {
   cat <<'USAGE'
@@ -61,6 +68,11 @@ usage() {
   --engines СПИСОК      Движки через запятую: gigaam,faster_whisper,nemo,vosk,…
   --models СПИСОК       Модели через запятую, загрузить сразу после установки
   --skip-models         Не загружать веса моделей
+  --alignment ИМЯ       Принудительное выравнивание: none | mfa | whisperx
+
+Режим работы
+  --interactive         Мастер с вопросами (по умолчанию, если есть терминал)
+  --no-interactive      Без вопросов, все значения из ключей и автоопределения
 
 Служба и права
   --no-service          Не создавать службу автозапуска
@@ -104,10 +116,13 @@ while [[ $# -gt 0 ]]; do
     --host)        HOST="${2:?нужен адрес}"; shift 2 ;;
     --mode)        MODE="${2:?native или docker}"; shift 2 ;;
     --profile)     PROFILE="${2:?имя профиля}"; shift 2 ;;
-    --engines)     ENGINES="${2:?список движков}"; shift 2 ;;
-    --models)      MODELS="${2:?список моделей}"; shift 2 ;;
+    --engines)     ENGINES="${2:?список движков}"; ENGINES_EXPLICIT=1; shift 2 ;;
+    --models)      MODELS="${2:?список моделей}"; MODELS_EXPLICIT=1; shift 2 ;;
     --user)        SERVICE_USER="${2:?имя пользователя}"; shift 2 ;;
     --skip-models) SKIP_MODELS=1; shift ;;
+    --interactive) INTERACTIVE=1; shift ;;
+    --no-interactive) INTERACTIVE=0; shift ;;
+    --alignment)   ALIGNMENT="${2:?none, mfa или whisperx}"; shift 2 ;;
     --no-service)  CREATE_SERVICE=0; shift ;;
     --offline)     OFFLINE=1; shift ;;
     --force)       FORCE=1; shift ;;
@@ -183,6 +198,132 @@ profile_disk_gb() {
 [[ -z "${ENGINES}" ]] && ENGINES="$(profile_engines "${PROFILE}")"
 if [[ -z "${MODELS}" && "${SKIP_MODELS}" -eq 0 ]]; then
   MODELS="$(profile_models "${PROFILE}")"
+fi
+
+
+# ---------------------------------------------------------------------------
+# Мастер установки
+# ---------------------------------------------------------------------------
+#
+# Запускается, когда есть терминал и не задан --no-interactive или --yes.
+# Каждый вопрос имеет ответ по умолчанию, подобранный по обнаруженному железу,
+# поэтому «Enter пять раз» даёт разумную установку.
+
+run_wizard() {
+  local ram_gb disk_gb accel_label
+
+  ram_gb="$(detect_ram_gb 2>/dev/null || echo 0)"
+  disk_gb="$(df -Pk "$(dirname "${DATA_DIR}")" 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}')"
+  case "${ACCEL}" in
+    cuda) accel_label="видеокарта NVIDIA" ;;
+    rocm) accel_label="видеокарта AMD (ROCm)" ;;
+    mps)  accel_label="Apple Silicon (Metal)" ;;
+    *)    accel_label="только процессор" ;;
+  esac
+
+  wizard_step "Установка ASR Hub" \
+    "Enter принимает предложенное значение — оно подобрано по вашему железу"
+
+  printf '  %sОбнаружено:%s %s, %s, %s ГБ памяти, %s ГБ свободно\n' \
+    "${C_DIM}" "${C_RESET}" "${OS}/${ARCH}" "${accel_label}" "${ram_gb}" "${disk_gb:-?}"
+
+  # --- 1. Что ставим ------------------------------------------------------
+  local default_profile=1
+  case "$(recommend_profile)" in
+    light) default_profile=1 ;; cpu) default_profile=2 ;;
+    standard) default_profile=3 ;; russian) default_profile=4 ;;
+    apple) default_profile=5 ;; full) default_profile=6 ;;
+  esac
+
+  # Если профиль задан ключом, мастер предлагает именно его, а не своё умолчание.
+  case "${PROFILE}" in
+    light) default_profile=1 ;; cpu) default_profile=2 ;;
+    standard) default_profile=3 ;; russian) default_profile=4 ;;
+    apple) default_profile=5 ;; full) default_profile=6 ;;
+  esac
+
+  wizard_choose PROFILE "Что установить?" "${default_profile}" \
+    "light|Минимум — проверить, что всё работает|~1 ГБ. faster-whisper small. Годится, чтобы посмотреть интерфейс" \
+    "cpu|Сервер без видеокарты|~4 ГБ. int8-квантизация. Час записи обрабатывается за час-полтора" \
+    "standard|Стандартный набор|~8 ГБ. GigaAM v3 + faster-whisper. Лучший выбор для машины с GPU" \
+    "russian|Только русский язык|~3 ГБ. GigaAM v3, T-one, Vosk. Ничего лишнего" \
+    "apple|MacBook на Apple Silicon|~3 ГБ. whisper.cpp с Metal и Core ML, работает от батареи" \
+    "full|Всё сразу|60+ ГБ и час установки. Для сравнения моделей между собой"
+
+  # Явно заданные --engines и --models мастер не перетирает.
+  [[ -z "${ENGINES_EXPLICIT}" ]] && ENGINES="$(profile_engines "${PROFILE}")"
+  [[ -z "${MODELS_EXPLICIT}" ]] && MODELS="$(profile_models "${PROFILE}")"
+
+  # Предупреждаем до начала работы, а не на седьмом шаге.
+  local need_gb; need_gb="$(profile_disk_gb "${PROFILE}")"
+  if [[ -n "${disk_gb}" && "${disk_gb}" -lt "${need_gb}" ]]; then
+    warn "Профилю нужно около ${need_gb} ГБ, свободно ${disk_gb} ГБ."
+    confirm "Продолжить всё равно?" "n" || exit 0
+  fi
+  if [[ "${ACCEL}" == "cpu" && "${PROFILE}" =~ ^(standard|full)$ ]]; then
+    warn "Видеокарта не обнаружена: выбранные модели будут работать в 10–30 раз медленнее."
+    hint "Профиль «cpu» подобран как раз для такой машины."
+    confirm "Оставить выбранный профиль?" "n" || { PROFILE="cpu";
+      ENGINES="$(profile_engines cpu)"; MODELS="$(profile_models cpu)"; }
+  fi
+
+  # --- 2. Куда ставим -----------------------------------------------------
+  wizard_ask PREFIX "Каталог программы" "${PREFIX}" wizard_valid_path
+  wizard_ask DATA_DIR "Каталог данных" "${DATA_DIR}" wizard_valid_path \
+    "Здесь будут веса моделей, загруженные файлы, результаты и база заданий."
+  VENV="${PREFIX}/venv"
+
+  # --- 3. Сеть ------------------------------------------------------------
+  local suggested_port="${PORT}"
+  check_port_free "${PORT}" || suggested_port="$(find_free_port "${PORT}")"
+  wizard_ask PORT "Порт сервера" "${suggested_port}" wizard_valid_port
+
+  wizard_choose HOST "Кто сможет подключаться?" 2 \
+    "127.0.0.1|Только эта машина|Снаружи сервер не виден. Доступ — через SSH-туннель или прокси" \
+    "0.0.0.0|Любой, кто дотянется по сети|Обычный выбор для сервера. Оставьте включённой проверку ключей"
+
+  # --- 4. Дополнительные возможности --------------------------------------
+  local extras=""
+  wizard_multi extras "Что ещё включить?" "1" \
+    "service|Автозапуск при загрузке машины|systemd, launchd или планировщик Windows" \
+    "alignment|Точные границы слов (MFA)|+2–3 ГБ и conda. Нужно для субтитров и дубляжа" \
+    "monitoring|Отправку метрик в систему мониторинга|Настроим адрес приёмника на следующем шаге"
+
+  [[ ",${extras}," == *",service,"* ]] && CREATE_SERVICE=1 || CREATE_SERVICE=0
+  [[ ",${extras}," == *",alignment,"* ]] && ALIGNMENT="mfa"
+  if [[ ",${extras}," == *",monitoring,"* ]]; then
+    wizard_choose MONITORING "Куда отправлять метрики?" 1 \
+      "prometheus_pushgateway|Prometheus Pushgateway|Для сервера за NAT, до которого не достучаться" \
+      "influxdb|InfluxDB|Метрики пишутся в базу временных рядов" \
+      "otlp|OpenTelemetry Collector|Общий сборщик телеметрии"
+    wizard_ask MONITORING_URL "Адрес приёмника" "http://localhost:9091" wizard_valid_host
+  fi
+
+  # --- 5. Подтверждение ---------------------------------------------------
+  # Профиль мог смениться после предупреждения о видеокарте — пересчитываем.
+  need_gb="$(profile_disk_gb "${PROFILE}")"
+  [[ "${ALIGNMENT}" == "mfa" ]] && need_gb=$((need_gb + 3))
+
+  local models_line="${MODELS:-не загружать}"
+  [[ "${SKIP_MODELS}" -eq 1 ]] && models_line="пропустить (--skip-models)"
+
+  wizard_summary \
+    "Профиль|${PROFILE}" \
+    "Движки|${ENGINES}" \
+    "Модели|${models_line}" \
+    "Каталог программы|${PREFIX}" \
+    "Каталог данных|${DATA_DIR}" \
+    "Адрес|http://${HOST}:${PORT}" \
+    "Автозапуск|$([[ ${CREATE_SERVICE} -eq 1 ]] && echo "да" || echo "нет")" \
+    "Выравнивание|${ALIGNMENT:-нет}" \
+    "Мониторинг|${MONITORING:-только по запросу}" \
+    "Займёт на диске|около ${need_gb} ГБ"
+
+  confirm "Начинать установку?" "y" || { info "Отменено."; exit 0; }
+}
+
+if [[ "${INTERACTIVE}" == "1" ]] || { [[ "${INTERACTIVE}" == "auto" ]] && wizard_interactive; }; then
+  run_wizard
 fi
 
 # ---------------------------------------------------------------------------
@@ -272,7 +413,12 @@ if [[ "${MODE}" == "native" ]]; then
   [[ "${ENGINES}" == *whisper_cpp* ]] && MISSING_SYS+=("$(system_package_names cmake)" $(system_package_names build))
 fi
 
-MISSING_SYS=($(printf '%s\n' "${MISSING_SYS[@]:-}" | tr ' ' '\n' | grep -v '^$' | sort -u))
+# Осторожно: при пустом массиве grep не находит строк и возвращает 1,
+# что под pipefail роняет установку. Поэтому пустоту проверяем заранее.
+if [[ ${#MISSING_SYS[@]} -gt 0 ]]; then
+  readarray -t MISSING_SYS < <(printf '%s\n' "${MISSING_SYS[@]}" \
+    | tr ' ' '\n' | grep -v '^$' | sort -u || true)
+fi
 if [[ ${#MISSING_SYS[@]} -gt 0 ]]; then
   info "Не хватает: ${MISSING_SYS[*]}"
   if confirm "Установить системные пакеты?"; then
@@ -299,7 +445,17 @@ CREATED_PREFIX=0
 ensure_dir "${PREFIX}"
 ensure_dir "${DATA_DIR}" 0750
 for sub in uploads results models logs tmp; do ensure_dir "${DATA_DIR}/${sub}" 0750; done
-[[ "${CREATED_PREFIX}" -eq 1 ]] && add_rollback "rm -rf '${PREFIX}'"
+# На macOS каталог данных лежит внутри prefix, поэтому откат удаляет только
+# подкаталоги программы, а не prefix целиком: иначе снесёт модели и базу.
+if [[ "${CREATED_PREFIX}" -eq 1 ]]; then
+  if [[ "${DATA_DIR}" == "${PREFIX}"/* ]]; then
+    for sub in server scripts config requirements docker venv; do
+      add_rollback "rm -rf '${PREFIX}/${sub}'"
+    done
+  else
+    add_rollback "rm -rf '${PREFIX}'"
+  fi
+fi
 ok "Каталоги готовы"
 
 # ---------------------------------------------------------------------------
@@ -473,6 +629,31 @@ runtime:
   models_dir: ${DATA_DIR}/models
   temp_dir: ${DATA_DIR}/tmp
 CFGEOF
+
+    # Выбранное в мастере дописывается отдельно, чтобы шаблон выше оставался
+    # одинаковым для любой установки.
+    if [[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" ]]; then
+      cat >> "${CONFIG_FILE}" <<CFGEOF
+
+postprocess:
+  # Уточнение границ слов по звуку. Если выравниватель недоступен,
+  # задание доводится до конца на таймкодах модели.
+  alignment_backend: ${ALIGNMENT}
+CFGEOF
+    fi
+
+    if [[ -n "${MONITORING}" ]]; then
+      cat >> "${CONFIG_FILE}" <<CFGEOF
+
+monitoring:
+  monitoring_push_enabled: true
+  monitoring_targets:
+    - kind: ${MONITORING}
+      url: ${MONITORING_URL:-http://localhost:9091}
+      interval_s: 60
+CFGEOF
+    fi
+
     add_rollback "rm -f '${CONFIG_FILE}'"
   fi
   ok "Конфигурация: ${CONFIG_FILE}"
@@ -481,6 +662,19 @@ fi
 if [[ "${MODE}" == "native" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
   ( cd "${PREFIX}/server" && "${VENV}/bin/python" -m asrhub --print-config \
       > "${DATA_DIR}/config.example.yaml" 2>/dev/null ) || true
+fi
+
+# ---------------------------------------------------------------------------
+# Выравнивание (по запросу мастера или ключа --alignment)
+# ---------------------------------------------------------------------------
+
+if [[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" && "${MODE}" == "native" ]]; then
+  info "Установка выравнивания «${ALIGNMENT}»…"
+  if ! ASRHUB_DATA_DIR="${DATA_DIR}" run bash "${PREFIX}/scripts/models.sh" \
+       install-engine "${ALIGNMENT}" --prefix "${PREFIX}"; then
+    warn "Выравнивание не установлено — распознавание это не затронет."
+    hint "Повторить позже: bash ${PREFIX}/scripts/models.sh install-engine ${ALIGNMENT}"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -567,7 +761,7 @@ printf '  Управлять моделями      bash %s/scripts/models.sh lis
 printf '  Управлять службой       bash %s/scripts/service.sh {start|stop|status|logs}\n' "${PREFIX}"
 printf '  Обновить                bash %s/scripts/update.sh\n' "${PREFIX}"
 printf '  Удалить                 bash %s/scripts/uninstall.sh\n' "${PREFIX}"
-if [[ ${#FAILED_ENGINES[@]:-0} -gt 0 ]]; then
+if [[ ${#FAILED_ENGINES[@]} -gt 0 ]]; then
   printf '\n%sНе установились движки: %s%s\n' "${C_YELLOW}" "${FAILED_ENGINES[*]}" "${C_RESET}"
   printf '  Повторить: bash %s/scripts/models.sh install-engine <движок>\n' "${PREFIX}"
 fi

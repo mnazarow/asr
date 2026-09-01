@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -23,6 +24,8 @@ from typing import Any
 from . import catalog
 from .errors import ConfigError
 from .hardware import detect, recommended_settings
+
+log = logging.getLogger("asrhub.config")
 
 ENV_PREFIX = "ASRHUB_"
 _TRUE = {"1", "true", "yes", "on", "да", "истина"}
@@ -238,6 +241,11 @@ class Settings:
             "data_dir": str(self.paths.data) if self.paths else "",
             **grouped,
         }
+        # Ключи доступа хранятся в том же файле и не относятся ни к одной
+        # группе параметров. Без этой строки сохранение настроек стирало их
+        # целиком, и после перезапуска доступ к серверу терялся.
+        if self.api_keys:
+            payload["api_keys"] = self.api_keys
         tmp = target.with_suffix(target.suffix + ".tmp")
         try:
             if target.suffix in (".yaml", ".yml"):
@@ -248,6 +256,23 @@ class Settings:
         except OSError as exc:
             raise ConfigError(f"Не удалось сохранить конфигурацию: {exc}") from exc
         return target
+
+
+    def persist_api_keys(self) -> bool:
+        """Записывает ключи доступа в файл конфигурации.
+
+        Вызывается при создании и отзыве ключа: иначе изменение живёт только
+        в памяти процесса и теряется при перезапуске, хотя интерфейс обещает
+        обратное («ключ показывается один раз — сохраните его»).
+        """
+        if self.config_file is None:
+            return False
+        try:
+            self.save()
+            return True
+        except ConfigError as exc:
+            log.warning("Ключи доступа не сохранены: %s", exc)
+            return False
 
 
 def _dump_yaml(payload: dict[str, Any]) -> str:
@@ -437,10 +462,15 @@ def load(config_path: str | os.PathLike[str] | None = None,
         settings.api_keys[key] = {"role": "admin", "name": "создан автоматически при первом запуске"}
         keyfile = paths.data / "api-key.txt"
         try:
-            keyfile.write_text(key + "\n", encoding="utf-8")
-            os.chmod(keyfile, 0o600)
-        except OSError:
-            pass
+            # Файл создаётся сразу с нужными правами: если выставлять их после
+            # записи, остаётся окно, в котором ключ доступен на чтение всем.
+            handle = os.open(str(keyfile), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                fh.write(key + "\n")
+        except OSError as exc:
+            log.error("Не удалось сохранить ключ доступа в %s: %s", keyfile, exc)
+            log.error("Ключ доступа этого запуска: %s", key)
+        settings.persist_api_keys()
     return settings
 
 

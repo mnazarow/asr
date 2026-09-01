@@ -12,12 +12,26 @@ from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, Upload
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from ..db import new_id
-from ..errors import ASRHubError, FileTooLarge, JobNotFound, UnsupportedFormat
+from ..errors import (
+    ASRHubError,
+    ConfigError,
+    FileTooLarge,
+    JobNotFound,
+    StorageError,
+    UnsupportedFormat,
+)
 from ..job_queue import ACTIVE_STATUSES
 from ..logging_setup import get_logger
 from ..pipeline import export as export_mod
 from ..pipeline.audio import SUPPORTED_EXTENSIONS
-from .deps import Principal, authenticate, error_response, get_state, require_write
+from .deps import (
+    Principal,
+    authenticate,
+    error_response,
+    get_state,
+    require_owner,
+    require_write,
+)
 
 log = get_logger("api.jobs")
 router = APIRouter(prefix="/api/jobs", tags=["Задания"])
@@ -43,11 +57,13 @@ def _parse_settings(raw: str | None) -> dict[str, Any]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise error_response(ASRHubError(
+        raise error_response(ConfigError(
             f"Не удалось разобрать параметры задания: {exc}",
             hint="Поле settings должно быть корректным JSON.")) from exc
     if not isinstance(data, dict):
-        raise error_response(ASRHubError("Параметры задания должны быть объектом JSON."))
+        raise error_response(ConfigError(
+            "Параметры задания должны быть объектом JSON.",
+            hint='Пример: settings={"model":"gigaam-v3-rnnt","language":"ru"}'))
     return data
 
 
@@ -88,7 +104,7 @@ async def create_job(
                 out.write(chunk)
     except OSError as exc:
         target.unlink(missing_ok=True)
-        raise error_response(ASRHubError(f"Не удалось сохранить файл: {exc}")) from exc
+        raise error_response(StorageError(f"Не удалось сохранить файл: {exc}")) from exc
     finally:
         await file.close()
 
@@ -121,6 +137,14 @@ async def create_batch(
 ) -> dict[str, Any]:
     state = get_state(request)
     require_write(principal)
+    limit_mb = int(state.settings.get("max_upload_mb") or 2048)
+    max_files = int(state.settings.get("max_batch_files") or 200)
+    if len(files) > max_files:
+        raise error_response(ConfigError(
+            f"В одном пакете {len(files)} файлов при пределе {max_files}.",
+            hint="Разбейте отправку на несколько пакетов или поднимите "
+                 "max_batch_files в настройках."))
+
     group = new_id("grp")
     created: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -136,8 +160,18 @@ async def create_batch(
             continue
         target = state.settings.paths.uploads / f"{new_id('up')}{suffix or '.bin'}"
         try:
+            # Тот же предел, что и в одиночной загрузке: без него ключ с ролью
+            # «user» забивал диск пакетом любого размера.
+            size = 0
             with target.open("wb") as out:
-                shutil.copyfileobj(item.file, out, 1 << 20)
+                while True:
+                    chunk = await item.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > limit_mb * 1024 * 1024:
+                        raise FileTooLarge(size / 1024 / 1024, limit_mb)
+                    out.write(chunk)
             job = state.queue.submit(
                 file_path=target, filename=filename, settings=merged,
                 owner=principal.name, api_key_name=principal.name,
@@ -147,6 +181,7 @@ async def create_batch(
             target.unlink(missing_ok=True)
             errors.append({"filename": filename, "error": exc.message})
         except OSError as exc:
+            target.unlink(missing_ok=True)
             errors.append({"filename": filename, "error": str(exc)})
         finally:
             await item.close()
@@ -191,6 +226,7 @@ def get_job(request: Request, job_id: str,
             with_segments: bool = False,
             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     try:
         job = state.queue.get(job_id)
     except JobNotFound as exc:
@@ -205,6 +241,7 @@ def get_job(request: Request, job_id: str,
 def get_segments(request: Request, job_id: str,
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     state.queue.get(job_id)
     return {"items": state.db.get_segments(job_id)}
 
@@ -213,15 +250,16 @@ def get_segments(request: Request, job_id: str,
 def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
              principal: Principal = Depends(authenticate)):
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     job = state.queue.get(job_id)
     if job["status"] != "completed":
-        raise error_response(ASRHubError(
+        raise error_response(ConfigError(
             f"Задание в состоянии «{job['status']}» — результата пока нет.",
             hint="Дождитесь завершения обработки."))
 
     result_dir = Path(job.get("result_path") or "")
     if fmt not in export_mod.FORMATS:
-        raise error_response(ASRHubError(
+        raise error_response(ConfigError(
             f"Неизвестный формат «{fmt}».",
             hint="Доступные форматы: " + ", ".join(export_mod.FORMATS)))
 
@@ -234,7 +272,9 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
     # Формат не сохранялся при обработке — строим на лету из сегментов.
     segments = state.db.get_segments(job_id)
     if not segments:
-        raise error_response(ASRHubError("Сегменты задания недоступны."))
+        raise error_response(ConfigError(
+            "Сегменты задания недоступны.",
+            hint="Сегменты появляются после успешного распознавания."))
     payload = {
         "meta": {"filename": job.get("filename"), "model": job.get("model"),
                  "language": job.get("language"), "duration_s": job.get("media_duration_s"),
@@ -267,10 +307,25 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
         "Content-Disposition": content_disposition(f"{name}.{fmt}")})
 
 
+def _owned_job(request: Request, job_id: str, principal: Principal) -> dict[str, Any]:
+    """Находит задание и проверяет права на него."""
+    state = get_state(request)
+    try:
+        job = state.queue.get(job_id)
+    except JobNotFound as exc:
+        raise error_response(exc) from exc
+    try:
+        require_owner(principal, job)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    return job
+
+
 @router.post("/{job_id}/cancel", summary="Отменить задание")
 def cancel(request: Request, job_id: str,
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.cancel(job_id, by=principal.name)
 
@@ -280,6 +335,7 @@ def retry(request: Request, job_id: str,
           overrides: dict[str, Any] | None = Body(default=None),
           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.retry(job_id, overrides)
 
@@ -289,6 +345,7 @@ def set_priority(request: Request, job_id: str,
                  priority: int = Body(embed=True, ge=0, le=100),
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.set_priority(job_id, priority)
 
@@ -297,6 +354,7 @@ def set_priority(request: Request, job_id: str,
 def to_top(request: Request, job_id: str,
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.move_to_top(job_id)
 
@@ -305,6 +363,7 @@ def to_top(request: Request, job_id: str,
 def to_bottom(request: Request, job_id: str,
               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.move_to_bottom(job_id)
 
@@ -313,6 +372,7 @@ def to_bottom(request: Request, job_id: str,
 def pause_job(request: Request, job_id: str,
               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.pause_job(job_id)
 
@@ -321,6 +381,7 @@ def pause_job(request: Request, job_id: str,
 def resume_job(request: Request, job_id: str,
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     return state.queue.resume_job(job_id)
 
@@ -329,6 +390,7 @@ def resume_job(request: Request, job_id: str,
 def delete_job(request: Request, job_id: str,
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     job = state.queue.get(job_id)
     if job["status"] in ACTIVE_STATUSES:
@@ -349,6 +411,7 @@ def set_reference(request: Request, job_id: str,
     from ..pipeline import metrics as M
 
     state = get_state(request)
+    _owned_job(request, job_id, principal)
     require_write(principal)
     job = state.queue.get(job_id)
     detail = M.detailed(text, job.get("text") or "")

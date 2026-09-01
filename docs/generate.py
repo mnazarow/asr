@@ -37,6 +37,21 @@ def yes(value: bool) -> str:
     return "да" if value else "—"
 
 
+def plural(number: int, one: str, few: str, many: str) -> str:
+    """Русское согласование существительного с числительным."""
+    tail100 = number % 100
+    tail10 = number % 10
+    if 11 <= tail100 <= 14:
+        word = many
+    elif tail10 == 1:
+        word = one
+    elif 2 <= tail10 <= 4:
+        word = few
+    else:
+        word = many
+    return f"{number} {word}"
+
+
 def clip(text: str, limit: int) -> str:
     """Обрезать по границе слова, не разрывая его посередине."""
     text = " ".join(text.split())
@@ -396,11 +411,507 @@ def generate_presets() -> str:
     return "\n".join(out) + "\n"
 
 
+
+
+# ===========================================================================
+# Раздел 16. Мониторинг
+# ===========================================================================
+
+def generate_monitoring() -> str:
+    """Собирает справочную часть раздела о мониторинге из каталога метрик."""
+    from asrhub.monitoring import catalog as mon
+
+    stats = mon.stats()
+    out: list[str] = []
+    add = out.append
+
+    add("# Мониторинг\n")
+    add("![Устройство мониторинга](images/diag-07-monitoring.png)\n")
+    add("Сервис отдаёт наружу **"
+        + plural(stats["total"], "метрику", "метрики", "метрик") + "** в "
+        + plural(stats["groups"], "группе", "группах", "группах") + ": "
+        + plural(stats["gauges"], "мгновенное значение", "мгновенных значения",
+                 "мгновенных значений") + ", "
+        + plural(stats["counters"], "счётчик", "счётчика", "счётчиков") + " и "
+        + plural(stats["histograms"], "гистограмма", "гистограммы", "гистограмм")
+        + ". У " + plural(stats["with_thresholds"], "метрики", "метрик", "метрик")
+        + " заданы пороги тревоги, у каждой есть описание и рекомендация.\n")
+    add("Раздел собран из каталога метрик сервера, поэтому описание не может разойтись "
+        "с тем, что сервис отдаёт на самом деле. Тот же каталог доступен программно: "
+        "`GET /api/monitoring/catalog`.\n")
+    add("Подробный справочник по каждому маршруту — с параметрами, схемами ответов "
+        "и настоящими примерами — вынесен отдельно: "
+        "«Программный интерфейс мониторинга».\n")
+
+    # --- быстрый старт ------------------------------------------------------
+    add("## С чего начать\n")
+    add("Три шага, после которых мониторинг работает:\n")
+    add("```bash")
+    add("# 1. Убедиться, что метрики отдаются")
+    add("curl http://сервер:8080/api/monitoring/metrics | head -20")
+    add("")
+    add("# 2. Забрать готовый блок для prometheus.yml")
+    add("curl http://сервер:8080/api/monitoring/config/prometheus-scrape >> prometheus.yml")
+    add("")
+    add("# 3. Забрать готовые правила оповещения и панель Grafana")
+    add("curl http://сервер:8080/api/monitoring/config/prometheus -o asrhub-rules.yml")
+    add("curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.json")
+    add("```\n")
+    add("> **Рекомендация.** Начните с пяти метрик и не пытайтесь следить за всеми сразу. "
+        "`asrhub_up`, `asrhub_queue_depth`, `asrhub_disk_free_gb`, `asrhub_rtf` и доля "
+        "неудачных заданий закрывают почти все аварии, которые случаются на практике. "
+        "Остальное пригодится, когда будете разбираться в причинах.\n")
+
+    # --- точки доступа ------------------------------------------------------
+    add("## Точки доступа\n")
+    add("| Адрес | Что отдаёт | Ключ |")
+    add("|---|---|---|")
+    rows = [
+        ("`GET /api/monitoring/metrics`",
+         "Все метрики. Формат — параметр `format`", "не нужен*"),
+        ("`GET /api/monitoring/metrics.json`",
+         "Снимок с описанием, рекомендацией и порогом каждой метрики", "не нужен*"),
+        ("`GET /api/monitoring/health`",
+         "Сводное состояние: живость, готовность, запуск, тревоги", "не нужен"),
+        ("`GET /api/monitoring/live`", "Проба живости для оркестратора", "не нужен"),
+        ("`GET /api/monitoring/ready`", "Проба готовности для балансировщика", "не нужен"),
+        ("`GET /api/monitoring/startup`", "Проба завершения запуска", "не нужен"),
+        ("`GET /api/monitoring/catalog`", "Справочник метрик целиком", "нужен"),
+        ("`GET /api/monitoring/catalog/{имя}`", "Описание одной метрики", "нужен"),
+        ("`GET /api/monitoring/alerts`", "Состояние тревог", "нужен"),
+        ("`GET /api/monitoring/alerts/history`", "История срабатываний", "нужен"),
+        ("`GET`/`PUT /api/monitoring/alerts/rules`", "Правила оповещения", "нужен"),
+        ("`GET`/`PUT /api/monitoring/targets`", "Приёмники метрик", "нужен"),
+        ("`POST /api/monitoring/targets/test`", "Проверить приёмник немедленно", "нужен"),
+        ("`GET /api/monitoring/config/prometheus`", "Готовые правила оповещения", "не нужен*"),
+        ("`GET /api/monitoring/config/grafana`", "Готовая панель", "не нужен*"),
+        ("`GET /api/monitoring/config/zabbix`", "Готовый шаблон", "не нужен*"),
+        ("`GET /api/monitoring/info`", "Состояние самой подсистемы мониторинга", "нужен"),
+    ]
+    for path, what, key in rows:
+        add(f"| {path} | {what} | {key} |")
+    add("")
+    add("\\* Пока включена настройка `monitoring_public` (по умолчанию включена). "
+        "Так сделано намеренно: Prometheus не умеет обновлять истекающие ключи, и "
+        "правильное место для ограничения доступа — прокси, а не приложение.\n")
+
+    # --- форматы ------------------------------------------------------------
+    add("## Форматы выгрузки\n")
+    add("Один и тот же снимок отдаётся в семи форматах — параметром `format`.\n")
+    add("| Значение | Формат | Для чего |")
+    add("|---|---|---|")
+    formats = [
+        ("`prometheus`", "текстовый формат Prometheus", "умолчание; понимают почти все системы"),
+        ("`openmetrics`", "OpenMetrics 1.0", "строгий стандарт, требуется некоторым сборщикам"),
+        ("`json`", "JSON с описаниями", "своя система; получатель видит и число, и его смысл"),
+        ("`otlp`", "OTLP/HTTP", "OpenTelemetry Collector"),
+        ("`influx`", "InfluxDB line protocol", "InfluxDB, Telegraf, VictoriaMetrics"),
+        ("`graphite`", "Graphite plaintext", "Graphite, StatsD, Carbon"),
+        ("`zabbix`", "JSON для zabbix_sender", "Zabbix"),
+        ("`csv`", "плоская таблица", "разовая выгрузка в таблицу"),
+    ]
+    for value, name, why in formats:
+        add(f"| {value} | {name} | {why} |")
+    add("")
+    add("```bash")
+    add("curl 'http://сервер:8080/api/monitoring/metrics?format=influx'")
+    add("curl 'http://сервер:8080/api/monitoring/metrics?format=zabbix&host=asr-01'")
+    add("```\n")
+
+    add(MONITORING_SETUP)
+
+    # --- справочник метрик --------------------------------------------------
+    add("## Справочник метрик\n")
+    add("Для каждой метрики указано, что она означает, какое значение считать обычным, "
+        "при каком пороге поднимать тревогу и что делать, когда она сработала. "
+        "Пороги — отправная точка: их придётся подогнать под свой поток.\n")
+
+    add("### Сводка по группам\n")
+    add("| Группа | Метрик | С порогами | О чём |")
+    add("|---|---|---|---|")
+    for group in mon.GROUPS:
+        items = mon.metrics_for_group(group["id"])
+        with_threshold = sum(1 for m in items if m.threshold)
+        add(f"| **{group['title']}** | {len(items)} | {with_threshold} | {group['description']} |")
+    add("")
+
+    for group in mon.GROUPS:
+        items = mon.metrics_for_group(group["id"])
+        if not items:
+            continue
+        add(f"### {group['title']}\n")
+        add(f"{group['description']}\n")
+        for spec in items:
+            add(f"#### {spec.label}\n")
+            meta = [f"**Метрика:** `{spec.name}`", f"**Тип:** {TYPE_RU[spec.type]}"]
+            if spec.unit:
+                meta.append(f"**Единица:** {spec.unit}")
+            if spec.labels:
+                meta.append("**Метки:** " + ", ".join(f"`{label}`" for label in spec.labels))
+            add(" · ".join(meta) + "\n")
+            add(spec.description + "\n")
+            if spec.normal:
+                add(f"**Обычное значение:** {spec.normal}\n")
+            if spec.recommendation:
+                add(f"> **Рекомендация.** {spec.recommendation}\n")
+            if spec.threshold:
+                threshold = spec.threshold
+                word = "выше" if threshold.direction == "above" else "ниже"
+                parts = []
+                if threshold.warning is not None:
+                    parts.append(f"предупреждение — {word} {threshold.warning}")
+                if threshold.critical is not None:
+                    parts.append(f"критично — {word} {threshold.critical}")
+                line = f"**Порог:** {'; '.join(parts)}"
+                if threshold.for_seconds:
+                    line += f"; выдержка {threshold.for_seconds} с"
+                add(line + ".\n")
+                if threshold.note:
+                    add(f"⚠️ {threshold.note}\n")
+            if spec.troubleshooting:
+                add(f"**Что делать при срабатывании:** {spec.troubleshooting}\n")
+            if spec.since_restart:
+                add("Счётчик обнуляется при перезапуске сервиса — это нормально: "
+                    "функция `rate()` в Prometheus обрабатывает обнуление правильно.\n")
+
+    add(MONITORING_TAIL)
+    return "\n".join(out) + "\n"
+
+
+MONITORING_SETUP = """## Раздел «Мониторинг» в интерфейсе
+
+![Раздел мониторинга](images/18-monitoring.png)
+
+Всё, что описано ниже, видно и настраивается из браузера: состояние проб, тревоги
+с их порогами, приёмники метрик, ссылки на выгрузку и справочник по каждой метрике.
+
+Верхняя строка отвечает на вопрос «всё ли в порядке» одним взглядом: состояние,
+число тревог, сколько метрик в снимке, сколько было опросов.
+
+### Пробы состояния
+
+Три пробы отвечают на три разных вопроса, и путать их дорого.
+
+| Проба | Вопрос | Что делает оркестратор при провале |
+|---|---|---|
+| `live` | процесс жив? | перезапускает контейнер |
+| `ready` | можно ли слать запросы? | снимает нагрузку, контейнер оставляет |
+| `startup` | запуск закончился? | ждёт, не считая две другие пробы |
+
+⚠️ Частая и дорогая ошибка — повесить на `live` проверку базы или очереди. Тогда
+короткая недоступность диска приводит к бесконечному циклу перезапусков, а при
+каждом перезапуске заново загружаются веса моделей. Проверка внешних зависимостей
+— это `ready`, и только она.
+
+Проба `ready` намеренно не считает поставленную на паузу очередь отказом: пауза —
+осознанное действие оператора, и снимать сервер с нагрузки во время обслуживания
+не нужно. Она отмечается предупреждением.
+
+### Справочник метрик прямо в интерфейсе
+
+![Справочник метрик](images/19-metric-catalog.png)
+
+Каждая метрика разворачивается в карточку: описание, обычное значение,
+рекомендация, порог с выдержкой и что делать при срабатывании. Тот же текст
+возвращает `GET /api/monitoring/catalog` — если вы строите свою панель, подсказки
+не придётся писать заново.
+
+## Настройка Prometheus
+
+Сервер отдаёт готовый блок для `prometheus.yml`:
+
+```bash
+curl http://сервер:8080/api/monitoring/config/prometheus-scrape
+```
+
+```yaml
+scrape_configs:
+  - job_name: asrhub
+    metrics_path: /api/monitoring/metrics
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ['asr.company.ru:8080']
+```
+
+> **Рекомендация.** Интервал сбора чаще 15 секунд смысла не имеет: замеры процессора,
+> памяти и видеокарты обновляются раз в 20 секунд служебным циклом сервера, и более
+> частый опрос вернёт те же самые числа, потратив ресурсы на запросы к базе. 30 секунд
+> — разумное умолчание.
+
+Если `monitoring_public` выключен, добавьте ключ:
+
+```yaml
+    authorization:
+      type: Bearer
+      credentials: ah_ваш_ключ
+```
+
+### Правила оповещения
+
+Готовый файл правил собирается из порогов каталога:
+
+```bash
+curl http://сервер:8080/api/monitoring/config/prometheus -o /etc/prometheus/asrhub-rules.yml
+promtool check rules /etc/prometheus/asrhub-rules.yml
+curl -X POST http://prometheus:9090/-/reload
+```
+
+Внутри — правила вида:
+
+```yaml
+- alert: ASRHubDiskFreeGbCritical
+  expr: asrhub_disk_free_gb < 5
+  for: 300s
+  labels: { severity: critical }
+  annotations:
+    summary: 'Свободно на диске: ниже 5 ГБ'
+    description: 'POST /api/maintenance/cleanup, затем bash scripts/models.sh disk'
+```
+
+Часть правил считается не прямым сравнением, а выражением — иначе они были бы
+бессмысленны:
+
+```promql
+# доля неудачных заданий, а не их число: ночной прогон архива
+# иначе поднимет тревогу на ровном месте
+sum(rate(asrhub_jobs_total{status="failed"}[30m]))
+  / clamp_min(sum(rate(asrhub_jobs_total[30m])), 0.001) > 0.2
+
+# видеопамять в процентах от общего объёма, а не в мегабайтах
+asrhub_gpu_memory_mb / clamp_min(asrhub_gpu_memory_total_mb, 1) * 100 > 90
+
+# недоступность ловится через absent(): если сервис лежит,
+# метрики нет вообще, и сравнивать её значение не с чем
+absent(asrhub_up) == 1
+```
+
+⚠️ Пороги в готовом файле — отправная точка, а не истина. Очередь из ста заданий
+бывает и нормой, и аварией: это зависит от вашего потока. Прогоните файл неделю,
+посмотрите, какие правила срабатывают впустую, и поднимите их пороги. Правило,
+которое дежурный привык игнорировать, хуже отсутствующего.
+
+## Панель Grafana
+
+```bash
+curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.json
+```
+
+Импортируется как есть: Dashboards → Import → Upload JSON. Панель собирается по
+группам каталога метрик, поэтому не расходится с тем, что сервер отдаёт.
+
+Что стоит вынести на первый экран собственной панели:
+
+| Панель | Запрос |
+|---|---|
+| Состояние | `asrhub_up` |
+| Очередь и её возраст | `asrhub_queue_depth`, `asrhub_queue_oldest_seconds` |
+| Скорость | `asrhub_rtf{quantile="p95"}` |
+| Доля отказов | `sum(rate(asrhub_jobs_total{status="failed"}[30m])) / clamp_min(sum(rate(asrhub_jobs_total[30m])), 0.001)` |
+| Место на диске | `asrhub_disk_free_gb` |
+| Видеопамять, % | `asrhub_gpu_memory_mb / asrhub_gpu_memory_total_mb * 100` |
+| Часы аудио в час | `rate(asrhub_audio_seconds_total[1h]) * 3.6` |
+
+## Zabbix
+
+```bash
+curl http://сервер:8080/api/monitoring/config/zabbix -o asrhub-template.yaml
+```
+
+Импорт: Настройка → Шаблоны → Импорт. Элементы создаются типом «Zabbix trapper»,
+данные отправляет сам сервер:
+
+```yaml
+monitoring_targets:
+  - kind: webhook
+    url: http://zabbix-proxy:10051/
+    interval_s: 60
+```
+
+Либо забирайте HTTP-агентом с `/api/monitoring/metrics?format=zabbix&host=asr-01`.
+
+## OpenTelemetry
+
+```yaml
+monitoring_targets:
+  - kind: otlp
+    url: http://otel-collector:4318
+    interval_s: 30
+```
+
+Метрики уходят в общий сборщик телеметрии в формате OTLP/HTTP и дальше — куда
+настроен коллектор. Пакет `opentelemetry` на сервере не нужен: тело запроса
+собирается вручную, лишняя зависимость на сервере распознавания ни к чему.
+
+## Kubernetes
+
+```yaml
+livenessProbe:
+  httpGet: { path: /api/monitoring/live, port: 8080 }
+  periodSeconds: 20
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet: { path: /api/monitoring/ready, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 2
+
+# Загрузка весов модели занимает десятки секунд, а на холодном кеше — минуты.
+# Без startupProbe контейнер будет убит до того, как успеет запуститься.
+startupProbe:
+  httpGet: { path: /api/monitoring/startup, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 60
+```
+
+Для сбора метрик оператором Prometheus:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: asrhub
+spec:
+  selector:
+    matchLabels: { app: asrhub }
+  endpoints:
+    - port: http
+      path: /api/monitoring/metrics
+      interval: 30s
+```
+
+## Отправка метрик наружу
+
+Забирать метрики опросом надёжнее: система сбора сразу видит, что сервер замолчал.
+Отправка нужна там, где до сервера не достучаться — закрытый контур, NAT, машина
+без постоянного адреса.
+
+![Добавление приёмника](images/20-monitoring-target.png)
+
+```yaml
+monitoring_push_enabled: true
+monitoring_targets:
+  - kind: prometheus_pushgateway
+    url: http://pushgw:9091
+    interval_s: 60
+  - kind: influxdb
+    url: http://influx:8086
+    database: asrhub
+    interval_s: 30
+```
+
+Проверить настройку можно до сохранения — кнопкой «Проверить» в интерфейсе или
+запросом:
+
+```bash
+curl -X POST http://сервер:8080/api/monitoring/targets/test \\
+  -H "X-API-Key: ключ" -H "Content-Type: application/json" \\
+  -d '{"kind": "influxdb", "url": "http://influx:8086", "database": "asrhub"}'
+```
+
+```json
+{"ok": true, "sent_metrics": 118}
+```
+
+⚠️ Настроив отправку, заведите оповещение на `asrhub_push_targets_healthy`.
+Молчащий приёмник означает не отсутствие проблем, а то, что вы перестали их видеть,
+— и это опаснее любой тревоги.
+"""
+
+
+MONITORING_TAIL = """## Тревоги внутри сервера
+
+Пороги считаются и на стороне сервиса — на случай, когда внешнего мониторинга нет.
+Состояния устроены как у Prometheus:
+
+```
+норма → наблюдение → тревога → снята
+```
+
+Промежуточное «наблюдение» существует, чтобы одиночный всплеск не будил дежурного:
+тревога поднимается, только если условие держится дольше выдержки. Смена состояния
+пишется в ленту событий сервера, поэтому историю видно и в разделе «Журнал».
+
+```bash
+curl -H "X-API-Key: ключ" http://сервер:8080/api/monitoring/alerts
+curl -H "X-API-Key: ключ" http://сервер:8080/api/monitoring/alerts/history
+```
+
+Свои пороги:
+
+```bash
+curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \\
+  -H "X-API-Key: ключ" -H "Content-Type: application/json" \\
+  -d '[{"metric": "asrhub_queue_depth", "direction": "above",
+        "threshold": 500, "severity": "warning", "for_seconds": 1800}]'
+```
+
+Вернуть пороги каталога: `POST /api/monitoring/alerts/rules/reset`.
+
+> **Рекомендация.** Если Prometheus у вас есть, оповещения держите в нём: там
+> история, группировка, подавление и маршрутизация дежурным. Встроенные тревоги —
+> для установки без внешнего мониторинга, чтобы кончающийся диск было видно хотя
+> бы в интерфейсе.
+
+## Если что-то не работает
+
+**Метрики отдаются, но половины значений нет.** Посмотрите
+`GET /api/monitoring/info` — поле `collection_errors` перечисляет источники,
+которые не удалось опросить, с причиной. Сбой одного источника не лишает вас
+остальных метрик: это сделано намеренно, чтобы неработающий `nvidia-smi` не
+оставлял без данных об очереди.
+
+**В Prometheus метрики есть, но все старые.** Проверьте `monitoring_cache_ttl_s`:
+если он больше интервала сбора, вы получаете один и тот же снимок несколько раз.
+Значение должно быть примерно вдвое меньше интервала.
+
+**Метки маршрутов размножились.** Такого быть не должно: маршрут берётся из шаблона
+(`/api/jobs/{job_id}`), а не из конкретного адреса. Если вы видите метки с
+идентификаторами заданий — сообщите об этом, это ошибка.
+
+**Хранилище метрик распухает.** Разрезы по моделям ограничены сорока значениями,
+но при большом числе моделей и владельцев объём всё равно растёт. Уберите ненужные
+разрезы на стороне Prometheus через `metric_relabel_configs`.
+
+**Тревога срабатывает впустую.** Поднимите порог или выдержку — правило, которое
+дежурный привык игнорировать, хуже отсутствующего. Пороги каталога рассчитаны на
+типичную установку и не знают вашего потока.
+
+**Отправка не доходит.** `GET /api/monitoring/targets` показывает по каждому
+приёмнику время последней попытки, время последнего успеха и текст ошибки.
+Сбой отправки никогда не влияет на работу сервиса — задания продолжают
+обрабатываться.
+
+## Что мониторить в первую очередь
+
+Если заводите оповещения с нуля, начните с этих шести и не добавляйте остальные,
+пока эти не отработают неделю без ложных срабатываний.
+
+| Что | Выражение | Почему именно это |
+|---|---|---|
+| Сервис не отвечает | `absent(asrhub_up) == 1` | Самая частая авария; всё остальное вторично |
+| Кончается диск | `asrhub_disk_free_gb < 20` | Заполненный диск повреждает базу и результаты |
+| Очередь растёт | `asrhub_queue_depth > 50` за 15 мин | Не хватает мощности; чем раньше видно, тем дешевле |
+| Люди ждут | `asrhub_queue_oldest_seconds > 1800` | То, что чувствует пользователь, а не сервер |
+| Задания падают | доля `failed` > 5 % за 30 мин | Отличает поломку от единичного плохого файла |
+| Нет ни одного движка | `asrhub_engines_available < 1` | Обычно означает, что обновление сломало зависимости |
+"""
+
+
+TYPE_RU = {
+    "gauge": "мгновенное значение",
+    "counter": "счётчик",
+    "histogram": "гистограмма",
+    "info": "справочная",
+}
+
+
 def main() -> int:
     print("Сборка справочных разделов документации:")
     for name, builder in (("04-parameters.md", generate_parameters),
                           ("03-models.md", generate_models),
-                          ("13-presets.md", generate_presets)):
+                          ("13-presets.md", generate_presets),
+                          ("16-monitoring.md", generate_monitoring)):
         text = builder()
         path = DOCS / name
         path.write_text(text, encoding="utf-8")

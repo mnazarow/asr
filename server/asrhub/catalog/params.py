@@ -41,6 +41,8 @@ GROUPS: list[dict[str, str]] = [
      "description": "Сетевые настройки, аутентификация, лимиты загрузки, хранение и журналирование."},
     {"id": "runtime", "title": "Управление ресурсами",
      "description": "Кеш моделей, выгрузка при простое, лимиты памяти, аварийные предохранители."},
+    {"id": "monitoring", "title": "Мониторинг",
+     "description": "Выгрузка метрик наружу, пороги тревог, приёмники телеметрии."},
 ]
 
 PARAMS: list[P] = []
@@ -1597,6 +1599,205 @@ _p(P(
 # ===========================================================================
 
 _p(P(
+    key="alignment_backend",
+    label="Принудительное выравнивание",
+    group="postprocess",
+    type="enum",
+    default="none",
+    options=[
+        {"value": "none", "label": "Не выравнивать (таймкоды модели)"},
+        {"value": "mfa", "label": "Montreal Forced Aligner (точнее всего)"},
+        {"value": "whisperx", "label": "WhisperX (wav2vec2, легче в установке)"},
+    ],
+    description=(
+        "Уточнение границ слов по звуку. Таймкоды, которые выдаёт распознаватель, — "
+        "это оценка декодера: он сообщает, на каком кадре, по его мнению, было слово. "
+        "Выравнивание решает другую задачу: текст уже известен, и нужно найти, где "
+        "именно в сигнале звучит каждое слово."
+    ),
+    recommendation=(
+        "Включайте, когда границы важны: субтитры, дубляж, разбор спорных записей, "
+        "нарезка аудио по словам. Если расшифровку читают люди, выигрыш не окупает "
+        "ни времени, ни установки. MFA точнее и не требует видеокарты, но ставится "
+        "через conda и занимает 2–3 ГБ; WhisperX легче поставить, работает на GPU, "
+        "качество границ чуть ниже. При любой неудаче выравнивания задание доводится "
+        "до конца на модельных таймкодах."
+    ),
+    examples=[
+        Ex("Расшифровка для чтения", "none", "Границы слов не нужны"),
+        Ex("Субтитры к видео", "mfa", "Точные границы заметны при наложении"),
+        Ex("Дубляж и озвучание", "mfa", "Липсинк требует пословной точности"),
+        Ex("Уже есть GPU и whisperx", "whisperx", "Быстрее и без conda"),
+    ],
+    impact={"quality": "up", "speed": "down", "memory": "up"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_dictionary",
+    label="Словарь произношения",
+    group="postprocess",
+    type="str",
+    default="russian_mfa",
+    description=(
+        "Произносительный словарь MFA: он сопоставляет написание слова его звучанию. "
+        "Для русского — russian_mfa."
+    ),
+    recommendation=(
+        "Словарь должен соответствовать языку записи, иначе выравнивание либо "
+        "провалится, либо разложит слова наугад. Загружается один раз: "
+        "mfa model download dictionary russian_mfa."
+    ),
+    examples=[
+        Ex("Русский", "russian_mfa", ""),
+        Ex("Английский", "english_us_mfa", ""),
+        Ex("Свой словарь", "/srv/mfa/наш-словарь.dict",
+           "Термины и имена, которых нет в стандартном"),
+    ],
+    requires={"alignment_backend": "mfa"},
+    impact={"quality": "up", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_acoustic_model",
+    label="Акустическая модель выравнивания",
+    group="postprocess",
+    type="str",
+    default="russian_mfa",
+    description="Акустическая модель MFA, по которой ищутся границы звуков.",
+    recommendation=(
+        "Берите пару «словарь и модель» одного языка. Загружается один раз: "
+        "mfa model download acoustic russian_mfa."
+    ),
+    examples=[Ex("Русский", "russian_mfa", ""), Ex("Английский", "english_mfa", "")],
+    requires={"alignment_backend": "mfa"},
+    impact={"quality": "up", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_retry_beam",
+    label="Ширина луча при повторе",
+    group="postprocess",
+    type="int",
+    default=80,
+    minimum=10,
+    maximum=400,
+    step=10,
+    description=(
+        "Насколько широко MFA ищет соответствие, если с первого прохода выровнять "
+        "не удалось. Больше значение — больше шансов на трудной записи и больше времени."
+    ),
+    recommendation=(
+        "80 хватает почти всегда. Поднимайте до 200, если в журнале часто "
+        "встречается «beam too narrow»: это записи с шумом, эхом или сильным акцентом."
+    ),
+    examples=[
+        Ex("Обычные записи", 80, ""),
+        Ex("Шумные записи", 200, "Медленнее, но выравнивание проходит"),
+    ],
+    requires={"alignment_backend": "mfa"},
+    impact={"quality": "up", "speed": "down", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_jobs",
+    label="Потоков выравнивания",
+    group="postprocess",
+    type="int",
+    default=4,
+    minimum=1,
+    maximum=64,
+    description="Сколько процессов MFA запускает параллельно.",
+    recommendation=(
+        "По числу физических ядер, но не больше: MFA считает на процессоре, и "
+        "перебор потоков только добавляет накладных расходов. На сервере, где "
+        "одновременно идёт распознавание, оставьте половину ядер."
+    ),
+    examples=[Ex("Восьмиядерный сервер", 4, ""), Ex("Выделенная машина", 8, "")],
+    requires={"alignment_backend": "mfa"},
+    impact={"quality": "neutral", "speed": "up", "memory": "up"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_timeout_s",
+    label="Тайм-аут выравнивания",
+    group="postprocess",
+    type="int",
+    default=900,
+    minimum=30,
+    maximum=7200,
+    step=60,
+    unit="с",
+    description="Сколько ждать MFA, прежде чем считать выравнивание неудавшимся.",
+    recommendation=(
+        "Выравнивание идёт примерно за десятую часть длительности записи на "
+        "четырёх ядрах. Для часовых записей 900 секунд — с запасом. По истечении "
+        "тайм-аута задание не падает: остаются модельные таймкоды."
+    ),
+    examples=[Ex("Записи до часа", 900, ""), Ex("Многочасовые записи", 3600, "")],
+    requires={"alignment_backend": "mfa"},
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_keep_text",
+    label="Сохранять исходный текст",
+    group="postprocess",
+    type="bool",
+    default=True,
+    description=(
+        "Брать из выравнивателя только границы, а слова оставлять из расшифровки. "
+        "Выравниватель работает с очищенным текстом в нижнем регистре и без знаков "
+        "препинания, поэтому его вывод нельзя просто подставить вместо расшифровки."
+    ),
+    recommendation=(
+        "Оставьте включённым. Выключение имеет смысл только при отладке — чтобы "
+        "увидеть, что именно выравниватель услышал."
+    ),
+    examples=[
+        Ex("Обычная работа", True, "Пунктуация и заглавные сохраняются"),
+        Ex("Отладка выравнивания", False, "Видно, как слова разобрал выравниватель"),
+    ],
+    requires={"alignment_backend": ["mfa", "whisperx"]},
+    impact={"quality": "up", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="alignment_max_gap_s",
+    label="Склейка после выравнивания",
+    group="postprocess",
+    type="float",
+    default=0.0,
+    minimum=0.0,
+    maximum=5.0,
+    step=0.1,
+    unit="с",
+    description=(
+        "Склеивать соседние сегменты одного говорящего, если пауза между ними "
+        "короче указанной. Ноль отключает склейку."
+    ),
+    recommendation=(
+        "После выравнивания границы становятся точными, и запись нередко распадается "
+        "на множество коротких кусков — по фразе на вдох. 0,5 секунды возвращает "
+        "текст к читаемому виду. Для субтитров склейку лучше не включать: там "
+        "дробление как раз полезно."
+    ),
+    examples=[
+        Ex("Субтитры", 0.0, "Дробные сегменты удобны для показа"),
+        Ex("Протокол для чтения", 0.5, "Фразы не рассыпаются построчно"),
+    ],
+    requires={"alignment_backend": ["mfa", "whisperx"]},
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
     key="diarization_enabled",
     label="Разделять по говорящим",
     group="diarization",
@@ -2280,6 +2481,34 @@ _p(P(
 ))
 
 _p(P(
+    key="max_batch_files",
+    label="Файлов в одном пакете",
+    group="queue",
+    type="int",
+    default=200,
+    minimum=1,
+    maximum=5000,
+    step=10,
+    description=(
+        "Сколько файлов принимается одним запросом POST /api/jobs/batch. "
+        "Сверх этого предела пакет отклоняется целиком."
+    ),
+    recommendation=(
+        "Предел нужен потому, что пакет обрабатывается одним HTTP-запросом: "
+        "тысяча файлов держит соединение открытым минутами и занимает диск "
+        "до того, как хоть одно задание попадёт в очередь. Для больших архивов "
+        "правильнее send-dir у клиента asrctl — он шлёт файлы по одному."
+    ),
+    examples=[
+        Ex("Обычная работа", 200, ""),
+        Ex("Массовая загрузка с быстрого диска", 1000, ""),
+        Ex("Медленный канал", 20, "Меньше потерь при обрыве"),
+    ],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
     key="max_queue_size",
     label="Предельная длина очереди",
     group="queue",
@@ -2822,6 +3051,142 @@ _p(P(
     examples=[Ex("Продуктивная эксплуатация", False, "Требование к персональным данным"),
               Ex("Отладка на тестовых файлах", True, "")],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="monitoring_public",
+    label="Метрики без ключа доступа",
+    group="monitoring",
+    type="bool",
+    default=True,
+    description=(
+        "Разрешает системе сбора забирать метрики с /api/monitoring/metrics без "
+        "ключа доступа. Остальные разделы программного интерфейса это не затрагивает."
+    ),
+    recommendation=(
+        "Оставьте включённым и закройте путь /api/monitoring/ на прокси по адресу "
+        "сети сбора — так принято и так проще: Prometheus не умеет обновлять "
+        "истекающие ключи. Выключайте, только если сервер смотрит в интернет "
+        "напрямую, без прокси."
+    ),
+    examples=[
+        Ex("Prometheus в той же сети", True, "Доступ ограничивается на прокси"),
+        Ex("Сервер открыт в интернет", False, "Системе сбора понадобится ключ"),
+    ],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="monitoring_cache_ttl_s",
+    label="Кеш снимка метрик",
+    group="monitoring",
+    type="float",
+    default=5.0,
+    minimum=0.0,
+    maximum=120.0,
+    step=1.0,
+    unit="с",
+    description=(
+        "Сколько секунд повторно отдавать один и тот же снимок метрик. Сбор "
+        "затрагивает базу, а за метриками могут прийти одновременно система "
+        "сбора, панель интерфейса и отправка наружу."
+    ),
+    recommendation=(
+        "Ставьте примерно вдвое меньше интервала сбора: при опросе раз в 30 секунд "
+        "хватит 5–15. Ноль отключает кеш — так делают только при отладке: на живом "
+        "сервере частые опросы начнут заметно грузить базу."
+    ),
+    examples=[
+        Ex("Опрос раз в 30 секунд", 5.0, ""),
+        Ex("Несколько систем сбора", 15.0, "Снимок делится между ними"),
+        Ex("Отладка", 0.0, "Каждый запрос считает заново"),
+    ],
+    impact={"quality": "neutral", "speed": "up", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="monitoring_push_enabled",
+    label="Отправлять метрики наружу",
+    group="monitoring",
+    type="bool",
+    default=True,
+    description=(
+        "Разрешает серверу самому отправлять метрики в приёмники из "
+        "monitoring_targets. Если список приёмников пуст, ничего не происходит."
+    ),
+    recommendation=(
+        "Забирать метрики опросом надёжнее: система сбора сразу видит, что сервер "
+        "замолчал. Отправка нужна там, где до сервера не достучаться — закрытый "
+        "контур, NAT, машина без постоянного адреса."
+    ),
+    examples=[
+        Ex("Prometheus рядом", False, "Он заберёт метрики сам"),
+        Ex("Сервер за NAT", True, "Отправка в Pushgateway или InfluxDB"),
+    ],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="monitoring_targets",
+    label="Приёмники метрик",
+    group="monitoring",
+    type="list",
+    default=[],
+    description=(
+        "Куда сервер отправляет метрики сам. Каждый приёмник описывается объектом "
+        "с полями kind, url и interval_s. Доступные kind: prometheus_pushgateway, "
+        "influxdb, otlp, statsd, webhook."
+    ),
+    recommendation=(
+        "Интервал меньше 30 секунд редко оправдан: замеры железа обновляются раз "
+        "в 20 секунд, и более частая отправка шлёт те же самые числа. Проверить "
+        "настройку до сохранения можно через POST /api/monitoring/targets/test."
+    ),
+    examples=[
+        Ex("Pushgateway",
+           [{"kind": "prometheus_pushgateway", "url": "http://pushgw:9091",
+             "interval_s": 60}],
+           "Классический вариант для сервера за NAT"),
+        Ex("InfluxDB",
+           [{"kind": "influxdb", "url": "http://influx:8086", "database": "asrhub",
+             "interval_s": 30}], ""),
+        Ex("OpenTelemetry",
+           [{"kind": "otlp", "url": "http://otel-collector:4318", "interval_s": 30}],
+           "Метрики уходят в общий сборщик телеметрии"),
+        Ex("Два приёмника сразу",
+           [{"kind": "influxdb", "url": "http://influx:8086", "interval_s": 30},
+            {"kind": "webhook", "url": "https://ваш-сервис/metrics", "interval_s": 300}],
+           "Сбой одного не мешает другому"),
+    ],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
+))
+
+_p(P(
+    key="monitoring_rules",
+    label="Правила оповещения",
+    group="monitoring",
+    type="list",
+    default=[],
+    description=(
+        "Собственные пороги тревог. Пустой список означает пороги из каталога "
+        "метрик — они подобраны под типичную установку и обычно годятся как есть."
+    ),
+    recommendation=(
+        "Если у вас есть Prometheus, оповещения лучше держать в нём: там история, "
+        "группировка и маршрутизация. Правила здесь нужны установке без внешнего "
+        "мониторинга — чтобы кончающийся диск было видно хотя бы в интерфейсе."
+    ),
+    examples=[
+        Ex("Пороги по умолчанию", [], "Берутся из каталога метрик"),
+        Ex("Своя очередь",
+           [{"metric": "asrhub_queue_depth", "direction": "above", "threshold": 500,
+             "severity": "warning", "for_seconds": 1800}],
+           "Для сервера, где очередь из сотен заданий — норма"),
+    ],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    advanced=True,
 ))
 
 _p(P(

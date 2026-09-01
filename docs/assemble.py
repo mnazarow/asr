@@ -33,6 +33,10 @@ CHAPTERS: list[tuple[str, str]] = [
     ("13-presets.md", "Пресеты"),
     ("14-architecture.md", "Архитектура"),
     ("15-licenses.md", "Лицензии"),
+    ("16-monitoring.md", "Мониторинг"),
+    ("17-monitoring-api.md", "Программный интерфейс мониторинга"),
+    ("18-review.md", "Ревизия кода"),
+    ("appendix-phone-asr.md", "Приложение. Разбор проектов phone_asr"),
 ]
 
 METADATA = """---

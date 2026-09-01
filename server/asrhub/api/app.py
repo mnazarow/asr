@@ -20,9 +20,11 @@ from ..engines import EngineRegistry
 from ..errors import ASRHubError
 from ..job_queue import JobQueue
 from ..logging_setup import get_logger, setup
+from ..monitoring import RUNTIME, MonitoringService
 from .deps import AppState
 from .routes_catalog import router as catalog_router
 from .routes_jobs import router as jobs_router
+from .routes_monitoring import router as monitoring_router
 from .routes_system import router as system_router
 
 log = get_logger("app")
@@ -44,6 +46,35 @@ curl -X POST http://сервер:8080/api/jobs \\
 """
 
 
+# Пути, которые считаются известными, когда шаблон маршрута недоступен
+# (статика и 404). Всё остальное сводится к «other»: иначе любой перебор
+# несуществующих адресов бесконечно наращивал бы число серий в памяти.
+_KNOWN_PREFIXES = ("/api/", "/ws", "/static/")
+
+
+def _route_fallback(path: str) -> str:
+    """Схлопывает путь в устойчивую метку, когда шаблон маршрута недоступен.
+
+    Число значений метки должно быть ограничено сверху: хранилище метрик
+    хранит по временному ряду на каждое, и неограниченный рост — это утечка
+    памяти и у нас, и в Prometheus.
+    """
+    if path in ("/", ""):
+        return "/"
+    if not path.startswith(_KNOWN_PREFIXES):
+        return "other"
+    parts = []
+    for part in path.split("/"):
+        if part.startswith(("job_", "up_", "grp_", "ah_")) or (
+                len(part) > 12 and any(ch.isdigit() for ch in part)):
+            parts.append("{id}")
+        else:
+            parts.append(part)
+    collapsed = "/".join(parts) or "/"
+    # Ограничиваем и длину: очень длинный путь тоже раздувает хранилище.
+    return collapsed if len(collapsed) <= 80 else "other"
+
+
 class EventHub:
     """Рассылка событий подписчикам WebSocket."""
 
@@ -58,9 +89,11 @@ class EventHub:
     async def register(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self._clients.add(websocket)
+        RUNTIME.websocket_clients = len(self._clients)
 
     def unregister(self, websocket: WebSocket) -> None:
         self._clients.discard(websocket)
+        RUNTIME.websocket_clients = len(self._clients)
 
     def publish(self, kind: str, data: dict[str, Any]) -> None:
         """Вызывается из рабочих потоков — переносим в цикл событий."""
@@ -108,18 +141,21 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     analytics = Analytics(db)
     state = AppState(settings=settings, db=db, registry=registry,
                      queue=queue, analytics=analytics)
+    state.monitoring = MonitoringService(state)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         hub.bind(asyncio.get_running_loop())
         if start_queue:
             queue.start()
+        state.monitoring.start()
         log.info("ASR Hub запущен: %s:%s, каталог данных %s",
                  settings.get("server_host"), settings.get("server_port"),
                  settings.paths.data)
         if settings.hardware_hint:
             log.info("%s", settings.hardware_hint)
         yield
+        state.monitoring.stop()
         queue.stop()
         registry.unload_all()
         db.close()
@@ -151,21 +187,45 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     @app.middleware("http")
     async def add_timing(request: Request, call_next):
         started = time.perf_counter()
+        RUNTIME.request_started()
+        status_code = 500
         try:
             response = await call_next(request)
+            status_code = response.status_code
         except ASRHubError as exc:
+            # Сюда попадают только ошибки, поднятые вне обработчика запроса;
+            # остальные перехватывает @app.exception_handler ниже по стеку.
+            status_code = exc.http_status
+            RUNTIME.note_error(exc.code, exc.retryable)
             return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
-        response.headers["X-Process-Time"] = f"{(time.perf_counter() - started) * 1000:.1f}ms"
+        finally:
+            RUNTIME.request_finished()
+            elapsed = time.perf_counter() - started
+            # Метка маршрута берётся из шаблона (/api/jobs/{job_id}), а не из
+            # конкретного адреса: иначе метки размножатся по числу заданий и
+            # уронят хранилище метрик.
+            route = request.scope.get("route")
+            path = getattr(route, "path", None) or _route_fallback(request.url.path)
+            labels = {"method": request.method, "route": path}
+            RUNTIME.inc("asrhub_http_requests_total", {**labels, "status": str(status_code)})
+            RUNTIME.observe("asrhub_http_request_seconds", elapsed, labels)
+            if status_code == 401:
+                RUNTIME.inc("asrhub_auth_failures_total")
+            elif status_code == 429:
+                RUNTIME.inc("asrhub_rate_limited_total")
+        response.headers["X-Process-Time"] = f"{elapsed * 1000:.1f}ms"
         return response
 
     @app.exception_handler(ASRHubError)
     async def asrhub_error_handler(request: Request, exc: ASRHubError):
         log.warning("Ошибка API %s: %s", exc.code, exc.message)
+        RUNTIME.note_error(exc.code, exc.retryable)
         return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
 
     @app.exception_handler(Exception)
     async def unexpected_handler(request: Request, exc: Exception):
         log.exception("Непредвиденная ошибка на %s: %s", request.url.path, exc)
+        RUNTIME.note_error("internal_error", retryable=False)
         return JSONResponse(status_code=500, content={
             "code": "internal_error",
             "message": f"Внутренняя ошибка сервера: {type(exc).__name__}",
@@ -175,11 +235,28 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(jobs_router)
     app.include_router(catalog_router)
     app.include_router(system_router)
+    app.include_router(monitoring_router)
 
     ws_router = APIRouter()
 
     @ws_router.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        # Лента событий несёт имена файлов, статусы и ошибки заданий, поэтому
+        # закрыта тем же ключом, что и остальной интерфейс. Ключ приходит в
+        # параметре адреса: заголовки в браузерном WebSocket задать нельзя.
+        if settings.get("auth_enabled", True):
+            token = (websocket.query_params.get("api_key")
+                     or websocket.headers.get("x-api-key") or "")
+            if not token:
+                header = websocket.headers.get("authorization", "")
+                parts = header.split(" ", 1)
+                token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
+                    else header.strip()
+            info = settings.api_keys.get(token)
+            if not info or info.get("enabled") is False:
+                await websocket.close(code=4401, reason="Ключ доступа отсутствует или недействителен")
+                return
+
         await hub.register(websocket)
         try:
             await websocket.send_text(json.dumps({

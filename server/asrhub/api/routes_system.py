@@ -8,10 +8,11 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from .. import catalog
-from ..errors import ASRHubError, ConfigError
+from ..errors import ConfigError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
 from ..logging_setup import recent as log_recent
+from ..monitoring.collector import RUNTIME
 from .deps import Principal, authenticate, error_response, get_state, require_admin
 
 router = APIRouter(prefix="/api", tags=["Сервер"])
@@ -127,6 +128,7 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
         state.registry.configure(int(state.settings.get("model_cache_size") or 2),
                                  int(state.settings.get("model_idle_unload_s") or 900))
     state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
+    RUNTIME.inc("asrhub_config_reloads_total")
     return {"applied": applied}
 
 
@@ -177,7 +179,7 @@ def analytics_section(request: Request, section: str, period: str = "week",
     }
     handler = handlers.get(section)
     if handler is None:
-        raise error_response(ASRHubError(
+        raise error_response(ConfigError(
             f"Неизвестный раздел аналитики «{section}».",
             hint="Доступные разделы: " + ", ".join(sorted(handlers))))
     return handler(period)
@@ -224,13 +226,22 @@ def create_key(request: Request, name: str = Body(embed=True),
     state = get_state(request)
     require_admin(principal)
     if role not in ("admin", "user", "readonly"):
-        raise error_response(ASRHubError("Роль должна быть admin, user или readonly."))
+        raise error_response(ConfigError(
+            f"Недопустимая роль «{role}».",
+            hint="Допустимые роли: admin — полный доступ, user — отправка заданий, "
+                 "readonly — только чтение."))
     key = "ah_" + secrets.token_urlsafe(24)
     state.settings.api_keys[key] = {"name": name, "role": role,
                                     "rate_limit": rate_limit, "enabled": True}
+    # Без записи на диск ключ жил бы только до перезапуска, тогда как
+    # интерфейс обещает пользователю обратное.
+    saved = state.settings.persist_api_keys()
     state.db.add_event(None, "key_created", f"Создан ключ «{name}» с ролью {role}")
-    return {"key": key, "name": name, "role": role,
-            "warning": "Ключ показывается один раз — сохраните его."}
+    return {"key": key, "name": name, "role": role, "persisted": saved,
+            "warning": "Ключ показывается один раз — сохраните его."
+                       if saved else
+                       "Ключ показывается один раз. Внимание: файл конфигурации "
+                       "недоступен, поэтому ключ будет действовать только до перезапуска."}
 
 
 @router.delete("/keys/{preview}", summary="Отозвать ключ доступа")
@@ -238,12 +249,25 @@ def revoke_key(request: Request, preview: str,
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    for key in list(state.settings.api_keys):
-        if key.startswith(preview[:6]):
-            state.settings.api_keys.pop(key, None)
-            state.db.add_event(None, "key_revoked", "Ключ доступа отозван")
-            return {"revoked": True}
-    raise error_response(ASRHubError("Ключ не найден."))
+    if len(preview) < 12:
+        raise error_response(ConfigError(
+            "Слишком короткий идентификатор ключа.",
+            hint="Передайте не менее двенадцати первых символов ключа — "
+                 "иначе под совпадение попадёт чужой ключ."))
+
+    matches = [key for key in state.settings.api_keys if key.startswith(preview)]
+    if not matches:
+        raise error_response(KeyNotFound(preview))
+    if len(matches) > 1:
+        raise error_response(ConfigError(
+            f"Под «{preview}» подходит несколько ключей ({len(matches)}).",
+            hint="Передайте больше символов, чтобы совпадение было однозначным."))
+
+    name = str(state.settings.api_keys.get(matches[0], {}).get("name") or "")
+    state.settings.api_keys.pop(matches[0], None)
+    state.settings.persist_api_keys()
+    state.db.add_event(None, "key_revoked", f"Отозван ключ доступа «{name}»")
+    return {"revoked": True, "name": name}
 
 
 @router.get("/metrics", summary="Метрики Prometheus", response_class=PlainTextResponse)

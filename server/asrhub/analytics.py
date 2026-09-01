@@ -32,6 +32,12 @@ def _since(period: str) -> float:
     return 0.0 if seconds == 0 else time.time() - seconds
 
 
+def _escape_label(value: Any) -> str:
+    """Экранирует значение метки по правилам формата Prometheus."""
+    text = str(value if value is not None else "")
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 class Analytics:
     def __init__(self, db: Database):
         self.db = db
@@ -40,7 +46,7 @@ class Analytics:
 
     def overview(self, period: str = "day") -> dict[str, Any]:
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
         done = [j for j in jobs if j["status"] == "completed"]
         failed = [j for j in jobs if j["status"] == "failed"]
         cancelled = [j for j in jobs if j["status"] == "cancelled"]
@@ -119,7 +125,7 @@ class Analytics:
         since = _since(period) or (time.time() - PERIODS["week"])
         span = max(time.time() - since, 60.0)
         width = span / buckets
-        jobs = self.db.list_jobs(since=since, limit=100000)
+        jobs = self.db.list_jobs(since=since, limit=100000, light=True)
 
         series = {
             "labels": [], "completed": [], "failed": [], "audio_minutes": [],
@@ -175,7 +181,7 @@ class Analytics:
 
     def by_model(self, period: str = "month") -> list[dict[str, Any]]:
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for job in jobs:
             grouped.setdefault(str(job.get("model") or "—"), []).append(job)
@@ -230,7 +236,7 @@ class Analytics:
 
     def _group(self, period: str, field: str, fallback: str) -> list[dict[str, Any]]:
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for job in jobs:
             grouped.setdefault(str(job.get(field) or fallback), []).append(job)
@@ -253,7 +259,7 @@ class Analytics:
 
     def errors(self, period: str = "month") -> dict[str, Any]:
         since = _since(period)
-        jobs = self.db.list_jobs(status="failed", since=since or None, limit=10000)
+        jobs = self.db.list_jobs(status="failed", since=since or None, limit=10000, light=True)
         by_code: dict[str, dict[str, Any]] = {}
         for job in jobs:
             code = str(job.get("error_code") or "unknown")
@@ -278,7 +284,7 @@ class Analytics:
 
     def duration_histogram(self, period: str = "month", bins: int = 10) -> dict[str, Any]:
         since = _since(period)
-        jobs = [j for j in self.db.list_jobs(status="completed", since=since or None, limit=100000)
+        jobs = [j for j in self.db.list_jobs(status="completed", since=since or None, limit=100000, light=True)
                 if j.get("media_duration_s")]
         durations = [float(j["media_duration_s"]) for j in jobs]
         if not durations:
@@ -297,7 +303,7 @@ class Analytics:
 
     def slowest(self, period: str = "month", limit: int = 15) -> list[dict[str, Any]]:
         since = _since(period)
-        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000)
+        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, light=True)
         jobs = [j for j in jobs if j.get("rtf")]
         jobs.sort(key=lambda j: float(j["rtf"]), reverse=True)
         return [{
@@ -310,7 +316,7 @@ class Analytics:
     def hourly_profile(self, period: str = "month") -> dict[str, Any]:
         """Распределение нагрузки по часам суток и дням недели."""
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
         hours = [0] * 24
         weekdays = [0] * 7
         for job in jobs:
@@ -328,7 +334,7 @@ class Analytics:
     def efficiency(self, period: str = "month") -> dict[str, Any]:
         """Оценка эффективности: сколько ресурсов уходит на час аудио."""
         since = _since(period)
-        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000)
+        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, light=True)
         audio = sum(float(j.get("media_duration_s") or 0) for j in jobs)
         proc = sum(float(j.get("processing_time_s") or 0) for j in jobs)
         load = sum(float(j.get("model_load_s") or 0) for j in jobs)
@@ -401,12 +407,14 @@ class Analytics:
             "Доля успешно завершённых заданий")
 
         for row in self.by_model("day"):
-            label = f'model="{row["model"]}"'
+            # Значение метки экранируется: имя модели приходит из запроса и
+            # без этого позволяло бы вписать в вывод поддельные метрики.
+            label = 'model="{}"'.format(_escape_label(row["model"]))
             add("model_jobs", row["jobs"], label)
             add("model_rtf_avg", row["rtf_avg"], label)
             add("model_success_rate", row["success_rate"], label)
 
-        samples = self.db.system_samples(time.time() - 300, limit=1)
+        samples = self.db.system_samples(time.time() - 300, limit=200)
         if samples:
             sample = samples[-1]
             add("cpu_percent", sample.get("cpu_percent"))

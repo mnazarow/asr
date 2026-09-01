@@ -33,6 +33,9 @@ param(
     [string]$Models = '',
     [switch]$SkipModels,
     [switch]$NoService,
+    [ValidateSet('', 'none', 'mfa', 'whisperx')][string]$Alignment = '',
+    [switch]$Interactive,
+    [switch]$NoInteractive,
     [switch]$Offline,
     [switch]$Force,
     [switch]$DryRun,
@@ -95,6 +98,113 @@ Set-StepTotal 9
 Write-Step 'Проверка окружения'
 
 $hw = Show-Environment
+
+# ---------------------------------------------------------------------------
+# Мастер установки
+# ---------------------------------------------------------------------------
+#
+# Запускается, когда есть консоль и не задан -NoInteractive или -Yes.
+# У каждого вопроса есть ответ по умолчанию, подобранный по обнаруженному
+# железу, поэтому «Enter пять раз» даёт разумную установку.
+
+function Invoke-InstallWizard {
+    $accelLabel = switch ($hw.Accelerator) {
+        'cuda' { 'видеокарта NVIDIA' }
+        'rocm' { 'видеокарта AMD' }
+        default { 'только процессор' }
+    }
+
+    Write-WizardStep 'Установка ASR Hub' `
+        'Enter принимает предложенное значение — оно подобрано по вашему железу'
+    Write-Host ("  Обнаружено: Windows, {0}, {1} ГБ памяти" -f $accelLabel, $hw.RamGb) `
+        -ForegroundColor DarkGray
+
+    $profileOrder = @('light', 'cpu', 'standard', 'russian', 'full')
+    $defaultProfile = [Math]::Max(1, $profileOrder.IndexOf((Get-RecommendedProfile)) + 1)
+
+    $script:Profile = Select-WizardOption -Question 'Что установить?' -DefaultIndex $defaultProfile -Options @(
+        @{ Value = 'light';    Label = 'Минимум — проверить, что всё работает';
+           Note = '~1 ГБ. faster-whisper small. Годится, чтобы посмотреть интерфейс' }
+        @{ Value = 'cpu';      Label = 'Сервер без видеокарты';
+           Note = '~4 ГБ. int8-квантизация. Час записи обрабатывается за час-полтора' }
+        @{ Value = 'standard'; Label = 'Стандартный набор';
+           Note = '~8 ГБ. GigaAM v3 + faster-whisper. Лучший выбор для машины с GPU' }
+        @{ Value = 'russian';  Label = 'Только русский язык';
+           Note = '~3 ГБ. GigaAM v3 и Vosk. Ничего лишнего' }
+        @{ Value = 'full';     Label = 'Всё сразу';
+           Note = '60+ ГБ и час установки. Для сравнения моделей между собой' }
+    )
+    $script:Engines = $profileEngines[$script:Profile]
+    $script:Models = $profileModels[$script:Profile]
+
+    if ($hw.Accelerator -eq 'cpu' -and $script:Profile -in @('standard', 'full')) {
+        Write-Warn 'Видеокарта не обнаружена: выбранные модели будут работать в 10–30 раз медленнее.'
+        Write-Hint 'Профиль «cpu» подобран как раз для такой машины.'
+        if (-not (Confirm-Action 'Оставить выбранный профиль?')) {
+            $script:Profile = 'cpu'
+            $script:Engines = $profileEngines['cpu']
+            $script:Models = $profileModels['cpu']
+        }
+    }
+
+    $script:Prefix = Read-WizardValue -Question 'Каталог программы' -Default $script:Prefix
+    $script:DataDir = Read-WizardValue -Question 'Каталог данных' -Default $script:DataDir `
+        -Note 'Здесь будут веса моделей, загруженные файлы, результаты и база заданий.'
+
+    $suggestedPort = if (Test-PortFree -Port $script:Port) { $script:Port }
+                     else { Find-FreePort -Start ($script:Port + 1) }
+    $script:Port = [int](Read-WizardValue -Question 'Порт сервера' -Default "$suggestedPort" -Validator {
+        param($value)
+        $number = 0
+        if (-not [int]::TryParse($value, [ref]$number) -or $number -lt 1 -or $number -gt 65535) {
+            Write-Warn 'Порт — число от 1 до 65535.'; return $false
+        }
+        if (-not (Test-PortFree -Port $number)) {
+            Write-Warn "Порт $number уже занят."; return $false
+        }
+        return $true
+    })
+
+    $script:BindHost = Select-WizardOption -Question 'Кто сможет подключаться?' -DefaultIndex 2 -Options @(
+        @{ Value = '127.0.0.1'; Label = 'Только эта машина';
+           Note = 'Снаружи сервер не виден. Доступ — через туннель или прокси' }
+        @{ Value = '0.0.0.0';   Label = 'Любой, кто дотянется по сети';
+           Note = 'Обычный выбор для сервера. Оставьте включённой проверку ключей' }
+    )
+
+    $extras = Select-WizardMany -Question 'Что ещё включить?' -Default '1' -Options @(
+        @{ Value = 'service';   Label = 'Автозапуск при входе в систему';
+           Note = 'Служба через NSSM или задача планировщика' }
+        @{ Value = 'alignment'; Label = 'Точные границы слов (WhisperX)';
+           Note = 'Нужно для субтитров и дубляжа. MFA на Windows ставится сложнее' }
+    )
+    if ($extras -notcontains 'service') { $script:NoService = $true }
+    if ($extras -contains 'alignment') { $script:Alignment = 'whisperx' }
+
+    $summary = [ordered]@{
+        'Профиль'          = $script:Profile
+        'Движки'           = $script:Engines
+        'Модели'           = if ($script:Models) { $script:Models } else { 'не загружать' }
+        'Каталог программы' = $script:Prefix
+        'Каталог данных'   = $script:DataDir
+        'Адрес'            = "http://$($script:BindHost):$($script:Port)"
+        'Автозапуск'       = if ($script:NoService) { 'нет' } else { 'да' }
+        'Выравнивание'     = if ($script:Alignment) { $script:Alignment } else { 'нет' }
+        'Займёт на диске'  = "около $($profileDisk[$script:Profile]) ГБ"
+    }
+    Show-WizardSummary -Rows $summary
+
+    if (-not (Confirm-Action 'Начинать установку?')) { Write-Info 'Отменено.'; exit 0 }
+}
+
+if (-not $NoInteractive -and ($Interactive -or (Test-Interactive))) {
+    Invoke-InstallWizard
+    # После мастера значения могли измениться — пересобираем производные.
+    $venv = Join-Path $Prefix 'venv'
+    $venvPython = Join-Path $venv 'Scripts\python.exe'
+    $venvPip = Join-Path $venv 'Scripts\pip.exe'
+}
+
 
 Write-Info "Профиль установки: $Profile"
 Write-Info "Движки: $Engines"

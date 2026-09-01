@@ -89,10 +89,9 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
   info "Снимок от $(date -r "${SNAPSHOT_DIR}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
   confirm "Восстановить предыдущую версию?" || exit 0
   bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" 2>/dev/null || true
-  run rsync -a --delete "${SNAPSHOT_DIR}/" "${PREFIX}/" 2>/dev/null || {
-    run rm -rf "${PREFIX}/server" "${PREFIX}/scripts"
-    run cp -a "${SNAPSHOT_DIR}/." "${PREFIX}/"
-  }
+  # Только поверх: в снимке лежит код, а --delete снёс бы venv, а на macOS
+  # ещё и каталог данных внутри prefix.
+  run cp -a "${SNAPSHOT_DIR}/." "${PREFIX}/"
   bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" 2>/dev/null || true
   ok "Откат выполнен: версия $(cat "${PREFIX}/VERSION" 2>/dev/null || echo '?')"
   exit 0
@@ -157,7 +156,9 @@ if [[ -f "${DATA_DIR}/asrhub.db" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
   fi
   ok "Копия базы: $(basename "${DB_BACKUP}") ($(human_size "$(stat -c%s "${DB_BACKUP}" 2>/dev/null || stat -f%z "${DB_BACKUP}" 2>/dev/null || echo 0)"))"
   # Держим не больше пяти копий
-  ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f
+  ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | tail -n +6 | while read -r old_backup; do
+    rm -f "${old_backup}"
+  done
 fi
 
 # --- Остановка --------------------------------------------------------------
@@ -219,9 +220,13 @@ if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-[[ "${WAS_RUNNING}" -eq 1 || true ]] && bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" || true
+if [[ "${WAS_RUNNING}" -eq 1 ]]; then
+  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" || true
+else
+  info "До обновления служба не работала — не запускаем."
+fi
 
-PORT="$(grep -E '^\s*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
+PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
 PORT="${PORT:-8080}"
 HEALTH_OK=0
 for _ in $(seq 1 20); do

@@ -119,7 +119,7 @@ bash "${SCRIPT_DIR}/service.sh" uninstall --prefix "${PREFIX}" 2>/dev/null || \
 
 # Останавливаем возможные процессы, запущенные вручную
 if have pgrep; then
-  PIDS="$(pgrep -f "asrhub" 2>/dev/null | grep -v "^$$\$" || true)"
+  PIDS="$(pgrep -f "python.*-m asrhub|uvicorn.*asrhub" 2>/dev/null | grep -v "^$$\$" || true)"
   if [[ -n "${PIDS}" ]]; then
     info "Останавливаем процессы: ${PIDS}"
     for pid in ${PIDS}; do run kill "${pid}" 2>/dev/null || true; done
@@ -149,11 +149,24 @@ fi
 
 step "Удаление файлов"
 
+# На macOS и при установке от пользователя каталог данных лежит ВНУТРИ
+# prefix. Снести prefix целиком означало бы удалить модели, базу и
+# результаты, о сохранности которых мы тут же отчитываемся ниже.
 if [[ -n "${PREFIX}" && -d "${PREFIX}" ]]; then
-  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+  if [[ "${PURGE}" -eq 0 && "${DATA_DIR}" == "${PREFIX}"/* ]]; then
+    info "Каталог данных находится внутри каталога программы — удаляем выборочно."
+    for sub in server scripts config requirements docker venv VERSION README.md; do
+      if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+        printf '  [пробный запуск] rm -rf %s\n' "${PREFIX}/${sub}"
+      else
+        rm -rf "${PREFIX:?}/${sub}"
+      fi
+    done
+    [[ "${ASRHUB_DRY_RUN}" == "1" ]] || ok "Программа удалена, данные оставлены: ${DATA_DIR}"
+  elif [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
     printf '  [пробный запуск] rm -rf %s\n' "${PREFIX}"
   else
-    rm -rf "${PREFIX}"
+    rm -rf "${PREFIX:?}"
     ok "Удалено: ${PREFIX}"
   fi
 fi
@@ -169,7 +182,7 @@ if [[ "${PURGE}" -eq 1 && -n "${DATA_DIR}" && -d "${DATA_DIR}" ]]; then
   if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
     printf '  [пробный запуск] rm -rf %s\n' "${DATA_DIR}"
   else
-    rm -rf "${DATA_DIR}"
+    rm -rf "${DATA_DIR:?}"
     ok "Удалено: ${DATA_DIR}"
   fi
 else

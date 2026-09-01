@@ -32,19 +32,30 @@ command -v pandoc >/dev/null || { echo "Нужен pandoc: apt install pandoc"; 
 mkdir -p "${BUILD}"
 cd "${ROOT}"
 
-echo "1/7 Справочные разделы из каталога"
+echo "1/8 Справочные разделы из каталога"
 python3 docs/generate.py
 
-echo "2/7 Схемы"
+echo "2/8 Справочник API мониторинга"
+# Собирается с работающего сервера: примеры ответов настоящие. Если сервер
+# не поднят, оставляем прошлую версию файла — сборка не должна падать из-за этого.
+ASRHUB_API_BASE="${ASRHUB_API_BASE:-http://127.0.0.1:8080}"
+if python3 docs/generate_api.py "${ASRHUB_API_BASE}" 2>/dev/null; then
+  :
+else
+  echo "  сервер на ${ASRHUB_API_BASE} недоступен — оставлена прошлая версия"
+  echo "  (запустите сервер и повторите, чтобы примеры обновились)"
+fi
+
+echo "3/8 Схемы"
 python3 docs/make_diagrams.py
 
-echo "3/7 Сборка единого Markdown"
+echo "4/8 Сборка единого Markdown"
 python3 docs/assemble.py
 
-echo "4/7 Шаблон оформления Word"
+echo "5/8 Шаблон оформления Word"
 python3 docs/make_reference.py "${BUILD}/reference.docx"
 
-echo "5/7 Word"
+echo "6/8 Word"
 pandoc "${BUILD}/asr-hub-полная-документация.md" \
   --from=markdown+pipe_tables+backtick_code_blocks+auto_identifiers \
   --metadata-file="${BUILD}/metadata.yaml" \
@@ -53,17 +64,17 @@ pandoc "${BUILD}/asr-hub-полная-документация.md" \
   --resource-path=".:docs" \
   -o "${OUT}"
 
-echo "6/7 Приведение к схеме OOXML и оформление таблиц"
+echo "7/8 Приведение к схеме OOXML и оформление таблиц"
 python3 docs/fix_docx.py "${OUT}"
 
 if [[ "${MAKE_PDF}" -eq 1 ]]; then
-  echo "7/7 Оглавление и PDF"
+  echo "8/8 Оглавление и PDF"
   python3 docs/update_toc.py "${OUT}" || {
     echo "  Оглавление не обновлено (нет LibreOffice или модуля uno)."
     echo "  Word заполнит его сам при первом открытии файла."
   }
 else
-  echo "7/7 пропущено (--no-pdf)"
+  echo "8/8 пропущено (--no-pdf)"
 fi
 
 echo

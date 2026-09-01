@@ -28,6 +28,8 @@ class AppState:
     analytics: Analytics
     started_at: float = field(default_factory=time.time)
     subscribers: set[Any] = field(default_factory=set)
+    monitoring: Any = None
+    version: str = "3.0.0"
     _rate: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
 
     def check_rate(self, key: str, limit: int) -> None:
@@ -97,6 +99,22 @@ def require_write(principal: Principal) -> Principal:
     if not principal.can_write:
         raise ForbiddenError("Ключ доступа работает только на чтение.")
     return principal
+
+
+def require_owner(principal: Principal, job: dict[str, Any]) -> None:
+    """Проверяет, что ключ вправе распоряжаться этим заданием.
+
+    Поле owner заполнялось, но нигде не сверялось: ключ с ролью «user» мог
+    удалить или переставить чужое задание. Администратор по-прежнему видит
+    и меняет всё.
+    """
+    if principal.is_admin:
+        return
+    owner = str(job.get("owner") or "")
+    if owner and owner != principal.name:
+        raise ForbiddenError(
+            f"Задание принадлежит другому ключу («{owner}»).",
+            hint="Распоряжаться чужими заданиями может только ключ с ролью admin.")
 
 
 def require_admin(principal: Principal) -> Principal:

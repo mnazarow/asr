@@ -277,6 +277,44 @@ class NoSpeechDetected(ASRHubError):
 # Ошибки очереди и выполнения
 # --------------------------------------------------------------------------
 
+class PresetNotFound(ASRHubError):
+    """Пресета с таким идентификатором нет."""
+
+    code = "preset_not_found"
+    http_status = 404
+    hint = "Список пресетов: GET /api/presets"
+
+    def __init__(self, preset_id: str, available: list[str] | None = None):
+        super().__init__(f"Пресет «{preset_id}» не найден.")
+        if available:
+            self.hint = "Доступные пресеты: " + ", ".join(available)
+
+
+class KeyNotFound(ASRHubError):
+    """Ключ доступа с таким началом не найден."""
+
+    code = "key_not_found"
+    http_status = 404
+    hint = "Список ключей: GET /api/keys"
+
+    def __init__(self, preview: str):
+        super().__init__(f"Ключ, начинающийся на «{preview}», не найден.")
+
+
+class MetricNotFound(ASRHubError):
+    """Метрика с таким именем отсутствует в каталоге мониторинга."""
+
+    code = "metric_not_found"
+    http_status = 404
+    hint = "Список метрик: GET /api/monitoring/catalog"
+
+    def __init__(self, name: str, suggestions: list[str] | None = None):
+        super().__init__(f"Метрика «{name}» не найдена.")
+        if suggestions:
+            self.hint = "Похожие метрики: " + ", ".join(suggestions[:5])
+        self.details = {"metric": name, "suggestions": suggestions or []}
+
+
 class JobNotFound(ASRHubError):
     """Задание не найдено."""
 

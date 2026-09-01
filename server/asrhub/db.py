@@ -212,6 +212,152 @@ def new_id(prefix: str = "job") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+
+#: Ожидаемый набор колонок — сверяется при миграции. Собран из _SCHEMA,
+#: поэтому не может разойтись с ней при добавлении новых полей.
+_EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
+    "jobs": {
+        "id": "TEXT",
+        "group_id": "TEXT",
+        "created_at": "REAL",
+        "updated_at": "REAL",
+        "queued_at": "REAL",
+        "started_at": "REAL",
+        "finished_at": "REAL",
+        "deadline": "REAL",
+        "status": "TEXT NOT NULL DEFAULT 'queued'",
+        "stage": "TEXT DEFAULT ''",
+        "progress": "REAL DEFAULT 0",
+        "priority": "INTEGER DEFAULT 50",
+        "filename": "TEXT",
+        "file_path": "TEXT",
+        "file_size": "INTEGER DEFAULT 0",
+        "file_hash": "TEXT",
+        "media_duration_s": "REAL DEFAULT 0",
+        "engine": "TEXT",
+        "model": "TEXT",
+        "language": "TEXT",
+        "params": "TEXT DEFAULT '{}'",
+        "result_path": "TEXT",
+        "text": "TEXT",
+        "segments_count": "INTEGER DEFAULT 0",
+        "words_count": "INTEGER DEFAULT 0",
+        "chars_count": "INTEGER DEFAULT 0",
+        "speakers_count": "INTEGER DEFAULT 0",
+        "avg_confidence": "REAL",
+        "rtf": "REAL",
+        "queue_time_s": "REAL",
+        "processing_time_s": "REAL",
+        "audio_prep_s": "REAL",
+        "model_load_s": "REAL",
+        "inference_s": "REAL",
+        "postprocess_s": "REAL",
+        "peak_memory_mb": "REAL",
+        "device": "TEXT",
+        "retries": "INTEGER DEFAULT 0",
+        "error_code": "TEXT",
+        "error_message": "TEXT",
+        "error_hint": "TEXT",
+        "cancelled_by": "TEXT",
+        "owner": "TEXT DEFAULT 'anonymous'",
+        "api_key_name": "TEXT",
+        "source": "TEXT DEFAULT 'api'",
+        "tags": "TEXT DEFAULT ''",
+        "reference_text": "TEXT",
+        "wer": "REAL",
+        "cer": "REAL",
+        "cached_from": "TEXT",
+        "webhook_url": "TEXT",
+        "webhook_status": "TEXT",
+    },
+    "segments": {
+        "job_id": "TEXT",
+        "idx": "INTEGER",
+        "start_s": "REAL",
+        "end_s": "REAL",
+        "text": "TEXT",
+        "speaker": "TEXT",
+        "confidence": "REAL",
+        "no_speech": "REAL",
+        "compression": "REAL",
+        "temperature": "REAL",
+        "language": "TEXT",
+        "words": "TEXT",
+    },
+    "events": {
+        "id": "INTEGER  AUTOINCREMENT",
+        "job_id": "TEXT",
+        "ts": "REAL",
+        "kind": "TEXT",
+        "message": "TEXT",
+        "data": "TEXT",
+    },
+    "metrics": {
+        "id": "INTEGER  AUTOINCREMENT",
+        "ts": "REAL",
+        "name": "TEXT",
+        "value": "REAL",
+        "job_id": "TEXT",
+        "model": "TEXT",
+        "engine": "TEXT",
+        "labels": "TEXT",
+    },
+    "api_keys": {
+        "key": "TEXT",
+        "name": "TEXT",
+        "role": "TEXT DEFAULT 'user'",
+        "created_at": "REAL",
+        "last_used": "REAL",
+        "requests": "INTEGER DEFAULT 0",
+        "rate_limit": "INTEGER DEFAULT 0",
+        "enabled": "INTEGER DEFAULT 1",
+    },
+    "kv": {
+        "key": "TEXT",
+        "value": "TEXT",
+        "ts": "REAL",
+    },
+    "model_stats": {
+        "model": "TEXT",
+        "engine": "TEXT",
+        "jobs_total": "INTEGER DEFAULT 0",
+        "jobs_ok": "INTEGER DEFAULT 0",
+        "jobs_failed": "INTEGER DEFAULT 0",
+        "audio_seconds": "REAL DEFAULT 0",
+        "processing_s": "REAL DEFAULT 0",
+        "words_total": "INTEGER DEFAULT 0",
+        "rtf_sum": "REAL DEFAULT 0",
+        "rtf_count": "INTEGER DEFAULT 0",
+        "confidence_sum": "REAL DEFAULT 0",
+        "confidence_count": "INTEGER DEFAULT 0",
+        "wer_sum": "REAL DEFAULT 0",
+        "wer_count": "INTEGER DEFAULT 0",
+        "last_used": "REAL",
+    },
+    "system_samples": {
+        "ts": "REAL",
+        "cpu_percent": "REAL",
+        "ram_used_mb": "REAL",
+        "ram_total_mb": "REAL",
+        "gpu_percent": "REAL",
+        "gpu_mem_mb": "REAL",
+        "gpu_mem_total": "REAL",
+        "disk_free_gb": "REAL",
+        "queue_depth": "INTEGER",
+        "active_jobs": "INTEGER",
+    },
+    "benchmarks": {
+        "id": "TEXT",
+        "created_at": "REAL",
+        "name": "TEXT",
+        "dataset": "TEXT",
+        "models": "TEXT",
+        "status": "TEXT DEFAULT 'running'",
+        "results": "TEXT",
+        "notes": "TEXT",
+    },
+}
+
 class Database:
     """Тонкая обёртка над SQLite с пулом соединений по потокам."""
 
@@ -303,6 +449,9 @@ class Database:
         with self._write_lock:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # Колонки добавляются ПЕРЕД схемой: индексы из _SCHEMA могут
+                # ссылаться на поля, которых в старой таблице ещё нет.
+                self._add_missing_columns(conn)
                 for statement in _SCHEMA:
                     conn.execute(statement)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -310,6 +459,26 @@ class Database:
             except sqlite3.Error as exc:
                 conn.execute("ROLLBACK")
                 raise StorageError(f"Не удалось применить миграции: {exc}") from exc
+
+    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
+        """Добавляет колонки, которых нет в уже созданных таблицах.
+
+        CREATE TABLE IF NOT EXISTS не трогает существующую таблицу, поэтому
+        база, созданная прошлой версией, новых колонок не получала — и после
+        обновления каждый запрос падал с «no such column». Здесь сравниваем
+        фактический набор колонок с ожидаемым и дописываем недостающие.
+        """
+        for table, columns in _EXPECTED_COLUMNS.items():
+            try:
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if not existing:
+                continue                    # таблицы ещё нет — её создаст _SCHEMA
+            for name, declaration in columns.items():
+                if name not in existing:
+                    log.info("Миграция: в таблицу «%s» добавлена колонка «%s»", table, name)
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     # --- задания --------------------------------------------------------
 
@@ -346,11 +515,23 @@ class Database:
         row = self.query_one("SELECT * FROM jobs WHERE id=?", (job_id,))
         return _row_to_job(row) if row else None
 
+    #: Колонки, которых достаточно аналитике. Без них выборка тащит ещё и
+    #: колонку text — то есть все расшифровки целиком.
+    LIGHT_COLUMNS = (
+        "id, status, model, engine, language, owner, source, priority, "
+        "created_at, queued_at, started_at, finished_at, media_duration_s, "
+        "processing_time_s, queue_time_s, audio_prep_s, model_load_s, "
+        "inference_s, postprocess_s, rtf, words_count, chars_count, "
+        "segments_count, speakers_count, avg_confidence, wer, cer, "
+        "error_code, retries, cached_from, device, file_size"
+    )
+
     def list_jobs(self, *, status: str | list[str] | None = None, owner: str | None = None,
                   model: str | None = None, search: str | None = None,
                   group_id: str | None = None, since: float | None = None,
                   limit: int = 100, offset: int = 0,
-                  order: str = "created_at DESC") -> list[dict[str, Any]]:
+                  order: str = "created_at DESC",
+                  light: bool = False) -> list[dict[str, Any]]:
         where: list[str] = []
         args: list[Any] = []
         if status:
@@ -381,10 +562,11 @@ class Database:
         if order not in allowed_order:
             order = "created_at DESC"
         clause = ("WHERE " + " AND ".join(where)) if where else ""
+        columns = self.LIGHT_COLUMNS if light else "*"
         rows = self.query(
-            f"SELECT * FROM jobs {clause} ORDER BY {order} LIMIT ? OFFSET ?",
+            f"SELECT {columns} FROM jobs {clause} ORDER BY {order} LIMIT ? OFFSET ?",
             [*args, limit, offset])
-        return [_row_to_job(r) for r in rows]
+        return [_row_to_job(r) for r in rows] if not light else [dict(r) for r in rows]
 
     def count_jobs(self, *, status: str | list[str] | None = None,
                    owner: str | None = None, since: float | None = None) -> int:
@@ -584,9 +766,12 @@ class Database:
             pass
 
     def system_samples(self, since: float, limit: int = 1000) -> list[dict[str, Any]]:
+        # Сортировка по убыванию с последующим разворотом: при limit=1 иначе
+        # возвращался самый старый замер окна, а не самый свежий.
         rows = self.query(
-            "SELECT * FROM system_samples WHERE ts>=? ORDER BY ts LIMIT ?", (since, limit))
-        return [dict(r) for r in rows]
+            "SELECT * FROM system_samples WHERE ts>=? ORDER BY ts DESC LIMIT ?",
+            (since, limit))
+        return [dict(r) for r in reversed(rows)]
 
     # --- ключи и настройки ----------------------------------------------
 
@@ -607,13 +792,17 @@ class Database:
 
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
                 events_days: int = 90) -> dict[str, int]:
-        removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0}
+        removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0, "bytes": 0}
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
             stale = self.query(
-                "SELECT id FROM jobs WHERE finished_at IS NOT NULL AND finished_at<?", (cutoff,))
+                "SELECT id, result_path, file_path FROM jobs "
+                "WHERE finished_at IS NOT NULL AND finished_at<?", (cutoff,))
             for row in stale:
+                # Сначала файлы, потом запись: если удаление файлов упадёт,
+                # задание останется в базе и попадёт в следующую уборку.
+                removed["bytes"] = removed.get("bytes", 0) + _remove_job_files(dict(row))
                 self.delete_job(row["id"])
             removed["jobs"] = len(stale)
         if metrics_days > 0:
@@ -653,6 +842,32 @@ class Database:
                 pass
             self._local.conn = None
         self._closed = True
+
+
+def _remove_job_files(job: dict[str, Any]) -> int:
+    """Удаляет каталог результатов и исходник задания. Возвращает объём."""
+    import shutil
+
+    freed = 0
+    result_path = job.get("result_path")
+    if result_path:
+        directory = Path(result_path)
+        if directory.is_dir():
+            try:
+                freed += sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
+                shutil.rmtree(directory, ignore_errors=True)
+            except OSError as exc:
+                log.warning("Не удалось удалить результаты %s: %s", directory, exc)
+    source = job.get("file_path")
+    if source:
+        path = Path(source)
+        try:
+            if path.is_file():
+                freed += path.stat().st_size
+                path.unlink()
+        except OSError as exc:
+            log.warning("Не удалось удалить исходник %s: %s", path, exc)
+    return freed
 
 
 def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:

@@ -1,0 +1,13 @@
+# Принудительное выравнивание через Montreal Forced Aligner.
+#
+# Сам MFA ставится не из pip, а через conda — он тянет Kaldi и OpenFst,
+# которых в PyPI нет. Скрипт scripts/models.sh install-engine mfa делает
+# это сам; здесь только разбор результата.
+#
+# Установка вручную:
+#   conda create -n mfa -c conda-forge montreal-forced-aligner
+#   conda activate mfa
+#   mfa model download acoustic russian_mfa
+#   mfa model download dictionary russian_mfa
+
+textgrid>=1.6.1
