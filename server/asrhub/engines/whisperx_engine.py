@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import DependencyMissing, GatedModelError, classify_exception
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
@@ -89,7 +90,7 @@ class WhisperXEngine(Engine):
                 diarize = whisperx.diarize.DiarizationPipeline(
                     use_auth_token=token, device=device)
                 kwargs: dict[str, Any] = {}
-                num = int(settings.get("diarization_num_speakers") or 0)
+                num = S.integer(settings, "diarization_num_speakers", 0)
                 if num:
                     kwargs["num_speakers"] = num
                 else:

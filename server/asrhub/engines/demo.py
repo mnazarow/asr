@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..pipeline import vad
 from ..pipeline.audio import probe
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
@@ -69,7 +70,7 @@ class DemoEngine(Engine):
         rtf = float(settings.get("simulated_rtf") or self.spec.default_params.get(
             "simulated_rtf", 0.15))
         segments: list[Segment] = []
-        speaker_count = max(1, min(3, int(settings.get("diarization_num_speakers") or 2)))
+        speaker_count = max(1, min(3, S.integer(settings, "diarization_num_speakers", 2)))
 
         for idx, span in enumerate(speech):
             self.report(progress, (idx + 1) / max(1, len(speech)), "распознавание")

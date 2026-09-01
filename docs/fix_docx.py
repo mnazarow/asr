@@ -315,6 +315,19 @@ def style_tables(root: etree._Element) -> int:
                 sub(tr_pr, flag)
                 changed += 1
 
+        # Остальные строки тоже не рвём. Иначе перенос страницы попадал
+        # внутрь строки, и наверху следующей оставался огрызок: пустые
+        # «Метод» и «Адрес» и одинокое слово из описания. Строку выше
+        # страницы Word разорвёт всё равно — запрет к таким не применяется.
+        for row in rows[1:]:
+            row_pr = row.find(W + "trPr")
+            if row_pr is None:
+                row_pr = etree.Element(W + "trPr")
+                row.insert(0, row_pr)
+            if row_pr.find(W + "cantSplit") is None:
+                sub(row_pr, "cantSplit")
+                changed += 1
+
         for cell in rows[0].findall(W + "tc"):
             tc_pr = cell.find(W + "tcPr")
             if tc_pr is None:

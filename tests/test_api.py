@@ -9,6 +9,7 @@ import pytest
 from asrhub.api import create_app
 from asrhub.config import load
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 @pytest.fixture()
@@ -199,3 +200,182 @@ def test_web_interface_served(client):
     assert "ASR Hub" in response.text
     for asset in ("/static/app.js", "/static/charts.js", "/static/styles.css"):
         assert client.get(asset).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Одноразовые билеты вместо ключа в адресе
+# ---------------------------------------------------------------------------
+
+def _ws_rejected(test_client, path: str) -> bool:
+    """Правда, если сервер закрыл соединение вместо приветствия."""
+    try:
+        with test_client.websocket_connect(path) as ws:
+            ws.receive_text()
+    except WebSocketDisconnect:
+        return True
+    except Exception:                                       # noqa: BLE001
+        # Отказ на этапе рукопожатия приходит как WebSocketDisconnect,
+        # но версия starlette может обернуть его иначе.
+        return True
+    return False
+
+
+def _auth_client(monkeypatch):
+    """Клиент с включённой аутентификацией и одним известным ключом."""
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    settings = load()
+    settings.api_keys["ah_ticket_key"] = {"name": "тест", "role": "admin", "enabled": True}
+    return create_app(settings, start_queue=False)
+
+
+def test_ticket_requires_key(data_dir, monkeypatch):
+    with TestClient(_auth_client(monkeypatch)) as c:
+        assert c.post("/api/auth/ticket").status_code == 401
+
+
+def test_ticket_is_single_use(data_dir, monkeypatch):
+    """Билет открывает WebSocket ровно один раз и живёт минуту."""
+    with TestClient(_auth_client(monkeypatch)) as c:
+        issued = c.post("/api/auth/ticket", headers={"X-API-Key": "ah_ticket_key"}).json()
+        assert issued["ticket"] and issued["expires_in"] > 0
+
+        with c.websocket_connect(f"/ws?ticket={issued['ticket']}") as ws:
+            assert json.loads(ws.receive_text())["type"] == "hello"
+
+        # Тот же билет второй раз не проходит.
+        assert _ws_rejected(c, f"/ws?ticket={issued['ticket']}")
+
+
+def test_ticket_forged_is_rejected(data_dir, monkeypatch):
+    with TestClient(_auth_client(monkeypatch)) as c:
+        assert _ws_rejected(c, "/ws?ticket=подделка")
+        assert _ws_rejected(c, "/ws")
+
+
+def test_websocket_still_accepts_api_key(data_dir, monkeypatch):
+    """Сторонние клиенты продолжают подключаться по ключу."""
+    with TestClient(_auth_client(monkeypatch)) as c, \
+            c.websocket_connect("/ws?api_key=ah_ticket_key") as ws:
+        assert json.loads(ws.receive_text())["type"] == "hello"
+
+
+def test_ticket_store_expires(monkeypatch):
+    """Просроченный билет не принимается."""
+    from asrhub.api.deps import TicketStore
+
+    store = TicketStore(ttl_s=0.01)
+    ticket, _ = store.issue("ключ")
+    time.sleep(0.05)
+    assert store.redeem(ticket) == ""
+
+
+def test_metrics_endpoint_matches_monitoring(client):
+    """Оба адреса Prometheus отдают одни и те же имена метрик.
+
+    Раньше /api/metrics обслуживался отдельным ручным экспортом на полтора
+    десятка метрик со старыми именами, и правила тревог, собранные по
+    каталогу, на нём не срабатывали.
+    """
+    def names(text: str) -> set[str]:
+        return {line.split("{")[0].split(" ")[0]
+                for line in text.splitlines() if line and not line.startswith("#")}
+
+    legacy = names(client.get("/api/metrics").text)
+    modern = names(client.get("/api/monitoring/metrics").text)
+    assert legacy == modern, "адреса Prometheus разошлись по именам метрик"
+    assert len(legacy) > 40, "экспорт снова сузился до старого ручного набора"
+
+
+# ---------------------------------------------------------------------------
+# Документация не должна расходиться с кодом
+# ---------------------------------------------------------------------------
+
+def _emitted_event_names() -> set[str]:
+    """Имена событий, которые сервер действительно шлёт в WebSocket."""
+    import re
+
+    root = Path(__file__).resolve().parent.parent / "server" / "asrhub"
+    names: set[str] = set()
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        names |= set(re.findall(r'_emit\(\s*"([a-z]+\.[a-z]+)"', text))
+    return names
+
+
+def test_documented_events_exist_in_code():
+    """Каждое событие из главы про API сервер обязан уметь отправлять.
+
+    В главе значились job.created, queue.changed, system.sample и
+    server.ready — ни одного из них сервер не шлёт. Клиент, написанный по
+    такой документации, ждал бы события, которых нет.
+    """
+    import re
+
+    chapter = (Path(__file__).resolve().parent.parent / "docs" / "08-api.md")
+    text = chapter.read_text(encoding="utf-8")
+    # Берём имена из таблицы событий: «| `job.progress` | …»
+    documented = set(re.findall(r"^\| `([a-z]+\.[a-z]+)` \|", text, flags=re.M))
+    assert documented, "таблица событий в главе не найдена"
+
+    emitted = _emitted_event_names()
+    unknown = documented - emitted
+    assert not unknown, f"документация обещает несуществующие события: {sorted(unknown)}"
+
+
+def test_all_emitted_events_are_documented():
+    """И наоборот: новое событие не должно остаться незадокументированным."""
+    import re
+
+    chapter = (Path(__file__).resolve().parent.parent / "docs" / "08-api.md")
+    text = chapter.read_text(encoding="utf-8")
+    documented = set(re.findall(r"^\| `([a-z]+\.[a-z]+)` \|", text, flags=re.M))
+    missing = _emitted_event_names() - documented
+    assert not missing, f"события есть в коде, но не описаны: {sorted(missing)}"
+
+
+def test_light_listing_drops_heavy_fields(client, sample_wav: Path):
+    """light=true не должен тащить текст и сегменты.
+
+    Параметр был реализован в базе, но наружу не выведен — а документация
+    его обещала.
+    """
+    with sample_wav.open("rb") as fh:
+        client.post("/api/jobs", files={"file": ("проба.wav", fh, "audio/wav")})
+    for _ in range(60):
+        items = client.get("/api/jobs?limit=1").json()["items"]
+        if items and items[0]["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.5)
+
+    full = client.get("/api/jobs?limit=1").json()["items"]
+    light = client.get("/api/jobs?limit=1&light=true").json()["items"]
+    assert full and light
+    assert "text" in full[0], "полный список обязан содержать расшифровку"
+    assert "text" not in light[0], "облегчённый список не должен нести текст"
+    assert light[0]["id"] == full[0]["id"]
+
+
+def test_form_fields_override_settings(client, sample_wav: Path):
+    """Параметр, переданный полем формы, должен применяться.
+
+    Раньше принималось только поле settings с JSON внутри, а `-F model=…`
+    молча пропадало: задание уходило на модель по умолчанию.
+    """
+    with sample_wav.open("rb") as fh:
+        response = client.post("/api/jobs",
+                               files={"file": ("проба.wav", fh, "audio/wav")},
+                               data={"language": "en"})
+    assert response.status_code == 200, response.text
+    assert response.json()["params"]["language"] == "en"
+
+
+def test_unknown_form_field_is_reported(client, sample_wav: Path):
+    """Опечатка в имени параметра не должна проходить молча."""
+    with sample_wav.open("rb") as fh:
+        response = client.post("/api/jobs",
+                               files={"file": ("проба.wav", fh, "audio/wav")},
+                               data={"languagee": "en"})
+    assert response.status_code == 400, response.text
+    assert "languagee" in response.json()["detail"]["message"]

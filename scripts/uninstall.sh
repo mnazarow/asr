@@ -139,7 +139,13 @@ if [[ "${MODE}" == "docker" || ( "${MODE}" == "auto" && -f "${PREFIX}/docker/doc
     ( cd "${PREFIX}/docker" 2>/dev/null && run ${COMPOSE} down --remove-orphans ) || \
       info "Контейнеры не найдены."
     if confirm "Удалить образ asrhub?" "n"; then
-      run docker image rm asrhub:latest 2>/dev/null || true
+      # Тегов может быть несколько: latest — процессорная сборка, cuda — под
+      # видеокарту. Раньше удалялся только latest, и образ на 8 ГБ оставался
+      # лежать после «полного» удаления.
+      for tag in $(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+                   | grep '^asrhub:' || true); do
+        run docker image rm "${tag}" 2>/dev/null || true
+      done
     fi
     ok "Контейнеры удалены"
   fi

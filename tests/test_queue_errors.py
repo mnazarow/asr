@@ -176,3 +176,71 @@ def test_registry_evicts_by_cache_size():
     first = registry.get({"model": "demo-simulator", "engine": "demo"})
     assert first is not None
     assert len(registry.loaded()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Регрессии ревизии: слот, кеш, планировщик
+# ---------------------------------------------------------------------------
+
+def test_failed_pick_releases_the_slot(data_dir, monkeypatch):
+    """Сорвавшийся выбор задания обязан вернуть занятый слот.
+
+    Слот резервировался до двух обращений к базе, а освобождение жило в
+    цикле воркера — и срабатывало только для заданий, которые тот успел
+    получить. Одна ошибка «база заблокирована» навсегда съедала слот; при
+    достижении предела очередь переставала брать работу до перезапуска.
+    """
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
+    from asrhub.config import load
+    from asrhub.db import Database
+    from asrhub.engines import EngineRegistry
+    from asrhub.errors import StorageError
+    from asrhub.job_queue import JobQueue
+
+    settings = load()
+    db = Database(settings.paths.db)
+    queue = JobQueue(db, settings, EngineRegistry())
+
+    def add(name: str, ts: float) -> str:
+        return db.create_job({"status": "queued", "filename": name,
+                              "model": "demo-simulator", "priority": 50,
+                              "created_at": ts, "queued_at": ts,
+                              "file_path": "/tmp/a.wav"})
+
+    add("a.wav", 1.0)
+    original = db.update_job
+    db.update_job = lambda *a, **kw: (_ for _ in ()).throw(StorageError("база заблокирована"))
+    with pytest.raises(StorageError):
+        queue._next_job(0)
+    db.update_job = original
+    assert queue._running == {}, "слот не освобождён после ошибки записи"
+
+    # Второй путь: задание исчезло между выборкой и чтением.
+    add("b.wav", 2.0)
+    original_get = db.get_job
+    db.get_job = lambda _: None
+    assert queue._next_job(0) is None
+    db.get_job = original_get
+    assert queue._running == {}, "слот не освобождён, когда задание исчезло"
+
+    # Очередь по-прежнему берёт работу.
+    add("c.wav", 3.0)
+    assert queue._next_job(0) is not None, "очередь встала после сорвавшихся попыток"
+
+
+def test_light_listing_carries_what_consumers_need():
+    """Облегчённый список обязан нести поля, которыми пользуются потребители.
+
+    Без deadline не работала политика планирования по сроку, без
+    error_message и filename разбор ошибок в аналитике показывал пустые
+    столбцы у всех строк — и то и другое молча.
+    """
+    from asrhub.db import Database
+
+    columns = {c.strip() for c in Database.LIGHT_COLUMNS.split(",")}
+    for needed in ("deadline", "error_code", "error_message", "error_hint",
+                   "filename", "rtf", "media_duration_s"):
+        assert needed in columns, f"{needed} пропал из облегчённого набора"
+    for heavy in ("text", "file_path", "params"):
+        assert heavy not in columns, f"{heavy} не должен ехать в облегчённом списке"

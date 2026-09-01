@@ -66,9 +66,18 @@ def prometheus(samples: list[Sample], *, openmetrics: bool = False) -> str:
                 help_text = " ".join(spec.description.split())
                 if spec.unit:
                     help_text += f" [{spec.unit}]"
-                lines.append(f"# HELP {base} {help_text}")
                 kind = "gauge" if spec.type == "info" else spec.type
-                lines.append(f"# TYPE {base} {kind}")
+                # В OpenMetrics имя семейства счётчика идёт БЕЗ суффикса
+                # _total — его несут только измерения. Пока имя объявлялось
+                # целиком, эталонный разборщик отвергал весь снимок целиком
+                # («Clashing name»), а не одну метрику: пропадали все
+                # семейства разом, включая asrhub_up, и авария выглядела как
+                # падение сервиса.
+                family = base
+                if openmetrics and kind == "counter" and family.endswith("_total"):
+                    family = family[: -len("_total")]
+                lines.append(f"# HELP {family} {help_text}")
+                lines.append(f"# TYPE {family} {kind}")
         for sample in items:
             lines.append(f"{sample.name}{_labels(sample.labels)} {_format(sample.value)}")
 
@@ -134,9 +143,22 @@ def graphite(samples: list[Sample], *, prefix: str = "asrhub") -> str:
 
 
 def zabbix_sender(samples: list[Sample], host: str) -> str:
-    """JSON для zabbix_sender: список пар «ключ — значение» с именем узла."""
+    """JSON для zabbix_sender: список пар «ключ — значение» с именем узла.
+
+    Отправляется ровно то, что шаблон умеет принять. Гистограммы и
+    устаревшие псевдонимы имён пропускаются: в Zabbix нет понятия корзины,
+    и раньше сотни точек вида `asrhub_job_duration_seconds_bucket[600]`
+    отбивались как «unsupported item key», забивая журнал сервера Zabbix.
+    """
     data = []
     for sample in samples:
+        base = _base_name(sample.name)
+        spec = METRICS_BY_NAME.get(base)
+        if spec is not None and (spec.type in ("histogram", "info")
+                                 or spec.deprecated_for):
+            continue
+        if sample.name != base:                 # _bucket, _sum, _count
+            continue
         key = sample.name
         if sample.labels:
             args = ",".join(str(v) for _, v in sorted(sample.labels.items()))
@@ -226,7 +248,7 @@ def prometheus_rules() -> str:
 
     for spec in METRICS:
         threshold = spec.threshold
-        if not threshold or spec.name == "asrhub_up":
+        if not threshold or spec.name == "asrhub_up" or spec.deprecated_for:
             continue
         seen_values: set[float] = set()
         for level, value in (("critical", threshold.critical), ("warning", threshold.warning)):
@@ -279,8 +301,8 @@ def _summary(spec: MetricSpec, direction: str, value: float) -> str:
         "asrhub_queue_paused": "Очередь остаётся на паузе",
         "asrhub_jobs_total": f"Доля неудачных заданий выше {value:.0%}",
         "asrhub_http_requests_total": f"Доля ответов 5xx выше {value:.0%}",
-        "asrhub_ram_used_mb": f"Оперативная память занята более чем на {value:.0f} %",
-        "asrhub_gpu_memory_mb": f"Видеопамять занята более чем на {value:.0f} %",
+        "asrhub_ram_used_bytes": f"Оперативная память занята более чем на {value:.0f} %",
+        "asrhub_gpu_memory_used_bytes": f"Видеопамять занята более чем на {value:.0f} %",
     }
     if spec.name in special:
         return special[spec.name]
@@ -306,13 +328,13 @@ def _rule_expression(spec: MetricSpec, direction: str, value: float) -> str:
         "asrhub_http_requests_total": (
             'sum(rate(asrhub_http_requests_total{status=~"5.."}[5m])) '
             "/ clamp_min(sum(rate(asrhub_http_requests_total[5m])), 0.001)"),
-        "asrhub_ram_used_mb": (
-            "asrhub_ram_used_mb / clamp_min(asrhub_ram_total_mb, 1) * 100"),
-        "asrhub_gpu_memory_mb": (
-            "asrhub_gpu_memory_mb / clamp_min(asrhub_gpu_memory_total_mb, 1) * 100"),
-        "asrhub_rtf": 'asrhub_rtf{quantile="p95"}',
-        "asrhub_queue_wait_seconds": 'asrhub_queue_wait_seconds{quantile="p95"}',
-        "asrhub_confidence": 'asrhub_confidence{quantile="avg"}',
+        "asrhub_ram_used_bytes": (
+            "asrhub_ram_used_bytes / clamp_min(asrhub_ram_total_bytes, 1) * 100"),
+        "asrhub_gpu_memory_used_bytes": (
+            "asrhub_gpu_memory_used_bytes / clamp_min(asrhub_gpu_memory_total_bytes, 1) * 100"),
+        "asrhub_rtf": 'asrhub_rtf{stat="p95"}',
+        "asrhub_queue_wait_seconds": 'asrhub_queue_wait_seconds{stat="p95"}',
+        "asrhub_confidence": 'asrhub_confidence{stat="avg"}',
         "asrhub_no_speech_total": "increase(asrhub_no_speech_total[30m])",
         "asrhub_auth_failures_total": "increase(asrhub_auth_failures_total[10m])",
         "asrhub_rate_limited_total": "increase(asrhub_rate_limited_total[10m])",
@@ -345,13 +367,14 @@ def grafana_dashboard(title: str = "ASR Hub") -> dict[str, Any]:
             {"expr": "asrhub_queue_depth", "legendFormat": "в очереди", "refId": "B"},
             {"expr": "asrhub_active_jobs", "legendFormat": "выполняется", "refId": "C"},
             {"expr": "asrhub_engines_available", "legendFormat": "движков", "refId": "D"},
-            {"expr": "asrhub_disk_free_gb", "legendFormat": "диск, ГБ", "refId": "E"},
+            {"expr": "asrhub_disk_free_bytes", "legendFormat": "свободно на диске", "refId": "E"},
         ],
     })
     y += 4
 
     for group in ("queue", "performance", "quality", "resources", "errors", "api"):
-        specs = [m for m in METRICS if m.group == group and m.type != "info"][:6]
+        specs = [m for m in METRICS
+                 if m.group == group and m.type != "info" and not m.deprecated_for][:6]
         if not specs:
             continue
         targets = []
@@ -401,12 +424,127 @@ def _stable_uuid(seed: str) -> str:
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:32]
 
 
+#: Метрики, у которых набор значений меток известен заранее. Для них можно
+#: объявить обычные элементы; всё остальное уходит в правило обнаружения.
+#: Срезы совпадают с тем, что отдаёт сборщик (collector.summarize).
+_STATS = [("avg",), ("p50",), ("p90",), ("p95",), ("p99",)]
+
+_KNOWN_LABEL_VALUES: dict[str, list[tuple[str, ...]]] = {
+    "asrhub_jobs_by_status": [("queued",), ("running",), ("completed",),
+                              ("failed",), ("cancelled",), ("retry",), ("paused",)],
+    "asrhub_rtf": _STATS,
+    "asrhub_queue_wait_seconds": _STATS,
+    "asrhub_confidence": _STATS,
+    "asrhub_wer": _STATS,
+    "asrhub_job_duration_seconds": _STATS,
+    "asrhub_media_duration_seconds": _STATS,
+}
+
+#: Для метрик со срезами (avg/p50/p95) порог из каталога относится к
+#: одному конкретному срезу — тому же, что и в правилах Prometheus.
+#: Без этого один порог заводил три одинаковых триггера, и дежурный получал
+#: три письма про одно и то же.
+_TRIGGER_STAT: dict[str, str] = {
+    "asrhub_rtf": "p95",
+    "asrhub_queue_wait_seconds": "p95",
+    "asrhub_confidence": "avg",
+}
+
+#: Выражения триггеров для метрик, чей порог задан не в единицах метрики.
+#: None означает, что осмысленного триггера в терминах Zabbix нет и
+#: выпускать его не нужно — лучше ни одного, чем заведомо ложный.
+_ZABBIX_EXPRESSIONS: dict[str, str | None] = {
+    # Порог в процентах от общего объёма, а метрика — в байтах.
+    "asrhub_ram_used_bytes":
+        "last(/ASR Hub/asrhub_ram_used_bytes)"
+        "/last(/ASR Hub/asrhub_ram_total_bytes)*100{op}{value}",
+    "asrhub_gpu_memory_used_bytes": None,      # метка gpu уходит в обнаружение
+    # Порог — доля неудач, метрика — накопительный счётчик.
+    "asrhub_jobs_total": None,
+    "asrhub_http_requests_total": None,
+    "asrhub_webhooks_total": None,
+    "asrhub_model_success_rate": None,
+    # Порог — прирост за окно, метрика — накопительный счётчик.
+    "asrhub_no_speech_total":
+        "(last(/ASR Hub/asrhub_no_speech_total)"
+        "-last(/ASR Hub/asrhub_no_speech_total,#1:now-30m)){op}{value}",
+    "asrhub_auth_failures_total":
+        "(last(/ASR Hub/asrhub_auth_failures_total)"
+        "-last(/ASR Hub/asrhub_auth_failures_total,#1:now-10m)){op}{value}",
+    "asrhub_rate_limited_total":
+        "(last(/ASR Hub/asrhub_rate_limited_total)"
+        "-last(/ASR Hub/asrhub_rate_limited_total,#1:now-10m)){op}{value}",
+    # Метрика существует, только когда равна единице: сравнивать бессмысленно,
+    # недоступность ловится отсутствием данных.
+    "asrhub_up": "nodata(/ASR Hub/asrhub_up,5m)=1",
+    # Падение видно по обнулению счётчика, а не по малому значению.
+    "asrhub_uptime_seconds":
+        "last(/ASR Hub/asrhub_uptime_seconds)<last(/ASR Hub/asrhub_uptime_seconds,#2)",
+    "asrhub_queue_paused": "last(/ASR Hub/asrhub_queue_paused)=1",
+}
+
+
+def _zabbix_item(spec: MetricSpec, key: str, label: str) -> list[str]:
+    return [
+        f"        - uuid: {_stable_uuid(key)}",
+        f"          name: {_yaml_str(label)}",
+        "          type: TRAP",
+        f"          key: {key}",
+        "          value_type: FLOAT",
+        f"          units: {_yaml_str(spec.unit)}",
+        f"          description: {_yaml_str(spec.description[:250])}",
+    ]
+
+
+def _zabbix_trigger(spec: MetricSpec, key: str, label: str) -> list[str]:
+    if spec.name in _ZABBIX_EXPRESSIONS:
+        template = _ZABBIX_EXPRESSIONS[spec.name]
+        if template is None:
+            return []
+        if "{op}" in template:
+            if not spec.threshold or spec.threshold.critical is None:
+                return []
+            operator = ">" if spec.threshold.direction == "above" else "<"
+            expression = template.format(op=operator, value=spec.threshold.critical)
+        else:
+            expression = template
+    else:
+        if not spec.threshold or spec.threshold.critical is None:
+            return []
+        operator = ">" if spec.threshold.direction == "above" else "<"
+        expression = f"last(/ASR Hub/{key}){operator}{spec.threshold.critical}"
+    return [
+        "          triggers:",
+        f"            - uuid: {_stable_uuid(key + ':trigger')}",
+        f"              expression: {_yaml_str(expression)}",
+        f"              name: {_yaml_str(label + ': порог превышен')}",
+        "              priority: HIGH",
+    ]
+
+
 def zabbix_template() -> str:
-    """Шаблон Zabbix 6+ в формате YAML со всеми метриками каталога."""
+    """Шаблон Zabbix 6+ в формате YAML.
+
+    Две вещи, из-за которых прежний шаблон не работал.
+
+    **Ключи.** zabbix_sender отправляет метрику с метками как «имя[значения]»,
+    а шаблон объявлял «имя». Zabbix сопоставляет trapper-элементы по точному
+    ключу, поэтому доезжало около пяти процентов данных, остальное отбивалось
+    как «unsupported item key»: ни очереди по состояниям, ни RTF, ни
+    уверенности, ни доступности движков. Теперь элемент объявляется ровно тем
+    ключом, каким метрика приходит, а метрики с заранее неизвестным составом
+    меток (модель, маршрут, код ошибки) собираются правилом обнаружения.
+
+    **Триггеры.** Порог из каталога подставлялся в сравнение сырого значения,
+    но у части метрик он задан в процентах, в долях или в приросте.
+    Получалось «last(asrhub_ram_used_bytes)>95» — авария при 95 байтах
+    занятой памяти, горящая всегда, — и «last(asrhub_up)<1», не срабатывающий
+    никогда, потому что метрика существует только когда равна единице.
+    """
     lines = [
         "# Шаблон Zabbix для ASR Hub.",
         "# Импорт: Настройка -> Шаблоны -> Импорт.",
-        "# Данные забираются zabbix_sender'ом или HTTP-агентом с /api/monitoring/export?format=zabbix",
+        "# Данные приходят zabbix_sender'ом: см. /api/monitoring/metrics?format=zabbix",
         "zabbix_export:",
         "  version: '6.0'",
         "  templates:",
@@ -417,26 +555,47 @@ def zabbix_template() -> str:
         "        - name: Applications",
         "      items:",
     ]
+
+    discovery: list[MetricSpec] = []
     for spec in METRICS:
-        if spec.type in ("info", "histogram"):
+        if spec.type in ("info", "histogram") or spec.deprecated_for:
             continue
-        value_type = "FLOAT"
+        if spec.labels:
+            known = _KNOWN_LABEL_VALUES.get(spec.name)
+            if known is None:
+                discovery.append(spec)
+                continue
+            wanted = _TRIGGER_STAT.get(spec.name)
+            for combo in known:
+                key = f"{spec.name}[{','.join(combo)}]"
+                label = f"{spec.label} ({' '.join(combo)})"
+                lines += _zabbix_item(spec, key, label)
+                if wanted is None or combo[0] == wanted:
+                    lines += _zabbix_trigger(spec, key, label)
+            continue
+        lines += _zabbix_item(spec, spec.name, spec.label)
+        lines += _zabbix_trigger(spec, spec.name, spec.label)
+
+    if discovery:
         lines += [
-            f"        - uuid: {_stable_uuid(spec.name)}",
-            f"          name: {_yaml_str(spec.label)}",
+            "      discovery_rules:",
+            f"        - uuid: {_stable_uuid('asrhub-discovery')}",
+            "          name: 'Метрики с произвольными метками'",
             "          type: TRAP",
-            f"          key: {spec.name}",
-            f"          value_type: {value_type}",
-            f"          units: {_yaml_str(spec.unit)}",
-            f"          description: {_yaml_str(spec.description[:250])}",
+            "          key: asrhub.discovery",
+            "          description: 'Метрики, состав меток у которых заранее "
+            "не известен: имя модели, маршрут, код ошибки.'",
+            "          item_prototypes:",
         ]
-        if spec.threshold and spec.threshold.critical is not None:
-            operator = ">" if spec.threshold.direction == "above" else "<"
+        for spec in discovery:
+            args = ",".join("{#" + label.upper() + "}" for label in spec.labels)
             lines += [
-                "          triggers:",
-                f"            - uuid: {_stable_uuid(spec.name + ':trigger')}",
-                f"              expression: {_yaml_str(f'last(/ASR Hub/{spec.name}){operator}{spec.threshold.critical}')}",
-                f"              name: {_yaml_str(spec.label + ': порог превышен')}",
-                "              priority: HIGH",
+                f"            - uuid: {_stable_uuid(spec.name + ':proto')}",
+                f"              name: {_yaml_str(spec.label + ' [' + ', '.join(spec.labels) + ']')}",
+                "              type: TRAP",
+                f"              key: {spec.name}[{args}]",
+                "              value_type: FLOAT",
+                f"              units: {_yaml_str(spec.unit)}",
+                f"              description: {_yaml_str(spec.description[:250])}",
             ]
     return "\n".join(lines) + "\n"

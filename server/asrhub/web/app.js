@@ -33,6 +33,43 @@ const state = {
 };
 
 const API = {
+  /** Контроллеры отмены по ключу: новый запрос отменяет предыдущий такой же. */
+  _inflight: new Map(),
+  /** Все незавершённые запросы на чтение — их снимает смена раздела. */
+  _pending: new Set(),
+
+  /**
+   * Снимает все незавершённые запросы на чтение.
+   *
+   * Вызывается при уходе из раздела. Без этого медленный ответ приходил уже
+   * после переключения и переписывал содержимое поверх нового раздела: на
+   * экране «Журнал», а в теле — таблица моделей. Запросы на изменение
+   * (POST, PUT, DELETE) не трогаем: постановка задания в очередь не должна
+   * срываться от того, что пользователь переключил вкладку.
+   */
+  abortAll() {
+    this._inflight.forEach((controller) => controller.abort());
+    this._inflight.clear();
+    this._pending.forEach((controller) => controller.abort());
+    this._pending.clear();
+  },
+
+  /**
+   * Запрос, который отменяет предыдущий с тем же ключом.
+   * Нужен для поиска и фильтров: без отмены ответ на «alpha» мог прийти
+   * после ответа на «beta» и перезаписать таблицу устаревшими данными.
+   */
+  latest(key, path, options) {
+    const previous = this._inflight.get(key);
+    if (previous) previous.abort();
+    const controller = new AbortController();
+    this._inflight.set(key, controller);
+    return this.call(path, Object.assign({ signal: controller.signal }, options || {}))
+      .finally(() => {
+        if (this._inflight.get(key) === controller) this._inflight.delete(key);
+      });
+  },
+
   async call(path, options) {
     const opts = Object.assign({ headers: {} }, options || {});
     const key = localStorage.getItem('asrhub_key');
@@ -42,12 +79,31 @@ const API = {
       opts.body = JSON.stringify(opts.json);
       delete opts.json;
     }
+    // Чтение получает свой контроллер отмены, если вызывающий не передал
+    // свой. Исключение — фоновые запросы: счётчики в меню и состояние связи
+    // живут вне разделов, и смена раздела не должна их снимать. Раньше
+    // счётчик тревог гас в ноль при каждом переходе именно поэтому.
+    const method = (opts.method || 'GET').toUpperCase();
+    const background = opts.background === true;
+    delete opts.background;
+    let own = null;
+    if (!opts.signal && method === 'GET' && !background) {
+      own = new AbortController();
+      opts.signal = own.signal;
+      this._pending.add(own);
+    }
     let response;
     try {
       response = await fetch(path, opts);
     } catch (err) {
+      if (err && err.name === 'AbortError') {
+        // Запрос отменён более свежим — это не сбой, а штатный ход.
+        throw { code: 'aborted', message: 'Запрос отменён', silent: true };
+      }
       throw { code: 'network', message: 'Сервер недоступен',
               hint: 'Проверьте, что служба asrhub запущена и доступна по сети.' };
+    } finally {
+      if (own) this._pending.delete(own);
     }
     const text = await response.text();
     let data = null;
@@ -64,6 +120,8 @@ const API = {
     return data;
   },
   get(path) { return this.call(path); },
+  /** Запрос вне разделов: смена раздела его не отменяет. */
+  background(path) { return this.call(path, { background: true }); },
   post(path, body) { return this.call(path, { method: 'POST', json: body === undefined ? {} : body }); },
   put(path, body) { return this.call(path, { method: 'PUT', json: body }); },
   del(path) { return this.call(path, { method: 'DELETE' }); },
@@ -92,7 +150,17 @@ function toast(message, kind, hint) {
   setTimeout(() => { node.style.opacity = '0'; setTimeout(() => node.remove(), 250); },
     kind === 'err' ? 9000 : 4200);
 }
+/** Страница уходит: браузер рвёт незавершённые запросы, и это не сбой. */
+let unloading = false;
+window.addEventListener('pagehide', () => { unloading = true; });
+window.addEventListener('beforeunload', () => { unloading = true; });
+
 function fail(err) {
+  // Отменённый запрос — не сбой: пользователь просто набрал следующий символ.
+  if (err && err.silent) return;
+  // При закрытии или перезагрузке вкладки все запросы падают разом, и на
+  // прощание пользователь получал стопку красных плашек «Сервер недоступен».
+  if (unloading) return;
   console.error(err);
   toast(err.message || 'Ошибка', 'err', err.hint);
 }
@@ -207,9 +275,10 @@ async function refreshEngines() {
 }
 async function refreshQueue() {
   try {
-    state.queue = await API.get('/api/queue');
+    state.queue = await API.background('/api/queue');
     const depth = state.queue.queue_depth || 0;
     qs('#badge-queue').textContent = depth;
+    updateAlertBadge();
     qs('#chip-queue').textContent = `очередь: ${depth}`;
     const busy = (state.queue.workers || []).filter((w) => w.busy).length;
     qs('#chip-workers').textContent = `воркеры: ${busy}/${state.queue.worker_count || 0}`;
@@ -226,10 +295,25 @@ function tick() {
 // WebSocket
 // ==========================================================================
 
-function connectWs() {
+async function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const key = localStorage.getItem('asrhub_key');
-  const url = `${proto}://${location.host}/ws${key ? `?api_key=${encodeURIComponent(key)}` : ''}`;
+
+  // Ключ в адресе оседает в истории браузера, в журнале обратного прокси и
+  // в заголовке Referer. Поэтому берём одноразовый билет на минуту: он
+  // гасится при первом подключении и ничего больше не открывает.
+  let ticket = '';
+  if (key) {
+    try {
+      const issued = await API.post('/api/auth/ticket', {});
+      ticket = (issued && issued.ticket) || '';
+    } catch (e) {
+      // Старый сервер без /api/auth/ticket или нет связи — не рвём ленту
+      // событий: ниже сработает обычный цикл переподключения.
+      ticket = '';
+    }
+  }
+  const url = `${proto}://${location.host}/ws${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`;
   try { state.ws = new WebSocket(url); } catch (e) { return; }
 
   state.ws.onopen = () => {
@@ -303,7 +387,15 @@ const VIEWS = {
 
 function go(view) {
   state.view = view;
-  qsa('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+  qsa('.nav-item').forEach((b) => {
+    const active = b.dataset.view === view;
+    b.classList.toggle('active', active);
+    // Кроме подсветки нужен и признак для диктора: без него активный раздел
+    // на слух ничем не отличался от прочих.
+    if (active) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
+  closeNav();                       // на узком экране меню уезжает после выбора
   const meta = VIEWS[view] || { title: view, subtitle: '' };
   qs('#view-title').textContent = meta.title;
   qs('#view-subtitle').textContent = meta.subtitle;
@@ -322,6 +414,55 @@ function render() {
   go(VIEWS[hash] ? hash : 'transcribe');
 }
 
+/**
+ * Счётчик тревог рядом с пунктом «Мониторинг».
+ *
+ * В разметке он стоял с нулём и нигде не обновлялся: при семи горящих
+ * тревогах меню показывало «0», и пользователь, привыкший к живому счётчику
+ * очереди, читал это как «тревог нет».
+ */
+async function updateAlertBadge() {
+  const badge = qs('#badge-alerts');
+  if (!badge) return;
+  try {
+    const data = await API.background('/api/monitoring/alerts?only_firing=true');
+    const summary = data.summary || {};
+    const firing = summary.firing ?? (data.items || []).length;
+    badge.textContent = firing;
+    badge.classList.toggle('err', firing > 0);
+  } catch (err) {
+    // Мониторинг может быть закрыт ключом или выключен — счётчик просто
+    // не показываем, шуметь об этом не о чем.
+    badge.textContent = '0';
+  }
+}
+
+/**
+ * Список файлов, которые сервер не принял, с причиной по каждому.
+ * Всплывашка живёт девять секунд и вмещает одну строку — для разбора
+ * отказов этого мало.
+ */
+function showRejected(errors) {
+  const host = qs('#file-list');
+  if (!host) return;
+  const box = h(`<div class="card" style="border-color:var(--err);margin-top:12px">
+    <div class="card-head"><b style="color:var(--err)">Не принято: ${errors.length}</b>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="rejected-close">Скрыть</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Файл</th><th>Почему</th></tr></thead>
+      <tbody>${errors.map((e) => `<tr>
+        <td class="truncate" style="max-width:260px">${esc(e.filename || '—')}</td>
+        <td class="small">${esc(e.error || '—')}</td></tr>`).join('')}</tbody></table></div>
+    <p class="small dim" style="margin-top:8px">Эти файлы остались в списке —
+      поправьте формат или размер и отправьте снова.</p>
+  </div>`);
+  const previous = qs('#rejected-box');
+  if (previous) previous.remove();
+  box.id = 'rejected-box';
+  host.parentNode.insertBefore(box, host.nextSibling);
+  qs('#rejected-close', box).onclick = () => box.remove();
+}
+
 function renderView(soft) {
   const content = qs('#content');
   const renderer = RENDERERS[state.view];
@@ -332,11 +473,24 @@ function renderView(soft) {
   // возврате в «Журнал» добавлялся ещё один опрос, и вкладка сама себя
   // упирала в ограничение частоты запросов.
   stopViewTimers();
+  API.abortAll();
+  // Подсказка графика прячется по mouseleave. Если узел, на котором она
+  // висит, снесён перерисовкой, событие не придёт никогда — и подсказка
+  // остаётся висеть поверх любых других разделов. Гасим её явно.
+  const tip = qs('#chart-tip');
+  if (tip) tip.style.display = 'none';
   content.innerHTML = '';
+  const view = state.view;
   try {
     const result = renderer.render(content);
     if (result && typeof result.catch === 'function') {
-      result.catch((err) => showViewFailure(content, err));
+      result.catch((err) => {
+        // Отменённый запрос и раздел, который успели сменить, — не ошибка:
+        // рисовать поверх нового раздела карточку «не загрузилось» нельзя.
+        if (err && err.silent) return;
+        if (state.view !== view) return;
+        showViewFailure(content, err);
+      });
     }
   } catch (err) {
     showViewFailure(content, err);
@@ -370,8 +524,36 @@ function showViewFailure(content, err) {
 
 window.addEventListener('hashchange', render);
 
+/** Выдвижное меню на узких экранах. */
+function toggleNav(force) {
+  const open = force === undefined ? !document.body.classList.contains('nav-open') : force;
+  document.body.classList.toggle('nav-open', open);
+  const button = qs('#nav-toggle');
+  if (button) {
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    button.setAttribute('aria-label', open ? 'Закрыть меню разделов' : 'Открыть меню разделов');
+  }
+  if (open) {
+    const first = qs('.nav-item');
+    if (first) first.focus();
+  }
+}
+
+function closeNav() {
+  if (document.body.classList.contains('nav-open')) toggleNav(false);
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   qsa('.nav-item').forEach((b) => b.addEventListener('click', () => go(b.dataset.view)));
+  const navToggle = qs('#nav-toggle');
+  if (navToggle) navToggle.addEventListener('click', () => toggleNav());
+  // Нажатие по затемнению закрывает меню: попасть в узкую кнопку на телефоне
+  // сложнее, чем просто ткнуть в сторону.
+  document.addEventListener('click', (e) => {
+    if (!document.body.classList.contains('nav-open')) return;
+    if (e.target.closest('.sidebar') || e.target.closest('#nav-toggle')) return;
+    closeNav();
+  });
   qs('#btn-refresh').addEventListener('click', () => {
     refreshQueue().then(() => renderView());
     toast('Обновлено');
@@ -415,8 +597,78 @@ function inEditable(target) {
 function closeTopModal() {
   const modals = qsa('.modal-backdrop');
   if (!modals.length) return false;
-  modals[modals.length - 1].remove();
+  closeModal(modals[modals.length - 1]);
   return true;
+}
+
+/** Элементы, до которых можно добраться клавишей Tab. */
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]),'
+  + ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Показывает модальное окно и делает его доступным с клавиатуры.
+ *
+ * Без этого окно оставалось «картинкой»: Tab уводил фокус на элементы под
+ * ним, экранный диктор продолжал читать спрятанный за подложкой список, а
+ * после закрытия фокус терялся в начале страницы.
+ */
+function mountModal(backdrop, options) {
+  const opts = options || {};
+  const dialog = qs('.modal', backdrop) || backdrop;
+  backdrop.setAttribute('role', 'presentation');
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('tabindex', '-1');
+
+  // Заголовок окна — первый <b> в шапке; его и озвучит диктор.
+  const heading = qs('.modal-head b', dialog);
+  if (heading) {
+    if (!heading.id) heading.id = `modal-title-${Math.random().toString(36).slice(2, 9)}`;
+    dialog.setAttribute('aria-labelledby', heading.id);
+  } else if (opts.label) {
+    dialog.setAttribute('aria-label', opts.label);
+  }
+
+  backdrop.__returnFocus = document.activeElement;
+  // Пока окно открыто, остальная страница скрыта от диктора.
+  const app = qs('.app');
+  if (app && qsa('.modal-backdrop').length === 0) app.setAttribute('aria-hidden', 'true');
+
+  document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
+
+  // Ловушка фокуса: Tab по кругу внутри окна.
+  backdrop.__trap = (e) => {
+    if (e.key !== 'Tab') return;
+    const items = qsa(FOCUSABLE, dialog).filter((el) => el.offsetParent !== null);
+    if (!items.length) { e.preventDefault(); dialog.focus(); return; }
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
+      e.preventDefault(); last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault(); first.focus();
+    }
+  };
+  backdrop.addEventListener('keydown', backdrop.__trap);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(backdrop); });
+
+  const initial = qsa(FOCUSABLE, dialog).filter((el) => el.offsetParent !== null)[0];
+  (initial || dialog).focus();
+  return backdrop;
+}
+
+/** Закрывает окно и возвращает фокус туда, откуда его открыли. */
+function closeModal(backdrop) {
+  if (!backdrop || !backdrop.parentNode) return;
+  const back = backdrop.__returnFocus;
+  backdrop.remove();
+  if (!qsa('.modal-backdrop').length) {
+    document.body.classList.remove('modal-open');
+    const app = qs('.app');
+    if (app) app.removeAttribute('aria-hidden');
+  }
+  if (back && typeof back.focus === 'function' && document.contains(back)) back.focus();
 }
 
 function focusSearch() {
@@ -438,9 +690,8 @@ function showHotkeys() {
       <p class="hint" style="margin-top:12px">Буквенные сокращения не срабатывают,
         пока курсор находится в поле ввода.</p></div>
   </div></div>`);
-  document.body.appendChild(backdrop);
-  qs('#hk-close', backdrop).onclick = () => backdrop.remove();
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+  mountModal(backdrop, { label: 'Горячие клавиши' });
+  qs('#hk-close', backdrop).onclick = () => closeModal(backdrop);
 }
 
 function installHotkeys() {
@@ -449,6 +700,7 @@ function installHotkeys() {
 
     if (e.key === 'Escape') {
       if (closeTopModal()) e.preventDefault();
+      else if (document.body.classList.contains('nav-open')) { closeNav(); e.preventDefault(); }
       else if (inEditable(e.target)) e.target.blur();
       return;
     }
@@ -705,7 +957,8 @@ RENDERERS.transcribe = {
             <div class="card-head"><h3>Файлы</h3>
               <span class="hint">аудио и видео: wav, mp3, m4a, flac, ogg, opus, mp4, mkv, mov…</span>
             </div>
-            <div class="dropzone" id="dropzone">
+            <div class="dropzone" id="dropzone" role="button" tabindex="0"
+                 aria-label="Выбрать файлы для распознавания: нажмите Enter или перетащите файлы">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                 <path d="M7 10l5-5 5 5M12 5v13"/></svg>
@@ -800,6 +1053,15 @@ RENDERERS.transcribe = {
     const zone = qs('#dropzone');
     const input = qs('#file-input');
     zone.addEventListener('click', () => input.click());
+    // Область была доступна только мышью: с клавиатуры до выбора файлов было
+    // не добраться совсем. Теперь она получает фокус и открывается по Enter
+    // и пробелу, как обычная кнопка.
+    zone.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        input.click();
+      }
+    });
     zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('over'); });
     zone.addEventListener('dragleave', () => zone.classList.remove('over'));
     zone.addEventListener('drop', (e) => {
@@ -990,8 +1252,22 @@ async function submitFiles() {
       form.append('settings', settings);
       form.append('priority', String(priority));
       const result = await API.call('/api/jobs/batch', { method: 'POST', body: form });
-      toast(`Поставлено заданий: ${result.created}`, 'ok',
-        result.errors.length ? `С ошибками: ${result.errors.length}` : '');
+      const rejected = result.errors || [];
+      toast(`Поставлено заданий: ${result.created}`, rejected.length ? 'warn' : 'ok',
+        rejected.length ? `Не принято: ${rejected.length}` : '');
+      if (rejected.length) {
+        // Сервер называет каждый отклонённый файл и причину, а интерфейс
+        // показывал только их число и тут же очищал список — узнать, какой
+        // файл не принят и почему, было негде. Оставляем отказы на виду и
+        // не трогаем их в списке: их можно поправить и отправить снова.
+        showRejected(rejected);
+        const names = new Set(rejected.map((e) => e.filename));
+        state.files = state.files.filter((f) => names.has(f.name));
+        renderFileList();
+        await refreshQueue();
+        renderView(true);
+        return;
+      }
     }
     state.files = [];
     renderFileList();
@@ -1094,7 +1370,13 @@ RENDERERS.queue = {
 
     qs('#q-pause').onclick = async () => {
       try {
-        state.queue = await API.post(q.paused ? '/api/queue/resume' : '/api/queue/pause');
+        // Состояние берём свежее, а не то, что было при отрисовке раздела:
+        // подпись обновляется автообновлением каждые четыре секунды, и после
+        // паузы, поставленной из другой вкладки, кнопка «Возобновить» слала
+        // ещё одну паузу — очередь не запускалась, и ничего об этом не
+        // сообщалось.
+        const paused = !!(state.queue && state.queue.paused);
+        state.queue = await API.post(paused ? '/api/queue/resume' : '/api/queue/pause');
         renderView();
       } catch (err) { fail(err); }
     };
@@ -1158,7 +1440,7 @@ RENDERERS.queue = {
       const params = new URLSearchParams({ limit: '120' });
       if (filter) params.set('status', filter);
       if (search) params.set('search', search);
-      const data = await API.get(`/api/jobs?${params}`);
+      const data = await API.latest('queue-table', `/api/jobs?${params}`);
       host.innerHTML = data.items.length ? `<table>
         <thead><tr>
           <th style="width:26px"></th><th>Файл</th><th>Модель</th>
@@ -1210,6 +1492,72 @@ RENDERERS.queue = {
   },
 };
 
+/**
+ * Скачивание результата без ключа в адресе.
+ *
+ * Ссылка <a href="…?api_key=…"> удобна, но адрес с ключом попадает в историю
+ * браузера, в журнал обратного прокси и в заголовок Referer при переходе на
+ * сторонний сайт. Забираем файл обычным запросом с заголовком X-API-Key и
+ * отдаём его через объектную ссылку — ключ не покидает заголовков.
+ */
+/**
+ * Имя файла из заголовка Content-Disposition.
+ * Предпочитает filename*= (RFC 5987) и не падает на неверном кодировании.
+ */
+function parseFilename(disposition) {
+  const extended = /filename\*\s*=\s*([^;]+)/i.exec(disposition);
+  if (extended) {
+    const raw = extended[1].trim();
+    // Формат: кодировка'язык'значение — например utf-8''%D1%84.txt
+    const parts = raw.split("'");
+    const encoded = parts.length >= 3 ? parts.slice(2).join("'") : raw;
+    try { return decodeURIComponent(encoded); } catch (e) { /* ниже запасной путь */ }
+  }
+  const plain = /filename\s*=\s*"([^"]*)"|filename\s*=\s*([^;]+)/i.exec(disposition);
+  if (plain) return (plain[1] !== undefined ? plain[1] : plain[2]).trim();
+  return '';
+}
+
+window.__asrhub.download = async (id, fmt) => {
+  const url = `/api/jobs/${id}/download?fmt=${encodeURIComponent(fmt)}`;
+  try {
+    const headers = {};
+    const key = localStorage.getItem('asrhub_key');
+    if (key) headers['X-API-Key'] = key;
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      let detail = {};
+      try { detail = (await response.json()).detail || {}; } catch (e) { detail = {}; }
+      throw { code: detail.code || 'http_error',
+              message: detail.message || `Не удалось скачать файл (HTTP ${response.status})`,
+              hint: detail.hint };
+    }
+    // Имя берём из Content-Disposition. Сервер шлёт два поля: запасное
+    // filename= в ASCII (кириллица в нём заменена подчёркиваниями) и
+    // filename*= по RFC 5987 с настоящим именем. Брать надо второе.
+    // Разбор «первое совпадение плюс decodeURIComponent» и портил имена,
+    // и падал целиком: у файла «отчёт 100% готово» запасное имя содержит
+    // знак процента, и декодирование бросало «URI malformed» — скачивание
+    // не начиналось вовсе.
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const name = parseFilename(disposition) || `${id}.${fmt}`;
+
+    const blob = await response.blob();
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = href;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    // Освобождаем память не сразу: Safari отменяет загрузку, если ссылку
+    // отозвать в том же кадре.
+    setTimeout(() => URL.revokeObjectURL(href), 30000);
+  } catch (err) {
+    fail(err);
+  }
+};
+
 window.__asrhub.jobAction = async (id, action) => {
   try {
     if (action === 'cancel' && !confirm('Отменить задание?')) return;
@@ -1255,7 +1603,7 @@ RENDERERS.results = {
     try {
       const params = new URLSearchParams({ status: 'completed', limit: '150', order });
       if (search) params.set('search', search);
-      const data = await API.get(`/api/jobs?${params}`);
+      const data = await API.latest('results-table', `/api/jobs?${params}`);
       host.innerHTML = data.items.length ? `<table>
         <thead><tr><th>Файл</th><th>Модель</th><th class="num">Длит.</th>
           <th class="num">Слов</th><th class="num">Сегм.</th><th class="num">RTF</th>
@@ -1275,10 +1623,8 @@ RENDERERS.results = {
           <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
           <td><div class="row" style="gap:3px">
             ${['txt', 'srt', 'json', 'docx'].map((f) =>
-              `<a class="btn sm" href="/api/jobs/${job.id}/download?fmt=${f}${
-                localStorage.getItem('asrhub_key')
-                  ? '&api_key=' + encodeURIComponent(localStorage.getItem('asrhub_key')) : ''
-              }" download>${f}</a>`).join('')}
+              `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
+                 title="Скачать в формате ${f}">${f}</button>`).join('')}
             <button class="ghost sm" onclick="__asrhub.openJob('${job.id}')">Открыть</button>
           </div></td></tr>`).join('')}
       </tbody></table>` : '<div class="empty">Завершённых заданий пока нет</div>';
@@ -1339,19 +1685,16 @@ function showJobModal(job) {
       <span class="small faint mono">${esc(job.id)}</span>
       <span class="spacer"></span>
       ${job.status === 'completed' ? ['txt', 'srt', 'vtt', 'json', 'csv', 'docx'].map((f) =>
-        `<a class="btn sm" href="/api/jobs/${job.id}/download?fmt=${f}${
-          localStorage.getItem('asrhub_key')
-            ? '&api_key=' + encodeURIComponent(localStorage.getItem('asrhub_key')) : ''
-        }" download>${f}</a>`).join('') : ''}
+        `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
+           title="Скачать в формате ${f}">${f}</button>`).join('') : ''}
       ${job.status === 'failed'
         ? `<button class="primary" onclick="__asrhub.jobAction('${job.id}','retry')">
              Повторить</button>` : ''}
     </div></div></div>`);
 
-  document.body.appendChild(backdrop);
-  const close = () => backdrop.remove();
+  mountModal(backdrop);
+  const close = () => closeModal(backdrop);
   qs('#modal-close', backdrop).onclick = close;
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
 
   const body = qs('#job-tab-body', backdrop);
   const tabs = {
@@ -1427,11 +1770,12 @@ RENDERERS.analytics = {
   async load() {
     const host = qs('#analytics-body');
     try {
-      const data = await API.get(`/api/analytics?period=${state.period}`);
+      const data = await API.latest('analytics', `/api/analytics?period=${state.period}`);
       state.analytics = data;
       this.draw(host, data);
     } catch (err) {
       fail(err);
+      if (err && err.silent) return;    // пришёл ответ посвежее — он и отрисуется
       host.innerHTML = `<div class="empty">Не удалось загрузить аналитику: ${esc(err.message)}</div>`;
     }
   },
@@ -1863,9 +2207,8 @@ window.__asrhub.showModel = async (id) => {
       <button onclick="__asrhub.useModel('${esc(m.id)}')" class="primary">
         Использовать эту модель</button>
     </div></div></div>`);
-  document.body.appendChild(backdrop);
-  qs('#mm-close', backdrop).onclick = () => backdrop.remove();
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+  mountModal(backdrop);
+  qs('#mm-close', backdrop).onclick = () => closeModal(backdrop);
 };
 
 // ==========================================================================
@@ -2152,7 +2495,11 @@ RENDERERS.system = {
   async render(root) {
     root.innerHTML = '<div class="empty">Загрузка сведений о сервере…</div>';
     let sys;
-    try { sys = await API.get('/api/system'); } catch (err) { fail(err); return; }
+    // Ошибку не гасим: renderView поймает её и покажет карточку с кнопкой
+    // «Повторить». Раньше здесь стоял catch с return, и раздел навсегда
+    // оставался на строке «Загрузка сведений о сервере…» — единственным
+    // признаком сбоя была всплывашка, исчезавшая через девять секунд.
+    sys = await API.get('/api/system');
     state.system = sys;
     const hw = sys.hardware;
     const gpu = (hw.gpus || [])[0];
@@ -2336,14 +2683,14 @@ RENDERERS.monitoring = {
     let info;
     let alerts;
     let targets;
-    try {
-      [health, info, alerts, targets] = await Promise.all([
-        API.get('/api/monitoring/health'),
-        API.get('/api/monitoring/info'),
-        API.get('/api/monitoring/alerts'),
-        API.get('/api/monitoring/targets'),
-      ]);
-    } catch (err) { fail(err); return; }
+    // Ошибку пробрасываем: её покажет renderView карточкой с кнопкой
+    // «Повторить», а не оставит раздел на «Опрос метрик…» насовсем.
+    [health, info, alerts, targets] = await Promise.all([
+      API.get('/api/monitoring/health'),
+      API.get('/api/monitoring/info'),
+      API.get('/api/monitoring/alerts'),
+      API.get('/api/monitoring/targets'),
+    ]);
 
     state.monitoring = { health, info, alerts, targets };
     const summary = alerts.summary || {};
@@ -2419,17 +2766,24 @@ RENDERERS.monitoring = {
 
   async loadCatalog() {
     let data;
-    try { data = await API.get('/api/monitoring/catalog'); } catch (err) { return; }
+    try {
+      data = await API.latest('mon-catalog', '/api/monitoring/catalog');
+    } catch (err) { return; }
     state.metricCatalog = data;
     const box = qs('#mon-catalog');
     const search = qs('#mon-search');
+    // Ответ мог прийти после ухода из раздела: тогда этих элементов уже нет,
+    // и попытка навесить обработчик роняла скрипт целиком («Cannot set
+    // properties of null»), а вместе с ним и обновление всех разделов.
+    if (!box || !search) return;
     const draw = () => {
       const needle = (search.value || '').toLowerCase().trim();
       const items = data.metrics.filter((m) => !needle
         || m.name.toLowerCase().includes(needle)
         || m.label.toLowerCase().includes(needle)
         || m.description.toLowerCase().includes(needle));
-      qs('#mon-count').textContent = `${items.length} из ${data.metrics.length}`;
+      const counter = qs('#mon-count');
+      if (counter) counter.textContent = `${items.length} из ${data.metrics.length}`;
       box.innerHTML = data.groups.map((group) => {
         const inGroup = items.filter((m) => m.group === group.id);
         if (!inGroup.length) return '';
@@ -2464,14 +2818,48 @@ function probeCard(name, probe) {
     </tr>`).join('')}</table></div>`;
 }
 
+/**
+ * Значение метрики в человеческих единицах.
+ *
+ * Каталог хранит метрики в базовых единицах Prometheus — байтах и секундах.
+ * Это правильно для сбора, но в таблице тревог получалось «31.6 млрд Б»
+ * вместо «29.5 ГБ» и «5400 с» вместо «1:30:00»: разобрать, много это или
+ * мало, было нельзя.
+ */
+function metricValue(value, unit) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+  const v = Number(value);
+  if (unit === 'Б' || unit === 'B') return fmtBytes(v);
+  if (unit === 'с' || unit === 's') {
+    if (Math.abs(v) < 1) return `${(v * 1000).toFixed(0)} мс`;
+    if (Math.abs(v) < 60) return `${num(v, v < 10 ? 2 : 1)} с`;
+    return fmtDur(v);
+  }
+  return `${num(v, 3)}${unit ? ' ' + unit : ''}`;
+}
+
+/** Байты в КБ/МБ/ГБ/ТБ по основанию 1024. */
+function fmtBytes(value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return '—';
+  const sign = v < 0 ? '-' : '';
+  let rest = Math.abs(v);
+  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ', 'ПБ'];
+  let i = 0;
+  while (rest >= 1024 && i < units.length - 1) { rest /= 1024; i += 1; }
+  const digits = i === 0 ? 0 : (rest < 10 ? 2 : rest < 100 ? 1 : 0);
+  return `${sign}${rest.toFixed(digits)} ${units[i]}`;
+}
+
 function alertsTable(alerts) {
   const active = alerts.filter((a) => a.state !== 'ok');
   const rows = (active.length ? active : alerts.slice(0, 12)).map((a) => `<tr>
     <td><span class="chip ${ALERT_STATE_CLASS[a.state] || ''}">${
       esc(ALERT_STATE_LABEL[a.state] || a.state)}</span></td>
     <td><b>${esc(a.label)}</b><div class="small dim">${esc(a.metric)}</div></td>
-    <td>${num(a.value, 3)}${a.unit ? ' ' + esc(a.unit) : ''}</td>
-    <td class="dim">${a.direction === 'above' ? '>' : '<'} ${num(a.threshold, 3)}</td>
+    <td class="nowrap">${esc(metricValue(a.value, a.unit))}</td>
+    <td class="dim nowrap">${a.direction === 'above' ? '>' : '<'} ${
+      esc(metricValue(a.threshold, a.unit))}</td>
     <td class="small">${esc(a.severity)}</td>
     <td class="small dim">${esc(a.hint || '')}</td></tr>`).join('');
   return `<div class="table-wrap"><table>
@@ -2526,7 +2914,8 @@ function metricCard(m) {
       ${m.normal ? `<p class="dim">Обычное значение: ${esc(m.normal)}</p>` : ''}
       ${m.recommendation ? `<div class="param-rec"><b>Рекомендация.</b> ${esc(m.recommendation)}</div>` : ''}
       ${threshold ? `<p class="dim">Порог: ${threshold.direction === 'above' ? 'выше' : 'ниже'}
-        ${threshold.warning ?? '—'} — предупреждение, ${threshold.critical ?? '—'} — критично,
+        ${esc(metricValue(threshold.warning, m.unit))} — предупреждение,
+        ${esc(metricValue(threshold.critical, m.unit))} — критично,
         выдержка ${threshold.for_seconds} с.
         ${threshold.note ? esc(threshold.note) : ''}</p>` : ''}
       ${m.troubleshooting ? `<p><b>Что делать:</b> ${esc(m.troubleshooting)}</p>` : ''}
@@ -2556,10 +2945,9 @@ function targetDialog(existing) {
       <span class="spacer"></span>
       <button class="primary" id="tg-save">Добавить</button>
     </div></div></div>`);
-  document.body.appendChild(backdrop);
-  const close = () => backdrop.remove();
+  mountModal(backdrop);
+  const close = () => closeModal(backdrop);
   qs('#tg-close', backdrop).onclick = close;
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
 
   const collect = () => ({
     kind: qs('#tg-kind', backdrop).value,
@@ -2631,8 +3019,8 @@ RENDERERS.logs = {
       const level = qs('#log-level') ? qs('#log-level').value : '';
       const search = qs('#log-search') ? qs('#log-search').value : '';
       const [logs, events] = await Promise.all([
-        API.get(`/api/logs?limit=250&level=${level}&search=${encodeURIComponent(search)}`),
-        API.get('/api/events?limit=150'),
+        API.latest('logs', `/api/logs?limit=250&level=${level}&search=${encodeURIComponent(search)}`),
+        API.latest('log-events', '/api/events?limit=150'),
       ]);
       const counts = qs('#log-counts');
       if (counts) {

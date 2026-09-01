@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import DependencyMissing, classify_exception
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
@@ -45,9 +46,9 @@ class WhisperEngine(Engine):
         device = self.resolve_device(settings)
         temperature: Any
         if settings.get("temperature_fallback", True):
-            temperature = (float(settings.get("temperature") or 0.0), 0.2, 0.4, 0.6, 0.8, 1.0)
+            temperature = (S.num(settings, "temperature", 0.0), 0.2, 0.4, 0.6, 0.8, 1.0)
         else:
-            temperature = float(settings.get("temperature") or 0.0)
+            temperature = S.num(settings, "temperature", 0.0)
 
         options: dict[str, Any] = {
             "language": self.language_for(settings),
@@ -57,8 +58,8 @@ class WhisperEngine(Engine):
             "best_of": int(settings.get("best_of") or 5),
             "compression_ratio_threshold": float(
                 settings.get("compression_ratio_threshold") or 2.4),
-            "logprob_threshold": float(settings.get("logprob_threshold") or -1.0),
-            "no_speech_threshold": float(settings.get("no_speech_threshold") or 0.6),
+            "logprob_threshold": S.num(settings, "logprob_threshold", -1.0),
+            "no_speech_threshold": S.num(settings, "no_speech_threshold", 0.6),
             "condition_on_previous_text": bool(
                 settings.get("condition_on_previous_text", False)),
             "word_timestamps": bool(settings.get("word_timestamps", True)),
@@ -76,7 +77,7 @@ class WhisperEngine(Engine):
             options["initial_prompt"] = prompt
             if settings.get("carry_initial_prompt"):
                 options["carry_initial_prompt"] = True
-        threshold = float(settings.get("hallucination_silence_threshold") or 0.0)
+        threshold = S.num(settings, "hallucination_silence_threshold", 0.0)
         if threshold > 0 and options["word_timestamps"]:
             options["hallucination_silence_threshold"] = threshold
 

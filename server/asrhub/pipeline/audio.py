@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import AudioError, AudioTooLong, BinaryMissing, UnsupportedFormat
 from ..logging_setup import get_logger
 
@@ -191,7 +192,7 @@ def build_filter_chain(settings: dict[str, Any]) -> str:
     """Собирает цепочку фильтров ffmpeg по настройкам задания."""
     filters: list[str] = []
 
-    highpass = int(settings.get("audio_highpass_hz") or 0)
+    highpass = S.integer(settings, "audio_highpass_hz", 0)
     if highpass > 0:
         filters.append(f"highpass=f={highpass}")
 
@@ -293,7 +294,7 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> list[tuple[st
     workdir.mkdir(parents=True, exist_ok=True)
     info = probe(src)
 
-    limit = int(settings.get("audio_max_duration_s") or 0)
+    limit = S.integer(settings, "audio_max_duration_s", 0)
     if limit and info.duration_s > limit:
         raise AudioTooLong(info.duration_s, limit)
     if info.duration_s <= 0.05:

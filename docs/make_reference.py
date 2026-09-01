@@ -7,7 +7,7 @@
 не соответствует схеме OOXML (лишний символ в стиле, продублированный
 pStyle, перепутанный порядок элементов в settings.xml).
 
-    python3 docs/make_reference.py [build/reference.docx]
+    python3 docs/make_reference.py [build/reference.docx] [подпись в колонтитуле]
 """
 from __future__ import annotations
 
@@ -36,7 +36,9 @@ NS = ('xmlns:o="urn:schemas-microsoft-com:office:office" '
       'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
       'xmlns:sl="http://schemas.openxmlformats.org/schemaLibrary/2006/main"')
 
-FOOTER = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+#: Колонтитул. Подпись подставляется: у отдельного справочника по
+#: интерфейсу она своя, иначе он подписан как полная документация.
+FOOTER_TEMPLATE = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:p>
     <w:pPr>
@@ -45,7 +47,7 @@ FOOTER = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
       <w:spacing w:before="0" w:after="0"/>
     </w:pPr>
     <w:r><w:rPr><w:color w:val="7A8794"/><w:sz w:val="16"/></w:rPr>
-      <w:t>ASR Hub — документация</w:t></w:r>
+      <w:t>{footer_text}</w:t></w:r>
     <w:r><w:tab/></w:r><w:r><w:tab/></w:r>
     <w:r><w:rPr><w:color w:val="7A8794"/><w:sz w:val="16"/></w:rPr>
       <w:fldChar w:fldCharType="begin"/></w:r>
@@ -230,6 +232,7 @@ def build_styles(xml: str) -> str:
 
 def main(argv: list[str]) -> int:
     out = Path(argv[1]) if len(argv) > 1 else DEFAULT_OUT
+    footer = argv[2] if len(argv) > 2 else "ASR Hub — документация"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -244,7 +247,8 @@ def main(argv: list[str]) -> int:
         styles = work / "word" / "styles.xml"
         styles.write_text(build_styles(styles.read_text(encoding="utf-8")), encoding="utf-8")
 
-        (work / "word" / "footer1.xml").write_text(FOOTER, encoding="utf-8")
+        (work / "word" / "footer1.xml").write_text(
+            FOOTER_TEMPLATE.format(footer_text=footer), encoding="utf-8")
         (work / "word" / "settings.xml").write_text(SETTINGS, encoding="utf-8")
 
         rels = work / "word" / "_rels" / "document.xml.rels"

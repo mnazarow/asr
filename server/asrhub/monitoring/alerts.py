@@ -125,15 +125,15 @@ def default_rules() -> list[Rule]:
         # Метрики, для которых порог задан в процентах или в приросте, здесь
         # не проверяются: их выражения требуют функций Prometheus.
         if spec.name in {"asrhub_jobs_total", "asrhub_http_requests_total",
-                         "asrhub_ram_used_mb", "asrhub_gpu_memory_mb",
+                         "asrhub_ram_used_bytes", "asrhub_gpu_memory_used_bytes",
                          "asrhub_no_speech_total", "asrhub_auth_failures_total",
                          "asrhub_webhooks_total", "asrhub_uptime_seconds"}:
             continue
         labels = {}
         if spec.name in {"asrhub_rtf", "asrhub_queue_wait_seconds"}:
-            labels = {"quantile": "p95"}
+            labels = {"stat": "p95"}
         elif spec.name == "asrhub_confidence":
-            labels = {"quantile": "avg"}
+            labels = {"stat": "avg"}
         for severity, value in (("critical", threshold.critical),
                                 ("warning", threshold.warning)):
             if value is None:

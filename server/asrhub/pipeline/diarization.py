@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..engines.base import Segment
 from ..errors import DependencyMissing, GatedModelError
 from ..logging_setup import get_logger
@@ -74,7 +75,7 @@ def _pyannote(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, f
             pass
 
     kwargs: dict[str, Any] = {}
-    num = int(settings.get("diarization_num_speakers") or 0)
+    num = S.integer(settings, "diarization_num_speakers", 0)
     if num:
         kwargs["num_speakers"] = num
     else:
@@ -136,7 +137,7 @@ def _by_pauses(segments: list[Segment], settings: dict[str, Any]) -> list[Segmen
     Не заменяет настоящую диаризацию, но на поочерёдном диалоге двух человек
     даёт разумный результат и не требует ни одной зависимости.
     """
-    speakers = max(2, int(settings.get("diarization_num_speakers") or 2))
+    speakers = max(2, S.integer(settings, "diarization_num_speakers", 2))
     gap_threshold = float(settings.get("diarization_pause_s") or 1.2)
     current = 0
     previous_end = None

@@ -57,6 +57,8 @@ class MetricSpec:
     troubleshooting: str = ""
     since_restart: bool = False
     expensive: bool = False
+    #: Заполнено у устаревших имён: указывает на новое имя метрики.
+    deprecated_for: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +69,7 @@ class MetricSpec:
             "threshold": self.threshold.to_dict() if self.threshold else None,
             "troubleshooting": self.troubleshooting,
             "since_restart": self.since_restart,
+            "deprecated_for": self.deprecated_for,
         }
 
 
@@ -257,7 +260,7 @@ _m(MetricSpec(
 
 _m(MetricSpec(
     name="asrhub_queue_wait_seconds", type="gauge", group="queue",
-    label="Ожидание в очереди", unit="с", labels=("quantile",),
+    label="Ожидание в очереди", unit="с", labels=("stat",),
     description=(
         "Время ожидания завершённых заданий: средние и перцентили p50, p90, p95, p99 "
         "за последние сутки."
@@ -415,7 +418,7 @@ _m(MetricSpec(
 
 _m(MetricSpec(
     name="asrhub_rtf", type="gauge", group="performance",
-    label="Коэффициент реального времени", labels=("quantile",),
+    label="Коэффициент реального времени", labels=("stat",),
     description=(
         "Отношение времени обработки к длительности записи. RTF 0,1 значит, что "
         "часовая запись обрабатывается за шесть минут. Меньше — лучше. "
@@ -493,7 +496,7 @@ _m(MetricSpec(
 
 _m(MetricSpec(
     name="asrhub_confidence", type="gauge", group="quality",
-    label="Уверенность модели", labels=("quantile",),
+    label="Уверенность модели", labels=("stat",),
     description=(
         "Оценка, которую модель даёт собственному результату: среднее и перцентили "
         "за сутки."
@@ -908,6 +911,64 @@ _m(MetricSpec(
     threshold=Threshold("below", warning=1, for_seconds=900),
 ))
 
+
+#: Метрики, переименованные ради соглашения об именовании Prometheus
+#: (базовые единицы: байты и секунды). Старое имя отдаётся рядом с новым,
+#: помеченное как устаревшее, чтобы существующие панели и правила не
+#: сломались в день обновления. Удалить старые имена можно будет тогда,
+#: когда все потребители перейдут на новые.
+RENAMED: dict[str, tuple[str, float]] = {
+    # старое имя: (новое имя, множитель к значению)
+    "asrhub_ram_used_mb": ("asrhub_ram_used_bytes", 1024 ** 2),
+    "asrhub_ram_total_mb": ("asrhub_ram_total_bytes", 1024 ** 2),
+    "asrhub_gpu_memory_mb": ("asrhub_gpu_memory_used_bytes", 1024 ** 2),
+    "asrhub_gpu_memory_total_mb": ("asrhub_gpu_memory_total_bytes", 1024 ** 2),
+    "asrhub_process_memory_mb": ("asrhub_process_memory_bytes", 1024 ** 2),
+    "asrhub_disk_free_gb": ("asrhub_disk_free_bytes", 1024 ** 3),
+    "asrhub_database_size_mb": ("asrhub_database_size_bytes", 1024 ** 2),
+    "asrhub_last_error_timestamp": ("asrhub_last_error_timestamp_seconds", 1.0),
+}
+
+#: Обратное соответствие — по нему сборщик добавляет устаревшие имена.
+RENAMED_FROM: dict[str, tuple[str, float]] = {
+    new_name: (old_name, factor) for old_name, (new_name, factor) in RENAMED.items()
+}
+
+
+def _apply_renames() -> None:
+    """Переименовывает метрики каталога и заводит записи об устаревших именах."""
+    extra: list[MetricSpec] = []
+    for index, spec in enumerate(METRICS):
+        if spec.name not in RENAMED:
+            continue
+        new_name, factor = RENAMED[spec.name]
+        unit = {1024 ** 2: "Б", 1024 ** 3: "Б"}.get(factor, spec.unit)
+        METRICS[index] = MetricSpec(
+            **{**spec.__dict__, "name": new_name, "unit": unit,
+               "threshold": _rescale(spec.threshold, factor)})
+        extra.append(MetricSpec(
+            **{**spec.__dict__, "deprecated_for": new_name,
+               "description": spec.description + " Устаревшее имя: "
+                              f"пользуйтесь «{new_name}» в базовых единицах.",
+               "threshold": None}))
+    METRICS.extend(extra)
+
+
+def _rescale(threshold: Threshold | None, factor: float) -> Threshold | None:
+    """Пересчитывает порог под новую единицу измерения."""
+    if threshold is None or factor == 1.0:
+        return threshold
+    # Пороги, заданные в процентах, пересчитывать нельзя — их узнаём по примечанию.
+    if "процент" in (threshold.note or "").lower():
+        return threshold
+    return Threshold(
+        direction=threshold.direction,
+        warning=threshold.warning * factor if threshold.warning is not None else None,
+        critical=threshold.critical * factor if threshold.critical is not None else None,
+        for_seconds=threshold.for_seconds, note=threshold.note)
+
+
+_apply_renames()
 
 METRICS_BY_NAME = {m.name: m for m in METRICS}
 

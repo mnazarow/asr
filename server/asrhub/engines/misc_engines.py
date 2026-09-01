@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import DependencyMissing, EngineError, classify_exception
 from ..pipeline.audio import probe
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
@@ -267,7 +268,7 @@ class SherpaOnnxEngine(Engine):
             raise EngineError("В каталоге модели нет файлов model.onnx и tokens.txt.")
         return sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
             model=str(model_file), tokens=str(tokens),
-            num_threads=int(settings.get("cpu_threads") or 0) or (os.cpu_count() or 4))
+            num_threads=S.integer(settings, "cpu_threads", 0) or (os.cpu_count() or 4))
 
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:

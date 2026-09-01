@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import DependencyMissing, classify_exception
 from ..pipeline.audio import probe
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
@@ -72,7 +73,7 @@ class TransformersEngine(Engine):
                     progress: ProgressCallback | None) -> TranscriptionResult:
         info = probe(audio_path)
         chunk = float(settings.get("chunk_length_s") or 0) or 30.0
-        overlap = float(settings.get("chunk_overlap_s") or 1.0)
+        overlap = S.num(settings, "chunk_overlap_s", 1.0)
 
         kwargs: dict[str, Any] = {
             "chunk_length_s": chunk,

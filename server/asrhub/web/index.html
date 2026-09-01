@@ -8,8 +8,9 @@
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+<a class="skip-link" href="#content">Перейти к содержимому</a>
 <div class="app">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar" aria-label="Разделы">
     <div class="brand">
       <div class="brand-mark">AH</div>
       <div>
@@ -18,7 +19,7 @@
       </div>
     </div>
 
-    <nav class="nav" id="nav">
+    <nav class="nav" id="nav" aria-label="Основная навигация">
       <div class="nav-group">Работа</div>
       <button class="nav-item active" data-view="transcribe">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4"/></svg>
@@ -70,7 +71,7 @@
     </nav>
 
     <div class="sidebar-foot">
-      <div id="conn-status"><span class="status-dot warn"></span>подключение…</div>
+      <div id="conn-status" role="status" aria-live="polite"><span class="status-dot warn"></span>подключение…</div>
       <div class="row">
         <span id="version-label">v3.0.0</span>
         <span class="spacer"></span>
@@ -81,6 +82,10 @@
 
   <div class="main">
     <header class="topbar">
+      <button class="ghost icon nav-toggle" id="nav-toggle"
+              aria-label="Открыть меню разделов" aria-expanded="false" aria-controls="sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
       <div>
         <h1 id="view-title">Транскрибация</h1>
         <div class="sub" id="view-subtitle">Загрузка файлов и распознавание речи</div>
@@ -94,11 +99,11 @@
       </div>
     </header>
 
-    <main class="content" id="content"></main>
+    <main class="content" id="content" tabindex="-1"></main>
   </div>
 </div>
 
-<div class="toasts" id="toasts"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 <div class="chart-tip" id="chart-tip"></div>
 
 <script src="/static/charts.js"></script>

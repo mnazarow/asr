@@ -16,6 +16,7 @@ import unicodedata
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from .. import settings_access as S
 from ..logging_setup import get_logger
 
 log = get_logger("postprocess")
@@ -126,6 +127,21 @@ def remove_fillers(text: str, fillers: Iterable[str] = ()) -> str:
 _PUNCT_CACHE: dict[str, Any] = {}
 
 
+def _report_missing(what: str, choice: str, explicit: bool, exc: Exception) -> None:
+    """Сообщает о недоступной надстройке ровно настолько громко, насколько надо.
+
+    При `auto` перебор вариантов — штатный ход, и место ему в debug. Но если
+    надстройку выбрали явно, молчание обманывает: пользователь просил
+    расстановку знаков препинания, получил текст без них и нигде не увидел
+    почему. Такой случай — предупреждение.
+    """
+    if explicit:
+        log.warning("%s «%s» недоступен, обработка пропущена: %s. "
+                    "Установите пакет или выберите другой вариант.", what, choice, exc)
+    else:
+        log.debug("%s «%s» недоступен: %s", what, choice, exc)
+
+
 def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
     key = f"{model}:{language}"
     if key in _PUNCT_CACHE:
@@ -136,6 +152,7 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
         return fn
 
     choice = model
+    explicit = model != "auto"
     if model == "auto":
         choice = "rupunct" if language == "ru" else "multilingual"
 
@@ -151,7 +168,8 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
 
             return _register(apply)
         except Exception as exc:
-            log.debug("RUPunct недоступен: %s", exc)
+            _report_missing("Модуль расстановки знаков препинания", "rupunct",
+                            explicit, exc)
 
     if choice == "sbert_punc_case_ru":
         try:
@@ -160,7 +178,8 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
             model_obj = SbertPuncCase()
             return _register(lambda text: model_obj.punctuate(text))
         except Exception as exc:
-            log.debug("sbert_punc_case_ru недоступен: %s", exc)
+            _report_missing("Модуль расстановки знаков препинания",
+                            "sbert_punc_case_ru", explicit, exc)
 
     if choice == "multilingual":
         try:
@@ -169,7 +188,8 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
             model_obj = PunctuationModel()
             return _register(lambda text: model_obj.restore_punctuation(text))
         except Exception as exc:
-            log.debug("deepmultilingualpunctuation недоступен: %s", exc)
+            _report_missing("Модуль расстановки знаков препинания",
+                            "multilingual", explicit, exc)
 
     return _register(None)
 
@@ -253,6 +273,7 @@ def _load_itn(backend: str, language: str):
     if key in _ITN_CACHE:
         return _ITN_CACHE[key]
     choice = backend
+    explicit = backend != "auto"
     if backend == "auto":
         choice = "nemo"
     if choice == "nemo":
@@ -265,7 +286,7 @@ def _load_itn(backend: str, language: str):
             _ITN_CACHE[key] = normalizer.inverse_normalize
             return _ITN_CACHE[key]
         except Exception as exc:
-            log.debug("NeMo ITN недоступен: %s", exc)
+            _report_missing("Нормализатор чисел", "nemo", explicit, exc)
     if choice in ("rus2num", "nemo") and language == "ru":
         try:
             from rus2num import Rus2Num  # type: ignore
@@ -274,7 +295,7 @@ def _load_itn(backend: str, language: str):
             _ITN_CACHE[key] = conv.convert
             return _ITN_CACHE[key]
         except Exception as exc:
-            log.debug("rus2num недоступен: %s", exc)
+            _report_missing("Нормализатор чисел", "rus2num", explicit, exc)
     _ITN_CACHE[key] = None
     return None
 
@@ -544,7 +565,7 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
 
     if settings.get("merge_short_segments", True):
         segments = merge_segments(
-            segments, float(settings.get("min_segment_duration_s") or 1.5))
+            segments, S.num(settings, "min_segment_duration_s", 1.5))
 
     names = str(settings.get("speaker_names") or "").strip()
     if names:

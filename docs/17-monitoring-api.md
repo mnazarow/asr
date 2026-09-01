@@ -122,7 +122,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 263.4
+asrhub_uptime_seconds 53.3
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -156,8 +156,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788236615.9033678,
-  "collected_at": "2026-09-01T04:23:35+0000",
+  "timestamp": 1788284496.9026723,
+  "collected_at": "2026-09-01T17:41:36+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -234,14 +234,14 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 263.4,
+  "uptime_s": 53.3,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 263 с",
+        "detail": "работает 53 с",
         "hint": ""
       },
       {
@@ -270,7 +270,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 29.5 ГБ",
+        "detail": "свободно 29.4 ГБ",
         "hint": ""
       },
       {
@@ -278,6 +278,7 @@ curl 'http://сервер:8080/api/monitoring/health'
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
+      }
 …
 ```
 
@@ -336,7 +337,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 29.5 ГБ",
+      "detail": "свободно 29.4 ГБ",
       "hint": ""
     },
     {
@@ -377,8 +378,6 @@ curl 'http://сервер:8080/api/monitoring/ready'
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `group` | в адресе | string | — | — |
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 **Пример**
 
@@ -442,8 +441,6 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/catalog?
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `name` | в пути | string | обязателен | — |
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 **Пример**
 
@@ -473,6 +470,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/catalog/a
   },
   "troubleshooting": "Поднять max_concurrent_jobs (если хватает памяти), перевести массовые задания на низкий приоритет, включить scheduling_policy: shortest_first, взять модель полегче",
   "since_restart": false,
+  "deprecated_for": "",
 …
 ```
 
@@ -492,8 +490,6 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/catalog/a
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `only_firing` | в адресе | boolean | `False` | — |
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 **Пример**
 
@@ -508,7 +504,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
   "summary": {
     "rules": 34,
     "firing": 0,
-    "pending": 1,
+    "pending": 2,
     "critical": 0,
     "warning": 0,
     "worst": "ok"
@@ -527,8 +523,6 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `limit` | в адресе | integer | `100` | — |
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 ### `GET /api/monitoring/alerts/rules`
 
@@ -537,22 +531,12 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 **Доступ:** любой действующий ключ.
 
 
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
-
 ### `PUT /api/monitoring/alerts/rules`
 
 Заменить правила оповещения.
 
 **Доступ:** ключ с ролью **admin**.
 
-
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 **Тело запроса** — JSON:
 
@@ -586,11 +570,6 @@ curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \
 **Доступ:** ключ с ролью **admin**.
 
 
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
-
 ## Приёмники метрик
 
 Куда сервер отправляет метрики сам.
@@ -601,11 +580,6 @@ curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \
 
 **Доступ:** любой действующий ключ.
 
-
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 **Пример**
 
@@ -635,11 +609,6 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/targets
 **Доступ:** ключ с ролью **admin**.
 
 
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
-
 **Тело запроса** — JSON:
 
 ```json
@@ -664,11 +633,6 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/targets
 
 **Доступ:** ключ с ролью **admin**.
 
-
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
 
 **Тело запроса** — JSON:
 
@@ -763,11 +727,6 @@ curl http://сервер:8080/api/monitoring/config/prometheus \
 **Доступ:** любой действующий ключ.
 
 
-| Параметр | Где | Тип | По умолчанию | Описание |
-|---|---|---|---|---|
-| `X-API-Key` | в заголовке | string | — | — |
-| `authorization` | в заголовке | string | — | — |
-
 **Пример**
 
 ```bash
@@ -779,13 +738,13 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 ```json
 {
   "scrapes": 3,
-  "samples": 311,
+  "samples": 496,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {
     "rules": 34,
     "firing": 0,
-    "pending": 1,
+    "pending": 2,
     "critical": 0,
     "warning": 0,
     "worst": "ok"

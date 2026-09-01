@@ -242,11 +242,21 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     @ws_router.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         # Лента событий несёт имена файлов, статусы и ошибки заданий, поэтому
-        # закрыта тем же ключом, что и остальной интерфейс. Ключ приходит в
-        # параметре адреса: заголовки в браузерном WebSocket задать нельзя.
+        # закрыта тем же ключом, что и остальной интерфейс. Заголовки в
+        # браузерном WebSocket задать нельзя, поэтому веб-интерфейс сначала
+        # берёт одноразовый билет (POST /api/auth/ticket) и предъявляет его в
+        # параметре ticket. Постоянный ключ в адресе тоже принимается — ради
+        # сторонних клиентов, — но интерфейс им больше не пользуется: адрес
+        # оседает в истории браузера и в журналах прокси.
         if settings.get("auth_enabled", True):
-            token = (websocket.query_params.get("api_key")
-                     or websocket.headers.get("x-api-key") or "")
+            hub_state = getattr(websocket.app.state, "hub", None)
+            token = ""
+            ticket = websocket.query_params.get("ticket", "")
+            if ticket and hub_state is not None:
+                token = hub_state.tickets.redeem(ticket)
+            if not token:
+                token = (websocket.query_params.get("api_key")
+                         or websocket.headers.get("x-api-key") or "")
             if not token:
                 header = websocket.headers.get("authorization", "")
                 parts = header.split(" ", 1)

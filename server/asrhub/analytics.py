@@ -44,9 +44,9 @@ class Analytics:
 
     # --- сводка ---------------------------------------------------------
 
-    def overview(self, period: str = "day") -> dict[str, Any]:
+    def overview(self, period: str = "day", owner: str | None = None) -> dict[str, Any]:
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
         done = [j for j in jobs if j["status"] == "completed"]
         failed = [j for j in jobs if j["status"] == "failed"]
         cancelled = [j for j in jobs if j["status"] == "cancelled"]
@@ -121,11 +121,12 @@ class Analytics:
 
     # --- ряды по времени -------------------------------------------------
 
-    def timeseries(self, period: str = "day", buckets: int = 48) -> dict[str, Any]:
+    def timeseries(self, period: str = "day", buckets: int = 48,
+                   owner: str | None = None) -> dict[str, Any]:
         since = _since(period) or (time.time() - PERIODS["week"])
         span = max(time.time() - since, 60.0)
         width = span / buckets
-        jobs = self.db.list_jobs(since=since, limit=100000, light=True)
+        jobs = self.db.list_jobs(since=since, limit=100000, owner=owner, light=True)
 
         series = {
             "labels": [], "completed": [], "failed": [], "audio_minutes": [],
@@ -179,9 +180,9 @@ class Analytics:
 
     # --- сравнение моделей -------------------------------------------------
 
-    def by_model(self, period: str = "month") -> list[dict[str, Any]]:
+    def by_model(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for job in jobs:
             grouped.setdefault(str(job.get("model") or "—"), []).append(job)
@@ -222,21 +223,22 @@ class Analytics:
 
     # --- прочие срезы -------------------------------------------------------
 
-    def by_language(self, period: str = "month") -> list[dict[str, Any]]:
+    def by_language(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         return self._group(period, "language", "Язык не определён")
 
-    def by_owner(self, period: str = "month") -> list[dict[str, Any]]:
-        return self._group(period, "owner", "аноним")
+    def by_owner(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+        return self._group(period, "owner", "аноним", owner)
 
-    def by_engine(self, period: str = "month") -> list[dict[str, Any]]:
+    def by_engine(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         return self._group(period, "engine", "—")
 
-    def by_source(self, period: str = "month") -> list[dict[str, Any]]:
-        return self._group(period, "source", "api")
+    def by_source(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+        return self._group(period, "source", "api", owner)
 
-    def _group(self, period: str, field: str, fallback: str) -> list[dict[str, Any]]:
+    def _group(self, period: str, field: str, fallback: str,
+               owner: str | None = None) -> list[dict[str, Any]]:
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for job in jobs:
             grouped.setdefault(str(job.get(field) or fallback), []).append(job)
@@ -257,9 +259,9 @@ class Analytics:
         rows.sort(key=lambda r: r["jobs"], reverse=True)
         return rows
 
-    def errors(self, period: str = "month") -> dict[str, Any]:
+    def errors(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         since = _since(period)
-        jobs = self.db.list_jobs(status="failed", since=since or None, limit=10000, light=True)
+        jobs = self.db.list_jobs(status="failed", since=since or None, limit=10000, owner=owner, light=True)
         by_code: dict[str, dict[str, Any]] = {}
         for job in jobs:
             code = str(job.get("error_code") or "unknown")
@@ -282,9 +284,10 @@ class Analytics:
             "by_code": rows,
         }
 
-    def duration_histogram(self, period: str = "month", bins: int = 10) -> dict[str, Any]:
+    def duration_histogram(self, period: str = "month", bins: int = 10,
+                          owner: str | None = None) -> dict[str, Any]:
         since = _since(period)
-        jobs = [j for j in self.db.list_jobs(status="completed", since=since or None, limit=100000, light=True)
+        jobs = [j for j in self.db.list_jobs(status="completed", since=since or None, limit=100000, owner=owner, light=True)
                 if j.get("media_duration_s")]
         durations = [float(j["media_duration_s"]) for j in jobs]
         if not durations:
@@ -301,9 +304,10 @@ class Analytics:
         return {"labels": labels, "counts": counts,
                 "total": len(durations), "summary": M.summarize(durations)}
 
-    def slowest(self, period: str = "month", limit: int = 15) -> list[dict[str, Any]]:
+    def slowest(self, period: str = "month", limit: int = 15,
+                owner: str | None = None) -> list[dict[str, Any]]:
         since = _since(period)
-        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, light=True)
+        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, owner=owner, light=True)
         jobs = [j for j in jobs if j.get("rtf")]
         jobs.sort(key=lambda j: float(j["rtf"]), reverse=True)
         return [{
@@ -313,10 +317,10 @@ class Analytics:
             "created_at": j.get("created_at"),
         } for j in jobs[:limit]]
 
-    def hourly_profile(self, period: str = "month") -> dict[str, Any]:
+    def hourly_profile(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         """Распределение нагрузки по часам суток и дням недели."""
         since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, light=True)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
         hours = [0] * 24
         weekdays = [0] * 7
         for job in jobs:
@@ -331,10 +335,10 @@ class Analytics:
             "peak_hour": max(range(24), key=lambda h: hours[h]) if any(hours) else None,
         }
 
-    def efficiency(self, period: str = "month") -> dict[str, Any]:
+    def efficiency(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         """Оценка эффективности: сколько ресурсов уходит на час аудио."""
         since = _since(period)
-        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, light=True)
+        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, owner=owner, light=True)
         audio = sum(float(j.get("media_duration_s") or 0) for j in jobs)
         proc = sum(float(j.get("processing_time_s") or 0) for j in jobs)
         load = sum(float(j.get("model_load_s") or 0) for j in jobs)
@@ -354,19 +358,19 @@ class Analytics:
 
     # --- сводный отчёт -------------------------------------------------------
 
-    def full_report(self, period: str = "week") -> dict[str, Any]:
+    def full_report(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
         return {
-            "overview": self.overview(period),
-            "timeseries": self.timeseries(period),
-            "models": self.by_model(period),
-            "languages": self.by_language(period),
-            "owners": self.by_owner(period),
-            "engines": self.by_engine(period),
-            "errors": self.errors(period),
-            "durations": self.duration_histogram(period),
-            "slowest": self.slowest(period),
-            "profile": self.hourly_profile(period),
-            "efficiency": self.efficiency(period),
+            "overview": self.overview(period, owner),
+            "timeseries": self.timeseries(period, owner=owner),
+            "models": self.by_model(period, owner),
+            "languages": self.by_language(period, owner),
+            "owners": self.by_owner(period, owner),
+            "engines": self.by_engine(period, owner),
+            "errors": self.errors(period, owner),
+            "durations": self.duration_histogram(period, owner=owner),
+            "slowest": self.slowest(period, owner=owner),
+            "profile": self.hourly_profile(period, owner),
+            "efficiency": self.efficiency(period, owner),
         }
 
     # --- экспорт метрик Prometheus --------------------------------------------

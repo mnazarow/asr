@@ -83,7 +83,10 @@ a:hover { text-decoration: underline; }
 
 .nav { padding: 10px 8px; flex: 1; overflow-y: auto; }
 .nav-item {
-  display: flex; align-items: center; gap: 10px; width: 100%;
+  /* justify-content наследуется от общего правила для button (center), и
+     пункты без счётчика оказывались посередине, а со счётчиком — слева:
+     список выглядел рваным. */
+  display: flex; align-items: center; justify-content: flex-start; gap: 10px; width: 100%;
   padding: 8px 10px; margin-bottom: 2px; border: 0; border-radius: var(--radius-sm);
   background: transparent; color: var(--text-dim); font: inherit; font-size: 13.5px;
   cursor: pointer; text-align: left; transition: background .12s, color .12s;
@@ -421,3 +424,133 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   font-size: 12px; color: var(--text-dim);
 }
 .mon-field input, .mon-field select { width: 100%; }
+
+/* ==========================================================================
+   Доступность с клавиатуры
+   ========================================================================== */
+
+/* Кольцо фокуса рисуется только при работе с клавиатуры (:focus-visible),
+   поэтому клик мышью его не оставляет. Раньше кольца не было вовсе, и на
+   тёмной теме положение фокуса было не видно совсем: пройти интерфейс
+   табуляцией было нельзя. */
+:where(button, a, [tabindex], summary):focus-visible,
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+.nav-item:focus-visible { outline-offset: -2px; }
+
+/* Ссылка «к содержимому» видна только при переходе на неё табуляцией. */
+.skip-link {
+  position: absolute; left: -9999px; top: 0; z-index: 500;
+  padding: 10px 16px; background: var(--accent); color: #fff;
+  border-radius: 0 0 var(--radius-sm) 0; font-size: 13px;
+}
+.skip-link:focus { left: 0; text-decoration: none; }
+
+/* Пока открыто модальное окно, фон не прокручивается: иначе на телефоне
+   страница уезжала под окном и вернуться к нужному месту было нельзя. */
+body.modal-open { overflow: hidden; }
+
+.dropzone:focus-visible { border-color: var(--accent); }
+
+/* Уважаем системную настройку «меньше движения». */
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+
+/* ==========================================================================
+   Узкие экраны
+   ========================================================================== */
+
+.nav-toggle { display: none; }
+
+@media (max-width: 900px) {
+  /* Боковая панель уезжает за край и выдвигается кнопкой: на 360 px она
+     занимала две трети ширины, и от таблицы результатов оставалась
+     полоска в несколько символов. */
+  .app { grid-template-columns: 1fr; }
+
+  .sidebar {
+    position: fixed; top: 0; left: 0; bottom: 0; width: 240px; z-index: 210;
+    transform: translateX(-100%); transition: transform .2s ease;
+    box-shadow: var(--shadow); height: 100dvh;
+  }
+  body.nav-open .sidebar { transform: translateX(0); }
+
+  /* Спрятанная панель не должна ловить фокус. Одного transform мало: все
+     её одиннадцать кнопок оставались в порядке обхода, и на телефоне после
+     ссылки «Перейти к содержимому» шло двенадцать невидимых остановок Tab
+     за левым краем экрана — фокуса не видно, страница не двигается,
+     ощущение «Tab сломан». visibility убирает их из обхода и не мешает
+     плавному выезду: она анимируется вместе с transform. */
+  .sidebar { visibility: hidden; transition: transform .2s ease, visibility .2s; }
+  body.nav-open .sidebar { visibility: visible; }
+
+  /* Подложка гасит выдвинутую панель по нажатию мимо неё. */
+  body.nav-open::after {
+    content: ''; position: fixed; inset: 0; z-index: 205;
+    background: rgba(0, 0, 0, .5);
+  }
+
+  .nav-toggle { display: inline-flex; }
+
+  .topbar { padding: 10px 14px; gap: 10px; }
+  .topbar h1 { font-size: 15.5px; }
+  .topbar .sub { display: none; }
+  .topbar-actions .chip { display: none; }
+
+  .content { padding: 14px 14px 48px; }
+  .card { padding: 13px 14px; }
+
+  /* Таблицы шире экрана прокручиваются внутри своей рамки, а не растягивают
+     страницу: горизонтальная прокрутка всего документа ломает липкую шапку. */
+  .table-wrap { max-height: none; -webkit-overflow-scrolling: touch; }
+  .table-wrap table { min-width: 560px; }
+  /* Таблица без обёртки .table-wrap прокручивается сама: иначе её ширина
+     раздвигала карточку, а за ней и весь документ. */
+  .card > table, .modal-body > table, .card > div > table {
+    display: block; overflow-x: auto; max-width: 100%;
+  }
+
+  /* Шапки карточек и панели кнопок переносятся: раньше кнопка «Очистить
+     очередь» уезжала за правый край и была недоступна. */
+  .card-head { flex-wrap: wrap; row-gap: 8px; }
+  .card-head .spacer { margin-left: 0; flex-basis: 100%; height: 0; }
+  .settings-toolbar { top: 48px; }
+  .topbar-actions { flex-wrap: nowrap; }
+
+  /* Параметр перестаёт быть двухколоночным: колонка управления была
+     фиксированной (300 px) и одна занимала почти весь экран. */
+  .param { grid-template-columns: 1fr; gap: 10px; }
+  .param-control { max-width: 100%; }
+
+  /* Поля ввода и списки не шире своего места. */
+  input[type=text], input[type=number], input[type=search],
+  input[type=password], select, textarea { max-width: 100%; min-width: 0; }
+  /* Элемент сетки по умолчанию не сжимается уже своего содержимого
+     (min-width: auto). Из-за этого карточка с таблицей раздвигала колонку
+     до 590 px, и весь документ уезжал вправо. */
+  .split, .grid { min-width: 0; }
+  .grid > *, .split > *, .main, .content > * { min-width: 0; }
+
+  .modal-backdrop { padding: 0; place-items: stretch; }
+  .modal { max-height: 100dvh; height: 100dvh; border-radius: 0; border: 0; }
+
+  .toasts { right: 10px; left: 10px; bottom: 10px; }
+  .toast { max-width: none; }
+
+  .row { flex-wrap: wrap; }
+}
+
+@media (max-width: 560px) {
+  .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-6 { grid-template-columns: 1fr; }
+  .topbar-actions { gap: 4px; }
+  .content { padding: 12px 10px 44px; }
+  .kpi { padding: 12px 13px; }
+  .kpi-value { font-size: 21px; }
+  .modal-head, .modal-body, .modal-foot { padding-left: 12px; padding-right: 12px; }
+  .modal-foot { flex-wrap: wrap; }
+}

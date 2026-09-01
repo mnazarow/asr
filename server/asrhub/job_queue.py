@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import random
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -97,6 +98,9 @@ class JobQueue:
         self._workers: list[threading.Thread] = []
         self._states: list[WorkerState] = []
         self._cancelled: set[str] = set()
+        # Индексы воркеров, помеченных на выход при уменьшении их числа.
+        self._retiring: set[int] = set()
+        self._webhooks: Any = None
         self._running: dict[str, float] = {}
         self._model_counts: dict[str, int] = {}
         self._max_queue = int(getattr(settings, "get", lambda *_: 1000)("max_queue_size", 1000) or 1000)
@@ -123,6 +127,10 @@ class JobQueue:
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop.set()
+        with self._lock:
+            pool, self._webhooks = self._webhooks, None
+        if pool is not None:
+            pool.shutdown(wait=False)
         self._wake.set()
         for thread in self._workers:
             thread.join(timeout=timeout / max(1, len(self._workers)))
@@ -130,16 +138,27 @@ class JobQueue:
         log.info("Очередь остановлена")
 
     def recover(self) -> int:
-        """Возвращает в очередь задания, оставшиеся в состоянии «выполняется»."""
-        stuck = self.db.list_jobs(status=STATUS_RUNNING, limit=1000)
-        for job in stuck:
-            self.db.update_job(job["id"], status=STATUS_QUEUED, stage="",
-                               progress=0.0, started_at=None)
-            self.db.add_event(job["id"], "recovered",
-                              "Задание возвращено в очередь после перезапуска сервера")
-        if stuck:
-            log.warning("Возвращено в очередь после перезапуска: %d заданий", len(stuck))
-        return len(stuck)
+        """Возвращает в очередь задания, оставшиеся в состоянии «выполняется».
+
+        Обрабатываются все такие задания, а не первая тысяча: остаток иначе
+        зависал бы навсегда — планировщик его не выберет, а очистка не удалит.
+        """
+        total = 0
+        while True:
+            stuck = self.db.list_jobs(status=STATUS_RUNNING, limit=1000, light=True)
+            if not stuck:
+                break
+            for job in stuck:
+                self.db.update_job(job["id"], status=STATUS_QUEUED, stage="",
+                                   progress=0.0, started_at=None)
+                self.db.add_event(job["id"], "recovered",
+                                  "Задание возвращено в очередь после перезапуска сервера")
+            total += len(stuck)
+            if len(stuck) < 1000:
+                break
+        if total:
+            log.warning("Возвращено в очередь после перезапуска: %d заданий", total)
+        return total
 
     # --- добавление -----------------------------------------------------
 
@@ -149,8 +168,16 @@ class JobQueue:
                tags: str = "", deadline: float | None = None,
                reference_text: str = "", webhook_url: str = "") -> dict[str, Any]:
         """Ставит файл в очередь. Возвращает описание задания."""
-        if webhook_url:
-            webhook_url = self._check_webhook_url(webhook_url)
+        # Адрес уведомления приходит двумя путями: отдельным аргументом и
+        # полем webhook_url внутри настроек задания. Проверялся только
+        # первый, поэтому запрет на внутреннюю сеть обходился одной строкой
+        # в JSON: settings={"webhook_url":"http://169.254.169.254/..."} — и
+        # сервер сам ходил по этому адресу, а поле webhook_status работало
+        # оракулом для обхода внутренней сети. Проверяем оба.
+        target = webhook_url or str(settings.get("webhook_url") or "")
+        if target:
+            target = self._check_webhook_url(target)
+        webhook_url = target
         depth = self.db.count_jobs(status=[STATUS_QUEUED, STATUS_RETRY])
         if depth >= self._max_queue:
             raise QueueFull(f"В очереди уже {depth} заданий (предел {self._max_queue}).")
@@ -175,9 +202,15 @@ class JobQueue:
             cached = self._find_cached(digest, params_digest)
             if cached is not None:
                 job_id = self._clone_cached(cached, filename, str(path), owner,
-                                            group_id, settings)
+                                            group_id, settings, webhook_url)
                 RUNTIME.inc("asrhub_cached_jobs_total")
                 self._emit("job.cached", {"id": job_id, "source": cached["id"]})
+                # Задание завершено мгновенно, но для отправителя оно
+                # завершено — значит уведомление обязано уйти. Раньше на
+                # этом пути его не отправляли вовсе, и внешняя система
+                # ждала колбэка до собственного тайм-аута.
+                if webhook_url:
+                    self._send_webhook(job_id)
                 return self.get(job_id)
 
         payload = dict(settings)
@@ -203,28 +236,41 @@ class JobQueue:
             "tags": tags,
             "deadline": deadline,
             "reference_text": reference_text or None,
-            "webhook_url": webhook_url or str(settings.get("webhook_url") or "") or None,
+            "webhook_url": webhook_url or None,
         })
         self._emit("job.queued", {"id": job_id, "filename": filename})
         self._wake.set()
         return self.get(job_id)
 
     def _find_cached(self, file_digest: str, params_digest: str) -> dict[str, Any] | None:
-        candidates = self.db.list_jobs(status=STATUS_COMPLETED, limit=50)
-        for job in candidates:
-            if job.get("file_hash") == file_digest and \
-                    (job.get("params") or {}).get("_hash") == params_digest:
-                return job
-        return None
+        """Ищет готовый результат для той же записи с теми же настройками.
+
+        Поиск идёт запросом по индексу, а не перебором последних заданий:
+        при потоке больше полусотни файлов перебор просто не находил
+        совпадений, и дедупликация тихо переставала работать.
+        """
+        cached = self.db.find_cached(file_digest, params_digest)
+        if cached is None:
+            return None
+        # Результаты могли быть удалены очисткой, а запись остаться:
+        # отдавать ссылку на несуществующий каталог нельзя.
+        result_path = cached.get("result_path")
+        if result_path and not Path(result_path).is_dir():
+            log.debug("Кеш пропущен: каталог результатов %s исчез", result_path)
+            return None
+        return cached
 
     def _clone_cached(self, cached: dict[str, Any], filename: str, path: str,
                       owner: str, group_id: str | None,
-                      settings: dict[str, Any]) -> str:
+                      settings: dict[str, Any], webhook_url: str = "") -> str:
         job_id = self.db.create_job({
             "id": new_id(),
             "group_id": group_id,
             "filename": filename,
             "file_path": path,
+            # Адрес уведомления переносим в клон: без него задание
+            # завершалось молча и повторить отправку было нечем.
+            "webhook_url": webhook_url or None,
             "file_hash": cached.get("file_hash"),
             "media_duration_s": cached.get("media_duration_s"),
             "engine": cached.get("engine"),
@@ -235,11 +281,14 @@ class JobQueue:
             "status": STATUS_COMPLETED,
             "cached_from": cached["id"],
         })
+        # Копируем каталог результатов, а не ссылаемся на чужой: иначе
+        # удаление любого из двух заданий уничтожало результаты второго.
+        result_path = self._copy_results(cached.get("result_path"), job_id)
         self.db.update_job(
             job_id,
             status=STATUS_COMPLETED,
             started_at=now(), finished_at=now(),
-            text=cached.get("text"), result_path=cached.get("result_path"),
+            text=cached.get("text"), result_path=result_path,
             segments_count=cached.get("segments_count"),
             words_count=cached.get("words_count"),
             avg_confidence=cached.get("avg_confidence"),
@@ -261,16 +310,47 @@ class JobQueue:
             raise JobNotFound(f"Задание «{job_id}» не найдено.")
         return job
 
+    def _copy_results(self, source: str | None, job_id: str) -> str | None:
+        """Копирует каталог результатов для задания, отданного из кеша."""
+        if not source:
+            return None
+        origin = Path(source)
+        if not origin.is_dir():
+            return None
+        target = self.settings.paths.results / job_id
+        try:
+            shutil.copytree(origin, target, dirs_exist_ok=True)
+        except OSError as exc:
+            log.warning("Не удалось скопировать результаты из кеша: %s", exc)
+            return str(origin)          # хуже, чем копия, но лучше, чем ничего
+        return str(target)
+
     def cancel(self, job_id: str, by: str = "user") -> dict[str, Any]:
+        """Отменяет задание. Уже завершённое не трогает.
+
+        Смена статуса идёт условным запросом: между проверкой и записью
+        воркер мог успеть завершить задание, и безусловная запись пометила
+        бы готовый результат отменённым.
+        """
         job = self.get(job_id)
         if job["status"] in (STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED):
             return job
         with self._lock:
             self._cancelled.add(job_id)
-        self.db.update_job(job_id, status=STATUS_CANCELLED, cancelled_by=by,
-                           finished_at=now(), stage="отменено")
-        self.db.add_event(job_id, "cancelled", f"Отменено ({by})")
-        self._emit("job.cancelled", {"id": job_id})
+
+        changed = self.db.update_job_if_status(
+            job_id,
+            expected=[STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY, STATUS_PAUSED],
+            status=STATUS_CANCELLED, cancelled_by=by,
+            finished_at=now(), stage="отменено")
+        if changed:
+            self.db.add_event(job_id, "cancelled", f"Отменено ({by})")
+            self._emit("job.cancelled", {"id": job_id})
+        else:
+            # Задание завершилось прямо во время отмены — это не ошибка.
+            with self._lock:
+                self._cancelled.discard(job_id)
+            log.info("Отмена %s не применена: задание уже завершилось", job_id)
         return self.get(job_id)
 
     def cancel_group(self, group_id: str) -> int:
@@ -355,11 +435,19 @@ class JobQueue:
         return self._paused
 
     def set_concurrency(self, workers: int) -> None:
-        """Меняет число воркеров: новые запускаются сразу, лишние завершатся сами."""
+        """Меняет число воркеров на ходу.
+
+        Новые потоки запускаются сразу; лишние помечаются на выход и
+        завершаются, доработав текущее задание. Без этой пометки потоки
+        оставались жить, а последовательность 2 → 8 → 2 оставляла восемь
+        живых воркеров при заявленных двух.
+        """
         workers = max(1, min(64, int(workers)))
         with self._lock:
             current = len(self._states)
             if workers > current:
+                # Вернувшиеся к работе индексы снимаем с выхода.
+                self._retiring -= set(range(workers))
                 for index in range(current, workers):
                     state = WorkerState(index=index)
                     self._states.append(state)
@@ -367,6 +455,8 @@ class JobQueue:
                                               name=f"asrhub-worker-{index}", daemon=True)
                     thread.start()
                     self._workers.append(thread)
+            elif workers < current:
+                self._retiring.update(range(workers, current))
             self._limit = workers
         self.settings.set("max_concurrent_jobs", workers)
         self._wake.set()
@@ -384,8 +474,18 @@ class JobQueue:
             per_model_limit = int(self.settings.get("max_concurrent_per_model") or 0)
 
             policy = str(self.settings.get("scheduling_policy") or "priority_fifo")
-            candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY], limit=500,
-                                           order="priority DESC")
+            # Порядок предварительной выборки должен соответствовать политике,
+            # иначе она работает на случайной верхушке очереди: срочное
+            # задание с низким приоритетом не будет выбрано, пока не
+            # разгребётся всё, что стоит выше.
+            preselect = {
+                "shortest_first": "media_duration_s ASC",
+                "deadline": "created_at ASC",
+                "fair_share": "created_at ASC",
+            }.get(policy, "priority DESC")
+            window = int(self.settings.get("scheduling_window") or 500)
+            candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
+                                           limit=window, order=preselect, light=True)
             candidates = [c for c in candidates if c["id"] not in self._running]
             if per_model_limit > 0:
                 candidates = [c for c in candidates
@@ -402,11 +502,33 @@ class JobQueue:
             self._running[chosen["id"]] = time.time()
             model = chosen.get("model") or ""
             self._model_counts[model] = self._model_counts.get(model, 0) + 1
+
+        # Слот занят. Дальше два обращения к базе, и любой их срыв обязан
+        # слот вернуть: освобождение живёт в _worker_loop, но только для
+        # заданий, которые тот успел получить. Без отката одна ошибка «база
+        # заблокирована» навсегда съедала слот, а при достижении предела
+        # очередь переставала брать работу до перезапуска.
+        try:
             self.db.update_job(chosen["id"], status=STATUS_RUNNING, started_at=now(),
                                stage="запуск", progress=0.0,
                                queue_time_s=max(0.0, now() - float(
                                    chosen.get("queued_at") or chosen.get("created_at") or now())))
-            return self.db.get_job(chosen["id"])
+            job = self.db.get_job(chosen["id"])
+        except Exception:
+            self._release_slot(chosen["id"], model)
+            raise
+        if job is None:
+            # Задание удалили между выборкой и чтением.
+            self._release_slot(chosen["id"], model)
+            return None
+        return job
+
+    def _release_slot(self, job_id: str, model: str) -> None:
+        """Возвращает занятый слот и счётчик модели."""
+        with self._lock:
+            self._running.pop(job_id, None)
+            if model in self._model_counts:
+                self._model_counts[model] = max(0, self._model_counts[model] - 1)
 
     def _check_webhook_url(self, url: str) -> str:
         """Проверяет адрес уведомления.
@@ -506,6 +628,13 @@ class JobQueue:
 
     def _worker_loop(self, index: int) -> None:
         while not self._stop.is_set():
+            with self._lock:
+                if index in self._retiring:
+                    self._retiring.discard(index)
+                    if index < len(self._states):
+                        del self._states[index:]
+                    log.info("Воркер %d завершён: число воркеров уменьшено", index)
+                    return
             job = None
             try:
                 job = self._next_job(index)
@@ -710,7 +839,23 @@ class JobQueue:
         job = self.db.get_job(job_id)
         if not job or not job.get("webhook_url"):
             return
-        threading.Thread(target=self._webhook_worker, args=(job,), daemon=True).start()
+        self._webhook_pool().submit(self._webhook_worker, job)
+
+    def _webhook_pool(self) -> Any:
+        """Ограниченный пул для доставки уведомлений.
+
+        Создаётся при первой доставке, чтобы не держать потоки на серверах,
+        где уведомления не используются.
+        """
+        with self._lock:
+            if self._webhooks is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                size = max(1, int(self.settings.get("webhook_workers") or 4))
+                self._webhooks = ThreadPoolExecutor(
+                    max_workers=size, thread_name_prefix="asrhub-webhook")
+                log.debug("Пул доставки уведомлений: %d потоков", size)
+            return self._webhooks
 
     def _webhook_worker(self, job: dict[str, Any]) -> None:
         import hashlib
@@ -763,6 +908,7 @@ class JobQueue:
 
     def _janitor_loop(self) -> None:
         last_cleanup = 0.0
+        failures = 0
         while not self._stop.wait(timeout=20.0):
             try:
                 self.registry.collect_idle()
@@ -773,8 +919,20 @@ class JobQueue:
                     if any(removed.values()):
                         log.info("Очистка хранилища: %s", removed)
                     last_cleanup = time.time()
-            except Exception as exc:
-                log.debug("Служебный цикл: %s", exc)
+            except Exception as exc:                    # noqa: BLE001
+                # Раньше здесь стоял debug, и постоянно падающая очистка диска
+                # не давала ни одной записи при штатном уровне INFO. Первые
+                # сбои показываем, дальше переходим на debug, чтобы не залить
+                # журнал одной и той же строкой раз в двадцать секунд.
+                failures += 1
+                if failures <= 3 or failures % 180 == 0:
+                    log.warning("Служебный цикл дал сбой (%d-й раз): %s", failures, exc)
+                else:
+                    log.debug("Служебный цикл: %s", exc)
+            else:
+                if failures:
+                    log.info("Служебный цикл восстановился после %d сбоев", failures)
+                failures = 0
 
     def _sample_system(self) -> None:
         sample: dict[str, Any] = {

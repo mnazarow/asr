@@ -517,13 +517,21 @@ class Database:
 
     #: Колонки, которых достаточно аналитике. Без них выборка тащит ещё и
     #: колонку text — то есть все расшифровки целиком.
+    #: Колонки облегчённого списка. Смысл набора — не тащить расшифровку и
+    #: разбор по сегментам: на сотне часовых записей это единицы мегабайт.
+    #: Всё остальное, чем пользуются планировщик, аналитика и таблицы,
+    #: обязано здесь быть — иначе получатель молча видит None. Так уже
+    #: случилось: без deadline не работала политика планирования по сроку,
+    #: без error_message и filename разбор ошибок в аналитике показывал
+    #: пустые столбцы у всех строк.
     LIGHT_COLUMNS = (
         "id, status, model, engine, language, owner, source, priority, "
-        "created_at, queued_at, started_at, finished_at, media_duration_s, "
-        "processing_time_s, queue_time_s, audio_prep_s, model_load_s, "
-        "inference_s, postprocess_s, rtf, words_count, chars_count, "
-        "segments_count, speakers_count, avg_confidence, wer, cer, "
-        "error_code, retries, cached_from, device, file_size"
+        "filename, deadline, created_at, queued_at, started_at, finished_at, "
+        "media_duration_s, processing_time_s, queue_time_s, audio_prep_s, "
+        "model_load_s, inference_s, postprocess_s, rtf, words_count, "
+        "chars_count, segments_count, speakers_count, avg_confidence, wer, "
+        "cer, error_code, error_message, error_hint, retries, cached_from, "
+        "device, file_size"
     )
 
     def list_jobs(self, *, status: str | list[str] | None = None, owner: str | None = None,
@@ -558,6 +566,7 @@ class Database:
             "created_at DESC", "created_at ASC", "priority DESC", "priority ASC",
             "media_duration_s DESC", "media_duration_s ASC", "rtf ASC", "rtf DESC",
             "finished_at DESC", "processing_time_s DESC", "updated_at DESC",
+            "queued_at ASC", "queued_at DESC", "deadline ASC",
         }
         if order not in allowed_order:
             order = "created_at DESC"
@@ -591,6 +600,29 @@ class Database:
             conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM events WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    def update_job_if_status(self, job_id: str, expected: list[str],
+                             **fields: Any) -> bool:
+        """Обновляет задание, только если его статус входит в ожидаемые.
+
+        Нужно там, где между чтением и записью состояние может измениться:
+        отмена и завершение задания идут из разных потоков, и безусловная
+        запись помечала бы готовый результат отменённым.
+
+        Returns:
+            True, если запись состоялась.
+        """
+        if not fields:
+            return False
+        fields["updated_at"] = now()
+        if isinstance(fields.get("params"), dict):
+            fields["params"] = json.dumps(fields["params"], ensure_ascii=False)
+        columns = ", ".join(f"{name}=?" for name in fields)
+        placeholders = ",".join("?" for _ in expected)
+        changed = self.execute(
+            f"UPDATE jobs SET {columns} WHERE id=? AND status IN ({placeholders})",
+            [*fields.values(), job_id, *expected])
+        return bool(changed)
 
     def find_cached(self, file_hash: str, params_hash: str) -> dict[str, Any] | None:
         row = self.query_one(

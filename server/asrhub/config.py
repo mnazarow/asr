@@ -75,6 +75,8 @@ def _mini_yaml(text: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
     section: dict[str, Any] | None = None
     list_key: str | None = None
+    #: Ключ верхнего уровня, про который ещё не известно, секция это или список.
+    pending_top_level: str | None = None
     for raw in text.splitlines():
         line = raw.split(" #", 1)[0].rstrip()
         if not line.strip() or line.lstrip().startswith("#"):
@@ -82,10 +84,16 @@ def _mini_yaml(text: str) -> dict[str, Any]:
         indent = len(line) - len(line.lstrip())
         stripped = line.strip()
         if stripped.startswith("- "):
+            if list_key is None:
+                continue
+            if pending_top_level == list_key:
+                # Оказалось, что это список верхнего уровня, а не секция.
+                data[list_key] = []
+                section = None
+                pending_top_level = None
             target = section if section is not None else data
-            if list_key is not None:
-                target.setdefault(list_key, [])
-                target[list_key].append(_scalar(stripped[2:].strip()))
+            target.setdefault(list_key, [])
+            target[list_key].append(_scalar(stripped[2:].strip()))
             continue
         if ":" not in stripped:
             continue
@@ -93,17 +101,22 @@ def _mini_yaml(text: str) -> dict[str, Any]:
         key = key.strip()
         val = val.strip()
         if indent == 0:
-            list_key = None
             if val == "":
+                # Ключ верхнего уровня без значения — это либо секция, либо
+                # список. Что именно, покажет следующая непустая строка:
+                # «- элемент» означает список. Раньше здесь всегда заводилась
+                # секция, и списки верхнего уровня молча терялись.
                 section = {}
                 data[key] = section
-                list_key = key if False else None
-                section_name = key
-                data[section_name] = section
+                list_key = key
+                pending_top_level = key
             else:
                 section = None
+                list_key = None
+                pending_top_level = None
                 data[key] = _scalar(val)
         else:
+            pending_top_level = None
             target = section if section is not None else data
             if val == "":
                 target[key] = []
@@ -212,9 +225,21 @@ class Settings:
                     result[key] = value
         return result
 
+    #: Параметры, которые нельзя показывать без include_secrets. Это обычные
+    #: значения каталога, поэтому они лежали в values и уходили любому ключу
+    #: вместе с настройками. webhook_secret подписывает уведомления: ключ
+    #: «только чтение» получал возможность подделывать результаты для
+    #: принимающей стороны.
+    SECRET_KEYS = ("webhook_secret",)
+
     def to_dict(self, include_secrets: bool = False) -> dict[str, Any]:
+        values = dict(self.values)
+        if not include_secrets:
+            for key in self.SECRET_KEYS:
+                if values.get(key):
+                    values[key] = "***"
         data = {
-            "values": dict(self.values),
+            "values": values,
             "sources": dict(self.sources),
             "config_file": str(self.config_file) if self.config_file else None,
             "paths": {k: str(v) for k, v in vars(self.paths).items()} if self.paths else {},

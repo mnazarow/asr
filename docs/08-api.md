@@ -4,6 +4,8 @@ HTTP-интерфейс покрывает всё, что умеет веб-ин
 
 Живой справочник по адресу `/api/reference` собирается сервером из схемы OpenAPI и работает без интернета. Машинно-читаемая схема — `/api/openapi.json`.
 
+Эта глава — введение: как устроен обмен и как решаются типовые задачи. Полный перечень маршрутов со всеми параметрами, правами доступа и настоящими примерами ответов вынесен в отдельный документ — «ASR Hub — программный интерфейс». Он собирается с работающего сервера командой `bash docs/build-api.sh`, поэтому не может разойтись с тем, что сервер отдаёт на самом деле.
+
 ## Аутентификация
 
 Ключ передаётся одним из трёх способов:
@@ -204,22 +206,52 @@ POST /api/maintenance/unload-models
 
 ## События по WebSocket
 
+Браузерный WebSocket не умеет отправлять заголовки, поэтому ключ пришлось бы писать в адрес — а он попадает в историю браузера, в журнал обратного прокси и в заголовок `Referer`. Вместо ключа берётся одноразовый билет: он живёт минуту, гасится при первом подключении и не открывает доступ к HTTP-маршрутам.
+
 ```javascript
-const ws = new WebSocket('ws://сервер:8080/ws?api_key=ah_ваш_ключ');
+// 1. Билет — обычным запросом с заголовком
+const { ticket } = await fetch('/api/auth/ticket', {
+  method: 'POST',
+  headers: { 'X-API-Key': ключ },
+}).then((r) => r.json());
+
+// 2. Подключение по билету
+const ws = new WebSocket(`ws://сервер:8080/ws?ticket=${encodeURIComponent(ticket)}`);
 
 ws.onmessage = (event) => {
-  const { type, data } = JSON.parse(event.data);
-  switch (type) {
-    case 'job.progress':  console.log(data.id, data.stage, data.progress); break;
-    case 'job.completed': console.log('готово', data.id); break;
-    case 'job.failed':    console.error(data.error, data.hint); break;
+  // Поля события лежат на верхнем уровне сообщения, вложенного data нет.
+  const message = JSON.parse(event.data);
+  switch (message.type) {
+    case 'job.progress':  console.log(message.id, message.stage, message.progress); break;
+    case 'job.completed': console.log('готово', message.id, 'RTF', message.rtf); break;
+    case 'job.failed':    console.error(message.error.message, message.error.hint); break;
   }
 };
 
 setInterval(() => ws.send('ping'), 30000);   // держим соединение живым
 ```
 
-Типы событий: `job.created`, `job.started`, `job.progress`, `job.completed`, `job.failed`, `job.retry`, `job.cancelled`, `job.cached`, `queue.changed`, `system.sample`, `server.ready`.
+Сторонние клиенты — те, что умеют задавать заголовки или живут в закрытом контуре, — могут по-прежнему подключаться с ключом: `ws://сервер:8080/ws?api_key=$КЛЮЧ`.
+
+**Типы событий**
+
+| Событие | Когда приходит | Полезные поля |
+|---|---|---|
+| `hello` | сразу после подключения | `queue` — состояние очереди, `history` — последние 20 событий |
+| `job.queued` | задание принято | `id`, `filename` |
+| `job.started` | задание взято в работу | `id`, `filename` |
+| `job.progress` | по ходу распознавания | `id`, `progress` (0…1), `stage` |
+| `job.completed` | задание готово | `id`, `rtf` |
+| `job.failed` | задание не удалось | `id`, `error` — объект с `code`, `message`, `hint` |
+| `job.retry` | будет повтор после сбоя | `id`, `attempt`, `delay_s`, `error` |
+| `job.cancelled` | задание отменено | `id` |
+| `job.cached` | результат взят из кеша | `id`, `source` — задание, из которого взят результат |
+| `queue.paused` | очередь приостановлена | — |
+| `queue.resumed` | очередь возобновлена | — |
+| `queue` | ответ на команду `status` | состояние очереди целиком |
+| `pong` | ответ на команду `ping` | — |
+
+В каждом сообщении есть `type` и `ts` — время события. Клиент может отправить серверу две команды: `ping` (ответ `pong`, чтобы соединение не закрыл прокси) и `status` (ответ `queue`).
 
 ## Формат ошибок
 

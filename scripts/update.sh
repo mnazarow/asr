@@ -161,15 +161,48 @@ if [[ -f "${DATA_DIR}/asrhub.db" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
   done
 fi
 
+# --- Режим установки --------------------------------------------------------
+
+# Установка в контейнере обновляется иначе: файлы в образе, а не в системе,
+# и без пересборки образа новая версия просто не попадала в работу — команда
+# отрабатывала «успешно», а сервер продолжал крутить старый код.
+DOCKER_MODE=0
+if [[ -f "${PREFIX}/docker/docker-compose.yml" && ! -x "${VPIP}" ]] && have docker; then
+  DOCKER_MODE=1
+elif [[ -f "${PREFIX}/docker/.env" ]] && have docker \
+     && docker ps --filter "name=^asrhub$" --format '{{.Names}}' 2>/dev/null | grep -q asrhub; then
+  DOCKER_MODE=1
+fi
+
+compose_cmd() {
+  local compose="docker compose"
+  docker compose version >/dev/null 2>&1 || compose="docker-compose"
+  local files=(-f docker-compose.yml)
+  # Надстройку с видеокартой подключаем, если ей пользовались при установке.
+  if grep -qE '^ASRHUB_ACCEL=cuda' "${PREFIX}/docker/.env" 2>/dev/null \
+     && [[ -f "${PREFIX}/docker/docker-compose.gpu.yml" ]]; then
+    files+=(-f docker-compose.gpu.yml)
+  fi
+  printf '%s ' "${compose}" "${files[@]}"
+}
+
 # --- Остановка --------------------------------------------------------------
 
 step "Остановка службы"
 WAS_RUNNING=0
-if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" >/dev/null 2>&1; then
-  WAS_RUNNING=1
-  bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" || warn "Не удалось остановить службу."
+if [[ "${DOCKER_MODE}" -eq 1 ]]; then
+  if docker ps --filter "name=^asrhub$" --format '{{.Names}}' 2>/dev/null | grep -q asrhub; then
+    WAS_RUNNING=1
+  fi
+  info "Установка в контейнере: остановка произойдёт при пересборке."
+  ok "Готово"
+else
+  if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" >/dev/null 2>&1; then
+    WAS_RUNNING=1
+    bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" || warn "Не удалось остановить службу."
+  fi
+  ok "Служба остановлена"
 fi
-ok "Служба остановлена"
 
 # --- Файлы ------------------------------------------------------------------
 
@@ -189,7 +222,9 @@ fi
 # --- Зависимости ------------------------------------------------------------
 
 step "Обновление зависимостей"
-if [[ -x "${VPIP}" ]]; then
+if [[ "${DOCKER_MODE}" -eq 1 ]]; then
+  info "Зависимости живут в образе — обновятся при пересборке."
+elif [[ -x "${VPIP}" ]]; then
   PIP_FLAGS=(--disable-pip-version-check --no-input --upgrade)
   retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt" || \
     warn "Часть базовых зависимостей не обновилась."
@@ -220,13 +255,28 @@ if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-if [[ "${WAS_RUNNING}" -eq 1 ]]; then
+if [[ "${DOCKER_MODE}" -eq 1 ]]; then
+  COMPOSE_LINE="$(compose_cmd)"
+  info "Пересборка образа (может занять несколько минут)…"
+  # shellcheck disable=SC2086
+  ( cd "${PREFIX}/docker" && retry 2 run ${COMPOSE_LINE} --env-file .env build ) || {
+    error "Пересборка образа не удалась."
+    hint "Журнал сборки выше; прежний контейнер не тронут."
+    exit 1
+  }
+  # shellcheck disable=SC2086
+  ( cd "${PREFIX}/docker" && run ${COMPOSE_LINE} --env-file .env up -d )
+elif [[ "${WAS_RUNNING}" -eq 1 ]]; then
   bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" || true
 else
   info "До обновления служба не работала — не запускаем."
 fi
 
-PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
+if [[ "${DOCKER_MODE}" -eq 1 ]]; then
+  PORT="$(grep -E '^ASRHUB_PORT=' "${PREFIX}/docker/.env" 2>/dev/null | cut -d= -f2 | head -1)"
+else
+  PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
+fi
 PORT="${PORT:-8080}"
 HEALTH_OK=0
 for _ in $(seq 1 20); do
@@ -246,6 +296,10 @@ else
   if confirm "Откатиться к предыдущей версии?"; then
     exec bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" --yes
   fi
-  hint "Журнал службы: bash ${PREFIX}/scripts/service.sh logs"
+  if [[ "${DOCKER_MODE}" -eq 1 ]]; then
+    hint "Журнал контейнера: cd ${PREFIX}/docker && docker compose logs --tail 100"
+  else
+    hint "Журнал службы: bash ${PREFIX}/scripts/service.sh logs"
+  fi
   exit 1
 fi

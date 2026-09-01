@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from .. import catalog
 from ..db import new_id
 from ..errors import (
     ASRHubError,
@@ -31,6 +32,7 @@ from .deps import (
     get_state,
     require_owner,
     require_write,
+    scope_owner,
 )
 
 log = get_logger("api.jobs")
@@ -65,6 +67,52 @@ def _parse_settings(raw: str | None) -> dict[str, Any]:
             "Параметры задания должны быть объектом JSON.",
             hint='Пример: settings={"model":"gigaam-v3-rnnt","language":"ru"}'))
     return data
+
+
+#: Поля формы, которые обрабатываются отдельно и параметрами не являются.
+_RESERVED_FORM_FIELDS = frozenset({
+    "file", "files", "settings", "priority", "group_id", "tags",
+    "reference_text", "webhook_url",
+})
+
+
+async def _form_overrides(request: Request) -> dict[str, Any]:
+    """Параметры, переданные отдельными полями формы.
+
+    Раньше принималось только поле settings с объектом JSON внутри. Первое,
+    что делает человек с curl, — пишет `-F model=gigaam-v3-e2e-rnnt`, и это
+    поле молча пропадало: задание уходило на модель по умолчанию, а в ответе
+    стояла не та модель, которую просили. Теперь принимаются оба способа,
+    поле settings имеет больший вес.
+    """
+    try:
+        form = await request.form()
+    except Exception:                                   # noqa: BLE001
+        return {}
+
+    values: dict[str, Any] = {}
+    unknown: list[str] = []
+    for name in form:
+        if name in _RESERVED_FORM_FIELDS:
+            continue
+        raw = form[name]
+        if not isinstance(raw, str):
+            continue                                    # это файл, а не параметр
+        if catalog.PARAMS_BY_KEY.get(name) is None:
+            unknown.append(name)
+            continue
+        values[name] = raw
+
+    if unknown:
+        # Молчать нельзя: опечатка в имени параметра иначе выглядит как
+        # «сервер меня проигнорировал».
+        known = ", ".join(sorted(unknown))
+        raise error_response(ConfigError(
+            f"Неизвестные поля формы: {known}.",
+            hint="Список допустимых параметров: GET /api/params. "
+                 "Служебные поля: file, settings, priority, group_id, tags, "
+                 "reference_text, webhook_url."))
+    return values
 
 
 @router.post("", summary="Поставить файл в очередь")
@@ -108,22 +156,26 @@ async def create_job(
     finally:
         await file.close()
 
-    overrides = _parse_settings(settings)
+    # Всё, что идёт после записи файла, обязано убирать его за собой: файл
+    # уже лежит в uploads, а задания, которое на него ссылается, ещё нет —
+    # значит уборщик его никогда не найдёт. Раньше разбор полей формы стоял
+    # вне защиты, и каждая опечатка в имени параметра оставляла на диске
+    # копию загруженной записи.
     try:
+        # Значения из settings перекрывают одноимённые поля формы: явный JSON
+        # выражает намерение точнее, чем разрозненные поля.
+        overrides = {**await _form_overrides(request), **_parse_settings(settings)}
         merged = state.settings.merged(overrides)
-    except ASRHubError as exc:
-        target.unlink(missing_ok=True)
-        raise error_response(exc) from exc
-
-    try:
         job = state.queue.submit(
             file_path=target, filename=filename, settings=merged,
             owner=principal.name, api_key_name=principal.name,
             priority=priority, group_id=group_id, source="web",
             tags=tags, reference_text=reference_text, webhook_url=webhook_url)
-    except ASRHubError as exc:
+    except Exception:
+        # Ловим всё: ASRHubError, HTTPException от разбора полей и любую
+        # неожиданную ошибку — файл не должен пережить неудачный запрос.
         target.unlink(missing_ok=True)
-        raise error_response(exc) from exc
+        raise
     return job
 
 
@@ -148,7 +200,7 @@ async def create_batch(
     group = new_id("grp")
     created: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    overrides = _parse_settings(settings)
+    overrides = {**await _form_overrides(request), **_parse_settings(settings)}
     merged = state.settings.merged(overrides)
 
     for item in files:
@@ -201,6 +253,8 @@ def list_jobs(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     order: str = "created_at DESC",
+    light: bool = Query(default=False,
+                        description="Только поля для таблицы, без текста и сегментов"),
     principal: Principal = Depends(authenticate),
 ) -> dict[str, Any]:
     state = get_state(request)
@@ -210,12 +264,19 @@ def list_jobs(
     elif status and "," in status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
     since = time.time() - since_hours * 3600 if since_hours else None
-    jobs = state.db.list_jobs(status=statuses, owner=owner, model=model, group_id=group_id,
+    # Выборка сужается до собственных заданий для всех, кроме администратора.
+    # Карточка задания давно закрыта require_owner, а список — нет: чужие
+    # имена файлов, пути на диске и расшифровки уходили любому ключу.
+    scope = scope_owner(principal, owner)
+    # Облегчённый список пропускает текст расшифровки и сегменты. На сотне
+    # часовых записей ответ со всем текстом — единицы мегабайт, и таблица в
+    # интерфейсе ждала их только чтобы выбросить.
+    jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
-                              order=order)
+                              order=order, light=light)
     return {
         "items": jobs,
-        "total": state.db.count_jobs(status=statuses, owner=owner),
+        "total": state.db.count_jobs(status=statuses, owner=scope),
         "limit": limit,
         "offset": offset,
     }

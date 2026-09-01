@@ -80,7 +80,7 @@ def test_thresholds_are_sane():
 SAMPLES = [
     Sample("asrhub_up", 1),
     Sample("asrhub_queue_depth", 7),
-    Sample("asrhub_rtf", 0.12, {"quantile": "p95"}),
+    Sample("asrhub_rtf", 0.12, {"stat": "p95"}),
     Sample("asrhub_build_info", 1, {"version": "3.0.0", "python": "3.12.1"}),
 ]
 
@@ -89,7 +89,7 @@ def test_prometheus_format():
     text = exporters.prometheus(SAMPLES)
     assert "# HELP asrhub_queue_depth" in text
     assert "# TYPE asrhub_queue_depth gauge" in text
-    assert 'asrhub_rtf{quantile="p95"} 0.12' in text
+    assert 'asrhub_rtf{stat="p95"} 0.12' in text
     # HELP не должен повторяться для одной метрики
     assert text.count("# HELP asrhub_up") == 1
 
@@ -105,7 +105,7 @@ def test_openmetrics_has_eof():
 
 def test_influx_and_graphite():
     influx = exporters.influx_line(SAMPLES)
-    assert "asrhub_rtf,quantile=p95 value=0.12" in influx
+    assert "asrhub_rtf,stat=p95 value=0.12" in influx
     graphite = exporters.graphite(SAMPLES)
     assert "asrhub.rtf.p95 0.12" in graphite
 
@@ -453,7 +453,10 @@ def test_every_catalog_metric_is_produced_somewhere():
             continue
         sources += path.read_text(encoding="utf-8")
 
-    orphans = [spec.name for spec in METRICS if spec.name not in sources]
+    # Устаревшие имена вычисляются не по имени, а через таблицу переименований,
+    # поэтому в исходниках их нет — и это правильно.
+    orphans = [spec.name for spec in METRICS
+               if spec.name not in sources and not spec.deprecated_for]
     assert not orphans, f"метрики объявлены, но нигде не вычисляются: {orphans}"
 
 
@@ -494,3 +497,175 @@ def test_push_manager_restarts_after_stop():
     manager.start()
     assert manager._thread is not None and manager._thread.is_alive()
     manager.stop()
+
+
+def test_deprecated_metric_names_are_still_exposed(client):
+    """Переименование не должно ломать существующие панели и правила."""
+    from asrhub.monitoring.catalog import RENAMED
+
+    body = client.get("/api/monitoring/metrics").text
+    names = {line.split("{")[0].split(" ")[0]
+             for line in body.splitlines() if line and not line.startswith("#")}
+
+    for old_name, (new_name, _) in RENAMED.items():
+        if new_name not in names:
+            continue                    # метрика недоступна в этой среде (нет GPU)
+        assert old_name in names, f"устаревшее имя {old_name} перестало отдаваться"
+
+
+def test_deprecated_alias_value_matches_unit():
+    """Значение под старым именем — в старых единицах, под новым — в базовых."""
+    from asrhub.monitoring.collector import Collector
+
+    aliases = Collector._deprecated_aliases([
+        Sample("asrhub_disk_free_bytes", 21474836480.0),
+        Sample("asrhub_ram_used_bytes", 8589934592.0),
+    ])
+    by_name = {s.name: s.value for s in aliases}
+    assert by_name["asrhub_disk_free_gb"] == 20.0
+    assert by_name["asrhub_ram_used_mb"] == 8192.0
+
+
+def test_process_memory_name_does_not_depend_on_psutil(monkeypatch):
+    """Имя метрики памяти одинаково с psutil и без него.
+
+    Раньше ветка с psutil отдавала asrhub_process_memory_mb, а запасная —
+    asrhub_process_memory_bytes: одна и та же сборка публиковала метрику под
+    разными именами, и правило тревоги работало на половине установок.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parent.parent / "server" / "asrhub" / "monitoring" / "collector.py"
+    text = source.read_text(encoding="utf-8")
+    body = text[text.index("def _process"):text.index("def _storage")]
+    emitted = set(re.findall(r'Sample\("(asrhub_process_memory[a-z_]*)"', body))
+    assert emitted == {"asrhub_process_memory_bytes"}, \
+        f"метрика памяти отдаётся под именами {sorted(emitted)}"
+
+
+def test_database_size_is_read_from_file(client):
+    """Размер базы — настоящие байты файла, а не округлённые мегабайты.
+
+    stats()["size_mb"] округляется до сотых мегабайта: пустая база давала
+    ровный ноль байт, а большая — обратно домноженное округление.
+    """
+    body = client.get("/api/monitoring/metrics").text
+    line = next((row for row in body.splitlines()
+                 if row.startswith("asrhub_database_size_bytes ")), None)
+    assert line, "метрика размера базы не отдаётся"
+    value = float(line.split()[1])
+    assert value > 0, "у существующей базы размер не может быть нулевым"
+    assert value == int(value), "размер файла должен быть целым числом байт"
+
+
+# ---------------------------------------------------------------------------
+# Регрессии второй ревизии
+# ---------------------------------------------------------------------------
+
+def test_openmetrics_output_is_valid(client):
+    """Формат OpenMetrics должен разбираться эталонным разборщиком.
+
+    Имя семейства счётчика в OpenMetrics идёт без суффикса _total — его
+    несут только измерения. Пока имя объявлялось целиком, разборщик отвергал
+    весь снимок разом («Clashing name»), а не одну метрику: пропадали все
+    семейства, включая asrhub_up, и авария выглядела как падение сервиса.
+    """
+    parser = pytest.importorskip("prometheus_client.openmetrics.parser")
+    body = client.get("/api/monitoring/metrics?format=openmetrics").text
+    families = list(parser.text_string_to_metric_families(body))
+    assert len(families) > 30, "снимок подозрительно мал"
+
+
+def test_prometheus_output_is_valid(client):
+    """Обычный формат Prometheus тоже проверяем эталонным разборщиком."""
+    parser = pytest.importorskip("prometheus_client.parser")
+    body = client.get("/api/monitoring/metrics").text
+    families = list(parser.text_string_to_metric_families(body))
+    assert len(families) > 30
+
+
+def test_zabbix_template_matches_what_is_sent(client):
+    """Ключи в шаблоне Zabbix должны совпадать с ключами отправки.
+
+    zabbix_sender шлёт метрику с метками как «имя[значения]», а шаблон
+    объявлял «имя»: Zabbix сопоставляет trapper-элементы по точному ключу,
+    поэтому доезжало около пяти процентов данных, остальное отбивалось как
+    «unsupported item key» — мониторинг выглядел настроенным и молчал.
+    """
+    yaml = pytest.importorskip("yaml")
+    template = yaml.safe_load(client.get("/api/monitoring/config/zabbix").text)
+    tpl = template["zabbix_export"]["templates"][0]
+    declared = {item["key"] for item in tpl["items"]}
+    prototypes = {p["key"].split("[")[0]
+                  for rule in tpl.get("discovery_rules", [])
+                  for p in rule.get("item_prototypes", [])}
+
+    sent = client.get("/api/monitoring/metrics?format=zabbix").json()["data"]
+    keys = {point["key"] for point in sent}
+    uncovered = [k for k in keys
+                 if k not in declared and k.split("[")[0] not in prototypes]
+    assert not uncovered, f"отправляются ключи, которых нет в шаблоне: {uncovered[:5]}"
+
+
+def test_zabbix_triggers_are_not_always_firing(client):
+    """Триггеры не должны сравнивать проценты с байтами.
+
+    Порог из каталога подставлялся в сравнение сырого значения:
+    «last(asrhub_ram_used_bytes)>95» — авария при 95 байтах занятой памяти,
+    горящая всегда; «last(asrhub_up)<1» — не срабатывающий никогда.
+    """
+    yaml = pytest.importorskip("yaml")
+    template = yaml.safe_load(client.get("/api/monitoring/config/zabbix").text)
+    tpl = template["zabbix_export"]["templates"][0]
+    expressions = [t["expression"] for item in tpl["items"]
+                   for t in item.get("triggers", [])]
+    joined = "\n".join(expressions)
+
+    assert "last(/ASR Hub/asrhub_ram_used_bytes)>95" not in joined, \
+        "процент сравнивается с байтами"
+    assert "last(/ASR Hub/asrhub_up)<1" not in joined, \
+        "метрика есть только когда равна единице — условие никогда не сработает"
+    # Один порог не должен заводить три одинаковых триггера по срезам.
+    rtf = [e for e in expressions if "asrhub_rtf" in e]
+    assert len(rtf) <= 1, f"по срезам заведено {len(rtf)} одинаковых триггеров"
+
+
+def test_zero_is_a_legal_setting_value():
+    """Ноль в параметре — значение, а не «не задано».
+
+    Повсюду стояло `float(settings.get(key) or ЗАПАСНОЕ)`, и легальный ноль
+    подменялся значением по умолчанию: пользователь отключал отбраковку
+    тишины, интерфейс значение принимал, задание пересчитывалось — и
+    возвращался ровно прежний результат.
+    """
+    from asrhub import settings_access as S
+
+    assert S.num({"no_speech_threshold": 0.0}, "no_speech_threshold", 0.6) == 0.0
+    assert S.num({"logprob_threshold": 0.0}, "logprob_threshold", -1.0) == 0.0
+    assert S.integer({"job_timeout_s": 0}, "job_timeout_s", 7200) == 0
+    # Отсутствие и мусор по-прежнему дают запасное значение.
+    assert S.num({}, "no_speech_threshold", 0.6) == 0.6
+    assert S.num({"x": ""}, "x", 0.6) == 0.6
+    assert S.num({"x": "абв"}, "x", 0.6) == 0.6
+
+
+def test_engines_do_not_swallow_legal_zero():
+    """Ни один движок не должен подменять ноль через `or`."""
+    import pathlib
+    import re
+
+    from asrhub import catalog
+
+    zero_legal = {k for k, s in catalog.PARAMS_BY_KEY.items()
+                  if s.minimum is not None
+                  and s.minimum <= 0 <= (s.maximum if s.maximum is not None else 1e18)}
+    # Многострочный поиск: перенос строки внутри вызова прятал два места.
+    pattern = re.compile(r'settings\.get\(\s*"([a-z_0-9]+)"\s*\)\s*or\s*(-?[0-9.]+)', re.S)
+    offenders = []
+    root = pathlib.Path(__file__).resolve().parent.parent / "server" / "asrhub"
+    for path in list((root / "engines").glob("*.py")) + list((root / "pipeline").glob("*.py")):
+        for key, fallback in pattern.findall(path.read_text(encoding="utf-8")):
+            if key in zero_legal and float(fallback) != 0.0:
+                offenders.append(f"{path.name}: {key}")
+    assert not offenders, "легальный ноль подменяется: " + "; ".join(offenders)

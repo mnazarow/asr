@@ -13,18 +13,26 @@
 """
 from __future__ import annotations
 
-import json
 import sys
-import urllib.error
-import urllib.request
-from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
-DOCS = ROOT / "docs"
+from apidoc import (
+    DOCS,
+    METHOD_ORDER,
+    body_block,
+    fetch,
+    find_key,
+    load_schema,
+    params_table,
+    sample,
+)
+from apidoc import (
+    operation_block as shared_operation_block,
+)
+
 PREFIX = "/api/monitoring"
 
-METHOD_ORDER = {"get": 0, "post": 1, "put": 2, "delete": 3}
+__all__ = ["fetch", "sample", "params_table", "body_block"]
 
 #: Порядок разделов и их описание. Маршруты, не попавшие ни в один раздел,
 #: собираются в конце — так новый маршрут не потеряется молча.
@@ -60,59 +68,6 @@ ADMIN_ROUTES = {
 }
 
 
-def fetch(url: str, key: str = "", raw: bool = False) -> Any:
-    request = urllib.request.Request(url)
-    if key:
-        request.add_header("X-API-Key", key)
-    with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
-        body = response.read().decode("utf-8")
-    return body if raw else json.loads(body)
-
-
-def sample(base: str, path: str, key: str, *, limit: int = 900,
-           lang: str = "json") -> str:
-    """Настоящий ответ сервера, обрезанный до читаемого объёма."""
-    try:
-        body = fetch(base + path, key, raw=True)
-    except (urllib.error.URLError, OSError) as exc:
-        return f"```\n(сервер недоступен: {exc})\n```"
-    if lang == "json":
-        try:
-            body = json.dumps(json.loads(body), ensure_ascii=False, indent=2)
-        except json.JSONDecodeError:
-            pass
-    if len(body) > limit:
-        body = body[:limit].rsplit("\n", 1)[0] + "\n…"
-    return f"```{lang}\n{body}\n```"
-
-
-def params_table(operation: dict[str, Any]) -> list[str]:
-    parameters = operation.get("parameters") or []
-    if not parameters:
-        return []
-    rows = ["", "| Параметр | Где | Тип | По умолчанию | Описание |", "|---|---|---|---|---|"]
-    for item in parameters:
-        schema = item.get("schema") or {}
-        kind = schema.get("type") or schema.get("anyOf", [{}])[0].get("type", "—")
-        default = schema.get("default")
-        default_text = "обязателен" if item.get("required") else (
-            f"`{default}`" if default not in (None, "") else "—")
-        place = {"query": "в адресе", "path": "в пути", "header": "в заголовке"}.get(
-            item.get("in", ""), item.get("in", ""))
-        rows.append(f"| `{item['name']}` | {place} | {kind} | {default_text} | "
-                    f"{item.get('description', '') or '—'} |")
-    return rows
-
-
-def body_block(operation: dict[str, Any]) -> list[str]:
-    content = ((operation.get("requestBody") or {}).get("content") or {})
-    schema = (content.get("application/json") or {}).get("schema")
-    if not schema:
-        return []
-    return ["", "**Тело запроса** — JSON:", "",
-            "```json", json.dumps(schema, ensure_ascii=False, indent=2)[:600], "```"]
-
-
 def access_note(path: str, method: str) -> str:
     if (path, method) in ADMIN_ROUTES:
         return "ключ с ролью **admin**"
@@ -123,20 +78,10 @@ def access_note(path: str, method: str) -> str:
 
 def main(argv: list[str]) -> int:
     base = (argv[1] if len(argv) > 1 else "http://127.0.0.1:8080").rstrip("/")
-    key = argv[2] if len(argv) > 2 else ""
-    if not key:
-        for candidate in (Path("/tmp/asrhub-demo/api-key.txt"),
-                          Path.home() / ".local/share/asrhub/api-key.txt",
-                          Path("/var/lib/asrhub/api-key.txt")):
-            if candidate.exists():
-                key = candidate.read_text(encoding="utf-8").strip()
-                break
+    key = find_key(argv[2] if len(argv) > 2 else "", base=base)
 
-    try:
-        schema = fetch(f"{base}/api/openapi.json")
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"Не удалось получить схему с {base}: {exc}")
-        print("Запустите сервер и повторите: python3 -m asrhub --port 8080")
+    schema = load_schema(base)
+    if schema is None:
         return 1
 
     paths = {p: ops for p, ops in schema["paths"].items() if p.startswith(PREFIX)}
@@ -176,14 +121,18 @@ def main(argv: list[str]) -> int:
         add(f"{description}\n")
         for path in present:
             for method in sorted(paths[path], key=lambda m: METHOD_ORDER.get(m, 9)):
-                out.extend(operation_block(path, method, paths[path][method], base, key))
+                out.extend(shared_operation_block(
+                    path, method, paths[path][method], base, key,
+                    access=access_note, examples=EXAMPLES))
 
     leftovers = sorted(set(paths) - covered)
     if leftovers:
         add("## Прочие маршруты\n")
         for path in leftovers:
             for method in sorted(paths[path], key=lambda m: METHOD_ORDER.get(m, 9)):
-                out.extend(operation_block(path, method, paths[path][method], base, key))
+                out.extend(shared_operation_block(
+                    path, method, paths[path][method], base, key,
+                    access=access_note, examples=EXAMPLES))
 
     add(MONITORING_API_TAIL)
 
@@ -192,31 +141,6 @@ def main(argv: list[str]) -> int:
     target.write_text(text, encoding="utf-8")
     print(f"  {target.name} — {len(text.splitlines())} строк, {len(text) // 1024} КБ")
     return 0
-
-
-def operation_block(path: str, method: str, operation: dict[str, Any],
-                    base: str, key: str) -> list[str]:
-    lines = [f"### `{method.upper()} {path}`\n"]
-    if operation.get("summary"):
-        lines.append(f"{operation['summary']}.\n")
-    doc = (operation.get("description") or "").strip()
-    if doc:
-        lines.append(doc + "\n")
-    lines.append(f"**Доступ:** {access_note(path, method)}.\n")
-    lines.extend(params_table(operation))
-    lines.extend(body_block(operation))
-
-    example = EXAMPLES.get((path, method))
-    if example:
-        lines += ["", "**Пример**", "", "```bash", example["curl"], "```"]
-        if example.get("show"):
-            lines += ["", "**Ответ**", "",
-                      sample(base, example["show"], key, lang=example.get("lang", "json"),
-                             limit=example.get("limit", 900))]
-        if example.get("note"):
-            lines += ["", example["note"]]
-    lines.append("")
-    return lines
 
 
 K = "$КЛЮЧ"

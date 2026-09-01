@@ -23,7 +23,7 @@ from typing import Any
 
 from .catalog import get_model
 from .engines import EngineRegistry, Segment
-from .errors import ASRHubError, NoSpeechDetected
+from .errors import ASRHubError, JobCancelled, NoSpeechDetected
 from .logging_setup import get_logger
 from .pipeline import audio as audio_mod
 from .pipeline import export, metrics, postprocess, vad
@@ -45,8 +45,29 @@ class ProcessOutcome:
     speakers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
+    #: Стадии, которые входят в RTF. Загрузка весов исключена намеренно:
+    #: она случается раз на несколько заданий и к скорости распознавания
+    #: отношения не имеет, а её включение завышало показатель настолько,
+    #: что сравнивать его с цифрами производителей было бессмысленно.
+    RTF_STAGES = ("audio_prep", "vad", "inference", "alignment",
+                  "diarization", "postprocess")
+
     @property
     def rtf(self) -> float:
+        """Отношение времени обработки к длительности записи.
+
+        Считается по стадиям конвейера без загрузки модели и без выгрузки
+        результатов: первое — разовая трата, второе к распознаванию не
+        относится. Полное время задания хранится отдельно, в
+        `processing_time_s`.
+        """
+        total = sum(value for stage, value in self.timings.items()
+                    if stage in self.RTF_STAGES)
+        return round(total / self.duration_s, 4) if self.duration_s > 0 else 0.0
+
+    @property
+    def rtf_total(self) -> float:
+        """RTF с учётом всех стадий, включая загрузку модели и выгрузку."""
         total = sum(self.timings.values())
         return round(total / self.duration_s, 4) if self.duration_s > 0 else 0.0
 
@@ -59,6 +80,7 @@ class ProcessOutcome:
             "speakers": self.speakers,
             "metrics": {
                 "rtf": self.rtf,
+                "rtf_total": self.rtf_total,
                 "processing_time_s": round(sum(self.timings.values()), 3),
                 "segments": len(self.segments),
                 "words": sum(len(s.get("text", "").split()) for s in self.segments),
@@ -90,6 +112,18 @@ class Timer:
                 time.perf_counter() - self._start)
             self._label = ""
 
+    def snapshot(self) -> dict[str, float]:
+        """Замеры на текущий момент, вместе с ещё идущей стадией.
+
+        Нужен там, где показатели надо положить в файл до того, как этап
+        закончится: сам файл и есть результат этого этапа.
+        """
+        values = dict(self.values)
+        if self._label:
+            values[self._label] = values.get(self._label, 0.0) + (
+                time.perf_counter() - self._start)
+        return values
+
 
 def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry,
                 *, workdir: Path, outdir: Path, basename: str,
@@ -98,6 +132,10 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     """Полный цикл обработки одного файла."""
 
     def report(value: float, stage: str) -> None:
+        # Проверка отмены живёт здесь, потому что этот обработчик движки
+        # вызывают между фрагментами: так отмена доходит внутрь распознавания,
+        # а не ждёт его конца.
+        check_cancel()
         if progress is not None:
             try:
                 progress(max(0.0, min(1.0, value)), stage)
@@ -106,7 +144,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
 
     def check_cancel() -> None:
         if cancelled is not None and cancelled():
-            raise ASRHubError("Задание отменено пользователем.", hint="")
+            raise JobCancelled(
+                "Задание отменено пользователем.",
+                hint="Повторить можно кнопкой «Повторить» в карточке задания.")
 
     timer = Timer()
     outcome = ProcessOutcome()
@@ -276,10 +316,20 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         "created_at": time.strftime("%d.%m.%Y %H:%M"),
         "settings_digest": settings_digest(settings),
     }
+    # Замеры кладём в outcome ДО формирования полезной нагрузки: to_result
+    # читает self.timings, и раньше в каждый выгруженный файл уходили нули —
+    # «rtf: 0.0», «processing_time_s: 0» и ни одной стадии, тогда как в
+    # интерфейсе по тому же заданию стояли настоящие значения. Берём снимок
+    # с ещё идущей стадией выгрузки: полностью её закрыть нельзя, сама
+    # запись файлов ещё впереди.
+    outcome.timings = {k: round(v, 4) for k, v in timer.snapshot().items()}
+
     result_payload = outcome.to_result(meta)
     outcome.files = export.write_all(result_payload, settings, outdir, basename)
-    timer.stop()
 
+    # Окончательные замеры — уже со временем записи файлов; они уходят в базу
+    # и в метрики, где точность важнее совпадения с содержимым файла.
+    timer.stop()
     outcome.timings = {k: round(v, 4) for k, v in timer.values.items()}
     report(1.0, "готово")
     return outcome

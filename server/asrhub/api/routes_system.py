@@ -8,12 +8,19 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from .. import catalog
-from ..errors import ConfigError, KeyNotFound
+from ..errors import AuthError, ConfigError, ForbiddenError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
 from ..logging_setup import recent as log_recent
 from ..monitoring.collector import RUNTIME
-from .deps import Principal, authenticate, error_response, get_state, require_admin
+from .deps import (
+    Principal,
+    authenticate,
+    error_response,
+    get_state,
+    require_admin,
+    scope_owner,
+)
 
 router = APIRouter(prefix="/api", tags=["Сервер"])
 
@@ -28,6 +35,23 @@ def health(request: Request) -> dict[str, Any]:
         "queue_paused": state.queue.is_paused,
         "catalog_date": catalog.CATALOG_DATE,
     }
+
+
+@router.post("/auth/ticket", summary="Одноразовый билет для WebSocket")
+def auth_ticket(request: Request,
+                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Выдаёт короткоживущий одноразовый билет вместо ключа в адресе.
+
+    Браузерный WebSocket не умеет отправлять заголовки, поэтому ключ раньше
+    приходилось писать в строку запроса — а она видна в истории браузера, в
+    журналах обратного прокси и в поле Referer. Билет действует минуту,
+    гасится при первом же использовании и не даёт доступа к HTTP-методам.
+    """
+    state = get_state(request)
+    if not state.settings.get("auth_enabled", True):
+        return {"ticket": "", "expires_in": 0, "auth_enabled": False}
+    ticket, ttl = state.tickets.issue(principal.key)
+    return {"ticket": ticket, "expires_in": ttl, "auth_enabled": True}
 
 
 @router.get("/system", summary="Сведения о сервере и оборудовании")
@@ -156,7 +180,11 @@ def reset_settings(request: Request,
 def analytics(request: Request, period: str = Query(default="week"),
               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
-    return state.analytics.full_report(period)
+    # Ключу без прав администратора аналитика считается только по его
+    # заданиям: иначе разделы «ошибки» и «самые медленные» показывали чужие
+    # имена файлов, а «по владельцам» — весь список тех, кто пользуется
+    # сервером.
+    return state.analytics.full_report(period, owner=scope_owner(principal))
 
 
 @router.get("/analytics/{section}", summary="Отдельный раздел аналитики")
@@ -182,12 +210,19 @@ def analytics_section(request: Request, section: str, period: str = "week",
         raise error_response(ConfigError(
             f"Неизвестный раздел аналитики «{section}».",
             hint="Доступные разделы: " + ", ".join(sorted(handlers))))
-    return handler(period)
+    return handler(period, owner=scope_owner(principal))
 
 
 @router.get("/logs", summary="Журнал сервера")
 def logs(request: Request, limit: int = 200, level: str = "", search: str = "",
          job_id: str = "", principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Журнал сервера целиком.
+
+    Требует ключа администратора: записи несут имена чужих файлов, тексты
+    ошибок и трассировки, а разделить журнал по владельцам нечем — строка
+    пишется до того, как становится известен ключ.
+    """
+    require_admin(principal)
     return {"items": log_recent(limit=limit, level=level, search=search, job_id=job_id),
             "counts": log_counts()}
 
@@ -195,8 +230,20 @@ def logs(request: Request, limit: int = 200, level: str = "", search: str = "",
 @router.get("/events", summary="Лента событий")
 def events(request: Request, limit: int = 100,
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Лента событий сервера.
+
+    Событие ссылается на задание и несёт имя файла, поэтому лента целиком
+    доступна только администратору. Ключ пользователя видит события своих
+    заданий — по ним же строится живое обновление интерфейса.
+    """
     state = get_state(request)
-    return {"items": state.db.get_events(limit=limit)}
+    items = state.db.get_events(limit=limit if principal.is_admin else limit * 4)
+    if principal.is_admin:
+        return {"items": items}
+
+    own = {j["id"] for j in state.db.list_jobs(owner=principal.name, limit=2000, light=True)}
+    mine = [e for e in items if not e.get("job_id") or e.get("job_id") in own]
+    return {"items": mine[:limit]}
 
 
 @router.get("/keys", summary="Ключи доступа")
@@ -270,13 +317,58 @@ def revoke_key(request: Request, preview: str,
     return {"revoked": True, "name": name}
 
 
+def _guard_metrics(request: Request, state: Any) -> None:
+    """Допуск к метрикам: свободно при monitoring_public, иначе по ключу."""
+    if not state.settings.get("auth_enabled", True):
+        return
+    if state.settings.get("monitoring_public", True):
+        return
+    token = (request.headers.get("x-api-key") or "").strip()
+    if not token:
+        header = request.headers.get("authorization", "")
+        parts = header.split(" ", 1)
+        token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
+            else header.strip()
+    if not token:
+        token = request.query_params.get("api_key", "")
+    info = state.settings.api_keys.get(token)
+    if not info:
+        raise error_response(AuthError("Ключ доступа отсутствует или недействителен."))
+    if info.get("enabled") is False:
+        raise error_response(ForbiddenError("Ключ доступа отключён."))
+
+
 @router.get("/metrics", summary="Метрики Prometheus", response_class=PlainTextResponse)
 def metrics(request: Request) -> PlainTextResponse:
+    """Полный снимок метрик в формате Prometheus.
+
+    Тот же вывод, что и у /api/monitoring/metrics. Раньше здесь работал
+    отдельный, написанный вручную экспорт на полтора десятка метрик со
+    старыми именами (asrhub_ram_used_mb, asrhub_disk_free_gb): два адреса
+    отдавали разные имена для одних и тех же величин, и правила тревог,
+    собранные по каталогу, на этом адресе не срабатывали ни разу.
+
+    Старые имена никуда не делись — подсистема мониторинга отдаёт их рядом
+    с новыми как устаревшие псевдонимы, — поэтому уже настроенный сбор
+    продолжает работать.
+    """
     state = get_state(request)
     if not state.settings.get("metrics_enabled", True):
         return PlainTextResponse("# экспорт метрик отключён\n", status_code=404)
-    return PlainTextResponse(state.analytics.prometheus(),
-                             media_type="text/plain; version=0.0.4; charset=utf-8")
+    # Тот же порядок допуска, что и у /api/monitoring/metrics. Раньше этот
+    # адрес не проверял ничего: администратор закрывал метрики настройкой
+    # monitoring_public: false, /api/monitoring/metrics честно отвечал 401,
+    # а здесь тот же снимок — глубина очереди, счётчики ошибок, свободное
+    # место, версии — отдавался кому угодно.
+    _guard_metrics(request, state)
+    service = getattr(state, "monitoring", None)
+    if service is None:
+        # Подсистема мониторинга не поднялась — отдаём хотя бы прежний срез,
+        # чтобы сбор метрик не остался совсем без данных.
+        return PlainTextResponse(state.analytics.prometheus(),
+                                 media_type="text/plain; version=0.0.4; charset=utf-8")
+    body, content_type = service.render("prometheus")
+    return PlainTextResponse(body, media_type=content_type)
 
 
 @router.get("/reference", summary="Автономный справочник API (без интернета)",

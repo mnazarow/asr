@@ -231,11 +231,25 @@ class Engine(ABC):
         return None if lang in ("auto", "") else lang
 
     def report(self, progress: ProgressCallback | None, value: float, stage: str) -> None:
-        if progress is not None:
-            try:
-                progress(max(0.0, min(1.0, value)), stage)
-            except Exception:
-                pass
+        """Сообщает о прогрессе и заодно проверяет, не отменено ли задание.
+
+        Отмена приходит именно отсюда: обработчик прогресса поднимает
+        JobCancelled, и движок прерывается на ближайшей границе фрагмента.
+        Раньше это исключение проглатывалось вместе с остальными, и кнопка
+        «Отменить» не действовала всё время распознавания — а на часовой
+        записи это десятки минут.
+
+        Прочие ошибки обработчика по-прежнему гасятся: сбой отрисовки
+        прогресса не повод терять уже посчитанный результат.
+        """
+        if progress is None:
+            return
+        try:
+            progress(max(0.0, min(1.0, value)), stage)
+        except ASRHubError:
+            raise                       # отмена и тайм-аут должны дойти до вызывающего
+        except Exception as exc:        # noqa: BLE001
+            self.log.debug("Обработчик прогресса упал: %s", exc)
 
     def describe(self) -> dict[str, Any]:
         available, reason = self.check_available()

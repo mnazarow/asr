@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import ASRHubError, BinaryMissing, DependencyMissing
 
 log = logging.getLogger("asrhub.alignment")
@@ -255,7 +256,7 @@ def _redistribute(segments: list[Any], words: list[dict[str, Any]],
     if cursor < len(words):
         log.debug("Выравнивание: осталось нераспределённых слов — %d",
                   len(words) - cursor)
-    return _merge_close(aligned_segments, float(settings.get("alignment_max_gap_s") or 0.0))
+    return _merge_close(aligned_segments, S.num(settings, "alignment_max_gap_s", 0.0))
 
 
 def _count_words(text: str) -> int:

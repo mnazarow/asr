@@ -111,6 +111,33 @@ def _post(url: str, body: bytes, headers: dict[str, str], timeout: float) -> Non
             raise RuntimeError(f"HTTP {response.status}")
 
 
+def _base_metric_name(name: str) -> str:
+    """Имя метрики без суффиксов гистограммы."""
+    for suffix in ("_bucket", "_sum", "_count"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _statsd_name(sample: Sample, prefix: str) -> str:
+    """Имя в точечной записи с сохранением имён меток.
+
+    Graphite и StatsD меток не знают, поэтому их приходится вписывать в имя.
+    Раньше записывались только значения, и метки разных измерений
+    склеивались по позиции: понять, что означает `asrhub.wer.gigaam_v3`,
+    было можно, а `asrhub.rtf.p95` — уже нет.
+    """
+    parts = [prefix, sample.name.replace("asrhub_", "")]
+    for key, value in sorted(sample.labels.items()):
+        clean = str(value).replace(".", "_").replace(" ", "_").replace("/", "_")
+        parts.append(f"{key}.{clean}")
+    return ".".join(parts)
+
+
+def _format_value(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else repr(round(float(value), 6))
+
+
 def send(target: Target, samples: list[Sample]) -> None:
     """Отправляет снимок в один приёмник. Бросает исключение при неудаче."""
     if target.kind == "prometheus_pushgateway":
@@ -139,16 +166,27 @@ def send(target: Target, samples: list[Sample]) -> None:
               {"Content-Type": "application/json", **target.headers}, target.timeout_s)
 
     elif target.kind == "statsd":
-        # StatsD принимает UDP-датаграммы; собираем по одной строке на метрику.
+        from .catalog import METRICS_BY_NAME
+
         host, _, port = target.url.replace("udp://", "").partition(":")
-        address = (host or "127.0.0.1", int(port or 8125))
-        payload = exporters.graphite(samples, prefix=target.prefix)
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        host = host or "127.0.0.1"
+        port_number = int(port or 8125)
+        # Семейство определяем по факту: приёмник может слушать IPv6.
+        family = socket.AF_INET
+        try:
+            family = socket.getaddrinfo(host, port_number, type=socket.SOCK_DGRAM)[0][0]
+        except (socket.gaierror, ValueError):
+            pass
+
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
             sock.settimeout(target.timeout_s)
-            for line in payload.splitlines():
-                name, _, rest = line.partition(" ")
-                value = rest.split(" ")[0]
-                sock.sendto(f"{name}:{value}|g".encode(), address)
+            for item in samples:
+                spec = METRICS_BY_NAME.get(_base_metric_name(item.name))
+                # Тип имеет значение: счётчик, отправленный как gauge, теряет
+                # смысл — StatsD перестаёт видеть по нему прирост.
+                kind = "c" if (spec and spec.type == "counter") else "g"
+                line = f"{_statsd_name(item, target.prefix)}:{_format_value(item.value)}|{kind}"
+                sock.sendto(line.encode("utf-8"), (host, port_number))
 
     elif target.kind == "webhook":
         body = json.dumps(exporters.json_snapshot(samples, with_meta=False),
@@ -210,11 +248,25 @@ class PushManager:
             self._thread = None
 
     def _loop(self) -> None:
+        failures = 0
         while not self._stop.wait(timeout=5.0):
             try:
                 self.tick()
             except Exception as exc:                        # noqa: BLE001
-                log.debug("Цикл отправки метрик: %s", exc)
+                # Неудача доставки в конкретный приёмник разбирается в
+                # push_once и видна в метрике. Сюда долетает только поломка
+                # самого цикла — её нельзя оставлять на уровне debug, иначе
+                # отправка метрик молча стоит, а понять это неоткуда.
+                failures += 1
+                if failures <= 3 or failures % 120 == 0:
+                    log.warning("Цикл отправки метрик дал сбой (%d-й раз): %s",
+                                failures, exc)
+                else:
+                    log.debug("Цикл отправки метрик: %s", exc)
+            else:
+                if failures:
+                    log.info("Цикл отправки метрик восстановился после %d сбоев", failures)
+                failures = 0
 
     def tick(self) -> None:
         """Отправляет метрики в те приёмники, у которых подошёл срок."""

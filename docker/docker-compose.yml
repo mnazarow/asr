@@ -1,8 +1,15 @@
 # ASR Hub — развёртывание через Docker Compose.
 #
-#   docker compose up -d                    запуск на процессоре
-#   docker compose --profile gpu up -d      запуск с видеокартой NVIDIA
-#   docker compose --profile proxy up -d    вместе с обратным прокси nginx
+#   docker compose up -d                                    сервер на процессоре
+#   docker compose --profile proxy up -d                    сервер и прокси nginx
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#                                                           сервер с видеокартой
+#
+# Вариант с видеокартой — файл-надстройка, а не отдельный сервис. Раньше
+# сервер с CUDA был вторым сервисом с профилем «gpu», и получалось так:
+# сервис без профиля поднимается всегда, поэтому «--profile gpu up» запускал
+# оба контейнера сразу, и второй падал с конфликтом за порт 8080. Надстройка
+# же подменяет параметры того же сервиса, и контейнер остаётся один.
 #
 # Параметры берутся из файла .env, который создаёт установщик.
 
@@ -21,7 +28,8 @@ services:
     image: asrhub:${ASRHUB_TAG:-latest}
     container_name: asrhub
     restart: unless-stopped
-    profiles: ["", "cpu", "default"]
+    # Профиля у сервера нет намеренно: сервис с профилем не поднимается без
+    # явного --profile, и «docker compose up -d» не запускал бы ничего.
     ports:
       - "${ASRHUB_PORT:-8080}:8080"
     volumes:
@@ -31,6 +39,10 @@ services:
       ASRHUB_SERVER_PORT: 8080
       ASRHUB_LOG_LEVEL: ${ASRHUB_LOG_LEVEL:-INFO}
       ASRHUB_MAX_CONCURRENT_JOBS: ${ASRHUB_WORKERS:-2}
+      # Владелец смонтированного тома. Если каталог на хосте принадлежит не
+      # 1000:1000, укажите его uid:gid здесь — контейнер подстроится.
+      ASRHUB_UID: ${ASRHUB_UID:-1000}
+      ASRHUB_GID: ${ASRHUB_GID:-1000}
       HF_TOKEN: ${HF_TOKEN:-}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
@@ -42,46 +54,6 @@ services:
       resources:
         limits:
           memory: ${ASRHUB_MEMORY_LIMIT:-16G}
-    logging:
-      driver: json-file
-      options: { max-size: "32m", max-file: "5" }
-
-  asrhub-gpu:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        PROFILE: ${ASRHUB_PROFILE:-full}
-        ACCEL: cuda
-        TORCH_INDEX: https://download.pytorch.org/whl/cu124
-    image: asrhub:${ASRHUB_TAG:-cuda}
-    container_name: asrhub-gpu
-    restart: unless-stopped
-    profiles: ["gpu"]
-    ports:
-      - "${ASRHUB_PORT:-8080}:8080"
-    volumes:
-      - "${ASRHUB_DATA:-./data}:/data"
-    environment:
-      ASRHUB_DATA_DIR: /data
-      ASRHUB_DEVICE: cuda
-      ASRHUB_COMPUTE_TYPE: float16
-      ASRHUB_MAX_CONCURRENT_JOBS: ${ASRHUB_WORKERS:-2}
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
-      HF_TOKEN: ${HF_TOKEN:-}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: ${GPU_COUNT:-1}
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 180s
     logging:
       driver: json-file
       options: { max-size: "32m", max-file: "5" }
@@ -98,4 +70,10 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - "${ASRHUB_CERTS:-./certs}:/etc/nginx/certs:ro"
     depends_on:
-      - asrhub
+      asrhub:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

@@ -63,20 +63,32 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim
 
+ARG PROFILE=standard
+ARG ACCEL=cpu
+
 LABEL org.opencontainers.image.title="ASR Hub" \
       org.opencontainers.image.description="Сервер распознавания речи на свободных моделях" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="3.0.0"
+LABEL ru.asrhub.profile="${PROFILE}" ru.asrhub.accel="${ACCEL}"
 
+# OMP_NUM_THREADS раньше стоял в ноль. Для OpenMP это недопустимое значение:
+# libgomp пишет «Invalid value» и игнорирует его. Число потоков сервер и так
+# считает сам по числу физических ядер, поэтому переменную не задаём.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     ASRHUB_DATA_DIR=/data \
-    HF_HOME=/data/models \
-    OMP_NUM_THREADS=0
+    HF_HOME=/data/models
+
+# Профиль сборки виден изнутри контейнера и в docker inspect: по одному
+# только имени образа не понять, какие движки в нём есть и собран ли он
+# под видеокарту.
+ENV ASRHUB_BUILD_PROFILE=${PROFILE} \
+    ASRHUB_BUILD_ACCEL=${ACCEL}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg libsndfile1 curl tini \
+        ffmpeg libsndfile1 curl tini gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash --uid 1000 asrhub
 
@@ -92,7 +104,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh && \
     mkdir -p /data/uploads /data/results /data/models /data/logs /data/tmp && \
     chown -R asrhub:asrhub /data /app
 
-USER asrhub
+# Пользователь не переключается здесь: смонтированный том принадлежит
+# владельцу с хоста, и права на него можно поправить только от root.
+# entrypoint.sh делает это и сразу понижает права до asrhub через gosu.
 WORKDIR /app/server
 VOLUME ["/data"]
 EXPOSE 8080

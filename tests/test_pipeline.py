@@ -212,3 +212,75 @@ def test_json_export_is_valid(result_payload):
 def test_subtitle_wrapping():
     text = export.wrap_subtitle("а" * 100, 42, 2)
     assert all(len(line) <= 55 for line in text.split("\n"))
+
+
+# ---------------------------------------------------------------------------
+# Регрессии ревизии: показатели в выгрузке и детектор речи
+# ---------------------------------------------------------------------------
+
+def test_exported_metrics_are_not_zero(tmp_path: Path, sample_wav: Path):
+    """В выгруженные файлы должны попадать настоящие показатели.
+
+    to_result читает self.timings, а замеры проставлялись после записи
+    файлов: в каждый выгруженный json уходили «rtf: 0.0» и
+    «processing_time_s: 0», тогда как в интерфейсе по тому же заданию стояли
+    настоящие значения. Расхождение выглядело как порча данных при выгрузке.
+    """
+    import json
+
+    from asrhub.config import load
+    from asrhub.engines import EngineRegistry
+    from asrhub.processor import process_job
+
+    settings = load().merged({"model": "demo-simulator", "engine": "demo",
+                              "vad_backend": "energy",
+                              "output_formats": ["json", "txt"]})
+    outcome = process_job(sample_wav, settings, EngineRegistry(),
+                          workdir=tmp_path / "wd", outdir=tmp_path / "out",
+                          basename="проба")
+
+    written = json.loads((tmp_path / "out" / "проба.json").read_text(encoding="utf-8"))
+    metrics = written["metrics"]
+    assert metrics["rtf"] > 0, "в файл записан нулевой RTF"
+    assert metrics["processing_time_s"] > 0, "в файл записано нулевое время"
+    assert any(k.startswith("stage_") for k in metrics), "нет разбивки по стадиям"
+    # И то, что уходит в базу, тоже заполнено.
+    assert outcome.timings, "замеры не проставлены в результат"
+
+
+def test_energy_vad_does_not_call_silence_speech(tmp_path: Path):
+    """Детектор не должен объявлять речью почти тихую запись.
+
+    Пик брался как 95-я перцентиль энергии. Если речи меньше пяти процентов,
+    в перцентиль попадал шум: контраст схлопывался, порог вставал ниже
+    шумовой полки, и час тишины уходил в движок целиком — со счётом за
+    вычисления и галлюцинациями Whisper на тишине.
+    """
+    import math
+    import random
+    import struct
+    import wave
+
+    from asrhub.pipeline import vad
+
+    path = tmp_path / "почти-тишина.wav"
+    rate, seconds = 16000, 60
+    random.seed(7)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = []
+        for i in range(seconds * rate):
+            t = i / rate
+            value = random.gauss(0, 30)
+            if 29.0 <= t < 31.0:                       # две секунды речи
+                value += 9000 * math.sin(2 * math.pi * 220 * t)
+            frames.append(struct.pack("<h", max(-32768, min(32767, int(value)))))
+        w.writeframes(b"".join(frames))
+
+    segments = vad.detect(path, {"vad_backend": "energy", "vad_threshold": 0.5})
+    found = sum(s.end - s.start for s in segments)
+    assert found < seconds * 0.25, \
+        f"детектор объявил речью {found:.0f} с из {seconds} при двух секундах речи"
+    assert found > 0.5, "речь потеряна совсем"

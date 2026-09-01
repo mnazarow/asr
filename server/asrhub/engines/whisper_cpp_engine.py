@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import BinaryMissing, EngineError, ModelNotDownloaded
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
@@ -82,13 +83,13 @@ class WhisperCppEngine(Engine):
             cmd = [
                 binary, "-m", model_file, "-f", str(audio_path),
                 "-oj", "-of", str(out_base),
-                "-t", str(int(settings.get("cpu_threads") or 0) or os.cpu_count() or 4),
+                "-t", str(S.integer(settings, "cpu_threads", 0) or os.cpu_count() or 4),
                 "-bs", str(int(settings.get("beam_size") or 5)),
                 "-bo", str(int(settings.get("best_of") or 5)),
-                "-tp", str(float(settings.get("temperature") or 0.0)),
+                "-tp", str(S.num(settings, "temperature", 0.0)),
                 "-et", str(float(settings.get("compression_ratio_threshold") or 2.4)),
-                "-lpt", str(float(settings.get("logprob_threshold") or -1.0)),
-                "-nth", str(float(settings.get("no_speech_threshold") or 0.6)),
+                "-lpt", str(S.num(settings, "logprob_threshold", -1.0)),
+                "-nth", str(S.num(settings, "no_speech_threshold", 0.6)),
             ]
             language = self.language_for(settings)
             cmd += ["-l", language or "auto"]
@@ -114,14 +115,14 @@ class WhisperCppEngine(Engine):
                 if vad_model and Path(vad_model).exists():
                     cmd += ["--vad", "-vm", vad_model,
                             "-vt", str(float(settings.get("vad_threshold") or 0.5)),
-                            "-vspd", str(int(settings.get("vad_min_speech_ms") or 250)),
-                            "-vsd", str(int(settings.get("vad_min_silence_ms") or 500)),
-                            "-vp", str(int(settings.get("vad_speech_pad_ms") or 200))]
+                            "-vspd", str(S.integer(settings, "vad_min_speech_ms", 250)),
+                            "-vsd", str(S.integer(settings, "vad_min_silence_ms", 500)),
+                            "-vp", str(S.integer(settings, "vad_speech_pad_ms", 200))]
 
             self.report(progress, 0.1, "распознавание")
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=int(settings.get("job_timeout_s") or 7200) or None,
+                                     timeout=S.integer(settings, "job_timeout_s", 7200) or None,
                                      check=False)
             except subprocess.TimeoutExpired as exc:
                 raise EngineError("whisper.cpp не завершился за отведённое время.") from exc

@@ -706,7 +706,7 @@ curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.
 |---|---|
 | Состояние | `asrhub_up` |
 | Очередь и её возраст | `asrhub_queue_depth`, `asrhub_queue_oldest_seconds` |
-| Скорость | `asrhub_rtf{quantile="p95"}` |
+| Скорость | `asrhub_rtf{stat="p95"}` |
 | Доля отказов | `sum(rate(asrhub_jobs_total{status="failed"}[30m])) / clamp_min(sum(rate(asrhub_jobs_total[30m])), 0.001)` |
 | Место на диске | `asrhub_disk_free_gb` |
 | Видеопамять, % | `asrhub_gpu_memory_mb / asrhub_gpu_memory_total_mb * 100` |

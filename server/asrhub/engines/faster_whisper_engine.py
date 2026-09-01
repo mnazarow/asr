@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..errors import DependencyMissing, classify_exception
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
@@ -74,7 +75,7 @@ class FasterWhisperEngine(Engine):
                 device=ct_device,
                 device_index=device_index,
                 compute_type=compute_type,
-                cpu_threads=int(settings.get("cpu_threads") or 0),
+                cpu_threads=S.integer(settings, "cpu_threads", 0),
                 num_workers=int(settings.get("num_workers") or 1),
                 download_root=str(settings.get("models_dir") or "") or None,
             )
@@ -88,26 +89,26 @@ class FasterWhisperEngine(Engine):
             "beam_size": int(settings.get("beam_size") or 5),
             "best_of": int(settings.get("best_of") or 5),
             "patience": float(settings.get("patience") or 1.0),
-            "length_penalty": float(settings.get("length_penalty") or 1.0),
+            "length_penalty": S.num(settings, "length_penalty", 1.0),
             "repetition_penalty": float(settings.get("repetition_penalty") or 1.0),
-            "no_repeat_ngram_size": int(settings.get("no_repeat_ngram_size") or 0),
+            "no_repeat_ngram_size": S.integer(settings, "no_repeat_ngram_size", 0),
             "compression_ratio_threshold": float(
                 settings.get("compression_ratio_threshold") or 2.4),
-            "log_prob_threshold": float(settings.get("logprob_threshold") or -1.0),
-            "no_speech_threshold": float(settings.get("no_speech_threshold") or 0.6),
+            "log_prob_threshold": S.num(settings, "logprob_threshold", -1.0),
+            "no_speech_threshold": S.num(settings, "no_speech_threshold", 0.6),
             "condition_on_previous_text": bool(settings.get("condition_on_previous_text", False)),
-            "prompt_reset_on_temperature": float(
-                settings.get("prompt_reset_on_temperature") or 0.5),
+            "prompt_reset_on_temperature": S.num(
+                settings, "prompt_reset_on_temperature", 0.5),
             "suppress_blank": bool(settings.get("suppress_blank", True)),
             "word_timestamps": bool(settings.get("word_timestamps", True)),
             "multilingual": bool(settings.get("multilingual_detection", False)),
         }
 
         if settings.get("temperature_fallback", True):
-            base = float(settings.get("temperature") or 0.0)
+            base = S.num(settings, "temperature", 0.0)
             opts["temperature"] = [base, 0.2, 0.4, 0.6, 0.8, 1.0]
         else:
-            opts["temperature"] = [float(settings.get("temperature") or 0.0)]
+            opts["temperature"] = [S.num(settings, "temperature", 0.0)]
 
         prompt = str(settings.get("initial_prompt") or "").strip()
         if prompt:
@@ -116,11 +117,11 @@ class FasterWhisperEngine(Engine):
         if hotwords:
             opts["hotwords"] = hotwords
 
-        threshold = float(settings.get("hallucination_silence_threshold") or 0.0)
+        threshold = S.num(settings, "hallucination_silence_threshold", 0.0)
         if threshold > 0 and opts["word_timestamps"]:
             opts["hallucination_silence_threshold"] = threshold
 
-        max_new = int(settings.get("max_new_tokens") or 0)
+        max_new = S.integer(settings, "max_new_tokens", 0)
         if max_new > 0:
             opts["max_new_tokens"] = max_new
 
@@ -132,8 +133,8 @@ class FasterWhisperEngine(Engine):
                 opts["suppress_tokens"] = [-1]
 
         if self.language_for(settings) is None:
-            opts["language_detection_threshold"] = float(
-                settings.get("language_detection_threshold") or 0.5)
+            opts["language_detection_threshold"] = S.num(
+                settings, "language_detection_threshold", 0.5)
             opts["language_detection_segments"] = int(
                 settings.get("language_detection_segments") or 1)
 
@@ -141,10 +142,10 @@ class FasterWhisperEngine(Engine):
             opts["vad_filter"] = True
             opts["vad_parameters"] = {
                 "threshold": float(settings.get("vad_threshold") or 0.5),
-                "min_speech_duration_ms": int(settings.get("vad_min_speech_ms") or 250),
+                "min_speech_duration_ms": S.integer(settings, "vad_min_speech_ms", 250),
                 "max_speech_duration_s": float(settings.get("vad_max_speech_s") or 30.0),
-                "min_silence_duration_ms": int(settings.get("vad_min_silence_ms") or 500),
-                "speech_pad_ms": int(settings.get("vad_speech_pad_ms") or 200),
+                "min_silence_duration_ms": S.integer(settings, "vad_min_silence_ms", 500),
+                "speech_pad_ms": S.integer(settings, "vad_speech_pad_ms", 200),
             }
             neg = settings.get("vad_neg_threshold")
             if neg is not None:

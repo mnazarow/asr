@@ -134,6 +134,16 @@ class Runtime:
 RUNTIME = Runtime()
 
 
+
+def _file_size(path: Any) -> int:
+    """Размер файла в байтах; ноль, если файла нет или он недоступен."""
+    if not path:
+        return 0
+    try:
+        return os.path.getsize(str(path))
+    except OSError:
+        return 0
+
 class Collector:
     """Собирает снимок всех параметров работы сервиса."""
 
@@ -190,7 +200,28 @@ class Collector:
         ):
             self._safe(source, fn, out, errors)
         self._safe("storage_size", lambda acc: acc.extend(self._expensive()), out, errors)
+        out.extend(self._deprecated_aliases(out))
         return out, errors
+
+    @staticmethod
+    def _deprecated_aliases(samples: list[Sample]) -> list[Sample]:
+        """Дублирует переименованные метрики под старыми именами.
+
+        Метрики переведены в базовые единицы (байты, секунды), как требует
+        соглашение Prometheus. Старые имена отдаются рядом, чтобы панели и
+        правила, написанные до переименования, продолжали работать: убрать
+        их можно будет, когда все потребители перейдут на новые.
+        """
+        from .catalog import RENAMED_FROM
+
+        aliases = []
+        for sample in samples:
+            entry = RENAMED_FROM.get(sample.name)
+            if entry is None:
+                continue
+            old_name, factor = entry
+            aliases.append(Sample(old_name, round(sample.value / factor, 4), sample.labels))
+        return aliases
 
     # -- служба --------------------------------------------------------------
 
@@ -238,8 +269,8 @@ class Collector:
         waits = [float(r["queue_time_s"]) for r in self.state.db.query(
             "SELECT queue_time_s FROM jobs WHERE queue_time_s IS NOT NULL "
             "AND finished_at>=? LIMIT 5000", (time.time() - 86400,))]
-        for quantile, value in self._quantiles(waits).items():
-            out.append(Sample("asrhub_queue_wait_seconds", value, {"quantile": quantile}))
+        for stat, value in self._quantiles(waits).items():
+            out.append(Sample("asrhub_queue_wait_seconds", value, {"stat": stat}))
 
     # -- задания -------------------------------------------------------------
 
@@ -280,7 +311,7 @@ class Collector:
         rtf = performance.get("rtf") or {}
         for key in ("avg", "p50", "p90", "p95", "p99"):
             if rtf.get(key) is not None:
-                out.append(Sample("asrhub_rtf", float(rtf[key]), {"quantile": key}))
+                out.append(Sample("asrhub_rtf", float(rtf[key]), {"stat": key}))
 
         for row in self._by_model()[:40]:
             if row.get("rtf_avg") is not None:
@@ -311,8 +342,8 @@ class Collector:
         confidences = [float(r["avg_confidence"]) for r in self.state.db.query(
             "SELECT avg_confidence FROM jobs WHERE avg_confidence IS NOT NULL "
             "AND finished_at>=? LIMIT 20000", (since,))]
-        for quantile, value in self._quantiles(confidences).items():
-            out.append(Sample("asrhub_confidence", round(value, 4), {"quantile": quantile}))
+        for stat, value in self._quantiles(confidences).items():
+            out.append(Sample("asrhub_confidence", round(value, 4), {"stat": stat}))
         if confidences:
             low = sum(1 for value in confidences if value < 0.7) / len(confidences)
             out.append(Sample("asrhub_low_confidence_share", round(low, 4)))
@@ -350,17 +381,21 @@ class Collector:
         samples = self.state.db.system_samples(time.time() - 600, limit=1)
         latest = samples[-1] if samples else {}
 
-        for column, metric in (("cpu_percent", "asrhub_cpu_percent"),
-                               ("ram_used_mb", "asrhub_ram_used_mb"),
-                               ("ram_total_mb", "asrhub_ram_total_mb")):
+        MB = 1024 ** 2
+        if latest.get("cpu_percent") is not None:
+            out.append(Sample("asrhub_cpu_percent", float(latest["cpu_percent"])))
+        for column, metric in (("ram_used_mb", "asrhub_ram_used_bytes"),
+                               ("ram_total_mb", "asrhub_ram_total_bytes")):
             if latest.get(column) is not None:
-                out.append(Sample(metric, float(latest[column])))
+                out.append(Sample(metric, float(latest[column]) * MB))
 
         for column, metric in (("gpu_percent", "asrhub_gpu_percent"),
-                               ("gpu_mem_mb", "asrhub_gpu_memory_mb"),
-                               ("gpu_mem_total", "asrhub_gpu_memory_total_mb")):
+                               ("gpu_mem_mb", "asrhub_gpu_memory_used_bytes"),
+                               ("gpu_mem_total", "asrhub_gpu_memory_total_bytes")):
             if latest.get(column) is not None:
-                out.append(Sample(metric, float(latest[column]), {"gpu": "0"}))
+                value = float(latest[column])
+                out.append(Sample(metric, value * (1 if metric.endswith("percent") else MB),
+                                  {"gpu": "0"}))
 
         self._gpu_extra(out)
         self._process(out)
@@ -392,29 +427,39 @@ class Collector:
             import psutil  # type: ignore
 
             process = psutil.Process(os.getpid())
-            out.append(Sample("asrhub_process_memory_mb",
-                              round(process.memory_info().rss / 1024 / 1024, 1)))
+            # Имя метрики не должно зависеть от того, установлен ли psutil.
+            # Раньше эта ветка отдавала asrhub_process_memory_mb, а запасная —
+            # asrhub_process_memory_bytes: один и тот же сервис на двух
+            # машинах публиковал метрику под разными именами, и правило
+            # тревоги срабатывало ровно на половине установок.
+            out.append(Sample("asrhub_process_memory_bytes",
+                              float(process.memory_info().rss)))
         except Exception:                                   # noqa: BLE001
             try:
                 with open(f"/proc/{os.getpid()}/statm", encoding="utf-8") as fh:
                     pages = int(fh.read().split()[1])
-                out.append(Sample("asrhub_process_memory_mb",
-                                  round(pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024, 1)))
+                out.append(Sample("asrhub_process_memory_bytes",
+                                  float(pages * os.sysconf("SC_PAGE_SIZE"))))
             except (OSError, ValueError, IndexError):
                 pass
 
     # -- хранилище -----------------------------------------------------------
 
+
     def _storage(self, out: list[Sample]) -> None:
         import shutil
 
         usage = shutil.disk_usage(str(self.state.settings.paths.data))
-        out.append(Sample("asrhub_disk_free_gb", round(usage.free / 1024 ** 3, 2)))
+        out.append(Sample("asrhub_disk_free_bytes", float(usage.free)))
         out.append(Sample("asrhub_disk_used_percent",
                           round(usage.used / usage.total * 100, 1) if usage.total else 0.0))
 
         stats = self.state.db.stats()
-        out.append(Sample("asrhub_database_size_mb", float(stats.get("size_mb") or 0)))
+        # Размер берётся у файла напрямую. Через stats()["size_mb"] он шёл
+        # округлённым до сотых мегабайта: пустая база (несколько килобайт)
+        # показывала ровный ноль, а большая — обратно домноженное округление
+        # вместо настоящего числа байт.
+        out.append(Sample("asrhub_database_size_bytes", float(_file_size(stats.get("path")))))
         for table in ("jobs", "segments", "events", "metrics"):
             if stats.get(table) is not None:
                 out.append(Sample("asrhub_database_rows", float(stats[table]), {"table": table}))
@@ -426,7 +471,8 @@ class Collector:
         out.append(Sample("asrhub_websocket_clients", float(self.runtime.websocket_clients)))
 
     def _errors(self, out: list[Sample]) -> None:
-        out.append(Sample("asrhub_last_error_timestamp", float(self.runtime.last_error_ts)))
+        out.append(Sample("asrhub_last_error_timestamp_seconds",
+                          float(self.runtime.last_error_ts)))
 
     def _runtime_series(self, out: list[Sample]) -> None:
         """Переносит в снимок счётчики и гистограммы, накопленные в памяти."""

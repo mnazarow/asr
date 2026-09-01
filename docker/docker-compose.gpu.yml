@@ -1,0 +1,32 @@
+# Надстройка для запуска на видеокарте NVIDIA.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+#                  --profile proxy up -d
+#
+# Требуется NVIDIA Container Toolkit на хосте:
+#   nvidia-ctk --version && docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+
+services:
+
+  asrhub:
+    build:
+      args:
+        PROFILE: ${ASRHUB_PROFILE:-full}
+        ACCEL: cuda
+        TORCH_INDEX: https://download.pytorch.org/whl/cu124
+    image: asrhub:${ASRHUB_TAG:-cuda}
+    environment:
+      ASRHUB_DEVICE: cuda
+      ASRHUB_COMPUTE_TYPE: float16
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
+    healthcheck:
+      # Первая загрузка весов на видеокарту дольше процессорной.
+      start_period: 180s

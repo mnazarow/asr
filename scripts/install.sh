@@ -497,13 +497,27 @@ ASRHUB_ENGINES=${ENGINES}
 ASRHUB_ACCEL=${ACCEL}
 ENVEOF
 
-  PROFILE_ARG=()
-  [[ "${ACCEL}" == "cuda" ]] && PROFILE_ARG=(--profile gpu)
+  # Вариант с видеокартой — файл-надстройка, а не отдельный профиль: сервис
+  # без профиля поднимается всегда, поэтому «--profile gpu up» запускал и
+  # процессорный контейнер тоже, и второй падал с конфликтом за порт.
+  COMPOSE_FILES=(-f docker-compose.yml)
+  if [[ "${ACCEL}" == "cuda" ]]; then
+    COMPOSE_FILES+=(-f docker-compose.gpu.yml)
+    info "Сборка под видеокарту NVIDIA (docker-compose.gpu.yml)"
+  fi
+
+  # Владелец каталога данных: контейнер приведёт права к нему при запуске.
+  {
+    echo "ASRHUB_UID=$(id -u)"
+    echo "ASRHUB_GID=$(id -g)"
+  } >> "${ENV_FILE}"
 
   info "Сборка образа (первый раз занимает 10–25 минут)…"
-  ( cd "${PREFIX}/docker" && retry 2 run ${COMPOSE} --env-file .env "${PROFILE_ARG[@]}" build )
-  ( cd "${PREFIX}/docker" && run ${COMPOSE} --env-file .env "${PROFILE_ARG[@]}" up -d )
-  add_rollback "cd '${PREFIX}/docker' && ${COMPOSE} down"
+  ( cd "${PREFIX}/docker" \
+      && retry 2 run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" build )
+  ( cd "${PREFIX}/docker" \
+      && run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" up -d )
+  add_rollback "cd '${PREFIX}/docker' && ${COMPOSE} ${COMPOSE_FILES[*]} down"
   ok "Контейнер запущен"
 
 else
