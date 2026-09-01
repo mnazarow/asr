@@ -1,0 +1,388 @@
+<#
+.SYNOPSIS
+    Общая библиотека скриптов ASR Hub для Windows.
+.DESCRIPTION
+    Журналирование, обработка ошибок с откатом, повторы, проверки окружения,
+    определение оборудования. Подключается так:
+
+        Import-Module "$PSScriptRoot\lib\Common.psm1" -Force
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
+$script:AsrHubVersion   = '3.0.0'
+$script:MinPython       = [version]'3.10'
+$script:LogFile         = $null
+$script:RollbackActions = [System.Collections.ArrayList]::new()
+$script:TempPaths       = [System.Collections.ArrayList]::new()
+$script:StepIndex       = 0
+$script:StepTotal       = 0
+$script:CurrentStep     = ''
+$script:DryRun          = $false
+$script:AssumeYes       = $false
+$script:Quiet           = $false
+
+# ---------------------------------------------------------------------------
+# Журналирование
+# ---------------------------------------------------------------------------
+
+function Initialize-AsrLog {
+    param([string]$Directory = $env:TEMP)
+    if (-not (Test-Path $Directory)) { New-Item -ItemType Directory -Path $Directory -Force | Out-Null }
+    $name = "asrhub-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+    $script:LogFile = Join-Path $Directory $name
+    "ASR Hub $script:AsrHubVersion — журнал от $(Get-Date)" | Set-Content -Path $script:LogFile
+    return $script:LogFile
+}
+
+function Write-AsrLog {
+    param([string]$Level, [string]$Message)
+    if ($script:LogFile) {
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message" |
+            Add-Content -Path $script:LogFile -ErrorAction SilentlyContinue
+    }
+}
+
+function Write-Info    { param([string]$m) if (-not $script:Quiet) { Write-Host "— $m" -ForegroundColor Cyan };   Write-AsrLog INFO $m }
+function Write-Ok      { param([string]$m) if (-not $script:Quiet) { Write-Host "✓ $m" -ForegroundColor Green };  Write-AsrLog OK $m }
+function Write-Warn    { param([string]$m) Write-Host "! $m" -ForegroundColor Yellow; Write-AsrLog WARN $m }
+function Write-Err     { param([string]$m) Write-Host "✕ $m" -ForegroundColor Red;    Write-AsrLog ERROR $m }
+function Write-Hint    { param([string]$m) Write-Host "  $m" -ForegroundColor DarkGray; Write-AsrLog HINT $m }
+function Write-Debug2  { param([string]$m) if ($env:ASRHUB_DEBUG -eq '1') { Write-Host "· $m" -ForegroundColor DarkGray }; Write-AsrLog DEBUG $m }
+
+function Write-Heading {
+    param([string]$Text)
+    if ($script:Quiet) { return }
+    Write-Host ''
+    Write-Host $Text -ForegroundColor White
+    Write-Host ('─' * $Text.Length) -ForegroundColor DarkGray
+    Write-AsrLog STEP $Text
+}
+
+function Write-Step {
+    param([string]$Text)
+    $script:StepIndex++
+    $script:CurrentStep = $Text
+    if ($script:Quiet) { return }
+    Write-Host ''
+    if ($script:StepTotal -gt 0) {
+        Write-Host "[$($script:StepIndex)/$($script:StepTotal)] $Text" -ForegroundColor Blue
+    } else {
+        Write-Host "▸ $Text" -ForegroundColor Blue
+    }
+    Write-AsrLog STEP $Text
+}
+
+function Set-StepTotal { param([int]$Total) $script:StepTotal = $Total; $script:StepIndex = 0 }
+
+function Show-Banner {
+    if ($script:Quiet) { return }
+    Write-Host @'
+   _   ___ ___   _  _      _
+  /_\ / __| _ \ | || |_  _| |__
+ / _ \\__ \   / | __ | || | '_ \
+/_/ \_\___/_|_\ |_||_|\_,_|_.__/
+'@ -ForegroundColor Blue
+    Write-Host "Сервер распознавания речи · версия $script:AsrHubVersion`n" -ForegroundColor DarkGray
+}
+
+# ---------------------------------------------------------------------------
+# Откат и очистка
+# ---------------------------------------------------------------------------
+
+function Add-Rollback {
+    param([scriptblock]$Action, [string]$Description = '')
+    [void]$script:RollbackActions.Add(@{ Action = $Action; Description = $Description })
+    Write-Debug2 "откат зарегистрирован: $Description"
+}
+
+function Invoke-Rollback {
+    if ($script:RollbackActions.Count -eq 0) { return }
+    Write-Warn "Откат изменений ($($script:RollbackActions.Count) действ.)…"
+    for ($i = $script:RollbackActions.Count - 1; $i -ge 0; $i--) {
+        $item = $script:RollbackActions[$i]
+        try { & $item.Action } catch { Write-Warn "  не удалось: $($item.Description)" }
+    }
+    $script:RollbackActions.Clear()
+    Write-Ok 'Откат завершён — система возвращена в исходное состояние.'
+}
+
+function Clear-Rollback { $script:RollbackActions.Clear() }
+
+function Invoke-AsrFailure {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    Write-Host ''
+    Write-Err "Сбой на шаге: $($script:CurrentStep)"
+    Write-Err $ErrorRecord.Exception.Message
+    if ($env:ASRHUB_DEBUG -eq '1') { Write-Host $ErrorRecord.ScriptStackTrace -ForegroundColor DarkGray }
+    Write-AsrLog ERROR $ErrorRecord.Exception.ToString()
+
+    $text = $ErrorRecord.Exception.Message
+    if ($text -match 'Access.*denied|отказано в доступе') {
+        Write-Hint 'Запустите PowerShell от имени администратора.'
+    } elseif ($text -match 'not recognized|не является внутренней') {
+        Write-Hint 'Не найдена нужная программа. Установите её или добавьте в PATH.'
+    } elseif ($text -match 'space|места на диске') {
+        Write-Hint 'Не хватает места на диске.'
+    } elseif ($text -match 'Unable to connect|соединение') {
+        Write-Hint 'Проблема с сетью. Проверьте доступ в интернет и настройки прокси.'
+    }
+    Invoke-Rollback
+    Write-Hint "Полный журнал: $script:LogFile"
+    Write-Hint 'Диагностика: powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1'
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Выполнение команд
+# ---------------------------------------------------------------------------
+
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [string[]]$Arguments = @(),
+        [switch]$IgnoreExitCode,
+        [string]$Description = ''
+    )
+    $display = "$Command $($Arguments -join ' ')"
+    if ($script:DryRun) { Write-Host "[пробный запуск] $display" -ForegroundColor Yellow; return '' }
+    Write-Debug2 "выполняется: $display"
+    Write-AsrLog CMD $display
+    $output = & $Command @Arguments 2>&1
+    $code = $LASTEXITCODE
+    if (-not $IgnoreExitCode -and $code -ne 0) {
+        Write-Err "Команда завершилась с кодом ${code}: $display"
+        $output | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        $reason = if ($Description) { $Description } else { 'Ошибка выполнения команды' }
+        throw "$reason (код $code)"
+    }
+    return $output
+}
+
+function Invoke-WithRetry {
+    param([int]$Attempts = 3, [Parameter(Mandatory)][scriptblock]$Action, [string]$Description = 'операция')
+    $delay = 2
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try { return & $Action }
+        catch {
+            if ($attempt -eq $Attempts) { throw }
+            Write-Warn "Попытка $attempt из ${Attempts} не удалась ($Description), повтор через $delay с…"
+            Start-Sleep -Seconds $delay
+            $delay *= 2
+        }
+    }
+}
+
+function Confirm-Action {
+    param([string]$Message, [string]$Default = 'y')
+    if ($script:AssumeYes) { return $true }
+    if (-not [Environment]::UserInteractive) { return $true }
+    $suffix = if ($Default -eq 'n') { '[y/N]' } else { '[Y/n]' }
+    $answer = Read-Host "? $Message $suffix"
+    if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
+    return $answer -match '^(y|yes|д|да)$'
+}
+
+# ---------------------------------------------------------------------------
+# Проверки окружения
+# ---------------------------------------------------------------------------
+
+function Test-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-CommandExists {
+    param([string]$Name)
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Find-Python {
+    $candidates = @()
+    foreach ($name in 'python3.13', 'python3.12', 'python3.11', 'python3.10', 'python', 'python3') {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { $candidates += $cmd.Source }
+    }
+    if (Test-CommandExists 'py') {
+        foreach ($v in '3.13', '3.12', '3.11', '3.10') {
+            try {
+                $path = & py "-$v" -c "import sys; print(sys.executable)" 2>$null
+                if ($LASTEXITCODE -eq 0 -and $path) { $candidates += $path.Trim() }
+            } catch { }
+        }
+    }
+    foreach ($path in ($candidates | Select-Object -Unique)) {
+        try {
+            $version = & $path -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
+            if ($LASTEXITCODE -eq 0 -and [version]$version -ge $script:MinPython) { return $path }
+        } catch { }
+    }
+    return $null
+}
+
+function Test-DiskSpace {
+    param([string]$Path, [int]$RequiredGb)
+    # Оператор ?? отсутствует в Windows PowerShell 5.1 — пишем совместимо.
+    $parent = Split-Path -Parent $Path
+    if ([string]::IsNullOrEmpty($parent)) { $parent = $Path }
+    $resolved = Resolve-Path -LiteralPath $parent -ErrorAction SilentlyContinue
+    $target = if ($resolved) { $resolved.Path } else { $Path }
+    $root = [System.IO.Path]::GetPathRoot($target)
+    if (-not $root) { return $true }
+    $drive = Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction SilentlyContinue
+    if (-not $drive) { return $true }
+    $freeGb = [math]::Round($drive.Free / 1GB, 1)
+    if ($freeGb -lt $RequiredGb) {
+        Write-Err "На диске $root свободно $freeGb ГБ, требуется не менее $RequiredGb ГБ."
+        return $false
+    }
+    Write-Debug2 "свободно на ${root}: $freeGb ГБ"
+    return $true
+}
+
+function Test-PortFree {
+    param([int]$Port)
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        try {
+            $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+            return -not $listener
+        } catch { }
+    }
+    # Запасной способ: пробуем занять порт сами.
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start(); $listener.Stop()
+        return $true
+    } catch { return $false }
+}
+
+function Find-FreePort {
+    param([int]$Start)
+    for ($port = $Start; $port -lt $Start + 50; $port++) {
+        if (Test-PortFree -Port $port) { return $port }
+    }
+    throw "Не найден свободный порт в диапазоне $Start–$($Start + 50)."
+}
+
+function Test-Internet {
+    param([string]$HostName = 'pypi.org')
+    try {
+        $response = Invoke-WebRequest -Uri "https://$HostName" -Method Head -TimeoutSec 8 -UseBasicParsing
+        return $response.StatusCode -lt 400
+    } catch { return $false }
+}
+
+# ---------------------------------------------------------------------------
+# Оборудование
+# ---------------------------------------------------------------------------
+
+function Get-GpuInfo {
+    $result = [ordered]@{ Accelerator = 'cpu'; Name = ''; MemoryMb = 0; CudaVersion = '' }
+    if (Test-CommandExists 'nvidia-smi') {
+        try {
+            $line = (& nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
+            if ($line) {
+                $parts = $line -split ','
+                $result.Accelerator = 'cuda'
+                $result.Name = $parts[0].Trim()
+                $result.MemoryMb = [int]($parts[1].Trim())
+                $smi = & nvidia-smi 2>$null | Out-String
+                if ($smi -match 'CUDA Version:\s*([\d.]+)') { $result.CudaVersion = $Matches[1] }
+            }
+        } catch { }
+    }
+    return $result
+}
+
+function Get-HardwareInfo {
+    # Get-CimInstance есть только в Windows PowerShell; на других платформах
+    # (например, при проверке скриптов в контейнере) обходимся тем, что доступно.
+    $cpu = $null; $os = $null
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try { $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1 } catch { }
+        try { $os  = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue } catch { }
+    }
+    $gpu = Get-GpuInfo
+    return [ordered]@{
+        OsName       = if ($os) { $os.Caption } else { 'Windows' }
+        OsVersion    = if ($os) { $os.Version } else { [Environment]::OSVersion.Version.ToString() }
+        Arch         = $env:PROCESSOR_ARCHITECTURE
+        CpuName      = if ($cpu) { $cpu.Name.Trim() } else { 'неизвестно' }
+        CpuCores     = if ($cpu) { $cpu.NumberOfCores } else { [Environment]::ProcessorCount }
+        CpuThreads   = [Environment]::ProcessorCount
+        RamGb        = if ($os) { [math]::Round($os.TotalVisibleMemorySize / 1MB, 1) } else { 0 }
+        Accelerator  = $gpu.Accelerator
+        GpuName      = $gpu.Name
+        GpuMemoryMb  = $gpu.MemoryMb
+        CudaVersion  = $gpu.CudaVersion
+        Ffmpeg       = Test-CommandExists 'ffmpeg'
+    }
+}
+
+function Show-Environment {
+    $hw = Get-HardwareInfo
+    Write-Host 'Обнаруженное окружение' -ForegroundColor White
+    Write-Host ("  Система          {0} ({1})" -f $hw.OsName, $hw.OsVersion)
+    Write-Host ("  Архитектура      {0}" -f $hw.Arch)
+    Write-Host ("  Процессор        {0}" -f $hw.CpuName)
+    Write-Host ("  Ядер             {0} физических / {1} логических" -f $hw.CpuCores, $hw.CpuThreads)
+    Write-Host ("  Память           {0} ГБ" -f $hw.RamGb)
+    Write-Host ("  Ускоритель       {0}" -f $hw.Accelerator)
+    if ($hw.GpuName) { Write-Host ("  Видеокарта       {0} ({1} МБ)" -f $hw.GpuName, $hw.GpuMemoryMb) }
+    if ($hw.CudaVersion) { Write-Host ("  CUDA             {0}" -f $hw.CudaVersion) }
+    Write-Host ("  ffmpeg           {0}" -f $(if ($hw.Ffmpeg) { 'установлен' } else { 'не найден' }))
+    Write-Host ''
+    return $hw
+}
+
+function Get-TorchIndexUrl {
+    param([string]$Accelerator, [string]$CudaVersion)
+    switch ($Accelerator) {
+        'cuda' {
+            if ($CudaVersion -like '13.*') { return 'https://download.pytorch.org/whl/cu130' }
+            if ($CudaVersion -like '12.8*' -or $CudaVersion -like '12.9*') { return 'https://download.pytorch.org/whl/cu128' }
+            if ($CudaVersion -like '12.*') { return 'https://download.pytorch.org/whl/cu124' }
+            if ($CudaVersion -like '11.*') { return 'https://download.pytorch.org/whl/cu118' }
+            return 'https://download.pytorch.org/whl/cu124'
+        }
+        default { return 'https://download.pytorch.org/whl/cpu' }
+    }
+}
+
+function Get-CTranslate2Pin {
+    param([string]$Accelerator, [string]$CudaVersion)
+    if ($Accelerator -ne 'cuda') { return 'ctranslate2>=4.5' }
+    if ($CudaVersion -like '11.*') { return 'ctranslate2==3.24.0' }
+    return 'ctranslate2>=4.5'
+}
+
+function Get-RecommendedProfile {
+    $hw = Get-HardwareInfo
+    if ($hw.Accelerator -eq 'cuda') {
+        if ($hw.GpuMemoryMb -ge 20000) { return 'full' }
+        if ($hw.GpuMemoryMb -ge 8000)  { return 'standard' }
+        return 'light'
+    }
+    if ($hw.RamGb -ge 16) { return 'cpu' }
+    return 'light'
+}
+
+function Format-Size {
+    param([long]$Bytes)
+    $units = 'Б', 'КБ', 'МБ', 'ГБ', 'ТБ'
+    $value = [double]$Bytes; $i = 0
+    while ($value -ge 1024 -and $i -lt 4) { $value /= 1024; $i++ }
+    return ('{0:N1} {1}' -f $value, $units[$i])
+}
+
+function Set-DryRun    { param([bool]$Value) $script:DryRun = $Value }
+function Set-AssumeYes { param([bool]$Value) $script:AssumeYes = $Value }
+function Set-Quiet     { param([bool]$Value) $script:Quiet = $Value }
+function Get-DryRun    { return $script:DryRun }
+function Get-LogFile   { return $script:LogFile }
+
+Export-ModuleMember -Function *

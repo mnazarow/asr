@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+#
+# asrctl — клиент ASR Hub для работы с удалённым сервером.
+# Работает на Linux и macOS, нужны только bash и curl.
+#
+#   asrctl config add рабочий https://asr.example.com ah_ключ
+#   asrctl send запись.mp3 --model gigaam-v3-e2e-rnnt --wait
+#   asrctl send-dir ./записи --recursive --formats srt,txt
+#   asrctl queue --watch
+#   asrctl get <id> --format srt --output субтитры.srt
+#   asrctl models --language ru
+#   asrctl tunnel --host asr.example.com --user admin
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+VERSION="3.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
+CONFIG_FILE="${CONFIG_DIR}/profiles"
+PROFILE="${ASRCTL_PROFILE:-default}"
+SERVER="${ASRHUB_SERVER:-http://127.0.0.1:8080}"
+API_KEY="${ASRHUB_KEY:-}"
+TIMEOUT=600
+QUIET=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_GREY=$'\033[90m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_GREY=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+say()  { [[ "${QUIET}" == "1" ]] || printf '%s\n' "$*"; }
+ok()   { [[ "${QUIET}" == "1" ]] || printf '%s✓%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
+warn() { printf '%s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+die()  { printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit "${2:-1}"; }
+
+need_curl() {
+  command -v curl >/dev/null 2>&1 || die "Нужен curl. Установите: apt install curl / brew install curl"
+}
+
+# ---------------------------------------------------------------------------
+# Профили серверов
+# ---------------------------------------------------------------------------
+
+load_profile() {
+  [[ -f "${CONFIG_FILE}" ]] || return 0
+  local line name url key
+  while IFS='|' read -r name url key; do
+    [[ "${name}" == "${PROFILE}" ]] || continue
+    SERVER="${url}"
+    [[ -n "${key}" ]] && API_KEY="${key}"
+    return 0
+  done < "${CONFIG_FILE}"
+}
+
+save_profile() {
+  local name="$1" url="$2" key="${3:-}"
+  mkdir -p "${CONFIG_DIR}"
+  chmod 700 "${CONFIG_DIR}"
+  touch "${CONFIG_FILE}"
+  chmod 600 "${CONFIG_FILE}"
+  grep -v "^${name}|" "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp" 2>/dev/null || true
+  printf '%s|%s|%s\n' "${name}" "${url%/}" "${key}" >> "${CONFIG_FILE}.tmp"
+  mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+  chmod 600 "${CONFIG_FILE}"
+  ok "Профиль «${name}» сохранён: ${url}"
+}
+
+# ---------------------------------------------------------------------------
+# Обращения к серверу
+# ---------------------------------------------------------------------------
+
+api() {
+  local method="$1" path="$2"; shift 2
+  need_curl
+  local args=(-sS --max-time "${TIMEOUT}" -X "${method}"
+              -H "Accept: application/json")
+  [[ -n "${API_KEY}" ]] && args+=(-H "X-API-Key: ${API_KEY}")
+  local response status body
+  response="$(curl "${args[@]}" -w '\n%{http_code}' "${SERVER}${path}" "$@" 2>&1)" || {
+    die "Сервер ${SERVER} недоступен. Проверьте адрес и сеть."
+  }
+  status="$(printf '%s' "${response}" | tail -1)"
+  body="$(printf '%s' "${response}" | sed '$d')"
+  if [[ "${status}" == "401" ]]; then
+    die "Неверный или отсутствующий ключ доступа. Задайте: asrctl config add ${PROFILE} ${SERVER} <ключ>"
+  fi
+  if [[ "${status}" =~ ^[45] ]]; then
+    local message hint_text
+    message="$(printf '%s' "${body}" | sed -n 's/.*"message"[: ]*"\([^"]*\)".*/\1/p' | head -1)"
+    hint_text="$(printf '%s' "${body}" | sed -n 's/.*"hint"[: ]*"\([^"]*\)".*/\1/p' | head -1)"
+    printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "${message:-Ошибка ${status}}" >&2
+    [[ -n "${hint_text}" ]] && printf '  %s%s%s\n' "${C_DIM}" "${hint_text}" "${C_RESET}" >&2
+    exit 1
+  fi
+  printf '%s' "${body}"
+}
+
+json_get() {
+  # json_get <json> <ключ> — простое извлечение без jq
+  local json="$1" key="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "${json}" | python3 -c "
+import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for part in '${key}'.split('.'):
+    if isinstance(data, list):
+        try: data = data[int(part)]
+        except Exception: sys.exit(0)
+    elif isinstance(data, dict):
+        data = data.get(part)
+    else:
+        sys.exit(0)
+    if data is None: sys.exit(0)
+print(data if not isinstance(data, (dict, list)) else json.dumps(data, ensure_ascii=False))"
+  else
+    printf '%s' "${json}" | sed -n "s/.*\"${key##*.}\"[: ]*\"\?\([^,\"}]*\)\"\?.*/\1/p" | head -1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Команды
+# ---------------------------------------------------------------------------
+
+cmd_send() {
+  local file="" wait_done=0 output_dir="." settings="{}" priority="" formats=""
+  local model="" language="" reference=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) model="$2"; shift 2 ;;
+      --language|--lang) language="$2"; shift 2 ;;
+      --formats) formats="$2"; shift 2 ;;
+      --settings) settings="$2"; shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      --reference) reference="$2"; shift 2 ;;
+      --wait) wait_done=1; shift ;;
+      --output|-o) output_dir="$2"; shift 2 ;;
+      -*) die "Неизвестный параметр: $1" ;;
+      *) file="$1"; shift ;;
+    esac
+  done
+  [[ -z "${file}" ]] && die "Укажите файл: asrctl send запись.mp3"
+  [[ -f "${file}" ]] || die "Файл не найден: ${file}"
+
+  # Собираем настройки задания
+  if command -v python3 >/dev/null 2>&1; then
+    settings="$(python3 -c "
+import json,sys
+data = json.loads('''${settings}''')
+for key, value in (('model', '''${model}'''), ('language', '''${language}''')):
+    if value: data[key] = value
+formats = '''${formats}'''
+if formats: data['output_formats'] = [f.strip() for f in formats.split(',') if f.strip()]
+print(json.dumps(data, ensure_ascii=False))")"
+  fi
+
+  local args=(-F "file=@${file}" -F "settings=${settings}")
+  [[ -n "${priority}" ]] && args+=(-F "priority=${priority}")
+  [[ -n "${reference}" ]] && args+=(-F "reference_text=${reference}")
+
+  say "Отправка: $(basename "${file}") ($(du -h "${file}" | cut -f1))"
+  local response job_id
+  response="$(api POST /api/jobs "${args[@]}")"
+  job_id="$(json_get "${response}" id)"
+  [[ -z "${job_id}" ]] && die "Сервер не вернул идентификатор задания."
+  ok "Задание создано: ${job_id}"
+
+  if [[ "${wait_done}" -eq 1 ]]; then
+    cmd_wait "${job_id}" --output "${output_dir}" --formats "${formats:-txt}"
+  else
+    say "Следить: asrctl status ${job_id}"
+  fi
+}
+
+cmd_send_dir() {
+  local dir="" recursive=0 pattern="" rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --recursive|-r) recursive=1; shift ;;
+      --pattern) pattern="$2"; shift 2 ;;
+      -*) rest+=("$1" "${2:-}"); shift 2 ;;
+      *) dir="$1"; shift ;;
+    esac
+  done
+  [[ -d "${dir}" ]] || die "Каталог не найден: ${dir}"
+  local depth=(-maxdepth 1)
+  [[ "${recursive}" -eq 1 ]] && depth=()
+  local files=()
+  while IFS= read -r -d '' f; do files+=("${f}"); done < <(
+    find "${dir}" "${depth[@]}" -type f \( \
+      -iname '*.wav' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.flac' \
+      -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.mp4' -o -iname '*.mkv' \
+      -o -iname '*.mov' -o -iname '*.aac' -o -iname '*.wma' \) \
+      ${pattern:+-name "${pattern}"} -print0 | sort -z)
+
+  [[ ${#files[@]} -eq 0 ]] && die "В каталоге нет поддерживаемых файлов."
+  say "Найдено файлов: ${#files[@]}"
+  local index=0 failed=0
+  for f in "${files[@]}"; do
+    index=$((index + 1))
+    printf '%s[%d/%d]%s %s\n' "${C_BLUE}" "${index}" "${#files[@]}" "${C_RESET}" "$(basename "${f}")"
+    if ! cmd_send "${f}" "${rest[@]}" 2>&1 | sed 's/^/    /'; then
+      failed=$((failed + 1))
+      warn "    не отправлен — продолжаем"
+    fi
+  done
+  ok "Отправлено: $(( ${#files[@]} - failed )) из ${#files[@]}"
+  [[ ${failed} -gt 0 ]] && warn "Не отправлено: ${failed}"
+}
+
+cmd_status() {
+  local job_id="${1:?Укажите идентификатор задания}"
+  local response
+  response="$(api GET "/api/jobs/${job_id}")"
+  printf '%s%s%s\n' "${C_BOLD}" "$(json_get "${response}" filename)" "${C_RESET}"
+  printf '  Состояние    %s (%s %%)\n' "$(json_get "${response}" status)" \
+    "$(python3 -c "print(round(float('$(json_get "${response}" progress)' or 0)*100))" 2>/dev/null || echo 0)"
+  printf '  Этап         %s\n' "$(json_get "${response}" stage)"
+  printf '  Модель       %s\n' "$(json_get "${response}" model)"
+  printf '  Длительность %s с\n' "$(json_get "${response}" media_duration_s)"
+  local rtf; rtf="$(json_get "${response}" rtf)"
+  [[ -n "${rtf}" ]] && printf '  RTF          %s\n' "${rtf}"
+  local err; err="$(json_get "${response}" error_message)"
+  if [[ -n "${err}" ]]; then
+    printf '  %sОшибка%s       %s\n' "${C_RED}" "${C_RESET}" "${err}"
+    printf '  %s%s%s\n' "${C_DIM}" "$(json_get "${response}" error_hint)" "${C_RESET}"
+  fi
+}
+
+cmd_wait() {
+  local job_id="${1:?Укажите идентификатор}"; shift
+  local output_dir="." formats="txt"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output|-o) output_dir="$2"; shift 2 ;;
+      --formats) formats="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local status="" progress="" spin='|/-\' i=0
+  while true; do
+    local response
+    response="$(api GET "/api/jobs/${job_id}")" || return 1
+    status="$(json_get "${response}" status)"
+    progress="$(json_get "${response}" progress)"
+    local stage; stage="$(json_get "${response}" stage)"
+    case "${status}" in
+      completed)
+        printf '\r%s✓%s готово                                        \n' "${C_GREEN}" "${C_RESET}"
+        local rtf; rtf="$(json_get "${response}" rtf)"
+        say "  RTF ${rtf} · слов $(json_get "${response}" words_count)"
+        IFS=',' read -ra FMTS <<< "${formats}"
+        for fmt in "${FMTS[@]}"; do
+          cmd_get "${job_id}" --format "${fmt}" --output "${output_dir}"
+        done
+        return 0 ;;
+      failed)
+        printf '\r%s✕%s ошибка                                        \n' "${C_RED}" "${C_RESET}"
+        printf '  %s\n' "$(json_get "${response}" error_message)"
+        printf '  %s%s%s\n' "${C_DIM}" "$(json_get "${response}" error_hint)" "${C_RESET}"
+        return 1 ;;
+      cancelled)
+        printf '\r%s!%s отменено                                      \n' "${C_YELLOW}" "${C_RESET}"
+        return 1 ;;
+      *)
+        i=$(( (i + 1) % 4 ))
+        printf '\r%s %s %s%%  %s        ' "${spin:i:1}" "${status}" \
+          "$(python3 -c "print(round(float('${progress:-0}')*100))" 2>/dev/null || echo 0)" "${stage}"
+        sleep 2 ;;
+    esac
+  done
+}
+
+cmd_get() {
+  local job_id="${1:?Укажите идентификатор}"; shift
+  local format="txt" output=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format|-f) format="$2"; shift 2 ;;
+      --output|-o) output="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  need_curl
+  local args=(-sS --max-time "${TIMEOUT}" -f)
+  [[ -n "${API_KEY}" ]] && args+=(-H "X-API-Key: ${API_KEY}")
+  # Каталогом считаем то, что уже существует как каталог, оканчивается на «/»
+  # или не содержит точки в имени. Иначе это имя файла.
+  local looks_like_dir=0
+  if [[ -z "${output}" ]]; then
+    looks_like_dir=1
+    output="."
+  elif [[ -d "${output}" || "${output}" == */ || "$(basename "${output}")" != *.* ]]; then
+    looks_like_dir=1
+  fi
+
+  if [[ "${looks_like_dir}" -eq 1 ]]; then
+    local name
+    name="$(api GET "/api/jobs/${job_id}" | { command -v python3 >/dev/null && python3 -c "
+import json,sys,os
+d=json.load(sys.stdin); print(os.path.splitext(d.get('filename','result'))[0])" || echo result; })"
+    mkdir -p "${output}"
+    output="${output%/}/${name}.${format}"
+  else
+    mkdir -p "$(dirname "${output}")"
+  fi
+  if curl "${args[@]}" "${SERVER}/api/jobs/${job_id}/download?fmt=${format}" -o "${output}"; then
+    ok "Сохранено: ${output}"
+  else
+    die "Не удалось скачать результат в формате ${format}."
+  fi
+}
+
+cmd_queue() {
+  local watch=0
+  [[ "${1:-}" == "--watch" || "${1:-}" == "-w" ]] && watch=1
+  while true; do
+    local response
+    response="$(api GET /api/queue)"
+    [[ "${watch}" -eq 1 ]] && printf '\033[H\033[J'
+    if command -v python3 >/dev/null 2>&1; then
+      printf '%s' "${response}" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+B, D, G, Y, R, RS = '\033[1m', '\033[90m', '\033[32m', '\033[33m', '\033[31m', '\033[0m'
+print(f\"{B}Очередь{RS}  ожидают: {d['queue_depth']}  выполняется: {d['active']}\"
+      f\"  воркеров: {d['worker_count']}  {'ПАУЗА' if d['paused'] else ''}\")
+counts = d.get('counts', {})
+print(f\"{D}готово {counts.get('completed',0)} · ошибок {counts.get('failed',0)}\"
+      f\" · отменено {counts.get('cancelled',0)}{RS}\")
+print()
+items = d.get('items', [])
+if not items:
+    print(f'{D}Очередь пуста{RS}')
+for job in items[:25]:
+    status = job['status']
+    colour = {'running': G, 'failed': R, 'retry': Y}.get(status, D)
+    bar_len = int((job.get('progress') or 0) * 20)
+    bar = '█' * bar_len + '·' * (20 - bar_len)
+    print(f\"  {colour}{status:<10}{RS} {job['filename'][:34]:<36} \"
+          f\"{bar} {int((job.get('progress') or 0)*100):3d}%  {job.get('stage','')[:22]}\")
+" || printf '%s\n' "${response}"
+    else
+      printf '%s\n' "${response}"
+    fi
+    [[ "${watch}" -eq 0 ]] && break
+    sleep 3
+  done
+}
+
+cmd_list() {
+  local status="" limit=25
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status) status="$2"; shift 2 ;;
+      --limit|-n) limit="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  api GET "/api/jobs?limit=${limit}${status:+&status=${status}}" | { command -v python3 >/dev/null && python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+D, RS = '\033[90m', '\033[0m'
+print(f\"{'ИДЕНТИФИКАТОР':<22} {'ФАЙЛ':<32} {'СОСТОЯНИЕ':<12} {'RTF':>7}  МОДЕЛЬ\")
+for job in d['items']:
+    rtf = f\"{job['rtf']:.3f}\" if job.get('rtf') else '—'
+    print(f\"{job['id'][:20]:<22} {job['filename'][:30]:<32} {job['status']:<12} {rtf:>7}  {D}{job.get('model','')}{RS}\")
+print(f\"\nВсего: {d['total']}\")
+" || cat; }
+}
+
+cmd_models() {
+  local language="" installed=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --language|--lang) language="$2"; shift 2 ;;
+      --installed) installed=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  api GET "/api/models${language:+?language=${language}}" | { command -v python3 >/dev/null && python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+B, D, G, Y, RS = '\033[1m', '\033[90m', '\033[32m', '\033[33m', '\033[0m'
+quality = {'excellent': f'{G}отличное{RS}', 'good': f'{G}хорошее{RS}',
+           'fair': f'{Y}среднее{RS}', 'poor': 'слабое', 'none': f'{D}—{RS}'}
+families = {}
+for m in d['items']:
+    families.setdefault(m['family'], []).append(m)
+for family, models in sorted(families.items()):
+    print(f'\n{B}{family}{RS}')
+    for m in models:
+        wer = [b['value'] for b in m['benchmarks'] if b['language']=='ru' and b['metric']=='WER']
+        wer_text = f'{min(wer):5.1f} %' if wer else '     —'
+        print(f\"  {m['id']:<34} {quality.get(m['ru_quality'],''):<20} WER ru {wer_text}  {D}{m['license']}{RS}\")
+print(f\"\nВсего моделей: {d['total']}\")
+" || cat; }
+}
+
+cmd_tunnel() {
+  local host="" user="${USER}" port="8080" local_port="8080"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) host="$2"; shift 2 ;;
+      --user) user="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --local-port) local_port="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -z "${host}" ]] && die "Укажите сервер: asrctl tunnel --host asr.example.com"
+  command -v ssh >/dev/null || die "Нужен ssh."
+  say "Туннель ${local_port} → ${host}:${port}"
+  say "Интерфейс будет доступен на http://127.0.0.1:${local_port}"
+  say "Прервать: Ctrl+C"
+  exec ssh -N -L "${local_port}:127.0.0.1:${port}" "${user}@${host}"
+}
+
+cmd_config() {
+  local action="${1:-list}"; shift || true
+  case "${action}" in
+    add)
+      local name="${1:?Укажите имя профиля}" url="${2:?Укажите адрес сервера}" key="${3:-}"
+      save_profile "${name}" "${url}" "${key}" ;;
+    list)
+      [[ -f "${CONFIG_FILE}" ]] || { say "Профилей нет. Добавить: asrctl config add <имя> <адрес> [ключ]"; return 0; }
+      printf '%-16s %-42s %s\n' "ПРОФИЛЬ" "АДРЕС" "КЛЮЧ"
+      while IFS='|' read -r name url key; do
+        printf '%-16s %-42s %s\n' "${name}" "${url}" \
+          "$( [[ -n "${key}" ]] && printf '%s…%s' "${key:0:6}" "${key: -3}" || printf '—' )"
+      done < "${CONFIG_FILE}" ;;
+    remove)
+      local name="${1:?Укажите имя профиля}"
+      grep -v "^${name}|" "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+      ok "Профиль «${name}» удалён" ;;
+    *) die "Неизвестная команда: ${action}" ;;
+  esac
+}
+
+cmd_health() {
+  local response; response="$(api GET /api/health)"
+  ok "Сервер ${SERVER} доступен"
+  printf '  Версия      %s\n' "$(json_get "${response}" version)"
+  printf '  Время работы %s с\n' "$(json_get "${response}" uptime_s)"
+  printf '  Очередь     %s\n' "$( [[ "$(json_get "${response}" queue_paused)" == "True" ]] && echo 'на паузе' || echo 'работает' )"
+}
+
+usage() {
+  cat <<'USAGE'
+asrctl — клиент ASR Hub
+
+Использование: asrctl <команда> [параметры]
+
+Отправка
+  send ФАЙЛ [--model M] [--language ru] [--formats srt,txt]
+            [--priority N] [--wait] [--output КАТАЛОГ]
+  send-dir КАТАЛОГ [--recursive] [--pattern '*.mp3'] [те же параметры]
+
+Наблюдение
+  queue [--watch]            состояние очереди (--watch — обновлять)
+  list [--status ...] [-n N] список заданий
+  status ИДЕНТИФИКАТОР       карточка задания
+  wait ИДЕНТИФИКАТОР         ждать завершения и скачать результат
+
+Результаты
+  get ИДЕНТИФИКАТОР [--format srt] [--output файл]
+
+Справочники
+  models [--language ru]     каталог моделей сервера
+  health                     проверка доступности
+
+Профили и доступ
+  config add ИМЯ АДРЕС [КЛЮЧ]
+  config list | remove ИМЯ
+  --profile ИМЯ              использовать профиль (или ASRCTL_PROFILE)
+  --server АДРЕС             адрес сервера напрямую
+  --key КЛЮЧ                 ключ доступа напрямую
+
+Прочее
+  tunnel --host СЕРВЕР [--user ИМЯ] [--port 8080]
+                             SSH-туннель к закрытому серверу
+  version                    версия клиента
+
+Примеры
+  asrctl config add прод https://asr.company.ru ah_xxxxx
+  asrctl --profile прод send совещание.mp3 --model gigaam-v3-e2e-rnnt --wait
+  asrctl send-dir ./архив --recursive --formats srt,json --priority 10
+  asrctl queue --watch
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+
+# Общие параметры принимаются и до команды, и после неё:
+#   asrctl --server https://… queue     и     asrctl queue --server https://…
+COMMAND=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile) PROFILE="$2"; shift 2 ;;
+    --server)  SERVER="${2%/}"; shift 2 ;;
+    --key)     API_KEY="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --quiet|-q) QUIET=1; shift ;;
+    *)
+      if [[ -z "${COMMAND}" ]]; then COMMAND="$1"; else ARGS+=("$1"); fi
+      shift ;;
+  esac
+done
+COMMAND="${COMMAND:-help}"
+load_profile
+
+case "${COMMAND}" in
+  send)       cmd_send "${ARGS[@]}" ;;
+  send-dir)   cmd_send_dir "${ARGS[@]}" ;;
+  status)     cmd_status "${ARGS[@]}" ;;
+  wait)       cmd_wait "${ARGS[@]}" ;;
+  get)        cmd_get "${ARGS[@]}" ;;
+  queue)      cmd_queue "${ARGS[@]:-}" ;;
+  list)       cmd_list "${ARGS[@]:-}" ;;
+  models)     cmd_models "${ARGS[@]:-}" ;;
+  config)     cmd_config "${ARGS[@]:-}" ;;
+  tunnel)     cmd_tunnel "${ARGS[@]:-}" ;;
+  health)     cmd_health ;;
+  version)    printf 'asrctl %s\n' "${VERSION}" ;;
+  help|-h|--help) usage ;;
+  *) printf 'Неизвестная команда: %s\n\n' "${COMMAND}" >&2; usage; exit 2 ;;
+esac

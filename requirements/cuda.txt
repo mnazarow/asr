@@ -1,0 +1,8 @@
+# Дополнение для NVIDIA CUDA 12.
+# Точный индекс подбирает установщик по версии драйвера, см. scripts/lib/detect.sh.
+-r base.txt
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch>=2.4
+torchaudio>=2.4
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9,<10

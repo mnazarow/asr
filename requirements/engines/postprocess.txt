@@ -1,0 +1,4 @@
+# Пунктуация и нормализация чисел для русского языка.
+# RUPunct (MIT) и sbert_punc_case_ru (Apache-2.0) ставятся через transformers.
+transformers>=4.48
+nemo-text-processing>=1.0

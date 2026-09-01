@@ -1,0 +1,11 @@
+docs/images
+*.pyc
+__pycache__/
+.git/
+.venv/
+venv/
+data/
+*.db
+*.log
+node_modules/
+.pytest_cache/

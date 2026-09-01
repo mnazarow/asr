@@ -1,0 +1,5 @@
+# Qwen3-ASR (Alibaba) — 30 языков, лицензия Apache-2.0.
+# Для продуктивной нагрузки предпочтителен запуск через vLLM.
+qwen-asr>=0.1
+transformers>=4.51
+accelerate>=0.30

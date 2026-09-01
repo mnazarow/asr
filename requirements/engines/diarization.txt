@@ -1,0 +1,4 @@
+# Разделение по говорящим.
+# pyannote требует принятия лицензии и токена Hugging Face:
+#   https://huggingface.co/pyannote/speaker-diarization-community-1
+pyannote.audio>=3.1

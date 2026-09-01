@@ -1,0 +1,3 @@
+# Moonshine — сверхлёгкий движок для edge-устройств. Только английский.
+useful-moonshine @ git+https://github.com/usefulsensors/moonshine.git
+onnxruntime>=1.17

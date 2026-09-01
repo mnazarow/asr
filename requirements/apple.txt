@@ -1,0 +1,5 @@
+# Дополнение для macOS на Apple Silicon.
+# PyTorch с поддержкой MPS ставится из обычного индекса.
+-r base.txt
+torch>=2.4
+torchaudio>=2.4

@@ -1,0 +1,6 @@
+# T-one (Т-Банк) — потоковое распознавание русской телефонии.
+#
+# ВНИМАНИЕ: KenLM не собирается нативно под Windows — используйте WSL или Docker.
+# Требования: Python 3.9+, минимум 4 ядра и 8 ГБ оперативной памяти.
+tone @ git+https://github.com/voicekit-team/T-one.git
+onnxruntime>=1.17

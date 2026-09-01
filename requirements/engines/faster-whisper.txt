@@ -1,0 +1,12 @@
+# faster-whisper — самая производительная реализация Whisper.
+#
+# Совместимость CTranslate2 (типовой источник ошибки libcudnn):
+#   CUDA 12 + cuDNN 9  ->  ctranslate2>=4.5
+#   CUDA 12 + cuDNN 8  ->  ctranslate2==4.4.0
+#   CUDA 11 + cuDNN 8  ->  ctranslate2==3.24.0
+# Установщик подставляет нужную версию сам (см. ctranslate2_pin в detect.sh).
+
+faster-whisper>=1.1
+ctranslate2>=4.5
+onnxruntime>=1.17
+av>=11

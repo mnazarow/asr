@@ -1,0 +1,44 @@
+[project]
+name = "asrhub"
+version = "3.0.0"
+description = "Сервер распознавания речи на свободных моделях: GigaAM, Whisper и другие"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ASR Hub" }]
+keywords = ["asr", "speech-recognition", "whisper", "gigaam", "распознавание речи"]
+
+[project.urls]
+Documentation = "docs/README.md"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["docs", ".venv", "venv", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "C4", "SIM"]
+ignore = [
+    # Depends() в значениях по умолчанию — штатный приём FastAPI
+    "B008",
+    # Длинные строки в каталоге: описания параметров и моделей читаемее целиком
+    "E501",
+    # Явные сравнения в проверках конфигурации нагляднее
+    "SIM108",
+    # try/except/pass в местах, где сбой заведомо не важен (журналирование,
+    # освобождение памяти, разбор необязательных полей), читается яснее,
+    # чем contextlib.suppress: видно, что именно игнорируется и почему.
+    "SIM105",
+    "SIM102",
+    "SIM103",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"server/asrhub/catalog/*.py" = ["E501"]
+"tests/*.py" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["server"]
+addopts = "-q --tb=short"
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,0 +1,12 @@
+# NVIDIA NeMo — модели Parakeet, Canary, Nemotron.
+#
+# ВНИМАНИЕ: стек NeMo конфликтует по зависимостям с другими движками.
+# Для продуктивной эксплуатации рекомендуется отдельное окружение
+# либо запуск моделей через ONNX/sherpa-onnx без NeMo.
+#
+# Системные пакеты: libsndfile1, ffmpeg.
+
+nemo-toolkit-asr>=2.0
+Cython>=3.0
+packaging>=23
+librosa>=0.10

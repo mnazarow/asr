@@ -1,0 +1,8 @@
+# Универсальный движок Hugging Face: wav2vec2, MOSS, Cohere, Granite,
+# OWSM, Phi-4, Vikhr Borealis.
+transformers>=4.48
+accelerate>=0.30
+datasets>=2.19
+sentencepiece>=0.2
+protobuf>=4.25
+librosa>=0.10

@@ -1,0 +1,4 @@
+# Mistral Voxtral — аудио-LLM с потоковым режимом.
+# Для продуктивной нагрузки рекомендуется vLLM.
+transformers>=4.54
+mistral-common[audio]>=1.5

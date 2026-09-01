@@ -1,0 +1,13 @@
+# GigaAM (SaluteDevices) — лучшее качество на русском языке.
+#
+# ВАЖНО: пакет gigaam на PyPI застыл на версии 0.1.0 (апрель 2025)
+# и не содержит v3. Ставим только из репозитория.
+#
+# Требования: Python 3.10+, ffmpeg в PATH, torch (ставится отдельно
+# установщиком с индексом под ваш ускоритель).
+
+gigaam @ git+https://github.com/salute-developers/GigaAM.git
+hydra-core>=1.3,<2
+omegaconf>=2.3,<3
+sentencepiece>=0.2
+onnxruntime>=1.17

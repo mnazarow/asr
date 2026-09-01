@@ -1,0 +1,2 @@
+# Meta Omnilingual ASR — 1600+ языков, Apache-2.0 на код и веса.
+omnilingual-asr>=0.1
