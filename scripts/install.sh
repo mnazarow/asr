@@ -40,6 +40,10 @@ OFFLINE=0
 FORCE=0
 SKIP_MODELS=0
 KEEP_DATA=1
+# Заполняется только в нативном режиме, а читается в самом конце для обоих.
+# Без этой строки docker-режим падал под `set -o nounset` уже после слов
+# «Установка завершена», и любой вызывающий видел код возврата 1.
+FAILED_ENGINES=()
 INTERACTIVE=auto
 ENGINES_EXPLICIT=""
 MODELS_EXPLICIT=""
@@ -278,13 +282,20 @@ run_wizard() {
   check_port_free "${PORT}" || suggested_port="$(find_free_port "${PORT}")"
   wizard_ask PORT "Порт сервера" "${suggested_port}" wizard_valid_port
 
-  wizard_choose HOST "Кто сможет подключаться?" 2 \
+  # Умолчание подстраивается под то, что задано ключом: --host 127.0.0.1
+  # означает «не выставлять наружу», и мастер не должен молча это отменять.
+  local host_default=2
+  [[ "${HOST}" == "127.0.0.1" || "${HOST}" == "localhost" ]] && host_default=1
+  wizard_choose HOST "Кто сможет подключаться?" "${host_default}" \
     "127.0.0.1|Только эта машина|Снаружи сервер не виден. Доступ — через SSH-туннель или прокси" \
     "0.0.0.0|Любой, кто дотянется по сети|Обычный выбор для сервера. Оставьте включённой проверку ключей"
 
   # --- 4. Дополнительные возможности --------------------------------------
+  # То же для автозапуска: --no-service снимает пункт из умолчания.
   local extras=""
-  wizard_multi extras "Что ещё включить?" "1" \
+  local extras_default="1"
+  [[ "${CREATE_SERVICE}" == "0" ]] && extras_default=""
+  wizard_multi extras "Что ещё включить?" "${extras_default}" \
     "service|Автозапуск при загрузке машины|systemd, launchd или планировщик Windows" \
     "alignment|Точные границы слов (MFA)|+2–3 ГБ и conda. Нужно для субтитров и дубляжа" \
     "monitoring|Отправку метрик в систему мониторинга|Настроим адрес приёмника на следующем шаге"
@@ -416,8 +427,18 @@ fi
 # Осторожно: при пустом массиве grep не находит строк и возвращает 1,
 # что под pipefail роняет установку. Поэтому пустоту проверяем заранее.
 if [[ ${#MISSING_SYS[@]} -gt 0 ]]; then
-  readarray -t MISSING_SYS < <(printf '%s\n' "${MISSING_SYS[@]}" \
-    | tr ' ' '\n' | grep -v '^$' | sort -u || true)
+  # readarray появился в bash 4.0, а macOS штатно поставляет 3.2.57 — и
+  # именно на macOS эта ветка срабатывает всегда, потому что ffmpeg там не
+  # предустановлен. Установка обрывалась на втором шаге с «readarray:
+  # command not found», а подсказка звала «установить недостающую
+  # программу», хотя не хватало встроенной команды оболочки.
+  _uniq=""
+  while IFS= read -r _line; do
+    [[ -n "${_line}" ]] && _uniq="${_uniq} ${_line}"
+  done < <(printf '%s\n' "${MISSING_SYS[@]}" | tr ' ' '\n' | grep -v '^$' | sort -u || true)
+  # shellcheck disable=SC2206
+  MISSING_SYS=(${_uniq})
+  unset _uniq _line
 fi
 if [[ ${#MISSING_SYS[@]} -gt 0 ]]; then
   info "Не хватает: ${MISSING_SYS[*]}"

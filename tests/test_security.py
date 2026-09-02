@@ -181,3 +181,31 @@ def test_rejected_upload_leaves_no_file(data_dir, monkeypatch):
         left = list(uploads.glob("*")) if uploads.exists() else []
         assert left == [], f"на диске осталось {len(left)} файлов без задания"
         assert c.get("/api/jobs").json()["total"] == 0
+
+
+def test_loading_settings_does_not_rotate_the_key(data_dir, monkeypatch):
+    """Повторная загрузка настроек не должна выпускать новый ключ.
+
+    Ключ читался только из config.yaml, а установки без него — а таких
+    большинство — получали новый ключ при каждой загрузке, и файл
+    api-key.txt переписывался. Достаточно было выполнить
+    `python3 -m asrhub --check` при работающем сервере: в файле оказывался
+    ключ, которого сервер не знает, и веб-интерфейс переставал пускать — с
+    файлом, выглядящим совершенно правильным.
+    """
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+
+    first = load()
+    keyfile = Path(data_dir) / "api-key.txt"
+    assert keyfile.exists(), "ключ не создан при первом запуске"
+    saved = keyfile.read_text(encoding="utf-8").strip()
+    assert saved in first.api_keys
+
+    for _ in range(3):
+        again = load()
+        assert keyfile.read_text(encoding="utf-8").strip() == saved, \
+            "файл ключа переписан при повторной загрузке"
+        assert saved in again.api_keys, "сервер не принял бы ключ из собственного файла"
+
+    assert oct(keyfile.stat().st_mode)[-3:] == "600", "ключ доступен на чтение всем"

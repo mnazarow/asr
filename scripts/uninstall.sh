@@ -155,6 +155,27 @@ fi
 
 step "Удаление файлов"
 
+# Модели спасаем ДО удаления чего-либо. Раньше перенос стоял после
+# `rm -rf "${PREFIX}"`, а на macOS каталог данных лежит внутри prefix: при
+# `--purge --keep-models` модели удалялись вместе с ним, и к моменту
+# переноса каталога уже не было — скрипт дважды отчитывался об успехе, а
+# весов на диске не оставалось.
+MODELS_KEEP=""
+if [[ "${PURGE}" -eq 1 && "${KEEP_MODELS}" -eq 1 && -d "${DATA_DIR}/models" ]]; then
+  MODELS_KEEP="${HOME}/asrhub-models-$(date +%Y%m%d)"
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '  [пробный запуск] mv %s %s\n' "${DATA_DIR}/models" "${MODELS_KEEP}"
+  else
+    if mv "${DATA_DIR}/models" "${MODELS_KEEP}"; then
+      ok "Модели перенесены в ${MODELS_KEEP}"
+    else
+      error "Не удалось перенести модели в ${MODELS_KEEP}."
+      error "Удаление остановлено, чтобы не потерять веса."
+      exit 1
+    fi
+  fi
+fi
+
 # На macOS и при установке от пользователя каталог данных лежит ВНУТРИ
 # prefix. Снести prefix целиком означало бы удалить модели, базу и
 # результаты, о сохранности которых мы тут же отчитываемся ниже.
@@ -178,21 +199,19 @@ if [[ -n "${PREFIX}" && -d "${PREFIX}" ]]; then
 fi
 
 if [[ "${PURGE}" -eq 1 && -n "${DATA_DIR}" && -d "${DATA_DIR}" ]]; then
-  if [[ "${KEEP_MODELS}" -eq 1 && -d "${DATA_DIR}/models" ]]; then
-    MODELS_KEEP="${HOME}/asrhub-models-$(date +%Y%m%d)"
-    if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
-      mv "${DATA_DIR}/models" "${MODELS_KEEP}"
-      ok "Модели перенесены в ${MODELS_KEEP}"
-    fi
-  fi
   if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
     printf '  [пробный запуск] rm -rf %s\n' "${DATA_DIR}"
   else
     rm -rf "${DATA_DIR:?}"
     ok "Удалено: ${DATA_DIR}"
   fi
-else
-  [[ -n "${DATA_DIR}" ]] && info "Данные сохранены: ${DATA_DIR}"
+elif [[ "${PURGE}" -eq 1 ]]; then
+  [[ -n "${MODELS_KEEP}" ]] && info "Модели: ${MODELS_KEEP}"
+elif [[ -n "${DATA_DIR}" && -d "${DATA_DIR}" ]]; then
+  info "Данные сохранены: ${DATA_DIR}"
+elif [[ -n "${DATA_DIR}" ]]; then
+  # Каталога уже нет — говорить «сохранены» было бы неправдой.
+  info "Каталог данных ${DATA_DIR} не найден."
 fi
 
 # --- 5. Остатки -------------------------------------------------------------

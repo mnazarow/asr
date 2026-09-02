@@ -178,6 +178,18 @@ case "${ACTION}" in
     fi ;;
 
   uninstall)
+    # Пробный запуск не останавливает и не сносит работающую службу: он
+    # только рассказывает, что сделал бы. Раньше флаг не доходил до этого
+    # скрипта, и «uninstall --dry-run» гасил службу по-настоящему.
+    if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+      if [[ "${OS}" == "macos" ]]; then
+        printf '  [пробный запуск] launchctl unload %s; rm -f %s\n' "${PLIST}" "${PLIST}"
+      else
+        printf '  [пробный запуск] systemctl disable --now %s.service\n' "${SERVICE_NAME}"
+        printf '  [пробный запуск] rm -f %s\n' "${UNIT}"
+      fi
+      exit 0
+    fi
     if [[ "${OS}" == "macos" ]]; then
       [[ -f "${PLIST}" ]] && { run launchctl unload "${PLIST}" 2>/dev/null || true; rm -f "${PLIST}"; }
       ok "Служба launchd удалена"

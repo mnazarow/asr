@@ -21,6 +21,8 @@ CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"
 SERVER="${ASRHUB_SERVER:-http://127.0.0.1:8080}"
 API_KEY="${ASRHUB_KEY:-}"
+# Общий предел ожидания результата, секунды. Ноль — ждать без ограничения.
+WAIT_LIMIT="${ASRHUB_WAIT_LIMIT:-3600}"
 TIMEOUT=600
 QUIET=0
 
@@ -46,11 +48,17 @@ need_curl() {
 
 load_profile() {
   [[ -f "${CONFIG_FILE}" ]] || return 0
-  local line name url key
+  local name url key
   while IFS='|' read -r name url key; do
     [[ "${name}" == "${PROFILE}" ]] || continue
-    SERVER="${url}"
-    [[ -n "${key}" ]] && API_KEY="${key}"
+    # Профиль — это умолчание, а не приказ. Раньше он присваивался
+    # безусловно и после разбора аргументов, поэтому `--server` и `--key`
+    # не действовали вовсе: запрос уходил на адрес из профиля, а заведомо
+    # неверный ключ проходил проверку. Переменные окружения он затирал так же.
+    [[ "${SERVER_EXPLICIT}" == "1" ]] || SERVER="${url}"
+    if [[ "${KEY_EXPLICIT}" != "1" && -n "${key}" ]]; then
+      API_KEY="${key}"
+    fi
     return 0
   done < "${CONFIG_FILE}"
 }
@@ -68,6 +76,76 @@ save_profile() {
   ok "Профиль «${name}» сохранён: ${url}"
 }
 
+
+# --- сборка JSON без внешних средств ---------------------------------------
+
+json_escape() {
+  # Экранируем обратную косую, кавычку и управляющие символы.
+  local out="$1"
+  out="${out//\\/\\\\}"
+  out="${out//\"/\\\"}"
+  printf '%s' "${out}"
+}
+
+build_settings() {
+  local base="${1:-\{\}}" model="$2" language="$3" formats="$4"
+  local body="${base}"
+
+  # Если python3 есть — пользуемся им: он корректно сольёт пользовательский
+  # JSON из --settings с остальными полями.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+raw, model, language, formats = sys.argv[1:5]
+try:
+    data = json.loads(raw or "{}")
+except json.JSONDecodeError as exc:
+    sys.stderr.write("Не разобрать --settings: %s\n" % exc)
+    raise SystemExit(2)
+if not isinstance(data, dict):
+    sys.stderr.write("--settings должен быть объектом JSON\n")
+    raise SystemExit(2)
+if model: data["model"] = model
+if language: data["language"] = language
+if formats:
+    data["output_formats"] = [f.strip() for f in formats.split(",") if f.strip()]
+print(json.dumps(data, ensure_ascii=False))' "${base}" "${model}" "${language}" "${formats}" && return 0
+    return 2
+  fi
+
+  # Без python3 собираем сами. Пользовательский --settings в этом случае
+  # передаётся как есть — сливать чужой JSON оболочкой мы не беремся, — а
+  # прочие поля добавляются, только если --settings не задан.
+  if [[ -n "${base}" && "${base}" != "{}" ]]; then
+    printf '%s' "${base}"
+    return 0
+  fi
+  local parts=()
+  [[ -n "${model}" ]] && parts+=("\"model\":\"$(json_escape "${model}")\"")
+  [[ -n "${language}" ]] && parts+=("\"language\":\"$(json_escape "${language}")\"")
+  if [[ -n "${formats}" ]]; then
+    local list="" fmt
+    local old_ifs="${IFS}"; IFS=','
+    for fmt in ${formats}; do
+      IFS="${old_ifs}"
+      fmt="$(printf '%s' "${fmt}" | tr -d ' ')"
+      [[ -z "${fmt}" ]] && continue
+      [[ -n "${list}" ]] && list="${list},"
+      list="${list}\"$(json_escape "${fmt}")\""
+      IFS=','
+    done
+    IFS="${old_ifs}"
+    [[ -n "${list}" ]] && parts+=("\"output_formats\":[${list}]")
+  fi
+  local joined="" part
+  for part in "${parts[@]:-}"; do
+    [[ -z "${part}" ]] && continue
+    [[ -n "${joined}" ]] && joined="${joined},"
+    joined="${joined}${part}"
+  done
+  printf '{%s}' "${joined}"
+}
+
 # ---------------------------------------------------------------------------
 # Обращения к серверу
 # ---------------------------------------------------------------------------
@@ -77,11 +155,32 @@ api() {
   need_curl
   local args=(-sS --max-time "${TIMEOUT}" -X "${method}"
               -H "Accept: application/json")
-  [[ -n "${API_KEY}" ]] && args+=(-H "X-API-Key: ${API_KEY}")
   local response status body
-  response="$(curl "${args[@]}" -w '\n%{http_code}' "${SERVER}${path}" "$@" 2>&1)" || {
+
+  # Ключ передаём через --config со стандартного ввода, а не аргументом:
+  # аргументы командной строки видны в `ps` любому пользователю машины, и
+  # ключ утекал даже при аккуратном хранении — в переменной окружения или в
+  # профиле с правами 600.
+  local config=""
+  [[ -n "${API_KEY}" ]] && config="header = \"X-API-Key: ${API_KEY}\""
+
+  # Ошибку curl держим отдельно от тела: раньше stderr сливался в ответ
+  # через 2>&1, и настоящий диагноз («Failed to open/read local data»)
+  # подменялся сообщением о недоступности сервера.
+  local errfile
+  errfile="$(mktemp "${TMPDIR:-/tmp}/asrctl-err.XXXXXX")"
+  if ! response="$(printf '%s' "${config}" \
+      | curl "${args[@]}" --config - -w '\n%{http_code}' \
+             "${SERVER}${path}" "$@" 2>"${errfile}")"; then
+    local reason
+    reason="$(tr -d '\r' < "${errfile}" | tail -1)"
+    rm -f "${errfile}"
+    if [[ -n "${reason}" ]]; then
+      die "Запрос не выполнен: ${reason}"
+    fi
     die "Сервер ${SERVER} недоступен. Проверьте адрес и сеть."
-  }
+  fi
+  rm -f "${errfile}"
   status="$(printf '%s' "${response}" | tail -1)"
   body="$(printf '%s' "${response}" | sed '$d')"
   if [[ "${status}" == "401" ]]; then
@@ -147,19 +246,17 @@ cmd_send() {
   [[ -z "${file}" ]] && die "Укажите файл: asrctl send запись.mp3"
   [[ -f "${file}" ]] || die "Файл не найден: ${file}"
 
-  # Собираем настройки задания
-  if command -v python3 >/dev/null 2>&1; then
-    settings="$(python3 -c "
-import json,sys
-data = json.loads('''${settings}''')
-for key, value in (('model', '''${model}'''), ('language', '''${language}''')):
-    if value: data[key] = value
-formats = '''${formats}'''
-if formats: data['output_formats'] = [f.strip() for f in formats.split(',') if f.strip()]
-print(json.dumps(data, ensure_ascii=False))")"
-  fi
+  # Настройки собираются средствами оболочки. Раньше весь этот блок стоял
+  # под `if command -v python3`, и без него --model, --language и --formats
+  # молча пропадали: задание уходило на модель сервера по умолчанию, а
+  # клиент рапортовал об успехе. При этом в заголовке файла написано, что
+  # нужны только bash и curl.
+  settings="$(build_settings "${settings}" "${model}" "${language}" "${formats}")"
 
-  local args=(-F "file=@${file}" -F "settings=${settings}")
+  # Имя файла берём в кавычки: curl трактует запятую как разделитель
+  # нескольких файлов, а точку с запятой — как начало параметра, и запись
+  # «совещание,часть1.wav» не отправлялась вовсе.
+  local args=(-F "file=@\"${file}\"" -F "settings=${settings}")
   [[ -n "${priority}" ]] && args+=(-F "priority=${priority}")
   [[ -n "${reference}" ]] && args+=(-F "reference_text=${reference}")
 
@@ -183,7 +280,17 @@ cmd_send_dir() {
     case "$1" in
       --recursive|-r) recursive=1; shift ;;
       --pattern) pattern="$2"; shift 2 ;;
-      -*) rest+=("$1" "${2:-}"); shift 2 ;;
+      # Часть флагов идёт без значения. Раньше любой «-*» съедал следующее
+      # слово: `send-dir КАТАЛОГ --wait --formats txt` пожирал --formats, и
+      # каталогом становилось «txt», а `send-dir КАТАЛОГ --wait` вылетал
+      # молча — shift 2 на одном оставшемся аргументе под errexit.
+      --wait|-w|--no-wait) rest+=("$1"); shift ;;
+      -*)
+        if [[ $# -ge 2 && "$2" != -* ]]; then
+          rest+=("$1" "$2"); shift 2
+        else
+          rest+=("$1"); shift
+        fi ;;
       *) dir="$1"; shift ;;
     esac
   done
@@ -210,7 +317,14 @@ cmd_send_dir() {
     fi
   done
   ok "Отправлено: $(( ${#files[@]} - failed )) из ${#files[@]}"
-  [[ ${failed} -gt 0 ]] && warn "Не отправлено: ${failed}"
+  # Последней командой функции было `[[ ${failed} -gt 0 ]] && warn …`: при
+  # нуле ошибок она ложна, и полный успех давал код возврата 1, а неудача —
+  # 0. Ровно наоборот тому, чего ждёт любой вызывающий сценарий.
+  if [[ ${failed} -gt 0 ]]; then
+    warn "Не отправлено: ${failed}"
+    return 1
+  fi
+  return 0
 }
 
 cmd_status() {
@@ -243,7 +357,23 @@ cmd_wait() {
     esac
   done
   local status="" progress="" spin='|/-\' i=0
+
+  # Общий срок ожидания. Раньше цикл был безусловным `while true`, а
+  # --timeout ограничивал только отдельный запрос curl: при остановленной
+  # очереди `asrctl wait` висел вечно, и убить его можно было лишь снаружи.
+  local deadline=0
+  if [[ "${WAIT_LIMIT}" -gt 0 ]]; then
+    deadline=$(( $(date +%s) + WAIT_LIMIT ))
+  fi
+
   while true; do
+    if [[ "${deadline}" -gt 0 && "$(date +%s)" -ge "${deadline}" ]]; then
+      printf '\r%s!%s ожидание прервано по сроку (%d с)                 \n' \
+        "${C_YELLOW}" "${C_RESET}" "${WAIT_LIMIT}"
+      say "Задание осталось в очереди: asrctl status ${job_id}"
+      say "Увеличить срок: asrctl --wait-limit 7200 wait ${job_id}"
+      return 2
+    fi
     local response
     response="$(api GET "/api/jobs/${job_id}")" || return 1
     status="$(json_get "${response}" status)"
@@ -267,10 +397,20 @@ cmd_wait() {
       cancelled)
         printf '\r%s!%s отменено                                      \n' "${C_YELLOW}" "${C_RESET}"
         return 1 ;;
+      paused)
+        # Отдельная ветка: иначе пользователь смотрит на крутящийся значок и
+        # не понимает, что очередь на паузе и ждать можно бесконечно.
+        i=$(( (i + 1) % 4 ))
+        printf '\r%s задание приостановлено — asrctl resume %s      ' \
+          "${spin:i:1}" "${job_id}"
+        sleep 2 ;;
       *)
         i=$(( (i + 1) % 4 ))
-        printf '\r%s %s %s%%  %s        ' "${spin:i:1}" "${status}" \
-          "$(python3 -c "print(round(float('${progress:-0}')*100))" 2>/dev/null || echo 0)" "${stage}"
+        local percent=0
+        if [[ -n "${progress}" ]]; then
+          percent="$(awk "BEGIN{printf \"%d\", ${progress}*100}" 2>/dev/null || echo 0)"
+        fi
+        printf '\r%s %s %s%%  %s        ' "${spin:i:1}" "${status}" "${percent}" "${stage}"
         sleep 2 ;;
     esac
   done
@@ -288,7 +428,11 @@ cmd_get() {
   done
   need_curl
   local args=(-sS --max-time "${TIMEOUT}" -f)
-  [[ -n "${API_KEY}" ]] && args+=(-H "X-API-Key: ${API_KEY}")
+  # Ключ идёт через --config со стандартного ввода: аргументы командной
+  # строки видны в ps любому пользователю машины.
+  local config=""
+  [[ -n "${API_KEY}" ]] && config="header = \"X-API-Key: ${API_KEY}\""
+
   # Каталогом считаем то, что уже существует как каталог, оканчивается на «/»
   # или не содержит точки в имени. Иначе это имя файла.
   local looks_like_dir=0
@@ -309,7 +453,9 @@ d=json.load(sys.stdin); print(os.path.splitext(d.get('filename','result'))[0])" 
   else
     mkdir -p "$(dirname "${output}")"
   fi
-  if curl "${args[@]}" "${SERVER}/api/jobs/${job_id}/download?fmt=${format}" -o "${output}"; then
+  if printf '%s' "${config}" \
+      | curl "${args[@]}" --config - \
+             "${SERVER}/api/jobs/${job_id}/download?fmt=${format}" -o "${output}"; then
     ok "Сохранено: ${output}"
   else
     die "Не удалось скачать результат в формате ${format}."
@@ -478,8 +624,11 @@ asrctl — клиент ASR Hub
   config add ИМЯ АДРЕС [КЛЮЧ]
   config list | remove ИМЯ
   --profile ИМЯ              использовать профиль (или ASRCTL_PROFILE)
-  --server АДРЕС             адрес сервера напрямую
-  --key КЛЮЧ                 ключ доступа напрямую
+  --server АДРЕС             адрес сервера; перекрывает профиль
+  --key КЛЮЧ                 ключ доступа; перекрывает профиль
+  --timeout СЕКУНДЫ          срок одного запроса (по умолчанию 30)
+  --wait-limit СЕКУНДЫ       общий срок ожидания результата (по умолчанию 3600,
+                             0 — ждать без ограничения; или ASRHUB_WAIT_LIMIT)
 
 Прочее
   tunnel --host СЕРВЕР [--user ИМЯ] [--port 8080]
@@ -500,12 +649,19 @@ USAGE
 #   asrctl --server https://… queue     и     asrctl queue --server https://…
 COMMAND=""
 ARGS=()
+# Признаки «задано явно»: их уважает load_profile. Переменные окружения тоже
+# считаются явным заданием — иначе профиль отменял бы ASRHUB_SERVER.
+SERVER_EXPLICIT=0
+KEY_EXPLICIT=0
+[[ -n "${ASRHUB_SERVER:-}" ]] && SERVER_EXPLICIT=1
+[[ -n "${ASRHUB_KEY:-}" ]] && KEY_EXPLICIT=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile) PROFILE="$2"; shift 2 ;;
-    --server)  SERVER="${2%/}"; shift 2 ;;
-    --key)     API_KEY="$2"; shift 2 ;;
+    --server)  SERVER="${2%/}"; SERVER_EXPLICIT=1; shift 2 ;;
+    --key)     API_KEY="$2"; KEY_EXPLICIT=1; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
+    --wait-limit) WAIT_LIMIT="$2"; shift 2 ;;
     --quiet|-q) QUIET=1; shift ;;
     *)
       if [[ -z "${COMMAND}" ]]; then COMMAND="$1"; else ARGS+=("$1"); fi

@@ -230,6 +230,17 @@ class EngineRegistry:
                 except Exception:
                     pass
             self._cache.clear()
+        # Модели постобработки живут в своём кеше и раньше про «выгрузить
+        # всё» не знали: после освобождения памяти в ней оставались
+        # трансформеры расстановки знаков препинания.
+        try:
+            from ..pipeline.postprocess import unload_text_models
+
+            freed = unload_text_models()
+            if freed:
+                log.info("Выгружено моделей постобработки: %d", freed)
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Не удалось выгрузить модели постобработки: %s", exc)
 
     def loaded(self) -> list[dict[str, Any]]:
         with self._lock:

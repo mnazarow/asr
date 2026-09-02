@@ -43,8 +43,18 @@ def main(argv: list[str] | None = None) -> int:
 
         return 0 if run_checks(settings) else 1
 
-    host = args.host or str(settings.get("server_host") or "0.0.0.0")
-    port = int(args.port or settings.get("server_port") or 8080)
+    # Адрес и порт кладём в настройки, а не только в uvicorn: из настроек их
+    # читают стартовая запись в журнале и готовый фрагмент prometheus.yml,
+    # который отдаёт /api/monitoring/config/prometheus-scrape. Раньше сервер,
+    # запущенный как `-m asrhub --host 127.0.0.1 --port 8199`, писал в журнал
+    # «запущен: 0.0.0.0:8080» и выдавал для сбора метрик адрес, по которому
+    # его нет.
+    if args.host:
+        settings.set("server_host", args.host)
+    if args.port:
+        settings.set("server_port", int(args.port))
+    host = str(settings.get("server_host") or "0.0.0.0")
+    port = int(settings.get("server_port") or 8080)
 
     try:
         import uvicorn

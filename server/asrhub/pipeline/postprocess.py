@@ -142,8 +142,38 @@ def _report_missing(what: str, choice: str, explicit: bool, exc: Exception) -> N
         log.debug("%s «%s» недоступен: %s", what, choice, exc)
 
 
+#: Сколько разных нормализаторов держать в памяти. Каждый — полноценная
+#: модель, поэтому предел небольшой и вытеснение простое: при переполнении
+#: кеш очищается целиком, следующая запись загрузит нужное заново.
+_ITN_CACHE_LIMIT = 4
+
+
+def unload_text_models() -> int:
+    """Выгружает модели постобработки. Возвращает, сколько их было.
+
+    Вызывается из реестра движков вместе с выгрузкой моделей распознавания:
+    иначе освобождение памяти «выгрузить всё» освобождало не всё.
+    """
+    count = len(_PUNCT_CACHE) + len(_ITN_CACHE)
+    _PUNCT_CACHE.clear()
+    _ITN_CACHE.clear()
+    if count:
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:                                   # noqa: BLE001
+            pass
+    return count
+
+
 def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
-    key = f"{model}:{language}"
+    # В ключе только выбор модели. Язык добавлять нельзя: загружаемая модель
+    # от него не зависит, а при `language: auto` и разноязычном потоке каждый
+    # новый определившийся язык добавлял ещё одну полную копию того же
+    # трансформера — до полутора гигабайт за язык, до девяноста девяти копий.
+    # Ни collect_idle, ни счётчик загруженных моделей про этот кеш не знали.
+    key = model
     if key in _PUNCT_CACHE:
         return _PUNCT_CACHE[key]
 
@@ -269,9 +299,13 @@ _SCALES_RU = {"тысяча": 1000, "тысячи": 1000, "тысяч": 1000, "�
 
 
 def _load_itn(backend: str, language: str):
+    # Язык здесь значим: InverseNormalizer(lang=...) создаётся под конкретный
+    # язык. Но число языков ограничиваем — иначе кеш растёт без предела.
     key = f"{backend}:{language}"
     if key in _ITN_CACHE:
         return _ITN_CACHE[key]
+    if len(_ITN_CACHE) >= _ITN_CACHE_LIMIT:
+        _ITN_CACHE.clear()
     choice = backend
     explicit = backend != "auto"
     if backend == "auto":

@@ -14,12 +14,23 @@ from .. import settings_access as S
 from ..engines.base import Segment
 from ..errors import DependencyMissing, GatedModelError
 from ..logging_setup import get_logger
+from ..monitoring.collector import RUNTIME
 
 log = get_logger("diarization")
 
 
 def diarize_segments(audio_path: Path, segments: list[Segment],
-                     settings: dict[str, Any]) -> list[Segment]:
+                     settings: dict[str, Any],
+                     warnings: list[str] | None = None) -> list[Segment]:
+    """Расставляет говорящих. Возвращает те же сегменты с полем speaker.
+
+    Если выбранный механизм не сработал, применяется разбивка по паузам —
+    но об этом обязательно сообщается: в журнал и в список предупреждений
+    задания. Раньше подмена была молчаливой, и в протоколе совещания реплики,
+    расставленные по паузе в 1,2 секунды, выглядели ровно так же, как
+    настоящая диаризация, — отличить их было нельзя ни в интерфейсе, ни в
+    выгрузке.
+    """
     backend = str(settings.get("diarization_backend") or "auto")
     order = {
         "auto": ["pyannote", "sortformer", "pauses"],
@@ -29,6 +40,19 @@ def diarize_segments(audio_path: Path, segments: list[Segment],
         "builtin": ["pauses"],
     }.get(backend, ["pauses"])
 
+    def fallback(reason: str) -> list[Segment]:
+        if reason:
+            note = (f"Диаризация «{backend}» не выполнена ({reason}). "
+                    "Говорящие расставлены по паузам — это грубая оценка, "
+                    "а не разделение по голосам.")
+            log.warning("%s", note)
+            if warnings is not None:
+                warnings.append(note)
+            RUNTIME.inc("asrhub_errors_total", labels={"code": "diarization_fallback",
+                                                       "retryable": "true"})
+        return _by_pauses(segments, settings)
+
+    failure = ""
     for name in order:
         try:
             if name == "pyannote":
@@ -36,17 +60,20 @@ def diarize_segments(audio_path: Path, segments: list[Segment],
             elif name == "sortformer":
                 turns = _sortformer(audio_path, settings)
             else:
-                return _by_pauses(segments, settings)
+                # До разбивки по паузам дошли штатно — она и была выбрана.
+                return fallback(failure)
         except (DependencyMissing, GatedModelError):
             if backend not in ("auto",):
                 raise
             continue
         except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
             log.warning("Диаризация «%s» не удалась: %s", name, exc)
             continue
         if turns:
             return _assign(segments, turns)
-    return _by_pauses(segments, settings)
+        failure = failure or "механизм не нашёл ни одного говорящего"
+    return fallback(failure)
 
 
 def _pyannote(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, float, str]]:

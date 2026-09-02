@@ -284,3 +284,106 @@ def test_energy_vad_does_not_call_silence_speech(tmp_path: Path):
     assert found < seconds * 0.25, \
         f"детектор объявил речью {found:.0f} с из {seconds} при двух секундах речи"
     assert found > 0.5, "речь потеряна совсем"
+
+
+def test_alignment_survives_word_count_mismatch():
+    """Границы не должны разъезжаться, когда счёт слов не совпадает.
+
+    _redistribute резал плоский список выровненных слов по числу слов в
+    тексте сегмента. Совпадение не гарантировано: MFA чистит текст и «из-за»
+    приходит двумя словами, WhisperX выбрасывает слова без таймкодов.
+    Расхождение в одно слово сдвигало границы всех последующих сегментов, и
+    сдвиг накапливался до конца записи.
+    """
+    from asrhub.engines.base import Segment
+    from asrhub.pipeline.alignment import _redistribute
+
+    def word(text: str, start: float, end: float) -> dict:
+        return {"word": text, "start": start, "end": end, "score": 0.9}
+
+    # MFA разбил «Из-за» и «чего-то» — восемь слов вместо шести по счёту.
+    aligned = [word("из", 0.0, 0.4), word("за", 0.4, 0.8),
+               word("чего", 0.8, 1.2), word("то", 1.2, 1.5),
+               word("встреча", 1.5, 2.4), word("сдвинулась", 2.4, 3.9),
+               word("обсудим", 4.0, 4.8), word("бюджет", 4.8, 5.9)]
+    segments = [Segment(start=0, end=0, text="Из-за чего-то встреча сдвинулась."),
+                Segment(start=0, end=0, text="Обсудим бюджет.")]
+    out = _redistribute(segments, aligned, {"alignment_keep_text": True})
+    assert round(out[0].end, 2) == 3.9, "границу первого сегмента сдвинуло"
+    assert round(out[1].start, 2) == 4.0, "второй сегмент забрал чужие слова"
+
+    # WhisperX потерял слово «дивный».
+    aligned = [word("привет", 0.0, 0.5), word("мир", 0.5, 1.0),
+               word("как", 2.0, 2.3), word("дела", 2.6, 3.0)]
+    segments = [Segment(start=0, end=0, text="Привет, дивный мир."),
+                Segment(start=0, end=0, text="Как дела?")]
+    out = _redistribute(segments, aligned, {"alignment_keep_text": True})
+    assert round(out[0].end, 2) == 1.0, "потерянное слово утащило чужую границу"
+    assert round(out[1].start, 2) == 2.0
+
+    # Текст остаётся исходным — со знаками препинания и заглавными.
+    assert out[0].text.startswith("Привет")
+
+
+def test_diarization_fallback_is_reported():
+    """Подмена диаризации разбивкой по паузам не должна быть молчаливой.
+
+    Если явно выбранный механизм падал не на отсутствии зависимости, ошибка
+    гасилась и говорящие расставлялись по паузам. В протоколе совещания это
+    неотличимо от настоящей диаризации — ни в интерфейсе, ни в выгрузке.
+    """
+    import wave
+
+    from asrhub.engines.base import Segment
+    from asrhub.pipeline import diarization
+
+    tmp = Path(__file__).resolve().parent / "_diar.wav"
+    with wave.open(str(tmp), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\0" * 32000)
+
+    original = diarization._pyannote
+    diarization._pyannote = lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("CUDA out of memory"))
+    try:
+        segments = [Segment(start=0, end=3, text="Первая"),
+                    Segment(start=3.1, end=6, text="Вторая"),
+                    Segment(start=9, end=12, text="Третья")]
+        warnings: list[str] = []
+        result = diarization.diarize_segments(
+            tmp, segments, {"diarization_backend": "pyannote"}, warnings)
+    finally:
+        diarization._pyannote = original
+        tmp.unlink(missing_ok=True)
+
+    assert all(s.speaker for s in result), "говорящие всё же должны быть расставлены"
+    assert warnings, "подмена прошла молча"
+    assert "по паузам" in warnings[0], warnings[0]
+
+
+def test_postprocess_cache_does_not_grow_per_language():
+    """Кеш моделей постобработки не должен расти по числу языков.
+
+    Модель пунктуации от языка не зависит, а ключ кеша его содержал: при
+    `language: auto` и разноязычном потоке каждый новый язык добавлял ещё
+    одну полную копию того же трансформера.
+    """
+    from asrhub.pipeline import postprocess
+
+    postprocess._PUNCT_CACHE.clear()
+    postprocess._ITN_CACHE.clear()
+    for language in ("ru", "en", "de", "fr", "es", "it", "pt", "nl"):
+        postprocess._load_punctuator("multilingual", language)
+        postprocess._load_itn("nemo", language)
+
+    assert len(postprocess._PUNCT_CACHE) == 1, \
+        f"на восемь языков заведено {len(postprocess._PUNCT_CACHE)} моделей пунктуации"
+    assert len(postprocess._ITN_CACHE) <= postprocess._ITN_CACHE_LIMIT, \
+        f"кеш нормализаторов вырос до {len(postprocess._ITN_CACHE)}"
+
+    # «Выгрузить всё» должно освобождать и этот кеш.
+    postprocess._PUNCT_CACHE["x"] = None
+    assert postprocess.unload_text_models() >= 1
+    assert not postprocess._PUNCT_CACHE and not postprocess._ITN_CACHE

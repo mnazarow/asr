@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -52,6 +53,45 @@ curl -X POST http://сервер:8080/api/jobs \\
 _KNOWN_PREFIXES = ("/api/", "/ws", "/static/")
 
 
+#: Пути, которые сервер обслуживает. Заполняется один раз при первом
+#: обращении из таблицы маршрутов приложения.
+_ROUTE_WHITELIST: set[str] | None = None
+
+
+def register_routes(app: Any) -> None:
+    """Запоминает шаблоны маршрутов приложения для метки route."""
+    global _ROUTE_WHITELIST
+    paths = {"/", "/ws"}
+
+    def walk(routes: Any, depth: int = 0) -> None:
+        # Подключённые маршрутизаторы приходят обёртками без собственного
+        # path, поэтому обходим вложенность, а не только верхний уровень:
+        # иначе в списке оказывались четыре служебных адреса, и все
+        # настоящие маршруты считались неизвестными.
+        if depth > 4:
+            return
+        for route in routes or []:
+            path = getattr(route, "path", None)
+            if path:
+                # Шаблон FastAPI выглядит как /api/jobs/{job_id}; приводим к
+                # тому же виду, в каком его собирает _route_fallback.
+                paths.add(re.sub(r"\{[^}]+\}", "{id}", path))
+            # Подключённый маршрутизатор в новых версиях FastAPI приходит
+            # обёрткой _IncludedRouter: настоящие маршруты лежат в
+            # original_router. Заглядываем и туда, и в обычное routes.
+            walk(getattr(route, "routes", None), depth + 1)
+            inner = getattr(route, "original_router", None)
+            if inner is not None:
+                walk(getattr(inner, "routes", None), depth + 1)
+
+    walk(getattr(app, "routes", []))
+    _ROUTE_WHITELIST = paths
+
+
+def _known_routes() -> set[str]:
+    return _ROUTE_WHITELIST if _ROUTE_WHITELIST is not None else set()
+
+
 def _route_fallback(path: str) -> str:
     """Схлопывает путь в устойчивую метку, когда шаблон маршрута недоступен.
 
@@ -71,8 +111,19 @@ def _route_fallback(path: str) -> str:
         else:
             parts.append(part)
     collapsed = "/".join(parts) or "/"
-    # Ограничиваем и длину: очень длинный путь тоже раздувает хранилище.
-    return collapsed if len(collapsed) <= 80 else "other"
+    if len(collapsed) > 80:
+        return "other"
+    # Ограничение длины само по себе ничего не ограничивало: перебор коротких
+    # несуществующих путей внутри /api/ добавлял по ряду на каждый, а 404
+    # отдаётся маршрутизатором до проверки ключа, так что перебор бесплатный
+    # и анонимный. Считаем меткой только то, что сервер действительно
+    # обслуживает; остальное схлопывается в «unknown».
+    known = _known_routes()
+    if not known:
+        # Список ещё не заполнен (модуль используется отдельно от приложения)
+        # — возвращаем схлопнутый путь, как раньше.
+        return collapsed
+    return collapsed if collapsed in known else "unknown"
 
 
 class EventHub:
@@ -304,5 +355,10 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             if path.exists():
                 return FileResponse(str(path), media_type="image/svg+xml")
             return JSONResponse(status_code=404, content={})
+
+    # Список обслуживаемых маршрутов нужен метке route: всё, чего в нём
+    # нет, схлопывается в «unknown» и не плодит временные ряды.
+    # Заполняем в самом конце, когда подключены все маршрутизаторы.
+    register_routes(app)
 
     return app

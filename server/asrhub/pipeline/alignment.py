@@ -229,14 +229,22 @@ def _redistribute(segments: list[Any], words: list[dict[str, Any]],
     aligned_segments = []
 
     for segment in segments:
-        own = _count_words(segment.text)
-        chunk = words[cursor:cursor + own]
-        cursor += own
+        source_words = segment.text.split()
+        # Раскладка по счёту слов верна только пока выравниватель вернул
+        # ровно столько же слов, сколько их в исходном тексте. Это не
+        # гарантировано: MFA отбрасывает дефисы при подготовке текста
+        # («из-за» становится двумя словами), а WhisperX выбрасывает слова,
+        # для которых не нашёл границ. Расхождение в одно слово сдвигало
+        # границы всех последующих сегментов, и сдвиг накапливался до конца
+        # записи — субтитры разъезжались на секунды и минуты. Поэтому
+        # опираемся на содержимое: ищем, где кончается этот сегмент.
+        take = _match_length(source_words, words, cursor)
+        chunk = words[cursor:cursor + take]
+        cursor += take
         if not chunk:
             aligned_segments.append(segment)
             continue
 
-        source_words = segment.text.split()
         segment.words = [
             {
                 "word": source_words[index] if keep_text and index < len(source_words)
@@ -257,6 +265,74 @@ def _redistribute(segments: list[Any], words: list[dict[str, Any]],
         log.debug("Выравнивание: осталось нераспределённых слов — %d",
                   len(words) - cursor)
     return _merge_close(aligned_segments, S.num(settings, "alignment_max_gap_s", 0.0))
+
+
+def _normalize(word: str) -> str:
+    """Слово в виде, пригодном для сравнения с выводом выравнивателя."""
+    cleaned = "".join(ch for ch in word.lower() if ch.isalnum())
+    return cleaned
+
+
+def _match_length(source_words: list[str], aligned: list[dict[str, Any]],
+                  cursor: int) -> int:
+    """Сколько выровненных слов приходится на этот сегмент.
+
+    Считаем по содержимому, а не по счёту. Два случая, из-за которых счёт
+    расходится:
+
+    * выравниватель разбил слово — MFA чистит текст и «из-за» превращается
+      в «из» + «за»;
+    * выравниватель слово пропустил — WhisperX выбрасывает те, для которых
+      не нашёл границ.
+
+    В первом случае забираем столько слов, сколько нужно, чтобы собрать
+    исходное целиком. Во втором — не забираем ничего: если текущее
+    выровненное слово подходит следующему слову сегмента, значит нынешнее
+    просто потеряно, и отдавать ему чужую границу нельзя.
+    """
+    if not source_words:
+        return 0
+    remaining = len(aligned) - cursor
+    if remaining <= 0:
+        return 0
+
+    taken = 0
+    for index, raw in enumerate(source_words):
+        target = _normalize(raw)
+        if not target or cursor + taken >= len(aligned):
+            continue
+
+        # Собираем выровненные слова, пока не покроем исходное целиком.
+        collected = ""
+        used = 0
+        while cursor + taken + used < len(aligned) and used < 8:
+            piece = _normalize(str(aligned[cursor + taken + used].get("word", "")))
+            if not piece:
+                used += 1
+                continue
+            if not target.startswith(collected + piece):
+                break
+            collected += piece
+            used += 1
+            if collected == target:
+                break
+        if collected == target and used:
+            taken += used
+            continue
+
+        # Совпадения нет. Смотрим вперёд: если текущее выровненное слово
+        # подходит одному из ближайших следующих слов сегмента, значит это
+        # слово выравниватель потерял — ничего не забираем.
+        current = _normalize(str(aligned[cursor + taken].get("word", "")))
+        lookahead = [_normalize(w) for w in source_words[index + 1:index + 4]]
+        if current and any(nxt and nxt.startswith(current) for nxt in lookahead):
+            continue
+
+        # Иначе считаем, что выравниватель дал другое слово вместо этого:
+        # берём одно и идём дальше.
+        taken += 1
+
+    return max(0, min(taken, remaining))
 
 
 def _count_words(text: str) -> int:

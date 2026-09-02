@@ -102,25 +102,70 @@ if ((Test-CommandExists 'docker') -and (Test-Path (Join-Path $Prefix 'docker\doc
 }
 
 Write-Step 'Удаление файлов'
+
+# Модели спасаем до всякого удаления: при установке без прав администратора
+# каталог данных лежит ВНУТРИ каталога программы (%LOCALAPPDATA%\ASRHub\data),
+# и снос prefix уносил их вместе с собой.
+$keptModels = ''
+if ($Purge -and $KeepModels -and $DataDir) {
+    $modelsDir = Join-Path $DataDir 'models'
+    if (Test-Path $modelsDir) {
+        $keptModels = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "ASRHub-models-$(Get-Date -Format 'yyyyMMdd')"
+        if (Get-DryRun) { Write-Host "  [пробный запуск] Move-Item $modelsDir $keptModels" }
+        else {
+            try {
+                Move-Item $modelsDir $keptModels -Force -ErrorAction Stop
+                Write-Ok "Модели перенесены: $keptModels"
+            } catch {
+                Write-Err "Не удалось перенести модели: $_"
+                Write-Err 'Удаление остановлено, чтобы не потерять веса.'
+                exit 1
+            }
+        }
+    }
+}
+
+# Каталог данных внутри каталога программы — обычная раскладка на Windows и
+# macOS. Снести prefix целиком означало бы удалить модели, базу и
+# результаты, о сохранности которых скрипт тут же отчитывается. В bash-версии
+# такая защита была, в этой — нет: обычный запуск без -Purge удалял всё и
+# писал «Данные сохранены».
+$dataInsidePrefix = $false
+if ($Prefix -and $DataDir) {
+    $p = [System.IO.Path]::GetFullPath($Prefix).TrimEnd('\')
+    $d = [System.IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+    $dataInsidePrefix = $d.StartsWith($p + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
 if ($Prefix -and (Test-Path $Prefix)) {
-    if (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $Prefix" }
+    if (-not $Purge -and $dataInsidePrefix) {
+        Write-Info 'Каталог данных находится внутри каталога программы — удаляем выборочно.'
+        foreach ($sub in @('server', 'scripts', 'config', 'requirements', 'docker',
+                           'venv', 'VERSION', 'README.md')) {
+            $target = Join-Path $Prefix $sub
+            if (-not (Test-Path $target)) { continue }
+            if (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $target" }
+            else { Remove-Item -Path $target -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        if (-not (Get-DryRun)) { Write-Ok "Программа удалена, данные оставлены: $DataDir" }
+    }
+    elseif (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $Prefix" }
     else {
         Remove-Item -Path $Prefix -Recurse -Force -ErrorAction SilentlyContinue
         Write-Ok "Удалено: $Prefix"
     }
 }
+
 if ($Purge -and $DataDir -and (Test-Path $DataDir)) {
-    if ($KeepModels) {
-        $modelsDir = Join-Path $DataDir 'models'
-        if (Test-Path $modelsDir) {
-            $keep = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "ASRHub-models-$(Get-Date -Format 'yyyyMMdd')"
-            if (-not (Get-DryRun)) { Move-Item $modelsDir $keep -Force; Write-Ok "Модели перенесены: $keep" }
-        }
-    }
     if (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $DataDir" }
     else { Remove-Item -Path $DataDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Ok "Удалено: $DataDir" }
-} elseif ($DataDir) {
+    if ($keptModels) { Write-Info "Модели: $keptModels" }
+} elseif ($Purge) {
+    if ($keptModels) { Write-Info "Модели: $keptModels" }
+} elseif ($DataDir -and (Test-Path $DataDir)) {
     Write-Info "Данные сохранены: $DataDir"
+} elseif ($DataDir) {
+    Write-Info "Каталог данных $DataDir не найден."
 }
 
 Write-Step 'Проверка остатков'

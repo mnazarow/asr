@@ -201,7 +201,7 @@ HOST=http://сервер:8080
 JOB=$(curl -s -H "X-API-Key: $KEY" \\
         -F 'file=@совещание.mp3' \\
         -F 'model=gigaam-v3-e2e-rnnt' \\
-        -F 'diarization=true' \\
+        -F 'diarization_enabled=true' \\
         "$HOST/api/jobs" | jq -r .id)
 
 # 2. Дождаться завершения
@@ -241,7 +241,7 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "curl": f"curl -H 'X-API-Key: {K}' \\\n"
                 "     -F 'file=@совещание.mp3' \\\n"
                 "     -F 'model=gigaam-v3-e2e-rnnt' \\\n"
-                "     -F 'diarization=true' \\\n"
+                "     -F 'diarization_enabled=true' \\\n"
                 f"     {HOST}/api/jobs",
         "note": "Файл передаётся как `multipart/form-data`. Любой параметр из "
                 "`GET /api/params` можно передать полем формы — он подменит "

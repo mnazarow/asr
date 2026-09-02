@@ -669,3 +669,21 @@ def test_engines_do_not_swallow_legal_zero():
             if key in zero_legal and float(fallback) != 0.0:
                 offenders.append(f"{path.name}: {key}")
     assert not offenders, "легальный ноль подменяется: " + "; ".join(offenders)
+
+
+def test_unknown_paths_collapse_to_single_label(client):
+    """Перебор несуществующих путей внутри /api/ не должен плодить серии.
+
+    Ограничение длины ничего не ограничивало: короткие несуществующие пути
+    попадали в метку как есть, а 404 отдаётся маршрутизатором до проверки
+    ключа — то есть перебор был бесплатным и анонимным.
+    """
+    from asrhub.api.app import _route_fallback
+
+    labels = {_route_fallback(f"/api/{'ab' * (i % 6 + 1)}{i}") for i in range(200)}
+    assert labels == {"unknown"}, f"перебор дал {len(labels)} значений метки"
+
+    # Настоящие маршруты по-прежнему различимы.
+    assert _route_fallback("/api/health") == "/api/health"
+    assert _route_fallback("/api/jobs/job_abc123/download") == "/api/jobs/{id}/download"
+    assert _route_fallback("/api/monitoring/metrics") == "/api/monitoring/metrics"

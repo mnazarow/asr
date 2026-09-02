@@ -32,6 +32,16 @@ _TRUE = {"1", "true", "yes", "on", "да", "истина"}
 _FALSE = {"0", "false", "no", "off", "нет", "ложь"}
 
 
+def parse_scalar(raw: str, kind: str) -> Any:
+    """Строка в значение объявленного типа.
+
+    Пользуются и разбор переменных окружения, и приём параметров задания
+    отдельными полями формы: и там, и там значение приходит строкой, а
+    проверка по каталогу ждёт настоящий тип.
+    """
+    return _parse_env_value(raw, kind)
+
+
 def _parse_env_value(raw: str, kind: str) -> Any:
     raw = raw.strip()
     if kind == "bool":
@@ -483,15 +493,49 @@ def load(config_path: str | os.PathLike[str] | None = None,
     )
 
     if settings.get("auth_enabled") and not api_keys:
+        keyfile = paths.data / "api-key.txt"
+
+        # Сначала пробуем прочитать уже созданный ключ. Без этого каждая
+        # загрузка настроек выпускала новый и переписывала файл: достаточно
+        # было выполнить `python3 -m asrhub --check` при работающем сервере,
+        # чтобы в api-key.txt оказался ключ, которого сервер не знает, — и
+        # веб-интерфейс переставал пускать с файлом, выглядящим правильным.
+        # Ключи из config.yaml читаются выше; сюда доходят установки без
+        # файла конфигурации, а таких большинство.
+        existing = ""
+        try:
+            if keyfile.exists():
+                existing = keyfile.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            log.warning("Не удалось прочитать ключ доступа из %s: %s", keyfile, exc)
+
+        if existing.startswith("ah_") and len(existing) >= 12:
+            settings.api_keys[existing] = {
+                "role": "admin", "name": "создан автоматически при первом запуске"}
+            return settings
+
         key = "ah_" + secrets.token_urlsafe(24)
         settings.api_keys[key] = {"role": "admin", "name": "создан автоматически при первом запуске"}
-        keyfile = paths.data / "api-key.txt"
         try:
             # Файл создаётся сразу с нужными правами: если выставлять их после
             # записи, остаётся окно, в котором ключ доступен на чтение всем.
-            handle = os.open(str(keyfile), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # O_EXCL — чтобы две загрузки, начавшиеся одновременно, не
+            # затирали ключ друг друга.
+            handle = os.open(str(keyfile),
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(handle, "w", encoding="utf-8") as fh:
                 fh.write(key + "\n")
+        except FileExistsError:
+            # Кто-то успел создать файл между проверкой и записью — берём его.
+            try:
+                other = keyfile.read_text(encoding="utf-8").strip()
+            except OSError:
+                other = ""
+            if other.startswith("ah_"):
+                settings.api_keys.pop(key, None)
+                settings.api_keys[other] = {
+                    "role": "admin", "name": "создан автоматически при первом запуске"}
+                return settings
         except OSError as exc:
             log.error("Не удалось сохранить ключ доступа в %s: %s", keyfile, exc)
             log.error("Ключ доступа этого запуска: %s", key)

@@ -208,11 +208,32 @@ fi
 
 if [[ "${ENGINES_ONLY}" -eq 0 ]]; then
   step "Обновление файлов"
-  if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+
+  # Источник и назначение могут совпадать: SOURCE_DIR по умолчанию — каталог,
+  # откуда запущен сам скрипт, а установщик печатает в разделе «Что дальше»
+  # именно «bash <PREFIX>/scripts/update.sh». Цикл сначала удалял каталог, а
+  # потом копировал из него же — «cp: cannot stat .../server», и установка
+  # оставалась без каталога server. Снимок при этом создавался, но обработчик
+  # ошибки о нём не говорил, и про --rollback пользователь не узнавал.
+  SRC_REAL="$(cd "${SOURCE_DIR}" 2>/dev/null && pwd -P || echo "${SOURCE_DIR}")"
+  DST_REAL="$(cd "${PREFIX}" 2>/dev/null && pwd -P || echo "${PREFIX}")"
+  if [[ "${SRC_REAL}" == "${DST_REAL}" ]]; then
+    info "Источник совпадает с установкой — файлы уже на месте, копирование пропущено."
+    info "Чтобы обновиться из другого места: bash update.sh --source /путь/к/новой/версии"
+  elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
     for item in server scripts config requirements docker VERSION README.md; do
       [[ -e "${SOURCE_DIR}/${item}" ]] || continue
+      # Копируем во временное имя рядом и подменяем: если копирование
+      # сорвётся на середине, прежний каталог останется целым.
+      staged="${PREFIX:?}/.${item}.new"
+      rm -rf "${staged}"
+      if ! cp -a "${SOURCE_DIR}/${item}" "${staged}"; then
+        rm -rf "${staged}"
+        error "Не удалось скопировать ${item}; прежняя версия не тронута."
+        exit 1
+      fi
       rm -rf "${PREFIX:?}/${item}"
-      cp -a "${SOURCE_DIR}/${item}" "${PREFIX}/"
+      mv "${staged}" "${PREFIX:?}/${item}"
     done
     chmod +x "${PREFIX}"/scripts/*.sh 2>/dev/null || true
   fi

@@ -244,3 +244,68 @@ def test_light_listing_carries_what_consumers_need():
         assert needed in columns, f"{needed} пропал из облегчённого набора"
     for heavy in ("text", "file_path", "params"):
         assert heavy not in columns, f"{heavy} не должен ехать в облегчённом списке"
+
+
+def test_client_script_has_no_known_defects():
+    """Статические проверки клиента: то, что уже ломалось.
+
+    Все три места воспроизводились запуском против живого сервера, поэтому
+    закрываем их проверкой исходника — поднимать ради этого сервер в тестах
+    незачем.
+    """
+    from pathlib import Path
+
+    client = (Path(__file__).resolve().parent.parent
+              / "scripts" / "client" / "asrctl").read_text(encoding="utf-8")
+
+    # Ключ не должен уходить аргументом curl: аргументы видны в ps.
+    assert '-H "X-API-Key: ${API_KEY}"' not in client, "ключ снова в аргументах curl"
+    assert "--config -" in client, "ключ не передаётся через стандартный ввод"
+
+    # Профиль — умолчание, а не приказ.
+    assert "SERVER_EXPLICIT" in client and "KEY_EXPLICIT" in client, \
+        "профиль снова затирает --server и --key"
+
+    # Имя файла в кавычках: запятая и точка с запятой в имени ломали отправку.
+    assert '-F "file=@\\"${file}\\""' in client, "имя файла без кавычек"
+
+    # Настройки собираются и без python3.
+    assert "build_settings" in client, "сборка настроек снова зависит от python3"
+
+    # У ожидания есть общий срок.
+    assert "WAIT_LIMIT" in client, "ожидание снова без предела"
+
+
+def test_install_scripts_have_no_known_defects():
+    """Статические проверки сценариев установки."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "scripts"
+    install = (root / "install.sh").read_text(encoding="utf-8")
+    update = (root / "update.sh").read_text(encoding="utf-8")
+    common = (root / "lib" / "common.sh").read_text(encoding="utf-8")
+    uninstall_ps = (root / "uninstall.ps1").read_text(encoding="utf-8")
+
+    # readarray — bash 4+, а macOS поставляет 3.2. Ищем вызов, не упоминание.
+    calls = [line for line in install.split("\n")
+             if "readarray" in line and not line.lstrip().startswith("#")]
+    assert not calls, f"readarray ломает установку на macOS: {calls}"
+
+    # Массив читается в docker-режиме, а заполняется только в нативном.
+    assert install.index("FAILED_ENGINES=()") < install.index("${#FAILED_ENGINES[@]}"), \
+        "FAILED_ENGINES читается раньше объявления"
+
+    # Обновление из самой установки не должно удалять источник.
+    assert "SRC_REAL" in update and "DST_REAL" in update, \
+        "update.sh снова удалит каталог, из которого копирует"
+
+    # Без терминала берётся умолчание, а не «да».
+    assert "[[ ! -t 0 ]] && return 0" not in common, \
+        "confirm снова соглашается без терминала"
+
+    # Пробный запуск не должен трогать службу в дочернем процессе.
+    assert "export ASRHUB_DRY_RUN" in common, "флаг пробного запуска не передаётся дальше"
+
+    # На Windows каталог данных лежит внутри каталога программы.
+    assert "dataInsidePrefix" in uninstall_ps, \
+        "удаление на Windows снова снесёт данные вместе с программой"

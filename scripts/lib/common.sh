@@ -36,6 +36,12 @@ ASRHUB_DEFAULT_PORT="8080"
 
 : "${ASRHUB_LOG_FILE:=}"
 : "${ASRHUB_DRY_RUN:=0}"
+# Флаг обязан переживать вызов дочернего скрипта: install.sh и uninstall.sh
+# запускают service.sh отдельным bash, и без export в дочернем процессе он
+# снова становился нулём — «пробный запуск» на самом деле создавал юнит
+# systemd, включал его в автозапуск и (при удалении) сносил работающую
+# службу.
+export ASRHUB_DRY_RUN
 : "${ASRHUB_ASSUME_YES:=0}"
 : "${ASRHUB_QUIET:=0}"
 : "${ASRHUB_NO_COLOR:=0}"
@@ -251,7 +257,17 @@ confirm() {
   local prompt="${1}"
   local default="${2:-y}"
   [[ "${ASRHUB_ASSUME_YES}" == "1" ]] && return 0
-  [[ ! -t 0 ]] && return 0
+
+  # Без терминала берём заданное умолчание, а не «да». Прежнее безусловное
+  # согласие означало, что `ssh машина 'bash uninstall.sh'`, задача Ansible
+  # или строка в cron выполняли полное удаление, ни о чём не спросив, —
+  # притом что вопрос задан именно с умолчанием «нет».
+  if [[ ! -t 0 ]]; then
+    printf '%s? %s %s — нет терминала, взято умолчание: %s%s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${prompt}" "${default}" "${C_RESET}" >&2
+    [[ "${default}" == "y" ]]
+    return
+  fi
   local suffix="[Y/n]"
   [[ "${default}" == "n" ]] && suffix="[y/N]"
   local answer
