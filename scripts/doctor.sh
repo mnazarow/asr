@@ -12,6 +12,8 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/detect.sh"
+# shellcheck source=lib/gpu.sh
+source "${SCRIPT_DIR}/lib/gpu.sh"
 
 set +o errexit    # диагностика не должна прерываться на первой проблеме
 
@@ -120,8 +122,38 @@ case "${ACCEL}" in
   mps)  check "Ускоритель" ok "Apple Silicon (Metal)"
         check "Поддержка движков" warn "NeMo и faster-whisper на GPU недоступны" \
           "На macOS используйте whisper_cpp с Core ML — это самый быстрый путь." ;;
-  *)    check "Видеокарта" warn "не обнаружена" \
-          "Работа только на процессоре. Включите int8 и выберите модель поменьше." ;;
+  *)
+    # «Не обнаружена» — неверный ответ, если карта в машине есть, а драйвера
+    # нет: чинить надо драйвер, а не искать модель поменьше. Поэтому сначала
+    # смотрим на шину PCI и только потом делаем вывод.
+    GPU_LINE="$(gpu_primary)"
+    if [[ -n "${GPU_LINE}" ]]; then
+      GPU_VENDOR="$(printf '%s' "${GPU_LINE}" | cut -d'|' -f2)"
+      GPU_ADDR="$(printf '%s' "${GPU_LINE}" | cut -d'|' -f1)"
+      GPU_DEV="$(printf '%s' "${GPU_LINE}" | cut -d'|' -f3)"
+      GPU_DISCRETE="$(printf '%s' "${GPU_LINE}" | cut -d'|' -f4)"
+      if [[ "${GPU_DISCRETE}" == "1" ]]; then
+        check "Видеокарта" warn \
+          "$(gpu_model_name "${GPU_VENDOR}" "${GPU_ADDR}" "${GPU_DEV}") — драйвер не работает" \
+          "Карта есть на шине (${GPU_ADDR}), но система её не использует. Поставить драйвер: bash scripts/install.sh --gpu-driver auto"
+        case "$(gpu_driver_state "${GPU_VENDOR}")" in
+          installed-noload) check "Модуль драйвера" fail "установлен, но не загружен" \
+            "Обычно помогает перезагрузка: модуль пересобирается под текущее ядро." ;;
+          loaded-nofunc)    check "Модуль драйвера" fail "загружен, но не отвечает" \
+            "Версии модуля и библиотек разошлись после обновления. Помогает перезагрузка." ;;
+        esac
+        if gpu_secure_boot_enabled; then
+          check "Secure Boot" warn "включён" \
+            "Собранный на месте модуль драйвера без подписи не загрузится. Отключите Secure Boot или зарегистрируйте ключ MOK."
+        fi
+      else
+        check "Видеокарта" warn "только встроенная" \
+          "Для расчётов встроенная графика не годится. Работа на процессоре: включите int8 и выберите модель поменьше."
+      fi
+    else
+      check "Видеокарта" warn "не обнаружена" \
+        "Работа только на процессоре. Включите int8 и выберите модель поменьше."
+    fi ;;
 esac
 
 if [[ -n "${DATA_DIR}" ]]; then

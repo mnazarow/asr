@@ -280,6 +280,168 @@ function Test-Internet {
 # Оборудование
 # ---------------------------------------------------------------------------
 
+function Resolve-GpuFromControllers {
+    <#
+      Разбор списка видеоадаптеров: какой из них главный и что о нём известно.
+      Вынесено из Get-GpuOnBus отдельной функцией, чтобы логику выбора можно
+      было проверить, подсунув придуманные адаптеры, а не только на машине с
+      нужной картой.
+
+      На вход — объекты со свойствами Name, PNPDeviceID, DriverVersion.
+      На выход — @{ Vendor; Name; PnpId; Discrete; DriverVersion; DriverIsGeneric }
+    #>
+    param([object[]]$Cards)
+
+    $found = [ordered]@{ Vendor = ''; Name = ''; PnpId = ''; Discrete = $false
+                         DriverVersion = ''; DriverIsGeneric = $true }
+    $bestRank = -1
+
+    foreach ($card in @($Cards)) {
+        $pnp = "$($card.PNPDeviceID)"
+        $name = "$($card.Name)"
+        $vendor = ''
+        if ($pnp -match 'VEN_10DE') { $vendor = 'nvidia' }
+        elseif ($pnp -match 'VEN_1002') { $vendor = 'amd' }
+        elseif ($pnp -match 'VEN_8086') { $vendor = 'intel' }
+        else { continue }
+
+        # Дискретная или встроенная. AdapterRAM для этого не годится: поле
+        # 32-битное, и на картах свыше 4 ГБ Windows возвращает мусор. У NVIDIA
+        # встроенной графики не бывает; у AMD и Intel встроенную выдаёт имя.
+        $discrete = $true
+        if ($vendor -ne 'nvidia' -and
+            $name -match 'UHD Graphics|HD Graphics|Iris|Vega \d+ Graphics|Radeon\(TM\) Graphics|Radeon Graphics') {
+            $discrete = $false
+        }
+
+        # Стандартный адаптер Microsoft — это отсутствие драйвера производителя.
+        $generic = ($name -match 'Microsoft Basic Display|Standard VGA|Basic Render')
+
+        $rank = switch ($vendor) { 'nvidia' { 30 } 'amd' { 20 } 'intel' { 10 } default { 0 } }
+        if ($discrete) { $rank += 100 }
+        if ($rank -gt $bestRank) {
+            $bestRank = $rank
+            $found.Vendor = $vendor
+            $found.Name = $name
+            $found.PnpId = $pnp
+            $found.Discrete = $discrete
+            $found.DriverVersion = "$($card.DriverVersion)"
+            $found.DriverIsGeneric = $generic
+        }
+    }
+    return $found
+}
+
+function Get-GpuOnBus {
+    <#
+      Карта так, как её видит сама Windows, а не драйвер вычислений.
+      Win32_VideoController отвечает и тогда, когда стоит стандартный
+      видеоадаптер Microsoft, то есть когда драйвера производителя нет, —
+      а это ровно тот случай, ради которого всё и затевалось.
+    #>
+    if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        return (Resolve-GpuFromControllers @())
+    }
+    try {
+        return (Resolve-GpuFromControllers @(Get-CimInstance Win32_VideoController -ErrorAction Stop))
+    } catch {
+        return (Resolve-GpuFromControllers @())
+    }
+}
+
+function Get-GpuDriverPackage {
+    <#
+      Что ставить под найденного производителя.
+
+      WingetIds — список кандидатов по убыванию предпочтения, а не один
+      идентификатор: каталог winget живёт своей жизнью, пакеты в нём
+      появляются, переименовываются и исчезают (у AMD собственного пакета
+      с драйвером нет вовсе). Install-GpuDriver проверяет кандидатов по
+      очереди и берёт первый существующий, а если не нашёлся ни один —
+      показывает прямую ссылку. Так неверный идентификатор превращается
+      в ссылку, а не в ошибку установки.
+    #>
+    param([ValidateSet('nvidia','amd','intel')][string]$Vendor)
+    switch ($Vendor) {
+        'nvidia' { return [ordered]@{
+            WingetIds = @('Nvidia.GeForceExperience', 'Nvidia.NVIDIAApp', 'Nvidia.CUDA')
+            Fallback  = 'https://www.nvidia.com/Download/index.aspx'
+            Label     = 'драйвер NVIDIA' } }
+        'amd'    { return [ordered]@{
+            WingetIds = @('AMD.AMDSoftwareAdrenalinEdition', 'AMD.AMDSoftware')
+            Fallback  = 'https://www.amd.com/en/support/download/drivers.html'
+            Label     = 'драйвер AMD Adrenalin' } }
+        'intel'  { return [ordered]@{
+            WingetIds = @('Intel.IntelDriverAndSupportAssistant')
+            Fallback  = 'https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html'
+            Label     = 'драйвер Intel Arc' } }
+    }
+}
+
+function Test-WingetPackage {
+    # Есть ли такой пакет в каталоге winget. Отдельной функцией, чтобы
+    # проверку можно было подменить в тестах.
+    param([string]$Id)
+    if (-not (Test-CommandExists 'winget')) { return $false }
+    try {
+        $null = & winget show --id $Id -e --disable-interactivity 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+function Install-GpuDriver {
+    <#
+      Ставит драйвер видеокарты через winget, а если подходящего пакета нет —
+      показывает прямую ссылку. Возвращает $true, только если установка
+      действительно выполнена.
+
+      В Windows драйвер обычно уже стоит из коробки или приезжает через
+      Windows Update, поэтому вызывать это стоит лишь когда система
+      показывает стандартный видеоадаптер Microsoft.
+    #>
+    param([ValidateSet('nvidia','amd','intel')][string]$Vendor)
+
+    $pkg = Get-GpuDriverPackage -Vendor $Vendor
+    if (-not (Test-CommandExists 'winget')) {
+        Write-Warn "winget не найден — поставить $($pkg.Label) автоматически нельзя."
+        Write-Hint "Скачайте вручную: $($pkg.Fallback)"
+        return $false
+    }
+    if (-not (Test-Administrator)) {
+        Write-Warn 'Установка драйвера требует прав администратора.'
+        Write-Hint 'Запустите PowerShell от имени администратора и повторите.'
+        Write-Hint "Либо поставьте вручную: $($pkg.Fallback)"
+        return $false
+    }
+
+    $chosen = $null
+    foreach ($id in $pkg.WingetIds) {
+        if (Test-WingetPackage -Id $id) { $chosen = $id; break }
+        Write-Debug2 "В каталоге winget нет пакета $id"
+    }
+    if (-not $chosen) {
+        Write-Warn "В каталоге winget нет подходящего пакета ($($pkg.Label))."
+        Write-Hint "Скачайте с сайта производителя: $($pkg.Fallback)"
+        Write-Hint 'Либо дождитесь Windows Update — драйверы видеокарт приходят и оттуда.'
+        return $false
+    }
+
+    Write-Info "Ставим $($pkg.Label) через winget ($chosen)."
+    try {
+        Invoke-Checked -Command 'winget' -Arguments @(
+            'install', '--id', $chosen, '-e',
+            '--accept-package-agreements', '--accept-source-agreements',
+            '--disable-interactivity') -IgnoreExitCode
+        Write-Ok "$($pkg.Label): установка выполнена."
+        Write-Hint 'Драйвер вступит в силу после перезагрузки.'
+        return $true
+    } catch {
+        Write-Warn "Установка через winget не удалась: $_"
+        Write-Hint "Скачайте вручную: $($pkg.Fallback)"
+        return $false
+    }
+}
+
 function Get-GpuInfo {
     $result = [ordered]@{ Accelerator = 'cpu'; Name = ''; MemoryMb = 0; CudaVersion = '' }
     if (Test-CommandExists 'nvidia-smi') {

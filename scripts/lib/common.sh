@@ -483,7 +483,11 @@ verify_checksum() {
 is_root() { [[ "$(id -u)" -eq 0 ]]; }
 
 as_root() {
-  if is_root; then "$@"; return; fi
+  # Пробный запуск обязан быть пробным и от имени root. Раньше ветка для
+  # root вызывала команду напрямую, минуя run, и `install.sh --dry-run`,
+  # запущенный от root — а в контейнерах и в Ansible он запускается именно
+  # так, — по-настоящему ставил системные пакеты.
+  if is_root; then run "$@"; return; fi
   if have sudo; then run sudo "$@"; return; fi
   error "Нужны права суперпользователя, но sudo не найден."
   hint "Запустите скрипт от имени root или установите sudo."

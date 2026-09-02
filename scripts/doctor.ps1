@@ -54,6 +54,22 @@ if (-not $Only -or $Only -eq 'hardware') {
     Test-Item 'Оперативная память' `
         $(if ($hw.RamGb -ge 16) { 'ok' } elseif ($hw.RamGb -ge 6) { 'warn' } else { 'fail' }) `
         "$($hw.RamGb) ГБ" 'Для моделей уровня large рекомендуется 16 ГБ.'
+    # Карта, найденная в системе, — не то же самое, что карта, доступная для
+    # расчётов: без драйвера производителя Windows показывает её как
+    # стандартный адаптер, и раньше проверка говорила «видеокарты нет».
+    $gpuBus = Get-GpuOnBus
+    if ($hw.Accelerator -ne 'cuda' -and $gpuBus.Vendor) {
+        if (-not $gpuBus.Discrete) {
+            Test-Item 'Видеокарта' 'warn' "только встроенная ($($gpuBus.Name))" `
+                'Для расчётов встроенная графика не годится: сервер работает на процессоре.'
+        } elseif ($gpuBus.DriverIsGeneric) {
+            Test-Item 'Видеокарта' 'warn' "$($gpuBus.Name) — драйвера нет" `
+                'Windows показывает стандартный адаптер. Поставить драйвер: powershell -File scripts\install.ps1'
+        } else {
+            Test-Item 'Видеокарта' 'warn' "$($gpuBus.Name) — драйвер есть, расчёты недоступны" `
+                'Установлен видеодрайвер без поддержки вычислений либо карта отключена в панели управления.'
+        }
+    }
     if ($hw.Accelerator -eq 'cuda') {
         Test-Item 'Видеокарта' 'ok' "$($hw.GpuName) — $($hw.GpuMemoryMb) МБ"
         Test-Item 'CUDA' 'ok' $hw.CudaVersion

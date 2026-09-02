@@ -17,6 +17,8 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 # shellcheck source=lib/detect.sh
 source "${SCRIPT_DIR}/lib/detect.sh"
+# shellcheck source=lib/gpu.sh
+source "${SCRIPT_DIR}/lib/gpu.sh"
 # shellcheck source=lib/whispercpp.sh
 source "${SCRIPT_DIR}/lib/whispercpp.sh"
 # shellcheck source=lib/wizard.sh
@@ -49,6 +51,14 @@ ENGINES_EXPLICIT=""
 MODELS_EXPLICIT=""
 ALIGNMENT=""
 MONITORING=""
+# auto — поставить драйвер под найденную карту; none — не трогать;
+# nvidia/amd/intel — ставить только если найдена карта этого производителя.
+GPU_DRIVER="auto"
+# Ускоритель, под который собираем окружение. Отличается от ACCEL, когда
+# драйвер поставлен, но ещё не работает: до перезагрузки nvidia-smi молчит,
+# а колёса PyTorch нужны уже под видеокарту, иначе после перезагрузки
+# окажется, что установлен процессорный torch.
+GPU_TARGET_ACCEL=""
 
 usage() {
   cat <<'USAGE'
@@ -77,6 +87,15 @@ usage() {
 Режим работы
   --interactive         Мастер с вопросами (по умолчанию, если есть терминал)
   --no-interactive      Без вопросов, все значения из ключей и автоопределения
+
+Видеокарта
+  --gpu-driver РЕЖИМ    auto (по умолчанию) | none | nvidia | amd | intel
+                        Карта ищется на шине PCI, поэтому находится и там,
+                        где драйвера ещё нет. auto — поставить драйвер и
+                        настроить, none — оставить как есть
+  --force-gpu-driver    Ставить драйвер даже при включённом Secure Boot
+                        (собранный модуль будет без подписи и не загрузится,
+                        пока вы не зарегистрируете ключ MOK)
 
 Служба и права
   --no-service          Не создавать службу автозапуска
@@ -127,6 +146,9 @@ while [[ $# -gt 0 ]]; do
     --interactive) INTERACTIVE=1; shift ;;
     --no-interactive) INTERACTIVE=0; shift ;;
     --alignment)   ALIGNMENT="${2:?none, mfa или whisperx}"; shift 2 ;;
+    --gpu-driver)  GPU_DRIVER="${2:?auto, none, nvidia, amd или intel}"; shift 2 ;;
+    --no-gpu-driver) GPU_DRIVER="none"; shift ;;
+    --force-gpu-driver) ASRHUB_FORCE_GPU_DRIVER=1; export ASRHUB_FORCE_GPU_DRIVER; shift ;;
     --no-service)  CREATE_SERVICE=0; shift ;;
     --offline)     OFFLINE=1; shift ;;
     --force)       FORCE=1; shift ;;
@@ -230,6 +252,25 @@ run_wizard() {
 
   printf '  %sОбнаружено:%s %s, %s, %s ГБ памяти, %s ГБ свободно\n' \
     "${C_DIM}" "${C_RESET}" "${OS}/${ARCH}" "${accel_label}" "${ram_gb}" "${disk_gb:-?}"
+
+  # Карта на шине есть, а драйвера нет — самый обидный случай: без этой
+  # строки человек выбирал бы профиль для машины без видеокарты, имея её.
+  local gpu_line gpu_vendor gpu_discrete
+  gpu_line="$(gpu_primary)"
+  if [[ -n "${gpu_line}" && "${ACCEL}" == "cpu" ]]; then
+    gpu_vendor="$(printf '%s' "${gpu_line}" | cut -d'|' -f2)"
+    gpu_discrete="$(printf '%s' "${gpu_line}" | cut -d'|' -f4)"
+    if [[ "${gpu_discrete}" == "1" ]]; then
+      printf '  %sНа шине найдена видеокарта %s, драйвер не установлен.%s\n' \
+        "${C_YELLOW}" "$(gpu_vendor_label "${gpu_vendor}")" "${C_RESET}"
+      if [[ "${GPU_DRIVER}" == "none" ]]; then
+        printf '  %sЗадан --no-gpu-driver: ставить не будем.%s\n' "${C_DIM}" "${C_RESET}"
+      else
+        printf '  %sУстановщик поставит драйвер — обычно нужна перезагрузка.%s\n' \
+          "${C_DIM}" "${C_RESET}"
+      fi
+    fi
+  fi
 
   # --- 1. Что ставим ------------------------------------------------------
   local default_profile=1
@@ -341,7 +382,24 @@ fi
 # Шаг 1. Предварительные проверки
 # ---------------------------------------------------------------------------
 
-set_step_total 9
+# Число шагов считаем по фактическому составу установки, а не берём
+# постоянным: раньше счётчик показывал «11 из 10», потому что часть шагов
+# условная — PyTorch, whisper.cpp, модели, служба.
+_steps=10                                   # нативная установка без дополнений
+if [[ "${MODE}" == "docker" ]]; then
+  _steps=8                                  # вместо venv и движков — сборка образа
+else
+  for _engine in gigaam faster_whisper whisper nemo transformers whisperx qwen3_asr voxtral; do
+    [[ "${ENGINES}" == *"${_engine}"* ]] && { _steps=$((_steps + 1)); break; }
+  done
+  [[ "${ENGINES}" == *whisper_cpp* ]] && _steps=$((_steps + 1))
+fi
+[[ -n "${MODELS}" && "${SKIP_MODELS}" -eq 0 ]] && _steps=$((_steps + 1))
+[[ "${CREATE_SERVICE}" -eq 1 ]] && _steps=$((_steps + 1))
+[[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" ]] && _steps=$((_steps + 1))
+set_step_total "${_steps}"
+unset _engine
+
 step "Проверка окружения"
 
 print_environment
@@ -456,7 +514,49 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Шаг 3. Каталоги
+# Шаг 3. Видеокарта: драйвер и настройка
+# ---------------------------------------------------------------------------
+#
+# Раньше установщик просто спрашивал у nvidia-smi, есть ли видеокарта. На
+# машине без драйвера ответ был «нет», и всё дальнейшее — колёса PyTorch,
+# профиль, конфигурация — собиралось под процессор. Карта в этой машине при
+# этом стояла. Здесь она ищется на шине PCI и, если драйвера нет, ставится.
+
+step "Видеокарта"
+
+if [[ "${MODE}" == "docker" ]]; then
+  # В контейнере драйвер берётся с хоста; ставить его внутрь нечего.
+  gpu_report
+  [[ "${ACCEL}" == "cuda" ]] || info "Для видеокарты в контейнере нужен NVIDIA Container Toolkit на хосте."
+elif [[ "${OS}" != "linux" ]]; then
+  gpu_report
+else
+  gpu_report
+  if gpu_ensure_driver "${GPU_DRIVER}"; then
+    # Пересчитываем: драйвер мог появиться только что.
+    ACCEL="$(detect_gpu)"
+    GPU_LINE="$(gpu_primary)"
+    if [[ -n "${GPU_LINE}" ]]; then
+      GPU_VENDOR="$(printf '%s' "${GPU_LINE}" | cut -d'|' -f2)"
+      case "$(gpu_vendor_key "${GPU_VENDOR}")" in
+        nvidia) GPU_TARGET_ACCEL="cuda" ;;
+        amd)    GPU_TARGET_ACCEL="rocm" ;;
+        intel)  GPU_TARGET_ACCEL="xpu" ;;
+      esac
+    fi
+    gpu_tune
+  fi
+  # Профиль подбирался по железу до установки драйвера. Если карта появилась
+  # только что, «cpu» больше не лучший выбор — но молча менять то, что
+  # пользователь подтвердил в мастере, нельзя.
+  if [[ "${ACCEL}" != "cpu" && "${PROFILE}" == "cpu" ]]; then
+    info "Видеокарта заработала — профиль «cpu» теперь занижен."
+    hint "Сменить набор моделей можно позже: bash scripts/models.sh --profile standard"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Шаг 4. Каталоги
 # ---------------------------------------------------------------------------
 
 step "Создание каталогов"
@@ -480,7 +580,7 @@ fi
 ok "Каталоги готовы"
 
 # ---------------------------------------------------------------------------
-# Шаг 4. Копирование файлов
+# Шаг 5. Копирование файлов
 # ---------------------------------------------------------------------------
 
 step "Копирование файлов приложения"
@@ -497,7 +597,7 @@ fi
 ok "Файлы скопированы в ${PREFIX}"
 
 # ---------------------------------------------------------------------------
-# Шаг 5. Развёртывание
+# Шаг 6. Развёртывание
 # ---------------------------------------------------------------------------
 
 if [[ "${MODE}" == "docker" ]]; then
@@ -572,8 +672,17 @@ else
     [[ "${ENGINES}" == *"${engine}"* ]] && NEEDS_TORCH=1
   done
   if [[ "${NEEDS_TORCH}" -eq 1 ]]; then
-    step "Установка PyTorch для ускорителя «${ACCEL}»"
-    TORCH_INDEX="$(torch_index_url "${ACCEL}")"
+    # Колёса выбираем под ту карту, что найдена на шине, а не под ту, что
+    # видна прямо сейчас: после установки драйвера до перезагрузки карта не
+    # отвечает, и обычная проверка дала бы процессорный torch — с ним и
+    # после перезагрузки считал бы процессор.
+    TORCH_ACCEL="${GPU_TARGET_ACCEL:-${ACCEL}}"
+    [[ "${TORCH_ACCEL}" == "xpu" ]] && TORCH_ACCEL="cpu"   # для Intel индекса нет
+    step "Установка PyTorch для ускорителя «${TORCH_ACCEL}»"
+    if [[ "${TORCH_ACCEL}" != "${ACCEL}" ]]; then
+      info "Карта пока не отвечает, но драйвер установлен — берём колёса под неё."
+    fi
+    TORCH_INDEX="$(torch_index_url "${TORCH_ACCEL}")"
     if [[ -n "${TORCH_INDEX}" ]]; then
       info "Индекс пакетов: ${TORCH_INDEX}"
       retry 3 run "${VPIP}" install "${PIP_FLAGS[@]}" --index-url "${TORCH_INDEX}" torch torchaudio || {
@@ -598,7 +707,7 @@ else
       continue
     fi
     info "Движок: ${engine}"
-    if [[ "${engine}" == "faster_whisper" && "${ACCEL}" == "cuda" ]]; then
+    if [[ "${engine}" == "faster_whisper" && "${GPU_TARGET_ACCEL:-${ACCEL}}" == "cuda" ]]; then
       # Пин ctranslate2 под установленный cuDNN — иначе типовая ошибка libcudnn
       PIN="$(ctranslate2_pin "${ACCEL}")"
       info "Версия CTranslate2 под вашу CUDA: ${PIN}"
@@ -619,7 +728,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Шаг 6. Конфигурация
+# Шаг 7. Конфигурация
 # ---------------------------------------------------------------------------
 
 step "Создание конфигурации"
@@ -632,6 +741,12 @@ else
   if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
     RECOMMENDED_MODEL="$(printf '%s' "${MODELS}" | cut -d, -f1)"
     [[ -z "${RECOMMENDED_MODEL}" ]] && RECOMMENDED_MODEL="demo-simulator"
+    # Устройство и точность под найденную карту. Пусто — оставляем auto:
+    # сервер определит сам, и это правильное поведение для машины без карты
+    # и для той, где драйвер заработает только после перезагрузки.
+    GPU_BATCHING_BLOCK="$(gpu_config_lines | sed 's/^/  /')"
+    [[ -z "${GPU_BATCHING_BLOCK}" ]] && GPU_BATCHING_BLOCK="  device: auto
+  compute_type: auto"
     write_file "${CONFIG_FILE}" <<CFGEOF
 # Конфигурация ASR Hub — создана установщиком $(date '+%Y-%m-%d %H:%M')
 # Полный список параметров с описаниями: ${DATA_DIR}/config.example.yaml
@@ -652,8 +767,7 @@ server:
   log_level: INFO
 
 batching:
-  device: auto
-  compute_type: auto
+${GPU_BATCHING_BLOCK}
 
 queue:
   max_concurrent_jobs: $( [[ "${ACCEL}" == "cpu" ]] && echo 1 || echo 2 )
@@ -694,6 +808,26 @@ CFGEOF
   ok "Конфигурация: ${CONFIG_FILE}"
 fi
 
+# Переменные окружения под видеокарту. Их читает служба (EnvironmentFile) и
+# ручной запуск через asrctl. В конфигурацию они не идут: это настройки
+# драйвера, а не сервера, и в разных машинах они разные.
+if [[ -n "${GPU_ENV_OVERRIDE}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+  ENV_SH="${DATA_DIR}/env.sh"
+  # Строки с прошлого запуска убираем: иначе после смены видеокарты
+  # осталась бы подсказка про старую, и новая работала бы неправильно.
+  if [[ -f "${ENV_SH}" ]]; then
+    grep -v '^# ASRHUB-GPU$' "${ENV_SH}" 2>/dev/null \
+      | grep -vE '^(HSA_OVERRIDE_GFX_VERSION|NEOReadDebugKeys|ClDeviceGlobalMemSizeAvailablePercent)=' \
+      > "${ENV_SH}.new" || true
+    mv -f "${ENV_SH}.new" "${ENV_SH}"
+  fi
+  {
+    printf '# ASRHUB-GPU\n'
+    printf '%s\n' "${GPU_ENV_OVERRIDE//;/$'\n'}"
+  } >> "${ENV_SH}"
+  ok "Переменные окружения видеокарты: ${ENV_SH}"
+fi
+
 if [[ "${MODE}" == "native" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
   ( cd "${PREFIX}/server" && "${VENV}/bin/python" -m asrhub --print-config \
       > "${DATA_DIR}/config.example.yaml" 2>/dev/null ) || true
@@ -713,7 +847,7 @@ if [[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" && "${MODE}" == "native" ]];
 fi
 
 # ---------------------------------------------------------------------------
-# Шаг 7. Загрузка моделей
+# Шаг 8. Загрузка моделей
 # ---------------------------------------------------------------------------
 
 if [[ -n "${MODELS}" && "${SKIP_MODELS}" -eq 0 && "${MODE}" == "native" ]]; then
@@ -733,7 +867,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Шаг 8. Служба автозапуска
+# Шаг 9. Служба автозапуска
 # ---------------------------------------------------------------------------
 
 if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
@@ -750,7 +884,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Шаг 9. Проверка
+# Шаг 10. Проверка
 # ---------------------------------------------------------------------------
 
 step "Проверка установки"
@@ -799,5 +933,14 @@ printf '  Удалить                 bash %s/scripts/uninstall.sh\n' "${PREF
 if [[ ${#FAILED_ENGINES[@]} -gt 0 ]]; then
   printf '\n%sНе установились движки: %s%s\n' "${C_YELLOW}" "${FAILED_ENGINES[*]}" "${C_RESET}"
   printf '  Повторить: bash %s/scripts/models.sh install-engine <движок>\n' "${PREFIX}"
+fi
+
+# Про перезагрузку говорим последней строкой, а не в середине установки:
+# именно её пользователь и должен унести с собой.
+if gpu_reboot_required; then
+  printf '\n%s%sНужна перезагрузка%s\n' "${C_BOLD}" "${C_YELLOW}" "${C_RESET}"
+  printf '  Драйвер видеокарты установлен, но модуль ядра загрузится только\n'
+  printf '  после перезагрузки. До неё сервер считает на процессоре.\n'
+  printf '  После перезагрузки проверьте: bash %s/scripts/doctor.sh\n' "${PREFIX}"
 fi
 printf '\n'

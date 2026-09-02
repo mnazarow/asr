@@ -14,6 +14,11 @@
 .PARAMETER Profile
     Состав установки: light, cpu, standard, full, russian.
 
+.PARAMETER NoGpuDriver
+    Не ставить драйвер видеокарты. По умолчанию установщик находит карту
+    через Windows (она видна и без драйвера производителя) и, если стоит
+    стандартный адаптер, ставит драйвер через winget.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 .EXAMPLE
@@ -33,6 +38,7 @@ param(
     [string]$Models = '',
     [switch]$SkipModels,
     [switch]$NoService,
+    [switch]$NoGpuDriver,
     [ValidateSet('', 'none', 'mfa', 'whisperx')][string]$Alignment = '',
     [switch]$Interactive,
     [switch]$NoInteractive,
@@ -45,6 +51,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1') -Force
+
+$script:GpuRebootRequired = $false
+$script:GpuTargetAccel = ''
 
 Set-DryRun $DryRun.IsPresent
 Set-AssumeYes $Yes.IsPresent
@@ -275,6 +284,47 @@ if (-not (Confirm-Action 'Начать установку?')) { Write-Info 'От
 
 # ---------------------------------------------------------------------------
 
+Write-Step 'Видеокарта'
+
+# Win32_VideoController отвечает и без драйвера производителя, поэтому карта
+# находится и на свежей системе — там, где раньше установщик считал, что её
+# нет, и собирал всё под процессор.
+$gpuBus = Get-GpuOnBus
+if (-not $gpuBus.Vendor) {
+    Write-Info 'Видеокарта не найдена — сервер будет считать на процессоре.'
+} else {
+    Write-Host ("  Видеокарта       {0}" -f $gpuBus.Name)
+    Write-Host ("  Тип              {0}" -f $(if ($gpuBus.Discrete) { 'дискретная' } else { 'встроенная' }))
+    Write-Host ("  Драйвер          {0}" -f $(if ($gpuBus.DriverIsGeneric) { 'стандартный адаптер Windows' } else { "версия $($gpuBus.DriverVersion)" }))
+
+    if (-not $gpuBus.Discrete) {
+        Write-Info 'Встроенная графика для расчётов не годится — ставить драйвер незачем.'
+    } elseif ($gpuBus.Vendor -eq 'intel') {
+        # То же, что и в Linux: движки ASR Hub пока не умеют считать на XPU.
+        Write-Info 'Найдена Intel Arc, но движки распознавания её пока не используют.'
+    } elseif (-not $gpuBus.DriverIsGeneric -and $hw.Accelerator -eq 'cuda') {
+        Write-Ok 'Драйвер установлен и работает.'
+    } elseif ($NoGpuDriver) {
+        Write-Info 'Задан -NoGpuDriver: драйвер не трогаем.'
+    } elseif ($DryRun) {
+        Write-Info "[пробный запуск] Здесь был бы установлен драйвер $($gpuBus.Vendor)."
+    } elseif ($gpuBus.DriverIsGeneric) {
+        if (Install-GpuDriver -Vendor $gpuBus.Vendor) { $script:GpuRebootRequired = $true }
+    } else {
+        # Драйвер производителя стоит, но nvidia-smi не отвечает: чаще всего
+        # это ноутбук с переключаемой графикой либо драйвер без CUDA.
+        Write-Warn 'Драйвер установлен, но карта недоступна для расчётов.'
+        Write-Hint 'Проверьте, что в панели управления NVIDIA карта не отключена, и что установлен полный драйвер, а не только видеодрайвер.'
+    }
+
+    # Колёса PyTorch выбираем под найденную карту, а не под ту, что видна
+    # прямо сейчас: до перезагрузки nvidia-smi молчит, и обычная проверка
+    # дала бы процессорный torch.
+    if ($gpuBus.Vendor -eq 'nvidia' -and $gpuBus.Discrete) { $script:GpuTargetAccel = 'cuda' }
+}
+
+# ---------------------------------------------------------------------------
+
 Write-Step 'Внешние программы'
 
 if (-not $hw.Ffmpeg) {
@@ -372,8 +422,15 @@ if ($Mode -eq 'docker') {
     $needsTorch = @('gigaam', 'faster_whisper', 'whisper', 'nemo', 'transformers', 'qwen3_asr') |
         Where-Object { $Engines -like "*$_*" }
     if ($needsTorch) {
-        Write-Step "Установка PyTorch для ускорителя «$($hw.Accelerator)»"
-        $indexUrl = Get-TorchIndexUrl -Accelerator $hw.Accelerator -CudaVersion $hw.CudaVersion
+        # Ускоритель берём тот, под который собираем: после установки драйвера
+        # до перезагрузки nvidia-smi молчит, и обычная проверка дала бы
+        # процессорный torch — с ним и после перезагрузки считал бы процессор.
+        $torchAccel = if ($script:GpuTargetAccel) { $script:GpuTargetAccel } else { $hw.Accelerator }
+        Write-Step "Установка PyTorch для ускорителя «$torchAccel»"
+        if ($torchAccel -ne $hw.Accelerator) {
+            Write-Info 'Карта пока не отвечает, но драйвер установлен — берём колёса под неё.'
+        }
+        $indexUrl = Get-TorchIndexUrl -Accelerator $torchAccel -CudaVersion $hw.CudaVersion
         Write-Info "Индекс пакетов: $indexUrl"
         try {
             Invoke-WithRetry -Attempts 3 -Description 'PyTorch' -Action {
@@ -547,5 +604,13 @@ Write-Host "  Удалить              powershell -File `"$Prefix\scripts\uni
 if ($failed) {
     Write-Host ''
     Write-Warn "Не установились движки: $($failed -join ', ')"
+}
+# Про перезагрузку — последней строкой: именно её и надо унести с собой.
+if ($script:GpuRebootRequired) {
+    Write-Host ''
+    Write-Host 'Нужна перезагрузка' -ForegroundColor Yellow
+    Write-Host '  Драйвер видеокарты установлен, но вступит в силу после перезагрузки.'
+    Write-Host '  До неё сервер считает на процессоре.'
+    Write-Host "  После перезагрузки проверьте: powershell -File `"$Prefix\scripts\doctor.ps1`""
 }
 Write-Host ''
