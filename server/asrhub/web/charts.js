@@ -448,6 +448,149 @@
     return svg;
   }
 
+  // ---- полоса громкости -----------------------------------------------------
+
+  /* Огибающая записи: по дорожке на канал или говорящего.
+   *
+   * Дорожками, а не одной картинкой с наложением: наложенные полосы двух
+   * собеседников сливаются там, где говорят оба, и именно эти места важнее
+   * всего. Каждая дорожка подписана слева — цвет здесь опознавательный
+   * знак, а не единственный признак.
+   *
+   * config: { curves: [{label, audio_waveform, sample_rate}], duration,
+   *           interval, onSeek(seconds) }
+   */
+  function waveform(host, config) {
+    const curves = (config.curves || []).filter(
+      (c) => c && (c.audio_waveform || []).length);
+    if (!curves.length) return empty(host, config.emptyText);
+
+    host.innerHTML = '';
+    const colors = palette();
+    const lane = config.laneHeight || 46;
+    const gap = 8;
+    const padLeft = config.labelWidth !== undefined ? config.labelWidth : 92;
+    const padRight = 10, padTop = 6, padBottom = 22;
+    const width = config.width || host.clientWidth || 640;
+    const height = padTop + curves.length * lane + (curves.length - 1) * gap + padBottom;
+    const iw = Math.max(40, width - padLeft - padRight);
+
+    // Общий предел по всем дорожкам: если у каждой свой, тихий собеседник
+    // выглядит таким же громким, как крикливый, и полоса врёт.
+    let peak = 0;
+    curves.forEach((c) => c.audio_waveform.forEach((pt) => {
+      if (pt.amplitude > peak) peak = pt.amplitude;
+    }));
+    peak = peak || 1;
+
+    const last = curves[0].audio_waveform[curves[0].audio_waveform.length - 1];
+    const step = config.interval || (curves[0].audio_waveform.length > 1
+      ? curves[0].audio_waveform[1].time - curves[0].audio_waveform[0].time : 1);
+    const duration = config.duration || (last.time + step);
+    const xOf = (seconds) => padLeft + Math.min(1, seconds / duration) * iw;
+
+    const svg = el('svg', {
+      class: 'chart waveform', viewBox: `0 0 ${width} ${height}`,
+      width: '100%', height, role: 'img',
+      'aria-label': 'Полоса громкости записи по дорожкам',
+    }, host);
+
+    const seekable = typeof config.onSeek === 'function';
+    const seekAt = (event) => {
+      if (!seekable) return;
+      const box = svg.getBoundingClientRect();
+      const ratio = (event.clientX - box.left) / box.width;      // viewBox тянется
+      const seconds = ((ratio * width) - padLeft) / iw * duration;
+      config.onSeek(Math.max(0, Math.min(duration, seconds)));
+    };
+
+    curves.forEach((curve, index) => {
+      const color = curve.color || colors[index % colors.length];
+      const top = padTop + index * (lane + gap);
+      const base = top + lane;
+      const points = curve.audio_waveform;
+
+      // Дорожка обозначена приглушённой подложкой и линией основания:
+      // без них столбики висят в воздухе и тишину не отличить от пропуска.
+      el('rect', { x: padLeft, y: top, width: iw, height: lane, rx: 4,
+                   fill: gridColor(), opacity: 0.5 }, svg);
+      el('line', { x1: padLeft, y1: base, x2: padLeft + iw, y2: base,
+                   stroke: css('--border', '#262e3a'), 'stroke-width': 1 }, svg);
+
+      // Столбик на замер, пока они шире двух пикселей; на длинной записи
+      // столбики тоньше волоса, и вместо них рисуется заливка.
+      const cell = iw / Math.max(1, points.length);
+      if (cell >= 2.5) {
+        points.forEach((pt) => {
+          // Ровный ноль ничем не рисуется: полную тишину показывает пустая
+          // дорожка с линией основания. Минимум в пиксель нужен только
+          // тихому звуку, иначе он пропадает совсем.
+          if (!pt.amplitude) return;
+          const h = Math.max(1, (pt.amplitude / peak) * (lane - 4));
+          el('rect', { x: xOf(pt.time) + 0.5, y: base - h,
+                       width: Math.max(1, cell - 1.5), height: h,
+                       rx: Math.min(2, cell / 3), fill: color }, svg);
+        });
+      } else {
+        let d = `M${padLeft.toFixed(1)},${base.toFixed(1)}`;
+        points.forEach((pt) => {
+          const h = (pt.amplitude / peak) * (lane - 4);
+          d += `L${xOf(pt.time).toFixed(1)},${(base - h).toFixed(1)}`;
+        });
+        d += `L${(padLeft + iw).toFixed(1)},${base.toFixed(1)}Z`;
+        el('path', { d, fill: color, opacity: 0.9 }, svg);
+      }
+
+      el('text', { x: padLeft - 8, y: top + lane / 2 + 4, 'text-anchor': 'end',
+                   fill: ink(), 'font-size': 11.5 }, svg)
+        .textContent = curve.label || `Дорожка ${index + 1}`;
+      el('rect', { x: padLeft - 5, y: top, width: 3, height: lane, rx: 1.5,
+                   fill: color }, svg);
+    });
+
+    // Ось времени.
+    const marks = niceTicks(0, duration, 6).filter((v) => v >= 0 && v <= duration);
+    marks.forEach((value) => {
+      el('text', { x: xOf(value), y: height - 7, 'text-anchor': 'middle',
+                   fill: faint(), 'font-size': 10.5 }, svg)
+        .textContent = config.timeFormat ? config.timeFormat(value) : fmtNum(value);
+    });
+
+    // Отслеживающая линия поверх всего: цель наведения — вся картинка,
+    // попасть в отдельный столбик мышью нереально.
+    const plotTop = padTop, plotH = height - padTop - padBottom;
+    const cursor = el('line', { x1: padLeft, y1: plotTop, x2: padLeft,
+                                y2: plotTop + plotH, stroke: css('--text', '#e6edf3'),
+                                'stroke-width': 1, opacity: 0 }, svg);
+    const hit = el('rect', { x: padLeft, y: plotTop, width: iw, height: plotH,
+                             fill: 'transparent',
+                             style: seekable ? 'cursor:pointer' : '' }, svg);
+
+    const at = (event) => {
+      const box = svg.getBoundingClientRect();
+      const seconds = Math.max(0, Math.min(duration,
+        (((event.clientX - box.left) / box.width) * width - padLeft) / iw * duration));
+      const slot = Math.min(curves[0].audio_waveform.length - 1,
+                            Math.max(0, Math.round(seconds / step)));
+      cursor.setAttribute('x1', xOf(seconds));
+      cursor.setAttribute('x2', xOf(seconds));
+      cursor.setAttribute('opacity', 0.55);
+      const label = config.timeFormat ? config.timeFormat(seconds) : fmtNum(seconds);
+      const rows = curves.map((c) => {
+        const pt = c.audio_waveform[slot];
+        return `${c.label}: ${pt ? pt.amplitude.toFixed(3) : '—'}`;
+      }).join(' · ');
+      tip.show(`${label} — ${rows}${seekable ? ' · щелчок: перейти к месту' : ''}`, event);
+    };
+    hit.addEventListener('mousemove', at);
+    hit.addEventListener('mouseleave', () => {
+      cursor.setAttribute('opacity', 0);
+      tip.hide();
+    });
+    if (seekable) hit.addEventListener('click', seekAt);
+    return svg;
+  }
+
   // ---- вспомогательное ------------------------------------------------------------
 
   function legend(host, items) {
@@ -466,6 +609,6 @@
     return null;
   }
 
-  global.Charts = { line, bars, hbars, stacked, donut, spark, heat,
+  global.Charts = { line, bars, hbars, stacked, donut, spark, heat, waveform,
                     palette, status, fmtNum, legend, empty };
 })(window);

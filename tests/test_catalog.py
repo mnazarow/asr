@@ -97,3 +97,19 @@ def test_russian_models_present():
 def test_excluded_models_documented():
     for item in catalog.EXCLUDED_MODELS:
         assert item["name"] and item["license"] and item["reason"]
+
+
+def test_param_impact_is_well_formed():
+    """`impact` — словарь с фиксированными ключами, а не свободный текст.
+
+    Строка в этом поле не мешает серверу и молча доходит до генератора
+    документации, где сборка падает на `.items()`. Проверка ловит это на
+    месте объявления параметра.
+    """
+    allowed_keys = {"quality", "speed", "memory"}
+    allowed_values = {"up", "down", "neutral"}
+    for spec in catalog.PARAMS:
+        assert isinstance(spec.impact, dict), f"{spec.key}: impact должен быть словарём"
+        assert set(spec.impact) <= allowed_keys, f"{spec.key}: лишние ключи в impact"
+        assert set(spec.impact.values()) <= allowed_values, \
+            f"{spec.key}: недопустимое значение в impact"

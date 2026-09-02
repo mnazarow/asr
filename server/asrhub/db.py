@@ -24,7 +24,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = [
     # --- версия 1: основные таблицы ---------------------------------------
@@ -81,7 +81,8 @@ _SCHEMA = [
         cer               REAL,
         cached_from       TEXT,
         webhook_url       TEXT,
-        webhook_status    TEXT
+        webhook_status    TEXT,
+        waveform          TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
@@ -244,6 +245,10 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "words_count": "INTEGER DEFAULT 0",
         "chars_count": "INTEGER DEFAULT 0",
         "speakers_count": "INTEGER DEFAULT 0",
+        # Огибающая громкости: массив кривых в JSON. Хранится рядом с
+        # заданием, а не в файле результата, чтобы её можно было отдать в
+        # карточке задания, не читая диск.
+        "waveform": "TEXT",
         "avg_confidence": "REAL",
         "rtf": "REAL",
         "queue_time_s": "REAL",
@@ -495,6 +500,8 @@ class Database:
         }
         if isinstance(payload.get("params"), dict):
             payload["params"] = json.dumps(payload["params"], ensure_ascii=False)
+        if isinstance(payload.get("waveform"), (list, dict)):
+            payload["waveform"] = json.dumps(payload["waveform"], ensure_ascii=False)
         columns = ", ".join(payload)
         holders = ", ".join("?" for _ in payload)
         self.execute(f"INSERT INTO jobs ({columns}) VALUES ({holders})", list(payload.values()))
@@ -507,6 +514,8 @@ class Database:
         fields["updated_at"] = now()
         if isinstance(fields.get("params"), dict):
             fields["params"] = json.dumps(fields["params"], ensure_ascii=False)
+        if isinstance(fields.get("waveform"), (list, dict)):
+            fields["waveform"] = json.dumps(fields["waveform"], ensure_ascii=False)
         assignments = ", ".join(f"{k}=?" for k in fields)
         self.execute(f"UPDATE jobs SET {assignments} WHERE id=?",
                      [*fields.values(), job_id])
@@ -575,7 +584,15 @@ class Database:
         rows = self.query(
             f"SELECT {columns} FROM jobs {clause} ORDER BY {order} LIMIT ? OFFSET ?",
             [*args, limit, offset])
-        return [_row_to_job(r) for r in rows] if not light else [dict(r) for r in rows]
+        if light:
+            return [dict(r) for r in rows]
+        jobs = [_row_to_job(r) for r in rows]
+        # Огибающая громкости в списке не нужна никому: на часовой записи это
+        # сотни килобайт на задание, а рисуют её только в карточке. Полные
+        # данные отдают `get_job` и `/api/jobs/{id}/waveform`.
+        for job in jobs:
+            job.pop("waveform", None)
+        return jobs
 
     def count_jobs(self, *, status: str | list[str] | None = None,
                    owner: str | None = None, since: float | None = None) -> int:
@@ -617,6 +634,8 @@ class Database:
         fields["updated_at"] = now()
         if isinstance(fields.get("params"), dict):
             fields["params"] = json.dumps(fields["params"], ensure_ascii=False)
+        if isinstance(fields.get("waveform"), (list, dict)):
+            fields["waveform"] = json.dumps(fields["waveform"], ensure_ascii=False)
         columns = ", ".join(f"{name}=?" for name in fields)
         placeholders = ",".join("?" for _ in expected)
         changed = self.execute(
@@ -904,10 +923,13 @@ def _remove_job_files(job: dict[str, Any]) -> int:
 
 def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
     job = dict(row)
-    raw = job.get("params")
-    if isinstance(raw, str):
-        try:
-            job["params"] = json.loads(raw)
-        except (TypeError, ValueError):
-            job["params"] = {}
+    for column, empty in (("params", {}), ("waveform", [])):
+        raw = job.get(column)
+        if isinstance(raw, str):
+            try:
+                job[column] = json.loads(raw)
+            except (TypeError, ValueError):
+                job[column] = empty
+        elif raw is None and column == "waveform":
+            job[column] = []
     return job

@@ -5,23 +5,10 @@ import json
 import time
 from pathlib import Path
 
-import pytest
 from asrhub.api import create_app
 from asrhub.config import load
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
-
-
-@pytest.fixture()
-def client(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
-    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
-    monkeypatch.setenv("ASRHUB_VAD_BACKEND", "energy")
-    monkeypatch.setenv("ASRHUB_MAX_CONCURRENT_JOBS", "2")
-    settings = load()
-    app = create_app(settings, start_queue=True)
-    with TestClient(app) as test_client:
-        yield test_client
 
 
 def test_health(client):
@@ -379,3 +366,60 @@ def test_unknown_form_field_is_reported(client, sample_wav: Path):
                                data={"languagee": "en"})
     assert response.status_code == 400, response.text
     assert "languagee" in response.json()["detail"]["message"]
+
+
+def test_form_field_examples_name_real_parameters():
+    """Каждый параметр из примеров `-F ключ=…` должен существовать в каталоге.
+
+    В справочнике стоял пример `-F 'diarization=true'`, а такого параметра
+    нет — есть diarization_enabled. Пользователь, скопировавший строку из
+    документации, получал 400 «Неизвестные поля формы».
+    """
+    import re
+
+    from asrhub import catalog
+
+    root = Path(__file__).resolve().parent.parent
+    reserved = {"file", "files", "settings", "priority", "group_id", "tags",
+                "reference_text", "webhook_url"}
+    pattern = re.compile(r"-F ['\"]?([a-z_0-9]+)=")
+
+    bad: list[str] = []
+    # Глава ревизии намеренно цитирует то, что было неверным, — это её
+    # содержание, а не инструкция к применению.
+    skip = {"18-review.md"}
+    for path in [*(root / "docs").glob("*.md"), *(root / "docs").glob("*.py"),
+                 *(root / "examples").glob("*.py")]:
+        if path.name in skip:
+            continue
+        for key in pattern.findall(path.read_text(encoding="utf-8")):
+            if key in reserved or key in catalog.PARAMS_BY_KEY:
+                continue
+            bad.append(f"{path.name}: {key}")
+    assert not bad, "в примерах названы несуществующие параметры: " + "; ".join(sorted(set(bad)))
+
+
+def test_form_fields_accept_declared_types(client, sample_wav: Path):
+    """Поле формы приходит строкой, а проверка ждёт объявленный тип.
+
+    `-F diarization_enabled=true` отвергалось с «ожидается да/нет», хотя
+    именно так этот способ описан в справочнике.
+    """
+    for value in ("true", "false", "да", "нет", "1", "0"):
+        with sample_wav.open("rb") as fh:
+            response = client.post("/api/jobs",
+                                   files={"file": ("проба.wav", fh, "audio/wav")},
+                                   data={"diarization_enabled": value})
+        assert response.status_code == 200, f"{value}: {response.text[:160]}"
+
+    with sample_wav.open("rb") as fh:
+        response = client.post("/api/jobs", files={"file": ("проба.wav", fh, "audio/wav")},
+                               data={"beam_size": "8"})
+    assert response.status_code == 200
+    assert response.json()["params"]["beam_size"] == 8, "число осталось строкой"
+
+    with sample_wav.open("rb") as fh:
+        response = client.post("/api/jobs", files={"file": ("проба.wav", fh, "audio/wav")},
+                               data={"diarization_enabled": "мусор"})
+    assert response.status_code == 400
+    assert "diarization_enabled" in response.json()["detail"]["message"]

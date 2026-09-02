@@ -223,9 +223,13 @@ const QUALITY_CLASS = {
 
 async function bootstrap() {
   try {
+    // Запуск идёт вне разделов, поэтому запросы фоновые: смена раздела не
+    // должна их снимать. Иначе переход по меню в первую секунду после
+    // загрузки отменял загрузку каталога, и вместо интерфейса появлялась
+    // карточка «Не удалось связаться с сервером. Запрос отменён».
     const [catalog, settings] = await Promise.all([
-      API.get('/api/catalog'),
-      API.get('/api/settings').catch(() => ({ values: {} })),
+      API.background('/api/catalog'),
+      API.background('/api/settings').catch(() => ({ values: {} })),
     ]);
     state.catalog = catalog;
     state.models = catalog.models;
@@ -241,10 +245,16 @@ async function bootstrap() {
     state.timer = setInterval(tick, 4000);
   } catch (err) {
     if (err.status === 401) { promptKey(); return; }
+    // Отменённый запрос — не сбой связи, и рисовать по нему заглушку нельзя.
+    if (err && err.silent) return;
     fail(err);
     qs('#content').innerHTML = `<div class="card"><div class="empty">
       <b>Не удалось связаться с сервером</b><div class="small" style="margin-top:8px">
-      ${esc(err.message)}<br>${esc(err.hint || '')}</div></div></div>`;
+      ${esc(err.message)}<br>${esc(err.hint || '')}</div>
+      <button class="primary" id="boot-retry" style="margin-top:12px">Повторить</button>
+      </div></div>`;
+    const retry = qs('#boot-retry');
+    if (retry) retry.onclick = () => bootstrap();
   }
 }
 
@@ -271,7 +281,7 @@ function promptKey() {
 }
 
 async function refreshEngines() {
-  try { state.engines = (await API.get('/api/engines')).items; } catch (e) { /* не критично */ }
+  try { state.engines = (await API.background('/api/engines')).items; } catch (e) { /* не критично */ }
 }
 async function refreshQueue() {
   try {
@@ -564,6 +574,10 @@ document.addEventListener('DOMContentLoaded', () => {
     localStorage.setItem('asrhub_theme',
       document.body.classList.contains('light') ? 'light' : 'dark');
     renderView();
+    // Графики берут цвета из темы в момент отрисовки, а renderView открытое
+    // окно не трогает: без этого события карточка после смены темы остаётся
+    // с цветами прежней.
+    document.body.dispatchEvent(new CustomEvent('asrhub:theme'));
   });
   installHotkeys();
   bootstrap();
@@ -662,6 +676,10 @@ function mountModal(backdrop, options) {
 function closeModal(backdrop) {
   if (!backdrop || !backdrop.parentNode) return;
   const back = backdrop.__returnFocus;
+  // Событие до удаления из документа: по нему содержимое окна снимает
+  // подписки на window — иначе каждое открытие карточки оставляет
+  // обработчик, который дальше дёргает уже несуществующие узлы.
+  backdrop.dispatchEvent(new CustomEvent('asrhub:closed'));
   backdrop.remove();
   if (!qsa('.modal-backdrop').length) {
     document.body.classList.remove('modal-open');
@@ -1441,6 +1459,17 @@ RENDERERS.queue = {
       if (filter) params.set('status', filter);
       if (search) params.set('search', search);
       const data = await API.latest('queue-table', `/api/jobs?${params}`);
+      // Таблица перерисовывается каждые четыре секунды. Если в ней стоит
+      // фокус клавиатуры, замена innerHTML его теряет — до кнопок дальних
+      // строк было просто не добраться: Tab возвращался в начало страницы.
+      // Запоминаем, на чём стоял фокус, и возвращаем его на то же место.
+      const focused = document.activeElement;
+      const restore = host.contains(focused)
+        ? { row: focused.closest('tr') ? focused.closest('tr').dataset.jobId : '',
+            action: focused.dataset ? focused.dataset.action || '' : '',
+            scroll: host.scrollTop }
+        : null;
+
       host.innerHTML = data.items.length ? `<table>
         <thead><tr>
           <th style="width:26px"></th><th>Файл</th><th>Модель</th>
@@ -1450,12 +1479,25 @@ RENDERERS.queue = {
         </tr></thead><tbody>
         ${data.items.map((job) => this.row(job)).join('')}
       </tbody></table>` : '<div class="empty">Нет заданий по выбранному фильтру</div>';
+
+      if (restore && restore.row) {
+        const row = host.querySelector(`tr[data-job-id="${restore.row}"]`);
+        const again = row && (restore.action
+          ? row.querySelector(`[data-action="${restore.action}"]`)
+          : row.querySelector('button'));
+        if (again) {
+          again.focus({ preventScroll: true });
+          host.scrollTop = restore.scroll;
+        }
+      }
     } catch (err) { fail(err); }
   },
 
   row(job) {
     const active = ['queued', 'running', 'retry', 'paused'].includes(job.status);
-    return `<tr class="queue-row ${job.status}">
+    // data-job-id и data-action нужны, чтобы вернуть фокус на ту же кнопку
+    // после автообновления таблицы.
+    return `<tr class="queue-row ${job.status}" data-job-id="${esc(job.id)}">
       <td>${job.status === 'running' ? '▶' : job.status === 'failed' ? '✕'
             : job.status === 'completed' ? '✓' : '·'}</td>
       <td><div class="truncate" style="max-width:230px" title="${esc(job.filename)}">
@@ -1475,18 +1517,19 @@ RENDERERS.queue = {
       <td class="small faint nowrap">${fmtAgo(job.created_at)}</td>
       <td><div class="row" style="gap:3px">
         ${active ? `<button class="ghost sm" title="Поднять наверх"
-            onclick="__asrhub.jobAction('${job.id}','top')">▲</button>
+            data-action="top" onclick="__asrhub.jobAction('${job.id}','top')">▲</button>
           <button class="ghost sm" title="Опустить"
-            onclick="__asrhub.jobAction('${job.id}','bottom')">▼</button>` : ''}
+            data-action="bottom" onclick="__asrhub.jobAction('${job.id}','bottom')">▼</button>` : ''}
         ${job.status === 'queued' ? `<button class="ghost sm" title="Приостановить"
-            onclick="__asrhub.jobAction('${job.id}','pause')">⏸</button>` : ''}
+            data-action="pause" onclick="__asrhub.jobAction('${job.id}','pause')">⏸</button>` : ''}
         ${job.status === 'paused' ? `<button class="ghost sm" title="Возобновить"
-            onclick="__asrhub.jobAction('${job.id}','resume')">▶</button>` : ''}
+            data-action="resume" onclick="__asrhub.jobAction('${job.id}','resume')">▶</button>` : ''}
         ${active ? `<button class="ghost sm danger" title="Отменить"
-            onclick="__asrhub.jobAction('${job.id}','cancel')">✕</button>` : ''}
+            data-action="cancel" onclick="__asrhub.jobAction('${job.id}','cancel')">✕</button>` : ''}
         ${job.status === 'failed' ? `<button class="ghost sm" title="Повторить"
-            onclick="__asrhub.jobAction('${job.id}','retry')">↻</button>` : ''}
-        <button class="ghost sm" onclick="__asrhub.openJob('${job.id}')">Открыть</button>
+            data-action="retry" onclick="__asrhub.jobAction('${job.id}','retry')">↻</button>` : ''}
+        <button class="ghost sm" data-action="open"
+          onclick="__asrhub.openJob('${job.id}')">Открыть</button>
       </div></td>
     </tr>`;
   },
@@ -1673,6 +1716,18 @@ function showJobModal(job) {
         ${job.error_hint ? `<div class="small dim" style="margin-top:6px;white-space:pre-wrap">${
           esc(job.error_hint)}</div>` : ''}</div>` : ''}
 
+      ${(job.waveform || []).length ? `<div class="wave-block" id="job-waveform-block">
+        <div class="row small dim" style="margin-bottom:6px">
+          <b class="small">Громкость записи</b>
+          <span class="spacer"></span>
+          <span class="faint">средний уровень за ${
+            num((job.params || {}).waveform_interval_s || 1, 2)} с${
+            segments.length ? ' · щелчок — переход к месту в расшифровке' : ''}</span>
+        </div>
+        <div id="job-waveform"></div>
+        <div id="job-waveform-legend"></div>
+      </div>` : ''}
+
       <div class="tabs" id="job-tabs">
         <button class="active" data-tab="text">Текст</button>
         <button data-tab="segments">Сегменты (${segments.length})</button>
@@ -1688,7 +1743,7 @@ function showJobModal(job) {
         `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
            title="Скачать в формате ${f}">${f}</button>`).join('') : ''}
       ${job.status === 'failed'
-        ? `<button class="primary" onclick="__asrhub.jobAction('${job.id}','retry')">
+        ? `<button class="primary" data-action="retry" onclick="__asrhub.jobAction('${job.id}','retry')">
              Повторить</button>` : ''}
     </div></div></div>`);
 
@@ -1700,8 +1755,8 @@ function showJobModal(job) {
   const tabs = {
     text: () => `<div class="transcript" style="white-space:pre-wrap;line-height:1.7">${
       esc(job.text || '—')}</div>`,
-    segments: () => segments.length ? `<div class="transcript">${segments.map((s) => `
-      <div class="segment">
+    segments: () => segments.length ? `<div class="transcript">${segments.map((s, i) => `
+      <div class="segment" data-index="${i}" data-start="${s.start}" data-end="${s.end}">
         <div class="ts">${fmtDur(s.start)}<br><span style="opacity:.6">${
           fmtDur(s.end)}</span></div>
         <div class="${(s.confidence !== null && s.confidence < 0.7) ? 'conf-low' : ''}">
@@ -1736,6 +1791,64 @@ function showJobModal(job) {
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
   show('text');
+  drawJobWaveform(backdrop, job, segments, show);
+}
+
+/* Полоса громкости в карточке: дорожка на канал или говорящего.
+ *
+ * Щелчок по полосе открывает вкладку сегментов и подводит к тому, что
+ * говорилось в эту секунду. Без этого полоса остаётся картинкой: видно,
+ * что в середине разговора кто-то долго молчал, а найти это место в
+ * расшифровке всё равно приходится вручную.
+ */
+function drawJobWaveform(backdrop, job, segments, show) {
+  const host = qs('#job-waveform', backdrop);
+  if (!host || !window.Charts || !Charts.waveform) return;
+  const curves = job.waveform || [];
+
+  const seek = (seconds) => {
+    if (!segments.length) return;
+    show('segments');
+    let index = segments.findIndex((s) => s.start <= seconds && seconds < s.end);
+    if (index < 0) {         // щелчок пришёлся на паузу — берём ближайшую реплику
+      let best = Infinity;
+      segments.forEach((s, i) => {
+        const distance = seconds < s.start ? s.start - seconds : seconds - s.end;
+        if (distance < best) { best = distance; index = i; }
+      });
+    }
+    if (index < 0) return;
+    const node = qs(`.segment[data-index="${index}"]`, backdrop);
+    if (!node) return;
+    qsa('.segment.active', backdrop).forEach((n) => n.classList.remove('active'));
+    node.classList.add('active');
+    node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  };
+
+  const draw = () => Charts.waveform(host, {
+    curves,
+    duration: job.media_duration_s || 0,
+    interval: (job.params || {}).waveform_interval_s || 1,
+    timeFormat: fmtDur,
+    onSeek: segments.length ? seek : null,
+  });
+  draw();
+
+  if (curves.length > 1) {
+    const colors = Charts.palette();
+    Charts.legend(qs('#job-waveform-legend', backdrop), curves.map((c, i) => ({
+      name: c.label || `Дорожка ${i + 1}`, color: colors[i % colors.length],
+    })));
+  }
+  // Ширина известна только после вставки в документ; и размер окна, и тема
+  // меняются, пока карточка открыта.
+  const redraw = () => draw();
+  window.addEventListener('resize', redraw);
+  document.body.addEventListener('asrhub:theme', redraw);
+  backdrop.addEventListener('asrhub:closed', () => {
+    window.removeEventListener('resize', redraw);
+    document.body.removeEventListener('asrhub:theme', redraw);
+  }, { once: true });
 }
 
 // ==========================================================================

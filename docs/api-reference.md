@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **64**, операций: **71**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **65**, операций: **72**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -104,6 +104,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/jobs/{job_id}/retry` | Повторить задание | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}/segments` | Сегменты задания | любой действующий ключ |
 | `POST` | `/api/jobs/{job_id}/top` | Поднять в начало очереди | ключ с правом записи (**admin** или **user**) |
+| `GET` | `/api/jobs/{job_id}/waveform` | Полоса громкости записи | любой действующий ключ |
 | `GET` | `/api/keys` | Ключи доступа | ключ с ролью **admin** |
 | `POST` | `/api/keys` | Создать ключ доступа | ключ с ролью **admin** |
 | `DELETE` | `/api/keys/{preview}` | Отозвать ключ доступа | ключ с ролью **admin** |
@@ -188,56 +189,11 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 
 ```json
 {
-  "items": [
-    {
-      "id": "job_2797ac6fd19a4ec6",
-      "status": "completed",
-      "model": "demo-simulator",
-      "engine": "demo",
-      "language": "ru",
-      "owner": "создан автоматически при первом запуске",
-      "source": "api",
-      "priority": 50,
-      "filename": "свежая-запись.wav",
-      "deadline": null,
-      "created_at": 1788284463.4547231,
-      "queued_at": 1788284463.4547231,
-      "started_at": 1788284463.4562674,
-      "finished_at": 1788284463.4562676,
-      "media_duration_s": 4.0,
-      "processing_time_s": 0.0,
-      "queue_time_s": 0.0,
-      "audio_prep_s": null,
-      "model_load_s": null,
-      "inference_s": null,
-      "postprocess_s": null,
-      "rtf": 0.1419,
-      "words_count": 9,
-      "chars_count": 0,
-      "segments_count": 1,
-      "speakers_count": 0,
-      "avg_confidence": 0.9157,
-      "wer": null,
-      "cer": null,
-      "error_code": null,
-      "error_message": null,
-      "error_hint": null,
-      "retries": 0,
-      "cached_from": "job_924a63bbe1b54733",
-      "device": null,
-      "file_size": 0
-    },
-    {
-      "id": "job_924a63bbe1b54733",
-      "status": "completed",
-      "model": "demo-simulator",
-      "engine": "demo",
-      "language": "ru",
-      "owner": "создан автоматически при первом запуске",
-      "source": "web",
-      "priority": 50,
-      "filename": "свежая-запись.wav",
-…
+  "items": [],
+  "total": 0,
+  "limit": 2,
+  "offset": 0
+}
 ```
 
 Показан облегчённый список (`light=true`): только поля для таблицы. Без него в каждом задании приходят ещё расшифровка целиком и разбор по сегментам — на сотне часовых записей это единицы мегабайт вместо десятков килобайт.
@@ -255,7 +211,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 curl -H 'X-API-Key: $КЛЮЧ' \
      -F 'file=@совещание.mp3' \
      -F 'model=gigaam-v3-e2e-rnnt' \
-     -F 'diarization=true' \
+     -F 'diarization_enabled=true' \
      http://сервер:8080/api/jobs
 ```
 
@@ -289,6 +245,7 @@ curl -H 'X-API-Key: $КЛЮЧ' \
 |---|---|---|---|---|
 | `job_id` | в пути | string | обязателен | — |
 | `with_segments` | в адресе | boolean | `False` | — |
+| `with_waveform` | в адресе | boolean | `True` | Отдавать полосу громкости. Отключите при частом опросе карточки: на длинной записи это сотни килобайт |
 
 **Пример**
 
@@ -462,6 +419,24 @@ curl -H 'X-API-Key: $КЛЮЧ' \
 |---|---|---|---|---|
 | `job_id` | в пути | string | обязателен | — |
 
+### `GET /api/jobs/{job_id}/waveform`
+
+Полоса громкости записи.
+
+Огибающая громкости: один замер на интервал, отдельно по каналам
+или говорящим.
+
+Значение `amplitude` — средний модуль отсчёта на интервале, безразмерное
+число от 0 до 1: тишина даёт около 0.001, обычная речь — 0.15…0.25.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `job_id` | в пути | string | обязателен | — |
+| `fmt` | в адресе | string | `points` | points — разобранные точки, phone_asr — массив JSON-строк |
+
 ## Очередь
 
 Управление потоком заданий целиком: пауза, число одновременных заданий, массовые операции. Приоритет отдельного задания — в разделе «Задания».
@@ -500,8 +475,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 7,
-    "failed": 5,
+    "completed": 0,
+    "failed": 0,
     "cancelled": 0
   },
   "queue_depth": 0,
@@ -923,8 +898,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/settings
 ```json
 {
   "values": {
-    "engine": "auto",
-    "model": "faster-whisper-small",
+    "engine": "demo",
+    "model": "demo-simulator",
     "language": "ru",
     "task": "transcribe",
     "model_fallback": "",
@@ -1023,53 +998,57 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788284483.6318934,
+    "generated_at": 1788320734.4310153,
     "jobs": {
-      "total": 12,
-      "completed": 7,
-      "failed": 5,
+      "total": 0,
+      "completed": 0,
+      "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
-      "cached": 2,
-      "success_rate": 0.5833
+      "cached": 0,
+      "success_rate": null
     },
     "volume": {
-      "audio_seconds": 28.6,
-      "audio_hours": 0.01,
-      "processing_seconds": 2.8,
-      "words": 83,
-      "characters": 435,
-      "segments": 10,
-      "files_per_hour": 0.04,
+      "audio_seconds": 0,
+      "audio_hours": 0.0,
+      "processing_seconds": 0,
+      "words": 0,
+      "characters": 0,
+      "segments": 0,
+      "files_per_hour": 0.0,
       "audio_hours_per_hour": 0.0
     },
     "performance": {
       "rtf": {
-        "count": 7,
-        "avg": 0.1529,
-        "min": 0.0774,
-        "max": 0.2602,
-        "p50": 0.1419,
-        "p90": 0.2602,
-        "p95": 0.2602,
-        "p99": 0.2602,
-        "stdev": 0.071558
+        "count": 0,
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "stdev": 0.0
       },
       "processing_time_s": {
-        "count": 5,
-        "avg": 0.5554,
-        "min": 0.367,
-        "max": 0.842,
-        "p50": 0.555,
-        "p90": 0.7536,
-        "p95": 0.7978,
-        "p99": 0.83316,
-        "stdev": 0.172416
+        "count": 0,
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "stdev": 0.0
       },
       "queue_time_s": {
-        "count": 5,
-        "avg": 0.066343,
-        "min": 0.001466,
+        "count": 0,
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
 …
 ```
 
@@ -1121,7 +1100,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 40.1,
+  "uptime_s": 196.1,
   "queue_paused": false,
   "catalog_date": "2026-08-31"
 }
@@ -1161,7 +1140,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 4
+    "INFO": 4,
+    "WARNING": 20
   }
 }
 ```
@@ -1196,7 +1176,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 40.1,
+  "uptime_s": 196.1,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v22",
@@ -1205,8 +1185,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
-    "disk_free_gb": 29.4,
+    "ram_available_gb": 7.0,
+    "disk_free_gb": 29.2,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1504,14 +1484,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 40.1,
+  "uptime_s": 196.1,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 40 с",
+        "detail": "работает 196 с",
         "hint": ""
       },
       {
@@ -1540,7 +1520,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 29.4 ГБ",
+        "detail": "свободно 29.2 ГБ",
         "hint": ""
       },
       {
@@ -1548,7 +1528,6 @@ curl http://сервер:8080/api/monitoring/health
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
-      }
 …
 ```
 
@@ -1693,7 +1672,7 @@ HOST=http://сервер:8080
 JOB=$(curl -s -H "X-API-Key: $KEY" \
         -F 'file=@совещание.mp3' \
         -F 'model=gigaam-v3-e2e-rnnt' \
-        -F 'diarization=true' \
+        -F 'diarization_enabled=true' \
         "$HOST/api/jobs" | jq -r .id)
 
 # 2. Дождаться завершения

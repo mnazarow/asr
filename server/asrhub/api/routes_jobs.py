@@ -12,6 +12,7 @@ from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, Upload
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import catalog
+from ..config import parse_scalar
 from ..db import new_id
 from ..errors import (
     ASRHubError,
@@ -24,6 +25,7 @@ from ..errors import (
 from ..job_queue import ACTIVE_STATUSES
 from ..logging_setup import get_logger
 from ..pipeline import export as export_mod
+from ..pipeline import waveform as waveform_mod
 from ..pipeline.audio import SUPPORTED_EXTENSIONS
 from .deps import (
     Principal,
@@ -92,16 +94,31 @@ async def _form_overrides(request: Request) -> dict[str, Any]:
 
     values: dict[str, Any] = {}
     unknown: list[str] = []
+    bad: list[str] = []
     for name in form:
         if name in _RESERVED_FORM_FIELDS:
             continue
         raw = form[name]
         if not isinstance(raw, str):
             continue                                    # это файл, а не параметр
-        if catalog.PARAMS_BY_KEY.get(name) is None:
+        spec = catalog.PARAMS_BY_KEY.get(name)
+        if spec is None:
             unknown.append(name)
             continue
-        values[name] = raw
+        # Поле формы всегда строка, а проверка значений ждёт настоящий тип:
+        # `-F diarization=true` отвергалось с «ожидается да/нет», хотя именно
+        # так этот способ и описан в справочнике. Приводим к типу параметра
+        # тем же разбором, что и для переменных окружения.
+        try:
+            values[name] = parse_scalar(raw, spec.type)
+        except (ConfigError, ValueError, json.JSONDecodeError) as exc:
+            bad.append(f"{name}: {exc}")
+
+    if bad:
+        raise error_response(ConfigError(
+            "Не удалось разобрать поля формы: " + "; ".join(bad),
+            hint="Логические значения: true/false, да/нет, 1/0. "
+                 "Списки — через запятую."))
 
     if unknown:
         # Молчать нельзя: опечатка в имени параметра иначе выглядит как
@@ -285,6 +302,10 @@ def list_jobs(
 @router.get("/{job_id}", summary="Карточка задания")
 def get_job(request: Request, job_id: str,
             with_segments: bool = False,
+            with_waveform: bool = Query(
+                default=True,
+                description="Отдавать полосу громкости. Отключите при частом "
+                            "опросе карточки: на длинной записи это сотни килобайт"),
             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     _owned_job(request, job_id, principal)
@@ -294,8 +315,45 @@ def get_job(request: Request, job_id: str,
         raise error_response(exc) from exc
     if with_segments:
         job["segments"] = state.db.get_segments(job_id)
+    curves = job.get("waveform") or []
+    if with_waveform and curves:
+        # `waveform` — разобранные точки для интерфейса, `waveforms` — тот же
+        # набор в виде массива JSON-строк: так его отдаёт phone_asr, и
+        # приёмники, написанные под него, читают карточку без переделок.
+        job["waveforms"] = waveform_mod.to_phone_asr(curves)
+    else:
+        job.pop("waveform", None)
     job["events"] = state.db.get_events(job_id, limit=100)
     return job
+
+
+@router.get("/{job_id}/waveform", summary="Полоса громкости записи")
+def get_waveform(request: Request, job_id: str,
+                 fmt: str = Query(default="points", pattern="^(points|phone_asr)$",
+                                  description="points — разобранные точки, "
+                                              "phone_asr — массив JSON-строк"),
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Огибающая громкости: один замер на интервал, отдельно по каналам
+    или говорящим.
+
+    Значение `amplitude` — средний модуль отсчёта на интервале, безразмерное
+    число от 0 до 1: тишина даёт около 0.001, обычная речь — 0.15…0.25.
+    """
+    state = get_state(request)
+    _owned_job(request, job_id, principal)
+    try:
+        job = state.queue.get(job_id)
+    except JobNotFound as exc:
+        raise error_response(exc) from exc
+    curves = job.get("waveform") or []
+    if fmt == "phone_asr":
+        return {"id": job_id, "waveforms": waveform_mod.to_phone_asr(curves)}
+    return {
+        "id": job_id,
+        "interval_s": (job.get("params") or {}).get("waveform_interval_s"),
+        "duration_s": job.get("media_duration_s"),
+        "curves": curves,
+    }
 
 
 @router.get("/{job_id}/segments", summary="Сегменты задания")

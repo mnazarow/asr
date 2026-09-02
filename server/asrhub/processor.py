@@ -44,6 +44,9 @@ class ProcessOutcome:
     stats: dict[str, Any] = field(default_factory=dict)
     speakers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Огибающая громкости: список кривых с полями audio_waveform,
+    #: sample_rate, speaker и label.
+    waveform: list[dict[str, Any]] = field(default_factory=list)
 
     #: Стадии, которые входят в RTF. Загрузка весов исключена намеренно:
     #: она случается раз на несколько заданий и к скорости распознавания
@@ -90,6 +93,7 @@ class ProcessOutcome:
             },
             "stats": self.stats,
             "warnings": self.warnings,
+            "waveform": self.waveform,
         }
 
 
@@ -263,11 +267,33 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         try:
             from .pipeline.diarization import diarize_segments
 
-            all_segments = diarize_segments(channels[0][1], all_segments, settings)
+            # Предупреждения складываем прямо в результат: подмена
+            # диаризации разбивкой по паузам должна быть видна в выгрузке,
+            # а не только в журнале сервера.
+            all_segments = diarize_segments(channels[0][1], all_segments, settings,
+                                            outcome.warnings)
         except ASRHubError as exc:
             outcome.warnings.append(f"Диаризация не выполнена: {exc.message}")
         except Exception as exc:
             outcome.warnings.append(f"Диаризация не выполнена: {exc}")
+        timer.stop()
+
+    # ---- 5а. Огибающая громкости -------------------------------------------
+    # Считается после диаризации: на монозаписи кривая строится на каждого
+    # говорящего, а до этого шага говорящие ещё не расставлены.
+    if settings.get("waveform_enabled", True):
+        check_cancel()
+        timer.start("waveform")
+        report(0.86, "полоса громкости")
+        try:
+            from .pipeline.waveform import build as build_waveform
+
+            outcome.waveform = build_waveform(channels, all_segments, settings)
+        except Exception as exc:                            # noqa: BLE001
+            # Полоса громкости — вспомогательные данные: её отсутствие не
+            # повод терять уже посчитанную расшифровку.
+            log.warning("Огибающая не построена: %s", exc)
+            outcome.warnings.append(f"Полоса громкости не построена: {exc}")
         timer.stop()
 
     # ---- 6. Постобработка -------------------------------------------------

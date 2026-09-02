@@ -734,6 +734,7 @@ class JobQueue:
             language=outcome.language,
             device=str(merged.get("device")),
             wer=accuracy.get("wer"), cer=accuracy.get("cer"),
+            waveform=outcome.waveform,
         )
         self.db.save_segments(job_id, outcome.segments)
 
@@ -864,13 +865,21 @@ class JobQueue:
         import urllib.error
         import urllib.request
 
-        payload = json_mod.dumps({
+        body: dict[str, Any] = {
             "id": job["id"], "status": job["status"], "filename": job.get("filename"),
             "model": job.get("model"), "rtf": job.get("rtf"),
             "duration_s": job.get("media_duration_s"),
             "words": job.get("words_count"),
             "error": job.get("error_message"),
-        }, ensure_ascii=False).encode("utf-8")
+        }
+        # Огибающая в уведомлении — совместимость с приёмниками phone_asr,
+        # которые ждут её полем `waveforms`. По умолчанию выключено: тело
+        # уведомления задумано коротким, а повторов доставки до пяти.
+        if self.settings.get("webhook_waveform") and job.get("waveform"):
+            from .pipeline.waveform import to_phone_asr
+
+            body["waveforms"] = to_phone_asr(job["waveform"])
+        payload = json_mod.dumps(body, ensure_ascii=False).encode("utf-8")
 
         secret = str(self.settings.get("webhook_secret") or "").encode("utf-8")
         headers = {"Content-Type": "application/json; charset=utf-8",

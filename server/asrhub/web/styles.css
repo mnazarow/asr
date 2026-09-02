@@ -331,6 +331,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .segment .conf-low { border-left: 2px solid var(--warn); padding-left: 8px; }
 .segment.active { background: var(--accent-soft); }
 
+.wave-block {
+  background: var(--bg-elev-2); border: 1px solid var(--border-soft);
+  border-radius: var(--radius); padding: 10px 12px; margin-bottom: 14px;
+}
+.chart.waveform { cursor: default; }
+
 /* ---------- Графики ---------- */
 
 .chart { width: 100%; display: block; }
@@ -340,7 +346,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .chart-tip {
   position: fixed; pointer-events: none; background: var(--bg-elev-2); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 9px;
-  font-size: 12px; box-shadow: var(--shadow); z-index: 100; display: none; white-space: pre;
+  /* Выше модального окна (200): подсказка графика в карточке задания иначе
+     оказывается под ним и не видна вовсе. Ниже уведомлений (300). */
+  font-size: 12px; box-shadow: var(--shadow); z-index: 250; display: none; white-space: pre;
 }
 
 /* ---------- Модальные окна и уведомления ---------- */

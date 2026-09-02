@@ -57,3 +57,19 @@ def sample_wav(tmp_path_factory: pytest.TempPathFactory) -> Path:
             handle.setframerate(rate)
             handle.writeframes(bytes(frames))
     return path
+
+
+@pytest.fixture()
+def client(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    """Сервер с демо-движком: полный цикл задания без настоящих моделей."""
+    from asrhub.api import create_app
+    from asrhub.config import load
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
+    monkeypatch.setenv("ASRHUB_VAD_BACKEND", "energy")
+    monkeypatch.setenv("ASRHUB_MAX_CONCURRENT_JOBS", "2")
+    app = create_app(load(), start_queue=True)
+    with TestClient(app) as test_client:
+        yield test_client

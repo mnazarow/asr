@@ -39,7 +39,10 @@ echo "2/8 Справочник API мониторинга"
 # Собирается с работающего сервера: примеры ответов настоящие. Если сервер
 # не поднят, оставляем прошлую версию файла — сборка не должна падать из-за этого.
 ASRHUB_API_BASE="${ASRHUB_API_BASE:-http://127.0.0.1:8080}"
-if python3 docs/generate_api.py "${ASRHUB_API_BASE}" 2>/dev/null; then
+# Ключ передаём так же, как это делает build-api.sh: без него защищённые
+# маршруты отвечают 401, и глава собирается с пустыми примерами — молча.
+ASRHUB_API_KEY="${ASRHUB_API_KEY:-}"
+if python3 docs/generate_api.py "${ASRHUB_API_BASE}" "${ASRHUB_API_KEY}" 2>/dev/null; then
   :
 else
   echo "  сервер на ${ASRHUB_API_BASE} недоступен — оставлена прошлая версия"
