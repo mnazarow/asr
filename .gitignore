@@ -1,0 +1,28 @@
+# Каталоги сборки и выгрузки
+build/
+dist/
+*.egg-info/
+
+# Кеши интерпретатора и инструментов
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Данные работающего сервера
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+api-key.txt
+
+# Пакеты, скачанные для установки
+*.whl
+
+# Служебное от macOS и редакторов
+.DS_Store
+.idea/
+.vscode/
