@@ -24,7 +24,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -85,7 +85,9 @@ _SCHEMA = [
         cached_from       TEXT,
         webhook_url       TEXT,
         webhook_status    TEXT,
-        waveform          TEXT
+        waveform          TEXT,
+        instance_id       TEXT,
+        heartbeat_at      REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
@@ -252,6 +254,12 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # заданием, а не в файле результата, чтобы её можно было отдать в
         # карточке задания, не читая диск.
         "waveform": "TEXT",
+        # Какой экземпляр сервера взял задание и когда в последний раз
+        # подтвердил, что жив. Нужно, чтобы два сервера на общей базе не
+        # брали одно задание и чтобы задания умершего экземпляра вернулись
+        # в очередь, а не висели «выполняется» вечно.
+        "instance_id": "TEXT",
+        "heartbeat_at": "REAL",
         "avg_confidence": "REAL",
         "rtf": "REAL",
         "queue_time_s": "REAL",
@@ -549,7 +557,8 @@ class Database:
         "device, file_size, progress, stage"
     )
 
-    def list_jobs(self, *, status: str | list[str] | None = None, owner: str | None = None,
+    def list_jobs(self, *, status: str | list[str] | None = None,
+                  owner: str | list[str] | None = None,
                   model: str | None = None, search: str | None = None,
                   group_id: str | None = None, since: float | None = None,
                   limit: int = 100, offset: int = 0,
@@ -563,8 +572,11 @@ class Database:
             where.append("status IN (" + ",".join("?" for _ in statuses) + ")")
             args.extend(statuses)
         if owner:
-            where.append("owner=?")
-            args.append(owner)
+            # Список владельцев — это подразделение: ключи одной группы
+            # видят задания друг друга.
+            owners = [owner] if isinstance(owner, str) else list(owner)
+            where.append("owner IN (" + ",".join("?" for _ in owners) + ")")
+            args.extend(owners)
         if model:
             where.append("model=?")
             args.append(model)
@@ -608,8 +620,36 @@ class Database:
             job.pop("waveform", None)
         return jobs
 
+    def owner_usage(self, owner: str | list[str], since: float) -> dict[str, float]:
+        """Расход владельца (или подразделения) с указанного момента.
+
+        Нужен для квот: сколько заданий поставлено, сколько часов звука
+        принято и сколько места заняли исходные файлы. Считается в базе, а
+        не перебором в памяти: на сотне тысяч заданий разница между этим и
+        выборкой — секунды на каждую загрузку.
+        """
+        owners = [owner] if isinstance(owner, str) else list(owner)
+        if not owners:
+            return {"jobs": 0, "audio_hours": 0.0, "storage_gb": 0.0}
+        placeholders = ",".join("?" for _ in owners)
+        row = self.query_one(
+            "SELECT COUNT(*) AS jobs, "
+            "       COALESCE(SUM(media_duration_s), 0) AS audio_s, "
+            "       COALESCE(SUM(file_size), 0) AS bytes "
+            f"FROM jobs WHERE owner IN ({placeholders}) AND created_at>=? "
+            "  AND status NOT IN ('cancelled', 'failed')",
+            [*owners, since])
+        if row is None:
+            return {"jobs": 0, "audio_hours": 0.0, "storage_gb": 0.0}
+        return {
+            "jobs": int(row["jobs"] or 0),
+            "audio_hours": round(float(row["audio_s"] or 0) / 3600, 4),
+            "storage_gb": round(float(row["bytes"] or 0) / 1024 ** 3, 4),
+        }
+
     def count_jobs(self, *, status: str | list[str] | None = None,
-                   owner: str | None = None, since: float | None = None) -> int:
+                   owner: str | list[str] | None = None,
+                   since: float | None = None) -> int:
         where: list[str] = []
         args: list[Any] = []
         if status:
@@ -617,8 +657,9 @@ class Database:
             where.append("status IN (" + ",".join("?" for _ in statuses) + ")")
             args.extend(statuses)
         if owner:
-            where.append("owner=?")
-            args.append(owner)
+            owners = [owner] if isinstance(owner, str) else list(owner)
+            where.append("owner IN (" + ",".join("?" for _ in owners) + ")")
+            args.extend(owners)
         if since:
             where.append("created_at>=?")
             args.append(since)

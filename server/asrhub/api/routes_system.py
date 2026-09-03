@@ -269,6 +269,35 @@ def events(request: Request, limit: int = 100,
     return {"items": mine[:limit]}
 
 
+@router.get("/usage", summary="Расход и квоты ключа")
+def usage(request: Request,
+          principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Сколько израсходовано за сутки и сколько всего можно.
+
+    Без этого маршрута о квоте узнавали только в момент отказа — уже после
+    того, как файл загружен.
+    """
+    state = get_state(request)
+    scope = scope_owner(principal) or principal.name
+    used = state.db.owner_usage(scope, time.time() - 86400)
+    limits = {
+        "jobs": principal.quota_jobs_per_day,
+        "audio_hours": principal.quota_audio_hours_per_day,
+        "storage_gb": principal.quota_storage_gb,
+    }
+    remaining = {k: (None if not limits[k] else round(max(0.0, limits[k] - used[k]), 4))
+                 for k in limits}
+    return {
+        "owner": principal.name,
+        "group": principal.group,
+        "scope": [scope] if isinstance(scope, str) else scope,
+        "window": "последние сутки",
+        "used": used,
+        "limits": {k: (v or None) for k, v in limits.items()},
+        "remaining": remaining,
+    }
+
+
 @router.get("/keys", summary="Ключи доступа")
 def list_keys(request: Request,
               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
@@ -287,6 +316,10 @@ def list_keys(request: Request,
             "role": info.get("role", "user"),
             "enabled": info.get("enabled", True),
             "rate_limit": info.get("rate_limit", 0),
+            "group": info.get("group", ""),
+            "quota_jobs_per_day": info.get("quota_jobs_per_day", 0),
+            "quota_audio_hours_per_day": info.get("quota_audio_hours_per_day", 0),
+            "quota_storage_gb": info.get("quota_storage_gb", 0),
         })
     return {"items": items}
 
@@ -295,6 +328,10 @@ def list_keys(request: Request,
 def create_key(request: Request, name: str = Body(embed=True),
                role: str = Body(default="user", embed=True),
                rate_limit: int = Body(default=0, embed=True),
+               group: str = Body(default="", embed=True),
+               quota_jobs_per_day: int = Body(default=0, embed=True),
+               quota_audio_hours_per_day: float = Body(default=0, embed=True),
+               quota_storage_gb: float = Body(default=0, embed=True),
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     import secrets
 
@@ -306,13 +343,21 @@ def create_key(request: Request, name: str = Body(embed=True),
             hint="Допустимые роли: admin — полный доступ, user — отправка заданий, "
                  "readonly — только чтение."))
     key = "ah_" + secrets.token_urlsafe(24)
-    state.settings.api_keys[key] = {"name": name, "role": role,
-                                    "rate_limit": rate_limit, "enabled": True}
+    # group объединяет ключи в подразделение: они видят задания друг друга.
+    # Квоты нулевые означают «без ограничения» и считаются за скользящие сутки.
+    state.settings.api_keys[key] = {
+        "name": name, "role": role, "rate_limit": rate_limit, "enabled": True,
+        "group": group,
+        "quota_jobs_per_day": max(0, quota_jobs_per_day),
+        "quota_audio_hours_per_day": max(0.0, quota_audio_hours_per_day),
+        "quota_storage_gb": max(0.0, quota_storage_gb),
+    }
     # Без записи на диск ключ жил бы только до перезапуска, тогда как
     # интерфейс обещает пользователю обратное.
     saved = state.settings.persist_api_keys()
     state.db.add_event(None, "key_created", f"Создан ключ «{name}» с ролью {role}")
-    return {"key": key, "name": name, "role": role, "persisted": saved,
+    return {"key": key, "name": name, "role": role, "group": group,
+            "persisted": saved,
             "warning": "Ключ показывается один раз — сохраните его."
                        if saved else
                        "Ключ показывается один раз. Внимание: файл конфигурации "

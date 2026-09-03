@@ -413,8 +413,13 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     return outcome
 
 
-def settings_digest(settings: dict[str, Any]) -> str:
-    """Короткий отпечаток настроек — входит в ключ кеша результатов."""
+def settings_digest(settings: dict[str, Any], *, weights: str = "") -> str:
+    """Короткий отпечаток настроек — входит в ключ кеша результатов.
+
+    weights — отпечаток файлов модели. Без него кеш опирался только на имя
+    модели, и обновление весов под тем же именем возвращало старый
+    результат как свежий.
+    """
     import hashlib
 
     from .catalog import PARAMS_BY_KEY
@@ -424,6 +429,8 @@ def settings_digest(settings: dict[str, Any]) -> str:
                     "priority", "max_retries", "job_timeout_s", "webhook_url",
                     "result_retention_days", "output_formats")}
     blob = json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str)
+    if weights:
+        blob += f"\nweights={weights}"
     return hashlib.blake2b(blob.encode("utf-8"), digest_size=8).hexdigest()
 
 

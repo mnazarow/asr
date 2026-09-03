@@ -19,6 +19,7 @@ from ..errors import (
     ConfigError,
     FileTooLarge,
     JobNotFound,
+    QuotaExceeded,
     StorageError,
     UnsupportedFormat,
 )
@@ -132,6 +133,53 @@ async def _form_overrides(request: Request) -> dict[str, Any]:
     return values
 
 
+def _probe_duration(path: Path) -> float:
+    """Длительность записи, ноль — если определить не удалось."""
+    from ..pipeline.audio import probe
+
+    try:
+        return float(probe(path).duration_s)
+    except (ASRHubError, OSError):
+        return 0.0
+
+
+def check_quota(request: Request, principal: Principal, *,
+                incoming_bytes: int = 0, incoming_audio_s: float = 0.0) -> None:
+    """Проверяет суточные квоты ключа перед приёмом задания.
+
+    Три роли давали ответ на вопрос «что можно делать», но не на вопрос
+    «сколько». Один ключ мог занять всю очередь и весь диск, и остановить
+    это можно было только отключив ключ целиком.
+
+    Квота считается за скользящие сутки и восстанавливается сама.
+    Администратор не ограничен: иначе обслуживание сервера упиралось бы в
+    ту же стену, что и злоупотребление.
+    """
+    if principal.is_admin:
+        return
+    limits = {
+        "jobs": float(principal.quota_jobs_per_day),
+        "audio_hours": float(principal.quota_audio_hours_per_day),
+        "storage_gb": float(principal.quota_storage_gb),
+    }
+    if not any(limits.values()):
+        return
+
+    state = get_state(request)
+    scope = scope_owner(principal) or principal.name
+    used = state.db.owner_usage(scope, time.time() - 86400)
+    # Учитываем и то, что принимаем прямо сейчас: иначе одна загрузка на
+    # сто часов проходила бы поверх любой квоты.
+    pending = {
+        "jobs": used["jobs"] + 1,
+        "audio_hours": used["audio_hours"] + incoming_audio_s / 3600,
+        "storage_gb": used["storage_gb"] + incoming_bytes / 1024 ** 3,
+    }
+    for kind, limit in limits.items():
+        if limit and pending[kind] > limit:
+            raise error_response(QuotaExceeded(kind, round(pending[kind], 3), limit))
+
+
 @router.post("", summary="Поставить файл в очередь")
 async def create_job(
     request: Request,
@@ -151,6 +199,10 @@ async def create_job(
     suffix = Path(filename).suffix.lower()
     if suffix and suffix not in SUPPORTED_EXTENSIONS:
         raise error_response(UnsupportedFormat(filename, suffix))
+
+    # Квоту на число заданий проверяем до приёма файла: смысла принимать
+    # сотню мегабайт, чтобы затем отказать, нет.
+    check_quota(request, principal)
 
     limit_mb = int(state.settings.get("max_upload_mb") or 2048)
     target = state.settings.paths.uploads / f"{new_id('up')}{suffix or '.bin'}"
@@ -179,6 +231,9 @@ async def create_job(
     # вне защиты, и каждая опечатка в имени параметра оставляла на диске
     # копию загруженной записи.
     try:
+        # Объём и длительность известны только теперь, когда файл на диске.
+        check_quota(request, principal, incoming_bytes=size,
+                    incoming_audio_s=_probe_duration(target))
         # Значения из settings перекрывают одноимённые поля формы: явный JSON
         # выражает намерение точнее, чем разрозненные поля.
         overrides = {**await _form_overrides(request), **_parse_settings(settings)}
@@ -241,6 +296,10 @@ async def create_batch(
                     if size > limit_mb * 1024 * 1024:
                         raise FileTooLarge(size / 1024 / 1024, limit_mb)
                     out.write(chunk)
+            # Квота проверяется на каждый файл пакета: иначе один запрос из
+            # двухсот файлов обходил бы её целиком.
+            check_quota(request, principal, incoming_bytes=size,
+                        incoming_audio_s=_probe_duration(target))
             job = state.queue.submit(
                 file_path=target, filename=filename, settings=merged,
                 owner=principal.name, api_key_name=principal.name,

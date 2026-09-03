@@ -229,6 +229,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 
 .mono { font-family: var(--mono); font-size: 12.5px; }
 .dim { color: var(--text-dim); }
+.ok { color: var(--ok); }
+.err { color: var(--err); }
 .faint { color: var(--text-faint); }
 .small { font-size: 12px; }
 .nowrap { white-space: nowrap; }
@@ -561,4 +563,32 @@ body.modal-open { overflow: hidden; }
   .kpi-value { font-size: 21px; }
   .modal-head, .modal-body, .modal-foot { padding-left: 12px; padding-right: 12px; }
   .modal-foot { flex-wrap: wrap; }
+}
+
+/* --- Диктовка ------------------------------------------------------------
+   Текст на лету растёт сверху вниз и должен читаться с расстояния: строка
+   крупнее обычной, поле с прокруткой, чтобы карточка не разъезжала. */
+.dict-text {
+  min-height: 220px;
+  max-height: 420px;
+  overflow-y: auto;
+  font-size: 15px;
+  line-height: 1.8;
+  padding: 4px 2px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.dict-level {
+  height: 4px;
+  margin-top: 12px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.dict-level > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--ok);
+  transition: width 0.1s linear;
 }

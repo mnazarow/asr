@@ -209,12 +209,22 @@ def test_failed_pick_releases_the_slot(data_dir, monkeypatch):
                               "file_path": "/tmp/a.wav"})
 
     add("a.wav", 1.0)
-    original = db.update_job
-    db.update_job = lambda *a, **kw: (_ for _ in ()).throw(StorageError("база заблокирована"))
+    # Захват задания стал атомарным (update_job_if_status), но требование
+    # прежнее: сорвавшаяся запись обязана вернуть слот.
+    original = db.update_job_if_status
+    db.update_job_if_status = lambda *a, **kw: (_ for _ in ()).throw(
+        StorageError("база заблокирована"))
     with pytest.raises(StorageError):
         queue._next_job(0)
-    db.update_job = original
+    db.update_job_if_status = original
     assert queue._running == {}, "слот не освобождён после ошибки записи"
+
+    # Задание перехватил другой экземпляр: захват не удался, но и это не
+    # должно съедать слот.
+    db.update_job_if_status = lambda *a, **kw: False
+    assert queue._next_job(0) is None
+    db.update_job_if_status = original
+    assert queue._running == {}, "слот не освобождён, когда задание перехвачено"
 
     # Второй путь: задание исчезло между выборкой и чтением.
     add("b.wav", 2.0)

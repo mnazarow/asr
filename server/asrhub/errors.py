@@ -384,6 +384,36 @@ class AuthError(ASRHubError):
     hint = "Передайте ключ в заголовке X-API-Key или Authorization: Bearer <ключ>."
 
 
+class QuotaExceeded(ASRHubError):
+    """Исчерпана суточная квота ключа."""
+
+    code = "quota_exceeded"
+    http_status = 429
+    retryable = True
+
+    def __init__(self, kind: str, used: float, limit: float, unit: str = ""):
+        titles = {
+            "jobs": "заданий в сутки",
+            "audio_hours": "часов звука в сутки",
+            "storage_gb": "гигабайт загруженного за сутки",
+        }
+        fields = {
+            "jobs": "quota_jobs_per_day",
+            "audio_hours": "quota_audio_hours_per_day",
+            "storage_gb": "quota_storage_gb",
+        }
+        title = titles.get(kind, kind)
+        super().__init__(
+            f"Исчерпана квота: {title}. Использовано {used:g} из {limit:g}{unit}.",
+            hint=("Квота считается за последние сутки и восстанавливается сама. "
+                  "Увеличить её может администратор — полем "
+                  f"{fields.get(kind, kind)} у вашего ключа доступа. "
+                  "Текущий расход виден в GET /api/usage."),
+            details={"kind": kind, "used": used, "limit": limit,
+                     "field": fields.get(kind, kind)},
+        )
+
+
 class ForbiddenError(ASRHubError):
     """Недостаточно прав."""
 

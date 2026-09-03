@@ -104,6 +104,18 @@ class Principal:
     key: str = ""
     name: str = "аноним"
     role: str = "admin"
+    #: Подразделение. Ключи одной группы видят задания друг друга — это то
+    #: разделение, которого не хватало трём ролям: у бухгалтерии свои
+    #: записи, у отдела продаж свои, а «своё/чужое» по одному ключу не
+    #: позволяло даже двум сотрудникам работать с общим набором заданий.
+    group: str = ""
+    #: Квоты на сутки; ноль означает «без ограничения».
+    quota_jobs_per_day: int = 0
+    quota_audio_hours_per_day: float = 0.0
+    quota_storage_gb: float = 0.0
+    #: Имена всех ключей той же группы, включая себя. Заполняется при
+    #: аутентификации: только там доступны настройки с перечнем ключей.
+    peers: tuple[str, ...] = ()
 
     @property
     def is_admin(self) -> bool:
@@ -138,24 +150,52 @@ def authenticate(request: Request,
 
     limit = int(info.get("rate_limit") or state.settings.get("rate_limit_per_minute") or 0)
     state.check_rate(token, limit)
+    group = str(info.get("group") or "")
+    peers: tuple[str, ...] = ()
+    if group:
+        peers = tuple(sorted({
+            str(other.get("name") or "ключ")
+            for other in state.settings.api_keys.values()
+            if str(other.get("group") or "") == group}))
     return Principal(key=token, name=str(info.get("name") or "ключ"),
+                     group=group, peers=peers,
+                     quota_jobs_per_day=int(info.get("quota_jobs_per_day") or 0),
+                     quota_audio_hours_per_day=float(
+                         info.get("quota_audio_hours_per_day") or 0),
+                     quota_storage_gb=float(info.get("quota_storage_gb") or 0),
                      role=str(info.get("role") or "user"))
 
 
-def scope_owner(principal: Principal, requested: str | None = None) -> str | None:
-    """Владелец, которым надо ограничить выборку.
+def scope_owner(principal: Principal,
+                requested: str | None = None) -> str | list[str] | None:
+    """Владелец или их список, которым надо ограничить выборку.
 
     Карточка задания давно закрыта require_owner, а список — нет: ключ с
     ролью user получал по GET /api/jobs чужие задания целиком, вместе с
     именем файла, путём на диске и полной расшифровкой. Проверка стояла на
     одном пути и отсутствовала на соседнем.
 
-    Администратор видит всё и может отобрать по любому владельцу; остальным
-    выборка сужается до собственных заданий, что бы они ни просили.
+    Администратор видит всё и может отобрать по любому владельцу. Ключ в
+    группе видит задания своей группы — так работают подразделения. Ключ без
+    группы видит только своё.
     """
     if principal.is_admin:
         return requested or None
+    if principal.group and principal.peers:
+        # Запрошенный владелец учитывается, но только если он в той же группе.
+        if requested:
+            return requested if requested in principal.peers else principal.name
+        return list(principal.peers)
     return principal.name
+
+
+def same_scope(principal: Principal, owner: str) -> bool:
+    """Вправе ли ключ распоряжаться заданием этого владельца."""
+    if principal.is_admin:
+        return True
+    if owner == principal.name:
+        return True
+    return bool(principal.group) and owner in principal.peers
 
 
 def require_write(principal: Principal) -> Principal:
@@ -178,7 +218,7 @@ def require_owner(principal: Principal, job: dict[str, Any]) -> None:
     # задание — созданное клиентом командной строки, ключом без имени или
     # ещё до появления поля — читал и удалял кто угодно. Задание без
     # владельца считаем чужим для всех, кроме администратора.
-    if owner != principal.name:
+    if not same_scope(principal, owner):
         raise ForbiddenError(
             f"Задание принадлежит другому ключу («{owner}»).",
             hint="Распоряжаться чужими заданиями может только ключ с ролью admin.")

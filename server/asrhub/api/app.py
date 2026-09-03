@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -22,6 +23,7 @@ from ..errors import ASRHubError, FileTooLarge
 from ..job_queue import JobQueue
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
+from ..streaming import StreamSession
 from .deps import AppState
 from .routes_catalog import router as catalog_router
 from .routes_jobs import router as jobs_router
@@ -348,6 +350,125 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(monitoring_router)
 
     ws_router = APIRouter()
+
+    @ws_router.websocket("/api/stream")
+    async def stream_endpoint(websocket: WebSocket):
+        """Распознавание на лету: звук кусками внутрь, текст по ходу наружу.
+
+        Управление — текстовые сообщения JSON, звук — двоичные кадры.
+        Первое сообщение может задать модель, язык и формат звука; сессия
+        отвечает «ready» и сообщает, работает она настоящим потоком или
+        скользящим окном. «finish» завершает и отдаёт окончательный текст.
+
+        Ключ предъявляется так же, как на /ws: одноразовым билетом в
+        параметре ticket (браузер заголовки в WebSocket задать не может)
+        либо ключом в заголовке или параметре — для сторонних клиентов.
+        """
+        import asyncio as _asyncio
+
+        if not settings.get("stream_enabled", True):
+            await websocket.close(
+                code=4404, reason="Потоковое распознавание выключено (stream_enabled)")
+            return
+
+        principal_name, can_write = "без аутентификации", True
+        if settings.get("auth_enabled", True):
+            hub_state = getattr(websocket.app.state, "hub", None)
+            token = ""
+            ticket = websocket.query_params.get("ticket", "")
+            if ticket and hub_state is not None:
+                token = hub_state.tickets.redeem(ticket)
+            if not token:
+                token = (websocket.query_params.get("api_key")
+                         or websocket.headers.get("x-api-key") or "")
+            info = settings.api_keys.get(token)
+            if not info or info.get("enabled") is False:
+                await websocket.close(code=4401,
+                                      reason="Ключ доступа отсутствует или недействителен")
+                return
+            principal_name = str(info.get("name") or "ключ")
+            can_write = str(info.get("role") or "user") in ("admin", "user")
+        # Поток — это работа, а не чтение: ключу только для чтения он закрыт,
+        # как и постановка задания.
+        if not can_write:
+            await websocket.close(code=4403, reason="Ключ доступа работает только на чтение")
+            return
+
+        await websocket.accept()
+        session = None
+        try:
+            first = await websocket.receive()
+            config: dict[str, Any] = {}
+            pending: bytes = b""
+            if first.get("text"):
+                try:
+                    config = json.loads(first["text"]) or {}
+                except json.JSONDecodeError:
+                    config = {}
+            elif first.get("bytes"):
+                pending = first["bytes"]
+
+            overrides = {k: v for k, v in config.items()
+                         if k not in ("type", "format")}
+            merged = settings.merged(overrides)
+            session = StreamSession(
+                state.registry, merged,
+                source_format=str(config.get("format") or "pcm_s16le"),
+                workdir=Path(settings.get("temp_dir") or settings.paths.tmp))
+
+            ready = await _asyncio.to_thread(session.start)
+            await websocket.send_text(json.dumps(ready.to_dict(), ensure_ascii=False))
+            log.info("Поток открыт: %s, модель %s", principal_name,
+                     merged.get("model"))
+            if pending:
+                for event in await _asyncio.to_thread(session.feed, pending):
+                    await websocket.send_text(json.dumps(event.to_dict(), ensure_ascii=False))
+
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                if message.get("bytes"):
+                    # Распознавание — работа для потока, а не для цикла
+                    # событий: иначе сервер перестаёт отвечать всем
+                    # остальным на время каждого куска.
+                    events = await _asyncio.to_thread(session.feed, message["bytes"])
+                elif message.get("text"):
+                    try:
+                        command = json.loads(message["text"]) or {}
+                    except json.JSONDecodeError:
+                        continue
+                    kind = str(command.get("type") or "")
+                    if kind in ("finish", "stop", "eof"):
+                        for event in await _asyncio.to_thread(session.finish):
+                            await websocket.send_text(
+                                json.dumps(event.to_dict(), ensure_ascii=False))
+                        break
+                    if kind == "ping":
+                        await websocket.send_text('{"type":"pong"}')
+                    continue
+                else:
+                    continue
+                for event in events:
+                    await websocket.send_text(json.dumps(event.to_dict(), ensure_ascii=False))
+        except WebSocketDisconnect:
+            log.info("Поток закрыт клиентом: %s", principal_name)
+        except ASRHubError as exc:
+            with contextlib.suppress(Exception):
+                await websocket.send_text(json.dumps(
+                    {"type": "error", **exc.to_dict()}, ensure_ascii=False))
+        except Exception as exc:                        # noqa: BLE001
+            log.exception("Поток прерван: %s", exc)
+            with contextlib.suppress(Exception):
+                await websocket.send_text(json.dumps(
+                    {"type": "error", "message": str(exc)}, ensure_ascii=False))
+        finally:
+            # Сессия держит буфер, процесс ffmpeg и состояние движка —
+            # оборванное соединение не должно оставлять их висеть.
+            if session is not None:
+                await _asyncio.to_thread(session.close)
+            with contextlib.suppress(Exception):
+                await websocket.close()
 
     @ws_router.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

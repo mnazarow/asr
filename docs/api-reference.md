@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **65**, операций: **72**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **66**, операций: **73**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -32,8 +32,20 @@
 случае. Журнал сервера доступен только администратору: записи несут имена
 чужих файлов и трассировки, а разделить их по владельцам нечем.
 
+**Подразделения.** Ключи с одинаковым `group` видят задания друг друга —
+всюду, где действует область видимости. Ключ без `group` видит только своё.
+Подразделение не меняет роль: `readonly` в подразделении читает задания
+коллег, но по-прежнему ничего не создаёт.
+
 **Ограничение частоты.** Считается по ключу, не по адресу. При превышении
 приходит 429 с заголовком `Retry-After` и подсказкой в теле.
+
+**Квоты.** Отдельно от частоты у ключа есть суточные пределы: число заданий
+(`quota_jobs_per_day`), часы звука (`quota_audio_hours_per_day`) и объём
+загруженного (`quota_storage_gb`). Ноль означает «без ограничения»,
+администратор не ограничен, окно скользящее — квота восстанавливается сама.
+Расход виден в `GET /api/usage` до отказа; при исчерпании приходит 429 с
+кодом `quota_exceeded` и именем поля, которое надо поднять.
 
 ## Формат ошибок
 
@@ -77,6 +89,34 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 очереди и последние события), `job.progress` по ходу распознавания,
 `job.completed`, `job.failed`, `job.retry`, `job.queued`, `queue`. Клиент
 может отправить `ping` (ответ `pong`) и `status` (ответ — состояние очереди).
+
+## Распознавание на лету
+
+Второй WebSocket — `/api/stream` — принимает звук кусками и отдаёт текст по
+ходу, не дожидаясь конца записи. Ключ предъявляется так же, билетом.
+Управление — сообщения JSON, звук — двоичные кадры:
+
+```
+-> {"type": "config", "format": "auto", "stream_window_s": 3}
+<- {"type": "ready", "mode": "window", "window_s": 3.0, "note": "..."}
+-> «двоичный кадр со звуком»
+<- {"type": "partial", "text": "коллеги добрый", "start": 0, "end": 3.1}
+-> {"type": "finish"}
+<- {"type": "final", "text": "Коллеги, добрый день.", "start": 0, "end": 4.2}
+<- {"type": "done", "duration_s": 4.2, "text": "Коллеги, добрый день."}
+```
+
+Поле `mode` в `ready` говорит, как сессия работает: `native` — движок держит
+состояние между кусками и звук распознаётся один раз (Vosk); `window` —
+движок состояния не держит, поэтому накопленный звук распознаётся заново
+каждые `stream_window_s` секунд. `partial` — черновик, который заменяется
+следующим целиком; `final` — то, что уже не изменится, его дописывают.
+
+Формат `pcm_s16le` (моно, 16 кГц, 16 бит) не требует ничего; `auto`
+пропускает через ffmpeg любой контейнер, но присылать надо один непрерывный
+поток, а не отдельные файлы. Сессия длиннее часа прерывается: для длинных
+записей есть `POST /api/jobs`. Ключу `readonly` поток закрыт — это работа, а
+не чтение. Готовый клиент: `examples/stream_microphone.py`.
 
 ## Обзор всех маршрутов
 
@@ -154,6 +194,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/settings/reset` | Сбросить настройки к значениям по умолчанию | ключ с ролью **admin** |
 | `POST` | `/api/settings/save` | Сохранить настройки в файл конфигурации | ключ с ролью **admin** |
 | `GET` | `/api/system` | Сведения о сервере и оборудовании | любой действующий ключ |
+| `GET` | `/api/usage` | Расход и квоты ключа | любой действующий ключ |
 
 ## Задания
 
@@ -189,11 +230,57 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 
 ```json
 {
-  "items": [],
-  "total": 0,
-  "limit": 2,
-  "offset": 0
-}
+  "items": [
+    {
+      "id": "job_e752ac214ed04848",
+      "status": "completed",
+      "model": "gigaam-v3-e2e-rnnt",
+      "engine": "gigaam",
+      "language": "ru",
+      "owner": "Сидорчук Д.",
+      "source": "web",
+      "priority": 10,
+      "filename": "вебинар-165.wav",
+      "deadline": null,
+      "created_at": 1788400043.3269281,
+      "queued_at": 1788400043.3269281,
+      "started_at": 1788400118.4813502,
+      "finished_at": 1788400138.1381946,
+      "media_duration_s": 223.2230510519809,
+      "processing_time_s": 19.66,
+      "queue_time_s": 75.15,
+      "audio_prep_s": 1.614,
+      "model_load_s": 3.062,
+      "inference_s": 14.765,
+      "postprocess_s": 1.225,
+      "rtf": 0.0881,
+      "words_count": 577,
+      "chars_count": 3462,
+      "segments_count": 36,
+      "speakers_count": 3,
+      "avg_confidence": 0.9829,
+      "wer": null,
+      "cer": null,
+      "error_code": null,
+      "error_message": null,
+      "error_hint": null,
+      "retries": 0,
+      "cached_from": null,
+      "device": "cuda",
+      "file_size": 7143137,
+      "progress": 1.0,
+      "stage": "готово"
+    },
+    {
+      "id": "job_23413cf83c3a4c82",
+      "status": "completed",
+      "model": "parakeet-tdt-0.6b-v3",
+      "engine": "nemo",
+      "language": "ru",
+      "owner": "Петрова М.",
+      "source": "web-batch",
+      "priority": 50,
+…
 ```
 
 Показан облегчённый список (`light=true`): только поля для таблицы. Без него в каждом задании приходят ещё расшифровка целиком и разбор по сегментам — на сотне часовых записей это единицы мегабайт вместо десятков килобайт.
@@ -459,6 +546,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
+  "instance": "vm:22554",
+  "instances": [],
   "workers": [
     {
       "index": 0,
@@ -475,9 +564,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 0,
-    "failed": 0,
-    "cancelled": 0
+    "completed": 256,
+    "failed": 10,
+    "cancelled": 8
   },
   "queue_depth": 0,
   "active": 0,
@@ -485,7 +574,15 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
   "eta_s": 0.0,
   "policy": "priority_fifo",
   "max_queue_size": 1000,
-  "loaded_models": [],
+  "loaded_models": [
+    {
+      "key": "demo::demo-simulator::cpu::int8",
+      "model": "demo-simulator",
+      "engine": "demo",
+      "loaded": true,
+      "idle_s": 375.5
+    }
+  ],
   "items": []
 }
 ```
@@ -998,57 +1095,51 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788396720.053555,
+    "generated_at": 1788400851.1821766,
     "jobs": {
-      "total": 0,
-      "completed": 0,
-      "failed": 0,
-      "cancelled": 0,
+      "total": 274,
+      "completed": 256,
+      "failed": 10,
+      "cancelled": 8,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": null
+      "success_rate": 0.9343
     },
     "volume": {
-      "audio_seconds": 0,
-      "audio_hours": 0.0,
-      "processing_seconds": 0,
-      "words": 0,
-      "characters": 0,
-      "segments": 0,
-      "files_per_hour": 0.0,
-      "audio_hours_per_hour": 0.0
+      "audio_seconds": 330788.2,
+      "audio_hours": 91.89,
+      "processing_seconds": 44327.2,
+      "words": 754122,
+      "characters": 4524732,
+      "segments": 35395,
+      "files_per_hour": 1.52,
+      "audio_hours_per_hour": 0.55
     },
     "performance": {
       "rtf": {
-        "count": 0,
-        "avg": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "p50": 0.0,
-        "p90": 0.0,
-        "p95": 0.0,
-        "p99": 0.0,
-        "stdev": 0.0
+        "count": 256,
+        "avg": 0.135459,
+        "min": 0.0176,
+        "max": 0.5409,
+        "p50": 0.1106,
+        "p90": 0.29225,
+        "p95": 0.379175,
+        "p99": 0.44389,
+        "stdev": 0.105282
       },
       "processing_time_s": {
-        "count": 0,
-        "avg": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "p50": 0.0,
-        "p90": 0.0,
-        "p95": 0.0,
-        "p99": 0.0,
-        "stdev": 0.0
+        "count": 256,
+        "avg": 173.15332,
+        "min": 0.97,
+        "max": 2014.66,
+        "p50": 51.88,
+        "p90": 509.74,
+        "p95": 625.4975,
+        "p99": 1298.2165,
+        "stdev": 283.726527
       },
       "queue_time_s": {
-        "count": 0,
-        "avg": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "p50": 0.0,
-        "p90": 0.0,
-        "p95": 0.0,
+        "count": 256,
 …
 ```
 
@@ -1100,7 +1191,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 65.4,
+  "uptime_s": 531.6,
   "queue_paused": false,
   "catalog_date": "2026-08-31"
 }
@@ -1140,7 +1231,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 4
+    "INFO": 16,
+    "WARNING": 6
   }
 }
 ```
@@ -1175,7 +1267,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 65.4,
+  "uptime_s": 531.7,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1184,7 +1276,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
+    "ram_available_gb": 7.0,
     "disk_free_gb": 29.1,
     "gpus": [],
     "accelerator": "cpu",
@@ -1209,14 +1301,13 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "_reason": "Видеокарта не обнаружена. Выбран режим int8 на 2 физических ядрах — единственный практичный вариант на процессоре."
   },
   "log_counts": {
-    "INFO": 4
-  },
+    "INFO": 16,
 …
 ```
 
-## Ключи доступа
+## Ключи доступа, подразделения и квоты
 
-Выпуск и отзыв ключей, одноразовые билеты для WebSocket.
+Выпуск и отзыв ключей, одноразовые билеты для WebSocket, расход по суточным квотам. Ключи с одинаковым `group` видят задания друг друга.
 
 ### `POST /api/auth/ticket`
 
@@ -1282,6 +1373,54 @@ curl -X POST -H 'X-API-Key: $КЛЮЧ' -H 'Content-Type: application/json' \
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `preview` | в пути | string | обязателен | — |
+
+### `GET /api/usage`
+
+Расход и квоты ключа.
+
+Сколько израсходовано за сутки и сколько всего можно.
+
+Без этого маршрута о квоте узнавали только в момент отказа — уже после
+того, как файл загружен.
+
+**Доступ:** любой действующий ключ.
+
+
+**Пример**
+
+```bash
+curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
+```
+
+**Ответ**
+
+```json
+{
+  "owner": "создан автоматически при первом запуске",
+  "group": "",
+  "scope": [
+    "создан автоматически при первом запуске"
+  ],
+  "window": "последние сутки",
+  "used": {
+    "jobs": 0,
+    "audio_hours": 0.0,
+    "storage_gb": 0.0
+  },
+  "limits": {
+    "jobs": null,
+    "audio_hours": null,
+    "storage_gb": null
+  },
+  "remaining": {
+    "jobs": null,
+    "audio_hours": null,
+    "storage_gb": null
+  }
+}
+```
+
+Расход за скользящие сутки и пределы ключа. `null` в `limits` означает, что по этому измерению ограничения нет. У ключа в подразделении расход считается на всё подразделение — иначе квоту обходили бы вторым ключом.
 
 ## Обслуживание
 
@@ -1485,14 +1624,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 65.4,
+  "uptime_s": 531.7,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 65 с",
+        "detail": "работает 532 с",
         "hint": ""
       },
       {
@@ -1529,7 +1668,6 @@ curl http://сервер:8080/api/monitoring/health
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
-      }
 …
 ```
 

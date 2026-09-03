@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
-from .. import catalog
+from .. import catalog, model_files
 from ..engines import ENGINE_CLASSES, engine_status
 from ..errors import ASRHubError, ModelNotFound, PresetNotFound
 from ..logging_setup import get_logger
@@ -92,42 +92,18 @@ def model_status(request: Request, model_id: str,
     if spec is None:
         raise error_response(ModelNotFound(model_id, catalog.suggest_models(model_id)))
     models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
-    found = _find_local(models_dir, spec.source)
+    found = model_files.find_local(models_dir, spec.source)
     cls = ENGINE_CLASSES.get(spec.engine)
     available, reason = cls.check_available() if cls else (False, "движок неизвестен")
     return {
         "model": model_id,
         "downloaded": bool(found),
         "path": str(found) if found else None,
-        "size_mb": round(_dir_size(found) / 1024 / 1024, 1) if found else None,
+        "size_mb": round(model_files.directory_size(found) / 1024 / 1024, 1) if found else None,
         "engine_available": available,
         "engine_reason": reason,
         "download": _downloads.get(model_id),
     }
-
-
-def _find_local(models_dir: Path, source: str) -> Path | None:
-    if not models_dir.exists():
-        return None
-    if source.startswith("http"):
-        name = source.rsplit("/", 1)[-1].replace(".zip", "")
-        for candidate in models_dir.rglob(f"*{name}*"):
-            if candidate.is_dir():
-                return candidate
-        return None
-    slug = "models--" + source.replace("/", "--")
-    for base in (models_dir, models_dir / "hub"):
-        candidate = base / slug
-        if candidate.exists():
-            return candidate
-    direct = models_dir / source.replace("/", "_")
-    return direct if direct.exists() else None
-
-
-def _dir_size(path: Path | None) -> int:
-    if path is None or not path.exists():
-        return 0
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
 @router.post("/models/{model_id}/download", summary="Загрузить веса модели")
@@ -163,6 +139,9 @@ def download_model(request: Request, model_id: str,
                     cache_dir=str(models_dir),
                     token=state.settings.hf_token or None)
             entry.update(status="completed", progress=1.0, message="готово")
+            # Веса сменились — запомненный отпечаток больше не годится,
+            # иначе кеш до минуты отдавал бы результаты прошлой версии.
+            model_files.forget(models_dir)
             state.db.add_event(None, "model_downloaded", f"Загружена модель {model_id}")
         except Exception as exc:
             entry.update(status="failed", message=str(exc)[:500])
@@ -181,11 +160,12 @@ def remove_model(request: Request, model_id: str,
     if spec is None:
         raise error_response(ModelNotFound(model_id, catalog.suggest_models(model_id)))
     models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
-    found = _find_local(models_dir, spec.source)
+    found = model_files.find_local(models_dir, spec.source)
     if not found:
         return {"model": model_id, "removed": False, "message": "веса не найдены на диске"}
-    freed = _dir_size(found)
+    freed = model_files.directory_size(found)
     shutil.rmtree(found, ignore_errors=True)
+    model_files.forget(models_dir)
     state.db.add_event(None, "model_removed", f"Удалены веса модели {model_id}")
     return {"model": model_id, "removed": True, "freed_mb": round(freed / 1024 / 1024, 1)}
 

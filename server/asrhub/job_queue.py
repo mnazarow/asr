@@ -14,8 +14,10 @@
 """
 from __future__ import annotations
 
+import os
 import random
 import shutil
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import model_files
 from .catalog import get_model
 from .db import Database, new_id, now
 from .engines import EngineRegistry
@@ -45,6 +48,17 @@ from .monitoring.collector import (
 from .processor import cleanup_workdir, process_job, safe_workdir, settings_digest
 
 log = get_logger("queue")
+
+
+#: Кто мы такие среди серверов на общей базе. Имя машины плюс идентификатор
+#: процесса: достаточно, чтобы отличить два экземпляра, и понятно человеку,
+#: который смотрит в базу и хочет знать, на какой машине висит задание.
+INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+#: Через сколько секунд без отметки задание считается брошенным. Пять минут
+#: с запасом покрывают паузу на выгрузке большой модели: отметка ставится
+#: на каждом шаге конвейера, а самый долгий из них — загрузка весов.
+STALE_AFTER_S = 300.0
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -190,8 +204,19 @@ class JobQueue:
         from .pipeline.audio import file_hash, probe
 
         digest = file_hash(path)
-        params_digest = settings_digest(settings)
         spec = get_model(str(settings.get("model") or ""))
+        # Отпечаток весов входит в ключ кеша: без него обновление модели под
+        # тем же именем отдавало старый результат как свежий, и понять это
+        # было нельзя ни по ответу, ни по карточке задания.
+        weights = ""
+        if spec is not None:
+            try:
+                weights = model_files.fingerprint(
+                    self.settings.get("models_dir") or self.settings.paths.models,
+                    spec.source)
+            except OSError as exc:
+                log.debug("Отпечаток весов «%s» не снят: %s", spec.id, exc)
+        params_digest = settings_digest(settings, weights=weights)
 
         duration = 0.0
         try:
@@ -517,10 +542,23 @@ class JobQueue:
         # заблокирована» навсегда съедала слот, а при достижении предела
         # очередь переставала брать работу до перезапуска.
         try:
-            self.db.update_job(chosen["id"], status=STATUS_RUNNING, started_at=now(),
-                               stage="запуск", progress=0.0,
-                               queue_time_s=max(0.0, now() - float(
-                                   chosen.get("queued_at") or chosen.get("created_at") or now())))
+            # Захват атомарный: UPDATE ... WHERE status IN (...) выполняет
+            # только один процесс, остальным вернётся False. Без этого два
+            # сервера на общей базе брали одно и то же задание — каждый
+            # читал его как «в очереди» и записывал «выполняется» поверх
+            # другого, и запись обрабатывалась дважды.
+            claimed = self.db.update_job_if_status(
+                chosen["id"], [STATUS_QUEUED, STATUS_RETRY],
+                status=STATUS_RUNNING, started_at=now(),
+                stage="запуск", progress=0.0,
+                instance_id=INSTANCE_ID, heartbeat_at=now(),
+                queue_time_s=max(0.0, now() - float(
+                    chosen.get("queued_at") or chosen.get("created_at") or now())))
+            if not claimed:
+                # Задание успел взять другой экземпляр (или его отменили) —
+                # это не ошибка, просто берём следующее.
+                self._release_slot(chosen["id"], model)
+                return None
             job = self.db.get_job(chosen["id"])
         except Exception:
             self._release_slot(chosen["id"], model)
@@ -690,7 +728,12 @@ class JobQueue:
         def progress(value: float, stage: str) -> None:
             state.progress = value
             state.stage = stage
-            self.db.update_job(job_id, progress=round(value, 4), stage=stage)
+            # heartbeat_at обновляется вместе с прогрессом: по нему другой
+            # экземпляр понимает, что задание живо, а не брошено умершим
+            # процессом. Отдельного потока для этого не нужно — шаги
+            # конвейера и так идут чаще, чем срок устаревания.
+            self.db.update_job(job_id, progress=round(value, 4), stage=stage,
+                               heartbeat_at=now())
             self._emit("job.progress", {"id": job_id, "progress": round(value, 4),
                                         "stage": stage})
 
@@ -733,6 +776,7 @@ class JobQueue:
             job_id,
             [STATUS_RUNNING],
             status=STATUS_COMPLETED, finished_at=now(), progress=1.0, stage="готово",
+            instance_id=None, heartbeat_at=None,
             text=outcome.text,
             result_path=str(outdir),
             segments_count=len(outcome.segments),
@@ -810,7 +854,7 @@ class JobQueue:
             self._cancelled.discard(job_id)
         if was_cancelled:
             self.db.update_job(job_id, status=STATUS_CANCELLED, finished_at=now(),
-                               stage="отменено")
+                               stage="отменено", instance_id=None, heartbeat_at=None)
             RUNTIME.inc("asrhub_jobs_total", {"status": "cancelled"})
             self._discard_results(outdir)
             return
@@ -834,6 +878,7 @@ class JobQueue:
                 job_id, status=STATUS_RETRY, retries=retries + 1,
                 error_code=error.code, error_message=error.message, error_hint=error.hint,
                 stage=f"повтор через {int(delay)} с", progress=0.0,
+                instance_id=None, heartbeat_at=None,
                 queued_at=now() + delay, params=params)
             self.db.add_event(job_id, "retry_scheduled",
                               f"Повтор {retries + 1} из {max_retries} через {int(delay)} с: "
@@ -848,7 +893,7 @@ class JobQueue:
         self.db.update_job(
             job_id, status=STATUS_FAILED, finished_at=now(), progress=0.0,
             stage="ошибка", error_code=error.code, error_message=error.message,
-            error_hint=error.hint)
+            error_hint=error.hint, instance_id=None, heartbeat_at=None)
         self.db.bump_model_stats(str(job.get("model") or ""), str(job.get("engine") or ""),
                                  ok=False)
         RUNTIME.inc("asrhub_jobs_total", {"status": "failed"})
@@ -987,6 +1032,45 @@ class JobQueue:
 
     # --- фоновое обслуживание ---------------------------------------------
 
+    def _reclaim_stale_jobs(self) -> None:
+        """Возвращает в очередь задания экземпляров, которые перестали отвечать.
+
+        Сервер, убитый по нехватке памяти или остановленный вместе с
+        машиной, оставляет свои задания в состоянии «выполняется» навсегда:
+        пользователь видит вечные 40 % и не может ни дождаться, ни понять,
+        что случилось. Раз отметка жизни устарела — задание никто не
+        считает, и его можно отдать заново.
+
+        Свои задания не трогаем: за них отвечает этот процесс, и его
+        собственный поток может просто задержаться на загрузке весов.
+        """
+        cutoff = now() - STALE_AFTER_S
+        try:
+            stale = self.db.query(
+                "SELECT id, instance_id, retries FROM jobs "
+                "WHERE status=? AND instance_id IS NOT NULL AND instance_id<>? "
+                "  AND COALESCE(heartbeat_at, started_at, 0)<? LIMIT 100",
+                (STATUS_RUNNING, INSTANCE_ID, cutoff))
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("Проверка брошенных заданий не удалась: %s", exc)
+            return
+        for row in stale:
+            job_id = row["id"]
+            returned = self.db.update_job_if_status(
+                job_id, [STATUS_RUNNING],
+                status=STATUS_QUEUED, stage="возвращено в очередь", progress=0.0,
+                started_at=None, instance_id=None, heartbeat_at=None,
+                queued_at=now())
+            if returned:
+                log.warning("Задание %s возвращено в очередь: экземпляр «%s» "
+                            "не отвечает", job_id, row["instance_id"],
+                            extra={"job_id": job_id})
+                self.db.add_event(
+                    job_id, "reclaimed",
+                    f"Экземпляр «{row['instance_id']}» перестал отвечать — "
+                    "задание возвращено в очередь")
+                self._wake.set()
+
     def _janitor_loop(self) -> None:
         last_cleanup = 0.0
         failures = 0
@@ -1004,6 +1088,7 @@ class JobQueue:
                         if failures <= 3 or failures % 180 == 0:
                             log.warning("Служебный шаг %s дал сбой (%d-й раз): %s",
                                         getattr(step_fn, "__name__", step_fn), failures, exc)
+                self._reclaim_stale_jobs()
                 if time.time() - last_cleanup > 3600:
                     retention = int(self.settings.get("result_retention_days") or 30)
                     removed = self.db.cleanup(results_days=retention)
@@ -1091,8 +1176,30 @@ class JobQueue:
         avg_rtf = sum(rtf_values) / len(rtf_values) if rtf_values else 0.25
         workers = int(self.settings.get("max_concurrent_jobs") or 2)
         eta = (pending_audio * avg_rtf / max(1, workers)) if pending_audio else 0.0
+        # Какие экземпляры сейчас держат задания. На одном сервере это всегда
+        # он сам; на нескольких — видно, кто чем занят, и сразу заметно, если
+        # один перестал отвечать и его задания вот-вот вернутся в очередь.
+        instances: list[dict[str, Any]] = []
+        try:
+            for row in self.db.query(
+                    "SELECT instance_id, COUNT(*) AS jobs, MAX(heartbeat_at) AS beat "
+                    "FROM jobs WHERE status=? AND instance_id IS NOT NULL "
+                    "GROUP BY instance_id", (STATUS_RUNNING,)):
+                beat = float(row["beat"] or 0)
+                instances.append({
+                    "instance": row["instance_id"],
+                    "self": row["instance_id"] == INSTANCE_ID,
+                    "jobs": int(row["jobs"] or 0),
+                    "last_seen_s": round(max(0.0, now() - beat), 1) if beat else None,
+                    "stale": bool(beat and now() - beat > STALE_AFTER_S),
+                })
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("Список экземпляров не собран: %s", exc)
+
         return {
             "paused": self._paused,
+            "instance": INSTANCE_ID,
+            "instances": instances,
             "workers": [s.to_dict() for s in self._states],
             "worker_count": workers,
             "counts": counts,

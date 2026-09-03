@@ -37,7 +37,7 @@ bash scripts/install.sh --profile standard             # установить
 | `scripts/client/` | `asrctl` — консольный клиент |
 | `docker/` | Dockerfile, compose, nginx |
 | `docs/` | документация, схемы, снимки экрана, сборка Word |
-| `tests/` | 79 тестов |
+| `tests/` | 342 теста |
 
 ## Разработка
 

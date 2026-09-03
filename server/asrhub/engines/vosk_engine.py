@@ -63,6 +63,17 @@ class VoskEngine(Engine):
         SetLogLevel(-1)
         return Model(str(self._model_dir(settings)))
 
+    def stream_session(self, settings: dict[str, Any]) -> Any:
+        """Настоящий поток: распознаватель держит состояние между кусками.
+
+        Vosk для этого и сделан — та же модель, что и для файлов, но вместо
+        чтения WAV ей скармливают куски по мере поступления, и после
+        каждого можно спросить текущую гипотезу.
+        """
+
+        self.ensure_loaded(settings)
+        return _VoskStream(self._model, settings)
+
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:
         from vosk import KaldiRecognizer  # type: ignore
@@ -120,3 +131,31 @@ class VoskEngine(Engine):
             duration=segments[-1].end if segments else 0.0,
             meta={"streaming_capable": True},
         )
+
+
+class _VoskStream:
+    """Состояние потокового распознавания Vosk.
+
+    accept() возвращает пару (вид, текст) или None, если сказать пока
+    нечего: «final» — законченная фраза, «partial» — текущая гипотеза,
+    которая ещё может измениться.
+    """
+
+    def __init__(self, model: Any, settings: dict[str, Any]) -> None:
+        from vosk import KaldiRecognizer  # type: ignore
+
+        self._recognizer = KaldiRecognizer(model, 16000)
+        self._recognizer.SetWords(bool(settings.get("word_timestamps", True)))
+
+    def accept(self, pcm: bytes) -> tuple[str, str] | None:
+        if self._recognizer.AcceptWaveform(pcm):
+            text = str(json.loads(self._recognizer.Result()).get("text", "")).strip()
+            return ("final", text) if text else None
+        text = str(json.loads(self._recognizer.PartialResult()).get("partial", "")).strip()
+        return ("partial", text) if text else None
+
+    def finish(self) -> str:
+        return str(json.loads(self._recognizer.FinalResult()).get("text", "")).strip()
+
+    def close(self) -> None:
+        self._recognizer = None

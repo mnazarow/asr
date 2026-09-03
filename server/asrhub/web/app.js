@@ -394,6 +394,7 @@ function updateProgress(message) {
 
 const VIEWS = {
   transcribe: { title: 'Транскрибация', subtitle: 'Загрузка файлов и распознавание речи' },
+  dictation:  { title: 'Диктовка', subtitle: 'Распознавание с микрофона на лету, без ожидания конца записи' },
   queue:      { title: 'Очередь', subtitle: 'Управление заданиями, приоритетами и воркерами' },
   results:    { title: 'Результаты', subtitle: 'Выполненные задания и выгрузка' },
   analytics:  { title: 'Аналитика', subtitle: 'Показатели производительности и качества' },
@@ -486,6 +487,7 @@ function showRejected(errors) {
 
 function renderView(soft) {
   const content = qs('#content');
+  const view = state.view;
   const renderer = RENDERERS[state.view];
   if (!renderer) { content.innerHTML = ''; return; }
   if (soft && renderer.soft) { renderer.soft(); return; }
@@ -493,6 +495,17 @@ function renderView(soft) {
   // Отменяем таймеры и подписки предыдущего раздела: без этого при каждом
   // возврате в «Журнал» добавлялся ещё один опрос, и вкладка сама себя
   // упирала в ограничение частоты запросов.
+  // Раздел, который уходит, может держать что-то живое — микрофон и открытый
+  // сокет диктовки. Без этого крючка запись продолжалась бы в фоне, а
+  // индикатор записи в браузере горел бы после ухода со страницы.
+  if (state.renderedView && state.renderedView !== view) {
+    const leaving = RENDERERS[state.renderedView];
+    if (leaving && typeof leaving.leave === 'function') {
+      try { leaving.leave(); } catch (e) { /* уход не должен мешать приходу */ }
+    }
+  }
+  state.renderedView = view;
+
   stopViewTimers();
   API.abortAll();
   // Подсказка графика прячется по mouseleave. Если узел, на котором она
@@ -501,7 +514,6 @@ function renderView(soft) {
   const tip = qs('#chart-tip');
   if (tip) tip.style.display = 'none';
   content.innerHTML = '';
-  const view = state.view;
   try {
     const result = renderer.render(content);
     if (result && typeof result.catch === 'function') {
@@ -598,11 +610,11 @@ document.addEventListener('DOMContentLoaded', () => {
 // Горячие клавиши
 // --------------------------------------------------------------------------
 
-const HOTKEY_VIEWS = ['transcribe', 'queue', 'results', 'analytics', 'models',
+const HOTKEY_VIEWS = ['transcribe', 'dictation', 'queue', 'results', 'analytics', 'models',
                       'compare', 'settings', 'system', 'monitoring', 'logs'];
 
 const HOTKEY_HELP = [
-  ['1 … 0', 'переход к разделу по номеру'],
+  ['1 … 0', 'переход к разделу по номеру (в порядке меню; на «Журнал» цифры не хватило)'],
   ['/', 'поиск в текущем разделе'],
   ['u', 'выбрать файлы для загрузки'],
   ['r', 'обновить данные раздела'],
@@ -712,11 +724,15 @@ function showHotkeys() {
   const rows = HOTKEY_HELP
     .map(([key, what]) => `<tr><td><kbd>${esc(key)}</kbd></td><td>${esc(what)}</td></tr>`)
     .join('');
+  const numbers = HOTKEY_VIEWS.slice(0, 10)
+    .map((view, index) => `${index === 9 ? '0' : index + 1} — ${(VIEWS[view] || {}).title || view}`)
+    .join(', ');
   const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:520px">
     <div class="modal-head"><b>Горячие клавиши</b><span class="spacer"></span>
       <button class="ghost icon" id="hk-close" aria-label="Закрыть" title="Закрыть">✕</button></div>
     <div class="modal-body"><table class="table"><tbody>${rows}</tbody></table>
-      <p class="hint" style="margin-top:12px">Буквенные сокращения не срабатывают,
+      <p class="hint" style="margin-top:12px">Номера разделов: ${numbers}.</p>
+      <p class="hint" style="margin-top:6px">Буквенные сокращения не срабатывают,
         пока курсор находится в поле ввода.</p></div>
   </div></div>`);
   mountModal(backdrop, { label: 'Горячие клавиши' });
@@ -1320,6 +1336,380 @@ async function submitFiles() {
 }
 
 window.__asrhub.removeFile = (index) => { state.files.splice(index, 1); renderFileList(); };
+
+// ==========================================================================
+// Вид: Диктовка
+// ==========================================================================
+
+/**
+ * Распознавание с микрофона на лету.
+ *
+ * Файл принимался целиком: чтобы увидеть первое слово, надо было дождаться
+ * конца записи. Здесь звук уходит на сервер кусками по мере записи, а текст
+ * возвращается по ходу — через тот же маршрут /api/stream, что и у
+ * программных клиентов.
+ *
+ * Микрофон браузер отдаёт только в защищённом контексте: https либо
+ * localhost. Это не наше ограничение и не ошибка сервера, поэтому раздел
+ * говорит об этом прямо, а не показывает молчаливо неработающую кнопку.
+ */
+RENDERERS.dictation = {
+  render(root) {
+    const models = (state.models || []);
+    const streaming = models.filter((m) => m.streaming);
+    const current = state.jobSettings.model || (state.settings || {}).model || '';
+    const secure = window.isSecureContext
+      || ['localhost', '127.0.0.1', '::1'].includes(location.hostname);
+    const hasMic = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+      && typeof window.MediaRecorder !== 'undefined';
+
+    root.innerHTML = `
+      <div class="split">
+        <div>
+          <section class="card">
+            <div class="card-head"><h3>Микрофон</h3>
+              <span class="hint" id="dict-mode">режим определится при запуске</span>
+            </div>
+            ${(secure && hasMic) ? '' : `
+              <div class="card" style="border-color:var(--warn);margin-bottom:12px">
+                <b>Микрофон недоступен в этой вкладке.</b>
+                <div class="small" style="margin-top:6px">
+                  ${secure
+                    ? 'Браузер не поддерживает запись через MediaRecorder. Диктовка работает в Chrome, Firefox, Edge и Safari 14.1+.'
+                    : 'Браузер отдаёт микрофон только по https или на localhost. Откройте интерфейс через https либо по адресу http://localhost:8080 на самом сервере.'}
+                  Разбор без микрофона возможен всегда: раздел «Транскрибация» принимает готовые файлы, а программный клиент —
+                  <span class="mono">examples/stream_microphone.py</span>.
+                </div>
+              </div>`}
+            <div class="row" style="gap:12px;align-items:center">
+              <button class="primary" id="dict-toggle" ${(secure && hasMic) ? '' : 'disabled'}>
+                Начать диктовку</button>
+              <span class="mono" id="dict-timer">00:00</span>
+              <span class="spacer"></span>
+              <span class="small dim" id="dict-status">не записывается</span>
+            </div>
+            <div id="dict-level" class="dict-level" aria-hidden="true"><span></span></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h3>Расшифровка</h3>
+              <span class="hint">серым — гипотеза, она ещё уточняется</span>
+              <span class="spacer"></span>
+              <button class="ghost sm" id="dict-copy">Копировать</button>
+              <button class="ghost sm" id="dict-save">Скачать .txt</button>
+              <button class="ghost sm" id="dict-clear">Очистить</button>
+            </div>
+            <div id="dict-text" class="dict-text" role="log" aria-live="polite"
+                 aria-label="Расшифровка диктовки"><span class="faint">Здесь появится текст.</span></div>
+          </section>
+        </div>
+
+        <div>
+          <section class="card">
+            <div class="card-head"><h3>Настройка</h3></div>
+            <div class="stack" style="gap:12px">
+              <div>
+                <label for="dict-model">Модель</label>
+                <select id="dict-model" style="margin-top:4px">
+                  <option value="">серверная по умолчанию</option>
+                  ${models.map((m) => `<option value="${esc(m.id)}"${m.id === current ? ' selected' : ''}>${esc(m.name)}${m.streaming ? ' · поток' : ''}</option>`).join('')}
+                </select>
+                <div class="small faint" style="margin-top:6px">
+                  Движки с настоящим потоком держат состояние между кусками и уточняют
+                  гипотезу после каждого — таких моделей в каталоге ${streaming.length}.
+                  Остальные работают скользящим окном: накопленный звук распознаётся заново.
+                </div>
+              </div>
+              <div>
+                <label for="dict-window">Шаг гипотез, секунд</label>
+                <input type="number" id="dict-window" class="mono" min="1" max="30" step="0.5"
+                       value="3" style="margin-top:4px;width:100%">
+                <div class="small faint" style="margin-top:6px">
+                  Действует только для моделей без потока. Меньше — чаще обновления
+                  и больше повторной работы: каждое окно распознаёт всё сказанное с начала.
+                </div>
+              </div>
+              <div class="small dim">
+                Сессия длиннее часа прерывается. Для длинных записей ставьте обычное
+                задание — оно надёжнее и даёт разметку по говорящим.
+              </div>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h3>Как это работает</h3></div>
+            <div class="small" style="line-height:1.7">
+              Звук уходит кусками по четверти секунды в WebSocket <span class="mono">/api/stream</span>.
+              Сервер отвечает двумя видами сообщений: <b>гипотеза</b> — черновик, который
+              заменяется следующим целиком, и <b>окончательный кусок</b> — то, что уже не изменится.
+              Здесь гипотеза показана серым и дописывается в конец,
+              окончательный текст — обычным цветом.
+              <div style="margin-top:10px">
+                Тот же обмен из своей программы:
+                <span class="mono">examples/stream_microphone.py</span>.
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>`;
+
+    this.session = null;
+    qs('#dict-toggle').onclick = () => (this.session ? this.stop() : this.start());
+    qs('#dict-copy').onclick = () => {
+      const text = this.finalText();
+      if (!text) { toast('Пока нечего копировать', 'warn'); return; }
+      navigator.clipboard.writeText(text).then(() => toast('Текст скопирован'),
+                                               () => toast('Буфер обмена недоступен', 'err'));
+    };
+    qs('#dict-save').onclick = () => {
+      const text = this.finalText();
+      if (!text) { toast('Пока нечего сохранять', 'warn'); return; }
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+      link.download = `диктовка-${stamp}.txt`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 5000);
+    };
+    qs('#dict-clear').onclick = () => {
+      this.final = [];
+      this.partial = '';
+      this.paint();
+    };
+    this.final = this.final || [];
+    this.partial = '';
+  },
+
+  /** Уход из раздела обязан отпустить микрофон: индикатор записи не должен гореть. */
+  leave() { this.stop(true); },
+
+  finalText() {
+    return (this.final || []).join(' ').replace(/\s+/g, ' ').trim();
+  },
+
+  paint() {
+    const host = qs('#dict-text');
+    if (!host) return;
+    const done = this.finalText();
+    if (!done && !this.partial) {
+      host.innerHTML = '<span class="faint">Здесь появится текст.</span>';
+      return;
+    }
+    host.innerHTML = `${esc(done)}${this.partial ? ` <span class="faint">${esc(this.partial)}</span>` : ''}`;
+    host.scrollTop = host.scrollHeight;
+  },
+
+  setStatus(text, kind) {
+    const node = qs('#dict-status');
+    if (!node) return;
+    node.textContent = text;
+    node.className = `small ${kind || 'dim'}`;
+  },
+
+  async start() {
+    const button = qs('#dict-toggle');
+    button.disabled = true;
+    this.setStatus('запрашиваем микрофон…');
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+    } catch (err) {
+      button.disabled = false;
+      // Отказ в доступе — самая частая причина, и звучит она в браузере
+      // одинаково невнятно. Говорим, что именно произошло и что делать.
+      this.setStatus('микрофон не разрешён', 'err');
+      toast(err && err.name === 'NotAllowedError'
+        ? 'Браузер не дал доступ к микрофону. Разрешите его в значке замка слева от адреса.'
+        : `Микрофон недоступен: ${err && err.message ? err.message : err}`, 'err');
+      return;
+    }
+
+    // Ключ в адресе оседает в журналах прокси — берём одноразовый билет,
+    // как и лента событий.
+    let ticket = '';
+    try {
+      const issued = await API.post('/api/auth/ticket', {});
+      ticket = (issued && issued.ticket) || '';
+    } catch (e) { ticket = ''; }
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = `${proto}://${location.host}/api/stream${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`;
+    let socket;
+    try {
+      socket = new WebSocket(url);
+    } catch (e) {
+      stream.getTracks().forEach((t) => t.stop());
+      button.disabled = false;
+      this.setStatus('соединение не открылось', 'err');
+      return;
+    }
+    socket.binaryType = 'arraybuffer';
+
+    const recorder = new MediaRecorder(stream, pickMime());
+    this.session = { stream, socket, recorder, started: Date.now() };
+    this.partial = '';
+    this.watchLevel(stream);
+
+    socket.onopen = () => {
+      const model = qs('#dict-model').value;
+      const window_s = parseFloat(qs('#dict-window').value) || 3;
+      const config = { type: 'config', format: 'auto', stream_window_s: window_s };
+      if (model) config.model = model;
+      socket.send(JSON.stringify(config));
+      // MediaRecorder с timeslice даёт один непрерывный контейнер, а не
+      // независимые файлы: только так ffmpeg на сервере разберёт поток.
+      recorder.start(250);
+      button.disabled = false;
+      button.textContent = 'Остановить';
+      button.classList.add('danger');
+      this.setStatus('идёт запись', 'ok');
+      // Часы принадлежат записи, а не разделу: viewTimer гасит таймеры только
+      // при смене раздела, и после остановки обработчик продолжал стучать в
+      // уже обнулённую сессию — по ошибке в консоли на каждую секунду.
+      this.tick = setInterval(() => {
+        if (!this.session) { clearInterval(this.tick); this.tick = null; return; }
+        const seconds = Math.floor((Date.now() - this.session.started) / 1000);
+        const node = qs('#dict-timer');
+        if (node) node.textContent =
+          `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+      }, 1000);
+    };
+
+    socket.onmessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch (e) { return; }
+      switch (message.type) {
+        case 'ready': {
+          const hint = qs('#dict-mode');
+          if (hint) hint.textContent = message.mode === 'native'
+            ? 'настоящий поток: гипотеза уточняется после каждого куска'
+            : `скользящее окно ${message.window_s} с: движок потока не держит`;
+          break;
+        }
+        case 'partial':
+          this.partial = message.text || '';
+          this.paint();
+          break;
+        case 'final':
+          if (message.text) this.final.push(message.text);
+          this.partial = '';
+          this.paint();
+          break;
+        case 'done':
+          this.setStatus('готово', 'ok');
+          break;
+        case 'error':
+          this.setStatus('ошибка', 'err');
+          toast(`${message.message || 'Поток прерван'}${message.hint ? ` ${message.hint}` : ''}`, 'err');
+          break;
+        default:
+          break;
+      }
+    };
+
+    socket.onclose = (event) => {
+      // Отказ приходит кодом закрытия — без разбора он выглядит как обрыв сети.
+      const reasons = {
+        4401: 'Ключ доступа не принят.',
+        4403: 'Ключу доступа разрешено только чтение — диктовка ему закрыта.',
+        4404: 'Потоковое распознавание выключено параметром stream_enabled.',
+      };
+      if (reasons[event.code]) {
+        this.setStatus('отказано', 'err');
+        toast(reasons[event.code], 'err');
+      }
+      this.stop(true);
+    };
+
+    recorder.ondataavailable = (event) => {
+      if (socket.readyState === WebSocket.OPEN && event.data && event.data.size) {
+        event.data.arrayBuffer().then((buffer) => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(buffer);
+        });
+      }
+    };
+  },
+
+  /**
+   * Полоса уровня. Немой микрофон — самая частая причина «сервер молчит»:
+   * запись идёт, кадры уходят, распознавать нечего. Полоса отвечает на это
+   * раньше, чем пустая расшифровка.
+   */
+  watchLevel(stream) {
+    const bar = qs('#dict-level > span');
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!bar || !Ctx) return;
+    let context;
+    try { context = new Ctx(); } catch (e) { return; }
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    context.createMediaStreamSource(stream).connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    this.level = { context, stop: false };
+    const draw = () => {
+      if (!this.level || this.level.stop) return;
+      analyser.getByteTimeDomainData(data);
+      let peak = 0;
+      for (let i = 0; i < data.length; i += 1) peak = Math.max(peak, Math.abs(data[i] - 128));
+      bar.style.width = `${Math.min(100, (peak / 128) * 260).toFixed(0)}%`;
+      requestAnimationFrame(draw);
+    };
+    draw();
+  },
+
+  releaseLevel() {
+    if (!this.level) return;
+    this.level.stop = true;
+    try { this.level.context.close(); } catch (e) { /* уже закрыт */ }
+    this.level = null;
+    const bar = qs('#dict-level > span');
+    if (bar) bar.style.width = '0';
+  },
+
+  /**
+   * Останавливает запись. Тихий вариант (при уходе из раздела или закрытии
+   * сокета) не трогает разметку: её уже нет.
+   */
+  stop(silent) {
+    const session = this.session;
+    this.session = null;
+    if (this.tick) { clearInterval(this.tick); this.tick = null; }
+    this.releaseLevel();
+    if (!session) { if (!silent) this.resetButton(); return; }
+    try { if (session.recorder.state !== 'inactive') session.recorder.stop(); } catch (e) { /* уже */ }
+    session.stream.getTracks().forEach((track) => track.stop());
+    try {
+      if (session.socket.readyState === WebSocket.OPEN) {
+        // Досылаем «finish»: сервер досчитает хвост и вернёт окончательный текст.
+        session.socket.send(JSON.stringify({ type: 'finish' }));
+        setTimeout(() => { try { session.socket.close(); } catch (e) { /* уже */ } }, 4000);
+      } else {
+        session.socket.close();
+      }
+    } catch (e) { /* уже закрыт */ }
+    if (!silent) this.setStatus('запись остановлена');
+    this.resetButton();
+  },
+
+  resetButton() {
+    const button = qs('#dict-toggle');
+    if (!button) return;
+    button.disabled = false;
+    button.textContent = 'Начать диктовку';
+    button.classList.remove('danger');
+  },
+};
+
+/** Формат записи, который поддерживает этот браузер. */
+function pickMime() {
+  const wanted = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  for (const type of wanted) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) return { mimeType: type };
+  }
+  return {};      // пусть браузер выберет сам — ffmpeg на сервере разберёт
+}
 
 // ==========================================================================
 // Вид: Очередь
