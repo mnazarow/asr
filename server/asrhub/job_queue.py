@@ -156,17 +156,30 @@ class JobQueue:
     def recover(self) -> int:
         """Возвращает в очередь задания, оставшиеся в состоянии «выполняется».
 
-        Обрабатываются все такие задания, а не первая тысяча: остаток иначе
-        зависал бы навсегда — планировщик его не выберет, а очистка не удалит.
+        Забираются только свои — этого экземпляра и ничьи (так помечены
+        задания, начатые до появления учёта экземпляров). Задания соседей
+        не трогаются, даже если они выглядят зависшими: за них отвечает
+        `_reclaim_stale_jobs`, который сначала ждёт, пока отметка жизни
+        устареет. Без этой оговорки перезапуск любого сервера на общей базе
+        сбрасывал прогресс всех соседей и запускал их задания второй раз —
+        двойная оплата видеокарты и два одинаковых уведомления заказчику,
+        то есть ровно то, что неделимый захват и должен был исключить.
         """
         total = 0
         while True:
-            stuck = self.db.list_jobs(status=STATUS_RUNNING, limit=1000, light=True)
+            # Спрашиваем базу напрямую: облегчённый список не отдаёт
+            # instance_id, и фильтр по нему молча пропускал бы всё подряд.
+            stuck = self.db.query(
+                "SELECT id FROM jobs WHERE status=? "
+                "  AND (instance_id IS NULL OR instance_id='' OR instance_id=?) "
+                "LIMIT 1000",
+                (STATUS_RUNNING, INSTANCE_ID))
             if not stuck:
                 break
             for job in stuck:
                 self.db.update_job(job["id"], status=STATUS_QUEUED, stage="",
-                                   progress=0.0, started_at=None)
+                                   progress=0.0, started_at=None,
+                                   instance_id=None, heartbeat_at=None)
                 self.db.add_event(job["id"], "recovered",
                                   "Задание возвращено в очередь после перезапуска сервера")
             total += len(stuck)
@@ -299,6 +312,11 @@ class JobQueue:
             # завершалось молча и повторить отправку было нечем.
             "webhook_url": webhook_url or None,
             "file_hash": cached.get("file_hash"),
+            # Размер обязателен: суточная квота на объём считается именно по
+            # нему, и без него ключ заполнял диск без предела, повторяя
+            # загрузку одного и того же файла, — а GET /api/usage показывал
+            # неизменный расход и врал и пользователю, и администратору.
+            "file_size": Path(path).stat().st_size if Path(path).exists() else 0,
             "media_duration_s": cached.get("media_duration_s"),
             "engine": cached.get("engine"),
             "model": cached.get("model"),
@@ -775,6 +793,10 @@ class JobQueue:
         finished = self.db.update_job_if_status(
             job_id,
             [STATUS_RUNNING],
+            # Задание могли отобрать, пока мы считали: если отметка жизни
+            # устарела, его уже перезапустил сосед. Своё имя в условии
+            # означает «пишем, только если оно всё ещё за нами».
+            expected_instance=INSTANCE_ID,
             status=STATUS_COMPLETED, finished_at=now(), progress=1.0, stage="готово",
             instance_id=None, heartbeat_at=None,
             text=outcome.text,
@@ -1056,19 +1078,55 @@ class JobQueue:
             return
         for row in stale:
             job_id = row["id"]
+            retries = int(row["retries"] or 0)
+            # Возврат — это попытка, и её надо считать. Иначе задание,
+            # роняющее сервер (а «убит по нехватке памяти» обычно повторяется
+            # на том же файле), возвращалось в очередь без конца и убивало
+            # экземпляры один за другим: ни отказа, ни записи об ошибке, ни
+            # сигнала администратору. Обычный путь повторов сюда не доходит —
+            # процесс умирает раньше, чем успевает его пройти.
+            job = self.db.get_job(job_id) or {}
+            limit = int((job.get("params") or {}).get("max_retries")
+                        or self.settings.get("max_retries") or 0)
+            if retries >= limit:
+                given_up = self.db.update_job_if_status(
+                    job_id, [STATUS_RUNNING],
+                    status=STATUS_FAILED, finished_at=now(),
+                    stage="", progress=0.0,
+                    instance_id=None, heartbeat_at=None,
+                    error_code="instance_lost",
+                    error_message=(f"Экземпляр «{row['instance_id']}» перестал "
+                                   f"отвечать, попыток израсходовано: {retries}."),
+                    error_hint=("Задание возвращалось в очередь и снова обрывало "
+                                "обработку. Проверьте журнал сервера и память: "
+                                "чаще всего так выглядит нехватка памяти на "
+                                "конкретной записи. Повторить вручную: "
+                                "POST /api/jobs/{id}/retry"))
+                if given_up:
+                    log.error("Задание %s снято: экземпляры теряются на нём "
+                              "%d раз подряд", job_id, retries,
+                              extra={"job_id": job_id})
+                    self.db.add_event(
+                        job_id, "failed",
+                        f"Задание снято: экземпляры теряются на нём {retries} "
+                        "раз подряд")
+                continue
+
             returned = self.db.update_job_if_status(
                 job_id, [STATUS_RUNNING],
                 status=STATUS_QUEUED, stage="возвращено в очередь", progress=0.0,
                 started_at=None, instance_id=None, heartbeat_at=None,
-                queued_at=now())
+                retries=retries + 1, queued_at=now())
             if returned:
                 log.warning("Задание %s возвращено в очередь: экземпляр «%s» "
-                            "не отвечает", job_id, row["instance_id"],
+                            "не отвечает (попытка %d из %d)", job_id,
+                            row["instance_id"], retries + 1, limit,
                             extra={"job_id": job_id})
                 self.db.add_event(
                     job_id, "reclaimed",
                     f"Экземпляр «{row['instance_id']}» перестал отвечать — "
-                    "задание возвращено в очередь")
+                    f"задание возвращено в очередь (попытка {retries + 1} "
+                    f"из {limit})")
                 self._wake.set()
 
     def _janitor_loop(self) -> None:

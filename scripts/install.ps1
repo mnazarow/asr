@@ -49,6 +49,10 @@ param(
     [switch]$Quiet
 )
 
+# Имена параметров, заданных явно: мастер обязан их уважать, а не
+# подставлять поверх свои умолчания.
+$script:ExplicitArgs = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$PSBoundParameters.Keys)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1') -Force
 
@@ -128,8 +132,19 @@ function Invoke-InstallWizard {
     Write-Host ("  Обнаружено: Windows, {0}, {1} ГБ памяти" -f $accelLabel, $hw.RamGb) `
         -ForegroundColor DarkGray
 
+    # Что задано в командной строке — то мастер не переспрашивает и, главное,
+    # не затирает. Раньше -Profile, -BindHost и -Engines молча пропадали:
+    # пользователь писал -BindHost 127.0.0.1, а сервер выставлялся в сеть на
+    # 0.0.0.0, потому что умолчание мастера было записано в коде числом. В
+    # bash-двойнике это уже исправлено, здесь — нет.
+    $explicit = $script:ExplicitArgs
+
     $profileOrder = @('light', 'cpu', 'standard', 'russian', 'full')
-    $defaultProfile = [Math]::Max(1, $profileOrder.IndexOf((Get-RecommendedProfile)) + 1)
+    $defaultProfile = if ($explicit.Contains('Profile') -and $script:Profile) {
+        [Math]::Max(1, $profileOrder.IndexOf($script:Profile) + 1)
+    } else {
+        [Math]::Max(1, $profileOrder.IndexOf((Get-RecommendedProfile)) + 1)
+    }
 
     $script:Profile = Select-WizardOption -Question 'Что установить?' -DefaultIndex $defaultProfile -Options @(
         @{ Value = 'light';    Label = 'Минимум — проверить, что всё работает';
@@ -143,16 +158,17 @@ function Invoke-InstallWizard {
         @{ Value = 'full';     Label = 'Всё сразу';
            Note = '60+ ГБ и час установки. Для сравнения моделей между собой' }
     )
-    $script:Engines = $profileEngines[$script:Profile]
-    $script:Models = $profileModels[$script:Profile]
+    # Явно перечисленные движки профиль не переопределяет.
+    if (-not $explicit.Contains('Engines')) { $script:Engines = $profileEngines[$script:Profile] }
+    if (-not $explicit.Contains('Models'))  { $script:Models  = $profileModels[$script:Profile] }
 
     if ($hw.Accelerator -eq 'cpu' -and $script:Profile -in @('standard', 'full')) {
         Write-Warn 'Видеокарта не обнаружена: выбранные модели будут работать в 10–30 раз медленнее.'
         Write-Hint 'Профиль «cpu» подобран как раз для такой машины.'
         if (-not (Confirm-Action 'Оставить выбранный профиль?')) {
             $script:Profile = 'cpu'
-            $script:Engines = $profileEngines['cpu']
-            $script:Models = $profileModels['cpu']
+            if (-not $explicit.Contains('Engines')) { $script:Engines = $profileEngines['cpu'] }
+            if (-not $explicit.Contains('Models'))  { $script:Models  = $profileModels['cpu'] }
         }
     }
 
@@ -174,20 +190,24 @@ function Invoke-InstallWizard {
         return $true
     })
 
-    $script:BindHost = Select-WizardOption -Question 'Кто сможет подключаться?' -DefaultIndex 2 -Options @(
+    $hostDefault = if ($explicit.Contains('BindHost') -and $script:BindHost -eq '127.0.0.1') { 1 } else { 2 }
+    $script:BindHost = Select-WizardOption -Question 'Кто сможет подключаться?' -DefaultIndex $hostDefault -Options @(
         @{ Value = '127.0.0.1'; Label = 'Только эта машина';
            Note = 'Снаружи сервер не виден. Доступ — через туннель или прокси' }
         @{ Value = '0.0.0.0';   Label = 'Любой, кто дотянется по сети';
            Note = 'Обычный выбор для сервера. Оставьте включённой проверку ключей' }
     )
 
-    $extras = Select-WizardMany -Question 'Что ещё включить?' -Default '1' -Options @(
+    $extrasDefault = if ($explicit.Contains('NoService') -and $script:NoService) { '' } else { '1' }
+    $extras = Select-WizardMany -Question 'Что ещё включить?' -Default $extrasDefault -Options @(
         @{ Value = 'service';   Label = 'Автозапуск при входе в систему';
            Note = 'Служба через NSSM или задача планировщика' }
         @{ Value = 'alignment'; Label = 'Точные границы слов (WhisperX)';
            Note = 'Нужно для субтитров и дубляжа. MFA на Windows ставится сложнее' }
     )
-    if ($extras -notcontains 'service') { $script:NoService = $true }
+    # Обе ветки: без второй снятая галочка не возвращала автозапуск, а
+    # отмеченная не отменяла заданный в командной строке -NoService.
+    $script:NoService = ($extras -notcontains 'service')
     if ($extras -contains 'alignment') { $script:Alignment = 'whisperx' }
 
     $summary = [ordered]@{
@@ -377,7 +397,8 @@ $dstReal = [System.IO.Path]::GetFullPath($Prefix)
 if ($srcReal -eq $dstReal) {
     Write-Info 'Источник совпадает с установкой — файлы уже на месте, копирование пропущено.'
 } elseif (-not (Get-DryRun)) {
-    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'VERSION', 'README.md')) {
+    # examples: интерфейс «Диктовки» ссылается на stream_microphone.py.
+    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'examples', 'VERSION', 'README.md')) {
         $source = Join-Path $RepoDir $item
         if (Test-Path $source) {
             $target = Join-Path $Prefix $item

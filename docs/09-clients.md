@@ -54,6 +54,7 @@ asrctl get job_7f3a9c21 --format txt --output ./выгрузка/   # катал
 
 ```bash
 asrctl models --language ru
+asrctl models --installed             # только скачанные
 asrctl health
 asrctl version
 ```

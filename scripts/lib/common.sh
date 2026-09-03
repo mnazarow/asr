@@ -24,6 +24,13 @@ fi
 set -o errexit
 set -o nounset
 set -o pipefail
+# errtrace обязателен, а не «на всякий случай»: без него ловушка ERR не
+# наследуется функциями, а вся работа скриптов в них и происходит. Сбой в
+# run_wizard, download, install_system_packages, gpu_install_* или check_python
+# просто завершал установку с кодом 1 — без сообщения об ошибке, без записи в
+# журнал и, главное, без отката уже сделанных изменений, который шапка
+# install.sh обещает прямым текстом.
+set -o errtrace
 shopt -s inherit_errexit 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
@@ -343,8 +350,17 @@ check_python() {
 
 check_disk_space() {
   local path="$1" needed_gb="$2"
-  local avail_kb avail_gb
-  mkdir -p "${path}" 2>/dev/null || true
+  local avail_kb avail_gb probe="$1"
+  # Каталог здесь не создаём. Раньше `mkdir -p` шёл прямо тут, в обход `run`,
+  # и это стоило двух вещей: `--dry-run` оставлял на диске каталоги, о которых
+  # тут же писал «изменений не вносилось», а каталог данных доставался
+  # ensure_dir уже существующим — тот пропускал chmod, и вместо 0750 он
+  # оставался 0755 вместе с config.yaml, куда сервер дописывает ключи
+  # доступа. Свободное место меряем по ближайшему существующему предку.
+  while [[ ! -d "${probe}" && "${probe}" != "/" && "${probe}" != "." ]]; do
+    probe="$(dirname "${probe}")"
+  done
+  path="${probe}"
   if have df; then
     avail_kb="$(df -Pk "${path}" 2>/dev/null | awk 'NR==2 {print $4}')" || avail_kb=0
     avail_gb=$(( ${avail_kb:-0} / 1024 / 1024 ))
@@ -373,15 +389,57 @@ check_memory() {
   fi
 }
 
+# Кто ещё работает над этим каталогом данных.
+#
+# Сервер умеет работать в нескольких экземплярах над общей базой: задание
+# захватывается неделимо, и каждый экземпляр подписывает взятое своим именем.
+# Для скриптов это значит, что каталог данных может быть не только «наш»:
+# удаление с --purge или подмена кода под работающими соседями — это потеря
+# чужой работы. Спрашиваем саму базу: она знает, кто держит задания.
+#
+# Печатает имена посторонних экземпляров через запятую; пусто — все свои.
+other_instances() {
+  local data_dir="$1" db="$1/asrhub.db"
+  [[ -f "${db}" ]] || return 0
+  have python3 || return 0
+  python3 - "${db}" <<'PYEOF' 2>/dev/null || true
+import sqlite3, socket, sys, time
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=2)
+    rows = conn.execute(
+        "SELECT DISTINCT instance_id, MAX(COALESCE(heartbeat_at, started_at, 0)) "
+        "FROM jobs WHERE status='running' AND instance_id IS NOT NULL "
+        "GROUP BY instance_id").fetchall()
+except Exception:
+    sys.exit(0)
+host = socket.gethostname()
+# Свежая отметка жизни — экземпляр действительно работает; пять минут это тот
+# же порог, по которому сервер возвращает брошенные задания в очередь.
+alive = [name for name, beat in rows
+         if name and not name.startswith(f"{host}:") and time.time() - (beat or 0) < 300]
+print(",".join(sorted(alive)))
+PYEOF
+}
+
 check_port_free() {
-  local port="$1"
+  local port="$1" listening=""
+  # Без подоболочки с отключённым pipefail этот конвейер врал. `grep -q`
+  # выходит по первому совпадению, `ss`/`netstat` продолжают писать, получают
+  # SIGPIPE, и код конвейера становится 141 — то есть «не нашли». На машине,
+  # где сокетов больше, чем влезает в буфер трубы (а это любой сервер),
+  # занятый порт объявлялся свободным: doctor.sh сообщал, что сервер не
+  # запущен, а install.sh не предлагал выбрать другой порт.
   if have ss; then
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$" && return 1
+    listening="$(set +o pipefail; ss -ltn 2>/dev/null | awk '{print $4}' \
+                 | grep -cE "[:.]${port}\$" || true)"
   elif have lsof; then
     lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 1
+    listening=0
   elif have netstat; then
-    netstat -an 2>/dev/null | grep -qE "[:.]${port}[[:space:]].*LISTEN" && return 1
+    listening="$(set +o pipefail; netstat -an 2>/dev/null \
+                 | grep -cE "[:.]${port}[[:space:]].*LISTEN" || true)"
   fi
+  [[ "${listening:-0}" -gt 0 ]] && return 1
   return 0
 }
 
@@ -420,25 +478,45 @@ backup_file() {
 }
 
 write_file() {
-  # write_file <путь> <<'EOF' ... EOF — атомарная запись с резервной копией
-  local path="$1"
+  # write_file <путь> [права] <<'EOF' ... EOF — атомарная запись с копией.
+  # Права выставляются до переноса на место: config.yaml с ключами доступа
+  # не должен существовать даже мгновение доступным всем на чтение.
+  local path="$1" mode="${2:-}"
   local dir; dir="$(dirname "${path}")"
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    cat > /dev/null
+    printf '%s[пробный запуск]%s запись %s\n' "${C_YELLOW}" "${C_RESET}" "${path}"
+    return 0
+  fi
   mkdir -p "${dir}"
   [[ -e "${path}" ]] && backup_file "${path}" >/dev/null
   local tmp="${path}.tmp.$$"
   cat > "${tmp}"
+  [[ -n "${mode}" ]] && chmod "${mode}" "${tmp}"
   mv -f "${tmp}" "${path}"
   debug "записан файл: ${path}"
 }
 
 ensure_dir() {
   local path="$1" mode="${2:-0755}"
+  # Создание каталога — изменение на диске, значит подчиняется пробному
+  # запуску наравне с командами. Раньше не подчинялось: `--dry-run` оставлял
+  # после себя каталог программы и весь каталог данных с подкаталогами и тут
+  # же писал «изменений не вносилось».
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    [[ -d "${path}" ]] || printf '%s[пробный запуск]%s mkdir -m %s %s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${mode}" "${path}"
+    return 0
+  fi
   if [[ ! -d "${path}" ]]; then
     mkdir -p "${path}"
-    chmod "${mode}" "${path}"
     add_rollback "rmdir '${path}' 2>/dev/null || true"
     debug "создан каталог: ${path}"
   fi
+  # chmod и для существующего каталога: иначе права зависели от того, кто
+  # создал его первым. Каталог данных так и оставался 0755 — а в нём лежит
+  # config.yaml с ключами доступа, их группами и квотами.
+  chmod "${mode}" "${path}" 2>/dev/null || true
 }
 
 download() {

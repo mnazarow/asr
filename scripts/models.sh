@@ -456,7 +456,11 @@ disk)
   heading "Занятое место"
   if [[ -d "${MODELS_DIR}" ]]; then
     printf '  Модели:\n'
-    du -sh "${MODELS_DIR}"/* 2>/dev/null | sort -rh | head -25 | sed 's/^/    /'
+    # `head` закрывает трубу, `sort` умирает от SIGPIPE, pipefail делает код
+    # 141 и errexit обрывает команду на этом месте: на кеше из тысяч
+    # каталогов отчёт кончался, не дойдя ни до итога, ни до свободного места.
+    (set +o pipefail; du -sh "${MODELS_DIR}"/* 2>/dev/null | sort -rh | head -25 \
+      | sed 's/^/    /') || true
     printf '\n  Всего моделей: %s\n' "$(du -sh "${MODELS_DIR}" 2>/dev/null | awk '{print $1}')"
   fi
   for sub in uploads results logs tmp; do

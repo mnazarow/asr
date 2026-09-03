@@ -253,21 +253,6 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         outcome.warnings.append(
             "Речь не обнаружена в каналах: " + ", ".join(silent_channels))
 
-    # Подготовка сместила систему координат: обрезка начальной тишины
-    # сдвинула всё на offset_s, изменение темпа сжало в speed раз. Движок
-    # работал уже в новых координатах, и без возврата назад субтитры
-    # разъезжаются с исходной записью ровно на длину обрезанной тишины.
-    if prepared_audio.shifted:
-        for segment in all_segments:
-            segment.start = round(prepared_audio.to_source_time(segment.start), 3)
-            segment.end = round(prepared_audio.to_source_time(segment.end), 3)
-            for word in segment.words or []:
-                for key in ("start", "end"):
-                    if isinstance(word.get(key), (int, float)):
-                        word[key] = round(prepared_audio.to_source_time(float(word[key])), 3)
-        log.debug("Таймкоды возвращены в координаты исходной записи: "
-                  "сдвиг %.3f с, темп %.3f", prepared_audio.offset_s, prepared_audio.speed)
-
     all_segments.sort(key=lambda s: s.start)
 
     # ---- 4. Принудительное выравнивание ----------------------------------
@@ -307,6 +292,27 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         except Exception as exc:
             outcome.warnings.append(f"Диаризация не выполнена: {exc}")
         timer.stop()
+
+    # Подготовка сместила систему координат: обрезка начальной тишины
+    # сдвинула всё на offset_s, изменение темпа сжало в speed раз. Движок
+    # работал уже в новых координатах, и без возврата назад субтитры
+    # разъезжаются с исходной записью ровно на длину обрезанной тишины.
+    #
+    # Возврат стоит здесь, а не сразу после распознавания: выравнивание и
+    # диаризация выше получают тот же подготовленный файл и должны видеть
+    # метки в его координатах. Раньше возврат шёл до них — и обе работали по
+    # меткам исходной записи, глядя в обрезанный файл: при обрезке в пять
+    # секунд выравнивание искало слова за концом звука.
+    if prepared_audio.shifted:
+        for segment in all_segments:
+            segment.start = round(prepared_audio.to_source_time(segment.start), 3)
+            segment.end = round(prepared_audio.to_source_time(segment.end), 3)
+            for word in segment.words or []:
+                for key in ("start", "end"):
+                    if isinstance(word.get(key), (int, float)):
+                        word[key] = round(prepared_audio.to_source_time(float(word[key])), 3)
+        log.debug("Таймкоды возвращены в координаты исходной записи: "
+                  "сдвиг %.3f с, темп %.3f", prepared_audio.offset_s, prepared_audio.speed)
 
     # ---- 6. Постобработка -------------------------------------------------
     check_cancel()
@@ -359,6 +365,20 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             from .pipeline.waveform import build as build_waveform
 
             outcome.waveform = build_waveform(channels, outcome.segments, settings)
+            # Полоса считается по подготовленному звуку, а расшифровка уже
+            # вернулась в координаты исходной записи. Без перевода оси
+            # карточка задания рисовала их рядом на разных шкалах: щелчок по
+            # полосе открывал не ту реплику, а при обрезке тишины полоса
+            # начиналась там, где в записи ещё тишина.
+            if prepared_audio.shifted:
+                for track in outcome.waveform or []:
+                    for points in track.values():
+                        if not isinstance(points, list):
+                            continue
+                        for point in points:
+                            if isinstance(point, dict) and "time" in point:
+                                point["time"] = round(
+                                    prepared_audio.to_source_time(float(point["time"])), 3)
         except Exception as exc:                            # noqa: BLE001
             # Полоса громкости — вспомогательные данные: её отсутствие не
             # повод терять уже посчитанную расшифровку.

@@ -546,7 +546,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:22554",
+  "instance": "vm:13968",
   "instances": [],
   "workers": [
     {
@@ -574,15 +574,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
   "eta_s": 0.0,
   "policy": "priority_fifo",
   "max_queue_size": 1000,
-  "loaded_models": [
-    {
-      "key": "demo::demo-simulator::cpu::int8",
-      "model": "demo-simulator",
-      "engine": "demo",
-      "loaded": true,
-      "idle_s": 375.5
-    }
-  ],
+  "loaded_models": [],
   "items": []
 }
 ```
@@ -676,6 +668,7 @@ curl -X POST -H 'X-API-Key: $КЛЮЧ' -H 'Content-Type: application/json' \
 | `streaming` | в адресе | boolean | — | — |
 | `diarization` | в адресе | boolean | — | — |
 | `commercial_only` | в адресе | boolean | `False` | — |
+| `installed` | в адресе | boolean | — | — |
 | `search` | в адресе | string | — | — |
 
 **Пример**
@@ -1095,15 +1088,15 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788400851.1821766,
+    "generated_at": 1788406630.4011252,
     "jobs": {
-      "total": 274,
+      "total": 273,
       "completed": 256,
-      "failed": 10,
+      "failed": 9,
       "cancelled": 8,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 0.9343
+      "success_rate": 0.9377
     },
     "volume": {
       "audio_seconds": 330788.2,
@@ -1191,7 +1184,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 531.6,
+  "uptime_s": 100.1,
   "queue_paused": false,
   "catalog_date": "2026-08-31"
 }
@@ -1231,8 +1224,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 16,
-    "WARNING": 6
+    "INFO": 3
   }
 }
 ```
@@ -1267,17 +1259,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 531.7,
+  "uptime_s": 100.2,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
-    "disk_free_gb": 29.1,
+    "ram_available_gb": 7.1,
+    "disk_free_gb": 28.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1301,7 +1293,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "_reason": "Видеокарта не обнаружена. Выбран режим int8 на 2 физических ядрах — единственный практичный вариант на процессоре."
   },
   "log_counts": {
-    "INFO": 16,
+    "INFO": 3
+  },
 …
 ```
 
@@ -1624,14 +1617,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 531.7,
+  "uptime_s": 100.2,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 532 с",
+        "detail": "работает 100 с",
         "hint": ""
       },
       {
@@ -1660,7 +1653,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 29.1 ГБ",
+        "detail": "свободно 28.9 ГБ",
         "hint": ""
       },
       {

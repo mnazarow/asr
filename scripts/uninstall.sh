@@ -79,12 +79,35 @@ if [[ -z "${PREFIX}" && -z "${DATA_DIR}" ]]; then
   exit 0
 fi
 
+# Каталог данных может быть общим: над ним работают другие машины. Удаление
+# с --purge унесло бы их базу и результаты вместе с нашими — молча.
+if [[ "${PURGE}" -eq 1 ]]; then
+  OTHERS="$(other_instances "${DATA_DIR}" || true)"
+  if [[ -n "${OTHERS}" ]]; then
+    warn "Над каталогом данных прямо сейчас работают другие серверы: ${OTHERS}"
+    hint "С ключом --purge вы удалите и их базу, задания и результаты."
+    hint "Если нужно убрать только эту установку — запустите без --purge."
+    confirm "Всё равно удалить общий каталог данных?" "n" || { info "Отменено."; exit 0; }
+  fi
+fi
+
 heading "Что будет удалено"
+# du -sb — расширение GNU: на macOS ключа нет, и размер всегда выходил «0 Б».
+# Запасной путь через `du -sk` есть везде, включая BSD.
+dir_bytes() {
+  local path="$1" value
+  value="$(du -sb "${path}" 2>/dev/null | awk '{print $1}')" || value=""
+  if [[ -z "${value}" ]]; then
+    value="$(du -sk "${path}" 2>/dev/null | awk '{print $1 * 1024}')" || value=0
+  fi
+  printf '%s' "${value:-0}"
+}
+
 [[ -n "${PREFIX}" ]] && printf '  Программа        %s (%s)\n' "${PREFIX}" \
-  "$(human_size "$(du -sb "${PREFIX}" 2>/dev/null | awk '{print $1}' || echo 0)")"
+  "$(human_size "$(dir_bytes "${PREFIX}")")"
 if [[ "${PURGE}" -eq 1 ]]; then
   printf '  Данные           %s (%s)%s\n' "${DATA_DIR}" \
-    "$(human_size "$(du -sb "${DATA_DIR}" 2>/dev/null | awk '{print $1}' || echo 0)")" \
+    "$(human_size "$(dir_bytes "${DATA_DIR}")")" \
     "$( [[ "${KEEP_MODELS}" -eq 1 ]] && echo ' — модели будут сохранены' )"
 else
   printf '  Данные           %s %sсохраняются%s\n' "${DATA_DIR}" "${C_GREEN}" "${C_RESET}"
@@ -117,9 +140,26 @@ step "Остановка службы"
 bash "${SCRIPT_DIR}/service.sh" uninstall --prefix "${PREFIX}" 2>/dev/null || \
   info "Служба не найдена или уже удалена."
 
-# Останавливаем возможные процессы, запущенные вручную
+# Останавливаем процессы ЭТОЙ установки, запущенные вручную.
+# Прежний шаблон ловил всё, где встречается «asrhub»: на машине с двумя
+# установками (а с общим каталогом данных их и делают несколько) удаление
+# одной убивало сервер второй, на другом порту и из другого каталога.
+# Заодно под kill попадала любая посторонняя оболочка, у которой эти слова
+# оказались в командной строке. Поэтому сверяем каталог программы.
 if have pgrep; then
-  PIDS="$(pgrep -f "python.*-m asrhub|uvicorn.*asrhub" 2>/dev/null | grep -v "^$$\$" || true)"
+  PIDS="$(pgrep -f "${PREFIX}/venv/bin/python.*-m asrhub|${PREFIX}/venv/bin/uvicorn" \
+          2>/dev/null | grep -v "^$$\$" || true)"
+  if [[ -z "${PIDS}" ]] && have pgrep; then
+    # Запасной путь: процесс мог быть запущен не из venv установки. Тогда
+    # опознаём его по каталогу данных в окружении — он у каждой установки свой.
+    for pid in $(pgrep -f "\-m asrhub" 2>/dev/null || true); do
+      if tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
+         | grep -qxF "ASRHUB_DATA_DIR=${DATA_DIR}"; then
+        PIDS="${PIDS} ${pid}"
+      fi
+    done
+    PIDS="$(printf '%s' "${PIDS}" | tr ' ' '\n' | grep -v '^$' || true)"
+  fi
   if [[ -n "${PIDS}" ]]; then
     info "Останавливаем процессы: ${PIDS}"
     for pid in ${PIDS}; do run kill "${pid}" 2>/dev/null || true; done

@@ -57,27 +57,46 @@ install_systemd() {
   [[ -z "${run_user}" && "${user_mode}" -eq 0 ]] && run_user="root"
 
   local content
+  # Пути с пробелами systemd режет по пробелу: ExecStart искал программу
+  # «/opt/asr», ReadWritePaths отбрасывался целиком (а с ProtectSystem=full
+  # это делает каталог данных доступным только на чтение), Documentation
+  # превращался в неверный URL. Значения, попадающие в директивы, берём в
+  # кавычки; в URL пробел заменяем на %20.
+  local WORKDIR_Q EXEC_Q DATA_DIR_Q PREFIX_ESC
+  # Формы экранирования у systemd разные, и перепутать их значит получить
+  # молча сломанный юнит. В путях (WorkingDirectory, ReadWritePaths) кавычки
+  # не принимаются — там пробел пишется как \x20. В командной строке
+  # (ExecStart) наоборот работают кавычки. В URL пробел — это %20, а сам
+  # знак процента у systemd начинает подстановку, поэтому удваивается.
+  WORKDIR_Q="${PREFIX// /\\x20}/server"
+  EXEC_Q="\"${PREFIX}/venv/bin/python\""
+  DATA_DIR_Q="${DATA_DIR// /\\x20}"
+  PREFIX_ESC="${PREFIX// /%%20}"
+
   content="$(cat <<UNITEOF
 [Unit]
 Description=ASR Hub — сервер распознавания речи
-Documentation=file://${PREFIX}/docs/README.md
+Documentation=file://${PREFIX_ESC}/docs/README.md
 After=network-online.target
 Wants=network-online.target
+# StartLimit* — ключи секции [Unit]. В [Service] systemd их игнорирует с
+# записью «Unknown key name», и задуманное «5 попыток за 120 с» не работало:
+# оставалось умолчание.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
 ${run_user:+User=${run_user}}
-WorkingDirectory=${PREFIX}/server
+WorkingDirectory=${WORKDIR_Q}
 Environment="ASRHUB_DATA_DIR=${DATA_DIR}"
 Environment="PYTHONUNBUFFERED=1"
 Environment="HF_HOME=${DATA_DIR}/models"
 EnvironmentFile=-${DATA_DIR}/env.sh
-ExecStart=${PREFIX}/venv/bin/python -m asrhub --host ${HOST} --port ${PORT}
+ExecStart=${EXEC_Q} -m asrhub --host ${HOST} --port ${PORT}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10
-StartLimitBurst=5
-StartLimitIntervalSec=120
 TimeoutStopSec=45
 KillMode=mixed
 
@@ -90,7 +109,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=${DATA_DIR}
+ReadWritePaths=${DATA_DIR_Q}
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
@@ -223,7 +242,14 @@ case "${ACTION}" in
 
   status)
     if [[ "${OS}" == "macos" ]]; then
-      if launchctl list 2>/dev/null | grep -q com.asrhub.server; then
+      # `grep -q` рвёт трубу на первом совпадении, launchctl получает
+      # SIGPIPE, и pipefail делает код конвейера 141 — «не нашли». А настоящий
+      # `launchctl list` печатает сотни строк, поэтому служба на macOS всегда
+      # объявлялась незапущенной. Отсюда же тянулось: update.sh определял
+      # WAS_RUNNING этим же вызовом и не поднимал сервер после обновления,
+      # оставляя его на старом коде.
+      if [[ "$(set +o pipefail; launchctl list 2>/dev/null \
+               | grep -c com.asrhub.server || true)" -gt 0 ]]; then
         ok "Служба запущена"
         launchctl list com.asrhub.server 2>/dev/null | head -12
       else

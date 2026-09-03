@@ -27,12 +27,17 @@ def full_catalog() -> dict[str, Any]:
 
 @router.get("/models", summary="Список моделей")
 def list_models(
+    request: Request,
     language: str | None = None,
     engine: str | None = None,
     family: str | None = None,
     streaming: bool | None = None,
     diarization: bool | None = None,
     commercial_only: bool = False,
+    #: Только те модели, чьи веса лежат на диске. Клиент командной строки
+    #: принимал такой ключ и молча его игнорировал: `asrctl models
+    #: --installed` печатал весь каталог из семидесяти с лишним моделей.
+    installed: bool | None = None,
     search: str | None = None,
 ) -> dict[str, Any]:
     items = catalog.MODELS
@@ -49,6 +54,11 @@ def list_models(
         items = [m for m in items if m.diarization == diarization]
     if commercial_only:
         items = [m for m in items if m.commercial_use]
+    if installed is not None:
+        state = get_state(request)
+        models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
+        items = [m for m in items
+                 if bool(model_files.find_local(models_dir, m.source)) is installed]
     if search:
         needle = search.lower()
         items = [m for m in items

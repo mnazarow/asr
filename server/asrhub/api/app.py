@@ -381,6 +381,15 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             if not token:
                 token = (websocket.query_params.get("api_key")
                          or websocket.headers.get("x-api-key") or "")
+            if not token:
+                # Bearer обещан и в заголовке OpenAPI, и в докстринге этого
+                # маршрута, и /ws его разбирает. Здесь его не было, и
+                # сторонний клиент, написанный по документации, получал
+                # 4401 «ключ недействителен» на действующем ключе.
+                header = websocket.headers.get("authorization", "")
+                parts = header.split(" ", 1)
+                token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
+                    else header.strip()
             info = settings.api_keys.get(token)
             if not info or info.get("enabled") is False:
                 await websocket.close(code=4401,

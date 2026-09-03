@@ -41,7 +41,6 @@ SERVICE_USER=""
 OFFLINE=0
 FORCE=0
 SKIP_MODELS=0
-KEEP_DATA=1
 # Заполняется только в нативном режиме, а читается в самом конце для обоих.
 # Без этой строки docker-режим падал под `set -o nounset` уже после слов
 # «Установка завершена», и любой вызывающий видел код возврата 1.
@@ -51,6 +50,9 @@ ENGINES_EXPLICIT=""
 MODELS_EXPLICIT=""
 ALIGNMENT=""
 MONITORING=""
+# Распознавание на лету. Включено по умолчанию — как и на сервере; ключ нужен,
+# чтобы выключить его на машине, где ffmpeg ставить не будут.
+STREAM_ENABLED="true"
 # auto — поставить драйвер под найденную карту; none — не трогать;
 # nvidia/amd/intel — ставить только если найдена карта этого производителя.
 GPU_DRIVER="auto"
@@ -153,6 +155,10 @@ while [[ $# -gt 0 ]]; do
     --offline)     OFFLINE=1; shift ;;
     --force)       FORCE=1; shift ;;
     --dry-run)     ASRHUB_DRY_RUN=1; shift ;;
+    # Имя службы. Нужно, когда на машине больше одной установки: без него
+    # вторая переписывала юнит первой (/etc/systemd/system/asrhub.service).
+    --name)        SERVICE_NAME="$2"; shift 2 ;;
+    --no-stream)   STREAM_ENABLED="false"; shift ;;
     --yes|-y)      ASRHUB_ASSUME_YES=1; shift ;;
     --quiet|-q)    ASRHUB_QUIET=1; shift ;;
     --debug)       ASRHUB_DEBUG=1; shift ;;
@@ -235,11 +241,19 @@ fi
 # Каждый вопрос имеет ответ по умолчанию, подобранный по обнаруженному железу,
 # поэтому «Enter пять раз» даёт разумную установку.
 
+# Имя службы. По умолчанию одно на машину; для второй установки задаётся
+# ключом --name, иначе она перезаписала бы юнит первой.
+SERVICE_NAME="${SERVICE_NAME:-asrhub}"
+
 run_wizard() {
   local ram_gb disk_gb accel_label
 
   ram_gb="$(detect_ram_gb 2>/dev/null || echo 0)"
-  disk_gb="$(df -Pk "$(dirname "${DATA_DIR}")" 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}')"
+  # `|| true`: каталога данных на новой машине ещё нет, df на таком пути
+  # возвращает 1, и мастер молча выходил, не задав ни одного вопроса.
+  disk_gb="$(df -Pk "$(dirname "${DATA_DIR}")" 2>/dev/null \
+             | awk 'NR==2{printf "%d", $4/1048576}' || true)"
+  disk_gb="${disk_gb:-0}"
   case "${ACCEL}" in
     cuda) accel_label="видеокарта NVIDIA" ;;
     rocm) accel_label="видеокарта AMD (ROCm)" ;;
@@ -336,13 +350,27 @@ run_wizard() {
   local extras=""
   local extras_default="1"
   [[ "${CREATE_SERVICE}" == "0" ]] && extras_default=""
+  # Поток включён по умолчанию — пункт отмечен, чтобы его можно было снять
+  # осознанно, а не обнаружить включённым постфактум.
+  extras_default="${extras_default:+${extras_default},}4"
   wizard_multi extras "Что ещё включить?" "${extras_default}" \
     "service|Автозапуск при загрузке машины|systemd, launchd или планировщик Windows" \
     "alignment|Точные границы слов (MFA)|+2–3 ГБ и conda. Нужно для субтитров и дубляжа" \
-    "monitoring|Отправку метрик в систему мониторинга|Настроим адрес приёмника на следующем шаге"
+    "monitoring|Отправку метрик в систему мониторинга|Настроим адрес приёмника на следующем шаге" \
+    "stream|Распознавание на лету (диктовка с микрофона)|Раздел «Диктовка» и WebSocket /api/stream. Нужен ffmpeg"
 
   [[ ",${extras}," == *",service,"* ]] && CREATE_SERVICE=1 || CREATE_SERVICE=0
   [[ ",${extras}," == *",alignment,"* ]] && ALIGNMENT="mfa"
+  [[ ",${extras}," == *",stream,"* ]] && STREAM_ENABLED="true" || STREAM_ENABLED="false"
+  # Микрофон браузер отдаёт только по https или на localhost. Сказать об этом
+  # надо до установки, а не после первого недоумения пользователя.
+  if [[ "${STREAM_ENABLED}" == "true" && "${HOST}" == "0.0.0.0" ]]; then
+    warn "Диктовка с микрофона по http работать не будет."
+    hint "Браузер отдаёт микрофон только по https или на localhost."
+    hint "Поставьте перед сервером обратный прокси с сертификатом —"
+    hint "готовый пример: ${REPO_DIR}/docker/nginx.conf. Всё остальное, включая"
+    hint "поток из своей программы (examples/stream_microphone.py), работает и так."
+  fi
   if [[ ",${extras}," == *",monitoring,"* ]]; then
     wizard_choose MONITORING "Куда отправлять метрики?" 1 \
       "prometheus_pushgateway|Prometheus Pushgateway|Для сервера за NAT, до которого не достучаться" \
@@ -369,6 +397,7 @@ run_wizard() {
     "Автозапуск|$([[ ${CREATE_SERVICE} -eq 1 ]] && echo "да" || echo "нет")" \
     "Выравнивание|${ALIGNMENT:-нет}" \
     "Мониторинг|${MONITORING:-только по запросу}" \
+    "Распознавание на лету|$([[ "${STREAM_ENABLED}" == "true" ]] && echo "включено" || echo "выключено")" \
     "Займёт на диске|около ${need_gb} ГБ"
 
   confirm "Начинать установку?" "y" || { info "Отменено."; exit 0; }
@@ -570,7 +599,7 @@ for sub in uploads results models logs tmp; do ensure_dir "${DATA_DIR}/${sub}" 0
 # подкаталоги программы, а не prefix целиком: иначе снесёт модели и базу.
 if [[ "${CREATED_PREFIX}" -eq 1 ]]; then
   if [[ "${DATA_DIR}" == "${PREFIX}"/* ]]; then
-    for sub in server scripts config requirements docker venv; do
+    for sub in server scripts config requirements docker examples venv; do
       add_rollback "rm -rf '${PREFIX}/${sub}'"
     done
   else
@@ -594,7 +623,10 @@ DST_REAL="$(cd "${PREFIX}" 2>/dev/null && pwd -P || echo "${PREFIX}")"
 if [[ "${SRC_REAL}" == "${DST_REAL}" ]]; then
   info "Источник совпадает с установкой — файлы уже на месте, копирование пропущено."
 elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
-  for item in server scripts config requirements docker VERSION README.md; do
+  # examples тоже: раздел «Диктовка» и документация ссылаются на
+  # examples/stream_microphone.py как на запасной путь без микрофона, а в
+  # установке этого файла не было вовсе.
+  for item in server scripts config requirements docker examples VERSION README.md; do
     [[ -e "${REPO_DIR}/${item}" ]] || continue
     rm -rf "${PREFIX:?}/${item}"
     cp -a "${REPO_DIR}/${item}" "${PREFIX}/"
@@ -616,7 +648,7 @@ if [[ "${MODE}" == "docker" ]]; then
   have "${COMPOSE%% *}" || { error "Не найден docker compose."; exit 127; }
 
   ENV_FILE="${PREFIX}/docker/.env"
-  write_file "${ENV_FILE}" <<ENVEOF
+  write_file "${ENV_FILE}" 0640 <<ENVEOF
 # Создано установщиком ASR Hub $(date '+%Y-%m-%d %H:%M')
 ASRHUB_PORT=${PORT}
 ASRHUB_HOST=${HOST}
@@ -757,7 +789,9 @@ else
     GPU_BATCHING_BLOCK="$(gpu_config_lines | sed 's/^/  /')"
     [[ -z "${GPU_BATCHING_BLOCK}" ]] && GPU_BATCHING_BLOCK="  device: auto
   compute_type: auto"
-    write_file "${CONFIG_FILE}" <<CFGEOF
+    # 0640: в config.yaml сервер дописывает ключи доступа с их группами и
+  # квотами. Читать его должен только владелец установки.
+  write_file "${CONFIG_FILE}" 0640 <<CFGEOF
 # Конфигурация ASR Hub — создана установщиком $(date '+%Y-%m-%d %H:%M')
 # Полный список параметров с описаниями: ${DATA_DIR}/config.example.yaml
 # Все параметры также доступны в веб-интерфейсе в разделе «Настройки».
@@ -775,6 +809,11 @@ server:
   auth_enabled: true
   max_upload_mb: 2048
   log_level: INFO
+  # Распознавание на лету: раздел «Диктовка» и WebSocket /api/stream.
+  # stream_window_s — шаг гипотез для движков, которые не держат состояние
+  # между кусками: меньше значит чаще обновления и больше повторной работы.
+  stream_enabled: ${STREAM_ENABLED}
+  stream_window_s: 4
 
 batching:
 ${GPU_BATCHING_BLOCK}
@@ -905,14 +944,36 @@ if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
       warn "Команда useradd недоступна — служба будет работать от root."
     fi
     if [[ -n "${SERVICE_USER}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
-      run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
-        warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
+      # Каталог данных может быть общим: сервер умеет работать в нескольких
+      # экземплярах над одной базой. `useradd --system` даёт на каждой машине
+      # свой свободный uid, поэтому безусловный chown -R отбирал общий
+      # каталог у соседей — они переставали читать собственную базу.
+      # Если каталог уже принадлежит кому-то другому, спрашиваем.
+      DATA_OWNER="$(stat -c '%U' "${DATA_DIR}" 2>/dev/null \
+                    || stat -f '%Su' "${DATA_DIR}" 2>/dev/null || echo '')"
+      if [[ -n "${DATA_OWNER}" && "${DATA_OWNER}" != "root" \
+            && "${DATA_OWNER}" != "${SERVICE_USER}" ]]; then
+        warn "Каталог данных «${DATA_DIR}» принадлежит пользователю ${DATA_OWNER}."
+        hint "Похоже, над ним уже работает другая установка ASR Hub."
+        hint "Смена владельца отберёт у неё доступ к собственной базе."
+        if confirm "Всё равно передать каталог пользователю ${SERVICE_USER}?" "n"; then
+          run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
+            warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
+        else
+          info "Владелец каталога данных не меняется."
+          hint "Для общего каталога заведите одну группу и дайте её обоим"
+          hint "пользователям: chgrp -R asrhub '${DATA_DIR}' && chmod -R g+rwX '${DATA_DIR}'"
+        fi
+      else
+        run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
+          warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
+      fi
     fi
   fi
 
   bash "${SCRIPT_DIR}/service.sh" install \
     --prefix "${PREFIX}" --data "${DATA_DIR}" \
-    --port "${PORT}" --host "${HOST}" \
+    --port "${PORT}" --host "${HOST}" --name "${SERVICE_NAME}" \
     ${SERVICE_USER:+--user "${SERVICE_USER}"} || {
       warn "Служба не создана."
       hint "Запускать вручную: ${VENV}/bin/python -m asrhub --port ${PORT}"

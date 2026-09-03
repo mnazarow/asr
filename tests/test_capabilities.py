@@ -273,6 +273,7 @@ def test_stale_job_returns_to_the_queue(database, tmp_path: Path):
     queue = jq.JobQueue.__new__(jq.JobQueue)       # без запуска потоков
     queue.db = database
     queue._wake = __import__("threading").Event()
+    queue.settings = {"max_retries": 3}
     queue._reclaim_stale_jobs()
 
     returned = database.get_job(lost)
@@ -298,6 +299,7 @@ def test_live_instance_keeps_its_job(database):
     queue = jq.JobQueue.__new__(jq.JobQueue)
     queue.db = database
     queue._wake = __import__("threading").Event()
+    queue.settings = {"max_retries": 3}
     queue._reclaim_stale_jobs()
     assert database.get_job(job_id)["status"] == jq.STATUS_RUNNING
 
@@ -565,3 +567,289 @@ def test_dictation_documented_with_screenshot(repo_root: Path):
     api = (repo_root / "docs" / "08-api.md").read_text(encoding="utf-8")
     assert "## Распознавание на лету" in api
     assert "stream_window_s" in api and "4403" in api
+
+
+# ---------------------------------------------------------------------------
+# Ревизия шестого захода: то, что нашлось в самих этих возможностях
+# ---------------------------------------------------------------------------
+
+
+def _wav_bytes(seconds: float) -> bytes:
+    """Готовый WAV в памяти — вход для ffmpeg в режиме «auto»."""
+    import io
+    import wave
+
+    from asrhub.streaming import tone
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(tone(seconds))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("seconds", [0.5, 10.0, 30.0])
+def test_large_frame_does_not_wedge_the_decoder(seconds):
+    """Кадр любого размера обязан проходить целиком.
+
+    Труба вывода ffmpeg вмещает 64 КБ. Мы писали в него весь кадр разом и
+    только потом забирали готовое: на куске от десяти секунд ffmpeg упирался
+    в трубу, переставал читать вход — а мы уже ждали на записи. Обе стороны
+    замирали навсегда. Документация при этом обещает «размер любой», и
+    каждая такая сессия навсегда занимала поток из пула: шести кадров
+    хватало, чтобы диктовка перестала работать у всех, а сервер при этом
+    отвечал на проверку живости как ни в чём не бывало.
+    """
+    import shutil
+    import threading
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("нужен ffmpeg")
+    from asrhub.streaming import _Decoder
+
+    decoder = _Decoder("auto")
+    got: list[int] = []
+    worker = threading.Thread(
+        target=lambda: got.append(len(decoder.feed(_wav_bytes(seconds)))), daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), f"кадр на {seconds} с подвесил декодер"
+    got.append(len(decoder.close()))
+    assert sum(got) == int(seconds * 16000) * 2, "звук потерян при перекодировании"
+
+
+def test_window_work_does_not_grow_with_the_conversation(tmp_path: Path):
+    """Скользящее окно распознавало всё сказанное с начала — цена росла как T².
+
+    За пять минут диктовки модель успевала отработать 190 минут звука, и
+    примерно с сорок пятой секунды сервер переставал догонять: гипотезы шли
+    всё реже и всё более старые. То есть ровно то, ради чего маршрут
+    делался, переставало работать.
+    """
+    import contextlib
+    import wave
+
+    from asrhub.streaming import StreamSession, tone
+
+    lengths: list[float] = []
+
+    class _Engine:
+        def transcribe(self, path, settings, progress):
+            with wave.open(str(path)) as handle:
+                lengths.append(handle.getnframes() / handle.getframerate())
+            return type("R", (), {"segments": [type("S", (), {"text": "слово"})()]})()
+
+    class _Registry:
+        def get(self, settings):
+            return _Engine()
+
+        def lease(self, settings):
+            return contextlib.nullcontext(_Engine())
+
+    session = StreamSession(_Registry(), {"stream_window_s": 4.0}, workdir=tmp_path)
+    session.start()
+    for _ in range(150):                       # пять минут по две секунды
+        session.feed(tone(2.0))
+    session.finish()
+
+    spoken = 300.0
+    assert max(lengths) <= 40.0, \
+        f"один кусок вырос до {max(lengths):.0f} с — хвост ничем не ограничен"
+    assert sum(lengths) < spoken * 8, \
+        f"модели скормлено {sum(lengths) / 60:.0f} мин на {spoken / 60:.0f} мин речи"
+    assert session.duration_s == pytest.approx(spoken, abs=1.0), \
+        "длительность сессии сбилась при закреплении хвоста"
+    session.close()
+
+
+def test_restart_does_not_steal_a_live_neighbours_job(database):
+    """`recover()` при старте забирал задания всех экземпляров подряд.
+
+    Перезапуск любого сервера на общей базе сбрасывал прогресс соседей и
+    запускал их задания второй раз — двойная оплата видеокарты и два
+    одинаковых уведомления заказчику, то есть ровно то, что неделимый
+    захват и должен был исключить.
+    """
+    import threading
+
+    from asrhub import job_queue as jq
+
+    alive = database.create_job({"filename": "сосед.wav", "status": jq.STATUS_RUNNING,
+                                 "model": "demo-simulator"})
+    database.update_job(alive, instance_id="сосед:1908", heartbeat_at=jq.now(),
+                        progress=0.4)
+    mine = database.create_job({"filename": "моё.wav", "status": jq.STATUS_RUNNING,
+                                "model": "demo-simulator"})
+    database.update_job(mine, instance_id=jq.INSTANCE_ID, heartbeat_at=jq.now())
+    orphan = database.create_job({"filename": "ничьё.wav", "status": jq.STATUS_RUNNING,
+                                  "model": "demo-simulator"})
+
+    queue = jq.JobQueue.__new__(jq.JobQueue)
+    queue.db = database
+    queue._wake = threading.Event()
+    queue.recover()
+
+    assert database.get_job(alive)["status"] == jq.STATUS_RUNNING, \
+        "перезапуск отобрал задание у живого соседа"
+    assert database.get_job(alive)["progress"] == 0.4, "сброшен чужой прогресс"
+    assert database.get_job(mine)["status"] == jq.STATUS_QUEUED, \
+        "своё задание после перезапуска не вернулось в очередь"
+    assert database.get_job(orphan)["status"] == jq.STATUS_QUEUED, \
+        "задание без экземпляра осталось висеть навсегда"
+
+
+def test_a_revived_instance_cannot_overwrite_a_reassigned_job(database):
+    """Одного статуса мало, когда серверов несколько.
+
+    Экземпляр, застрявший дольше пяти минут и оживший, дописывал свой ответ
+    поверх задания, которое уже считает другой сервер: пользователь получал
+    результат от процесса, объявленного мёртвым, а работа второго
+    экземпляра выбрасывалась вместе с каталогом выгрузки.
+    """
+    from asrhub import job_queue as jq
+
+    job_id = database.create_job({"filename": "спор.wav", "status": jq.STATUS_RUNNING,
+                                  "model": "demo-simulator"})
+    database.update_job(job_id, instance_id="сервер-Б:200")
+
+    late = database.update_job_if_status(
+        job_id, [jq.STATUS_RUNNING], expected_instance="застрявший-А:100",
+        status=jq.STATUS_COMPLETED, text="ответ застрявшего экземпляра")
+    assert late is False, "запись мёртвого экземпляра прошла"
+    assert database.get_job(job_id)["status"] == jq.STATUS_RUNNING
+
+    own = database.update_job_if_status(
+        job_id, [jq.STATUS_RUNNING], expected_instance="сервер-Б:200",
+        status=jq.STATUS_COMPLETED, text="ответ того, кто действительно считал")
+    assert own is True, "владелец не смог записать свой результат"
+
+
+def test_lost_instance_is_not_an_endless_loop(database):
+    """Возврат брошенного задания обязан считаться попыткой.
+
+    «Убит по нехватке памяти» обычно повторяется на том же файле: задание
+    возвращалось в очередь без конца и убивало экземпляры один за другим —
+    ни отказа, ни записи об ошибке, ни сигнала администратору.
+    """
+    import threading
+
+    from asrhub import job_queue as jq
+
+    job_id = database.create_job({"filename": "убийца.wav", "status": jq.STATUS_RUNNING,
+                                  "model": "demo-simulator",
+                                  "params": {"max_retries": 2}})
+    queue = jq.JobQueue.__new__(jq.JobQueue)
+    queue.db = database
+    queue._wake = threading.Event()
+    queue.settings = {"max_retries": 2}
+
+    seen = []
+    old = jq.now() - jq.STALE_AFTER_S - 60
+    for cycle in range(4):
+        database.update_job(job_id, status=jq.STATUS_RUNNING,
+                            instance_id=f"труп-{cycle}", heartbeat_at=old, started_at=old)
+        queue._reclaim_stale_jobs()
+        row = database.get_job(job_id)
+        seen.append((row["status"], row["retries"]))
+
+    assert seen[0] == (jq.STATUS_QUEUED, 1)
+    assert seen[1] == (jq.STATUS_QUEUED, 2)
+    assert seen[2][0] == jq.STATUS_FAILED, f"задание вернулось в очередь снова: {seen}"
+    assert database.get_job(job_id)["error_code"] == "instance_lost"
+    assert "повторить" in (database.get_job(job_id)["error_hint"] or "").lower()
+
+
+def test_cached_job_counts_towards_the_storage_quota(database, tmp_path: Path,
+                                                     sample_wav: Path):
+    """Задание из кеша не записывало размер файла, и квота на объём обходилась.
+
+    Файл сохранялся честно, а расход не рос: ключ заполнял диск без предела,
+    повторяя загрузку одного и того же файла, а `GET /api/usage` показывал
+    неизменную цифру и врал и пользователю, и администратору.
+    """
+    import shutil
+
+    from asrhub import job_queue as jq
+
+    original = database.create_job({
+        "filename": "первая загрузка.wav", "owner": "объём",
+        "status": jq.STATUS_COMPLETED, "model": "demo-simulator",
+        "file_hash": "одинаковый", "media_duration_s": 6.0,
+        "file_size": sample_wav.stat().st_size, "text": "готовая расшифровка"})
+    copy = tmp_path / "повторная загрузка.wav"
+    shutil.copy(sample_wav, copy)
+
+    before = database.owner_usage("объём", 0)["storage_gb"]
+    queue = jq.JobQueue.__new__(jq.JobQueue)
+    queue.db = database
+    queue._copy_results = lambda *args: None
+    clone = queue._clone_cached(database.get_job(original), copy.name, str(copy),
+                                "объём", None, {"model": "demo-simulator"})
+    after = database.owner_usage("объём", 0)["storage_gb"]
+
+    assert database.get_job(clone)["file_size"] == copy.stat().st_size, \
+        "задание из кеша записано с нулевым размером"
+    assert after > before, ("повторная загрузка не попала в расход по квоте: "
+                            f"было {before}, стало {after}")
+
+
+def test_stream_accepts_the_bearer_header(keys_client):
+    """Bearer обещан и в заголовке OpenAPI, и в докстринге маршрута.
+
+    `/ws` его разбирал, `/api/stream` — нет: сторонний клиент, написанный по
+    документации, получал «ключ недействителен» на действующем ключе.
+    """
+    admin = keys_client.headers["X-API-Key"]
+    with keys_client.websocket_connect(
+            "/api/stream", headers={"X-API-Key": "", "Authorization": f"Bearer {admin}"}
+    ) as socket:
+        socket.send_text(json.dumps({"type": "config"}))
+        assert json.loads(socket.receive_text())["type"] == "ready"
+
+
+def test_waveform_and_transcript_share_one_axis(tmp_path: Path, data_dir: Path):
+    """Полоса громкости оставалась в шкале подготовленного файла.
+
+    Расшифровка возвращалась в координаты исходной записи, а полоса — нет.
+    В карточке задания они нарисованы рядом: щелчок по полосе открывал не ту
+    реплику, а при обрезке тишины полоса начиналась там, где в записи ещё
+    тишина. Субтитры при этом были верны — расходились именно они с полосой.
+    """
+    import math
+    import struct
+    import wave
+
+    from asrhub import processor
+    from asrhub.config import load
+    from asrhub.engines import EngineRegistry
+
+    rate, frames = 16000, bytearray()
+    for index in range(rate * 15):           # пять секунд тишины, десять — тона
+        second = index / rate
+        amplitude = 0.0 if second < 5.0 else 0.4
+        frames += struct.pack("<h", int(amplitude * 32767 * math.sin(2 * math.pi * 320 * second)))
+    source = tmp_path / "тишина-и-тон.wav"
+    with wave.open(str(source), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(bytes(frames))
+
+    settings = load().merged({"audio_trim_silence": True, "waveform_enabled": True,
+                              "waveform_interval_s": 1.0, "model": "demo-simulator",
+                              "engine": "demo", "vad_backend": "energy"})
+    workdir, outdir = tmp_path / "w", tmp_path / "o"
+    workdir.mkdir()
+    outdir.mkdir()
+    outcome = processor.process_job(source, settings, EngineRegistry(),
+                                    workdir=workdir, outdir=outdir, basename="проба")
+
+    points = (outcome.waveform or [{}])[0].get("audio_waveform") or []
+    assert points, "полоса не построена"
+    assert points[0]["time"] >= 4.0, \
+        f"полоса начинается с {points[0]['time']} с, хотя первые пять секунд — тишина"
+    assert outcome.segments, "речь не найдена"
+    assert abs(points[0]["time"] - outcome.segments[0]["start"]) < 2.0, \
+        "полоса и расшифровка нарисованы на разных осях"

@@ -137,7 +137,9 @@ step "Снимок текущей версии"
 if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
   rm -rf "${SNAPSHOT_DIR}"
   mkdir -p "${SNAPSHOT_DIR}"
-  for item in server scripts config requirements docker VERSION; do
+  # README.md попадает в снимок: обновление его заменяет, а откат без него
+  # оставлял бы файл от новой версии.
+  for item in server scripts config requirements docker examples VERSION README.md; do
     [[ -e "${PREFIX}/${item}" ]] && cp -a "${PREFIX}/${item}" "${SNAPSHOT_DIR}/"
   done
   ok "Снимок: ${SNAPSHOT_DIR}"
@@ -145,6 +147,18 @@ if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
 fi
 
 # --- База данных ------------------------------------------------------------
+
+# Над общей базой могут работать соседние экземпляры. Подмена кода под ними
+# не ломает базу — схема совместима, — но версия сервера станет разной на
+# разных машинах, а это самый неприятный вид расхождения: воспроизводится
+# через раз. Предупреждаем и даём остановиться.
+OTHERS="$(other_instances "${DATA_DIR}" || true)"
+if [[ -n "${OTHERS}" ]]; then
+  warn "Над этой базой работают и другие серверы: ${OTHERS}"
+  hint "После обновления версии на машинах разойдутся."
+  hint "Обновляйте их подряд или остановите на время обновления."
+  confirm "Продолжить обновление?" "y" || { info "Отменено."; exit 0; }
+fi
 
 step "Резервная копия базы"
 if [[ -f "${DATA_DIR}/asrhub.db" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
@@ -167,10 +181,16 @@ fi
 # и без пересборки образа новая версия просто не попадала в работу — команда
 # отрабатывала «успешно», а сервер продолжал крутить старый код.
 DOCKER_MODE=0
-if [[ -f "${PREFIX}/docker/docker-compose.yml" && ! -x "${VPIP}" ]] && have docker; then
+# Признак — .env, который пишет только установка в контейнере, или живой
+# контейнер. Файл docker-compose.yml лежит в любой копии исходников, поэтому
+# по нему нельзя судить ни о чём: нативная установка со сломанным venv
+# принималась за докерную, зависимости молча не обновлялись, а дальше шла
+# пересборка образа на машине, где docker никогда не использовали.
+if [[ -f "${PREFIX}/docker/.env" ]] && have docker; then
   DOCKER_MODE=1
-elif [[ -f "${PREFIX}/docker/.env" ]] && have docker \
-     && docker ps --filter "name=^asrhub$" --format '{{.Names}}' 2>/dev/null | grep -q asrhub; then
+elif have docker && [[ "$(set +o pipefail; \
+       docker ps --filter "name=^asrhub$" --format '{{.Names}}' 2>/dev/null \
+       | grep -c asrhub || true)" -gt 0 ]]; then
   DOCKER_MODE=1
 fi
 
@@ -221,7 +241,7 @@ if [[ "${ENGINES_ONLY}" -eq 0 ]]; then
     info "Источник совпадает с установкой — файлы уже на месте, копирование пропущено."
     info "Чтобы обновиться из другого места: bash update.sh --source /путь/к/новой/версии"
   elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
-    for item in server scripts config requirements docker VERSION README.md; do
+    for item in server scripts config requirements docker examples VERSION README.md; do
       [[ -e "${SOURCE_DIR}/${item}" ]] || continue
       # Копируем во временное имя рядом и подменяем: если копирование
       # сорвётся на середине, прежний каталог останется целым.
@@ -236,6 +256,9 @@ if [[ "${ENGINES_ONLY}" -eq 0 ]]; then
       mv "${staged}" "${PREFIX:?}/${item}"
     done
     chmod +x "${PREFIX}"/scripts/*.sh 2>/dev/null || true
+    # Клиент командной строки — исполняемый файл без расширения, и прошлая
+    # строка его не задевала: после обновления asrctl терял право на запуск.
+    chmod +x "${PREFIX}"/scripts/client/asrctl 2>/dev/null || true
   fi
   ok "Файлы обновлены до версии ${NEW_VERSION}"
 fi
@@ -243,6 +266,23 @@ fi
 # --- Зависимости ------------------------------------------------------------
 
 step "Обновление зависимостей"
+# Установлен ли движок: спрашиваем pip про пакеты, перечисленные в файле
+# требований. Имена пакетов и имена модулей совпадают далеко не всегда, а
+# `pip show` знает ровно то, что установлено.
+engine_installed() {
+  local req="$1" name
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line%%[<>=!;[]*}"
+    name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+    [[ -z "${name}" ]] && continue
+    if "${VPIP}" show "${name}" >/dev/null 2>&1; then
+      return 0
+    fi
+  done < "${req}"
+  return 1
+}
+
 if [[ "${DOCKER_MODE}" -eq 1 ]]; then
   info "Зависимости живут в образе — обновятся при пересборке."
 elif [[ -x "${VPIP}" ]]; then
@@ -251,8 +291,12 @@ elif [[ -x "${VPIP}" ]]; then
     warn "Часть базовых зависимостей не обновилась."
   for req in "${PREFIX}"/requirements/engines/*.txt; do
     engine="$(basename "${req}" .txt)"
-    module="$(printf '%s' "${engine}" | tr '-' '_')"
-    if "${VPY}" -c "import ${module}" >/dev/null 2>&1; then
+    # Раньше имя файла превращали в имя модуля простым tr '-' '_' — и для
+    # половины движков такого модуля не существует (diarization, vad,
+    # postprocess, mfa, qwen3-asr, voxtral, kyutai, omnilingual, whisper-cpp).
+    # Проверка молча не срабатывала, и эти движки не обновлялись никогда.
+    # Спрашиваем не выдуманный модуль, а сами пакеты из файла требований.
+    if engine_installed "${req}"; then
       info "Движок ${engine} установлен — обновляем"
       retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" -r "${req}" || \
         warn "  ${engine}: обновление не удалось, остаётся прежняя версия"
@@ -293,10 +337,14 @@ else
   info "До обновления служба не работала — не запускаем."
 fi
 
+# `|| true` здесь обязателен: grep возвращает 2, когда файла нет, и 1, когда
+# в нём нет строки, а pipefail с errexit превращали это в обрыв обновления на
+# последнем шаге — при том что код и зависимости уже заменены. Установка без
+# config.yaml — случай штатный и самый частый.
 if [[ "${DOCKER_MODE}" -eq 1 ]]; then
-  PORT="$(grep -E '^ASRHUB_PORT=' "${PREFIX}/docker/.env" 2>/dev/null | cut -d= -f2 | head -1)"
+  PORT="$(grep -E '^ASRHUB_PORT=' "${PREFIX}/docker/.env" 2>/dev/null | cut -d= -f2 | head -1 || true)"
 else
-  PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
+  PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1 || true)"
 fi
 PORT="${PORT:-8080}"
 HEALTH_OK=0

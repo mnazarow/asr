@@ -195,7 +195,12 @@ gpu_driver_state() {
       if [[ -d /sys/module/amdgpu ]]; then printf 'installed-noload'; return 0; fi
       printf 'absent' ;;
     intel)
-      if have clinfo && clinfo 2>/dev/null | grep -qi 'Intel.*Graphics'; then
+      # Через подоболочку без pipefail: `clinfo` печатает сотни строк, и
+      # SIGPIPE от `grep -q` превращал код конвейера в 141. Рабочая Intel Arc
+      # объявлялась «драйвер не установлен», а gpu_ensure_driver шёл ставить
+      # набор Intel заново поверх работающего.
+      if have clinfo && [[ "$(set +o pipefail; clinfo 2>/dev/null \
+           | grep -ci 'Intel.*Graphics' || true)" -gt 0 ]]; then
         printf 'ready'; return 0
       fi
       if [[ -e /dev/dri/renderD128 && -d /sys/module/i915 ]] || [[ -d /sys/module/xe ]]; then

@@ -56,7 +56,7 @@ if ($Rollback) {
     Write-Info "Снимок от $((Get-Item $snapshotDir).LastWriteTime)"
     if (-not (Confirm-Action 'Восстановить предыдущую версию?')) { exit 0 }
     & (Join-Path $PSScriptRoot 'service.ps1') -Action stop -Prefix $Prefix -DataDir $DataDir
-    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'VERSION')) {
+    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'examples', 'VERSION', 'README.md')) {
         $source = Join-Path $snapshotDir $item
         if (Test-Path $source) {
             $target = Join-Path $Prefix $item
@@ -89,7 +89,7 @@ Write-Step 'Снимок текущей версии'
 if (-not (Get-DryRun)) {
     if (Test-Path $snapshotDir) { Remove-Item $snapshotDir -Recurse -Force }
     New-Item -ItemType Directory -Path $snapshotDir -Force | Out-Null
-    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'VERSION')) {
+    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'examples', 'VERSION', 'README.md')) {
         $source = Join-Path $Prefix $item
         if (Test-Path $source) { Copy-Item $source $snapshotDir -Recurse -Force }
     }
@@ -124,7 +124,7 @@ if (-not $EnginesOnly) {
         Write-Info 'Источник совпадает с установкой — файлы уже на месте.'
         Write-Hint 'Чтобы обновиться из другого места: update.ps1 -Source C:\путь\к\новой\версии'
     } elseif (-not (Get-DryRun)) {
-        foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'VERSION', 'README.md')) {
+        foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'examples', 'VERSION', 'README.md')) {
             $sourcePath = Join-Path $Source $item
             if (Test-Path $sourcePath) {
                 $target = Join-Path $Prefix $item
@@ -136,16 +136,53 @@ if (-not $EnginesOnly) {
     Write-Ok "Файлы обновлены до версии $newVersion"
 }
 
+# Установка в контейнере обновляется иначе: файлы лежат в образе, и без его
+# пересборки новая версия просто не попадает в работу. В bash-двойнике этот
+# путь есть с самого начала, здесь его не было вовсе: venv не находился,
+# образ не пересобирался, работающий контейнер отвечал на проверку живости
+# СТАРЫМ кодом — и скрипт объявлял обновление успешным.
+$dockerMode = $false
+if ((Test-Path (Join-Path $Prefix 'docker\.env')) -and (Get-Command docker -ErrorAction SilentlyContinue)) {
+    $dockerMode = $true
+} elseif (Get-Command docker -ErrorAction SilentlyContinue) {
+    $running = & docker ps --filter 'name=^asrhub$' --format '{{.Names}}' 2>$null
+    if ($running) { $dockerMode = $true }
+}
+
+function Get-ComposeCommand {
+    & docker compose version *> $null
+    $base = if ($LASTEXITCODE -eq 0) { @('docker', 'compose') } else { @('docker-compose') }
+    $files = @('-f', 'docker-compose.yml')
+    $envFile = Join-Path $Prefix 'docker\.env'
+    if ((Test-Path $envFile) -and (Select-String -Path $envFile -Pattern '^ASRHUB_ACCEL=cuda' -Quiet) `
+        -and (Test-Path (Join-Path $Prefix 'docker\docker-compose.gpu.yml'))) {
+        $files += @('-f', 'docker-compose.gpu.yml')
+    }
+    return @{ Command = $base[0]; Prefix = ($base[1..($base.Count - 1)] + $files) }
+}
+
 Write-Step 'Обновление зависимостей'
-if (Test-Path $venvPip) {
+if ($dockerMode) {
+    Write-Info 'Зависимости живут в образе — обновятся при пересборке.'
+} elseif (Test-Path $venvPip) {
     Invoke-WithRetry -Attempts 2 -Description 'базовые зависимости' -Action {
         Invoke-Checked -Command $venvPip -Arguments @('install', '--upgrade',
             '--disable-pip-version-check', '-r', (Join-Path $Prefix 'requirements\base.txt'))
     } | Out-Null
     foreach ($req in (Get-ChildItem (Join-Path $Prefix 'requirements\engines') -Filter '*.txt')) {
-        $module = $req.BaseName -replace '-', '_'
-        & $venvPython -c "import $module" 2>$null
-        if ($LASTEXITCODE -eq 0) {
+        # Имя файла требований не равно имени модуля: у diarization, vad,
+        # postprocess, mfa, qwen3-asr и ещё нескольких такого модуля нет
+        # вовсе, и проверка молча не срабатывала — эти движки не
+        # обновлялись никогда. Спрашиваем pip про сами пакеты из файла.
+        $installed = $false
+        foreach ($line in (Get-Content $req.FullName)) {
+            $name = ($line -split '#')[0]
+            $name = ($name -split '[<>=!;\[]')[0].Trim()
+            if (-not $name) { continue }
+            & $venvPip show $name *> $null
+            if ($LASTEXITCODE -eq 0) { $installed = $true; break }
+        }
+        if ($installed) {
             Write-Info "Движок $($req.BaseName) установлен — обновляем"
             try {
                 Invoke-Checked -Command $venvPip -Arguments @('install', '--upgrade',
@@ -160,13 +197,35 @@ Write-Step 'Запуск и проверка'
 if ($NoRestart) { Write-Info 'Перезапуск пропущен.'; exit 0 }
 if (Get-DryRun) { Write-Ok 'Пробный запуск завершён.'; exit 0 }
 
-& (Join-Path $PSScriptRoot 'service.ps1') -Action start -Prefix $Prefix -DataDir $DataDir
-
 $port = 8080
-$configFile = Join-Path $DataDir 'config.yaml'
-if (Test-Path $configFile) {
-    $match = Select-String -Path $configFile -Pattern 'server_port:\s*(\d+)' | Select-Object -First 1
-    if ($match) { $port = [int]$match.Matches[0].Groups[1].Value }
+if ($dockerMode) {
+    # Без пересборки образа новый код в контейнер не попадает: проверка
+    # живости отвечала бы 200 от старой версии, и обновление объявлялось
+    # успешным, ничего не изменив.
+    $compose = Get-ComposeCommand
+    Push-Location (Join-Path $Prefix 'docker')
+    try {
+        Write-Info 'Пересборка образа (может занять несколько минут)…'
+        Invoke-Checked -Command $compose.Command `
+            -Arguments ($compose.Prefix + @('--env-file', '.env', 'build')) | Out-Null
+        Invoke-Checked -Command $compose.Command `
+            -Arguments ($compose.Prefix + @('--env-file', '.env', 'up', '-d')) | Out-Null
+    } catch {
+        Write-Err 'Пересборка образа не удалась. Прежний контейнер не тронут.'
+        exit 1
+    } finally { Pop-Location }
+    $envFile = Join-Path $Prefix 'docker\.env'
+    if (Test-Path $envFile) {
+        $match = Select-String -Path $envFile -Pattern '^ASRHUB_PORT=(\d+)' | Select-Object -First 1
+        if ($match) { $port = [int]$match.Matches[0].Groups[1].Value }
+    }
+} else {
+    & (Join-Path $PSScriptRoot 'service.ps1') -Action start -Prefix $Prefix -DataDir $DataDir
+    $configFile = Join-Path $DataDir 'config.yaml'
+    if (Test-Path $configFile) {
+        $match = Select-String -Path $configFile -Pattern 'server_port:\s*(\d+)' | Select-Object -First 1
+        if ($match) { $port = [int]$match.Matches[0].Groups[1].Value }
+    }
 }
 
 $healthy = $false

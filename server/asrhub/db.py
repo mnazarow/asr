@@ -674,12 +674,20 @@ class Database:
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
     def update_job_if_status(self, job_id: str, expected: list[str],
+                             *, expected_instance: str | None = None,
                              **fields: Any) -> bool:
         """Обновляет задание, только если его статус входит в ожидаемые.
 
         Нужно там, где между чтением и записью состояние может измениться:
         отмена и завершение задания идут из разных потоков, и безусловная
         запись помечала бы готовый результат отменённым.
+
+        expected_instance добавляет к проверке владельца. Одного статуса
+        мало, когда серверов несколько: экземпляр, застрявший дольше пяти
+        минут (своп, ввод-вывод, долгая загрузка весов) и оживший, дописывал
+        свой ответ поверх задания, которое уже считает другой сервер.
+        Пользователь получал результат от процесса, объявленного мёртвым, а
+        работа второго экземпляра выбрасывалась вместе с каталогом выгрузки.
 
         Returns:
             True, если запись состоялась.
@@ -693,9 +701,12 @@ class Database:
             fields["waveform"] = json.dumps(fields["waveform"], ensure_ascii=False)
         columns = ", ".join(f"{name}=?" for name in fields)
         placeholders = ",".join("?" for _ in expected)
-        changed = self.execute(
-            f"UPDATE jobs SET {columns} WHERE id=? AND status IN ({placeholders})",
-            [*fields.values(), job_id, *expected])
+        where = f"id=? AND status IN ({placeholders})"
+        args: list[Any] = [*fields.values(), job_id, *expected]
+        if expected_instance is not None:
+            where += " AND instance_id=?"
+            args.append(expected_instance)
+        changed = self.execute(f"UPDATE jobs SET {columns} WHERE {where}", args)
         return bool(changed)
 
     def find_cached(self, file_hash: str, params_hash: str) -> dict[str, Any] | None:

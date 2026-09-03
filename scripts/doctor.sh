@@ -232,8 +232,11 @@ heading "Внешние программы"
 if have ffmpeg; then
   check "ffmpeg" ok "$(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f3)"
 else
-  check "ffmpeg" fail "не найден" \
-    "Debian/Ubuntu: sudo apt install ffmpeg · macOS: brew install ffmpeg"
+  # Раньше отказ звучал просто «не найден». Без ffmpeg сервер принимает
+  # только несжатый WAV 16 кГц, а диктовка в браузере не работает вовсе:
+  # MediaRecorder отдаёт WebM/Opus, и разбирать его больше нечем.
+  check "ffmpeg" fail "не найден — сервер сможет читать только WAV 16 кГц моно" \
+    "Без него не работают: mp3/m4a/видео, «Диктовка» в интерфейсе и формат auto в /api/stream. Debian/Ubuntu: sudo apt install ffmpeg · macOS: brew install ffmpeg"
   [[ "${FIX}" -eq 1 ]] && install_system_packages ffmpeg
 fi
 have ffprobe && check "ffprobe" ok "есть" || check "ffprobe" warn "не найден" "Обычно ставится вместе с ffmpeg."
@@ -301,6 +304,92 @@ else
   else
     check "Порт ${PORT}" fail "занят другой программой" \
       "Освободите порт или смените: asrctl config set server_port 9000"
+  fi
+fi
+fi
+
+# ---------------------------------------------------------------------------
+# Возможности сервера
+# ---------------------------------------------------------------------------
+# Раздел появился потому, что доктор ничего не знал о том, что сервер умеет
+# сверх обработки файлов: поток, подразделения и квоты ключей, несколько
+# экземпляров над общей базой. Всё это либо работает, либо тихо не работает,
+# и заметить второе было нечем.
+
+if [[ -z "${ONLY}" || "${ONLY}" == "network" ]]; then
+heading "Возможности"
+
+STREAM_ENABLED="$(grep -E '^[[:space:]]*stream_enabled:' "${DATA_DIR}/config.yaml" 2>/dev/null \
+                  | awk '{print $2}' | head -1 || true)"
+STREAM_ENABLED="${STREAM_ENABLED:-true}"
+if [[ "${STREAM_ENABLED}" == "false" ]]; then
+  check "Распознавание на лету" warn "выключено (stream_enabled: false)" \
+    "Раздел «Диктовка» и маршрут /api/stream отвечают отказом. Включить: asrctl config set stream_enabled true"
+elif have ffmpeg; then
+  check "Распознавание на лету" ok "включено, ffmpeg на месте"
+else
+  check "Распознавание на лету" fail "включено, но без ffmpeg работает только сырой PCM" \
+    "Браузер шлёт WebM/Opus — «Диктовка» будет отвечать отказом. Поставьте ffmpeg."
+fi
+
+# Микрофон браузер отдаёт только в защищённом контексте — это ограничение
+# браузера, а не сервера, и о нём лучше узнать до, а не после установки.
+HOST_BOUND="$(grep -E '^[[:space:]]*server_host:' "${DATA_DIR}/config.yaml" 2>/dev/null \
+              | awk '{print $2}' | head -1 || true)"
+if [[ "${HOST_BOUND}" == "0.0.0.0" || -z "${HOST_BOUND}" ]]; then
+  check "Микрофон в браузере" warn "нужен https или localhost" \
+    "По http с другой машины браузер микрофон не отдаст. Поставьте перед сервером обратный прокси с сертификатом — пример есть в docker/nginx.conf."
+else
+  check "Микрофон в браузере" ok "сервер слушает локально — микрофон доступен"
+fi
+
+# Ключи с подразделениями и квотами: сводка по config.yaml.
+if [[ -f "${DATA_DIR}/config.yaml" ]] && have python3; then
+  KEYS_SUMMARY="$(python3 - "${DATA_DIR}/config.yaml" <<'PYEOF' 2>/dev/null || true
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+keys = len(re.findall(r"^\s{2,}ah_[A-Za-z0-9_-]+:", text, re.M))
+groups = sorted(set(re.findall(r"^\s+group:\s*(\S+)", text, re.M)))
+quotas = len(re.findall(r"^\s+quota_\w+:\s*[1-9]", text, re.M))
+print(f"{keys}|{','.join(groups)}|{quotas}")
+PYEOF
+)"
+  # Имя KEY_GROUPS, а не GROUPS: GROUPS — служебная переменная bash с
+  # массивом групп пользователя. Запись в неё через `read` не проходит,
+  # и в отчёт вместо подразделений попадал идентификатор группы root.
+  IFS='|' read -r KEY_COUNT KEY_GROUPS KEY_QUOTAS <<< "${KEYS_SUMMARY:-0||0}"
+  if [[ "${KEY_COUNT:-0}" -gt 0 ]]; then
+    check "Ключи доступа" ok "${KEY_COUNT} шт.${KEY_GROUPS:+, подразделения: ${KEY_GROUPS}}${KEY_QUOTAS:+, квот задано: ${KEY_QUOTAS}}"
+  else
+    check "Ключи доступа" warn "в config.yaml не найдены" \
+      "Первый ключ сервер создаёт сам при запуске — он в ${DATA_DIR}/api-key.txt"
+  fi
+fi
+
+# Несколько экземпляров над одной базой: спрашиваем сам сервер.
+PORT_CAP="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null \
+            | awk '{print $2}' | head -1 || true)"
+PORT_CAP="${PORT_CAP:-8080}"
+KEY_FILE="${DATA_DIR}/api-key.txt"
+if have curl && [[ -r "${KEY_FILE}" ]]; then
+  QUEUE_JSON="$(curl -fsS --max-time 3 -H "X-API-Key: $(cat "${KEY_FILE}")" \
+                "http://127.0.0.1:${PORT_CAP}/api/queue" 2>/dev/null || true)"
+  if [[ -n "${QUEUE_JSON}" ]] && have python3; then
+    INSTANCES="$(printf '%s' "${QUEUE_JSON}" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+items = data.get('instances') or []
+stale = [i['instance'] for i in items if i.get('stale')]
+print(f\"{len(items)}|{','.join(stale)}\")" 2>/dev/null || true)"
+    IFS='|' read -r COUNT STALE <<< "${INSTANCES:-0|}"
+    if [[ -n "${STALE}" ]]; then
+      check "Экземпляры сервера" warn "не отвечает: ${STALE}" \
+        "Их задания вернутся в очередь автоматически через пять минут молчания."
+    elif [[ "${COUNT:-0}" -gt 1 ]]; then
+      check "Экземпляры сервера" ok "${COUNT} над общей базой, все отвечают"
+    else
+      check "Экземпляры сервера" ok "один"
+    fi
   fi
 fi
 fi

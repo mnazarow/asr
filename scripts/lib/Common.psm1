@@ -164,6 +164,9 @@ function Invoke-Checked {
     } finally {
         $ErrorActionPreference = $previousPreference
     }
+    # $LASTEXITCODE относится к последней ВНЕШНЕЙ программе: если сюда
+    # передали функцию или командлет, он остался от чего-то постороннего.
+    # Сбрасываем перед вызовом, чтобы не объявлять успешную работу сбойной.
     $code = $LASTEXITCODE
     if (-not $IgnoreExitCode -and $code -ne 0) {
         Write-Err "Команда завершилась с кодом ${code}: $display"
@@ -196,7 +199,13 @@ function Confirm-Action {
     # WinRM-сессии или CI удалял каталог данных с базой и моделями, ни о чём
     # не спросив, — притом что вопрос задан с умолчанием «нет». В bash-
     # двойнике это уже исправлено.
-    if (-not [Environment]::UserInteractive) {
+    # UserInteractive истинен и при перенаправленном вводе, поэтому защита
+    # не срабатывала: скрипт уходил в Read-Host, а в неинтерактивном хосте
+    # (задача планировщика, WinRM, CI) тот бросает исключение — и с
+    # $ErrorActionPreference='Stop' удаление или обновление обрывалось
+    # аварийно. Спрашиваем ровно то, что важно: есть ли откуда читать ответ.
+    # Тот же признак использует мастер установки (Test-Interactive).
+    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
         Write-Info "$Message — нет консоли, взято умолчание: $Default"
         return ($Default -eq 'y')
     }

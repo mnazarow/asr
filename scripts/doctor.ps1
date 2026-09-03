@@ -31,14 +31,22 @@ function Test-Item {
     if ($Hint -and $Status -ne 'ok') { Write-Host "      $Hint" -ForegroundColor DarkGray }
 }
 
+# Переменные окружения могут быть не заданы (урезанный профиль, запуск из
+# службы, не-Windows). Join-Path на пустом значении бросает исключение, и
+# диагностика превращалась в простыню ошибок вместо ответа.
+function Join-IfSet([string] $base, [string] $leaf) {
+    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
+    return (Join-Path $base $leaf)
+}
 if (-not $Prefix) {
-    foreach ($c in @('C:\Program Files\ASRHub', (Join-Path $env:LOCALAPPDATA 'ASRHub'))) {
-        if (Test-Path $c) { $Prefix = $c; break }
+    foreach ($c in @('C:\Program Files\ASRHub', (Join-IfSet $env:LOCALAPPDATA 'ASRHub'))) {
+        if ($c -and (Test-Path $c)) { $Prefix = $c; break }
     }
 }
 if (-not $DataDir) {
-    foreach ($c in @((Join-Path $env:ProgramData 'ASRHub'), (Join-Path $env:LOCALAPPDATA 'ASRHub\data'))) {
-        if (Test-Path $c) { $DataDir = $c; break }
+    foreach ($c in @((Join-IfSet $env:ProgramData 'ASRHub'),
+                     (Join-IfSet $env:LOCALAPPDATA 'ASRHub\data'))) {
+        if ($c -and (Test-Path $c)) { $DataDir = $c; break }
     }
 }
 
@@ -96,6 +104,23 @@ if (-not $Only -or $Only -eq 'hardware') {
 
 if (-not $Only) {
     Write-Heading 'Установка'
+    # Установку могли не найти — тогда $Prefix и $DataDir пусты, а Join-Path
+    # пустую строку не принимает. Раньше диагностика в этом случае
+    # превращалась в простыню исключений Join-Path и Test-Path — ровно там,
+    # где она и должна была сказать «установка не найдена».
+    if (-not $Prefix -or -not $DataDir) {
+        Test-Item 'Установка' 'fail' 'не найдена в стандартных местах' `
+            'Укажите путь: -Prefix C:\ASRHub -DataDir C:\ProgramData\ASRHub'
+        Write-Host ''
+        Write-Heading 'Итог'
+        Write-Host ("  ✓ пройдено: {0}   ! предупреждений: {1}   ✕ ошибок: {2}" -f
+            $script:Passed, $script:Warned, $script:Failed)
+        Write-Host ''
+        Write-Host '  ASR Hub на этой машине не найден.' -ForegroundColor Red
+        Write-Host '  Установка: powershell -File scripts\install.ps1' -ForegroundColor DarkGray
+        Write-Host ''
+        exit 1
+    }
     Test-Item 'Каталог программы' $(if ($Prefix -and (Test-Path $Prefix)) { 'ok' } else { 'fail' }) `
         $(if ($Prefix) { $Prefix } else { 'не найден' }) `
         'Запустите установку: powershell -File scripts\install.ps1'
@@ -134,14 +159,29 @@ if (-not $Only -or $Only -eq 'engines') {
     if (Test-Path $venvPython) {
         Push-Location (Join-Path $Prefix 'server')
         try {
-            & $venvPython -c @"
+            # Одинарные кавычки внутри: в PowerShell обратная косая ничего не
+            # экранирует (это делает обратный апостроф), поэтому \" уходило в
+            # Python дословно и раздел падал с SyntaxError на каждой машине.
+            # Ошибка внешней программы не является ошибкой PowerShell, так что
+            # catch её не ловил: пользователь видел трассировку Python, а
+            # раздел не попадал ни в «пройдено», ни в «ошибок».
+            $probe = @'
 import sys
 sys.path.insert(0, '.')
 from asrhub.engines import engine_status
 for item in engine_status():
     mark = 'OK ' if item['available'] else '--- '
-    print(f\"  {mark} {item['id']:<20} {item['reason'][:64] if not item['available'] else 'установлен'}\")
-"@
+    note = 'установлен' if item['available'] else item['reason'][:64]
+    print('  {0} {1:<20} {2}'.format(mark, item['id'], note))
+'@
+            $output = & $venvPython -c $probe 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $output | ForEach-Object { Write-Host $_ }
+                Test-Item 'Проверка движков' 'ok' 'опрошены'
+            } else {
+                Test-Item 'Проверка движков' 'fail' "python вернул код $LASTEXITCODE"
+                $output | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" }
+            }
         } catch { Test-Item 'Проверка движков' 'fail' 'не удалось выполнить' }
         finally { Pop-Location }
     } else {
