@@ -111,8 +111,12 @@ WORKDIR /app/server
 VOLUME ["/data"]
 EXPOSE 8080
 
+# /health, а не /api/health: адрес тот же по содержанию, но отвечает 503,
+# когда база недоступна, — то есть curl -fsS честно признаёт контейнер
+# нездоровым вместо «200, всё хорошо» на сервере, который упадёт на первом
+# же задании.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/api/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-m", "asrhub", "--host", "0.0.0.0", "--port", "8080"]

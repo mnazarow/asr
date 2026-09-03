@@ -45,7 +45,8 @@ services:
       ASRHUB_GID: ${ASRHUB_GID:-1000}
       HF_TOKEN: ${HF_TOKEN:-}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      # /health отвечает 503 при недоступной базе — curl -fsS это заметит.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3

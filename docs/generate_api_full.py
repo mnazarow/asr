@@ -70,8 +70,14 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      ("/api/monitoring", "/api/metrics")),
 ]
 
+#: Маршруты вне префикса /api, которые всё равно должны попасть в справочник.
+#: Отбор шёл по «/api/», и короткие адреса — проверка доступности и приём
+#: разговоров по схеме phone_asr — молча выпадали из документации, хотя это
+#: ровно те два адреса, которые настраивают в чужих системах.
+ROOT_PATHS = {"/health", "/process-call", "/statuses"}
+
 #: Маршруты, открытые без ключа.
-OPEN_ROUTES = {"/api/health"}
+OPEN_ROUTES = {"/api/health", "/health"}
 #: Маршруты, выборка которых сужается до заданий самого ключа.
 SCOPED_ROUTES = {"/api/jobs", "/api/analytics", "/api/analytics/{section}",
                  "/api/events"}
@@ -115,7 +121,7 @@ def access_note(path: str, method: str) -> str:
         return "без ключа: это и есть вход"
     if path == "/api/auth/password":
         return "учётная запись, вошедшая по логину и паролю"
-    if path == "/api/process-call":
+    if path in ("/api/process-call", "/process-call"):
         return "ключ с правом записи; принимается и полем `api_key` в теле"
     if path in OPEN_ROUTES:
         return "без ключа"
@@ -461,7 +467,8 @@ def main(argv: list[str]) -> int:
         return 1
 
     paths = {p: {m: op for m, op in ops.items() if m in METHOD_ORDER}
-             for p, ops in schema["paths"].items() if p.startswith("/api/")}
+             for p, ops in schema["paths"].items()
+             if p.startswith("/api/") or p in ROOT_PATHS}
     paths = {p: ops for p, ops in paths.items() if ops}
     total = sum(len(ops) for ops in paths.values())
 

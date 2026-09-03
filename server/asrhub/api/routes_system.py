@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .. import catalog
 from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, KeyNotFound
@@ -29,16 +29,67 @@ log = get_logger("api.settings")
 router = APIRouter(prefix="/api", tags=["Сервер"])
 
 
-@router.get("/health", summary="Проверка доступности")
-def health(request: Request) -> dict[str, Any]:
-    state = get_state(request)
-    return {
-        "status": "ok",
+def _health_body(state: Any) -> tuple[dict[str, Any], int]:
+    """Состояние сервера и код ответа для проверки.
+
+    Проверка обязана отвечать «не в порядке», когда работать нельзя, — иначе
+    балансировщик держит в строю сервер, который принимает запросы и на
+    каждом падает. Смотрим на то, без чего распознавание невозможно: базу.
+    Всё остальное (нет весов модели, занята очередь) — это «занят», а не
+    «сломан», и снимать такой сервер с раздачи не нужно.
+
+    Проверка базы — «SELECT 1»: пробы ходят раз в несколько секунд, и
+    дорогой запрос здесь превратился бы в постоянную нагрузку.
+    """
+    checks: dict[str, Any] = {}
+    healthy = True
+    try:
+        state.db.query_one("SELECT 1 AS ok")
+        checks["database"] = "ok"
+    except Exception as exc:                                   # noqa: BLE001
+        checks["database"] = f"недоступна: {exc}"
+        healthy = False
+
+    # Очередь может быть остановлена намеренно (пауза) — это не поломка, и
+    # различать эти два случая важнее, чем свести всё к одному признаку.
+    checks["queue"] = "приостановлена" if state.queue.is_paused else "работает"
+
+    body = {
+        "status": "ok" if healthy else "degraded",
         "version": "3.0.0",
         "uptime_s": round(time.time() - state.started_at, 1),
         "queue_paused": state.queue.is_paused,
         "catalog_date": catalog.CATALOG_DATE,
+        "checks": checks,
     }
+    return body, 200 if healthy else 503
+
+
+@router.get("/health", summary="Проверка доступности")
+def health(request: Request) -> JSONResponse:
+    state = get_state(request)
+    body, status_code = _health_body(state)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+#: Тот же ответ по адресу, куда пробы стучатся по умолчанию. Балансировщики,
+#: docker HEALTHCHECK, uptime-мониторы и kubelet спрашивают /health, а не
+#: /api/health, и настраивать это каждому — лишний шаг, на котором проверку
+#: чаще всего просто не заводят.
+health_router = APIRouter(tags=["Сервер"])
+
+
+@health_router.get("/health", summary="Проверка доступности (без префикса)")
+def health_root(request: Request) -> JSONResponse:
+    """То же самое, что GET /api/health, по общепринятому адресу.
+
+    Ключ не спрашиваем намеренно: ответ не рассказывает ничего, кроме того,
+    что сервер отвечает, а проверка, требующая ключа, однажды покажет
+    «сервер лёг» из-за отозванного ключа — и разбираться будут не с ключом.
+    """
+    state = get_state(request)
+    body, status_code = _health_body(state)
+    return JSONResponse(status_code=status_code, content=body)
 
 
 @router.post("/auth/ticket", summary="Одноразовый билет для WebSocket")

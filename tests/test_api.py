@@ -423,3 +423,75 @@ def test_form_fields_accept_declared_types(client, sample_wav: Path):
                                data={"diarization_enabled": "мусор"})
     assert response.status_code == 400
     assert "diarization_enabled" in response.json()["detail"]["message"]
+
+
+def test_health_answers_on_the_conventional_path(client):
+    """Проверка живёт и по /health, а не только под префиксом /api.
+
+    Балансировщики, docker HEALTHCHECK, uptime-мониторы и kubelet стучатся в
+    /health по умолчанию. Настраивать каждому свой путь — лишний шаг, на
+    котором проверку чаще всего просто не заводят.
+    """
+    short = client.get("/health")
+    full = client.get("/api/health")
+    assert short.status_code == 200
+    assert short.json()["status"] == full.json()["status"] == "ok"
+    assert short.json()["version"] == full.json()["version"]
+    # Ключ не спрашивается: проверка, требующая ключа, однажды покажет
+    # «сервер лёг» из-за отозванного ключа, и разбираться будут не с ключом.
+    assert "checks" in short.json()
+
+
+def test_health_says_degraded_when_the_database_is_gone(data_dir, monkeypatch):
+    """Проверка обязана отвечать отказом, когда работать нельзя.
+
+    Иначе балансировщик держит в строю сервер, который принимает запросы и
+    падает на каждом: 200 при мёртвой базе — это не «здоров», а «врёт».
+    """
+    from fastapi.testclient import TestClient
+
+    from asrhub.api.app import create_app
+
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    app = create_app(start_queue=False)
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+        state = app.state.hub
+        working = state.db
+
+        class Broken:
+            def query_one(self, *args, **kwargs):
+                raise RuntimeError("файл базы недоступен")
+
+            def __getattr__(self, name):
+                return getattr(working, name)
+
+        state.db = Broken()
+        try:
+            broken = client.get("/health")
+            assert broken.status_code == 503, "сервер объявил себя здоровым без базы"
+            assert broken.json()["status"] == "degraded"
+            assert "недоступна" in broken.json()["checks"]["database"]
+            # Тот же ответ и под префиксом: два адреса не должны расходиться.
+            assert client.get("/api/health").status_code == 503
+        finally:
+            state.db = working
+        assert client.get("/health").status_code == 200
+
+
+def test_paused_queue_is_not_an_unhealthy_server(client):
+    """Пауза очереди — это «занят по решению человека», а не поломка.
+
+    Снимать такой сервер с раздачи нельзя: он отвечает, принимает задания и
+    отдаёт готовые результаты, просто не берёт новые в работу.
+    """
+    client.post("/api/queue/pause")
+    try:
+        paused = client.get("/health")
+        assert paused.status_code == 200
+        assert paused.json()["status"] == "ok"
+        assert paused.json()["queue_paused"] is True
+        assert paused.json()["checks"]["queue"] == "приостановлена"
+    finally:
+        client.post("/api/queue/resume")
