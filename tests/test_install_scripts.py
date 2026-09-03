@@ -1484,3 +1484,133 @@ def test_directory_that_cannot_run_programs_is_refused(repo_root: Path,
     assert "ПРОПУЩЕНО" not in result.stdout
     assert "noexec" in result.stderr
     assert not list(target.glob(".asrhub-exec.*")), "проба осталась после отказа"
+
+
+def test_removing_an_engine_also_removes_the_package_itself(repo_root: Path,
+                                                            tmp_path: Path):
+    """`remove-engine` снимал зависимости, а сам движок оставлял.
+
+    Пакет, поставленный из репозитория, перечислен только в файле-спутнике,
+    и список к удалению собирался мимо него. Заодно `grep -v` возвращает
+    единицу, когда отбросил все строки, — на файле из одних комментариев
+    скрипт умирал бы под errexit молча, ничего не удалив.
+    """
+    source = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
+    block = re.search(r'(  NODEPS="\$\(dirname "\$\{REQ\}"\)/no-deps/\$\(basename "\$\{REQ\}"\)"\n'
+                      r'  PACKAGES=.*?\|\| true\)"\n)', source, re.S)
+    assert block, "не найдена сборка списка пакетов"
+
+    engines = tmp_path / "engines"
+    (engines / "no-deps").mkdir(parents=True)
+    (engines / "движок.txt").write_text(
+        "# комментарий\nхydra-core>=1.3,<2\nчисла>=2\n", encoding="utf-8")
+    (engines / "no-deps" / "движок.txt").write_text(
+        "# спутник\nсам-движок @ git+https://example.invalid/пакет.git\n", encoding="utf-8")
+
+    def packages(req: Path) -> tuple[int, str]:
+        script = f'''
+          set -Eeuo pipefail
+          REQ="{req}"
+{block.group(1)}
+          printf '%s\\n' "${{PACKAGES}}"
+        '''
+        result = run_bash(script)
+        return result.returncode, result.stdout.strip()
+
+    code, out = packages(engines / "движок.txt")
+    assert code == 0, "сборка списка оборвалась"
+    assert "сам-движок" in out, "движок из репозитория не попал в список"
+    assert "git+" not in out, "в список попал адрес репозитория"
+    assert "хydra-core" in out and ">=" not in out
+
+    # Файл из одних комментариев не должен ронять скрипт.
+    (engines / "пустой.txt").write_text("# ничего\n", encoding="utf-8")
+    code, out = packages(engines / "пустой.txt")
+    assert code == 0, "файл из одних комментариев оборвал скрипт"
+    assert out == ""
+
+
+def test_engine_list_does_not_offer_a_directory(repo_root: Path):
+    """Каталог no-deps не должен выглядеть движком.
+
+    Список доступных движков собирался как `ls` каталога с обрезанием «.txt».
+    Подкаталог со спутниками попадал в него как движок «no-deps», которого
+    не существует.
+    """
+    source = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
+    assert "ls -- *.txt" in source, "список движков собирается по всему каталогу"
+
+    result = run_bash(f'bash "{repo_root}/scripts/models.sh" install-engine несуществующий')
+    assert result.returncode == 2
+    text = result.stdout + result.stderr
+    assert "Доступные:" in text
+    assert "no-deps" not in text, "каталог предложен как движок"
+    assert "gigaam" in text, "настоящие движки пропали из списка"
+
+
+def test_scripts_that_change_things_keep_a_log(repo_root: Path):
+    """Скрипт обещал «Полный вывод: <журнал>», не заведя журнала.
+
+    models.sh печатал эту строку при неудачной установке движка, а
+    setup_logging не вызывал — и в ней стояло «журнал не велся». Заодно
+    журнал не должен подменяться у дочернего процесса: install.sh запускает
+    models.sh и service.sh отдельными bash, и записи всех троих должны лечь
+    в один файл.
+    """
+    for name in ("install.sh", "update.sh", "uninstall.sh", "models.sh",
+                 "doctor.sh", "service.sh"):
+        text = (repo_root / "scripts" / name).read_text(encoding="utf-8")
+        assert "setup_logging" in text, f"{name} не ведёт журнала"
+
+    # Доктор и управление службой штатно получают ненулевые коды, и ловушка
+    # ERR превращала бы обычный ответ в аварию — у них её быть не должно.
+    for name in ("doctor.sh", "service.sh"):
+        text = (repo_root / "scripts" / name).read_text(encoding="utf-8")
+        assert "enable_error_handling" not in text, \
+            f"{name} обрывался бы на первой же непройденной проверке"
+
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    # Имя журнала родителя задаём явно: у setup_logging оно составляется из
+    # имени скрипта и секунды, и два вызова подряд дали бы одинаковое имя —
+    # проверка прошла бы и без всякой защиты от подмены.
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      export ASRHUB_LOG_FILE="${{TMPDIR:-/tmp}}/журнал-родителя.log"
+      : > "${{ASRHUB_LOG_FILE}}"
+      # Дочерний процесс: журнал должен остаться прежним. Имена переменных
+      # латиницей — bash не принимает кириллицу в идентификаторах.
+      child="$(bash -c 'source "{common}"; setup_logging /tmp; printf "%s" "${{ASRHUB_LOG_FILE}}"')"
+      if [[ "${{ASRHUB_LOG_FILE}}" == "${{child}}" ]]; then echo ОДИН_ЖУРНАЛ; else echo "РАЗНЫЕ ${{child}}"; fi
+      rm -f "${{ASRHUB_LOG_FILE}}"
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert "ОДИН_ЖУРНАЛ" in result.stdout, result.stdout
+
+
+def test_pip_output_reaches_the_log(repo_root: Path, tmp_path: Path):
+    """Полный вывод pip обязан оказаться в журнале, а не только на экране.
+
+    Иначе обещание «Полный вывод: <журнал>» остаётся пустым: разбор называет
+    причину, но подробности исчезают вместе с окном терминала.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    log = tmp_path / "журнал.log"
+    fake_pip = tmp_path / "pip"
+    fake_pip.write_text('#!/usr/bin/env bash\n'
+                        'echo "ERROR: очень подробная причина отказа"\n'
+                        'exit 1\n', encoding="utf-8")
+    fake_pip.chmod(0o755)
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      ASRHUB_LOG_FILE="{log}"
+      : > "${{ASRHUB_LOG_FILE}}"
+      pip_install "{fake_pip}" 1 --disable-pip-version-check пакет || true
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    body = log.read_text(encoding="utf-8")
+    assert "очень подробная причина отказа" in body, "вывод pip не попал в журнал"
+    assert "вывод pip" in body, "нет разметки, по которой его найти"

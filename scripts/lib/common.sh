@@ -544,6 +544,16 @@ pip_install() {
   unset ASRHUB_RETRY_LABEL
   if [[ ${status} -ne 0 ]]; then
     diagnose_pip_failure "${capture}" "$(dirname "${pip}")/python" "${offline}" || true
+    # Полный вывод кладём в журнал: скрипты обещают его строкой «Полный
+    # вывод: …», а до сих пор обещание было пустым — вывод жил только на
+    # экране и пропадал вместе с ним.
+    if [[ -n "${ASRHUB_LOG_FILE:-}" ]]; then
+      {
+        printf '\n----- вывод pip -----\n'
+        cat "${capture}"
+        printf '----- конец вывода pip -----\n'
+      } >> "${ASRHUB_LOG_FILE}" 2>/dev/null || true
+    fi
   fi
   rm -f "${capture}" 2>/dev/null || true
   return "${status}"
@@ -938,6 +948,13 @@ human_size() {
 }
 
 setup_logging() {
+  # Уже заданный журнал не подменяем: install.sh запускает service.sh и
+  # models.sh отдельными процессами, и записи всех троих должны лечь в один
+  # файл — иначе искать причину придётся в трёх.
+  if [[ -n "${ASRHUB_LOG_FILE:-}" ]]; then
+    debug "журнал уже задан: ${ASRHUB_LOG_FILE}"
+    return 0
+  fi
   local dir="${1:-/tmp}"
   mkdir -p "${dir}" 2>/dev/null || dir="/tmp"
   ASRHUB_LOG_FILE="${dir}/asrhub-$(basename "${0%.sh}")-$(date +%Y%m%d-%H%M%S).log"

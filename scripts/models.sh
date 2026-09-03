@@ -17,6 +17,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/detect.sh"
 
+# Ловушка ошибок и журнал. Без них сбой внутри функции завершал скрипт кодом 1
+# молча, а обещание «Полный вывод: <журнал>» в конце неудачной установки
+# движка было пустым: журнал никто не заводил.
+enable_error_handling
+setup_logging "${TMPDIR:-/tmp}"
+
 usage() {
   # Справка — это шапка файла: печатаем комментарии до первой строки кода,
   # чтобы добавленная команда попадала в справку сама собой.
@@ -369,7 +375,8 @@ install-engine)
   [[ -f "${REQ}" ]] || REQ="${SCRIPT_DIR}/../requirements/engines/${ENGINE//_/-}.txt"
   if [[ ! -f "${REQ}" ]]; then
     error "Нет файла зависимостей для движка «${ENGINE}»."
-    hint "Доступные: $(ls "${SCRIPT_DIR}/../requirements/engines/" 2>/dev/null | sed 's/.txt//' | tr '\n' ' ')"
+    hint "Доступные: $(cd "${SCRIPT_DIR}/../requirements/engines" 2>/dev/null \
+      && ls -- *.txt 2>/dev/null | sed 's/\.txt$//' | tr '\n' ' ')"
     exit 2
   fi
   VPIP="${PREFIX}/venv/bin/pip"
@@ -460,7 +467,18 @@ remove-engine)
   REQ="${SCRIPT_DIR}/../requirements/engines/${ENGINE//_/-}.txt"
   [[ -f "${REQ}" ]] || { error "Нет файла зависимостей для «${ENGINE}»."; exit 2; }
   VPIP="${PREFIX}/venv/bin/pip"
-  PACKAGES="$(grep -vE '^\s*(#|$|--)' "${REQ}" | sed 's/[<>=!].*//' | tr '\n' ' ')"
+  # Читаем и файл-спутник: движок, поставленный из репозитория, перечислен
+  # только в нём, и без этого «remove-engine gigaam» снимал зависимости, а
+  # сам gigaam оставлял в окружении.
+  #
+  # `|| true` не для красоты: grep -v возвращает единицу, когда отбросил всё,
+  # то есть на файле из одних комментариев — и под errexit скрипт умирал бы
+  # молча, ничего не удалив.
+  NODEPS="$(dirname "${REQ}")/no-deps/$(basename "${REQ}")"
+  PACKAGES="$(cat "${REQ}" "${NODEPS}" 2>/dev/null \
+    | grep -vE '^\s*(#|$|--)' \
+    | sed -e 's/[[:space:]]*@.*//' -e 's/[<>=!].*//' \
+    | tr '\n' ' ' || true)"
   info "Будут удалены пакеты: ${PACKAGES}"
   warn "Некоторые пакеты могут использоваться другими движками."
   confirm "Продолжить?" "n" || exit 0

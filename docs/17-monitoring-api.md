@@ -122,7 +122,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 16.2
+asrhub_uptime_seconds 15.9
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -156,8 +156,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788425823.255785,
-  "collected_at": "2026-09-03T08:57:03+0000",
+  "timestamp": 1788428028.6692514,
+  "collected_at": "2026-09-03T09:33:48+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -234,7 +234,7 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 16.2,
+  "uptime_s": 16.0,
   "liveness": {
     "status": "ok",
     "checks": [
@@ -270,7 +270,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 16.3 ГБ",
+        "detail": "свободно 16.2 ГБ",
         "hint": ""
       },
       {
@@ -337,7 +337,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 16.3 ГБ",
+      "detail": "свободно 16.2 ГБ",
       "hint": ""
     },
     {

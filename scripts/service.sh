@@ -9,6 +9,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/detect.sh"
 
+# Журнал есть, а ловушки ERR нет — намеренно: и доктор, и управление
+# службой штатно получают ненулевые коды (проверка не прошла, служба
+# остановлена), и обрывать на них работу значило бы превращать обычный
+# ответ в аварию.
+setup_logging "${TMPDIR:-/tmp}"
+
 ACTION="${1:-status}"; shift || true
 
 PREFIX="/opt/asrhub"

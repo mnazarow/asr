@@ -79,6 +79,22 @@ requirements/engines/no-deps/gigaam.txt  сам пакет — ставится 
 
 Так же можно поступить с любым другим движком: положите файл с его именем в `requirements/engines/no-deps/`, а зависимости перечислите в обычном файле. Подкаталог, а не сосед по имени, потому что `update.sh` перебирает `engines/*.txt` и принял бы соседний файл за отдельный движок.
 
+**Если исправление ещё не доехало до сервера.** Файлы требований лежат в самой установке (`/opt/asrhub/requirements/`), и `models.sh` читает их оттуда, а не из репозитория. Пока установка не обновлена, движок можно поставить теми же двумя командами вручную:
+
+```bash
+/opt/asrhub/venv/bin/pip install --disable-pip-version-check \
+  'hydra-core>=1.3,<2' 'omegaconf>=2.3,<3' 'sentencepiece>=0.2' \
+  'soundfile>=0.12' 'tqdm>=4.60' 'numpy>=2,<3' 'onnxruntime>=1.17'
+/opt/asrhub/venv/bin/pip install --disable-pip-version-check --no-deps \
+  'gigaam @ git+https://github.com/salute-developers/GigaAM.git'
+```
+
+А саму установку обновить из свежего дистрибутива:
+
+```bash
+sudo bash /opt/asrhub/scripts/update.sh --source /путь/к/новому/asr-hub
+```
+
 ### Установка PyTorch падает или тянет не ту сборку
 
 Скрипт выбирает индекс по найденному ускорителю. Если определение ошиблось, укажите явно:
