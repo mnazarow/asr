@@ -14,6 +14,10 @@
 
 ASRHUB_PCI_ROOT="${ASRHUB_PCI_ROOT:-/sys/bus/pci/devices}"
 
+# Где искать базу имён устройств (файл pci.ids из пакета hwdata). Список
+# путей через пробел; переопределяется в тестах по той же причине, что и
+# ASRHUB_PCI_ROOT.
+
 # Идентификаторы производителей на шине PCI.
 PCI_VENDOR_NVIDIA="0x10de"
 PCI_VENDOR_AMD="0x1002"
@@ -144,6 +148,19 @@ gpu_model_name() {
     line="$(lspci -s "${address}" 2>/dev/null | sed 's/^[^ ]* [^:]*: //')"
     [[ -n "${line}" ]] && { printf '%s' "${line}"; return 0; }
   fi
+  # Та же база имён без lspci: файл pci.ids ставится пакетом hwdata и лежит
+  # на большинстве систем сам по себе. Ищем строку модели внутри блока
+  # производителя — без него в отчёте оставалось «NVIDIA (устройство 0x2684)»,
+  # по которому человек не узнаёт свою карту.
+  local ids name
+  for ids in ${ASRHUB_PCI_IDS:-/usr/share/hwdata/pci.ids /usr/share/misc/pci.ids /usr/share/pci.ids}; do
+    [[ -r "${ids}" ]] || continue
+    name="$(awk -v vend="${vendor#0x}" -v dev="${3#0x}" '
+      $0 ~ "^"vend"  " { inside = 1; next }
+      /^[0-9a-f]/     { inside = 0 }
+      inside && $1 == dev { sub("^\t"dev"  ", ""); print; exit }' "${ids}" 2>/dev/null)"
+    [[ -n "${name}" ]] && { printf '%s' "${name}"; return 0; }
+  done
   printf '%s' "$(gpu_vendor_label "${vendor}") (устройство $3)"
 }
 
@@ -163,6 +180,28 @@ gpu_primary() {
     if [[ ${rank} -gt ${best_rank} ]]; then best_rank=${rank}; best="${line}"; fi
   done < <(gpu_scan)
   printf '%s' "${best}"
+}
+
+gpu_pending() {
+  # Карта, которая заработает после установки драйвера.
+  #
+  # Печатает «ключ_вендора|модель», если на шине есть дискретная карта, а
+  # драйвер для неё ещё не готов; иначе пусто.
+  #
+  # Нужна потому, что `detect_gpu` отвечает на другой вопрос — «что работает
+  # прямо сейчас», и на свежей машине честно отвечает «процессор». Отчёт об
+  # окружении спрашивал только его и поэтому молчал о карте, которую сам же
+  # установщик через минуту и включит: человек с RTX 4090 видел строку
+  # «Ускоритель cpu», ни слова о видеокарте и предложенный профиль «light».
+  local line address vendor device discrete state
+  line="$(gpu_primary)"
+  [[ -n "${line}" ]] || return 0
+  IFS='|' read -r address vendor device discrete _ <<< "${line}"
+  [[ "${discrete}" == "1" ]] || return 0
+  state="$(gpu_driver_state "${vendor}")"
+  [[ "${state}" == "ready" ]] && return 0
+  printf '%s|%s' "$(gpu_vendor_key "${vendor}")" \
+    "$(gpu_model_name "${vendor}" "${address}" "${device}")"
 }
 
 gpu_driver_state() {

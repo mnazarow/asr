@@ -234,8 +234,10 @@ def test_installer_picks_gpu_wheels_before_reboot(pci_tree, repo_root: Path,
 
 
 @pytest.mark.parametrize("flag,expect_install,expect_text", [
-    (["--no-gpu-driver"], False, "Видеокарта       NVIDIA"),
-    (["--gpu-driver", "none"], False, "Видеокарта       NVIDIA"),
+    # Имя карты берётся из lspci или pci.ids, а их на сборочной машине может
+    # не быть — проверяем сам факт строки, а не её содержимое.
+    (["--no-gpu-driver"], False, "Видеокарта  "),
+    (["--gpu-driver", "none"], False, "Видеокарта  "),
     (["--gpu-driver", "amd"], False, "не совпал с найденной картой"),
     (["--gpu-driver", "auto"], True, "Здесь был бы установлен драйвер nvidia"),
     ([], True, "Здесь был бы установлен драйвер nvidia"),
@@ -433,3 +435,126 @@ def test_troubleshooting_covers_driver_states(repo_root: Path):
     for phrase in ("Secure Boot", "dkms autoinstall", "HSA_OVERRIDE_GFX_VERSION",
                    "render,video"):
         assert phrase in text, f"в главе про неполадки нет разбора: {phrase}"
+
+
+# ---------------------------------------------------------------------------
+# Отчёт об окружении: карта, для которой драйвер ещё не поставлен
+# ---------------------------------------------------------------------------
+
+
+def _run_without_driver_tools(root: Path, repo_root: Path, snippet: str,
+                              tmp_path: Path) -> str:
+    """Тот же прогон, но в PATH нет ни nvidia-smi, ни rocm-smi.
+
+    Именно так выглядит свежая машина: карта в слоте, драйвера нет — и
+    `detect_gpu` честно отвечает «процессор».
+    """
+    stub = tmp_path / "чистый-path"
+    stub.mkdir(exist_ok=True)
+    for name in ("bash", "awk", "sed", "tr", "cut", "basename", "dirname", "uname",
+                 "cat", "head", "grep", "printf", "date", "df", "nproc", "getconf",
+                 "sort", "stat", "command", "ls", "mkdir", "python3"):
+        source = shutil.which(name)
+        if source and not (stub / name).exists():
+            (stub / name).symlink_to(source)
+    script = textwrap.dedent(f"""
+        set -o errexit -o nounset -o pipefail
+        source "{repo_root}/scripts/lib/common.sh"
+        source "{repo_root}/scripts/lib/detect.sh"
+        source "{repo_root}/scripts/lib/gpu.sh"
+        {snippet}
+    """)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{stub}:/usr/bin:/bin", "ASRHUB_PCI_ROOT": str(root),
+             "ASRHUB_QUIET": "0", "HOME": str(tmp_path), "TERM": "dumb"},
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_environment_report_shows_a_card_without_a_driver(pci_tree, repo_root: Path,
+                                                          tmp_path: Path):
+    """Установщик молчал о видеокарте, для которой сам же ставит драйвер.
+
+    `print_environment` спрашивал только `detect_gpu`, а тот опирается на
+    `nvidia-smi` — на свежей машине его нет. Человек с RTX 4090 читал
+    «Ускоритель cpu», ни слова о видеокарте, и шёл выяснять, почему
+    установщик её не видит. Шина PCI при этом карту показывала: ровно ради
+    этого gpu.sh и написан.
+    """
+    root = pci_tree("rtx4090")
+    out = _run_without_driver_tools(root, repo_root, "print_environment", tmp_path)
+    assert "Ускоритель" in out
+    assert "Видеокарта" in out, "карта на шине не упомянута в отчёте"
+    assert "драйвер не установлен" in out, "не сказано, почему ускоритель «cpu»"
+
+
+def test_profile_accounts_for_the_driver_about_to_be_installed(pci_tree,
+                                                               repo_root: Path,
+                                                               tmp_path: Path):
+    """Профиль подбирался для машины без видеокарты — за минуту до установки драйвера.
+
+    Установка без вопросов на машине с RTX 4090 выбирала «light»:
+    faster-whisper small на видеокарте, купленной ради больших моделей.
+    """
+    root = pci_tree("rtx4090")
+    blind = _run_without_driver_tools(root, repo_root, "recommend_profile", tmp_path)
+    aware = _run_without_driver_tools(root, repo_root, "recommend_profile 1", tmp_path)
+    assert blind.strip() == "light", "исходное поведение изменилось — проверьте тест"
+    assert aware.strip() == "standard", \
+        f"профиль по-прежнему выбирается без учёта карты: {aware.strip()!r}"
+
+
+def test_integrated_graphics_does_not_inflate_the_profile(pci_tree, repo_root: Path,
+                                                          tmp_path: Path):
+    """Видеоядро в процессоре — не повод ставить набор для машины с картой."""
+    root = pci_tree("intel_igpu")
+    aware = _run_without_driver_tools(root, repo_root, "recommend_profile 1", tmp_path)
+    assert aware.strip() in ("light", "cpu"), \
+        f"встроенная графика принята за видеокарту: {aware.strip()!r}"
+    out = _run_without_driver_tools(root, repo_root, "print_environment", tmp_path)
+    assert "драйвер не установлен" not in out, \
+        "отчёт обещает драйвер для встроенной графики"
+
+
+def test_no_card_report_is_unchanged(pci_tree, repo_root: Path, tmp_path: Path):
+    """На машине без видеокарты отчёт остаётся прежним — без лишних строк."""
+    out = _run_without_driver_tools(pci_tree(), repo_root, "print_environment", tmp_path)
+    assert "Ускоритель" in out
+    assert "Видеокарта" not in out
+
+
+def test_model_name_comes_from_the_local_database(repo_root: Path, tmp_path: Path):
+    """«NVIDIA (устройство 0x2684)» — не тот ответ, по которому узнают свою карту.
+
+    lspci есть не везде, а файл pci.ids из пакета hwdata лежит на
+    большинстве систем сам по себе.
+    """
+    ids = tmp_path / "pci.ids"
+    ids.write_text("10de  NVIDIA Corporation\n"
+                   "\t2684  AD102 [GeForce RTX 4090]\n"
+                   "\t2685  AD102 другое устройство\n"
+                   "1002  Advanced Micro Devices, Inc. [AMD/ATI]\n"
+                   "\t744c  Navi 31 [Radeon RX 7900 XT/XTX]\n", encoding="utf-8")
+    script = textwrap.dedent(f"""
+        set -o errexit -o nounset -o pipefail
+        source "{repo_root}/scripts/lib/common.sh"
+        source "{repo_root}/scripts/lib/detect.sh"
+        source "{repo_root}/scripts/lib/gpu.sh"
+        gpu_model_name 0x10de 0000:01:00.0 0x2684
+        printf '\n'
+        gpu_model_name 0x1002 0000:03:00.0 0x744c
+        printf '\n'
+        gpu_model_name 0x10de 0000:01:00.0 0xffff
+    """)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": "/usr/bin:/bin", "ASRHUB_PCI_IDS": str(ids), "ASRHUB_QUIET": "1"},
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "AD102 [GeForce RTX 4090]", lines
+    assert lines[1] == "Navi 31 [Radeon RX 7900 XT/XTX]", lines
+    # Неизвестное устройство не должно превращаться в чужое имя.
+    assert "GeForce" not in lines[2] and "0xffff" in lines[2], lines

@@ -402,3 +402,112 @@ def test_stale_neighbour_does_not_block_anything(repo_root: Path, tmp_path: Path
     common = repo_root / "scripts" / "lib" / "common.sh"
     found = run_bash(f'source "{common}"; other_instances "{data}"').stdout.strip()
     assert found == "", f"молчащий экземпляр посчитан живым: {found!r}"
+
+
+# ---------------------------------------------------------------------------
+# Виртуальное окружение Python
+# ---------------------------------------------------------------------------
+
+
+def _fake_python(directory: Path, version: str = "3.14", *,
+                 has_ensurepip: bool = False) -> Path:
+    """Интерпретатор, у которого venv есть, а ensurepip нет.
+
+    Ровно так выглядит Debian и Ubuntu без пакета pythonX.Y-venv.
+    """
+    path = directory / "python3"
+    ensurepip = "exit 0" if has_ensurepip else "exit 1"
+    path.write_text(f'''#!/bin/sh
+case "$*" in
+  *"import ensurepip"*) {ensurepip} ;;
+  *"import venv"*) exit 0 ;;
+  *"-m venv"*)
+      echo "The virtual environment was not created successfully because" >&2
+      echo "ensurepip is not available." >&2
+      exit 1 ;;
+  *version_info*) echo "{version}" ;;
+  -V|--version) echo "Python {version}.0" ;;
+  *) exec /usr/bin/python3 "$@" ;;
+esac
+''', encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _fake_apt_cache(directory: Path, known: tuple[str, ...]) -> None:
+    listed = "|".join(known)
+    path = directory / "apt-cache"
+    path.write_text(f'#!/bin/sh\ncase "$2" in\n  {listed}) exit 0 ;;\n'
+                    '  *) exit 100 ;;\nesac\n', encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_missing_ensurepip_is_noticed_before_the_venv_is_built(repo_root: Path,
+                                                               tmp_path: Path):
+    """Проверялся `import venv`, а ломался `ensurepip`.
+
+    `venv` — часть стандартной библиотеки и импортируется всегда, даже когда
+    пакета pythonX.Y-venv нет. В Debian и Ubuntu именно в нём лежит
+    ensurepip, без которого `python -m venv` доходит до конца и падает — уже
+    после того, как каталоги созданы. Установка сваливалась в откат на
+    шестом шаге вместо того, чтобы поставить один пакет на втором.
+    """
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    python = _fake_python(stub)
+    _fake_apt_cache(stub, ("python3.14-venv", "python3.14-dev", "ffmpeg", "git"))
+
+    result = subprocess.run(
+        [BASH, str(repo_root / "scripts" / "install.sh"), "--dry-run",
+         "--no-interactive", "--yes", "--profile", "light", "--skip-models",
+         "--no-service", "--offline", "--prefix", str(tmp_path / "app"),
+         "--data", str(tmp_path / "data")],
+        env={**os.environ, "PATH": f"{stub}:/usr/bin:/bin",
+             "ASRHUB_PYTHON": str(python)},
+        capture_output=True, text=True, timeout=300, cwd=str(repo_root))
+    assert result.returncode == 0, result.stdout[-1500:]
+    assert "python3.14-venv" in result.stdout, \
+        f"пакет venv не попал в список недостающих:\n{result.stdout[-1500:]}"
+
+
+def test_venv_package_name_follows_the_chosen_interpreter(repo_root: Path,
+                                                          tmp_path: Path):
+    """Метапакет python3-venv тянет ensurepip для ДРУГОГО интерпретатора.
+
+    Если сервер ставится на python3.14 из стороннего репозитория, а мы
+    просим python3-venv, ensurepip так и не появится — установка упадёт
+    второй раз тем же способом.
+    """
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    _fake_python(stub)
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    detect = repo_root / "scripts" / "lib" / "detect.sh"
+
+    def names(known: tuple[str, ...]) -> str:
+        _fake_apt_cache(stub, known)
+        script = (f'source "{common}"; source "{detect}"; '
+                  f'export ASRHUB_PYTHON_FOR_PACKAGES="{stub}/python3"; '
+                  'system_package_names python-venv')
+        return subprocess.run([BASH, "-c", script],
+                              env={**os.environ, "PATH": f"{stub}:/usr/bin:/bin"},
+                              capture_output=True, text=True, timeout=60).stdout
+
+    assert "python3.14-venv" in names(("python3.14-venv", "python3.14-dev")), \
+        "версионный пакет не выбран"
+    # Если версионного пакета в репозитории нет — берём метапакет, иначе apt
+    # отвергнет всю установку целиком из-за одного несуществующего имени.
+    assert names(("python3-venv", "python3-dev")).split() == ["python3-venv", "python3-dev"]
+
+
+def test_venv_failure_names_the_package_to_install(repo_root: Path):
+    """Отказ обязан заканчиваться командой, а не общим «смотрите выше».
+
+    Сообщение интерпретатора правильное, но теряется среди строк отката.
+    """
+    text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = text.split('step "Виртуальное окружение Python"', 1)[1][:2000]
+    assert "Не удалось создать виртуальное окружение" in block
+    assert "import ensurepip" in block, "причина не различается"
+    assert "sudo apt install ${VENV_PKG}" in block, "нет готовой команды"
+    assert "--python /usr/bin/python3.12" in block, "не предложен другой интерпретатор"

@@ -52,6 +52,35 @@ detect_package_manager() {
   printf 'none'
 }
 
+# Пакет venv под тот интерпретатор, которым будем ставить сервер.
+# Проверяем, что такой пакет вообще есть в репозиториях: иначе apt отвергнет
+# всю установку целиком из-за одного несуществующего имени.
+_apt_venv_package() {
+  local version candidate
+  version="$("${ASRHUB_PYTHON_FOR_PACKAGES:-python3}" -c \
+             'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ -n "${version}" ]]; then
+    candidate="python${version}-venv"
+    if apt-cache show "${candidate}" >/dev/null 2>&1; then
+      printf '%s' "${candidate}"; return 0
+    fi
+  fi
+  printf 'python3-venv'
+}
+
+_apt_python_dev_package() {
+  local version candidate
+  version="$("${ASRHUB_PYTHON_FOR_PACKAGES:-python3}" -c \
+             'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ -n "${version}" ]]; then
+    candidate="python${version}-dev"
+    if apt-cache show "${candidate}" >/dev/null 2>&1; then
+      printf '%s' "${candidate}"; return 0
+    fi
+  fi
+  printf 'python3-dev'
+}
+
 install_system_packages() {
   # install_system_packages ffmpeg git build-essential
   local manager; manager="$(detect_package_manager)"
@@ -84,7 +113,12 @@ system_package_names() {
     build:pacman)        printf 'base-devel' ;;
     build:apk)           printf 'build-base' ;;
     build:brew)          printf '' ;;
-    python-venv:apt-get) printf 'python3-venv python3-dev' ;;
+    # Имя версионное: на Ubuntu пакет называется python3.12-venv,
+    # python3.14-venv и так далее, а метапакет python3-venv тянет venv для
+    # ИНОГО интерпретатора — того, что считается системным. Если сервер
+    # ставится на python3.14 из стороннего репозитория, метапакет не поможет:
+    # ensurepip так и не появится, а venv будет создаваться и падать в конце.
+    python-venv:apt-get) printf '%s %s' "$(_apt_venv_package)" "$(_apt_python_dev_package)" ;;
     python-venv:dnf|python-venv:yum) printf 'python3-devel' ;;
     python-venv:*)       printf '' ;;
     sndfile:apt-get)     printf 'libsndfile1' ;;
@@ -189,6 +223,17 @@ print_environment() {
   printf '  Ускоритель       %s\n' "${accel}"
   [[ -n "${gpu_name}" ]] && printf '  Видеокарта       %s (%s МБ)\n' "${gpu_name}" "${gpu_mem}"
   [[ -n "${cuda}" ]] && printf '  CUDA             %s\n' "${cuda}"
+  # Карта без драйвера: `detect_gpu` о ней не знает — он отвечает на вопрос
+  # «что работает сейчас», — а `nvidia-smi` на свежей машине не установлен,
+  # поэтому и строка «Видеокарта» выше не печаталась. Спрашиваем шину: иначе
+  # человек с RTX 4090 читает «Ускоритель cpu» и не понимает, что произошло.
+  if [[ "${accel}" == "cpu" ]] && declare -F gpu_pending >/dev/null 2>&1; then
+    local pending; pending="$(gpu_pending || true)"
+    if [[ -n "${pending}" ]]; then
+      printf '  Видеокарта       %s%s%s\n' "${C_YELLOW}" "${pending#*|}" "${C_RESET}"
+      printf '                   найдена на шине, драйвер не установлен\n'
+    fi
+  fi
   printf '  Менеджер пакетов %s\n' "$(detect_package_manager)"
   printf '  ffmpeg           %s\n' "$(have ffmpeg && ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f3 || echo 'не найден')"
   printf '\n'
@@ -196,9 +241,27 @@ print_environment() {
 
 # Рекомендуемый профиль установки под обнаруженное железо.
 recommend_profile() {
+  # recommend_profile [with_pending]
+  #
+  # with_pending=1 означает «драйвер поставим прямо сейчас», и тогда карта на
+  # шине считается рабочей. Без этого установщик подбирал профиль для машины
+  # без видеокарты, а через минуту сам же ставил драйвер: человек с RTX 4090
+  # получал предложение «light» — faster-whisper small.
+  local with_pending="${1:-0}"
   local accel; accel="$(detect_gpu)"
   local ram; ram="$(detect_ram_gb)"
   local gpu_mem; gpu_mem="$(detect_gpu_memory_mb)"
+  if [[ "${accel}" == "cpu" && "${with_pending}" == "1" ]] \
+     && declare -F gpu_pending >/dev/null 2>&1; then
+    local pending; pending="$(gpu_pending || true)"
+    case "${pending%%|*}" in
+      # Объём видеопамяти без драйвера неизвестен, поэтому берём «standard»:
+      # он рассчитан на машину с картой и не требует шестидесяти гигабайт
+      # диска, как «full».
+      nvidia) printf 'standard'; return 0 ;;
+      amd)    printf 'standard'; return 0 ;;
+    esac
+  fi
   case "${accel}" in
     cuda)
       if [[ "${gpu_mem}" -ge 20000 ]]; then printf 'full'

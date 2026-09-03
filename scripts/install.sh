@@ -174,7 +174,12 @@ print_banner
 OS="$(detect_os)"
 ARCH="$(detect_arch)"
 ACCEL="$(detect_gpu)"
-[[ -z "${PROFILE}" ]] && PROFILE="$(recommend_profile)"
+# Профиль по умолчанию — с учётом карты, драйвер для которой поставим сами.
+# Без этого установка без вопросов на машине с RTX 4090 выбирала «light»:
+# faster-whisper small на видеокарте за две тысячи долларов.
+GPU_PENDING_DRIVER=0
+[[ "${GPU_DRIVER}" != "none" && "${OS}" == "linux" ]] && GPU_PENDING_DRIVER=1
+[[ -z "${PROFILE}" ]] && PROFILE="$(recommend_profile "${GPU_PENDING_DRIVER}")"
 
 if [[ -z "${PREFIX}" ]]; then
   case "${OS}" in
@@ -260,6 +265,13 @@ run_wizard() {
     mps)  accel_label="Apple Silicon (Metal)" ;;
     *)    accel_label="только процессор" ;;
   esac
+  # «Только процессор» при видеокарте на шине — правда лишь до установки
+  # драйвера, и как итог обследования читается неверно.
+  if [[ "${ACCEL}" == "cpu" ]]; then
+    local pending_label; pending_label="$(gpu_pending || true)"
+    [[ -n "${pending_label}" ]] && \
+      accel_label="процессор (видеокарта найдена, драйвера ещё нет)"
+  fi
 
   wizard_step "Установка ASR Hub" \
     "Enter принимает предложенное значение — оно подобрано по вашему железу"
@@ -287,8 +299,12 @@ run_wizard() {
   fi
 
   # --- 1. Что ставим ------------------------------------------------------
+  # Единица означает «драйвер поставим прямо сейчас»: карта на шине считается
+  # рабочей. Иначе профиль подбирался для машины без видеокарты, а через
+  # минуту установщик сам же ставил драйвер — человек с RTX 4090 получал
+  # предложение «light».
   local default_profile=1
-  case "$(recommend_profile)" in
+  case "$(recommend_profile "${GPU_PENDING_DRIVER}")" in
     light) default_profile=1 ;; cpu) default_profile=2 ;;
     standard) default_profile=3 ;; russian) default_profile=4 ;;
     apple) default_profile=5 ;; full) default_profile=6 ;;
@@ -504,7 +520,15 @@ MISSING_SYS=()
 have ffmpeg || MISSING_SYS+=("$(system_package_names ffmpeg)")
 have git || MISSING_SYS+=("$(system_package_names git)")
 if [[ "${MODE}" == "native" ]]; then
-  if ! "${PY}" -c 'import venv' >/dev/null 2>&1; then
+  # Имя пакета зависит от версии выбранного интерпретатора — сообщаем её.
+  export ASRHUB_PYTHON_FOR_PACKAGES="${PY}"
+  # Проверять надо ensurepip, а не venv: venv — часть стандартной библиотеки
+  # и импортируется всегда, даже когда пакета python3.X-venv нет. В Debian и
+  # Ubuntu в этом пакете лежит именно ensurepip, без которого `python -m venv`
+  # доходит до конца и падает словами «ensurepip is not available» — уже
+  # после того, как каталоги созданы. Проверка смотрела на venv и поэтому
+  # ничего не находила.
+  if ! "${PY}" -c 'import ensurepip' >/dev/null 2>&1; then
     MISSING_SYS+=($(system_package_names python-venv))
   fi
   [[ "${ENGINES}" == *nemo* ]] && MISSING_SYS+=($(system_package_names sndfile))
@@ -687,7 +711,22 @@ else
   step "Виртуальное окружение Python"
 
   if [[ ! -d "${VENV}" ]]; then
-    run "${PY}" -m venv "${VENV}"
+    if ! run "${PY}" -m venv "${VENV}"; then
+      # Самая частая причина в Debian и Ubuntu — отсутствующий ensurepip.
+      # Сообщение интерпретатора выше правильное, но теряется среди отката,
+      # поэтому повторяем его своими словами и с готовой командой.
+      error "Не удалось создать виртуальное окружение Python."
+      if ! "${PY}" -c 'import ensurepip' >/dev/null 2>&1; then
+        VENV_PKG="$(system_package_names python-venv)"
+        hint "В этой сборке Python нет ensurepip — он поставляется отдельным пакетом."
+        hint "Установите его и повторите: sudo apt install ${VENV_PKG}"
+        hint "Интерпретатор: ${PY} ($("${PY}" -V 2>&1))"
+      else
+        hint "Проверьте права на «${PREFIX}» и свободное место на диске."
+      fi
+      hint "Другой интерпретатор можно задать ключом: --python /usr/bin/python3.12"
+      exit 1
+    fi
     add_rollback "rm -rf '${VENV}'"
   fi
   VPY="${VENV}/bin/python"
