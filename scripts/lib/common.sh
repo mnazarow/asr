@@ -39,6 +39,13 @@ shopt -s inherit_errexit 2>/dev/null || true
 
 ASRHUB_VERSION="3.0.0"
 ASRHUB_MIN_PYTHON="3.10"
+# Верхняя граница — не каприз, а состояние экосистемы. Движки распознавания
+# тянут за собой torch, onnxruntime, nemo и десяток библиотек с колёсами под
+# конкретные версии Python; на версии новее поддерживаемой их просто нет, и
+# установка обрывается не у нас, а внутри pip — на восьмом шаге, когда всё
+# остальное уже сделано. Пример: GigaAM требует onnxruntime==1.23.*, а у
+# 1.23 колёса есть только до cp313 включительно.
+ASRHUB_MAX_PYTHON="${ASRHUB_MAX_PYTHON:-3.13}"
 ASRHUB_DEFAULT_PORT="8080"
 
 : "${ASRHUB_LOG_FILE:=}"
@@ -299,6 +306,11 @@ require_command() {
   debug "найдено: ${cmd} -> $(command -v "${cmd}")"
 }
 
+version_gt() {
+  # Строго больше: «3.14 новее 3.13», но «3.13» не новее самой себя.
+  [[ "$1" != "$2" ]] && version_ge "$1" "$2"
+}
+
 version_ge() {
   # version_ge 3.11.2 3.10  -> истина
   printf '%s\n%s\n' "$2" "$1" | sort -V -C
@@ -322,19 +334,48 @@ check_python() {
       error "Указан Python ${forced_version}, требуется ${ASRHUB_MIN_PYTHON} или новее."
       return 1
     fi
+    if version_gt "${forced_version}" "${ASRHUB_MAX_PYTHON}"; then
+      # Заданное явно — уважаем, но предупреждаем: человек мог не знать,
+      # что колёс под эту версию ещё нет.
+      warn "Python ${forced_version} новее проверенной версии ${ASRHUB_MAX_PYTHON}."
+      hint "Часть движков может не установиться: под свежие версии Python"
+      hint "колёса torch, onnxruntime и nemo выходят с задержкой в месяцы."
+    fi
     printf '%s' "${ASRHUB_PYTHON}"
     debug "используется заданный интерпретатор ${ASRHUB_PYTHON} версии ${forced_version}"
     return 0
   fi
+  # Два прохода. Сначала ищем интерпретатор в проверенном диапазоне, и только
+  # если такого нет — берём слишком новый, о чём честно предупреждаем. Раньше
+  # проход был один и брал первый подходящий «снизу»: на машине, где есть
+  # только python3.14, установка шла на нём и разваливалась внутри pip.
+  local too_new="" too_new_version=""
   for candidate in python3.13 python3.12 python3.11 python3.10 python3 python; do
     have "${candidate}" || continue
     local version
     version="$("${candidate}" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || continue
-    if version_ge "${version}" "${ASRHUB_MIN_PYTHON}"; then
-      best="${candidate}"; best_version="${version}"
-      break
+    version_ge "${version}" "${ASRHUB_MIN_PYTHON}" || continue
+    if version_gt "${version}" "${ASRHUB_MAX_PYTHON}"; then
+      [[ -z "${too_new}" ]] && { too_new="${candidate}"; too_new_version="${version}"; }
+      continue
     fi
+    best="${candidate}"; best_version="${version}"
+    break
   done
+  if [[ -z "${best}" && -n "${too_new}" ]]; then
+    best="${too_new}"; best_version="${too_new_version}"
+    warn "Найден только Python ${best_version} — он новее проверенной версии ${ASRHUB_MAX_PYTHON}."
+    hint "Часть движков под него не соберётся: колёса torch, onnxruntime и"
+    hint "nemo выходят с задержкой в месяцы. Например, GigaAM требует"
+    hint "onnxruntime==1.23.*, а у него колёс новее cp313 нет."
+    case "$(uname -s)" in
+      Linux)  hint "Поставьте проверенную версию и повторите:";
+              hint "  sudo apt install python${ASRHUB_MAX_PYTHON} python${ASRHUB_MAX_PYTHON}-venv python${ASRHUB_MAX_PYTHON}-dev";
+              hint "  затем: bash scripts/install.sh --python /usr/bin/python${ASRHUB_MAX_PYTHON}" ;;
+      Darwin) hint "Поставьте проверенную версию: brew install python@${ASRHUB_MAX_PYTHON}";
+              hint "затем: bash scripts/install.sh --python \"\$(brew --prefix)/bin/python${ASRHUB_MAX_PYTHON}\"" ;;
+    esac
+  fi
   if [[ -z "${best}" ]]; then
     error "Не найден Python ${ASRHUB_MIN_PYTHON} или новее."
     case "$(uname -s)" in

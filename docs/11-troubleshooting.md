@@ -136,6 +136,33 @@ lspci | grep -Ei 'vga|3d|display'   # что на шине на самом де�
 
 Если `lspci` карту показывает, а установщик нет — пришлите вывод `ls /sys/bus/pci/devices/*/class`: значит, дерево устройств выглядит непривычно (так бывает в WSL и в некоторых контейнерах, где шины PCI просто нет).
 
+### Движки не ставятся: «no matching distributions available for your environment»
+
+Почти всегда причина одна — **слишком новая версия Python**. Колёса torch, onnxruntime, nemo и половины остального стека выходят под новую версию Python с задержкой в месяцы, а некоторые пакеты жёстко фиксируют версию зависимости:
+
+```
+gigaam 0.2.0 depends on onnxruntime==1.23.*
+Additionally, some packages in these conflicts have no matching distributions
+available for your environment: onnxruntime
+```
+
+Читается это как конфликт версий, а на деле означает: у `onnxruntime` 1.23 колёс новее `cp313` не выпускали, и на Python 3.14 их взять неоткуда. Обойти нельзя — пин стоит в метаданных самого GigaAM.
+
+Проверенный диапазон — от 3.10 до 3.13. Установщик предупреждает об этом на первом шаге и повторяет в итоге; `doctor.sh` показывает версию окружения отдельной строкой.
+
+```bash
+sudo apt install python3.13 python3.13-venv python3.13-dev
+sudo bash /opt/asrhub/scripts/install.sh --python /usr/bin/python3.13 --force
+```
+
+Верхнюю границу можно сдвинуть переменной `ASRHUB_MAX_PYTHON`, если вы знаете, что нужные колёса уже вышли:
+
+```bash
+ASRHUB_MAX_PYTHON=3.14 sudo bash scripts/install.sh
+```
+
+Ключ `--python` установщик уважает всегда: заданный вручную интерпретатор он берёт даже за пределами диапазона, но предупреждает.
+
 ### `ensurepip is not available` — не создаётся виртуальное окружение
 
 ```

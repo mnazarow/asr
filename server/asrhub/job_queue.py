@@ -971,11 +971,18 @@ class JobQueue:
             return self._webhooks
 
     def _webhook_worker(self, job: dict[str, Any]) -> None:
-        import hashlib
-        import hmac
         import json as json_mod
-        import urllib.error
-        import urllib.request
+
+        # Задание, принятое по схеме phone_asr, и отвечать должно её телом:
+        # приёмник на той стороне разбирает результат по своей схеме и на
+        # наши поля не рассчитан. Признак — блок _phone в параметрах задания,
+        # который кладёт маршрут /process-call.
+        call = (job.get("params") or {}).get("_phone")
+        if call:
+            body = self._phone_callback_body(job, call)
+            payload = json_mod.dumps(body, ensure_ascii=False).encode("utf-8")
+            self._deliver_webhook(job, payload)
+            return
 
         body: dict[str, Any] = {
             "id": job["id"], "status": job["status"], "filename": job.get("filename"),
@@ -992,6 +999,33 @@ class JobQueue:
 
             body["waveforms"] = to_phone_asr(job["waveform"])
         payload = json_mod.dumps(body, ensure_ascii=False).encode("utf-8")
+
+        self._deliver_webhook(job, payload)
+
+    def _phone_callback_body(self, job: dict[str, Any],
+                             call: dict[str, Any]) -> dict[str, Any]:
+        """Тело обратного вызова в схеме phone_asr."""
+        from .phone_compat import PhoneRequest, callback_body
+
+        request = PhoneRequest(
+            call_id=str(call.get("call_id") or ""), files=[],
+            base_url="", part=int(call.get("part") or 1),
+            total_parts=int(call.get("total_parts") or 1),
+            swap_sides=bool(call.get("swap_sides")))
+        segments = self.db.get_segments(job["id"])
+        body = callback_body(request, job, segments)
+        # base_path храним с приёма: имена исходных файлов после обработки
+        # уже не восстановить, а приёмник по ним и сопоставляет запись.
+        body["base_path"] = str(call.get("base_path") or body["base_path"])
+        return body
+
+    def _deliver_webhook(self, job: dict[str, Any], payload: bytes) -> None:
+        """Доставка с повторами. Одна на оба вида тела."""
+        import hashlib
+        import hmac
+        import time as time_mod
+        import urllib.error
+        import urllib.request
 
         secret = str(self.settings.get("webhook_secret") or "").encode("utf-8")
         headers = {"Content-Type": "application/json; charset=utf-8",
@@ -1013,7 +1047,7 @@ class JobQueue:
                 log.info("Уведомление для %s не доставлено (попытка %d из %d): %s",
                          job["id"], attempt + 1, attempts, exc)
             if attempt < attempts - 1:      # после последней попытки ждать незачем
-                time.sleep(min(60, 2 ** attempt))
+                time_mod.sleep(min(60, 2 ** attempt))
         self.db.update_job(job["id"], webhook_status="failed")
         RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
 

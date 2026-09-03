@@ -243,6 +243,23 @@ have ffprobe && check "ffprobe" ok "есть" || check "ffprobe" warn "не на
 have git && check "git" ok "$(git --version | cut -d' ' -f3)" || check "git" warn "не найден" "Нужен для установки GigaAM и whisper.cpp."
 have curl && check "curl" ok "есть" || check "curl" warn "не найден" "Используется для загрузок и проверки состояния."
 
+# Версия Python — не любопытство, а самая частая причина, по которой движки
+# не ставятся: под свежие версии колёса выходят с задержкой в месяцы.
+if [[ -x "${PREFIX}/venv/bin/python" ]]; then
+  PY_VERSION="$("${PREFIX}/venv/bin/python" -c \
+    'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ -z "${PY_VERSION}" ]]; then
+    check "Версия Python" warn "не определяется"
+  elif version_gt "${PY_VERSION}" "${ASRHUB_MAX_PYTHON}"; then
+    check "Версия Python" warn "${PY_VERSION} — новее проверенной ${ASRHUB_MAX_PYTHON}" \
+      "Часть движков под неё не соберётся: колёс torch, onnxruntime и nemo ещё нет. Пересобрать: install.sh --python /usr/bin/python${ASRHUB_MAX_PYTHON} --force"
+  elif version_ge "${PY_VERSION}" "${ASRHUB_MIN_PYTHON}"; then
+    check "Версия Python" ok "${PY_VERSION}"
+  else
+    check "Версия Python" fail "${PY_VERSION} — нужна ${ASRHUB_MIN_PYTHON} или новее"
+  fi
+fi
+
 heading "Движки распознавания"
 
 if [[ -x "${PREFIX}/venv/bin/python" ]]; then

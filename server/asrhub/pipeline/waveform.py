@@ -182,7 +182,8 @@ def build(channels: list[tuple[str, Path]], segments: list[Any],
     return curves
 
 
-def to_phone_asr(curves: list[dict[str, Any]]) -> list[str]:
+def to_phone_asr(curves: list[dict[str, Any]], *,
+                 compatible: bool = False) -> list[str]:
     """Кривые в том виде, в каком их отдаёт phone_asr: массив JSON-строк.
 
     В схеме phone_asr поле объявлено как `waveforms: list[str]`, а внутрь
@@ -192,11 +193,18 @@ def to_phone_asr(curves: list[dict[str, Any]]) -> list[str]:
 
     Поле `label` в совместимый вид не идёт: у phone_asr его нет, а лишний
     ключ ломает строгие разборщики.
+
+    compatible=True оставляет ровно два ключа, которые кладёт phone_asr —
+    `audio_waveform` и `speaker`. `sample_rate` он не кладёт, и для обратного
+    вызова, который принимает приёмник, написанный под phone_asr, лишний ключ
+    противоречит тому самому доводу, ради которого убран `label`. В
+    обычном уведомлении ASR Hub частота остаётся: там она полезна и никто не
+    сверяется со схемой phone_asr.
     """
     return [
         json.dumps({
             "audio_waveform": curve["audio_waveform"],
-            "sample_rate": curve["sample_rate"],
+            **({} if compatible else {"sample_rate": curve["sample_rate"]}),
             "speaker": curve["speaker"],
         }, ensure_ascii=False)
         for curve in curves

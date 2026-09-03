@@ -511,3 +511,98 @@ def test_venv_failure_names_the_package_to_install(repo_root: Path):
     assert "import ensurepip" in block, "причина не различается"
     assert "sudo apt install ${VENV_PKG}" in block, "нет готовой команды"
     assert "--python /usr/bin/python3.12" in block, "не предложен другой интерпретатор"
+
+
+# ---------------------------------------------------------------------------
+# Проверенный диапазон версий Python
+# ---------------------------------------------------------------------------
+
+
+def _python_stub(directory: Path, version: str) -> Path:
+    path = directory / f"python{version}" if version else directory / "python3"
+    path.write_text(f'''#!/bin/sh
+case "$*" in
+  *version_info*) echo "{version}" ;;
+  -V|--version) echo "Python {version}.0" ;;
+  *) exec /usr/bin/python3 "$@" ;;
+esac
+''', encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _only_these_tools(directory: Path) -> Path:
+    """PATH, в котором нет ничего лишнего — иначе найдётся системный python."""
+    stub = directory / "path"
+    stub.mkdir(exist_ok=True)
+    for name in ("bash", "sed", "awk", "tr", "cut", "grep", "head", "uname",
+                 "sort", "basename", "dirname", "cat", "date", "stat", "mkdir",
+                 "ls", "printf", "command"):
+        source = shutil.which(name)
+        if source and not (stub / name).exists():
+            (stub / name).symlink_to(source)
+    return stub
+
+
+def test_too_new_python_is_named_before_the_engines_fail(repo_root: Path,
+                                                         tmp_path: Path):
+    """Установка шла на Python 3.14 и разваливалась внутри pip на восьмом шаге.
+
+    Колёса torch, onnxruntime и nemo выходят под свежие версии Python с
+    задержкой в месяцы: GigaAM требует onnxruntime==1.23.*, а у него нет
+    колёс новее cp313. Сообщение pip — «no matching distributions available
+    for your environment» — не подсказывает, что менять надо интерпретатор.
+    """
+    stub = _only_these_tools(tmp_path)
+    shutil.copy(_python_stub(tmp_path, "3.14"), stub / "python3")
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    result = subprocess.run(
+        [BASH, "-c", f'source "{common}"; check_python'],
+        env={"PATH": str(stub), "ASRHUB_QUIET": "0", "TERM": "dumb"},
+        capture_output=True, text=True, timeout=60)
+    combined = result.stdout + result.stderr
+    assert "новее проверенной" in combined, f"о слишком новой версии молчим:\n{combined}"
+    assert "onnxruntime" in combined, "не названа настоящая причина"
+    assert "--python" in combined, "нет готовой команды с другим интерпретатором"
+    # Установку при этом не запрещаем: часть движков соберётся и на новой.
+    assert result.returncode == 0, "слишком новый Python стал запретом вместо предупреждения"
+
+
+def test_supported_python_is_preferred_when_both_exist(repo_root: Path,
+                                                       tmp_path: Path):
+    """Из двух интерпретаторов берём проверенный, а не первый попавшийся."""
+    stub = _only_these_tools(tmp_path)
+    shutil.copy(_python_stub(tmp_path, "3.14"), stub / "python3")
+    shutil.copy(_python_stub(tmp_path, "3.12"), stub / "python3.12")
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    result = subprocess.run(
+        [BASH, "-c", f'source "{common}"; check_python'],
+        env={"PATH": str(stub), "ASRHUB_QUIET": "1", "TERM": "dumb"},
+        capture_output=True, text=True, timeout=60)
+    assert result.stdout.strip() == "python3.12", \
+        f"выбран не проверенный интерпретатор: {result.stdout.strip()!r}"
+    assert "новее проверенной" not in result.stderr, "лишнее предупреждение"
+
+
+def test_version_gt_is_strict(repo_root: Path):
+    """«3.13 новее 3.13» — неверно, и на этом строится вся проверка."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = (f'source "{common}"; '
+              'for pair in "3.14 3.13" "3.13 3.13" "3.12 3.13" "3.9 3.10"; do '
+              'set -- $pair; version_gt "$1" "$2" && echo "да" || echo "нет"; done')
+    out = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                         timeout=60).stdout.split()
+    assert out == ["да", "нет", "нет", "нет"], out
+
+
+def test_engine_failure_points_at_the_interpreter(repo_root: Path):
+    """Отсылка к журналу — не ответ, когда причина известна заранее."""
+    models = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
+    assert 'version_gt "${PY_VERSION}" "${ASRHUB_MAX_PYTHON}"' in models, \
+        "models.sh не сверяет версию окружения при отказе"
+    assert "onnxruntime==1.23" in models, "не назван пример настоящей причины"
+    installer = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    assert "Не установились движки" in installer
+    assert "новее проверенной" in installer, "итог установки молчит о причине"
+    doctor = (repo_root / "scripts" / "doctor.sh").read_text(encoding="utf-8")
+    assert "Версия Python" in doctor, "доктор не проверяет версию Python"

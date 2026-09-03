@@ -1070,7 +1070,21 @@ printf '  Обновить                bash %s/scripts/update.sh\n' "${PREFIX
 printf '  Удалить                 bash %s/scripts/uninstall.sh\n' "${PREFIX}"
 if [[ ${#FAILED_ENGINES[@]} -gt 0 ]]; then
   printf '\n%sНе установились движки: %s%s\n' "${C_YELLOW}" "${FAILED_ENGINES[*]}" "${C_RESET}"
-  printf '  Повторить: bash %s/scripts/models.sh install-engine <движок>\n' "${PREFIX}"
+  # Если окружение собрано на слишком новом Python, причина почти наверняка
+  # в этом, и повторять установку тем же способом бессмысленно.
+  PY_VERSION="$("${PY}" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ -n "${PY_VERSION}" ]] && version_gt "${PY_VERSION}" "${ASRHUB_MAX_PYTHON}"; then
+    printf '  Окружение собрано на Python %s — новее проверенной %s.\n' \
+      "${PY_VERSION}" "${ASRHUB_MAX_PYTHON}"
+    printf '  Под свежие версии колёс torch, onnxruntime и nemo ещё нет.\n'
+    printf '  Пересоберите на проверенной версии:\n'
+    printf '    sudo apt install python%s python%s-venv python%s-dev\n' \
+      "${ASRHUB_MAX_PYTHON}" "${ASRHUB_MAX_PYTHON}" "${ASRHUB_MAX_PYTHON}"
+    printf '    sudo bash %s/scripts/install.sh --python /usr/bin/python%s --force\n' \
+      "${PREFIX}" "${ASRHUB_MAX_PYTHON}"
+  else
+    printf '  Повторить: bash %s/scripts/models.sh install-engine <движок>\n' "${PREFIX}"
+  fi
 fi
 
 # Про перезагрузку говорим последней строкой, а не в середине установки:

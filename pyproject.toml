@@ -41,4 +41,7 @@ ignore = [
 testpaths = ["tests"]
 pythonpath = ["server"]
 addopts = "-q --tb=short"
+# Медленные проверки — те, что гоняют полный цикл задания через очередь.
+# Отдельная метка нужна, чтобы их можно было пропустить: `-m "not slow"`.
+markers = ["slow: полный цикл через очередь, десятки секунд"]
 filterwarnings = ["ignore::DeprecationWarning"]

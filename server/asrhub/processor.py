@@ -240,7 +240,16 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             languages.append(result.language)
         for segment in result.segments:
             if label:
-                segment.speaker = segment.speaker or label
+                # Канал побеждает догадку движка, а не наоборот. Раньше стояло
+                # `segment.speaker or label`, и метка канала применялась только
+                # к сегментам без говорящего — а движки, которые сами
+                # расставляют говорящих (демонстрационный, WhisperX,
+                # диаризующие сборки), заполняют это поле всегда. В итоге
+                # стереозапись звонка, разведённая по каналам, приходила с
+                # одним говорящим на обе стороны: разделение, про которое в
+                # справочнике сказано «безошибочно для стереозаписей», молча
+                # не работало именно там, где оно и нужно.
+                segment.speaker = label
             all_segments.append(segment)
 
     # Речи нет ни в одном канале — вот это уже отказ. Если молчал только

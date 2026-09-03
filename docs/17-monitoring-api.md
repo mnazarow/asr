@@ -122,9 +122,10 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 100.2
+asrhub_uptime_seconds 8.8
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
+asrhub_build_info{catalog_date="2026-08-31",platform="linux-x86_64",python="3.11.15",schema_version="5",version="3.0.0"} 1
 …
 ```
 
@@ -156,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788406630.6578836,
-  "collected_at": "2026-09-03T03:37:10+0000",
+  "timestamp": 1788410578.9154422,
+  "collected_at": "2026-09-03T04:42:58+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -234,14 +235,14 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 100.3,
+  "uptime_s": 8.8,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 100 с",
+        "detail": "работает 9 с",
         "hint": ""
       },
       {
@@ -270,7 +271,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 28.9 ГБ",
+        "detail": "свободно 29.0 ГБ",
         "hint": ""
       },
       {
@@ -278,6 +279,7 @@ curl 'http://сервер:8080/api/monitoring/health'
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
+      }
 …
 ```
 
@@ -336,7 +338,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 28.9 ГБ",
+      "detail": "свободно 29.0 ГБ",
       "hint": ""
     },
     {
@@ -736,8 +738,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 2,
-  "samples": 517,
+  "scrapes": 1,
+  "samples": 177,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {

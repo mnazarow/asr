@@ -434,6 +434,22 @@ cls = ENGINE_CLASSES.get('${ENGINE}')
 print('Проверка:', cls.check_available() if cls else 'движок неизвестен')" 2>/dev/null || true
   else
     error "Установка не удалась."
+    # Самая частая причина отказа не в самом движке, а в версии Python:
+    # колёса torch, onnxruntime и nemo выходят под новые версии с задержкой
+    # в месяцы, и pip в этом случае пишет «no matching distributions
+    # available for your environment» — фразу, по которой не догадаешься, что
+    # менять надо интерпретатор.
+    PY_VERSION="$("${PREFIX}/venv/bin/python" -c \
+      'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+    if [[ -n "${PY_VERSION}" ]] && version_gt "${PY_VERSION}" "${ASRHUB_MAX_PYTHON}"; then
+      warn "Окружение собрано на Python ${PY_VERSION} — новее проверенной ${ASRHUB_MAX_PYTHON}."
+      hint "Скорее всего, дело в этом: под свежие версии Python нужных колёс"
+      hint "ещё нет. Например, GigaAM требует onnxruntime==1.23.*, а у него"
+      hint "колёс новее cp313 не выпускали."
+      hint "Пересоберите окружение на проверенной версии:"
+      hint "  sudo apt install python${ASRHUB_MAX_PYTHON} python${ASRHUB_MAX_PYTHON}-venv python${ASRHUB_MAX_PYTHON}-dev"
+      hint "  sudo bash ${PREFIX}/scripts/install.sh --python /usr/bin/python${ASRHUB_MAX_PYTHON} --force"
+    fi
     hint "Полный вывод: ${ASRHUB_LOG_FILE:-журнал не велся}"
     exit 1
   fi
