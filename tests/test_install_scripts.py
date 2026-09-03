@@ -506,7 +506,7 @@ def test_venv_failure_names_the_package_to_install(repo_root: Path):
     Сообщение интерпретатора правильное, но теряется среди строк отката.
     """
     text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
-    block = text.split('step "Виртуальное окружение Python"', 1)[1][:2000]
+    block = text.split('step "Виртуальное окружение Python"', 1)[1][:4000]
     assert "Не удалось создать виртуальное окружение" in block
     assert "import ensurepip" in block, "причина не различается"
     assert "sudo apt install ${VENV_PKG}" in block, "нет готовой команды"
@@ -758,3 +758,65 @@ def test_helper_returns_only_a_path(repo_root: Path, tmp_path: Path):
     assert result.stdout.strip() == str(stub / "python3.13"), \
         f"в stdout попало лишнее: {result.stdout!r}"
     assert "Устанавливаем" in result.stderr, "сообщения пропали совсем"
+
+
+# ---------------------------------------------------------------------------
+# Окружение и токен
+# ---------------------------------------------------------------------------
+
+
+def test_venv_is_rebuilt_when_the_interpreter_changes(repo_root: Path):
+    """Готовое окружение переиспользовалось, даже если собрано другой версией.
+
+    Это сводило на нет весь выбор версии: установщик находил слишком новый
+    Python, ставил рядом проверенный, писал «дальше работаем на 3.13» — и
+    тут же брал venv, собранный на 3.14. Движки падали ровно как прежде,
+    при том что в отчёте стояла правильная версия.
+    """
+    text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = text.split('step "Виртуальное окружение Python"', 1)[1][:2500]
+    assert "VENV_PY_VERSION" in block, "версия существующего окружения не читается"
+    assert '"${VENV_PY_VERSION}" != "${WANT_PY_VERSION}"' in block, \
+        "версии не сравниваются"
+    assert 'run rm -rf "${VENV}"' in block, "окружение не пересобирается"
+    assert "повреждено" in block, "сломанное окружение молча переиспользуется"
+
+
+def test_installer_accepts_a_hugging_face_token(repo_root: Path, tmp_path: Path):
+    """Токен нельзя было задать при установке вовсе.
+
+    Без него не скачиваются модели с ограниченным доступом: pyannote для
+    диаризации требует его всегда. Приходилось дописывать env.sh руками уже
+    после установки — то есть знать про этот файл.
+    """
+    text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    assert "--hf-token)" in text and "--hf-token-file)" in text
+    assert "HF_TOKEN_VALUE" in text
+
+    # Токен обязан попасть в env.sh строкой ИМЯ=ЗНАЧЕНИЕ и с правами 0640:
+    # systemd читает этот файл через EnvironmentFile, а в нём лежит секрет.
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    env_file = tmp_path / "env.sh"
+    script = f'''
+      source "{common}"
+      ENV_FILE="{env_file}"
+      HF_TOKEN_VALUE="hf_секретное_значение_1234567890"
+      write_file "${{ENV_FILE}}" 0640 <<'ENVEOF'
+ASRHUB_PORT=8080
+ENVEOF
+      printf 'HF_TOKEN=%s\\n' "${{HF_TOKEN_VALUE}}" >> "${{ENV_FILE}}"
+      chmod 0640 "${{ENV_FILE}}"
+    '''
+    run_bash(script)
+    body = env_file.read_text(encoding="utf-8")
+    assert "HF_TOKEN=hf_секретное_значение_1234567890" in body
+    assert not body.startswith("export"), "systemd читает строго ИМЯ=ЗНАЧЕНИЕ"
+    assert oct(env_file.stat().st_mode)[-3:] == "640", "секрет доступен на чтение всем"
+
+
+def test_empty_token_does_not_overwrite_the_environment(repo_root: Path):
+    """Пустое значение в env.sh перекрыло бы токен из окружения службы."""
+    text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = text.split("ASRHUB_ACCEL=${ACCEL}", 1)[1][:1200]
+    assert 'if [[ -n "${HF_TOKEN_VALUE}" ]]; then' in block, \
+        "токен пишется безусловно, даже пустой"

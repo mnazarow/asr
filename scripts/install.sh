@@ -55,6 +55,8 @@ MONITORING=""
 STREAM_ENABLED="true"
 # Ставить ли проверенную версию Python, когда найденная слишком новая.
 PYTHON_INSTALL=1
+# Токен Hugging Face: задаётся ключом или берётся из окружения.
+HF_TOKEN_VALUE="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
 # auto — поставить драйвер под найденную карту; none — не трогать;
 # nvidia/amd/intel — ставить только если найдена карта этого производителя.
 GPU_DRIVER="auto"
@@ -163,6 +165,12 @@ while [[ $# -gt 0 ]]; do
     --no-stream)   STREAM_ENABLED="false"; shift ;;
     # Не ставить Python самим, даже если найденный слишком новый.
     --no-python-install) PYTHON_INSTALL=0; shift ;;
+    # Токен Hugging Face. Без него не скачиваются модели с ограниченным
+    # доступом — pyannote для диаризации требует его всегда, часть весов
+    # GigaAM и Whisper тоже. Раньше его нельзя было задать при установке
+    # вовсе: приходилось дописывать env.sh руками уже после.
+    --hf-token)    HF_TOKEN_VALUE="$2"; shift 2 ;;
+    --hf-token-file) HF_TOKEN_VALUE="$(cat "${2:?}")"; shift 2 ;;
     --yes|-y)      ASRHUB_ASSUME_YES=1; shift ;;
     --quiet|-q)    ASRHUB_QUIET=1; shift ;;
     --debug)       ASRHUB_DEBUG=1; shift ;;
@@ -716,6 +724,20 @@ ASRHUB_ENGINES=${ENGINES}
 ASRHUB_ACCEL=${ACCEL}
 ENVEOF
 
+  # Токен пишем отдельной строкой и только если он есть: пустое значение в
+  # env.sh перекрыло бы токен из окружения службы. Файл уже 0640 — в нём
+  # лежит секрет, и читать его должен только владелец установки.
+  if [[ -n "${HF_TOKEN_VALUE}" ]]; then
+    if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+      printf '%s[пробный запуск]%s HF_TOKEN дописан в %s\n' \
+        "${C_YELLOW}" "${C_RESET}" "${ENV_FILE}"
+    else
+      printf 'HF_TOKEN=%s\n' "${HF_TOKEN_VALUE}" >> "${ENV_FILE}"
+      chmod 0640 "${ENV_FILE}" 2>/dev/null || true
+      ok "Токен Hugging Face записан (${HF_TOKEN_VALUE:0:6}…, ${#HF_TOKEN_VALUE} символов)"
+    fi
+  fi
+
   # Вариант с видеокартой — файл-надстройка, а не отдельный профиль: сервис
   # без профиля поднимается всегда, поэтому «--profile gpu up» запускал и
   # процессорный контейнер тоже, и второй падал с конфликтом за порт.
@@ -743,6 +765,37 @@ ENVEOF
 
 else
   step "Виртуальное окружение Python"
+
+  # Готовое окружение переиспользуется только если оно собрано ТЕМ ЖЕ
+  # интерпретатором. Раньше проверялось лишь наличие каталога, и это сводило
+  # на нет всю работу по выбору версии: установщик находил слишком новый
+  # Python, ставил рядом проверенный, объявлял «дальше работаем на 3.13» — и
+  # тут же брал venv, собранный на 3.14. Движки падали ровно как прежде, при
+  # том что в отчёте стояла правильная версия.
+  if [[ -d "${VENV}" ]]; then
+    VENV_PY_VERSION=""
+    if [[ -x "${VENV}/bin/python" ]]; then
+      VENV_PY_VERSION="$("${VENV}/bin/python" -c \
+        'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+    fi
+    WANT_PY_VERSION="$("${PY}" -c \
+      'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+    if [[ -z "${VENV_PY_VERSION}" ]]; then
+      warn "Существующее окружение повреждено — пересоберём."
+      run rm -rf "${VENV}"
+    elif [[ "${VENV_PY_VERSION}" != "${WANT_PY_VERSION}" ]]; then
+      info "Окружение собрано на Python ${VENV_PY_VERSION}, а ставим на ${WANT_PY_VERSION}."
+      hint "Пакеты придётся установить заново — иначе движки останутся от прошлой версии."
+      if [[ "${FORCE}" -eq 1 ]] || confirm "Пересобрать окружение?" "y"; then
+        run rm -rf "${VENV}"
+      else
+        warn "Оставляем окружение на Python ${VENV_PY_VERSION}."
+        hint "Движки, которых нет под эту версию, так и не установятся."
+      fi
+    else
+      debug "окружение уже собрано на Python ${VENV_PY_VERSION} — переиспользуем"
+    fi
+  fi
 
   if [[ ! -d "${VENV}" ]]; then
     if ! run "${PY}" -m venv "${VENV}"; then
