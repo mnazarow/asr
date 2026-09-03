@@ -209,3 +209,62 @@ def test_loading_settings_does_not_rotate_the_key(data_dir, monkeypatch):
         assert saved in again.api_keys, "сервер не принял бы ключ из собственного файла"
 
     assert oct(keyfile.stat().st_mode)[-3:] == "600", "ключ доступен на чтение всем"
+
+
+def test_saving_settings_keeps_the_file_private(data_dir: Path,
+                                                monkeypatch: pytest.MonkeyPatch,
+                                                tmp_path: Path):
+    """Сохранение настроек не должно раздавать права на файл с секретами.
+
+    Запись шла через временный файл: `tmp.write_text(...)` создаёт его по
+    umask (обычно 0644), а `tmp.replace(target)` отдаёт цели права ЭТОГО
+    файла. Установщик ставил на config.yaml 0640, а первый же запуск
+    сервера — тот самый, который дописывает туда автоматически созданный
+    ключ доступа, — делал файл с ключами и токеном Hugging Face читаемым
+    всем в системе.
+    """
+    from asrhub.config import load
+
+    config = tmp_path / "config.yaml"
+    config.write_text(f'data_dir: {data_dir}\nhf_token: "hf_токен1234567890абв"\n'
+                      'server:\n  server_port: 8080\n',
+                      encoding="utf-8")
+    config.chmod(0o640)
+
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    settings = load(config)
+
+    assert oct(config.stat().st_mode)[-3:] == "640", \
+        "файл с ключами доступа стал читаемым всем"
+    assert settings.api_keys, "ключ при первом запуске не создан — проверка ничего не стоит"
+    assert not list(tmp_path.glob("*.tmp")), "временный файл остался на диске"
+
+
+def test_saving_settings_keeps_the_hugging_face_token(data_dir: Path,
+                                                      monkeypatch: pytest.MonkeyPatch,
+                                                      tmp_path: Path):
+    """Токен обязан пережить сохранение настроек.
+
+    hf_token не относится ни к одной группе каталога, поэтому save() его не
+    писал — и первое же сохранение (сервер делает его сам при первом
+    запуске, когда выпускает ключ доступа) стирало из config.yaml токен,
+    записанный установщиком. Диаризация после этого падала с «нужен токен»
+    на ровном месте, а пользователь помнил, что вводил его в мастере.
+    """
+    from asrhub.config import load
+
+    config = tmp_path / "config.yaml"
+    config.write_text(f'data_dir: {data_dir}\nhf_token: "hf_токен1234567890абв"\n'
+                      'server:\n  server_port: 8080\n',
+                      encoding="utf-8")
+
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    first = load(config)
+    assert first.hf_token == "hf_токен1234567890абв"
+
+    body = config.read_text(encoding="utf-8")
+    assert "hf_token" in body, "сохранение стёрло токен из файла"
+    assert load(config).hf_token == "hf_токен1234567890абв"
+    assert first.get("server_port") == 8080, "остальные параметры не должны пострадать"

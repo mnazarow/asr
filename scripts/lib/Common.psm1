@@ -705,6 +705,28 @@ function Read-WizardValue {
     }
 }
 
+function Test-HfToken {
+    <#
+        .SYNOPSIS
+        Проверка токена Hugging Face для мастера установки.
+
+        .DESCRIPTION
+        Пустая строка — законный ответ: токен нужен не всем, и заставлять его
+        придумывать значило бы либо врать, либо застревать на этом вопросе.
+        Двойник bash-функции wizard_valid_hf_token: правило одно и то же, иначе
+        один и тот же токен принимался бы на Linux и отвергался на Windows.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $true }
+    if ($Token -notmatch '^hf_[A-Za-z0-9_-]{16,}$') {
+        Write-Warn 'Токен Hugging Face выглядит так: hf_ и ещё не меньше шестнадцати знаков.'
+        Write-Hint 'Взять его: https://huggingface.co/settings/tokens — права «read» достаточно.'
+        Write-Hint 'Оставьте поле пустым, если токен не нужен.'
+        return $false
+    }
+    return $true
+}
+
 function Show-WizardSummary {
     <#
         .SYNOPSIS

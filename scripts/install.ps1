@@ -36,6 +36,8 @@ param(
     [ValidateSet('', 'light', 'cpu', 'standard', 'full', 'russian')][string]$Profile = '',
     [string]$Engines = '',
     [string]$Models = '',
+    [string]$HfToken = '',
+    [string]$HfTokenFile = '',
     [switch]$SkipModels,
     [switch]$NoService,
     [switch]$NoGpuDriver,
@@ -55,6 +57,18 @@ $script:ExplicitArgs = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$PSBoundParameters.Keys)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1') -Force
+
+# Токен Hugging Face: файл важнее ключа (в командной строке секрет виден в
+# списке процессов), а окружение — на случай запуска из готового скрипта.
+if ($HfTokenFile) {
+    $HfToken = (Get-Content -LiteralPath $HfTokenFile -Raw).Trim()
+    $script:ExplicitArgs.Add('HfToken') | Out-Null
+}
+if (-not $HfToken) {
+    $HfToken = if ($env:HF_TOKEN) { $env:HF_TOKEN }
+               elseif ($env:HUGGING_FACE_HUB_TOKEN) { $env:HUGGING_FACE_HUB_TOKEN }
+               else { '' }
+}
 
 $script:GpuRebootRequired = $false
 $script:GpuTargetAccel = ''
@@ -204,11 +218,41 @@ function Invoke-InstallWizard {
            Note = 'Служба через NSSM или задача планировщика' }
         @{ Value = 'alignment'; Label = 'Точные границы слов (WhisperX)';
            Note = 'Нужно для субтитров и дубляжа. MFA на Windows ставится сложнее' }
+        @{ Value = 'diarization'; Label = 'Разделение по говорящим (pyannote)';
+           Note = '+1 ГБ. Нужен токен Hugging Face и согласие с лицензией модели' }
     )
     # Обе ветки: без второй снятая галочка не возвращала автозапуск, а
     # отмеченная не отменяла заданный в командной строке -NoService.
     $script:NoService = ($extras -notcontains 'service')
     if ($extras -contains 'alignment') { $script:Alignment = 'whisperx' }
+    # Диаризация ставится как обычный движок: файл требований у неё свой.
+    if ($extras -contains 'diarization' -and $script:Engines -notlike '*diarization*') {
+        $script:Engines = "$($script:Engines),diarization"
+    }
+
+    # Токен Hugging Face. Не спрашиваем, если он уже задан ключом или пришёл из
+    # окружения: мастер не переспрашивает то, что ему сказали.
+    #
+    # Текст пояснения зависит от выбора выше. Для диаризации токен не
+    # «желателен», а обязателен — pyannote без него не скачается, и узнать об
+    # этом на седьмом шаге хуже, чем ответить на вопрос сейчас.
+    if (-not $script:HfToken) {
+        $tokenNote = if ($extras -contains 'diarization') {
+            @'
+Для разделения по говорящим он обязателен: pyannote без токена не
+скачается. Возьмите на huggingface.co/settings/tokens (права «read») и примите
+лицензию модели pyannote/speaker-diarization-community-1.
+'@
+        } else {
+            @'
+Нужен для моделей с ограниченным доступом. Сейчас вы такие не
+выбрали, так что можно пропустить — Enter. Дописать потом:
+install.ps1 -HfToken hf_… или строкой hf_token: в config.yaml.
+'@
+        }
+        $script:HfToken = Read-WizardValue -Question 'Токен Hugging Face' -Default '' `
+            -Note $tokenNote -Validator { param($value) Test-HfToken -Token $value }
+    }
 
     $summary = [ordered]@{
         'Профиль'          = $script:Profile
@@ -219,6 +263,9 @@ function Invoke-InstallWizard {
         'Адрес'            = "http://$($script:BindHost):$($script:Port)"
         'Автозапуск'       = if ($script:NoService) { 'нет' } else { 'да' }
         'Выравнивание'     = if ($script:Alignment) { $script:Alignment } else { 'нет' }
+        'Токен Hugging Face' = if ($script:HfToken) {
+            "{0}… ({1} знаков)" -f $script:HfToken.Substring(0, 6), $script:HfToken.Length
+        } else { 'не задан' }
         'Займёт на диске'  = "около $($profileDisk[$script:Profile]) ГБ"
     }
     Show-WizardSummary -Rows $summary
@@ -420,6 +467,13 @@ if ($Mode -eq 'docker') {
             "ASRHUB_DATA=$DataDir", "ASRHUB_PROFILE=$Profile",
             "ASRHUB_ENGINES=$Engines", "ASRHUB_ACCEL=$($hw.Accelerator)"
         ) | Set-Content -Path $envFile -Encoding UTF8
+        # Токен дописываем отдельной строкой и только если он есть: пустое
+        # значение в .env перекрыло бы токен из окружения контейнера.
+        if ($HfToken) {
+            Add-Content -Path $envFile -Value "HF_TOKEN=$HfToken" -Encoding UTF8
+            Write-Ok ("Токен Hugging Face записан ({0}…, {1} символов)" -f `
+                $HfToken.Substring(0, 6), $HfToken.Length)
+        }
     }
     Push-Location (Join-Path $Prefix 'docker')
     try {
@@ -556,6 +610,27 @@ runtime:
 "@ | Set-Content -Path $configFile -Encoding UTF8
     Add-Rollback { Remove-Item $configFile -Force -ErrorAction SilentlyContinue } 'удалить config.yaml'
     Write-Ok "Конфигурация: $configFile"
+}
+
+# Токен Hugging Face кладём в config.yaml, а не в переменную окружения: её
+# пришлось бы прописывать службе, задаче планировщика и своей консоли по
+# отдельности, а конфигурацию читают все три. Строку заменяем, а не
+# дописываем: два ключа hf_token в YAML — это молча выигравший последний, то
+# есть потерянный только что введённый токен.
+if ($HfToken -and $Mode -eq 'native') {
+    if (Get-DryRun) {
+        Write-Info "[пробный запуск] hf_token записан бы в $configFile"
+    } elseif (Test-Path $configFile) {
+        $kept = @(Get-Content -Path $configFile -Encoding UTF8 |
+                  Where-Object { $_ -notmatch '^hf_token:' })
+        ($kept + ('hf_token: "{0}"' -f $HfToken)) |
+            Set-Content -Path $configFile -Encoding UTF8
+        Write-Ok ("Токен Hugging Face записан в конфигурацию ({0}…, {1} символов)" -f `
+            $HfToken.Substring(0, 6), $HfToken.Length)
+    } else {
+        Write-Warn 'Файл конфигурации не найден — токен Hugging Face не записан.'
+        Write-Hint "Дописать вручную: строка hf_token: в $configFile"
+    }
 }
 
 if ($Mode -eq 'native' -and -not (Get-DryRun)) {

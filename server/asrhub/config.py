@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -281,12 +282,31 @@ class Settings:
         # целиком, и после перезапуска доступ к серверу терялся.
         if self.api_keys:
             payload["api_keys"] = self.api_keys
+        # Токен Hugging Face — тоже не параметр каталога, и его тоже стирало
+        # первое же сохранение: сервер, создавая ключ доступа при первом
+        # запуске, переписывал файл и терял записанный установщиком токен.
+        # Диаризация после этого падала с «нужен токен» на ровном месте.
+        if self.hf_token:
+            payload["hf_token"] = self.hf_token
         tmp = target.with_suffix(target.suffix + ".tmp")
+        # Права наследуем от существующего файла. Временный создаётся по umask
+        # (обычно 0644), а replace() отдаёт цели ЕГО права — установщик ставил
+        # 0640, и первый же запуск сервера, тот самый, который дописывает сюда
+        # автоматически созданный ключ доступа, делал файл с ключами и токеном
+        # Hugging Face читаемым для всех в системе.
         try:
-            if target.suffix in (".yaml", ".yml"):
-                tmp.write_text(_dump_yaml(payload), encoding="utf-8")
-            else:
-                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except OSError:
+            mode = 0o600
+        try:
+            text = (_dump_yaml(payload) if target.suffix in (".yaml", ".yml")
+                    else json.dumps(payload, ensure_ascii=False, indent=2))
+            # Сразу с узкими правами: выставлять их после записи — значит
+            # оставить окно, в котором ключи доступны на чтение всем.
+            handle = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.chmod(tmp, mode)
             tmp.replace(target)
         except OSError as exc:
             raise ConfigError(f"Не удалось сохранить конфигурацию: {exc}") from exc

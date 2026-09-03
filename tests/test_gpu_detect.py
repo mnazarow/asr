@@ -558,3 +558,27 @@ def test_model_name_comes_from_the_local_database(repo_root: Path, tmp_path: Pat
     assert lines[1] == "Navi 31 [Radeon RX 7900 XT/XTX]", lines
     # Неизвестное устройство не должно превращаться в чужое имя.
     assert "GeForce" not in lines[2] and "0xffff" in lines[2], lines
+
+
+def test_largest_memory_region_is_found_without_aborting(tmp_path: Path,
+                                                         repo_root: Path):
+    """Берётся наибольшая область, а не последняя.
+
+    По размеру области памяти установщик отличает дискретную карту от
+    встроенной, то есть выбирает профиль установки. Размер брался как
+    `(( size > max )) && max=${size}`: `(( ))` возвращает единицу, когда
+    выражение ложно, и на последней области цикл заканчивался неудачей —
+    здесь это сходило с рук только потому, что следом идёт printf.
+    """
+    device = tmp_path / "0000:01:00.0"
+    device.mkdir(parents=True)
+    # Три области: 16 МБ, 8 ГБ и снова 16 МБ. Наибольшая — вторая, то есть
+    # на последней строке сравнение ложно.
+    (device / "resource").write_text(
+        "0x00000000f6000000 0x00000000f6ffffff 0x0000000000040200\n"
+        "0x0000004000000000 0x00000041ffffffff 0x000000000014220c\n"
+        "0x00000000f7000000 0x00000000f7ffffff 0x0000000000040200\n",
+        encoding="utf-8")
+
+    out = _run_gpu(tmp_path, f'_pci_bar_bytes "{device}"; printf "\\n"', repo_root)
+    assert out == str(8 * 1024 ** 3), f"получено {out}"

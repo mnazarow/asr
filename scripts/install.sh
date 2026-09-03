@@ -385,11 +385,16 @@ run_wizard() {
     "service|Автозапуск при загрузке машины|systemd, launchd или планировщик Windows" \
     "alignment|Точные границы слов (MFA)|+2–3 ГБ и conda. Нужно для субтитров и дубляжа" \
     "monitoring|Отправку метрик в систему мониторинга|Настроим адрес приёмника на следующем шаге" \
-    "stream|Распознавание на лету (диктовка с микрофона)|Раздел «Диктовка» и WebSocket /api/stream. Нужен ffmpeg"
+    "stream|Распознавание на лету (диктовка с микрофона)|Раздел «Диктовка» и WebSocket /api/stream. Нужен ffmpeg" \
+    "diarization|Разделение по говорящим (pyannote)|+1 ГБ. Нужен токен Hugging Face и согласие с лицензией модели"
 
   [[ ",${extras}," == *",service,"* ]] && CREATE_SERVICE=1 || CREATE_SERVICE=0
   [[ ",${extras}," == *",alignment,"* ]] && ALIGNMENT="mfa"
   [[ ",${extras}," == *",stream,"* ]] && STREAM_ENABLED="true" || STREAM_ENABLED="false"
+  # Диаризация ставится как обычный движок: файл требований у неё свой.
+  if [[ ",${extras}," == *",diarization,"* && "${ENGINES}" != *diarization* ]]; then
+    ENGINES="${ENGINES},diarization"
+  fi
   # Микрофон браузер отдаёт только по https или на localhost. Сказать об этом
   # надо до установки, а не после первого недоумения пользователя.
   if [[ "${STREAM_ENABLED}" == "true" && "${HOST}" == "0.0.0.0" ]]; then
@@ -405,6 +410,28 @@ run_wizard() {
       "influxdb|InfluxDB|Метрики пишутся в базу временных рядов" \
       "otlp|OpenTelemetry Collector|Общий сборщик телеметрии"
     wizard_ask MONITORING_URL "Адрес приёмника" "http://localhost:9091" wizard_valid_host
+  fi
+
+  # --- 4а. Токен Hugging Face ---------------------------------------------
+  # Не спрашиваем, если значение уже задано ключом --hf-token или пришло из
+  # окружения: мастер не переспрашивает то, что ему сказали.
+  #
+  # Текст пояснения зависит от выбора выше. Для диаризации токен не «желателен»,
+  # а обязателен — pyannote без него не скачается, и узнать об этом на седьмом
+  # шаге хуже, чем ответить на вопрос сейчас.
+  if [[ -z "${HF_TOKEN_VALUE}" ]]; then
+    local token_note
+    if [[ ",${extras}," == *",diarization,"* ]]; then
+      token_note="Для разделения по говорящим он обязателен: pyannote без токена не
+скачается. Возьмите на huggingface.co/settings/tokens (права «read») и примите
+лицензию модели pyannote/speaker-diarization-community-1."
+    else
+      token_note="Нужен для моделей с ограниченным доступом. Сейчас вы такие не
+выбрали, так что можно пропустить — Enter. Дописать потом:
+scripts/install.sh --hf-token hf_… или строкой hf_token: в config.yaml."
+    fi
+    wizard_ask HF_TOKEN_VALUE "Токен Hugging Face" "" wizard_valid_hf_token \
+      "${token_note}"
   fi
 
   # --- 5. Подтверждение ---------------------------------------------------
@@ -426,6 +453,8 @@ run_wizard() {
     "Выравнивание|${ALIGNMENT:-нет}" \
     "Мониторинг|${MONITORING:-только по запросу}" \
     "Распознавание на лету|$([[ "${STREAM_ENABLED}" == "true" ]] && echo "включено" || echo "выключено")" \
+    "Токен Hugging Face|$([[ -n "${HF_TOKEN_VALUE}" ]] \
+        && echo "${HF_TOKEN_VALUE:0:6}… (${#HF_TOKEN_VALUE} знаков)" || echo "не задан")" \
     "Займёт на диске|около ${need_gb} ГБ"
 
   confirm "Начинать установку?" "y" || { info "Отменено."; exit 0; }
@@ -981,6 +1010,35 @@ CFGEOF
     add_rollback "rm -f '${CONFIG_FILE}'"
   fi
   ok "Конфигурация: ${CONFIG_FILE}"
+fi
+
+# Токен Hugging Face. Пишем его в config.yaml, а не в env.sh: переменные
+# окружения читает systemd, но не launchd на macOS и не запуск руками через
+# asrctl, а конфигурацию читают все три. Раньше токен, введённый в мастере,
+# доходил только до docker/.env — при обычной установке он молча пропадал, и
+# диаризация падала на седьмом шаге с «нужен токен».
+#
+# Строку заменяем, а не дописываем: два ключа hf_token в YAML — это молча
+# выигравший последний, то есть потерянный только что введённый токен.
+if [[ -n "${HF_TOKEN_VALUE}" && "${MODE}" == "native" ]]; then
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    info "[пробный запуск] hf_token записан бы в ${CONFIG_FILE}"
+  elif [[ -f "${CONFIG_FILE}" ]]; then
+    HF_TMP="${CONFIG_FILE}.hf.$$"
+    grep -v '^hf_token:' "${CONFIG_FILE}" > "${HF_TMP}" 2>/dev/null || true
+    # Файл мог остаться без перевода строки в конце — тогда ключ приклеился бы
+    # к последней строке и YAML перестал бы читаться целиком.
+    if [[ -s "${HF_TMP}" ]] && [[ -n "$(tail -c1 "${HF_TMP}")" ]]; then
+      printf '\n' >> "${HF_TMP}"
+    fi
+    printf 'hf_token: "%s"\n' "${HF_TOKEN_VALUE}" >> "${HF_TMP}"
+    mv -f "${HF_TMP}" "${CONFIG_FILE}"
+    chmod 0640 "${CONFIG_FILE}" 2>/dev/null || true
+    ok "Токен Hugging Face записан в конфигурацию (${HF_TOKEN_VALUE:0:6}…, ${#HF_TOKEN_VALUE} символов)"
+  else
+    warn "Файл конфигурации не найден — токен Hugging Face не записан."
+    hint "Дописать вручную: строка hf_token: \"${HF_TOKEN_VALUE:0:6}…\" в ${CONFIG_FILE}"
+  fi
 fi
 
 # Переменные окружения под видеокарту. Их читает служба (EnvironmentFile) и

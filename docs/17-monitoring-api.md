@@ -122,7 +122,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 8.8
+asrhub_uptime_seconds 105
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 asrhub_build_info{catalog_date="2026-08-31",platform="linux-x86_64",python="3.11.15",schema_version="5",version="3.0.0"} 1
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788418501.3684042,
-  "collected_at": "2026-09-03T06:55:01+0000",
+  "timestamp": 1788422083.0451455,
+  "collected_at": "2026-09-03T07:54:43+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -235,14 +235,14 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 8.8,
+  "uptime_s": 105.1,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 9 с",
+        "detail": "работает 105 с",
         "hint": ""
       },
       {
@@ -279,7 +279,6 @@ curl 'http://сервер:8080/api/monitoring/health'
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
-      }
 …
 ```
 
@@ -738,8 +737,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 1,
-  "samples": 172,
+  "scrapes": 4,
+  "samples": 525,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {

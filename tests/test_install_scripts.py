@@ -820,3 +820,297 @@ def test_empty_token_does_not_overwrite_the_environment(repo_root: Path):
     block = text.split("ASRHUB_ACCEL=${ACCEL}", 1)[1][:1200]
     assert 'if [[ -n "${HF_TOKEN_VALUE}" ]]; then' in block, \
         "токен пишется безусловно, даже пустой"
+
+
+# ---------------------------------------------------------------------------
+# Токен Hugging Face в мастере
+# ---------------------------------------------------------------------------
+
+
+def _wizard_token_block(repo_root: Path) -> str:
+    """Настоящий кусок install.sh с вопросом про токен."""
+    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = re.search(r"(  # --- 4а\. Токен Hugging Face.*?\n)  # --- 5\.",
+                      source, re.S)
+    assert block, "в install.sh не найден шаг с вопросом про токен"
+    return block.group(1)
+
+
+def test_wizard_asks_for_the_token_and_says_when_it_is_required(repo_root: Path,
+                                                                tmp_path: Path):
+    """Токен спрашивается в мастере, и текст зависит от выбора диаризации.
+
+    Раньше про токен не спрашивали вовсе: pyannote скачивался уже после
+    установки и падал с «нужен токен» — на седьмом шаге, когда до конца
+    оставалось меньше всего. Для диаризации он не «желателен», а обязателен,
+    и вопрос обязан говорить именно это.
+    """
+    block = _wizard_token_block(repo_root)
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    note_file = tmp_path / "пояснение.txt"
+
+    def ask(extras: str, token: str = "") -> tuple[str, str]:
+        script = f'''
+          set -Eeuo pipefail
+          source "{common}"
+          # Подменяем сам вопрос: записываем то, с чем его позвали.
+          wizard_ask() {{ printf '%s' "$5" > "{note_file}"; printf -v "$1" '%s' "ОТВЕТ"; }}
+          run_step() {{
+            local extras="{extras}"
+            HF_TOKEN_VALUE="{token}"
+{block}
+            printf 'ТОКЕН=%s\\n' "${{HF_TOKEN_VALUE}}"
+          }}
+          run_step
+        '''
+        result = run_bash(script)
+        assert result.returncode == 0, result.stderr
+        note = note_file.read_text(encoding="utf-8") if note_file.exists() else ""
+        note_file.unlink(missing_ok=True)
+        return result.stdout, note
+
+    # С диаризацией — токен обязателен, и это сказано прямо.
+    out, note = ask("service,diarization")
+    assert "ТОКЕН=ОТВЕТ" in out, "вопрос не задан"
+    assert "обязателен" in note
+    assert "pyannote" in note
+
+    # Без неё — вопрос остаётся, но с честным «можно пропустить».
+    out, note = ask("service")
+    assert "ТОКЕН=ОТВЕТ" in out, "вопрос не задан"
+    assert "пропустить" in note
+    assert "обязателен" not in note
+
+    # Заданный ключом --hf-token не переспрашивается.
+    out, note = ask("service,diarization", token="hf_ключ_из_командной_строки")
+    assert "ТОКЕН=hf_ключ_из_командной_строки" in out, "мастер переспросил заданное"
+    assert note == "", "мастер переспросил заданное"
+
+
+def test_diarization_is_installed_as_an_engine(repo_root: Path):
+    """Отмеченная галочка обязана дойти до списка движков.
+
+    Вопрос про токен был бы бессмысленным, если бы сам pyannote не ставился:
+    сначала галочки не существовало вовсе, и условие «выбрана диаризация»
+    не срабатывало никогда.
+    """
+    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    assert "diarization|Разделение по говорящим" in source, "нет пункта в мастере"
+
+    block = re.search(r'(  # Диаризация ставится как обычный движок.*?\n  fi\n)',
+                      source, re.S)
+    assert block, "не найдено добавление движка"
+    script = f'''
+      set -Eeuo pipefail
+      run_step() {{
+        local extras="$1"
+        ENGINES="faster_whisper,vosk"
+{block.group(1)}
+        printf '%s\\n' "${{ENGINES}}"
+      }}
+      run_step "service,diarization"
+      run_step "service"
+      ENGINES_TWICE() {{ :; }}
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.split()
+    assert lines[0] == "faster_whisper,vosk,diarization"
+    assert lines[1] == "faster_whisper,vosk", "движок добавился без галочки"
+
+    # Файл требований должен существовать, иначе установка упадёт на шаге.
+    assert (repo_root / "requirements" / "engines" / "diarization.txt").exists()
+
+
+def test_token_reaches_the_configuration_the_server_reads(repo_root: Path,
+                                                          tmp_path: Path):
+    """Введённый токен обязан попасть туда, где сервер его найдёт.
+
+    Он писался только в docker/.env, то есть при обычной установке молча
+    пропадал: пользователь отвечал на вопрос, а диаризация всё равно падала
+    с «нужен токен». Переменные окружения читает systemd, но не launchd и не
+    запуск руками, а config.yaml читают все три.
+    """
+    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = re.search(r'(if \[\[ -n "\$\{HF_TOKEN_VALUE\}" && "\$\{MODE\}" == "native" '
+                      r'\]\]; then\n.*?\nfi\n)\n# Переменные окружения',
+                      source, re.S)
+    assert block, "в install.sh не найдена запись токена при обычной установке"
+
+    config = tmp_path / "config.yaml"
+    # Файл без перевода строки в конце — так его оставляет дописанный раздел.
+    config.write_text(f'data_dir: {tmp_path}\nhf_token: "hf_старый"\n\nserver:\n'
+                      '  server_port: 8080', encoding="utf-8")
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      CONFIG_FILE="{config}"
+      MODE=native
+      ASRHUB_DRY_RUN=0
+      HF_TOKEN_VALUE=hf_новый12345678901234
+{block.group(1)}
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+
+    body = config.read_text(encoding="utf-8")
+    assert body.count("hf_token:") == 1, "старая строка осталась — YAML возьмёт последнюю"
+    assert "hf_старый" not in body
+
+    from asrhub.config import load
+
+    settings = load(config)
+    assert settings.hf_token == "hf_новый12345678901234"
+    assert settings.get("server_port") == 8080, "конфигурация перестала читаться"
+    assert oct(config.stat().st_mode)[-3:] == "640", "в файле секрет"
+
+
+def test_wizard_summary_survives_cyrillic_labels(repo_root: Path):
+    """Сводка мастера падала на русских подписях.
+
+    ${#переменная} в локали C считает БАЙТЫ: «Распознавание на лету» — это
+    20 символов и 40 байт, ширина колонки 24, и выравнивание уходило в
+    минус. Хуже того, функция заканчивалась на (( )), а ложное условие —
+    это код возврата 1: под errexit мастер обрывался с «Сбой на шаге».
+    """
+    wizard = repo_root / "scripts" / "lib" / "wizard.sh"
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    # Ширина 24 — подпись короче поля; ширина 10 — длиннее. Второй случай
+    # важнее: именно на нём (( )) оказывалось ложным и возвращало единицу.
+    for locale in ("C", "C.UTF-8", "ru_RU.UTF-8"):
+        for width, expected in ((24, 25), (10, 22)):
+            script = f'''
+              set -Eeuo pipefail
+              source "{common}"; source "{wizard}"
+              out="$(wizard_pad "Распознавание на лету" {width})x"
+              printf '%s\\n' "${{out}}"
+            '''
+            result = run_bash(script, env={"LC_ALL": locale, "LANG": locale})
+            assert result.returncode == 0, \
+                f"локаль {locale}, ширина {width}: {result.stderr}"
+            line = result.stdout.rstrip("\n")
+            assert line.endswith("x")
+            # Считаем символы, а не байты: поле плюс наш «x».
+            assert len(line) == expected, \
+                f"локаль {locale}, ширина {width}: получилось {len(line)} знаков"
+
+
+# ---------------------------------------------------------------------------
+# То же самое на Windows
+# ---------------------------------------------------------------------------
+
+PWSH = shutil.which("pwsh") or shutil.which("powershell")
+
+
+@pytest.mark.skipif(PWSH is None, reason="PowerShell недоступен")
+def test_windows_token_check_matches_the_linux_one(repo_root: Path):
+    """Один и тот же токен обязан приниматься на обеих системах.
+
+    Правило живёт в двух местах — wizard_valid_hf_token и Test-HfToken, — и
+    разойтись им проще простого: тогда токен, принятый на сервере, мастер на
+    Windows отвергал бы как «неправильный», и объяснить это было бы нечем.
+    """
+    cases = ["", "hf_" + "a" * 16, "hf_" + "a" * 34, "hf_короткий",
+             "sk-совсем-другой-ключ", "a" * 40]
+    module = repo_root / "scripts" / "lib" / "Common.psm1"
+    script = (f'Import-Module "{module}" -Force; ' +
+              "; ".join(f'(Test-HfToken -Token "{case}") | ForEach-Object {{ "$_" }}'
+                        for case in cases))
+    result = subprocess.run([PWSH, "-NoProfile", "-Command", script],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    windows = [line for line in result.stdout.splitlines()
+               if line.strip() in ("True", "False")]
+
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    wizard = repo_root / "scripts" / "lib" / "wizard.sh"
+    checks = "\n".join(
+        f'if wizard_valid_hf_token "{case}" >/dev/null 2>&1; '
+        f'then echo True; else echo False; fi' for case in cases)
+    linux = run_bash(f'source "{common}"; source "{wizard}"\n{checks}')
+    assert linux.returncode == 0, linux.stderr
+
+    assert windows == linux.stdout.split(), \
+        f"проверки разошлись: Windows {windows}, Linux {linux.stdout.split()}"
+    # И сама проверка что-то значит: пустая строка принимается, мусор — нет.
+    assert windows[0] == "True" and windows[-1] == "False"
+
+
+@pytest.mark.skipif(PWSH is None, reason="PowerShell недоступен")
+def test_windows_installer_asks_for_the_token_too(repo_root: Path):
+    """Мастер на Windows обязан спрашивать то же, что и на Linux.
+
+    Скрипты — двойники, и расхождение обнаруживается только на чужой машине:
+    на сервере токен спросили, на ноутбуке — нет, и диаризация не работает
+    ровно у того, кто ставил её на Windows.
+    """
+    text = (repo_root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    assert "[string]$HfToken" in text and "[string]$HfTokenFile" in text
+    assert "Разделение по говорящим (pyannote)" in text, "нет пункта в мастере"
+    assert "Токен Hugging Face" in text, "не спрашивается токен"
+    assert "Test-HfToken" in text, "ввод не проверяется"
+    assert "hf_token: \"{0}\"" in text, "токен не доходит до конфигурации"
+
+    # Разбор файла целиком: опечатка в PowerShell видна только при разборе,
+    # а запустить install.ps1 вне Windows нельзя.
+    checked = subprocess.run(
+        [PWSH, "-NoProfile", "-Command",
+         "$e = $null; $null = [System.Management.Automation.Language.Parser]"
+         f"::ParseFile('{repo_root / 'scripts' / 'install.ps1'}', [ref]$null, [ref]$e); "
+         "if ($e -and $e.Count) { $e | ForEach-Object { $_.Message }; exit 1 }"],
+        capture_output=True, text=True, timeout=120)
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+
+
+def test_example_configuration_never_carries_a_real_token(repo_root: Path):
+    """config.example.yaml раздаётся с правами 0644 — секрета в нём быть не может.
+
+    Пример пишется командой `--print-config` при установке, и если бы он
+    печатал действующее значение, токен утекал бы в файл, который читают все.
+    """
+    import os as _os
+
+    env = {**_os.environ, "ASRHUB_HF_TOKEN": "hf_реальный1234567890"}
+    result = subprocess.run(
+        ["python3", "-m", "asrhub", "--print-config"],
+        cwd=str(repo_root / "server"), env=env,
+        capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert "hf_реальный1234567890" not in result.stdout
+    assert "# hf_token:" in result.stdout, "в примере нет самой строки про токен"
+
+
+@pytest.mark.skipif(PWSH is None, reason="PowerShell недоступен")
+def test_windows_token_replaces_the_old_line_too(repo_root: Path, tmp_path: Path):
+    """Windows-установщик обязан заменять строку, а не дописывать вторую.
+
+    Два ключа `hf_token` в YAML — это молча выигравший последний. Если
+    install.ps1 просто дописывал бы строку, повторная установка возвращала
+    бы старый токен, и понять это по файлу было бы невозможно.
+    """
+    source = (repo_root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    block = re.search(r"(?ms)^if \(\$HfToken -and \$Mode -eq 'native'\) \{.*?^\}$", source)
+    assert block, "в install.ps1 не найдена запись токена в конфигурацию"
+
+    config = tmp_path / "config.yaml"
+    config.write_text(f'data_dir: {tmp_path}\nhf_token: "hf_старый"\n\nserver:\n'
+                      '  server_port: 8080\n', encoding="utf-8")
+    piece = tmp_path / "block.ps1"
+    piece.write_text(block.group(0), encoding="utf-8")
+
+    script = (f'Import-Module "{repo_root / "scripts" / "lib" / "Common.psm1"}" -Force; '
+              '$HfToken = "hf_новый12345678901234"; $Mode = "native"; '
+              f'$configFile = "{config}"; . "{piece}"')
+    result = subprocess.run([PWSH, "-NoProfile", "-Command", script],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+    body = config.read_text(encoding="utf-8")
+    assert body.count("hf_token:") == 1, "старая строка осталась"
+    assert "hf_старый" not in body
+
+    from asrhub.config import load
+
+    assert load(config).hf_token == "hf_новый12345678901234"
+    assert load(config).get("server_port") == 8080

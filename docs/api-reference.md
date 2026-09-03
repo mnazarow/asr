@@ -548,7 +548,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:22580",
+  "instance": "vm:32439",
   "instances": [],
   "workers": [
     {
@@ -990,7 +990,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/settings
 ```json
 {
   "values": {
-    "engine": "demo",
+    "engine": "auto",
     "model": "demo-simulator",
     "language": "ru",
     "task": "transcribe",
@@ -1090,51 +1090,51 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788410526.7104557,
+    "generated_at": 1788422064.8499298,
     "jobs": {
-      "total": 271,
-      "completed": 254,
+      "total": 270,
+      "completed": 253,
       "failed": 9,
       "cancelled": 8,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 0.9373
+      "success_rate": 0.937
     },
     "volume": {
-      "audio_seconds": 330505.3,
-      "audio_hours": 91.81,
-      "processing_seconds": 44307.5,
-      "words": 753447,
-      "characters": 4520682,
-      "segments": 35363,
+      "audio_seconds": 327324.6,
+      "audio_hours": 90.92,
+      "processing_seconds": 44041.0,
+      "words": 745693,
+      "characters": 4474158,
+      "segments": 35105,
       "files_per_hour": 1.51,
-      "audio_hours_per_hour": 0.55
+      "audio_hours_per_hour": 0.54
     },
     "performance": {
       "rtf": {
-        "count": 254,
-        "avg": 0.135946,
+        "count": 253,
+        "avg": 0.136152,
         "min": 0.0176,
         "max": 0.5409,
-        "p50": 0.11125,
-        "p90": 0.29359,
-        "p95": 0.379405,
-        "p99": 0.444614,
-        "stdev": 0.10555
+        "p50": 0.1115,
+        "p90": 0.29426,
+        "p95": 0.37952,
+        "p99": 0.444976,
+        "stdev": 0.105707
       },
       "processing_time_s": {
-        "count": 254,
-        "avg": 174.439016,
+        "count": 253,
+        "avg": 174.075099,
         "min": 0.97,
         "max": 2014.66,
-        "p50": 54.145,
-        "p90": 512.416,
-        "p95": 627.5205,
-        "p99": 1299.9119,
-        "stdev": 284.469493
+        "p50": 53.84,
+        "p90": 513.754,
+        "p95": 628.532,
+        "p99": 1300.7596,
+        "stdev": 284.972116
       },
       "queue_time_s": {
-        "count": 254,
+        "count": 253,
 …
 ```
 
@@ -1186,7 +1186,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 98.7,
+  "uptime_s": 86.9,
   "queue_paused": false,
   "catalog_date": "2026-08-31"
 }
@@ -1226,7 +1226,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 3
+    "INFO": 3,
+    "WARNING": 7
   }
 }
 ```
@@ -1261,17 +1262,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 98.7,
+  "uptime_s": 87.0,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 7.1,
-    "disk_free_gb": 29.0,
+    "disk_free_gb": 28.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1295,8 +1296,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "_reason": "Видеокарта не обнаружена. Выбран режим int8 на 2 физических ядрах — единственный практичный вариант на процессоре."
   },
   "log_counts": {
-    "INFO": 3
-  },
+    "INFO": 3,
 …
 ```
 
@@ -1619,14 +1619,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 98.7,
+  "uptime_s": 87.0,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 99 с",
+        "detail": "работает 87 с",
         "hint": ""
       },
       {
@@ -1655,7 +1655,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 29.0 ГБ",
+        "detail": "свободно 28.9 ГБ",
         "hint": ""
       },
       {
