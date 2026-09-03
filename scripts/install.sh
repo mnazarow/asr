@@ -136,6 +136,24 @@ USAGE
 # Разбор аргументов
 # ---------------------------------------------------------------------------
 
+# Строка запуска целиком — её показывает обработчик ошибок, чтобы повторить
+# установку теми же ключами, а не вспоминать их заново. Снимаем до разбора:
+# цикл ниже съедает аргументы через shift.
+#
+# Токен маскируем: это сообщение печатается на экран и попадает в журнал,
+# и секрету там не место.
+ASRHUB_INVOCATION="bash $0"
+_prev=""
+for _arg in "$@"; do
+  case "${_prev}" in
+    --hf-token) ASRHUB_INVOCATION="${ASRHUB_INVOCATION} hf_…" ;;
+    *)          ASRHUB_INVOCATION="${ASRHUB_INVOCATION} ${_arg}" ;;
+  esac
+  _prev="${_arg}"
+done
+unset _prev _arg
+export ASRHUB_INVOCATION
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --python)      ASRHUB_PYTHON="${2:?нужен путь к интерпретатору}"; export ASRHUB_PYTHON; shift 2 ;;
@@ -581,6 +599,89 @@ fi
 
 confirm "Начать установку?" || { info "Отменено пользователем."; exit 0; }
 
+# Замок ставим после согласия: до него ничего не меняется, и человек мог
+# просто посмотреть на сводку и выйти.
+acquire_install_lock "${PREFIX}" || exit 1
+
+# --- Проверки, которые дешевле сделать сейчас -------------------------------
+#
+# Каждая из них — про сбой, который иначе случится через двадцать минут, на
+# восьмом шаге, когда установлено уже почти всё. Стоят они секунды.
+
+# Каталоги должны быть доступны на запись. Иначе первая же запись падает с
+# «Permission denied» посреди копирования, а не здесь, где ещё можно уйти и
+# перезапустить с sudo.
+for _dir in "${PREFIX}" "${DATA_DIR}"; do
+  _probe_dir="${_dir}"
+  while [[ ! -d "${_probe_dir}" && "${_probe_dir}" != "/" ]]; do
+    _probe_dir="$(dirname "${_probe_dir}")"
+  done
+  if [[ ! -w "${_probe_dir}" ]]; then
+    error "Нет прав на запись в ${_probe_dir}."
+    hint "Запустите установку с sudo или выберите другой каталог:"
+    hint "  bash scripts/install.sh --prefix ~/.local/share/asrhub --data ~/.local/share/asrhub/data"
+    exit 13
+  fi
+done
+unset _dir _probe_dir
+
+# Раздел, смонтированный с noexec: файлы создаются, а запускаться отказываются.
+# Виртуальное окружение на таком разделе собирается успешно и не работает —
+# ошибка приходит уже от pip, «Permission denied» на собственный python.
+if [[ "${MODE}" == "native" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+  _exec_probe="$(mktemp "${PREFIX%/}/.asrhub-exec.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "${_exec_probe}" ]]; then
+    printf '#!/bin/sh\nexit 0\n' > "${_exec_probe}"
+    chmod +x "${_exec_probe}" 2>/dev/null || true
+    if ! "${_exec_probe}" 2>/dev/null; then
+      error "Каталог ${PREFIX} не позволяет запускать программы (монтирование noexec)."
+      hint "Виртуальное окружение здесь соберётся, но python из него не запустится."
+      hint "Выберите другой каталог: --prefix /opt/asrhub"
+      rm -f "${_exec_probe}"
+      exit 1
+    fi
+    rm -f "${_exec_probe}"
+  fi
+  unset _exec_probe
+fi
+
+# Движки, которые ставятся прямо из репозитория, требуют git. Без него pip
+# доходит до клонирования и падает — на девятом шаге из десяти.
+if [[ "${MODE}" == "native" && "${OFFLINE}" -eq 0 ]]; then
+  _needs_git=""
+  IFS=',' read -ra _engine_list <<< "${ENGINES}"
+  for _engine in "${_engine_list[@]}"; do
+    _engine="$(printf '%s' "${_engine}" | tr -d ' ')"
+    [[ -z "${_engine}" ]] && continue
+    _nodeps="${REPO_DIR}/requirements/engines/no-deps/${_engine//_/-}.txt"
+    if [[ -f "${_nodeps}" ]] && grep -q 'git+' "${_nodeps}" 2>/dev/null; then
+      _needs_git="${_needs_git:+${_needs_git}, }${_engine}"
+    fi
+  done
+  if [[ -n "${_needs_git}" ]] && ! have git; then
+    warn "Движки ${_needs_git} ставятся из репозитория, а git не найден."
+    if ! install_system_packages git; then
+      error "Без git эти движки установить нельзя."
+      hint "Поставьте его и повторите: sudo apt install git"
+      exit 127
+    fi
+  fi
+  unset _needs_git _engine _engine_list _nodeps
+fi
+
+# Каталог для временных файлов: pip распаковывает и собирает пакеты в нём, а
+# не в каталоге установки. Полный /tmp роняет установку с «No space left on
+# device» в середине сборки — сообщением, по которому не догадаться, что
+# место кончилось совсем не там, где его проверяли.
+if [[ "${MODE}" == "native" ]]; then
+  _tmp_free="$(free_space_gb "${TMPDIR:-/tmp}" 2>/dev/null || echo 0)"
+  if [[ "${_tmp_free}" =~ ^[0-9]+$ ]] && (( _tmp_free < 2 )); then
+    warn "В ${TMPDIR:-/tmp} свободно ${_tmp_free} ГБ — этого мало для сборки пакетов."
+    hint "Задайте другой каталог: export TMPDIR=/var/tmp и повторите установку."
+  fi
+  unset _tmp_free
+fi
+
 # ---------------------------------------------------------------------------
 # Шаг 2. Системные зависимости
 # ---------------------------------------------------------------------------
@@ -860,7 +961,9 @@ else
     warn "Не удалось обновить pip — продолжаем с текущей версией."
 
   step "Установка зависимостей сервера"
-  retry 3 run "${VPIP}" install "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt"
+  # Без базовых зависимостей сервер не запустится вовсе — здесь не
+  # предупреждение, а остановка с откатом. Но причину называем до неё.
+  pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt"
   ok "Базовые зависимости установлены"
 
   # PyTorch ставим отдельно: у него свой индекс под каждый ускоритель
@@ -882,12 +985,12 @@ else
     TORCH_INDEX="$(torch_index_url "${TORCH_ACCEL}")"
     if [[ -n "${TORCH_INDEX}" ]]; then
       info "Индекс пакетов: ${TORCH_INDEX}"
-      retry 3 run "${VPIP}" install "${PIP_FLAGS[@]}" --index-url "${TORCH_INDEX}" torch torchaudio || {
+      pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" --index-url "${TORCH_INDEX}" torch torchaudio || {
         warn "Установка с индекса ${TORCH_INDEX} не удалась, пробуем обычный индекс."
-        retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" torch torchaudio
+        pip_install "${VPIP}" 2 "${PIP_FLAGS[@]}" torch torchaudio
       }
     else
-      retry 3 run "${VPIP}" install "${PIP_FLAGS[@]}" torch torchaudio
+      pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" torch torchaudio
     fi
     ok "PyTorch установлен"
   fi
@@ -910,7 +1013,7 @@ else
       info "Версия CTranslate2 под вашу CUDA: ${PIN}"
       retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" "${PIN}" || true
     fi
-    if retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" -r "${REQ}"; then
+    if install_engine_requirements "${VPIP}" "${REQ}" "${PIP_FLAGS[@]}"; then
       ok "  ${engine} установлен"
     else
       FAILED_ENGINES+=("${engine}")

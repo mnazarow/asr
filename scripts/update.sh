@@ -270,16 +270,24 @@ step "Обновление зависимостей"
 # требований. Имена пакетов и имена модулей совпадают далеко не всегда, а
 # `pip show` знает ровно то, что установлено.
 engine_installed() {
-  local req="$1" name
-  while IFS= read -r line; do
-    line="${line%%#*}"
-    line="${line%%[<>=!;[]*}"
-    name="$(printf '%s' "${line}" | tr -d '[:space:]')"
-    [[ -z "${name}" ]] && continue
-    if "${VPIP}" show "${name}" >/dev/null 2>&1; then
-      return 0
-    fi
-  done < "${req}"
+  local req="$1" name file
+  for file in "${req}" "$(dirname "${req}")/no-deps/$(basename "${req}")"; do
+    [[ -f "${file}" ]] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      # Прямая ссылка PEP 508 — «пакет @ git+https://…». Без среза по «@»
+      # именем пакета становилась вся строка с адресом, и pip про неё,
+      # разумеется, ничего не знал: движок, поставленный из репозитория,
+      # выглядел неустановленным и не обновлялся никогда.
+      line="${line%%@*}"
+      line="${line%%[<>=!;[]*}"
+      name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+      [[ -z "${name}" ]] && continue
+      if "${VPIP}" show "${name}" >/dev/null 2>&1; then
+        return 0
+      fi
+    done < "${file}"
+  done
   return 1
 }
 
@@ -287,7 +295,7 @@ if [[ "${DOCKER_MODE}" -eq 1 ]]; then
   info "Зависимости живут в образе — обновятся при пересборке."
 elif [[ -x "${VPIP}" ]]; then
   PIP_FLAGS=(--disable-pip-version-check --no-input --upgrade)
-  retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt" || \
+  pip_install "${VPIP}" 2 "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt" || \
     warn "Часть базовых зависимостей не обновилась."
   for req in "${PREFIX}"/requirements/engines/*.txt; do
     engine="$(basename "${req}" .txt)"
@@ -298,7 +306,7 @@ elif [[ -x "${VPIP}" ]]; then
     # Спрашиваем не выдуманный модуль, а сами пакеты из файла требований.
     if engine_installed "${req}"; then
       info "Движок ${engine} установлен — обновляем"
-      retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" -r "${req}" || \
+      install_engine_requirements "${VPIP}" "${req}" "${PIP_FLAGS[@]}" || \
         warn "  ${engine}: обновление не удалось, остаётся прежняя версия"
     fi
   done

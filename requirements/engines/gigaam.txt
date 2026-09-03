@@ -1,13 +1,24 @@
 # GigaAM (SaluteDevices) — лучшее качество на русском языке.
 #
 # ВАЖНО: пакет gigaam на PyPI застыл на версии 0.1.0 (апрель 2025)
-# и не содержит v3. Ставим только из репозитория.
+# и не содержит v3. Ставим только из репозитория — он перечислен в
+# requirements/engines/no-deps/gigaam.txt и ставится с --no-deps.
+#
+# Почему --no-deps: в pyproject GigaAM зависимости прибиты жёстко —
+# onnxruntime==1.23.* и onnx==1.19.*. Колёс под Python 3.14 у этих версий
+# нет, и установка обрывается с ResolutionImpossible ещё до загрузки
+# самого пакета. Ни onnx, ни onnxruntime при распознавании не нужны: они
+# нужны только для экспорта модели в ONNX (gigaam/onnx_utils.py, который
+# импортируется по требованию). Поэтому зависимости перечислены здесь
+# своими руками — теми же пакетами, но диапазонами, а не точками.
 #
 # Требования: Python 3.10+, ffmpeg в PATH, torch (ставится отдельно
 # установщиком с индексом под ваш ускоритель).
 
-gigaam @ git+https://github.com/salute-developers/GigaAM.git
 hydra-core>=1.3,<2
 omegaconf>=2.3,<3
 sentencepiece>=0.2
+soundfile>=0.12
+tqdm>=4.60
+numpy>=2,<3
 onnxruntime>=1.17

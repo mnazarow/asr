@@ -1,0 +1,8 @@
+# Ставится с --no-deps: зависимости перечислены в ../gigaam.txt.
+#
+# Без этого pip упирается в onnxruntime==1.23.* из pyproject GigaAM —
+# версию, у которой нет колёс под Python 3.14. Установка обрывалась с
+# ResolutionImpossible, и движок не ставился вовсе, хотя для распознавания
+# ни onnx, ни конкретная версия onnxruntime не нужны.
+
+gigaam @ git+https://github.com/salute-developers/GigaAM.git

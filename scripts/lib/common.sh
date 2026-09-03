@@ -139,15 +139,26 @@ on_error() {
   set +o errexit
   printf '\n'
   error "Сбой на шаге: ${_STEP_CURRENT:-неизвестный шаг}"
-  error "Команда: ${command}"
+  # «Команда: return ${status}» — внутренняя строка библиотеки, и человеку она
+  # не говорит ничего: настоящая причина уже названа выше разбором вывода.
+  # Показываем команду только когда она осмысленна.
+  case "${command}" in
+    return*|exit*) : ;;
+    *) error "Команда: ${command}" ;;
+  esac
   error "Строка: ${line_no}, код возврата: ${exit_code}"
-  [[ "${ASRHUB_DEBUG:-0}" == "1" ]] && _stack_trace
+  if [[ "${ASRHUB_DEBUG:-0}" == "1" ]]; then _stack_trace; fi
   explain_exit_code "${exit_code}"
   run_rollback
   cleanup_temp
   printf '\n'
   hint "Полный журнал: ${ASRHUB_LOG_FILE:-журнал не велся}"
   hint "Диагностика окружения: bash scripts/doctor.sh"
+  # Повторить ровно то же самое: после отката установка начинается с чистого
+  # листа, и подбирать ключи заново не нужно.
+  if [[ -n "${ASRHUB_INVOCATION:-}" ]]; then
+    hint "Повторить после исправления: ${ASRHUB_INVOCATION}"
+  fi
   exit "${exit_code}"
 }
 
@@ -161,7 +172,11 @@ explain_exit_code() {
     126) hint "Файл найден, но не исполняемый. Проверьте права: chmod +x" ;;
     127) hint "Команда не найдена. Установите недостающую программу." ;;
     130) hint "Прервано пользователем (Ctrl+C)." ;;
+    134) hint "Программа завершилась аварийно (SIGABRT). Обычно это ошибка в самой программе." ;;
     137) hint "Процесс убит (нехватка памяти?). Проверьте свободную оперативную память." ;;
+    139) hint "Обращение к чужой памяти (SIGSEGV). Чаще всего — несовместимая сборка пакета." ;;
+    141) hint "Оборван канал (SIGPIPE): команда справа закрылась раньше времени." ;;
+    143) hint "Процесс остановлен извне (SIGTERM)." ;;
   esac
 }
 
@@ -250,6 +265,290 @@ run_quiet() {
 }
 
 # Повтор с нарастающей задержкой: сеть и зеркала пакетов бывают нестабильны.
+# ---------------------------------------------------------------------------
+# Замок на каталог установки
+# ---------------------------------------------------------------------------
+#
+# Два установщика в одном каталоге ломают друг другу окружение: второй сносит
+# venv, пока первый в него ставит пакеты. Заканчивается это установкой, где
+# половина движков есть, а половины нет, и найти причину по журналу нельзя —
+# в нём всё успешно.
+
+acquire_install_lock() {
+  local dir="$1" lock owner=""
+  [[ "${ASRHUB_DRY_RUN}" == "1" ]] && return 0
+  lock="${dir}/.asrhub-install.lock"
+  mkdir -p "${dir}" 2>/dev/null || true
+  # noclobber + > — атомарное создание: проверка и создание одной операцией,
+  # иначе два процесса успевают проскочить между ними.
+  if ( set -o noclobber; printf '%s\n' "$$" > "${lock}" ) 2>/dev/null; then
+    register_temp "${lock}"
+    return 0
+  fi
+  owner="$(cat "${lock}" 2>/dev/null || true)"
+  if [[ "${owner}" =~ ^[0-9]+$ ]] && kill -0 "${owner}" 2>/dev/null; then
+    error "В каталоге ${dir} уже идёт установка (процесс ${owner})."
+    hint "Дождитесь её окончания или остановите: kill ${owner}"
+    hint "Если процесса давно нет, удалите файл: rm -f ${lock}"
+    return 1
+  fi
+  if [[ -e "${lock}" ]]; then
+    # Замок от прерванной установки: процесса с таким номером уже нет.
+    warn "Найден замок прерванной установки — снимаем."
+    rm -f "${lock}" 2>/dev/null || true
+    if ( set -o noclobber; printf '%s\n' "$$" > "${lock}" ) 2>/dev/null; then
+      register_temp "${lock}"
+      return 0
+    fi
+  fi
+  # Не смогли создать вовсе — каталог недоступен на запись. Это выяснится и
+  # без нас на первом же шаге, поэтому не мешаем, но говорим вслух.
+  warn "Не удалось поставить замок в ${dir} — установка продолжается без него."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Разбор ошибок pip
+# ---------------------------------------------------------------------------
+#
+# Установка пакетов — единственное место, где чужая программа печатает сто
+# строк и уходит с кодом 1. Пользователь видел «установка не удалась» и
+# должен был сам искать причину в этой стене текста. Здесь причина называется
+# одной строкой и вместе с командой, которая её лечит.
+
+# Выполняет pip, показывая вывод и одновременно складывая его в файл: без
+# сохранения причина остаётся только на экране, и скрипт о ней ничего не знает.
+#
+#   run_pip ФАЙЛ_ДЛЯ_ВЫВОДА КОМАНДА…
+run_pip() {
+  local capture="$1"; shift
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '%s[пробный запуск]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*"
+    return 0
+  fi
+  debug "выполняется: $*"
+  _log_raw CMD "$*"
+  local had_errexit=0
+  [[ $- == *e* ]] && had_errexit=1
+  set +o errexit
+  "$@" 2>&1 | tee -a "${capture}"
+  local status=${PIPESTATUS[0]}
+  if [[ ${had_errexit} -eq 1 ]]; then set -o errexit; fi
+  [[ ${status} -ne 0 ]] && _log_raw CMDFAIL "$* -> ${status}"
+  return "${status}"
+}
+
+# Ставит диагноз по сохранённому выводу pip.
+#
+#   diagnose_pip_failure ФАЙЛ [ПУТЬ_К_PYTHON]
+#
+# Возвращает 0, если причина опознана и напечатана, 1 — если нет.
+# Порядок проверок от частного к общему: «нет колеса под этот Python»
+# выглядит как обычный конфликт версий, и общее правило перехватило бы его.
+diagnose_pip_failure() {
+  local file="$1" python="${2:-}" offline="${3:-0}" text pyver=""
+  [[ -f "${file}" ]] || return 1
+  text="$(cat "${file}" 2>/dev/null)" || return 1
+  [[ -n "${text}" ]] || return 1
+
+  if [[ -n "${python}" && -x "${python}" ]]; then
+    pyver="$("${python}" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+  fi
+  local pyname="Python${pyver:+ ${pyver}}"
+
+  # Прибитая гвоздями зависимость, которой нет под этот Python. Ровно так
+  # не ставился GigaAM: onnxruntime==1.23.* без колёс под 3.14.
+  if [[ "${text}" == *ResolutionImpossible* \
+     && "${text}" == *"no matching distributions available"* ]]; then
+    local culprit
+    culprit="$(printf '%s' "${text}" | sed -n 's/.*depends on \([A-Za-z0-9._-]*\)==.*/\1/p' | head -1)"
+    error "Зависимости пакета прибиты к версии, которой нет под ${pyname}."
+    [[ -n "${culprit}" ]] && hint "Не нашлось: ${culprit}"
+    hint "Это не ошибка установки — под эту версию Python колёс ещё не выпустили."
+    hint "Соберите окружение на проверенной версии:"
+    hint "  sudo bash scripts/install.sh --python /usr/bin/python${ASRHUB_MAX_PYTHON} --force"
+    hint "Либо перечислите зависимости вручную в requirements/engines/<движок>.txt,"
+    hint "а сам пакет — в requirements/engines/no-deps/<движок>.txt."
+    return 0
+  fi
+
+  if [[ "${text}" == *"conflicting dependencies"* || "${text}" == *ResolutionImpossible* ]]; then
+    error "Пакеты требуют несовместимых версий одной библиотеки."
+    printf '%s' "${text}" | sed -n '/The conflict is caused by/,/^$/p' | head -8 >&2
+    hint "Чаще всего лечится установкой движка в отдельное окружение."
+    return 0
+  fi
+
+  # Сеть. Каждая причина лечится по-разному, поэтому и разделены.
+  if [[ "${text}" == *"Temporary failure in name resolution"* \
+     || "${text}" == *"Could not resolve host"* \
+     || "${text}" == *"Name or service not known"* \
+     || "${text}" == *"nodename nor servname provided"* ]]; then
+    error "Не разрешается имя сервера пакетов — не работает DNS."
+    hint "Проверьте: getent hosts pypi.org"
+    return 0
+  fi
+  if [[ "${text}" == *"Tunnel connection failed"* || "${text}" == *ProxyError* \
+     || "${text}" == *"407 Proxy"* ]]; then
+    error "Прокси не пропускает запросы к серверу пакетов."
+    hint "Задайте его явно и повторите:"
+    hint "  export https_proxy=http://адрес:порт; export http_proxy=\$https_proxy"
+    return 0
+  fi
+  if [[ "${text}" == *CERTIFICATE_VERIFY_FAILED* || "${text}" == *SSLError* \
+     || "${text}" == *SSLCertVerificationError* ]]; then
+    error "Не проверяется сертификат сервера пакетов."
+    hint "Обычно так ведёт себя корпоративный шлюз, подменяющий TLS."
+    hint "Добавьте его корневой сертификат в систему или укажите:"
+    hint "  ${VPIP:-pip} config set global.cert /путь/к/корневому.pem"
+    return 0
+  fi
+  if [[ "${text}" == *"Read timed out"* || "${text}" == *ReadTimeoutError* \
+     || "${text}" == *"Connection refused"* || "${text}" == *"Network is unreachable"* \
+     || "${text}" == *"Connection reset"* || "${text}" == *"Failed to establish a new connection"* ]]; then
+    error "Сервер пакетов недоступен — обрывается соединение."
+    hint "Проверьте сеть и повторите: часть загрузок весит сотни мегабайт."
+    return 0
+  fi
+
+  # Автономный режим отличаем до общего разбора: без индекса pip говорит ровно
+  # то же самое — «нет подходящей версии», — и совет про версию Python увёл бы
+  # в сторону от настоящей причины, пустого кеша.
+  if [[ "${offline}" == "1" && ( "${text}" == *"No matching distribution found"* \
+     || "${text}" == *"Could not find a version that satisfies"* ) ]]; then
+    error "Автономный режим: нужного пакета нет в кеше pip."
+    hint "Кеш заполняется при установке с доступом в интернет."
+    hint "Либо снимите автономный режим, либо подготовьте кеш заранее:"
+    hint "  pip download -r requirements/base.txt -d /путь/к/кешу"
+    return 0
+  fi
+
+  if [[ "${text}" == *"No matching distribution found"* \
+     || "${text}" == *"Could not find a version that satisfies"* ]]; then
+    local missing
+    missing="$(printf '%s' "${text}" | sed -n 's/.*No matching distribution found for \(.*\)/\1/p' | head -1)"
+    error "Для ${pyname} нет подходящей версии${missing:+: ${missing}}."
+    if [[ "${text}" == *"(from versions:"* ]]; then
+      hint "Доступные версии перечислены в выводе выше — нужной среди них нет."
+    fi
+    hint "Проверьте версию Python и архитектуру: некоторые пакеты выходят с задержкой."
+    return 0
+  fi
+
+  if [[ "${text}" == *"No space left on device"* || "${text}" == *"Errno 28"* ]]; then
+    error "Закончилось место на диске."
+    hint "Кеш pip нередко занимает гигабайты: ${VPIP:-pip} cache purge"
+    return 0
+  fi
+
+  if [[ "${text}" == *MemoryError* || "${text}" == *"Killed"* \
+     || "${text}" == *"virtual memory exhausted"* ]]; then
+    error "Не хватило оперативной памяти при сборке пакета."
+    hint "Соберите пакеты по одному или добавьте файл подкачки."
+    return 0
+  fi
+
+  if [[ "${text}" == *"Could not build wheels"* || "${text}" == *"Failed building wheel"* \
+     || "${text}" == *"error: command '"* || "${text}" == *"gcc: fatal error"* \
+     || "${text}" == *"Python.h: No such file"* ]]; then
+    local package
+    package="$(printf '%s' "${text}" | sed -n 's/.*Failed building wheel for \(.*\)/\1/p' | head -1)"
+    error "Готового пакета нет, а собрать из исходников нечем${package:+ (${package})}."
+    hint "Нужны компилятор и заголовки Python:"
+    hint "  sudo apt install build-essential python${pyver:-3}-dev"
+    return 0
+  fi
+
+  if [[ "${text}" == *externally-managed-environment* ]]; then
+    error "Установка идёт в системный Python, а он защищён от изменений."
+    hint "Так и задумано: пакеты ставятся только в виртуальное окружение."
+    return 0
+  fi
+
+  if [[ "${text}" == *"Permission denied"* || "${text}" == *"Errno 13"* ]]; then
+    error "Отказано в доступе при записи пакетов."
+    hint "Запустите установку с sudo или выберите каталог, доступный на запись."
+    return 0
+  fi
+
+  if [[ "${text}" == *"THESE PACKAGES DO NOT MATCH THE HASHES"* \
+     || "${text}" == *"HASH mismatch"* ]]; then
+    error "Загруженный пакет не совпадает с контрольной суммой."
+    hint "Обычно это испорченный кеш: ${VPIP:-pip} cache purge"
+    return 0
+  fi
+
+  if [[ "${text}" == *"is not a supported wheel on this platform"* ]]; then
+    error "Пакет собран под другую архитектуру."
+    hint "Проверьте разрядность и платформу: $(uname -m 2>/dev/null || echo '?')"
+    return 0
+  fi
+
+  if [[ "${text}" == *"Invalid requirement"* ]]; then
+    error "Файл требований прочитать не удалось — ошибка в его синтаксисе."
+    hint "Это ошибка в самом ASR Hub: сообщите строку из вывода выше."
+    return 0
+  fi
+
+  return 1
+}
+
+# Установка требований движка.
+#
+#   install_engine_requirements ПУТЬ_К_PIP ФАЙЛ_ТРЕБОВАНИЙ [ключи pip…]
+#
+# Рядом с обычным файлом может лежать engines/no-deps/<движок>.txt —
+# перечисленное в нём ставится с --no-deps, а его зависимости берутся из
+# обычного файла. Это нужно пакетам, которые прибивают версии гвоздями:
+# GigaAM требует onnxruntime==1.23.*, а колёс под Python 3.14 у этой версии
+# нет — pip обрывался с ResolutionImpossible, и движок не ставился вовсе,
+# хотя onnxruntime нужен ему только для экспорта в ONNX.
+#
+# Подкаталог, а не сосед по имени: engines/*.txt перебирается циклом в
+# update.sh, и файл-спутник попал бы в него как отдельный «движок».
+install_engine_requirements() {
+  local pip="$1" req="$2"; shift 2
+  local nodeps
+  nodeps="$(dirname "${req}")/no-deps/$(basename "${req}")"
+  pip_install "${pip}" 2 "$@" -r "${req}" || return 1
+  if [[ -f "${nodeps}" ]]; then
+    pip_install "${pip}" 2 "$@" --no-deps -r "${nodeps}" || return 1
+  fi
+  return 0
+}
+
+# Установка пакетов: повторы при обрыве плюс разбор причины отказа.
+#
+#   pip_install ПУТЬ_К_PIP ЧИСЛО_ПОПЫТОК аргументы_pip…
+#
+# Повтор нужен для сетевых обрывов — загрузки идут сотнями мегабайт. Но
+# повторять бессмысленно, когда колеса под эту версию Python просто нет:
+# причина называется сразу после последней попытки, и пользователю не нужно
+# искать её в выводе pip.
+pip_install() {
+  local pip="$1" attempts="$2"; shift 2
+  local capture status=0 label="" arg offline=0
+  # Ключи в подпись не берём: имя нужно человеку, а не для повторения строки.
+  # Заодно замечаем автономный режим — от него зависит объяснение отказа.
+  for arg in "$@"; do
+    [[ "${arg}" == "--no-index" ]] && offline=1
+    [[ "${arg}" == -* ]] && continue
+    label="${label:+${label} }$(basename "${arg}")"
+  done
+  capture="$(mktemp "${TMPDIR:-/tmp}/asrhub-pip.XXXXXX")"
+  register_temp "${capture}"
+  # Присваивание перед вызовом функции в разных bash ведёт себя по-разному
+  # (в 3.2 на macOS оно переживает вызов), поэтому ставим и снимаем вручную.
+  ASRHUB_RETRY_LABEL="установка пакетов (${label:-без имени})"
+  retry "${attempts}" run_pip "${capture}" "${pip}" install "$@" || status=$?
+  unset ASRHUB_RETRY_LABEL
+  if [[ ${status} -ne 0 ]]; then
+    diagnose_pip_failure "${capture}" "$(dirname "${pip}")/python" "${offline}" || true
+  fi
+  rm -f "${capture}" 2>/dev/null || true
+  return "${status}"
+}
+
 retry() {
   local attempts="${1}"; shift
   local delay=2 attempt=1 status=0
@@ -257,7 +556,9 @@ retry() {
     status=0
     "$@" && return 0 || status=$?
     if [[ ${attempt} -ge ${attempts} ]]; then
-      error "Не удалось выполнить после ${attempts} попыток: $*"
+      # Имя вместо всей команды: у pip она разрастается до временного файла и
+      # десятка ключей, из которых пользователю не пригодится ни один.
+      error "Не удалось выполнить после ${attempts} попыток: ${ASRHUB_RETRY_LABEL:-$*}"
       return ${status}
     fi
     warn "Попытка ${attempt} из ${attempts} не удалась (код ${status}), повтор через ${delay} с…"
@@ -387,6 +688,20 @@ check_python() {
   fi
   printf '%s' "${best}"
   debug "выбран интерпретатор ${best} версии ${best_version}"
+}
+
+# Свободное место в гигабайтах у ближайшего существующего предка пути.
+# Отдельной функцией, потому что спрашивают об этом в трёх местах, и каждое
+# со своей причиной: каталог данных, каталог установки и /tmp, где pip
+# распаковывает и собирает пакеты.
+free_space_gb() {
+  local probe="$1" avail_kb
+  while [[ ! -d "${probe}" && "${probe}" != "/" && "${probe}" != "." ]]; do
+    probe="$(dirname "${probe}")"
+  done
+  if ! have df; then printf '%s' ""; return 0; fi
+  avail_kb="$(df -Pk "${probe}" 2>/dev/null | awk 'NR==2 {print $4}')" || avail_kb=0
+  printf '%s' "$(( ${avail_kb:-0} / 1024 / 1024 ))"
 }
 
 check_disk_space() {

@@ -425,7 +425,7 @@ install-engine)
   fi
 
   info "Установка движка «${ENGINE}»…"
-  if retry 2 run "${VPIP}" install --disable-pip-version-check -r "${REQ}"; then
+  if install_engine_requirements "${VPIP}" "${REQ}" --disable-pip-version-check; then
     ok "Движок «${ENGINE}» установлен"
     "${PREFIX}/venv/bin/python" -c "
 import sys; sys.path.insert(0,'${PREFIX}/server')

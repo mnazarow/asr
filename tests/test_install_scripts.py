@@ -1114,3 +1114,373 @@ def test_windows_token_replaces_the_old_line_too(repo_root: Path, tmp_path: Path
 
     assert load(config).hf_token == "hf_новый12345678901234"
     assert load(config).get("server_port") == 8080
+
+
+# ---------------------------------------------------------------------------
+# Движки с прибитыми гвоздями зависимостями
+# ---------------------------------------------------------------------------
+
+
+def test_gigaam_installs_without_resolving_its_hard_pins(repo_root: Path):
+    """GigaAM не ставился вовсе — из-за версий, прибитых в его pyproject.
+
+    `onnxruntime==1.23.*` и `onnx==1.19.*` не имеют колёс под Python 3.14, и
+    pip обрывался с ResolutionImpossible ещё до загрузки самого пакета:
+    «no matching distributions available for your environment: onnxruntime».
+    При этом для распознавания ни onnx, ни конкретная версия onnxruntime не
+    нужны — они только для экспорта модели в ONNX.
+    """
+    engines = repo_root / "requirements" / "engines"
+    main = (engines / "gigaam.txt").read_text(encoding="utf-8")
+    companion = engines / "no-deps" / "gigaam.txt"
+    assert companion.exists(), "нет файла для установки без зависимостей"
+
+    assert "git+https://github.com/salute-developers/GigaAM" in \
+        companion.read_text(encoding="utf-8")
+    assert "git+" not in main, "пакет остался там, где pip разрешает зависимости"
+    # Зависимости перечислены своими руками — иначе --no-deps оставит движок
+    # без hydra, omegaconf и остального, и он не импортируется.
+    for package in ("hydra-core", "omegaconf", "sentencepiece", "soundfile",
+                    "tqdm", "numpy", "onnxruntime"):
+        assert package in main, f"в требованиях нет {package}"
+
+    # Спутник обязан лежать в подкаталоге: update.sh перебирает engines/*.txt
+    # и принял бы соседний файл за отдельный движок.
+    assert companion.parent.name == "no-deps"
+    assert not list(engines.glob("*.no-deps.txt"))
+
+
+def test_companion_file_is_installed_without_dependencies(repo_root: Path,
+                                                          tmp_path: Path):
+    """Спутник ставится с --no-deps, и только он.
+
+    Обратное — `--no-deps` на весь файл требований — оставило бы без
+    зависимостей и hydra-core с omegaconf, то есть движок бы не заработал.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    engines = tmp_path / "engines"
+    (engines / "no-deps").mkdir(parents=True)
+    (engines / "движок.txt").write_text("пакет-зависимость\n", encoding="utf-8")
+    (engines / "no-deps" / "движок.txt").write_text("пакет-без-зависимостей\n",
+                                                    encoding="utf-8")
+    calls = tmp_path / "вызовы.txt"
+    fake_pip = tmp_path / "pip"
+    fake_pip.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{calls}"\n',
+                        encoding="utf-8")
+    fake_pip.chmod(0o755)
+
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      install_engine_requirements "{fake_pip}" "{engines}/движок.txt" --флаг
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    lines = calls.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2, f"вызовов pip: {lines}"
+    assert "--no-deps" not in lines[0], "зависимости движка не установлены"
+    assert lines[0].endswith("движок.txt")
+    assert "--no-deps" in lines[1] and lines[1].endswith("no-deps/движок.txt")
+    assert lines.index(lines[0]) < lines.index(lines[1]), \
+        "пакет ставится раньше своих зависимостей"
+
+    # Без спутника — ровно один вызов: остальные движки не должны меняться.
+    calls.unlink()
+    (engines / "no-deps" / "движок.txt").unlink()
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_engine_from_a_repository_is_recognised_as_installed(repo_root: Path,
+                                                             tmp_path: Path):
+    """Движок, поставленный из репозитория, выглядел неустановленным.
+
+    Имя пакета вырезалось по `<>=!;[`, а прямая ссылка PEP 508 выглядит как
+    «gigaam @ git+https://…»: именем становилась вся строка с адресом. Такой
+    движок не обновлялся никогда — `update.sh` его просто не видел.
+    """
+    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
+    body = re.search(r"(engine_installed\(\) \{\n.*?\n\}\n)", source, re.S)
+    assert body, "не найдена функция engine_installed"
+
+    engines = tmp_path / "engines"
+    (engines / "no-deps").mkdir(parents=True)
+    (engines / "движок.txt").write_text("посторонний-пакет>=1\n", encoding="utf-8")
+    (engines / "no-deps" / "движок.txt").write_text(
+        "нужный-пакет @ git+https://example.invalid/пакет.git\n", encoding="utf-8")
+
+    # Макет pip: знает ровно один пакет — тот, что стоит из репозитория.
+    fake_pip = tmp_path / "pip"
+    fake_pip.write_text('#!/usr/bin/env bash\n'
+                        '[[ "$1" == "show" && "$2" == "нужный-пакет" ]] && exit 0\n'
+                        'exit 1\n', encoding="utf-8")
+    fake_pip.chmod(0o755)
+
+    script = f'''
+      set -Eeuo pipefail
+      VPIP="{fake_pip}"
+{body.group(1)}
+      if engine_installed "{engines}/движок.txt"; then echo НАЙДЕН; else echo НЕТ; fi
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["НАЙДЕН"]
+
+
+# ---------------------------------------------------------------------------
+# Обработка ошибок установщика
+# ---------------------------------------------------------------------------
+
+
+def _diagnose(repo_root: Path, tmp_path: Path, text: str, *, offline: str = "0"):
+    """Прогоняет разбор вывода pip на настоящем тексте ошибки."""
+    capture = tmp_path / "вывод.txt"
+    capture.write_text(text, encoding="utf-8")
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      if diagnose_pip_failure "{capture}" "" "{offline}"; then :; else echo НЕ_ОПОЗНАНА; fi
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    return result.stdout + result.stderr
+
+
+def test_pip_failure_is_explained_in_one_line(repo_root: Path, tmp_path: Path):
+    """Сто строк вывода pip заменяются одной строкой о причине.
+
+    Установка движка обрывалась словами «установка не удалась — сервер
+    запустится без него», и почему — пользователь должен был выяснять сам по
+    трассировке pip. Тексты здесь — настоящие, снятые с неудавшихся запусков.
+    """
+    # Прибитая версия, которой нет под этот Python: так не ставился GigaAM.
+    text = _diagnose(repo_root, tmp_path, """
+ERROR: Cannot install -r gigaam.txt (line 9) and onnxruntime>=1.17 because these package versions have conflicting dependencies.
+
+The conflict is caused by:
+    The user requested onnxruntime>=1.17
+    gigaam 0.2.0 depends on onnxruntime==1.23.*
+
+Additionally, some packages in these conflicts have no matching distributions available for your environment:
+    onnxruntime
+
+ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/
+""")
+    assert "прибиты к версии" in text
+    assert "onnxruntime" in text, "не названа виновная библиотека"
+    assert "--python" in text, "нет команды, которая это лечит"
+
+    # Нет колеса вообще.
+    text = _diagnose(repo_root, tmp_path, """
+ERROR: Could not find a version that satisfies the requirement onnxruntime==1.23.0 (from versions: 1.24.1, 1.29.0)
+ERROR: No matching distribution found for onnxruntime==1.23.0
+""")
+    assert "нет подходящей версии" in text and "onnxruntime==1.23.0" in text
+
+    # Прокси. Настоящий вывод: pip повторяет попытки и заканчивает теми же
+    # словами «No matching distribution found» — сетевую причину надо узнать
+    # раньше, иначе совет будет про версию Python.
+    text = _diagnose(repo_root, tmp_path, """
+WARNING: Retrying (Retry(total=4)) after connection broken by 'OSError('Tunnel connection failed: 403 Forbidden')': /simple/requests/
+ERROR: Could not find a version that satisfies the requirement requests (from versions: none)
+ERROR: No matching distribution found for requests
+""")
+    assert "Прокси" in text, "сетевая причина принята за отсутствие версии"
+    assert "https_proxy" in text
+
+    # Автономный режим выглядит точно так же — и тоже не про версию Python.
+    text = _diagnose(repo_root, tmp_path, """
+ERROR: Could not find a version that satisfies the requirement fastapi (from versions: none)
+ERROR: No matching distribution found for fastapi
+""", offline="1")
+    assert "Автономный режим" in text and "кеш" in text
+
+    # Остальные распознаваемые причины.
+    for sample, expected in (
+        ("OSError: [Errno 28] No space left on device", "место на диске"),
+        ("ERROR: Failed building wheel for onnx\nPython.h: No such file", "собрать из исходников"),
+        ("error: externally-managed-environment", "защищён от изменений"),
+        ("urllib3.exceptions.SSLError: CERTIFICATE_VERIFY_FAILED", "сертификат"),
+        ("socket.gaierror: [Errno -3] Temporary failure in name resolution", "DNS"),
+    ):
+        assert expected in _diagnose(repo_root, tmp_path, sample), sample
+
+    # И наоборот: незнакомый текст не выдумывает причину.
+    assert "НЕ_ОПОЗНАНА" in _diagnose(repo_root, tmp_path, "что-то совершенно неожиданное")
+
+
+def test_second_installer_does_not_run_in_the_same_directory(repo_root: Path,
+                                                             tmp_path: Path):
+    """Две установки в один каталог ломают окружение друг друга.
+
+    Второй установщик сносит venv, пока первый в него ставит пакеты. На
+    выходе — установка, где половина движков есть, а половины нет, причём в
+    журнале обеих всё успешно.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    target = tmp_path / "установка"
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      enable_error_handling
+      acquire_install_lock "{target}" || exit 9
+      # Второй установщик — отдельный процесс, как оно и бывает.
+      bash -c '
+        set -Eeuo pipefail
+        source "{common}"
+        acquire_install_lock "{target}" && echo ВТОРОЙ_ВЗЯЛ || echo ВТОРОЙ_ОТКАЗ
+      '
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert "ВТОРОЙ_ОТКАЗ" in result.stdout
+    assert "уже идёт установка" in result.stderr
+    # Замок снимается сам: иначе прерванная установка блокировала бы каталог
+    # навсегда, и человеку пришлось бы удалять файл руками.
+    assert not (target / ".asrhub-install.lock").exists()
+
+
+def test_lock_left_by_a_dead_installer_is_removed(repo_root: Path, tmp_path: Path):
+    """Замок прерванной установки не должен блокировать каталог навсегда."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    target = tmp_path / "установка"
+    target.mkdir()
+    # Номер процесса, которого заведомо нет.
+    (target / ".asrhub-install.lock").write_text("999999\n", encoding="utf-8")
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      acquire_install_lock "{target}" && echo ВЗЯЛ
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert "ВЗЯЛ" in result.stdout
+    assert "прерванной установки" in result.stderr
+
+
+def test_failure_tells_how_to_repeat_without_leaking_the_token(repo_root: Path):
+    """После сбоя нужно повторить установку — теми же ключами.
+
+    И строка запуска попадает не только на экран, но и в журнал, поэтому
+    токен Hugging Face в ней обязан быть замаскирован.
+    """
+    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = re.search(r"(ASRHUB_INVOCATION=\"bash \$0\"\n.*?\nexport ASRHUB_INVOCATION\n)",
+                      source, re.S)
+    assert block, "строка запуска не собирается"
+    script = f'''
+      set -Eeuo pipefail
+      собрать() {{
+{block.group(1)}
+        printf '%s\\n' "${{ASRHUB_INVOCATION}}"
+      }}
+      собрать --profile light --hf-token hf_секрет1234567890 --yes
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    line = result.stdout.strip()
+    assert "--profile light" in line and "--yes" in line
+    assert "hf_секрет1234567890" not in line, "токен утёк в сообщение и в журнал"
+    assert "hf_…" in line
+
+    # И сама подсказка существует.
+    common = (repo_root / "scripts" / "lib" / "common.sh").read_text(encoding="utf-8")
+    assert "Повторить после исправления" in common
+
+
+def _preflight_block(repo_root: Path, marker: str) -> str:
+    """Достаёт из install.sh настоящий кусок предварительной проверки."""
+    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    block = re.search(marker, source, re.S)
+    assert block, f"не найден блок проверки: {marker}"
+    return block.group(1)
+
+
+def test_missing_git_is_named_before_the_engine_step(repo_root: Path, tmp_path: Path):
+    """Движок из репозитория без git падает на девятом шаге из десяти.
+
+    pip доходит до клонирования и обрывается — после того, как окружение
+    собрано, torch выкачан и полчаса потрачено. Проверить наличие git стоит
+    доли секунды, и делать это надо до всего.
+    """
+    block = _preflight_block(
+        repo_root, r'(if \[\[ "\$\{MODE\}" == "native" && "\$\{OFFLINE\}" -eq 0 \]\]; then\n'
+                   r'  _needs_git=.*?\n  unset _needs_git _engine _engine_list _nodeps\nfi\n)')
+    common = repo_root / "scripts" / "lib" / "common.sh"
+
+    def probe(*, git_present: bool, install_works: bool) -> tuple[int, str]:
+        script = f'''
+          set -Eeuo pipefail
+          source "{common}"
+          MODE=native
+          OFFLINE=0
+          ENGINES="faster_whisper,gigaam"
+          REPO_DIR="{repo_root}"
+          have() {{ [[ "$1" == "git" ]] && return {0 if git_present else 1}; command -v "$1" >/dev/null 2>&1; }}
+          install_system_packages() {{ return {0 if install_works else 1}; }}
+{block}
+          echo ДОШЛИ_ДО_КОНЦА
+        '''
+        result = run_bash(script)
+        return result.returncode, result.stdout + result.stderr
+
+    # git есть — проверка молчит и не мешает.
+    code, text = probe(git_present=True, install_works=True)
+    assert code == 0 and "ДОШЛИ_ДО_КОНЦА" in text
+    assert "git" not in text.lower() or "ставятся из репозитория" not in text
+
+    # git нет, но ставится — предупреждение и продолжение.
+    code, text = probe(git_present=False, install_works=True)
+    assert code == 0 and "ДОШЛИ_ДО_КОНЦА" in text
+    assert "ставятся из репозитория" in text and "gigaam" in text
+
+    # git нет и не ставится — остановка здесь, а не на девятом шаге.
+    code, text = probe(git_present=False, install_works=False)
+    assert code == 127, text
+    assert "ДОШЛИ_ДО_КОНЦА" not in text
+    assert "apt install git" in text
+
+
+def test_directory_that_cannot_run_programs_is_refused(repo_root: Path,
+                                                       tmp_path: Path):
+    """Раздел с noexec: venv соберётся, а python из него не запустится.
+
+    Ошибка приходит уже от pip — «Permission denied» на собственный
+    интерпретатор, — и по ней не догадаться, что дело в способе монтирования.
+    """
+    block = _preflight_block(
+        repo_root, r'(if \[\[ "\$\{MODE\}" == "native" && "\$\{ASRHUB_DRY_RUN\}" != "1" \]\]; then\n'
+                   r'  _exec_probe=.*?\n  unset _exec_probe\nfi\n)')
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    target = tmp_path / "установка"
+    target.mkdir()
+
+    # Обычный каталог: проверка обязана пропустить.
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      MODE=native; ASRHUB_DRY_RUN=0; PREFIX="{target}"
+{block}
+      echo ПРОПУЩЕНО
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0 and "ПРОПУЩЕНО" in result.stdout, result.stderr
+    assert not list(target.glob(".asrhub-exec.*")), "проба осталась на диске"
+
+    # Каталог, где программы не запускаются: подменяем chmod, чтобы пробный
+    # файл остался без права на запуск — это ровно то, что делает noexec.
+    script = f'''
+      set -Eeuo pipefail
+      source "{common}"
+      MODE=native; ASRHUB_DRY_RUN=0; PREFIX="{target}"
+      chmod() {{ return 0; }}
+{block}
+      echo ПРОПУЩЕНО
+    '''
+    result = run_bash(script)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "ПРОПУЩЕНО" not in result.stdout
+    assert "noexec" in result.stderr
+    assert not list(target.glob(".asrhub-exec.*")), "проба осталась после отказа"
