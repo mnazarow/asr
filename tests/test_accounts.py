@@ -361,3 +361,143 @@ def test_password_can_be_reset_from_the_console(tmp_path: Path, repo_root: Path)
     # Пароль не должен уходить в аргументы: они видны в списке процессов.
     source = (repo_root / "server" / "asrhub" / "__main__.py").read_text(encoding="utf-8")
     assert "getpass" in source
+
+
+# ---------------------------------------------------------------------------
+# Токен Hugging Face в настройках
+# ---------------------------------------------------------------------------
+
+
+def _admin(client):
+    """Входит администратором и снимает обязательную смену пароля."""
+    _login(client)
+    client.post("/api/auth/password", json={"current_password": DEFAULT_PASSWORD,
+                                            "new_password": "пароль-настроек-2026"})
+
+
+def test_hf_token_is_set_from_the_interface_and_never_shown_back(app_client, data_dir: Path):
+    """Токен задаётся из интерфейса, но целиком наружу не отдаётся.
+
+    До этого его можно было задать только при установке или строкой в
+    config.yaml — то есть человеку с доступом к серверу. При этом показывать
+    его в ответе нельзя: он уйдёт в кеш браузера и будет виден через плечо.
+    """
+    _admin(app_client)
+    assert app_client.get("/api/settings/hf-token").json()["configured"] is False
+
+    token = "hf_" + "a" * 30
+    saved = app_client.put("/api/settings/hf-token", json={"token": token})
+    assert saved.status_code == 200
+    body = saved.json()
+    assert body["configured"] is True
+    assert body["preview"] == "hf_aaa…"
+    assert body["length"] == len(token)
+    assert token not in saved.text, "токен вернулся целиком"
+
+    state = app_client.get("/api/settings/hf-token")
+    assert token not in state.text
+    assert state.json()["preview"] == "hf_aaa…"
+
+    # И в общих настройках его тоже нет: их читает любой ключ, включая readonly.
+    assert token not in app_client.get("/api/settings").text
+
+    # Записан в конфигурацию, а не только в память процесса.
+    config = data_dir / "config.yaml"
+    assert config.exists()
+    assert token in config.read_text(encoding="utf-8")
+    assert oct(config.stat().st_mode)[-3:] in ("600", "640"), "файл с секретом читают все"
+
+
+def test_hf_token_checks_the_shape_and_can_be_removed(app_client):
+    """Мусор вместо токена отклоняется, пустая строка — это «убрать».
+
+    Опечатка в токене иначе обнаружилась бы через полчаса на загрузке весов,
+    и виноватой выглядела бы модель.
+    """
+    _admin(app_client)
+    bad = app_client.put("/api/settings/hf-token", json={"token": "просто-текст"})
+    assert bad.status_code == 400
+    # Поля отказа доступны верхним уровнем — и одинаково у всех маршрутов.
+    assert "hf_" in bad.json()["message"]
+    assert bad.json()["code"] == "config_error"
+
+    app_client.put("/api/settings/hf-token", json={"token": "hf_" + "b" * 30})
+    assert app_client.get("/api/settings/hf-token").json()["configured"] is True
+
+    cleared = app_client.put("/api/settings/hf-token", json={"token": ""})
+    assert cleared.status_code == 200
+    assert cleared.json()["configured"] is False
+
+
+def test_hf_token_is_admin_only(app_client):
+    """Токен открывает доступ к чужим весам — задавать его может админ."""
+    _admin(app_client)
+    app_client.post("/api/users", json={"username": "оператор", "password": "пароль-оператора",
+                                        "role": "user", "must_change_password": False})
+    app_client.post("/api/auth/logout")
+    _login(app_client, "оператор", "пароль-оператора")
+
+    assert app_client.get("/api/settings/hf-token").status_code == 403
+    assert app_client.put("/api/settings/hf-token",
+                          json={"token": "hf_" + "c" * 30}).status_code == 403
+
+
+def test_access_section_exists_in_the_settings_view(repo_root: Path):
+    """Раздел «Доступ» в настройках — там, где его ищут.
+
+    Ключ доступа и токен лежали в разделе «Сервер», куда за настройками не
+    ходят. Панель кнопок параметров в этом разделе скрыта: «Сбросить» там
+    сбросил бы совсем не то, о чём думает человек.
+    """
+    app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "const ACCESS_GROUP = '_access';" in app
+    assert "renderAccessSection" in app
+    assert "'/api/settings/hf-token'" in app
+    assert "state.paramGroup === ACCESS_GROUP ? 'hidden' : ''" in app, \
+        "панель параметров показана там, где параметров нет"
+    # Токен не должен запрашиваться у того, кто не администратор: иначе в
+    # интерфейсе появится отказ там, где просто нечего показывать.
+    assert "if (!isAdmin) {" in app
+
+
+def test_error_body_has_one_shape_everywhere(app_client):
+    """Отказ читается одинаково, откуда бы он ни пришёл.
+
+    Ошибка, поднятая через error_response, уходила вложенной в `detail`, а
+    та же ошибка из глубины — полями верхнего уровня. Клиент был обязан
+    разбирать оба вида, и нигде об этом не говорилось. Теперь поля есть
+    верхним уровнем всегда, а `detail` сохранён для тех, кто уже разбирает
+    ответ так.
+    """
+    _admin(app_client)
+    cases = [
+        app_client.get("/api/jobs/такого-нет"),                       # error_response
+        app_client.put("/api/settings/hf-token", json={"token": "мусор"}),
+        app_client.post("/api/auth/login", json={"username": "нет", "password": "нет"}),
+    ]
+    for response in cases:
+        body = response.json()
+        assert response.status_code >= 400
+        assert body.get("code"), f"нет поля code: {body}"
+        assert body.get("message"), f"нет поля message: {body}"
+        assert "retryable" in body, f"нет признака повторяемости: {body}"
+        if "detail" in body:
+            assert body["detail"]["code"] == body["code"], "вложенная копия разошлась"
+
+
+def test_the_key_field_lives_in_one_place(repo_root: Path):
+    """Поле для ключа было в двух разделах и показывало разное.
+
+    В «Справке» стояло своё поле с тем же значением из localStorage: сохранив
+    ключ в одном месте, человек видел в другом прежний — до перезагрузки
+    страницы. Теперь ключ задаётся только в «Настройки → Доступ», а «Справка»
+    туда ведёт.
+    """
+    app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "help-key-save" not in app and "help-key-clear" not in app, \
+        "в справке осталось второе поле для ключа"
+    assert "help-to-access" in app, "из справки нет пути к разделу «Доступ»"
+    # Ключ кладётся в браузер ровно в двух местах, и оба обязательны: форма
+    # «войти по ключу» на экране входа — туда попадают, ещё не войдя, — и
+    # раздел «Доступ». Третье место означало бы, что поля снова разошлись.
+    assert app.count("localStorage.setItem('asrhub_key'") == 2

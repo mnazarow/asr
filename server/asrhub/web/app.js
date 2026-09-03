@@ -3054,6 +3054,179 @@ window.__asrhub.cmpRemove = (id) => {
 };
 
 // ==========================================================================
+// Раздел «Доступ» в настройках
+// ==========================================================================
+//
+// Ключ доступа и токен Hugging Face — не параметры каталога: у них нет ни
+// значения по умолчанию, ни диапазона, а показывать их целиком нельзя.
+// Поэтому отдельный раздел со своими правилами вместо карточек параметров.
+
+const ACCESS_GROUP = '_access';
+
+function maskKey(value) {
+  if (!value) return '';
+  return value.length > 12 ? `${value.slice(0, 8)}…${value.slice(-4)}` : `${value.slice(0, 4)}…`;
+}
+
+async function renderAccessSection(host) {
+  const stored = localStorage.getItem('asrhub_key') || '';
+  const me = state.me || {};
+  const isAdmin = me.role === 'admin';
+
+  host.innerHTML = `
+    <section class="card">
+      <div class="card-head"><h3>Этот браузер</h3>
+        <span class="hint">чем интерфейс подписывает свои запросы</span></div>
+      <div class="params" style="padding:14px 16px">
+        <p class="small dim" id="access-current"></p>
+        <div class="row wrap" style="gap:8px">
+          <input type="password" id="access-key" placeholder="ah_…" autocomplete="off"
+                 style="flex:1;min-width:220px">
+          <button class="primary sm" id="access-key-save">Использовать этот ключ</button>
+          <button class="ghost sm" id="access-key-forget">Забыть ключ</button>
+        </div>
+        <p class="small dim" style="margin-top:8px">Ключ хранится только в этом
+          браузере и уходит заголовком <span class="mono">X-API-Key</span>. Если вы вошли
+          логином и паролем, ключ здесь не нужен.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h3>Ключи доступа</h3>
+        <span class="hint">для программ: curl, asrctl, интеграции</span></div>
+      <div class="params" style="padding:14px 16px">
+        <div id="access-keys"></div>
+        ${isAdmin ? `<div class="row wrap" style="margin-top:10px;gap:6px">
+          <input type="text" id="access-new-name" placeholder="название ключа"
+                 style="flex:1;min-width:160px">
+          <select id="access-new-role" style="width:130px">
+            <option value="user">user</option><option value="admin">admin</option>
+            <option value="readonly">readonly</option></select>
+          <button class="primary sm" id="access-new">Создать</button></div>
+          <p class="small dim" style="margin-top:8px">Полное значение ключа
+            показывается один раз при создании — сохраните его сразу.</p>`
+        : '<p class="small dim" style="margin-top:8px">Создавать и отзывать ключи может администратор.</p>'}
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h3>Токен Hugging Face</h3>
+        <span class="hint">модели с ограниченным доступом и pyannote</span></div>
+      <div class="params" style="padding:14px 16px">
+        <div id="access-hf"></div>
+      </div>
+    </section>`;
+
+  // --- ключ этого браузера ---
+  const current = qs('#access-current');
+  if (me.kind === 'user') {
+    current.textContent = `Вход по учётной записи «${me.name}» — запросы подписывает сессия.`;
+  } else if (stored) {
+    current.textContent = `Сейчас используется ключ ${maskKey(stored)}.`;
+  } else {
+    current.textContent = 'Ключ не задан: сервер разрешает работу без аутентификации.';
+  }
+  qs('#access-key-save').onclick = () => {
+    const value = qs('#access-key').value.trim();
+    if (!value) { toast('Введите ключ', 'warn'); return; }
+    localStorage.setItem('asrhub_key', value);
+    toast('Ключ сохранён', 'ok', 'Страница перезагрузится');
+    setTimeout(() => location.reload(), 600);
+  };
+  qs('#access-key-forget').onclick = () => {
+    localStorage.removeItem('asrhub_key');
+    toast('Ключ убран из браузера', 'warn');
+    setTimeout(() => location.reload(), 600);
+  };
+
+  // --- список ключей ---
+  await loadAccessKeys();
+  if (isAdmin) {
+    qs('#access-new').onclick = async () => {
+      const name = qs('#access-new-name').value.trim();
+      if (!name) { toast('Укажите название ключа', 'warn'); return; }
+      try {
+        const created = await API.post('/api/keys',
+          { name, role: qs('#access-new-role').value, rate_limit: 0 });
+        prompt('Сохраните ключ — он показывается один раз:', created.key);
+        qs('#access-new-name').value = '';
+        loadAccessKeys();
+      } catch (err) { fail(err); }
+    };
+  }
+
+  // --- токен Hugging Face ---
+  await loadHfToken(isAdmin);
+}
+
+async function loadAccessKeys() {
+  const box = qs('#access-keys');
+  if (!box) return;
+  try {
+    const data = await API.get('/api/keys');
+    box.innerHTML = data.items.length ? `<table>
+      <thead><tr><th>Ключ</th><th>Название</th><th>Роль</th><th></th></tr></thead><tbody>
+      ${data.items.map((k) => `<tr>
+        <td class="mono small">${esc(k.key_preview)}</td>
+        <td>${esc(k.name || '')}</td>
+        <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span></td>
+        <td><button class="ghost sm danger"
+          onclick="__asrhub.revokeKey('${esc(k.key_id || '')}')">отозвать</button></td>
+      </tr>`).join('')}</tbody></table>` : '<div class="empty small">Ключей нет</div>';
+  } catch (err) {
+    box.innerHTML = '<div class="empty small">Список ключей доступен администратору</div>';
+  }
+}
+
+async function loadHfToken(isAdmin) {
+  const box = qs('#access-hf');
+  if (!box) return;
+  if (!isAdmin) {
+    box.innerHTML = '<div class="empty small">Токен задаёт администратор</div>';
+    return;
+  }
+  let info;
+  try {
+    info = await API.get('/api/settings/hf-token');
+  } catch (err) {
+    box.innerHTML = '<div class="empty small">Не удалось получить состояние токена</div>';
+    return;
+  }
+  box.innerHTML = `
+    <p class="small dim" style="margin:0 0 10px">${info.configured
+      ? `Задан: <span class="mono">${esc(info.preview)}</span> (${info.length} знаков).`
+      : 'Не задан. Без него не скачаются pyannote для разделения по говорящим и модели с ограниченным доступом.'}</p>
+    <div class="row wrap" style="gap:8px">
+      <input type="password" id="hf-input" placeholder="hf_…" autocomplete="off"
+             style="flex:1;min-width:220px">
+      <button class="primary sm" id="hf-save">Сохранить</button>
+      ${info.configured ? '<button class="ghost sm danger" id="hf-clear">Убрать</button>' : ''}
+    </div>
+    <p class="small dim" style="margin-top:8px">Токен сохраняется в
+      <span class="mono">${esc(info.config_file || 'config.yaml')}</span> и на экран целиком
+      не выводится. Взять его: huggingface.co/settings/tokens, прав «read» достаточно.</p>`;
+
+  qs('#hf-save').onclick = async () => {
+    const token = qs('#hf-input').value.trim();
+    if (!token) { toast('Введите токен', 'warn'); return; }
+    try {
+      await API.put('/api/settings/hf-token', { token });
+      toast('Токен сохранён', 'ok', 'Движки подхватят его при следующем задании');
+      loadHfToken(true);
+    } catch (err) { fail(err); }
+  };
+  const clear = qs('#hf-clear');
+  if (clear) clear.onclick = async () => {
+    if (!confirm('Убрать токен Hugging Face?')) return;
+    try {
+      await API.put('/api/settings/hf-token', { token: '' });
+      toast('Токен убран', 'warn');
+      loadHfToken(true);
+    } catch (err) { fail(err); }
+  };
+}
+
+// ==========================================================================
 // Вид: Настройки
 // ==========================================================================
 
@@ -3065,9 +3238,16 @@ RENDERERS.settings = {
         <div class="group-nav" id="group-nav">
           ${groups.map((g) => `<button data-group="${esc(g.id)}"
             class="${state.paramGroup === g.id ? 'active' : ''}">${esc(g.title)}</button>`).join('')}
+          <!-- Доступ — не группа каталога, а отдельный раздел: ключ доступа и
+               токен Hugging Face это не параметры со значением по умолчанию и
+               диапазоном, а секреты, и правятся они иначе. Место здесь,
+               потому что искать их идут в «Настройки», а не в «Сервер». -->
+          <button data-group="${ACCESS_GROUP}"
+            class="${state.paramGroup === ACCESS_GROUP ? 'active' : ''}">Доступ</button>
         </div>
       </div>
-      <div class="settings-toolbar" style="top:106px">
+      <div class="settings-toolbar" style="top:106px"
+           ${state.paramGroup === ACCESS_GROUP ? 'hidden' : ''}>
         <input type="search" id="p-search" placeholder="поиск по параметрам"
           value="${esc(state.paramSearch)}" style="width:260px">
         <label class="row" style="gap:6px;cursor:pointer">
@@ -3085,7 +3265,11 @@ RENDERERS.settings = {
       state.paramSearch = '';
       renderView();
     }));
+    // Панель параметров в разделе «Доступ» скрыта: «Сбросить» там сбросил бы
+    // не то, о чём человек думает, а «Применить» относится к параметрам
+    // каталога, которых в этом разделе нет.
     let timer;
+    if (state.paramGroup !== ACCESS_GROUP) {
     qs('#p-search').addEventListener('input', (e) => {
       clearTimeout(timer);
       state.paramSearch = e.target.value;
@@ -3118,6 +3302,7 @@ RENDERERS.settings = {
         renderView();
       } catch (err) { fail(err); }
     };
+    }
     this.list();
   },
 
@@ -3125,6 +3310,10 @@ RENDERERS.settings = {
     const host = qs('#params-body');
     const search = (state.paramSearch || '').toLowerCase();
     const groups = state.catalog.groups;
+
+    // Поиск идёт по параметрам каталога, поэтому раздел «Доступ» показываем
+    // только когда он выбран явно и в поиске пусто.
+    if (state.paramGroup === ACCESS_GROUP && !search) { renderAccessSection(host); return; }
 
     let items = state.params;
     if (search) {
@@ -3891,12 +4080,13 @@ curl -H "X-API-Key: ${esc(key)}" "${location.origin}/api/analytics?period=week"<
           <a class="btn" href="/api/openapi.json" target="_blank">Схема OpenAPI</a>
         </div>`)}
 
-      ${card('Ключ доступа', '', `<div class="row">
-        <input type="password" id="help-key" value="${esc(localStorage.getItem('asrhub_key') || '')}"
-          placeholder="ah_…" style="flex:1">
-        <button class="primary" id="help-key-save">Сохранить</button>
-        <button class="danger" id="help-key-clear">Забыть</button></div>
-        <div class="small faint" style="margin-top:8px">Ключ хранится только в этом браузере.</div>`)}
+      ${card('Ключ доступа', 'задаётся в одном месте', `<div class="small dim">
+        Ключ этого браузера, список ключей для программ и токен Hugging Face —
+        в разделе <b>Настройки → Доступ</b>. Раньше поле для ключа стояло ещё и
+        здесь: два поля показывали одно значение, и сохранив ключ в одном,
+        человек видел в другом прежний.</div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="help-to-access">Открыть «Доступ»</button></div>`)}
 
       ${card('Источники данных каталога', 'каждое число в каталоге имеет ссылку на первоисточник',
         `<div class="table-wrap"><table>
@@ -3908,15 +4098,10 @@ curl -H "X-API-Key: ${esc(key)}" "${location.origin}/api/analytics?period=week"<
           Каталог собран по состоянию на ${esc(state.catalog.date)}. Модели выходят
           постоянно — сверяйтесь с первоисточниками перед принятием решений.</div>`)}`;
 
-    qs('#help-key-save').onclick = () => {
-      localStorage.setItem('asrhub_key', qs('#help-key').value.trim());
-      toast('Ключ сохранён', 'ok');
-      location.reload();
-    };
-    qs('#help-key-clear').onclick = () => {
-      localStorage.removeItem('asrhub_key');
-      toast('Ключ забыт', 'warn');
-      location.reload();
+    qs('#help-to-access').onclick = () => {
+      state.paramGroup = ACCESS_GROUP;
+      state.paramSearch = '';
+      go('settings');
     };
   },
 };

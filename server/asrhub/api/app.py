@@ -14,6 +14,7 @@ from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..accounts import Accounts
 from ..analytics import Analytics
@@ -335,6 +336,25 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 RUNTIME.inc("asrhub_rate_limited_total")
         response.headers["X-Process-Time"] = f"{elapsed * 1000:.1f}ms"
         return response
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request: Request, exc: StarletteHTTPException):
+        """Приводит отказы к одному виду.
+
+        Ошибка, поднятая через error_response, уходила клиенту вложенной в
+        detail, а та же самая ошибка, вылетевшая из глубины, — полями
+        верхнего уровня. Клиент был обязан разбирать оба вида, и об этом
+        нигде не говорилось. Теперь поля есть и там, и там: новый клиент
+        читает верхний уровень, старый — detail, и никто не ломается.
+        """
+        detail = exc.detail
+        headers = getattr(exc, "headers", None)
+        if isinstance(detail, dict) and "code" in detail:
+            return JSONResponse(status_code=exc.status_code,
+                                content={**detail, "detail": detail},
+                                headers=headers)
+        return JSONResponse(status_code=exc.status_code,
+                            content={"detail": detail}, headers=headers)
 
     @app.exception_handler(ASRHubError)
     async def asrhub_error_handler(request: Request, exc: ASRHubError):

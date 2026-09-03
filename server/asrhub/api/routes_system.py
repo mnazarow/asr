@@ -1,6 +1,7 @@
 """Маршруты сервера: состояние, настройки, очередь, аналитика, журнал, ключи."""
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -8,9 +9,10 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from .. import catalog
-from ..errors import AuthError, ConfigError, ForbiddenError, KeyNotFound
+from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
+from ..logging_setup import get_logger
 from ..logging_setup import recent as log_recent
 from ..monitoring.collector import RUNTIME
 from .deps import (
@@ -21,6 +23,8 @@ from .deps import (
     require_admin,
     scope_owner,
 )
+
+log = get_logger("api.settings")
 
 router = APIRouter(prefix="/api", tags=["Сервер"])
 
@@ -169,6 +173,63 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
     state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
     RUNTIME.inc("asrhub_config_reloads_total")
     return {"applied": applied}
+
+
+@router.get("/settings/hf-token", summary="Задан ли токен Hugging Face")
+def hf_token_state(request: Request,
+                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Отдаёт признак и начало токена, но никогда его целиком.
+
+    Показать токен в интерфейсе — значит отдать его каждому, кто заглянет
+    через плечо, и положить в кеш браузера. Для «задан ли и тот ли» хватает
+    шести знаков и длины.
+    """
+    state = get_state(request)
+    require_admin(principal)
+    token = str(state.settings.hf_token or "")
+    return {
+        "configured": bool(token),
+        "preview": (token[:6] + "…") if token else "",
+        "length": len(token),
+        # Куда ляжет изменение — путь честнее слова «конфигурация»: файла
+        # может не быть вовсе, и тогда он создастся при первой записи.
+        "config_file": str(state.settings.config_file
+                           or (state.settings.paths.data / "config.yaml")),
+    }
+
+
+@router.put("/settings/hf-token", summary="Задать токен Hugging Face")
+def set_hf_token(request: Request, token: str = Body(default="", embed=True),
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Записывает токен и сохраняет его в файл конфигурации.
+
+    Токен — не параметр каталога: у него нет ни диапазона, ни значения по
+    умолчанию, и через PUT /api/settings он не проходит. Поэтому отдельный
+    маршрут, а заодно и отдельное право: раздавать доступ к чужим весам
+    может только администратор.
+
+    Пустая строка — это «убрать»: иногда токен надо именно снять, например
+    при передаче сервера другому владельцу.
+    """
+    state = get_state(request)
+    require_admin(principal)
+    token = (token or "").strip()
+    if token and not re.match(r"^hf_[A-Za-z0-9_-]{16,}$", token):
+        raise error_response(ConfigError(
+            "Токен Hugging Face выглядит так: hf_ и ещё не меньше шестнадцати знаков.",
+            hint="Взять его: https://huggingface.co/settings/tokens — прав «read» достаточно."))
+    state.settings.hf_token = token
+    target = state.settings.config_file or (state.settings.paths.data / "config.yaml")
+    try:
+        state.settings.save(target)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    state.db.add_event(None, "settings_changed",
+                       "Токен Hugging Face " + ("задан" if token else "убран"))
+    log.info("Токен Hugging Face %s", "задан" if token else "убран")
+    return {"configured": bool(token),
+            "preview": (token[:6] + "…") if token else "",
+            "length": len(token)}
 
 
 @router.post("/settings/save", summary="Сохранить настройки в файл конфигурации")

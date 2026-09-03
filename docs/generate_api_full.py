@@ -87,7 +87,15 @@ ADMIN_ROUTES = {
     ("/api/monitoring/alerts/rules", "put"),
     ("/api/monitoring/alerts/rules/reset", "post"),
     ("/api/monitoring/targets", "put"), ("/api/monitoring/targets/test", "post"),
+    # Учётные записи заводит и правит только администратор. Без этих строк
+    # правило «изменяющий метод — значит admin или user» приписывало бы
+    # обычному пользователю право заводить себе администратора: справочник
+    # обещал бы доступ, которого сервер не даёт.
+    ("/api/users", "get"), ("/api/users", "post"),
+    ("/api/users/{user_id}", "patch"), ("/api/users/{user_id}", "delete"),
 }
+#: Вход и выход ключа не требуют вовсе: это и есть способ его получить.
+OPEN_AUTH_ROUTES = {"/api/auth/login", "/api/auth/logout"}
 #: Маршруты, доступные без ключа при monitoring_public: true.
 MONITORING_OPEN = {
     "/api/monitoring/metrics", "/api/monitoring/metrics.json",
@@ -103,6 +111,12 @@ WRITE_METHODS = {"post", "put", "delete", "patch"}
 def access_note(path: str, method: str) -> str:
     if (path, method) in ADMIN_ROUTES:
         return "ключ с ролью **admin**"
+    if path in OPEN_AUTH_ROUTES:
+        return "без ключа: это и есть вход"
+    if path == "/api/auth/password":
+        return "учётная запись, вошедшая по логину и паролю"
+    if path == "/api/process-call":
+        return "ключ с правом записи; принимается и полем `api_key` в теле"
     if path in OPEN_ROUTES:
         return "без ключа"
     if path in SCOPED_ROUTES and method == "get":

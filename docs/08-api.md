@@ -57,6 +57,19 @@ curl "http://сервер:8080/api/jobs?api_key=ah_ваш_ключ"   # толь
 
 Есть и четвёртый, только для `POST /api/process-call`: поле `api_key` прямо в теле JSON. Так его присылает phone_asr, и совместимость с ним важнее единообразия.
 
+Токен Hugging Face — не параметр каталога, и через `PUT /api/settings` он не проходит. Для него отдельная пара маршрутов, обе только для администратора:
+
+```bash
+curl -H "X-API-Key: ah_ключ_админа" http://сервер:8080/api/settings/hf-token
+# {"configured": true, "preview": "hf_abc…", "length": 37, "config_file": "/var/lib/asrhub/config.yaml"}
+
+curl -X PUT http://сервер:8080/api/settings/hf-token \
+  -H "X-API-Key: ah_ключ_админа" -H "Content-Type: application/json" \
+  -d '{"token": "hf_xxxxxxxxxxxxxxxxxxxx"}'
+```
+
+Целиком токен не возвращается никогда — только первые шесть знаков и длина. Пустая строка означает «убрать». То же самое доступно в интерфейсе: **Настройки → Доступ**.
+
 Роли ключей:
 
 | Роль | Права |
