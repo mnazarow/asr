@@ -1033,10 +1033,20 @@ class JobQueue:
         if secret:
             headers["X-ASRHub-Signature"] = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
+        # Адрес кодируем перед отправкой: urllib требует уже закодованный
+        # путь и бросает «'ascii' codec can't encode characters», не дойдя до
+        # сети. Кириллица в адресе обратного вызова — обычное дело (имя
+        # проекта в пути), и без этого доставка молча падала пять раз подряд
+        # и помечалась «failed», а вызывающая сторона ничего не получала.
+        # Преобразование идемпотентно: уже закодованный адрес не меняется.
+        from .phone_compat import encode_url
+
+        target = encode_url(str(job["webhook_url"]))
+
         attempts = 5
         for attempt in range(attempts):
             try:
-                request = urllib.request.Request(job["webhook_url"], data=payload,
+                request = urllib.request.Request(target, data=payload,
                                                  headers=headers, method="POST")
                 with urllib.request.urlopen(request, timeout=15) as response:
                     if 200 <= response.status < 300:

@@ -418,3 +418,97 @@ def test_channel_beats_the_engine_guess(tmp_path: Path, data_dir: Path):
     speakers = {segment["speaker"] for segment in outcome.segments}
     assert speakers == {"SPEAKER_00", "SPEAKER_01"}, \
         f"стороны разговора слились в одну: {speakers}"
+
+
+def test_api_key_is_accepted_in_the_request_body(data_dir, monkeypatch):
+    """phone_asr присылает ключ полем api_key в теле, а не заголовком.
+
+    Заголовка X-API-Key в этом запросе нет вовсе, и без разбора тела
+    совместимый клиент получал 401 при формально верном ключе — то есть
+    совместимость, ради которой всё делалось, не работала на первом же шаге.
+    """
+    from pathlib import Path
+
+    from asrhub.api.app import create_app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    with TestClient(create_app(start_queue=False)) as client:
+        key = (Path(data_dir) / "api-key.txt").read_text(encoding="utf-8").strip()
+        body = {
+            "call_id": "12345",
+            "base_url": "http://127.0.0.1:9/проект",
+            "api_key": key,
+            "files": ["http://127.0.0.1:9/запись.wav"],
+        }
+        # Внутренние адреса по умолчанию запрещены — проверяем то, что нужно:
+        # ключ принят (иначе был бы 401, а не отказ по адресу).
+        accepted = client.post("/api/process-call", json=body)
+        assert accepted.status_code != 401, accepted.text
+
+        refused = client.post("/api/process-call", json=dict(body, api_key="ah_чужой"))
+        assert refused.status_code == 401
+        assert refused.json()["code"] == "auth_error"
+
+        # Тот же адрес без префикса /api — как у phone_asr.
+        assert client.post("/process-call", json=body).status_code != 401
+
+        # Ключ не должен попасть в задание: он не параметр распознавания.
+        assert "api_key" not in str(body.get("settings", {}))
+
+
+def test_callback_url_with_cyrillic_is_delivered(tmp_path, monkeypatch):
+    """Кириллица в адресе обратного вызова ломала доставку молча.
+
+    urllib требует уже закодованный путь и бросает «'ascii' codec can't
+    encode characters», не дойдя до сети. Пять попыток подряд заканчивались
+    пометкой «failed», а вызывающая сторона не получала ничего — при том что
+    имя проекта в пути обратного вызова обычно как раз русское.
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received: list[tuple[str, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):                      # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            received.append((self.path, self.rfile.read(length)))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):           # тишина в выводе тестов
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        from asrhub.db import Database
+        from asrhub.job_queue import JobQueue
+
+        queue = JobQueue.__new__(JobQueue)      # без запуска рабочих потоков
+        queue.db = Database(tmp_path / "asrhub.db")
+        queue.settings = _FakeSettings()
+        job = {"id": "job_1", "webhook_url": f"http://127.0.0.1:{port}/проект/callback.php"}
+        queue.db.execute(
+            "INSERT INTO jobs (id, status, created_at, updated_at) "
+            "VALUES (?, 'completed', 0, 0)", ["job_1"])
+        queue._deliver_webhook(job, json.dumps({"ok": True}).encode("utf-8"))
+    finally:
+        server.shutdown()
+
+    assert received, "уведомление не доставлено"
+    path, payload = received[0]
+    assert path == "/%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82/callback.php"
+    assert json.loads(payload) == {"ok": True}
+
+
+class _FakeSettings:
+    """Минимум, который нужен доставке уведомления."""
+
+    def get(self, key, default=None):
+        return {"webhook_secret": "", "webhook_workers": 1}.get(key, default)

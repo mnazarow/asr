@@ -18,6 +18,8 @@ const state = {
   settings: {},
   queue: null,
   system: null,
+  //: Кто вошёл: {name, role, kind: 'user'|'key', must_change_password}.
+  me: null,
   analytics: null,
   period: 'week',
   jobSettings: {},
@@ -124,6 +126,7 @@ const API = {
   background(path) { return this.call(path, { background: true }); },
   post(path, body) { return this.call(path, { method: 'POST', json: body === undefined ? {} : body }); },
   put(path, body) { return this.call(path, { method: 'PUT', json: body }); },
+  patch(path, body) { return this.call(path, { method: 'PATCH', json: body }); },
   del(path) { return this.call(path, { method: 'DELETE' }); },
 };
 
@@ -223,6 +226,11 @@ const QUALITY_CLASS = {
 
 async function bootstrap() {
   try {
+    // Сначала выясняем, кто мы. Раньше загрузка начиналась с каталога, а он
+    // открыт всем: без ключа интерфейс отрисовывался целиком и выглядел
+    // рабочим, хотя очередь, результаты и настройки отвечали отказом на
+    // каждый запрос. Форма входа появлялась только при недоступном сервере.
+    state.me = await API.background('/api/auth/me');
     // Запуск идёт вне разделов, поэтому запросы фоновые: смена раздела не
     // должна их снимать. Иначе переход по меню в первую секунду после
     // загрузки отменял загрузку каталога, и вместо интерфейса появлялась
@@ -239,12 +247,17 @@ async function bootstrap() {
     state.jobSettings = Object.assign({}, state.settings);
     qs('#badge-models').textContent = catalog.models.length;
     qs('#badge-params').textContent = catalog.params.length;
+    applyWhoAmI();
     await Promise.all([refreshEngines(), refreshQueue()]);
     connectWs();
     render();
     state.timer = setInterval(tick, 4000);
   } catch (err) {
     if (err.status === 401) { promptKey(); return; }
+    // Пароль по умолчанию: интерфейс всё равно не заработает, пока его не
+    // сменят, поэтому ведём прямо к форме, а не показываем ошибку в каждом
+    // разделе по очереди.
+    if (err.code === 'password_change_required') { promptPasswordChange(); return; }
     // Отменённый запрос — не сбой связи, и рисовать по нему заглушку нельзя.
     if (err && err.silent) return;
     fail(err);
@@ -259,16 +272,73 @@ async function bootstrap() {
 }
 
 function promptKey() {
+  // Форма входа. Логин и пароль — обычный путь для человека; ключ доступа
+  // остаётся для программ и для тех, кто уже настроил его себе, поэтому
+  // спрятан под ссылкой, а не выброшен.
+  const content = qs('#content');
+  content.innerHTML = '';
+  const card = h(`<div class="card" style="max-width:460px;margin:60px auto">
+    <div class="card-head"><h2>Вход</h2></div>
+    <div class="stack" style="gap:10px">
+      <label class="small dim" for="login-user">Логин</label>
+      <input type="text" id="login-user" autocomplete="username" autofocus>
+      <label class="small dim" for="login-pass">Пароль</label>
+      <input type="password" id="login-pass" autocomplete="current-password">
+      <div id="login-error" class="small" style="color:var(--err);display:none"></div>
+      <button class="primary" id="login-go">Войти</button>
+      <div class="small dim" style="margin-top:6px">
+        <a href="#" id="login-by-key">Войти по ключу доступа</a>
+      </div>
+    </div></div>`);
+  content.appendChild(card);
+
+  const showError = (text, hint) => {
+    const box = qs('#login-error');
+    box.textContent = hint ? `${text} ${hint}` : text;
+    box.style.display = '';
+  };
+
+  qs('#login-go').onclick = async () => {
+    const username = qs('#login-user').value.trim();
+    const password = qs('#login-pass').value;
+    if (!username || !password) { showError('Введите логин и пароль.'); return; }
+    const button = qs('#login-go');
+    button.disabled = true;
+    try {
+      const result = await API.post('/api/auth/login', { username, password });
+      // Ключ из прошлой жизни убираем: иначе он поедет в заголовке и
+      // перекроет только что заведённую сессию — вход как будто не сработал.
+      localStorage.removeItem('asrhub_key');
+      if (result && result.must_change_password) { promptPasswordChange(); return; }
+      location.reload();
+    } catch (err) {
+      showError(err.message || 'Не удалось войти.', err.hint || '');
+      button.disabled = false;
+    }
+  };
+  qs('#login-pass').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') qs('#login-go').click();
+  });
+  qs('#login-user').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') qs('#login-pass').focus();
+  });
+  qs('#login-by-key').onclick = (e) => { e.preventDefault(); promptApiKey(); };
+}
+
+function promptApiKey() {
   const content = qs('#content');
   content.innerHTML = '';
   const card = h(`<div class="card" style="max-width:520px;margin:60px auto">
-    <div class="card-head"><h2>Требуется ключ доступа</h2></div>
-    <p class="dim small">Сервер запущен с включённой аутентификацией. Ключ, созданный
-    при первом запуске, находится в файле <span class="mono">api-key.txt</span>
-    в каталоге данных сервера.</p>
+    <div class="card-head"><h2>Вход по ключу доступа</h2></div>
+    <p class="dim small">Ключ, созданный при первом запуске, находится в файле
+    <span class="mono">api-key.txt</span> в каталоге данных сервера. Обычно он
+    нужен программам — человеку проще войти логином и паролем.</p>
     <div class="stack" style="gap:10px">
       <input type="password" id="key-input" placeholder="ah_…" autocomplete="off">
       <button class="primary" id="key-save">Сохранить и войти</button>
+      <div class="small dim" style="margin-top:6px">
+        <a href="#" id="key-by-login">Войти по логину и паролю</a>
+      </div>
     </div></div>`);
   content.appendChild(card);
   qs('#key-save').onclick = () => {
@@ -278,6 +348,82 @@ function promptKey() {
   qs('#key-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') qs('#key-save').click();
   });
+  qs('#key-by-login').onclick = (e) => { e.preventDefault(); promptKey(); };
+}
+
+function promptPasswordChange(optional) {
+  // Пока пароль по умолчанию не сменён, сервер отвечает отказом на всё,
+  // кроме самой смены. Показываем форму вместо интерфейса, а не поверх
+  // него: иначе за ней виден пустой каркас с ошибками в каждом разделе.
+  const content = qs('#content');
+  content.innerHTML = '';
+  const card = h(`<div class="card" style="max-width:460px;margin:60px auto">
+    <div class="card-head"><h2>${optional ? 'Смена пароля' : 'Смените пароль'}</h2></div>
+    ${optional ? '' : `<p class="dim small">Сейчас действует пароль, заданный при
+      первом запуске. Он известен всем, у кого есть эта программа, поэтому
+      работать с сервером до смены нельзя.</p>`}
+    <div class="stack" style="gap:10px">
+      <label class="small dim" for="pw-current">Текущий пароль</label>
+      <input type="password" id="pw-current" autocomplete="current-password">
+      <label class="small dim" for="pw-new">Новый пароль</label>
+      <input type="password" id="pw-new" autocomplete="new-password">
+      <label class="small dim" for="pw-repeat">Ещё раз</label>
+      <input type="password" id="pw-repeat" autocomplete="new-password">
+      <div id="pw-error" class="small" style="color:var(--err);display:none"></div>
+      <button class="primary" id="pw-go">Сохранить</button>
+      ${optional ? '<div class="small dim"><a href="#" id="pw-cancel">Отмена</a></div>' : ''}
+    </div></div>`);
+  content.appendChild(card);
+
+  const showError = (text, hint) => {
+    const box = qs('#pw-error');
+    box.textContent = hint ? `${text} ${hint}` : text;
+    box.style.display = '';
+  };
+
+  qs('#pw-go').onclick = async () => {
+    const current = qs('#pw-current').value;
+    const next = qs('#pw-new').value;
+    if (next !== qs('#pw-repeat').value) { showError('Пароли не совпадают.'); return; }
+    const button = qs('#pw-go');
+    button.disabled = true;
+    try {
+      await API.post('/api/auth/password',
+                     { current_password: current, new_password: next });
+      toast('Пароль изменён');
+      location.reload();
+    } catch (err) {
+      showError(err.message || 'Не удалось сменить пароль.', err.hint || '');
+      button.disabled = false;
+    }
+  };
+  qs('#pw-repeat').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') qs('#pw-go').click();
+  });
+  const cancel = qs('#pw-cancel');
+  if (cancel) cancel.onclick = (e) => { e.preventDefault(); renderView(); };
+}
+
+function applyWhoAmI() {
+  // Кто вошёл — показываем в шапке. Кнопки «Пароль» и «Выйти» появляются
+  // только при входе по учётной записи: у ключа доступа пароля нет, а
+  // «выйти» для него означало бы удалить ключ из браузера — это делается
+  // осознанно, а не кнопкой рядом с очередью.
+  if (!state.me) return;
+  const chip = qs('#chip-user');
+  if (chip) {
+    chip.textContent = `${state.me.name}${state.me.role === 'admin' ? ' · админ' : ''}`;
+    chip.hidden = false;
+  }
+  const isUser = state.me.kind === 'user';
+  ['#btn-password', '#btn-logout'].forEach((sel) => {
+    const button = qs(sel);
+    if (button) button.hidden = !isUser;
+  });
+  if (state.me.default_password_in_use) {
+    toast('Действует пароль по умолчанию', 'warn',
+          'Смените его в разделе «Сервер» — сервер доступен всем, кто знает эту пару.');
+  }
 }
 
 async function refreshEngines() {
@@ -401,7 +547,7 @@ const VIEWS = {
   models:     { title: 'Модели', subtitle: 'Каталог моделей, лицензии, требования, загрузка весов' },
   compare:    { title: 'Сравнение моделей', subtitle: 'Качество, скорость и лицензии рядом' },
   settings:   { title: 'Настройки', subtitle: 'Все параметры с описаниями, рекомендациями и примерами' },
-  system:     { title: 'Сервер', subtitle: 'Оборудование, движки, хранилище, ключи доступа' },
+  system:     { title: 'Сервер', subtitle: 'Оборудование, движки, хранилище, учётные записи и ключи' },
   monitoring: { title: 'Мониторинг', subtitle: 'Метрики наружу, пороги тревог, приёмники телеметрии' },
   logs:       { title: 'Журнал', subtitle: 'События сервера и заданий' },
   help:       { title: 'Справка', subtitle: 'Как пользоваться, программный интерфейс, устранение неполадок' },
@@ -590,6 +736,14 @@ document.addEventListener('DOMContentLoaded', () => {
   qs('#btn-refresh').addEventListener('click', () => {
     refreshQueue().then(() => renderView());
     toast('Обновлено');
+  });
+  qs('#btn-password').addEventListener('click', () => promptPasswordChange(true));
+  qs('#btn-logout').addEventListener('click', async () => {
+    try { await API.post('/api/auth/logout'); } catch (e) { /* всё равно уходим */ }
+    // Ключ из браузера тоже убираем: иначе после выхода интерфейс молча
+    // продолжит работать от него, и человек будет уверен, что вышел.
+    localStorage.removeItem('asrhub_key');
+    location.reload();
   });
   if (localStorage.getItem('asrhub_theme') === 'light') document.body.classList.add('light');
   qs('#theme-toggle').addEventListener('click', () => {
@@ -3112,7 +3266,7 @@ RENDERERS.system = {
             <button class="sm" id="btn-unload">Выгрузить модели из памяти</button>
           </div>`)}
 
-        ${card('Ключи доступа', 'создание и отзыв',
+        ${card('Ключи доступа', 'для программ: curl, asrctl, интеграции',
           '<div id="keys-body"></div>' +
           `<div class="row" style="margin-top:10px">
             <input type="text" id="key-name" placeholder="название ключа" style="flex:1">
@@ -3120,6 +3274,18 @@ RENDERERS.system = {
               <option value="user">user</option><option value="admin">admin</option>
               <option value="readonly">readonly</option></select>
             <button class="primary sm" id="key-create">Создать</button></div>`)}
+
+        ${card('Учётные записи', 'для людей: вход по логину и паролю',
+          '<div id="users-body"></div>' +
+          `<div class="row wrap" style="margin-top:10px;gap:6px">
+            <input type="text" id="user-name" placeholder="логин" style="flex:1;min-width:120px">
+            <input type="password" id="user-pass" placeholder="пароль" style="flex:1;min-width:120px">
+            <select id="user-role" style="width:120px">
+              <option value="user">user</option><option value="admin">admin</option>
+              <option value="readonly">readonly</option></select>
+            <button class="primary sm" id="user-create">Завести</button></div>
+          <div class="small dim" style="margin-top:6px">
+            Новый пользователь меняет пароль при первом входе.</div>`)}
       </div>`;
 
     qs('#apply-recommended').onclick = async () => {
@@ -3141,6 +3307,19 @@ RENDERERS.system = {
       try { await API.post('/api/maintenance/unload-models'); toast('Модели выгружены', 'ok'); }
       catch (err) { fail(err); }
     };
+    qs('#user-create').onclick = async () => {
+      const username = qs('#user-name').value.trim();
+      const password = qs('#user-pass').value;
+      if (!username || !password) { toast('Укажите логин и пароль', 'warn'); return; }
+      try {
+        await API.post('/api/users', { username, password,
+                                       role: qs('#user-role').value,
+                                       must_change_password: true });
+        qs('#user-name').value = ''; qs('#user-pass').value = '';
+        toast('Учётная запись заведена', 'ok');
+        this.loadUsers();
+      } catch (err) { fail(err); }
+    };
     qs('#key-create').onclick = async () => {
       const name = qs('#key-name').value.trim();
       if (!name) { toast('Укажите название ключа', 'warn'); return; }
@@ -3152,6 +3331,33 @@ RENDERERS.system = {
       } catch (err) { fail(err); }
     };
     this.loadKeys();
+    this.loadUsers();
+  },
+
+  async loadUsers() {
+    const host = qs('#users-body');
+    if (!host) return;
+    try {
+      const data = await API.get('/api/users');
+      const rows = data.users.map((u) => `<tr>
+        <td><b>${esc(u.username)}</b>${u.must_change_password
+            ? '<div class="small faint">пароль не сменён</div>' : ''}</td>
+        <td><span class="chip ${u.role === 'admin' ? 'accent' : ''}">${esc(u.role)}</span></td>
+        <td>${u.enabled ? '' : '<span class="chip err">отключён</span>'}</td>
+        <td class="row" style="gap:4px">
+          <button class="ghost sm"
+            onclick="__asrhub.resetPassword('${esc(u.id)}','${esc(u.username)}')">пароль</button>
+          <button class="ghost sm danger"
+            onclick="__asrhub.deleteUser('${esc(u.id)}','${esc(u.username)}')">удалить</button>
+        </td></tr>`).join('');
+      host.innerHTML = `${data.default_password_in_use ? `<div class="banner warn small">
+        Действует пароль по умолчанию (${esc(data.default_username)}/admin123).
+        Смените его — сервер доступен всем, кто знает эту пару.</div>` : ''}
+        <table><thead><tr><th>Логин</th><th>Роль</th><th></th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    } catch (err) {
+      host.innerHTML = '<div class="empty small">Список доступен администратору</div>';
+    }
   },
 
   async loadKeys() {
@@ -3173,6 +3379,22 @@ RENDERERS.system = {
       host.innerHTML = '<div class="empty small">Требуется ключ администратора</div>';
     }
   },
+};
+
+window.__asrhub.resetPassword = async (id, username) => {
+  const password = prompt(`Новый пароль для «${username}»:`);
+  if (!password) return;
+  try {
+    await API.patch(`/api/users/${id}`, { password, must_change_password: true });
+    toast('Пароль сброшен', 'ok', 'Пользователь сменит его при следующем входе');
+    renderView();
+  } catch (err) { fail(err); }
+};
+
+window.__asrhub.deleteUser = async (id, username) => {
+  if (!confirm(`Удалить учётную запись «${username}»?`)) return;
+  try { await API.del(`/api/users/${id}`); toast('Учётная запись удалена', 'warn'); renderView(); }
+  catch (err) { fail(err); }
 };
 
 window.__asrhub.revokeKey = async (preview) => {

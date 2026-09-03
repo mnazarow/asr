@@ -5,6 +5,62 @@ import argparse
 import sys
 
 
+def _users_command(settings: object, args: object) -> int:
+    """Обслуживание учётных записей из консоли: список и смена пароля.
+
+    Работает на остановленном сервере тоже: база SQLite открывается той же
+    библиотекой, и запись идёт в отдельной транзакции.
+    """
+    import getpass
+
+    from .accounts import Accounts, password_problem
+    from .db import Database
+
+    db = Database(settings.paths.db)          # type: ignore[attr-defined]
+    accounts = Accounts(db)
+    try:
+        if getattr(args, "list_users", False):
+            rows = accounts.list()
+            if not rows:
+                sys.stdout.write("Учётных записей нет.\n")
+                return 0
+            width = max(len(a.username) for a in rows)
+            for account in rows:
+                marks = []
+                if not account.enabled:
+                    marks.append("отключена")
+                if account.must_change_password:
+                    marks.append("пароль не сменён")
+                sys.stdout.write(
+                    f"{account.username.ljust(width)}  {account.role:<9}"
+                    f"{('  ' + ', '.join(marks)) if marks else ''}\n")
+            return 0
+
+        username = str(args.set_password)     # type: ignore[attr-defined]
+        account = accounts.by_username(username)
+        if account is None:
+            sys.stderr.write(f"Нет учётной записи «{username}».\n")
+            sys.stderr.write("Список: python -m asrhub --list-users\n")
+            return 2
+        # Пароль спрашиваем с клавиатуры, а не берём ключом: аргументы
+        # командной строки видны в списке процессов и остаются в истории
+        # оболочки.
+        password = getpass.getpass("Новый пароль: ")
+        if password != getpass.getpass("Ещё раз: "):
+            sys.stderr.write("Пароли не совпадают.\n")
+            return 2
+        problem = password_problem(password)
+        if problem:
+            sys.stderr.write(problem + "\n")
+            return 2
+        accounts.set_password(account.id, password)
+        sys.stdout.write(f"Пароль для «{account.username}» изменён. "
+                         "Все открытые сессии закрыты.\n")
+        return 0
+    finally:
+        db.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="asrhub", description="Сервер распознавания речи ASR Hub")
@@ -19,6 +75,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="Вывести пример config.yaml и выйти")
     parser.add_argument("--check", action="store_true",
                         help="Проверить окружение и выйти")
+    # Путь назад, когда пароль забыт. Без него единственный администратор,
+    # потерявший пароль, остаётся снаружи навсегда: ключ доступа управлять
+    # учётными записями не позволяет, а руками в базе — не вариант.
+    parser.add_argument("--set-password", metavar="ЛОГИН",
+                        help="Задать пароль учётной записи и выйти "
+                             "(пароль спрашивается с клавиатуры)")
+    parser.add_argument("--list-users", action="store_true",
+                        help="Показать учётные записи и выйти")
     args = parser.parse_args(argv)
 
     from .config import generate_example_config, load
@@ -42,6 +106,9 @@ def main(argv: list[str] | None = None) -> int:
         from .doctor import run_checks
 
         return 0 if run_checks(settings) else 1
+
+    if args.list_users or args.set_password:
+        return _users_command(settings, args)
 
     # Адрес и порт кладём в настройки, а не только в uvicorn: из настроек их
     # читают стартовая запись в журнале и готовый фрагмент prometheus.yml,

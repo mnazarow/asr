@@ -22,7 +22,13 @@ from pydantic import BaseModel, Field, field_validator
 from .. import phone_compat
 from ..errors import ASRHubError, ForbiddenError
 from ..logging_setup import get_logger
-from .deps import Principal, authenticate, error_response, get_state, require_write
+from .deps import (
+    Principal,
+    authenticate_body_key,
+    error_response,
+    get_state,
+    require_write,
+)
 
 log = get_logger("api.phone")
 
@@ -40,6 +46,9 @@ class ProcessCallBody(BaseModel):
     part: int = Field(default=1, ge=1)
     total_parts: int = Field(default=1, ge=1)
     swap_sides: bool = False
+    #: Ключ доступа прямо в теле — так его шлёт phone_asr. Заголовок и
+    #: параметр адреса тоже принимаются; в задание и в журнал он не попадает.
+    api_key: str = ""
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -50,7 +59,7 @@ class ProcessCallBody(BaseModel):
 @router.post("/process-call", status_code=status.HTTP_202_ACCEPTED,
              summary="Принять разговор на расшифровку (совместимо с phone_asr)")
 def process_call(request: Request, body: ProcessCallBody,
-                 principal: Principal = Depends(authenticate)) -> dict[str, str]:
+                 principal: Principal = Depends(authenticate_body_key)) -> dict[str, str]:
     """Принимает разговор и отвечает сразу, не дожидаясь расшифровки.
 
     Ответ 202 означает «взято в работу», а не «готово»: результат придёт
@@ -93,7 +102,7 @@ def process_call(request: Request, body: ProcessCallBody,
 
 @router.get("/statuses", summary="Состояние принятых разговоров")
 def statuses(request: Request,
-             principal: Principal = Depends(authenticate)) -> list[dict[str, Any]]:
+             principal: Principal = Depends(authenticate_body_key)) -> list[dict[str, Any]]:
     """Те же три поля, что отдаёт phone_asr: call_id, part и состояние.
 
     Состояния переведены в его словарь: у нас их больше, у него четыре.

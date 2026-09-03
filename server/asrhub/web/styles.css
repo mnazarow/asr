@@ -124,6 +124,11 @@ a:hover { text-decoration: underline; }
 .topbar .sub { font-size: 12.5px; color: var(--text-faint); }
 .topbar-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 
+/* Правила вида «button { display: inline-flex }» перебивают действие
+   атрибута hidden: кнопки «Пароль» и «Выйти» оставались на экране входа,
+   где им нечего делать. */
+[hidden] { display: none !important; }
+
 .content { padding: 22px 24px 60px; max-width: 1560px; width: 100%; }
 
 /* ---------- Общие элементы ---------- */
@@ -200,6 +205,14 @@ label { font-size: 13px; color: var(--text-dim); }
 }
 .chip.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .chip.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+
+/* Заметное предупреждение внутри карточки: пароль по умолчанию, устаревшая
+   настройка. Отличается от chip тем, что занимает строку целиком — такое
+   сообщение не должно теряться среди значений. */
+.banner { border-radius: 8px; padding: 8px 10px; margin-bottom: 10px;
+          border: 1px solid transparent; }
+.banner.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+.banner.err  { background: var(--err-soft);  color: var(--err);  border-color: var(--err); }
 .chip.err { background: var(--err-soft); color: var(--err); border-color: transparent; }
 .chip.info { background: var(--info-soft); color: var(--info); border-color: transparent; }
 .chip.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }

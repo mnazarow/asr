@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..accounts import Accounts
 from ..analytics import Analytics
 from ..config import Settings, load
 from ..db import Database
@@ -24,7 +25,9 @@ from ..job_queue import JobQueue
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
 from ..streaming import StreamSession
-from .deps import AppState
+from .deps import SESSION_COOKIE, AppState
+from .routes_auth import router as auth_router
+from .routes_auth import users_router
 from .routes_catalog import router as catalog_router
 from .routes_jobs import router as jobs_router
 from .routes_monitoring import router as monitoring_router
@@ -223,6 +226,10 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     analytics = Analytics(db)
     state = AppState(settings=settings, db=db, registry=registry,
                      queue=queue, analytics=analytics)
+    state.accounts = Accounts(db, float(settings.get("session_ttl_hours") or 168))
+    # Первый запуск: заводим admin с временным паролем. Без этого открыть
+    # интерфейс можно было только сходив на сервер за api-key.txt.
+    state.accounts.ensure_default_admin()
     state.monitoring = MonitoringService(state)
 
     @asynccontextmanager
@@ -345,6 +352,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             "hint": "Подробности в журнале сервера: раздел «Журнал» или файл logs/errors.log",
         })
 
+    app.include_router(auth_router)
+    app.include_router(users_router)
     app.include_router(jobs_router)
     app.include_router(catalog_router)
     app.include_router(system_router)
@@ -508,13 +517,29 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
                     else header.strip()
             info = settings.api_keys.get(token)
-            if not info or info.get("enabled") is False:
+            account = None
+            if not info:
+                # Вход по логину и паролю. Браузер отправляет куку и при
+                # рукопожатии WebSocket, поэтому билет здесь не нужен: без
+                # этой ветки лента событий у вошедшего паролем молча
+                # закрывалась с кодом 4401, и интерфейс показывал «нет связи».
+                if hub_state is not None and hub_state.accounts is not None:
+                    account = hub_state.accounts.session_account(
+                        websocket.cookies.get(SESSION_COOKIE, ""))
+            if info is None and account is None:
+                await websocket.close(code=4401, reason="Ключ доступа отсутствует или недействителен")
+                return
+            if info is not None and info.get("enabled") is False:
                 await websocket.close(code=4401, reason="Ключ доступа отсутствует или недействителен")
                 return
             # Имя выводим ровно так же, как authenticate строит Principal.name,
             # иначе владелец события и владелец задания не совпадут.
-            ws_owner = str(info.get("name") or "ключ")
-            ws_admin = str(info.get("role") or "user") == "admin"
+            if account is not None:
+                ws_owner = account.username
+                ws_admin = account.role == "admin"
+            else:
+                ws_owner = str(info.get("name") or "ключ")
+                ws_admin = str(info.get("role") or "user") == "admin"
         else:
             # Проверка ключей выключена — разделять некого, все равны.
             ws_owner, ws_admin = "", True

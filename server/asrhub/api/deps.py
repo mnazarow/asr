@@ -10,11 +10,12 @@ from typing import Any
 
 from fastapi import Header, HTTPException, Request
 
+from ..accounts import Accounts
 from ..analytics import Analytics
 from ..config import Settings
 from ..db import Database
 from ..engines import EngineRegistry
-from ..errors import ASRHubError, AuthError, ForbiddenError, RateLimited
+from ..errors import ASRHubError, AuthError, ForbiddenError, PasswordChangeRequired, RateLimited
 from ..job_queue import JobQueue
 from ..logging_setup import get_logger
 
@@ -77,6 +78,9 @@ class AppState:
     monitoring: Any = None
     version: str = "3.0.0"
     tickets: TicketStore = field(default_factory=TicketStore)
+    #: Учётные записи и сессии веб-интерфейса. Ключи доступа живут отдельно и
+    #: работают как раньше: они для программ, учётные записи — для людей.
+    accounts: Accounts | None = None
     _rate: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
 
     def check_rate(self, key: str, limit: int) -> None:
@@ -99,6 +103,16 @@ def get_state(request: Request) -> AppState:
     return state
 
 
+#: Имя куки с сессией веб-интерфейса.
+SESSION_COOKIE = "asrhub_session"
+
+#: Что разрешено, пока пароль не сменён. Всё остальное отвечает отказом с
+#: кодом password_change_required — интерфейс по нему показывает форму смены.
+_PASSWORD_CHANGE_ALLOWED = (
+    "/api/auth/me", "/api/auth/password", "/api/auth/logout", "/api/health",
+)
+
+
 @dataclass
 class Principal:
     key: str = ""
@@ -116,6 +130,10 @@ class Principal:
     #: Имена всех ключей той же группы, включая себя. Заполняется при
     #: аутентификации: только там доступны настройки с перечнем ключей.
     peers: tuple[str, ...] = ()
+    #: Учётная запись, если вход был по логину и паролю. Пусто для ключей.
+    user_id: str = ""
+    #: Пароль требует смены — до неё разрешены только сама смена и выход.
+    must_change_password: bool = False
 
     @property
     def is_admin(self) -> bool:
@@ -126,10 +144,60 @@ class Principal:
         return self.role in ("admin", "user")
 
 
+def _session_principal(request: Request, state: AppState) -> Principal | None:
+    """Пускает по куке сессии, если она есть и жива.
+
+    Ключ доступа проверяется первым: программа, приславшая ключ, должна
+    работать от него, даже если в том же браузере открыт интерфейс.
+    """
+    accounts = state.accounts
+    if accounts is None:
+        return None
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not token:
+        return None
+    account = accounts.session_account(token)
+    if account is None:
+        return None
+
+    # Проверка происхождения запроса. Кука уходит на сервер сама, поэтому
+    # чужая страница могла бы отправить запрос от имени вошедшего человека.
+    # SameSite=Lax отсекает это в браузере, а здесь — второй рубеж на случай
+    # старого браузера и на случай, когда куку принесли не из браузера.
+    origin = request.headers.get("origin") or ""
+    if origin and request.method not in ("GET", "HEAD", "OPTIONS"):
+        host = request.headers.get("host") or ""
+        if host and origin.split("://", 1)[-1] != host:
+            raise ForbiddenError(
+                "Запрос пришёл с чужой страницы.",
+                hint="Так браузер защищает вход по паролю. Откройте интерфейс сервера напрямую.")
+
+    limit = int(state.settings.get("rate_limit_per_minute") or 0)
+    state.check_rate(f"user:{account.id}", limit)
+
+    peers: tuple[str, ...] = ()
+    if account.group:
+        names = {other.username for other in accounts.list()
+                 if other.group == account.group}
+        names.update(str(info.get("name") or "ключ")
+                     for info in state.settings.api_keys.values()
+                     if str(info.get("group") or "") == account.group)
+        peers = tuple(sorted(names))
+
+    principal = Principal(name=account.username, role=account.role,
+                          group=account.group, peers=peers,
+                          user_id=account.id,
+                          must_change_password=account.must_change_password)
+    if principal.must_change_password \
+            and request.url.path not in _PASSWORD_CHANGE_ALLOWED:
+        raise PasswordChangeRequired()
+    return principal
+
+
 def authenticate(request: Request,
                  x_api_key: str | None = Header(default=None, alias="X-API-Key"),
                  authorization: str | None = Header(default=None)) -> Principal:
-    """Проверяет ключ доступа и лимит частоты запросов."""
+    """Проверяет ключ доступа или сессию входа и лимит частоты запросов."""
     state = get_state(request)
     if not state.settings.get("auth_enabled", True):
         return Principal(name="без аутентификации", role="admin")
@@ -144,6 +212,11 @@ def authenticate(request: Request,
 
     info = state.settings.api_keys.get(token)
     if not info:
+        # Ключа нет — пробуем сессию веб-интерфейса. Порядок важен: программа
+        # с ключом работает от ключа, даже если в браузере открыт интерфейс.
+        session = _session_principal(request, state)
+        if session is not None:
+            return session
         raise AuthError("Ключ доступа отсутствует или недействителен.")
     if info.get("enabled") is False:
         raise ForbiddenError("Ключ доступа отключён.")
@@ -164,6 +237,30 @@ def authenticate(request: Request,
                          info.get("quota_audio_hours_per_day") or 0),
                      quota_storage_gb=float(info.get("quota_storage_gb") or 0),
                      role=str(info.get("role") or "user"))
+
+
+async def authenticate_body_key(request: Request) -> Principal:
+    """Как authenticate, но ключ принимается ещё и полем api_key в теле.
+
+    Так его присылает phone_asr: в теле JSON рядом с call_id, base_url и
+    files. Заголовка X-API-Key в этом запросе нет вовсе, и без разбора тела
+    совместимый клиент получал 401 — при формально верном ключе.
+
+    Тело читается здесь и кешируется Starlette, поэтому обработчик получает
+    его как обычно и вторым чтением ничего не ломает.
+    """
+    token = ""
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip() == "application/json":
+        try:
+            payload = await request.json()
+        except Exception:                       # тело не JSON — не наша забота
+            payload = None
+        if isinstance(payload, dict):
+            token = str(payload.get("api_key") or "")
+    return authenticate(request,
+                        x_api_key=token or request.headers.get("X-API-Key"),
+                        authorization=request.headers.get("Authorization"))
 
 
 def scope_owner(principal: Principal,

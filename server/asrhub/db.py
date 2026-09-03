@@ -24,7 +24,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -159,6 +159,45 @@ _SCHEMA = [
         ts     REAL
     )
     """,
+    # --- версия 6: вход по логину и паролю --------------------------------
+    #
+    # Ключи доступа остаются как были — они для программ. Учётные записи
+    # нужны людям: чтобы открыть интерфейс, не надо заходить на сервер и
+    # читать api-key.txt.
+    #
+    # «group» — слово, занятое в SQL, поэтому колонка называется user_group.
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id              TEXT PRIMARY KEY,
+        username        TEXT NOT NULL UNIQUE,
+        password_hash   TEXT NOT NULL,
+        display_name    TEXT DEFAULT '',
+        role            TEXT DEFAULT 'user',
+        user_group      TEXT DEFAULT '',
+        enabled         INTEGER DEFAULT 1,
+        must_change     INTEGER DEFAULT 0,
+        created_at      REAL,
+        updated_at      REAL,
+        last_login      REAL,
+        failed_attempts INTEGER DEFAULT 0,
+        locked_until    REAL DEFAULT 0
+    )
+    """,
+    # Хранится не токен, а его sha256: утёкшая база не даёт войти.
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        token_hash  TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        created_at  REAL,
+        expires_at  REAL,
+        last_seen   REAL,
+        user_agent  TEXT DEFAULT '',
+        address     TEXT DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE)",
     # --- версия 2: агрегаты и системные снимки ----------------------------
     """
     CREATE TABLE IF NOT EXISTS model_stats (
@@ -222,6 +261,30 @@ def new_id(prefix: str = "job") -> str:
 #: Ожидаемый набор колонок — сверяется при миграции. Собран из _SCHEMA,
 #: поэтому не может разойтись с ней при добавлении новых полей.
 _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
+    "users": {
+        "id": "TEXT",
+        "username": "TEXT",
+        "password_hash": "TEXT",
+        "display_name": "TEXT DEFAULT ''",
+        "role": "TEXT DEFAULT 'user'",
+        "user_group": "TEXT DEFAULT ''",
+        "enabled": "INTEGER DEFAULT 1",
+        "must_change": "INTEGER DEFAULT 0",
+        "created_at": "REAL",
+        "updated_at": "REAL",
+        "last_login": "REAL",
+        "failed_attempts": "INTEGER DEFAULT 0",
+        "locked_until": "REAL DEFAULT 0",
+    },
+    "sessions": {
+        "token_hash": "TEXT",
+        "user_id": "TEXT",
+        "created_at": "REAL",
+        "expires_at": "REAL",
+        "last_seen": "REAL",
+        "user_agent": "TEXT DEFAULT ''",
+        "address": "TEXT DEFAULT ''",
+    },
     "jobs": {
         "id": "TEXT",
         "group_id": "TEXT",

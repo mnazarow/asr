@@ -414,6 +414,17 @@ class QuotaExceeded(ASRHubError):
         )
 
 
+class PasswordChangeRequired(ASRHubError):
+    """Работать нельзя, пока не сменён пароль по умолчанию."""
+
+    code = "password_change_required"
+    http_status = 403
+    hint = "Смените пароль: POST /api/auth/password."
+
+    def __init__(self, message: str = ""):
+        super().__init__(message or "Смените пароль, заданный при первом запуске.")
+
+
 class ForbiddenError(ASRHubError):
     """Недостаточно прав."""
 
