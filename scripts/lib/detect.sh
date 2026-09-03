@@ -102,6 +102,89 @@ install_system_packages() {
   esac
 }
 
+install_supported_python() {
+  # Ставит интерпретатор из проверенного диапазона и печатает путь к нему.
+  #
+  # Нужно потому, что предупреждения мало: человек читает «поставьте
+  # python3.13 и повторите», выходит, ставит, запускает заново — три лишних
+  # действия там, где скрипт и сам умеет всё три. Пустой вывод означает
+  # «поставить не удалось», и вызывающий продолжает с тем, что было.
+  #
+  # Версии перебираем сверху вниз: чем новее, тем дольше проживёт установка,
+  # но брать надо ту, которая есть в репозитории и правда ставится.
+  # Функция возвращает путь через stdout, поэтому ВСЁ остальное обязано идти
+  # в stderr. Иначе строка «Устанавливаем Python…» становится частью ответа,
+  # и вызывающий получает её вместо пути — а дальше пытается запустить.
+  local manager; manager="$(detect_package_manager)"
+  local wanted="${1:-${ASRHUB_MAX_PYTHON}}"
+  local candidates="${wanted} 3.13 3.12 3.11 3.10"
+  local version seen=""
+
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    # В пробном запуске ставить нечего, и объявлять это неудачей неверно.
+    printf '%s[пробный запуск]%s установка Python %s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${wanted}" >&2
+    printf ''
+    return 1
+  fi
+
+  for version in ${candidates}; do
+    case " ${seen} " in *" ${version} "*) continue ;; esac
+    seen="${seen} ${version}"
+    version_ge "${version}" "${ASRHUB_MIN_PYTHON}" || continue
+
+    local existing="python${version}"
+    if have "${existing}" && "${existing}" -c 'import ensurepip' >/dev/null 2>&1; then
+      # Уже стоит и пригоден — ставить нечего.
+      printf '%s' "$(command -v "${existing}")"
+      return 0
+    fi
+
+    local packages=""
+    case "${manager}" in
+      apt-get)
+        # На Debian и Ubuntu venv и заголовки лежат отдельными пакетами, и
+        # без них установка упрётся в ensurepip уже на шестом шаге.
+        packages="python${version} python${version}-venv python${version}-dev"
+        _apt_all_available ${packages} || { packages=""; } ;;
+      dnf|yum)  packages="python${version} python${version}-devel" ;;
+      pacman)   packages="python" ;;         # в Arch версия одна, свежая
+      apk)      packages="python3" ;;
+      brew)     packages="python@${version}" ;;
+      zypper)   packages="python${version//./}" ;;
+    esac
+    [[ -n "${packages}" ]] || continue
+
+    info "Устанавливаем Python ${version} из проверенного диапазона…" >&2
+    # shellcheck disable=SC2086
+    if install_system_packages ${packages} >&2; then
+      if have "python${version}"; then
+        printf '%s' "$(command -v "python${version}")"
+        return 0
+      fi
+      # pacman и apk ставят «python» без номера — проверяем, что вышло.
+      if have python3 && [[ "$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' \
+           2>/dev/null)" == "${version}" ]]; then
+        printf '%s' "$(command -v python3)"
+        return 0
+      fi
+    fi
+    warn "Python ${version} поставить не удалось — пробуем версию ниже."
+  done
+  printf ''
+  return 1
+}
+
+_apt_all_available() {
+  # Все ли пакеты есть в репозитории. Одного отсутствующего имени хватает,
+  # чтобы apt отверг установку целиком, поэтому проверяем заранее.
+  local name
+  for name in "$@"; do
+    apt-cache show "${name}" >/dev/null 2>&1 || return 1
+  done
+  return 0
+}
+
 system_package_names() {
   # Соответствие логических имён реальным пакетам разных дистрибутивов
   local manager; manager="$(detect_package_manager)"

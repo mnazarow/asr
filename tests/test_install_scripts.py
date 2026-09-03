@@ -606,3 +606,155 @@ def test_engine_failure_points_at_the_interpreter(repo_root: Path):
     assert "новее проверенной" in installer, "итог установки молчит о причине"
     doctor = (repo_root / "scripts" / "doctor.sh").read_text(encoding="utf-8")
     assert "Версия Python" in doctor, "доктор не проверяет версию Python"
+
+
+# ---------------------------------------------------------------------------
+# Установщик сам ставит проверенную версию Python
+# ---------------------------------------------------------------------------
+
+
+def _machine_with(tmp_path: Path, *, found: str, available: tuple[str, ...]) -> Path:
+    """PATH, где есть только заданный Python, а apt умеет поставить нужные.
+
+    Изоляция здесь обязательна: в сборочной машине свой python3.13, и без
+    неё проверка молча измеряла бы её, а не макет.
+    """
+    stub = tmp_path / "машина"
+    stub.mkdir(exist_ok=True)
+    for name in ("bash", "sh", "sed", "awk", "tr", "cut", "grep", "head", "tail",
+                 "printf", "uname", "command", "sort", "basename", "dirname",
+                 "cat", "date", "stat", "mkdir", "ls", "rm", "cp", "mv", "find",
+                 "id", "chmod", "tee", "wc", "env", "test", "df", "du", "xargs",
+                 "touch", "readlink", "realpath", "sleep"):
+        source = shutil.which(name)
+        if source and not (stub / name).exists():
+            (stub / name).symlink_to(source)
+
+    (stub / "python3").write_text(f'''#!/bin/sh
+case "$*" in
+  *"import ensurepip"*) exit 0 ;;
+  *version_info*) echo "{found}" ;;
+  -V|--version) echo "Python {found}.0" ;;
+  *) exec /usr/bin/python3 "$@" ;;
+esac
+''', encoding="utf-8")
+    (stub / "python3").chmod(0o755)
+
+    listed = "|".join([*available, "ffmpeg", "git"])
+    (stub / "apt-cache").write_text(
+        f'#!/bin/sh\ncase "$2" in\n  {listed}) exit 0 ;;\n  *) exit 100 ;;\nesac\n',
+        encoding="utf-8")
+    (stub / "apt-cache").chmod(0o755)
+
+    # Поддельный apt-get «ставит» интерпретатор, создавая его в том же каталоге.
+    versions = sorted({name.split("python")[1].split("-")[0]
+                       for name in available if name.startswith("python")})
+    branches = "\n".join(
+        f'    if [ "$a" = "python{version}" ]; then _make "{version}"; fi'
+        for version in versions)
+    (stub / "apt-get").write_text(f'''#!/bin/sh
+_make() {{
+  printf '#!/bin/sh\\ncase "$*" in\\n  *"import ensurepip"*) exit 0 ;;\\n'\\
+'  *version_info*) echo "%s" ;;\\n  -V|--version) echo "Python %s.0" ;;\\n'\\
+'  *) exec /usr/bin/python3 "$@" ;;\\nesac\\n' "$1" "$1" > "$(dirname "$0")/python$1"
+  chmod +x "$(dirname "$0")/python$1"
+}}
+for a in "$@"; do
+{branches}
+done
+exit 0
+''', encoding="utf-8")
+    (stub / "apt-get").chmod(0o755)
+    return stub
+
+
+def _install(repo_root: Path, stub: Path, target: Path, *extra: str):
+    return subprocess.run(
+        [BASH, str(repo_root / "scripts" / "install.sh"), "--no-interactive", "--yes",
+         "--profile", "light", "--skip-models", "--no-service", "--offline",
+         "--prefix", str(target / "prog"), "--data", str(target / "data"), *extra],
+        env={"PATH": str(stub), "TERM": "dumb", "HOME": str(target)},
+        capture_output=True, text=True, timeout=300, cwd=str(repo_root))
+
+
+def test_installer_installs_a_supported_python_itself(repo_root: Path, tmp_path: Path):
+    """Предупреждения мало: человек читает совет и делает три действия руками.
+
+    У скрипта есть и менеджер пакетов, и права, ради которых его запускают
+    под sudo, — значит он и должен поставить проверенную версию сам.
+    """
+    stub = _machine_with(tmp_path, found="3.14",
+                         available=("python3.13", "python3.13-venv", "python3.13-dev"))
+    result = _install(repo_root, stub, tmp_path / "уст")
+    out = result.stdout + result.stderr
+    assert "Устанавливаем Python 3.13" in out, f"проверенная версия не ставится:\n{out[:900]}"
+    assert "Дальше работаем на" in out, "поставили, но не переключились"
+    assert "Python 3.13" in out.split("Дальше работаем на")[1].split("\n")[0], \
+        "переключились не на ту версию"
+    assert (stub / "python3.13").exists()
+
+
+def test_installer_walks_down_to_an_available_version(repo_root: Path, tmp_path: Path):
+    """Если 3.13 в репозитории нет, берём 3.12 — а не сдаёмся на первой."""
+    stub = _machine_with(tmp_path, found="3.14",
+                         available=("python3.12", "python3.12-venv", "python3.12-dev"))
+    result = _install(repo_root, stub, tmp_path / "уст")
+    out = result.stdout + result.stderr
+    assert "Устанавливаем Python 3.12" in out, out[:900]
+    assert "Python 3.12" in out.split("✓ Python:")[1].split("\n")[0], \
+        "итоговый интерпретатор не тот"
+
+
+def test_explicit_python_is_never_overridden(repo_root: Path, tmp_path: Path):
+    """Указанный вручную интерпретатор — решение пользователя.
+
+    Подменять его нельзя даже к лучшему: человек мог знать, что делает.
+    """
+    stub = _machine_with(tmp_path, found="3.14",
+                         available=("python3.13", "python3.13-venv", "python3.13-dev"))
+    result = _install(repo_root, stub, tmp_path / "уст",
+                      "--python", str(stub / "python3"))
+    combined = result.stdout + result.stderr
+    assert "Устанавливаем Python" not in combined, "подменили заданный интерпретатор"
+    assert "новее проверенной" in combined, "и даже не предупредили"
+
+
+def test_python_install_can_be_declined(repo_root: Path, tmp_path: Path):
+    """`--no-python-install` оставляет всё как было."""
+    stub = _machine_with(tmp_path, found="3.14",
+                         available=("python3.13", "python3.13-venv", "python3.13-dev"))
+    result = _install(repo_root, stub, tmp_path / "уст", "--no-python-install")
+    out = result.stdout + result.stderr
+    assert "Устанавливаем Python" not in out
+    assert "Python 3.14" in out.split("✓ Python:")[1].split("\n")[0], \
+        "версию всё-таки подменили"
+
+
+def test_supported_python_is_not_reinstalled(repo_root: Path, tmp_path: Path):
+    """Ставить нечего, если подходящая версия уже есть — лишний apt никому не нужен."""
+    stub = _machine_with(tmp_path, found="3.12",
+                         available=("python3.13", "python3.13-venv", "python3.13-dev"))
+    result = _install(repo_root, stub, tmp_path / "уст")
+    out = result.stdout + result.stderr
+    assert "Устанавливаем Python" not in out
+    assert "новее проверенной" not in out
+
+
+def test_helper_returns_only_a_path(repo_root: Path, tmp_path: Path):
+    """Всё, кроме пути, обязано идти в stderr.
+
+    Функция возвращает путь через stdout: строка «Устанавливаем Python…»,
+    попав туда же, становится частью ответа — и вызывающий пытается её
+    запустить.
+    """
+    stub = _machine_with(tmp_path, found="3.14",
+                         available=("python3.13", "python3.13-venv", "python3.13-dev"))
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    detect = repo_root / "scripts" / "lib" / "detect.sh"
+    result = subprocess.run(
+        [BASH, "-c", f'source "{common}"; source "{detect}"; install_supported_python 3.13'],
+        env={"PATH": str(stub), "TERM": "dumb", "HOME": str(tmp_path)},
+        capture_output=True, text=True, timeout=120)
+    assert result.stdout.strip() == str(stub / "python3.13"), \
+        f"в stdout попало лишнее: {result.stdout!r}"
+    assert "Устанавливаем" in result.stderr, "сообщения пропали совсем"

@@ -53,6 +53,8 @@ MONITORING=""
 # Распознавание на лету. Включено по умолчанию — как и на сервере; ключ нужен,
 # чтобы выключить его на машине, где ffmpeg ставить не будут.
 STREAM_ENABLED="true"
+# Ставить ли проверенную версию Python, когда найденная слишком новая.
+PYTHON_INSTALL=1
 # auto — поставить драйвер под найденную карту; none — не трогать;
 # nvidia/amd/intel — ставить только если найдена карта этого производителя.
 GPU_DRIVER="auto"
@@ -159,6 +161,8 @@ while [[ $# -gt 0 ]]; do
     # вторая переписывала юнит первой (/etc/systemd/system/asrhub.service).
     --name)        SERVICE_NAME="$2"; shift 2 ;;
     --no-stream)   STREAM_ENABLED="false"; shift ;;
+    # Не ставить Python самим, даже если найденный слишком новый.
+    --no-python-install) PYTHON_INSTALL=0; shift ;;
     --yes|-y)      ASRHUB_ASSUME_YES=1; shift ;;
     --quiet|-q)    ASRHUB_QUIET=1; shift ;;
     --debug)       ASRHUB_DEBUG=1; shift ;;
@@ -464,7 +468,37 @@ fi
 
 if [[ "${MODE}" == "native" ]]; then
   PY="$(check_python)" || exit 1
+
+  # Слишком новый интерпретатор чиним сами, а не советуем починить.
+  # check_python в этом случае уже объяснил, чем грозит, и назвал команду —
+  # но человеку остаётся выйти, поставить пакет и запустить заново. Три
+  # действия там, где скрипт умеет все три: у него есть и менеджер пакетов,
+  # и права, ради которых его и запускают под sudo.
+  #
+  # Условие «явно задан --python» важно: указанный вручную интерпретатор —
+  # это решение пользователя, и подменять его нельзя даже к лучшему.
+  PY_VERSION="$("${PY}" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ -z "${ASRHUB_PYTHON:-}" && -n "${PY_VERSION}" ]] \
+     && version_gt "${PY_VERSION}" "${ASRHUB_MAX_PYTHON}" \
+     && [[ "${PYTHON_INSTALL}" != "0" ]]; then
+    if confirm "Поставить Python ${ASRHUB_MAX_PYTHON} и собрать окружение на нём?" "y"; then
+      NEW_PY="$(install_supported_python "${ASRHUB_MAX_PYTHON}" || true)"
+      if [[ -n "${NEW_PY}" ]]; then
+        PY="${NEW_PY}"
+        ok "Дальше работаем на ${PY} ($("${PY}" --version 2>&1))"
+      elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+        warn "Проверенную версию поставить не удалось — продолжаем на ${PY_VERSION}."
+        hint "Часть движков не установится; это будет видно в итоге установки."
+      fi
+    else
+      info "Остаёмся на Python ${PY_VERSION} по вашему выбору."
+      hint "Если движки не встанут, причина будет эта."
+    fi
+  fi
+
   ok "Python: ${PY} ($("${PY}" --version 2>&1))"
+  # Имя пакета venv выводится по выбранному интерпретатору — он мог смениться.
+  export ASRHUB_PYTHON_FOR_PACKAGES="${PY}"
 else
   require_command docker "Установите Docker: https://docs.docker.com/engine/install/" || exit 127
   if ! docker info >/dev/null 2>&1; then
