@@ -998,7 +998,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788320734.4310153,
+    "generated_at": 1788396720.053555,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1100,7 +1100,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 196.1,
+  "uptime_s": 65.4,
   "queue_paused": false,
   "catalog_date": "2026-08-31"
 }
@@ -1140,8 +1140,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 4,
-    "WARNING": 20
+    "INFO": 4
   }
 }
 ```
@@ -1176,17 +1175,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 196.1,
+  "uptime_s": 65.4,
   "hardware": {
     "os_name": "Linux",
-    "os_version": "6.18.44-fc-v22",
+    "os_version": "6.18.44-fc-v24",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
-    "disk_free_gb": 29.2,
+    "ram_available_gb": 7.1,
+    "disk_free_gb": 29.1,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1209,7 +1208,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_threads": 1,
     "_reason": "Видеокарта не обнаружена. Выбран режим int8 на 2 физических ядрах — единственный практичный вариант на процессоре."
   },
-  "database": {
+  "log_counts": {
+    "INFO": 4
+  },
 …
 ```
 
@@ -1484,14 +1485,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 196.1,
+  "uptime_s": 65.4,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 196 с",
+        "detail": "работает 65 с",
         "hint": ""
       },
       {
@@ -1520,7 +1521,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 29.2 ГБ",
+        "detail": "свободно 29.1 ГБ",
         "hint": ""
       },
       {
@@ -1528,6 +1529,7 @@ curl http://сервер:8080/api/monitoring/health
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
+      }
 …
 ```
 

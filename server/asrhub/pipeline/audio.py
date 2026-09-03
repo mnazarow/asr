@@ -188,6 +188,42 @@ def analyze_levels(path: Path, max_seconds: float = 600.0) -> dict[str, float]:
     return out
 
 
+def lead_silence_s(src: Path, settings: dict[str, Any]) -> float:
+    """Сколько секунд тишины в начале записи — теми же порогами, что и обрезка.
+
+    Нужна не сама обрезка, а её величина: на неё потом сдвигаются обратно
+    все таймкоды. Пороги (-45 дБ, 0.1 с) совпадают с теми, что стоят в
+    цепочке фильтров, иначе замер и обрезка разошлись бы.
+    """
+    if not settings.get("audio_trim_silence"):
+        return 0.0
+    exe = _ffmpeg()
+    cmd = [exe, "-hide_banner", "-nostdin", "-i", str(src),
+           "-af", "silencedetect=noise=-45dB:d=0.1", "-f", "null", "-"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    start_at_zero = False
+    for line in (res.stderr or "").splitlines():
+        if "silence_start:" in line:
+            try:
+                value = float(line.split("silence_start:")[1].strip().split(" ")[0])
+            except (ValueError, IndexError):
+                continue
+            # Интересует только тишина, с которой запись начинается.
+            if value <= 0.05:
+                start_at_zero = True
+            elif not start_at_zero:
+                return 0.0
+        elif "silence_end:" in line and start_at_zero:
+            try:
+                return max(0.0, float(line.split("silence_end:")[1].strip().split(" ")[0]))
+            except (ValueError, IndexError):
+                return 0.0
+    return 0.0
+
+
 def build_filter_chain(settings: dict[str, Any]) -> str:
     """Собирает цепочку фильтров ffmpeg по настройкам задания."""
     filters: list[str] = []
@@ -207,9 +243,13 @@ def build_filter_chain(settings: dict[str, Any]) -> str:
             log.warning("arnndn выбран, но файл модели не задан — шумоподавление пропущено")
 
     if settings.get("audio_trim_silence"):
+        # Режем только тишину в КОНЦЕ. Начальную здесь трогать нельзя: она
+        # сдвигает все таймкоды, а сдвиг никуда не записывается — субтитры
+        # уезжали ровно на длину тишины в начале записи. Начало обрезается
+        # через -ss на известную величину (см. lead_silence_s), и эта
+        # величина потом возвращается ко всем таймкодам.
         filters.append(
-            "silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:"
-            "detection=peak,areverse,"
+            "areverse,"
             "silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:"
             "detection=peak,areverse")
 
@@ -285,11 +325,34 @@ def channel_count(path: Path) -> int:
         return 1
 
 
-def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> list[tuple[str, Path]]:
+@dataclass(slots=True)
+class Prepared:
+    """Подготовленные файлы вместе со сдвигом системы координат.
+
+    Подготовка меняет время: обрезка начальной тишины сдвигает всё на
+    `offset_s`, изменение темпа сжимает или растягивает в `speed` раз.
+    Движок работает уже в новых координатах, поэтому исходное время
+    считается как `offset_s + t * speed`. Без этих двух чисел таймкоды
+    в субтитрах не соответствуют исходной записи.
+    """
+
+    channels: list[tuple[str, Path]]
+    offset_s: float = 0.0
+    speed: float = 1.0
+
+    def to_source_time(self, value: float) -> float:
+        """Время подготовленного файла -> время исходной записи."""
+        return self.offset_s + value * self.speed
+
+    @property
+    def shifted(self) -> bool:
+        return abs(self.offset_s) > 1e-3 or abs(self.speed - 1.0) > 1e-3
+
+
+def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
     """Готовит один или несколько WAV-файлов к распознаванию.
 
-    Возвращает список пар (метка канала, путь). Для режима «split» на
-    стереозаписи получится два файла.
+    Возвращает подготовленные каналы и сдвиг системы координат.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     info = probe(src)
@@ -301,18 +364,24 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> list[tuple[st
         raise AudioError(f"Длительность файла «{src.name}» близка к нулю.",
                          hint="Возможно, файл повреждён или содержит только заголовок.")
 
+    # Начальная тишина отмеряется один раз на исходном файле и одинаково
+    # применяется ко всем каналам: иначе левый и правый разъехались бы во
+    # времени между собой.
+    offset = lead_silence_s(src, settings)
+    speed = float(settings.get("audio_speed") or 1.0)
+
     mode = str(settings.get("audio_channels") or "mono")
     if mode == "split" and info.channels >= 2:
         outputs: list[tuple[str, Path]] = []
         for label, channel in (("Канал 1", "left"), ("Канал 2", "right")):
             dst = workdir / f"{src.stem}.{channel}.wav"
-            convert(src, dst, settings, channel=channel)
+            convert(src, dst, settings, channel=channel, start_s=offset or None)
             outputs.append((label, dst))
-        return outputs
+        return Prepared(outputs, offset_s=offset, speed=speed)
 
     dst = workdir / f"{src.stem}.prepared.wav"
-    convert(src, dst, settings)
-    return [("", dst)]
+    convert(src, dst, settings, start_s=offset or None)
+    return Prepared([("", dst)], offset_s=offset, speed=speed)
 
 
 def read_wav_mono(path: Path) -> tuple[list[float], int]:

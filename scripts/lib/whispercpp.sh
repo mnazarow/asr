@@ -45,6 +45,15 @@ build_whisper_cpp() {
     return 1
   fi
   ok "whisper.cpp собран: ${binary}"
-  printf 'export ASRHUB_WHISPER_CPP=%s\n' "${binary}" >> "${DATA_DIR:-/tmp}/env.sh"
+  # Формат строго ИМЯ=ЗНАЧЕНИЕ: systemd читает env.sh через EnvironmentFile
+  # и строку с «export » отбраковывает — переменная не доходила до службы,
+  # и собранный whisper.cpp сервер попросту не находил. Прежнюю строку
+  # убираем, иначе она копится при каждой переустановке.
+  local env_file="${DATA_DIR:-/tmp}/env.sh"
+  if [[ -f "${env_file}" ]]; then
+    grep -v '^\(export \)\?ASRHUB_WHISPER_CPP=' "${env_file}" > "${env_file}.new" 2>/dev/null || true
+    mv -f "${env_file}.new" "${env_file}"
+  fi
+  printf 'ASRHUB_WHISPER_CPP=%s\n' "${binary}" >> "${env_file}"
   return 0
 }

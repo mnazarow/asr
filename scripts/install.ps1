@@ -352,7 +352,14 @@ foreach ($dir in @($Prefix, $DataDir,
                    (Join-Path $DataDir 'tmp'))) {
     if (-not (Test-Path $dir)) {
         if (-not (Get-DryRun)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Add-Rollback { Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue } "удалить $dir"
+        # GetNewClosure обязателен: блок скрипта связывается с переменной
+        # поздно, и к моменту отката $dir равнялся последнему значению
+        # цикла. Откат пять раз удалял data\tmp, а каталог программы с venv
+        # оставался на диске — при том что скрипт писал «система возвращена
+        # в исходное состояние».
+        $captured = $dir
+        Add-Rollback ({ Remove-Item -LiteralPath $captured -Recurse -Force `
+                                    -ErrorAction SilentlyContinue }).GetNewClosure() "удалить $captured"
     }
 }
 Write-Ok 'Каталоги готовы'
@@ -361,7 +368,15 @@ Write-Ok 'Каталоги готовы'
 
 Write-Step 'Копирование файлов приложения'
 
-if (-not (Get-DryRun)) {
+# Запуск из уже установленной копии — обычное дело: скрипт сам печатает
+# путь вида "C:\Program Files\ASRHub\scripts\update.ps1". Без проверки
+# цикл удалял каталог и тут же копировал его сам в себя: установка
+# оставалась без server, а откат ничего не возвращал.
+$srcReal = [System.IO.Path]::GetFullPath($RepoDir)
+$dstReal = [System.IO.Path]::GetFullPath($Prefix)
+if ($srcReal -eq $dstReal) {
+    Write-Info 'Источник совпадает с установкой — файлы уже на месте, копирование пропущено.'
+} elseif (-not (Get-DryRun)) {
     foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'VERSION', 'README.md')) {
         $source = Join-Path $RepoDir $item
         if (Test-Path $source) {

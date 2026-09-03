@@ -223,14 +223,17 @@ class Analytics:
 
     # --- прочие срезы -------------------------------------------------------
 
+    # Владелец передаётся во все срезы без исключения. В двух он терялся, и
+    # обычный ключ видел в разделах «языки» и «движки» сводку по всему
+    # серверу: и чужие числа, и чужие названия моделей.
     def by_language(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
-        return self._group(period, "language", "Язык не определён")
+        return self._group(period, "language", "Язык не определён", owner)
 
     def by_owner(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         return self._group(period, "owner", "аноним", owner)
 
     def by_engine(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
-        return self._group(period, "engine", "—")
+        return self._group(period, "engine", "—", owner)
 
     def by_source(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         return self._group(period, "source", "api", owner)
@@ -276,11 +279,17 @@ class Analytics:
                     "id": job["id"], "filename": job.get("filename"),
                     "created_at": job.get("created_at")})
         rows = sorted(by_code.values(), key=lambda r: r["count"], reverse=True)
-        total_jobs = self.db.count_jobs(since=since or None)
+        # Числитель и знаменатель обязаны считаться по одному множеству.
+        # Раньше отказы брались по владельцу, а всего заданий — по всему
+        # серверу, и доля выходила заниженной в разы. Плюс len(jobs) упирался
+        # в limit выборки, поэтому на большом периоде отказы переставали
+        # расти после десяти тысяч.
+        total_jobs = self.db.count_jobs(since=since or None, owner=owner)
+        total_failed = self.db.count_jobs(status="failed", since=since or None, owner=owner)
         return {
-            "total_failed": len(jobs),
+            "total_failed": total_failed,
             "total_jobs": total_jobs,
-            "failure_rate": round(len(jobs) / total_jobs, 4) if total_jobs else 0.0,
+            "failure_rate": round(total_failed / total_jobs, 4) if total_jobs else 0.0,
             "by_code": rows,
         }
 

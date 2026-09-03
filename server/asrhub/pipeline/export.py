@@ -22,14 +22,16 @@ FORMATS = ["txt", "json", "srt", "vtt", "ass", "tsv", "csv", "md", "docx"]
 
 
 def format_timestamp(seconds: float, style: str = "srt") -> str:
-    seconds = max(0.0, float(seconds))
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int(round((seconds - int(seconds)) * 1000))
-    if millis == 1000:
-        secs += 1
-        millis = 0
+    # Всё считаем от округлённых миллисекунд. Раньше округление добавляло
+    # секунду отдельно, и перенос дальше не шёл: 59.9996 давало
+    # «00:00:60,000», а 3599.9996 — «00:59:60,000». Строгие плееры такой
+    # блок субтитров просто отбрасывают.
+    total_ms = int(round(max(0.0, float(seconds)) * 1000))
+    millis = total_ms % 1000
+    total_seconds = total_ms // 1000
+    secs = total_seconds % 60
+    minutes = (total_seconds // 60) % 60
+    hours = total_seconds // 3600
     if style == "srt":
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
     if style == "vtt":
@@ -37,7 +39,7 @@ def format_timestamp(seconds: float, style: str = "srt") -> str:
     if style == "ass":
         return f"{hours:d}:{minutes:02d}:{secs:02d}.{millis // 10:02d}"
     if style == "seconds":
-        return f"{seconds:.3f}"
+        return f"{total_ms / 1000:.3f}"
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
@@ -70,19 +72,31 @@ def wrap_subtitle(text: str, max_width: int = 42, max_lines: int = 2) -> str:
         lines.append(current)
     if len(lines) > max_lines:
         # Перераспределяем равномерно, чтобы не оставлять «висячее» слово.
-        joined = " ".join(lines)
+        # Ширину подбираем, пока текст не уложится: прежний расчёт «на глаз»
+        # (длина делить на число строк) не гарантировал нужного числа строк,
+        # а лишние строки просто отрезались — вместе со словами. На реплике
+        # из пятнадцати слов одно пропадало без следа.
+        joined = " ".join(words)
         target = max(1, len(joined) // max_lines + 1)
-        lines, current = [], ""
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            if len(candidate) <= target or not current:
-                current = candidate
-            else:
-                lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        lines = lines[:max_lines]
+        best = lines
+        for _ in range(24):
+            packed, current = [], ""
+            for word in words:
+                candidate = f"{current} {word}".strip()
+                if len(candidate) <= target or not current:
+                    current = candidate
+                else:
+                    packed.append(current)
+                    current = word
+            if current:
+                packed.append(current)
+            best = packed
+            if len(packed) <= max_lines:
+                break
+            target += max(1, target // 8)
+        # Даже если ширину пришлось увеличить сверх max_width, текст остаётся
+        # целым: обрезанная реплика хуже длинной строки.
+        lines = best
     return "\n".join(lines)
 
 
@@ -100,7 +114,9 @@ def _speaker_prefix(seg: dict[str, Any], settings: dict[str, Any]) -> str:
 def to_txt(result: dict[str, Any], settings: dict[str, Any]) -> str:
     segments = result.get("segments", [])
     mode = str(settings.get("paragraph_mode") or "speaker")
-    paragraphs = build_paragraphs(segments, mode)
+    paragraphs = build_paragraphs(
+        segments, mode,
+        speaker_labels=bool(settings.get("include_speaker_labels", True)))
     return "\n\n".join(p for p in paragraphs if p.strip()) + "\n"
 
 
@@ -177,6 +193,19 @@ def to_vtt(result: dict[str, Any], settings: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _ass_escape(text: str) -> str:
+    """Обезвреживает разметку ASS внутри реплики.
+
+    В фигурных скобках libass ждёт команды оформления, поэтому «скидка {30}
+    процентов» отрисовывалась без числа: всё, что в скобках, считалось
+    командой и просто не показывалось. Экранируем скобки и обратный слэш,
+    который в ASS тоже управляющий.
+    """
+    return (text.replace("\\", "\\\\")
+                .replace("{", "\\{")
+                .replace("}", "\\}"))
+
+
 def to_ass(result: dict[str, Any], settings: dict[str, Any]) -> str:
     width = int(settings.get("subtitle_max_line_width") or 42)
     lines_limit = int(settings.get("subtitle_max_lines") or 2)
@@ -200,7 +229,8 @@ def to_ass(result: dict[str, Any], settings: dict[str, Any]) -> str:
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     for seg in _prepare_subtitles(result, min_dur):
-        text = wrap_subtitle(seg.get("text", ""), width, lines_limit).replace("\n", "\\N")
+        text = wrap_subtitle(_ass_escape(seg.get("text", "")),
+                             width, lines_limit).replace("\n", "\\N")
         if not text.strip():
             continue
         speaker = seg.get("speaker") or ""

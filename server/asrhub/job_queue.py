@@ -98,6 +98,8 @@ class JobQueue:
         self._workers: list[threading.Thread] = []
         self._states: list[WorkerState] = []
         self._cancelled: set[str] = set()
+        #: Владельцы заданий для адресной рассылки событий по WebSocket.
+        self._owners: dict[str, str] = {}
         # Индексы воркеров, помеченных на выход при уменьшении их числа.
         self._retiring: set[int] = set()
         self._webhooks: Any = None
@@ -346,6 +348,13 @@ class JobQueue:
         if changed:
             self.db.add_event(job_id, "cancelled", f"Отменено ({by})")
             self._emit("job.cancelled", {"id": job_id})
+            with self._lock:
+                # Задание в очереди или на паузе отменяется без участия
+                # воркера, поэтому пометку об отмене снимаем сразу. Иначе она
+                # оставалась в множестве навсегда: cancel_all по очереди из
+                # десяти тысяч заданий добавлял десять тысяч вечных записей.
+                if job_id not in self._running:
+                    self._cancelled.discard(job_id)
         else:
             # Задание завершилось прямо во время отмены — это не ошибка.
             with self._lock:
@@ -485,13 +494,12 @@ class JobQueue:
             }.get(policy, "priority DESC")
             window = int(self.settings.get("scheduling_window") or 500)
             candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
-                                           limit=window, order=preselect, light=True)
+                                           limit=window, order=preselect, light=True,
+                                           ready_before=now())
             candidates = [c for c in candidates if c["id"] not in self._running]
             if per_model_limit > 0:
                 candidates = [c for c in candidates
                               if self._model_counts.get(c.get("model") or "", 0) < per_model_limit]
-            candidates = [c for c in candidates
-                          if not c.get("queued_at") or c["queued_at"] <= now()]
             if not candidates:
                 return None
 
@@ -704,19 +712,26 @@ class JobQueue:
                 basename=Path(job.get("filename") or job_id).stem,
                 progress=progress, cancelled=cancelled)
         except ASRHubError as exc:
-            self._handle_failure(job, exc, merged)
+            self._handle_failure(job, exc, merged, outdir=outdir)
             return
         except Exception as exc:
             self._handle_failure(job, classify_exception(
-                exc, engine=str(job.get("engine")), model=str(job.get("model"))), merged)
+                exc, engine=str(job.get("engine")), model=str(job.get("model"))), merged,
+                outdir=outdir)
             return
         finally:
             cleanup_workdir(workdir)
 
         elapsed = time.time() - started
         accuracy = outcome.stats.get("accuracy") or {}
-        self.db.update_job(
+        # Только из состояния «выполняется». Отмена аккуратно сверяет статус
+        # перед записью, а обратное направление было незащищено: отмена,
+        # пришедшая между последней проверкой в конвейере и этой записью,
+        # затиралась, и пользователь, которому уже ответили «отменено»,
+        # получал задание в состоянии «готово».
+        finished = self.db.update_job_if_status(
             job_id,
+            [STATUS_RUNNING],
             status=STATUS_COMPLETED, finished_at=now(), progress=1.0, stage="готово",
             text=outcome.text,
             result_path=str(outdir),
@@ -736,7 +751,18 @@ class JobQueue:
             wer=accuracy.get("wer"), cer=accuracy.get("cer"),
             waveform=outcome.waveform,
         )
+        if not finished:
+            # Задание успели отменить или удалить, пока оно считалось.
+            # Записывать результат некуда — убираем и файлы выгрузки.
+            log.info("Задание %s завершилось, но его состояние уже изменено — "
+                     "результат отброшен", job_id, extra={"job_id": job_id})
+            self._discard_results(outdir)
+            with self._lock:
+                self._cancelled.discard(job_id)
+            return
         self.db.save_segments(job_id, outcome.segments)
+        with self._lock:
+            self._cancelled.discard(job_id)
 
         RUNTIME.inc("asrhub_jobs_total", {"status": "completed"})
         RUNTIME.inc("asrhub_audio_seconds_total",
@@ -777,7 +803,7 @@ class JobQueue:
                 pass
 
     def _handle_failure(self, job: dict[str, Any], error: ASRHubError,
-                        merged: dict[str, Any]) -> None:
+                        merged: dict[str, Any], outdir: Path | None = None) -> None:
         job_id = job["id"]
         with self._lock:
             was_cancelled = job_id in self._cancelled
@@ -786,6 +812,7 @@ class JobQueue:
             self.db.update_job(job_id, status=STATUS_CANCELLED, finished_at=now(),
                                stage="отменено")
             RUNTIME.inc("asrhub_jobs_total", {"status": "cancelled"})
+            self._discard_results(outdir)
             return
 
         retries = int(job.get("retries") or 0)
@@ -832,7 +859,25 @@ class JobQueue:
         log.error("Задание %s провалено: %s", job_id, error.message,
                   extra={"job_id": job_id, "error_code": error.code})
         self._emit("job.failed", {"id": job_id, "error": error.to_dict()})
+        self._discard_results(outdir)
         self._send_webhook(job_id)
+
+    @staticmethod
+    def _discard_results(outdir: Path | None) -> None:
+        """Убирает каталог результатов задания, которое не дошло до конца.
+
+        Выгрузка создаёт каталог и пишет файлы до отметки «готово», а отмена
+        или тайм-аут срабатывали уже после этого. result_path в базу при этом
+        не попадал, поэтому ни удаление задания, ни уборка по сроку хранения
+        такой каталог не находили — он оставался на диске навсегда.
+        """
+        if outdir is None:
+            return
+        try:
+            if outdir.is_dir():
+                shutil.rmtree(outdir, ignore_errors=True)
+        except OSError as exc:
+            log.debug("Каталог результатов %s убрать не удалось: %s", outdir, exc)
 
     # --- уведомления -----------------------------------------------------
 
@@ -905,9 +950,36 @@ class JobQueue:
         self.db.update_job(job["id"], webhook_status="failed")
         RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
 
+    def _owner_of(self, job_id: str) -> str:
+        """Владелец задания для адресной рассылки событий.
+
+        Держим небольшой словарь вместо запроса к базе: события прогресса
+        идут по нескольку раз в секунду на каждое задание, и поход в базу
+        на каждое сделал бы рассылку дороже самой работы.
+        """
+        with self._lock:
+            cached = self._owners.get(job_id)
+        if cached is not None:
+            return cached
+        job = self.db.get_job(job_id)
+        owner = str((job or {}).get("owner") or "")
+        with self._lock:
+            self._owners[job_id] = owner
+            # Словарь не должен расти бесконечно на долгоживущем сервере.
+            if len(self._owners) > 4096:
+                for key in list(self._owners)[:2048]:
+                    self._owners.pop(key, None)
+        return owner
+
     def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.on_event is None:
             return
+        # Событие о задании адресное: имя файла, текст ошибки и сам факт
+        # работы — сведения владельца. Подписчику, который не владелец и не
+        # администратор, оно не уходит. Поле служебное и до клиента не
+        # доезжает — рассылка снимает его перед отправкой.
+        if "_owner" not in data and isinstance(data.get("id"), str):
+            data = {**data, "_owner": self._owner_of(data["id"])}
         try:
             self.on_event(kind, data)
         except Exception as exc:
@@ -919,15 +991,27 @@ class JobQueue:
         last_cleanup = 0.0
         failures = 0
         while not self._stop.wait(timeout=20.0):
+            # Каждый шаг в своей обёртке: раньше сбой первого (например,
+            # ошибка при выгрузке модели с видеокарты) означал, что уборка
+            # хранилища не выполняется НИКОГДА — last_cleanup не обновлялся,
+            # и диск не чистился, пока сбой не пройдёт сам.
             try:
-                self.registry.collect_idle()
-                self._sample_system()
+                for step_fn in (self.registry.collect_idle, self._sample_system):
+                    try:
+                        step_fn()
+                    except Exception as exc:            # noqa: BLE001
+                        failures += 1
+                        if failures <= 3 or failures % 180 == 0:
+                            log.warning("Служебный шаг %s дал сбой (%d-й раз): %s",
+                                        getattr(step_fn, "__name__", step_fn), failures, exc)
                 if time.time() - last_cleanup > 3600:
                     retention = int(self.settings.get("result_retention_days") or 30)
                     removed = self.db.cleanup(results_days=retention)
                     if any(removed.values()):
                         log.info("Очистка хранилища: %s", removed)
-                    last_cleanup = time.time()
+                    # Если уборка упёрлась в предел на заход, следующий
+                    # делаем не через час, а через минуту.
+                    last_cleanup = time.time() - 3540 if removed.get("more") else time.time()
             except Exception as exc:                    # noqa: BLE001
                 # Раньше здесь стоял debug, и постоянно падающая очистка диска
                 # не давала ни одной записи при штатном уровне INFO. Первые

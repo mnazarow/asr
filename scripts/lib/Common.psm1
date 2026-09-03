@@ -151,7 +151,19 @@ function Invoke-Checked {
     if ($script:DryRun) { Write-Host "[пробный запуск] $display" -ForegroundColor Yellow; return '' }
     Write-Debug2 "выполняется: $display"
     Write-AsrLog CMD $display
-    $output = & $Command @Arguments 2>&1
+    # В Windows PowerShell 5.1 слияние потоков от внешней программы при
+    # $ErrorActionPreference = 'Stop' превращает КАЖДУЮ строку stderr в
+    # терминирующую ошибку. Обычное «WARNING: You are using pip version…»
+    # обрывало установку при коде возврата 0 — на PowerShell 7 этого нет,
+    # поэтому дефект проявлялся только на штатной для Windows 5.1.
+    # Решение принимаем по коду возврата, как и задумано.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Command @Arguments 2>&1
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
     $code = $LASTEXITCODE
     if (-not $IgnoreExitCode -and $code -ne 0) {
         Write-Err "Команда завершилась с кодом ${code}: $display"
@@ -179,7 +191,15 @@ function Invoke-WithRetry {
 function Confirm-Action {
     param([string]$Message, [string]$Default = 'y')
     if ($script:AssumeYes) { return $true }
-    if (-not [Environment]::UserInteractive) { return $true }
+    # Без консоли берём заданное умолчание, а не «да». Прежнее безусловное
+    # согласие означало, что `uninstall.ps1 -Purge` из задачи планировщика,
+    # WinRM-сессии или CI удалял каталог данных с базой и моделями, ни о чём
+    # не спросив, — притом что вопрос задан с умолчанием «нет». В bash-
+    # двойнике это уже исправлено.
+    if (-not [Environment]::UserInteractive) {
+        Write-Info "$Message — нет консоли, взято умолчание: $Default"
+        return ($Default -eq 'y')
+    }
     $suffix = if ($Default -eq 'n') { '[y/N]' } else { '[Y/n]' }
     $answer = Read-Host "? $Message $suffix"
     if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }

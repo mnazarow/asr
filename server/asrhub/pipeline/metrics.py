@@ -61,6 +61,104 @@ class ErrorCounts:
         return data
 
 
+#: Предел на площадь матрицы Левенштейна за один заход. 4 млн ячеек — это
+#: около двух секунд на обычном процессоре; выше начинается ожидание, которое
+#: пользователь считает зависанием.
+_MATRIX_LIMIT = 4_000_000
+
+
+def _levenshtein_chunked(ref: Sequence[str], hyp: Sequence[str]) -> ErrorCounts:
+    """Расстояние Левенштейна, пригодное для многочасовых расшифровок.
+
+    Прямой расчёт квадратичен: на часовой записи посимвольный разбор
+    (около 55 000 знаков) занимал больше получаса, и всё это время задание
+    висело на 96 % и не отменялось.
+
+    Здесь длинные последовательности сначала разбиваются на совпадающие
+    участки и промежутки между ними (`difflib` делает это быстро), а точный
+    расчёт применяется только к промежуткам — они на порядки короче. Ответ
+    получается тот же, что и при прямом расчёте: совпадающие участки в
+    оптимальное выравнивание входят целиком.
+    """
+    if len(ref) * len(hyp) <= _MATRIX_LIMIT:
+        return _levenshtein(ref, hyp)
+
+    import difflib
+
+    total = ErrorCounts()
+    # autojunk отбрасывает часто встречающиеся элементы как «мусор». Для
+    # символов это почти все буквы, поэтому его обязательно выключать —
+    # иначе совпадающих участков не найдётся вовсе.
+    matcher = difflib.SequenceMatcher(a=list(ref), b=list(hyp), autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            total.hits += i2 - i1
+            continue
+        ref_part, hyp_part = ref[i1:i2], hyp[j1:j2]
+        if len(ref_part) * len(hyp_part) <= _MATRIX_LIMIT:
+            part = _levenshtein(ref_part, hyp_part)
+            total.substitutions += part.substitutions
+            total.deletions += part.deletions
+            total.insertions += part.insertions
+            total.hits += part.hits
+            continue
+        # Промежуток всё ещё огромен — значит тексты почти не пересекаются.
+        # Точное число здесь недостижимо за разумное время; завышенная
+        # оценка честнее зависания, и на таком расхождении она всё равно
+        # близка к единице.
+        common = min(len(ref_part), len(hyp_part))
+        total.substitutions += common
+        total.deletions += len(ref_part) - common
+        total.insertions += len(hyp_part) - common
+    return total
+
+
+def _char_counts(ref_words: Sequence[str], hyp_words: Sequence[str]) -> ErrorCounts:
+    """Посимвольные счётчики через пословное выравнивание.
+
+    Прямая матрица по символам — самая дорогая часть разбора: на часовой
+    расшифровке это часы. Но символы не нужно выравнивать заново: слова уже
+    выровнены, и внутри каждой пары остаётся сравнить десяток знаков.
+    Совпавшие слова дают чистые совпадения, вставленные и удалённые — свои
+    счётчики целиком.
+
+    Цена приёма — доли процента: пословное выравнивание не всегда совпадает
+    с посимвольно оптимальным, и CER может выйти чуть выше точного (на
+    проверках расхождение не превышало 0.003 при CER около 0.1). Пока текст
+    помещается в прямой расчёт, он и используется, так что на обычных
+    записях числа точные.
+    """
+    ref_chars = sum(len(w) for w in ref_words) + max(0, len(ref_words) - 1)
+    hyp_chars = sum(len(w) for w in hyp_words) + max(0, len(hyp_words) - 1)
+    if ref_chars * hyp_chars <= _MATRIX_LIMIT:
+        return _levenshtein(list(" ".join(ref_words)), list(" ".join(hyp_words)))
+
+    import difflib
+
+    total = ErrorCounts()
+    matcher = difflib.SequenceMatcher(a=list(ref_words), b=list(hyp_words), autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            # Слова совпали — совпали и все их знаки, вместе с пробелами
+            # между ними.
+            total.hits += sum(len(w) for w in ref_words[i1:i2]) + (i2 - i1 - 1)
+            continue
+        left = " ".join(ref_words[i1:i2])
+        right = " ".join(hyp_words[j1:j2])
+        if len(left) * len(right) <= _MATRIX_LIMIT:
+            part = _levenshtein(list(left), list(right))
+            total.substitutions += part.substitutions
+            total.deletions += part.deletions
+            total.insertions += part.insertions
+            total.hits += part.hits
+        else:
+            common = min(len(left), len(right))
+            total.substitutions += common
+            total.deletions += len(left) - common
+            total.insertions += len(right) - common
+    return total
+
+
 def _levenshtein(ref: Sequence[str], hyp: Sequence[str]) -> ErrorCounts:
     """Расстояние Левенштейна с подсчётом типов ошибок.
 
@@ -101,22 +199,22 @@ def wer(reference: str, hypothesis: str, **norm: Any) -> float:
     """Доля ошибок по словам (0 — идеально, 1 — все слова неверны)."""
     ref = normalize(reference, **norm).split()
     hyp = normalize(hypothesis, **norm).split()
-    return _levenshtein(ref, hyp).error_rate
+    return _levenshtein_chunked(ref, hyp).error_rate
 
 
 def cer(reference: str, hypothesis: str, **norm: Any) -> float:
     """Доля ошибок по символам. Устойчивее WER на языках с богатой морфологией."""
     ref = list(normalize(reference, **norm).replace(" ", ""))
     hyp = list(normalize(hypothesis, **norm).replace(" ", ""))
-    return _levenshtein(ref, hyp).error_rate
+    return _levenshtein_chunked(ref, hyp).error_rate
 
 
 def detailed(reference: str, hypothesis: str, **norm: Any) -> dict[str, Any]:
     """Полный разбор: WER, CER, счётчики ошибок и список расхождений."""
     ref_words = normalize(reference, **norm).split()
     hyp_words = normalize(hypothesis, **norm).split()
-    counts = _levenshtein(ref_words, hyp_words)
-    char_counts = _levenshtein(list(" ".join(ref_words)), list(" ".join(hyp_words)))
+    counts = _levenshtein_chunked(ref_words, hyp_words)
+    char_counts = _char_counts(ref_words, hyp_words)
     return {
         "wer": round(counts.error_rate, 6),
         "cer": round(char_counts.error_rate, 6),

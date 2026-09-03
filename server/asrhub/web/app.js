@@ -346,12 +346,12 @@ function handleEvent(message) {
   switch (message.type) {
     case 'job.completed':
       toast(`Задание готово (RTF ${num(message.rtf, 3)})`, 'ok');
-      refreshQueue(); if (state.view !== 'settings') renderView(true);
+      refreshQueue(); refreshLiveViews();
       break;
     case 'job.failed':
       toast('Задание завершилось ошибкой', 'err',
             (message.error && message.error.message) || '');
-      refreshQueue(); renderView(true);
+      refreshQueue(); refreshLiveViews();
       break;
     case 'job.retry':
       toast(`Повтор ${message.attempt} через ${message.delay_s} с`, 'warn', message.error);
@@ -365,6 +365,17 @@ function handleEvent(message) {
     case 'queue.paused': toast('Очередь приостановлена', 'warn'); refreshQueue(); break;
     case 'queue.resumed': toast('Очередь возобновлена', 'ok'); refreshQueue(); break;
   }
+}
+
+function refreshLiveViews() {
+  // Перерисовываем только те разделы, у которых есть мягкое обновление.
+  // Прежний renderView(true) для остальных означал полную перерисовку с
+  // нуля: в «Результатах» стиралась строка поиска и сортировка, в
+  // «Журнале» — уровень и поиск, в «Моделях» — пять фильтров. При очереди
+  // из десятка файлов это происходило каждые несколько секунд, и набрать
+  // запрос было физически невозможно.
+  const renderer = RENDERERS[state.view];
+  if (renderer && typeof renderer.soft === 'function') renderView(true);
 }
 
 function updateProgress(message) {
@@ -703,7 +714,7 @@ function showHotkeys() {
     .join('');
   const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:520px">
     <div class="modal-head"><b>Горячие клавиши</b><span class="spacer"></span>
-      <button class="ghost icon" id="hk-close">✕</button></div>
+      <button class="ghost icon" id="hk-close" aria-label="Закрыть" title="Закрыть">✕</button></div>
     <div class="modal-body"><table class="table"><tbody>${rows}</tbody></table>
       <p class="hint" style="margin-top:12px">Буквенные сокращения не срабатывают,
         пока курсор находится в поле ввода.</p></div>
@@ -1239,7 +1250,8 @@ function renderFileList() {
     <div class="file-item">
       <span class="truncate" style="flex:1">${esc(f.name)}</span>
       <span class="faint small nowrap">${fmtBytes(f.size)}</span>
-      <button class="ghost sm" onclick="__asrhub.removeFile(${i})">✕</button>
+      <button class="ghost sm" aria-label="Убрать файл ${esc(f.name)}"
+            title="Убрать из списка" onclick="__asrhub.removeFile(${i})">✕</button>
     </div>`).join('');
   const btn = qs('#btn-submit');
   if (btn) {
@@ -1256,17 +1268,25 @@ async function submitFiles() {
   btn.textContent = 'Отправка…';
   const priority = parseInt(qs('#job-priority').value, 10) || 50;
   const settings = JSON.stringify(state.jobSettings);
+  // Отправляем ровно тот набор, что был на момент нажатия. Список очищался
+  // целиком, поэтому файлы, перетащенные во время загрузки — а на сотнях
+  // мегабайт это минуты, — пропадали из списка, не попав в очередь, и без
+  // единого сообщения.
+  const batch = state.files.slice();
+  const drop = (accepted) => {
+    state.files = state.files.filter((f) => !accepted.includes(f));
+  };
   try {
-    if (state.files.length === 1) {
+    if (batch.length === 1) {
       const form = new FormData();
-      form.append('file', state.files[0]);
+      form.append('file', batch[0]);
       form.append('settings', settings);
       form.append('priority', String(priority));
       await API.call('/api/jobs', { method: 'POST', body: form });
       toast('Задание поставлено в очередь', 'ok');
     } else {
       const form = new FormData();
-      state.files.forEach((f) => form.append('files', f));
+      batch.forEach((f) => form.append('files', f));
       form.append('settings', settings);
       form.append('priority', String(priority));
       const result = await API.call('/api/jobs/batch', { method: 'POST', body: form });
@@ -1280,14 +1300,14 @@ async function submitFiles() {
         // не трогаем их в списке: их можно поправить и отправить снова.
         showRejected(rejected);
         const names = new Set(rejected.map((e) => e.filename));
-        state.files = state.files.filter((f) => names.has(f.name));
+        drop(batch.filter((f) => !names.has(f.name)));
         renderFileList();
         await refreshQueue();
         renderView(true);
         return;
       }
     }
-    state.files = [];
+    drop(batch);
     renderFileList();
     await refreshQueue();
     renderView(true);
@@ -1698,7 +1718,7 @@ function showJobModal(job) {
       <b>${esc(job.filename)}</b>
       ${statusChip(job.status)}
       <span class="spacer"></span>
-      <button class="ghost icon" id="modal-close">✕</button>
+      <button class="ghost icon" id="modal-close" aria-label="Закрыть" title="Закрыть">✕</button>
     </div>
     <div class="modal-body">
       <div class="grid cols-4" style="margin-bottom:14px">
@@ -2258,7 +2278,7 @@ window.__asrhub.showModel = async (id) => {
       <span class="chip badge-license">${esc(m.license)}</span>
       ${m.commercial_use ? '<span class="chip ok">коммерческое использование разрешено</span>'
         : '<span class="chip err">некоммерческая лицензия</span>'}
-      <span class="spacer"></span><button class="ghost icon" id="mm-close">✕</button></div>
+      <span class="spacer"></span><button class="ghost icon" id="mm-close" aria-label="Закрыть" title="Закрыть">✕</button></div>
     <div class="modal-body">
       <div class="grid cols-4" style="margin-bottom:14px">
         ${kpi('Параметров', m.params_m ? num(m.params_m) + ' млн' : '—')}
@@ -2408,6 +2428,7 @@ RENDERERS.compare = {
       const m = modelById(id);
       return m ? `<span class="chip accent">${esc(m.name)}
         <button class="ghost sm" style="padding:0 4px"
+          aria-label="Убрать модель из сравнения"
           onclick="__asrhub.cmpRemove('${esc(id)}')">✕</button></span>` : '';
     }).join('');
 
@@ -2755,7 +2776,7 @@ RENDERERS.system = {
           <td>${esc(k.name || '')}</td>
           <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span></td>
           <td><button class="ghost sm danger"
-            onclick="__asrhub.revokeKey('${esc(k.key_preview.split('…')[0])}')">отозвать</button>
+            onclick="__asrhub.revokeKey('${esc(k.key_id || '')}')">отозвать</button>
           </td></tr>`).join('')}</tbody></table>`
         : '<div class="empty small">Ключей нет — аутентификация отключена</div>';
     } catch (err) {
@@ -3040,7 +3061,7 @@ function metricCard(m) {
 function targetDialog(existing) {
   const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:560px">
     <div class="modal-head"><b>Новый приёмник метрик</b><span class="spacer"></span>
-      <button class="ghost icon" id="tg-close">✕</button></div>
+      <button class="ghost icon" id="tg-close" aria-label="Закрыть" title="Закрыть">✕</button></div>
     <div class="modal-body">
       <label class="mon-field"><span>Тип</span>
         <select id="tg-kind">${Object.entries(TARGET_KIND_LABEL).map(
@@ -3131,10 +3152,16 @@ RENDERERS.logs = {
     try {
       const level = qs('#log-level') ? qs('#log-level').value : '';
       const search = qs('#log-search') ? qs('#log-search').value : '';
-      const [logs, events] = await Promise.all([
+      // allSettled, а не all: журнал сервера открыт только администратору,
+      // и его 403 отменял загрузку целиком — обычный пользователь видел
+      // пустую панель событий вместо своих, и так каждые пять секунд.
+      const [logsResult, eventsResult] = await Promise.allSettled([
         API.latest('logs', `/api/logs?limit=250&level=${level}&search=${encodeURIComponent(search)}`),
         API.latest('log-events', '/api/events?limit=150'),
       ]);
+      const logsDenied = logsResult.status === 'rejected';
+      const logs = logsDenied ? { items: [], counts: {} } : logsResult.value;
+      const events = eventsResult.status === 'fulfilled' ? eventsResult.value : { items: [] };
       const counts = qs('#log-counts');
       if (counts) {
         counts.innerHTML = Object.entries(logs.counts || {})
@@ -3142,7 +3169,10 @@ RENDERERS.logs = {
             : k === 'WARNING' ? 'warn' : ''}">${k}: ${v}</span>`).join(' ');
       }
       const table = qs('#log-table');
-      if (table) {
+      if (table && logsDenied) {
+        table.innerHTML = '<div class="empty">Журнал сервера доступен только ключу '
+          + 'с ролью администратора.</div>';
+      } else if (table) {
         table.innerHTML = logs.items.length ? `<table>
           <thead><tr><th style="width:70px">Время</th><th style="width:80px">Уровень</th>
             <th>Сообщение</th></tr></thead><tbody>

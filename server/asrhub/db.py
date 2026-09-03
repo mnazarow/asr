@@ -26,6 +26,9 @@ log = get_logger("db")
 
 SCHEMA_VERSION = 4
 
+#: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
+CLEANUP_BATCH = 5000
+
 _SCHEMA = [
     # --- версия 1: основные таблицы ---------------------------------------
     """
@@ -540,7 +543,10 @@ class Database:
         "model_load_s, inference_s, postprocess_s, rtf, words_count, "
         "chars_count, segments_count, speakers_count, avg_confidence, wer, "
         "cer, error_code, error_message, error_hint, retries, cached_from, "
-        "device, file_size"
+        # progress и stage — по несколько байт, но без них облегчённый список
+        # не годится для очереди: на главном экране полоса выполнения и
+        # название стадии берутся именно из него.
+        "device, file_size, progress, stage"
     )
 
     def list_jobs(self, *, status: str | list[str] | None = None, owner: str | None = None,
@@ -548,7 +554,8 @@ class Database:
                   group_id: str | None = None, since: float | None = None,
                   limit: int = 100, offset: int = 0,
                   order: str = "created_at DESC",
-                  light: bool = False) -> list[dict[str, Any]]:
+                  light: bool = False,
+                  ready_before: float | None = None) -> list[dict[str, Any]]:
         where: list[str] = []
         args: list[Any] = []
         if status:
@@ -571,6 +578,13 @@ class Database:
             where.append("(filename LIKE ? OR text LIKE ? OR id LIKE ?)")
             needle = f"%{search}%"
             args.extend([needle, needle, needle])
+        if ready_before is not None:
+            # Отбор «время повтора уже наступило» обязан идти в SQL, а не
+            # после LIMIT. Планировщик выбирает окно из 500 заданий; если в
+            # статусе retry накопилось больше, окно целиком забивалось
+            # неготовыми, и воркеры простаивали, хотя готовые задания были.
+            where.append("(queued_at IS NULL OR queued_at<=?)")
+            args.append(ready_before)
         allowed_order = {
             "created_at DESC", "created_at ASC", "priority DESC", "priority ASC",
             "media_duration_s DESC", "media_duration_s ASC", "rtf ASC", "rtf DESC",
@@ -847,15 +861,30 @@ class Database:
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
+            # Предел на заход обязателен. Без него понижение срока хранения
+            # (скажем, с года до месяца) вытаскивало в память сотни тысяч
+            # строк, и служебный поток на десятки минут занимал единственную
+            # блокировку записи — воркеры вставали на каждом обновлении
+            # прогресса. Остаток уберётся следующим заходом через час.
+            #
+            # Второе условие — про незавершённые. Раньше отбор шёл только по
+            # finished_at, поэтому задания в очереди, на паузе и в ожидании
+            # повтора не устаревали никогда, и их загруженные файлы лежали в
+            # uploads вечно. Им даём срок втрое больше: они могут ждать
+            # долго, но не бесконечно.
             stale = self.query(
                 "SELECT id, result_path, file_path FROM jobs "
-                "WHERE finished_at IS NOT NULL AND finished_at<?", (cutoff,))
+                "WHERE (finished_at IS NOT NULL AND finished_at<?) "
+                "   OR (finished_at IS NULL AND created_at<?) "
+                "ORDER BY COALESCE(finished_at, created_at) LIMIT ?",
+                (cutoff, ts - results_days * 3 * 86400, CLEANUP_BATCH))
             for row in stale:
                 # Сначала файлы, потом запись: если удаление файлов упадёт,
                 # задание останется в базе и попадёт в следующую уборку.
                 removed["bytes"] = removed.get("bytes", 0) + _remove_job_files(dict(row))
                 self.delete_job(row["id"])
             removed["jobs"] = len(stale)
+            removed["more"] = 1 if len(stale) >= CLEANUP_BATCH else 0
         if metrics_days > 0:
             removed["metrics"] = self.execute(
                 "DELETE FROM metrics WHERE ts<?", (ts - metrics_days * 86400,))

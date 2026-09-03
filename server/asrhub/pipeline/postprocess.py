@@ -354,10 +354,21 @@ def _builtin_itn_ru(text: str) -> str:
             out.append(str(value))
         buffer.clear()
 
+    trailing = ".,!?;:…()«»\"'"
     for token in tokens:
-        bare = token.lower().strip(".,!?;:…()«»\"'")
+        bare = token.lower().strip(trailing)
         if bare in _UNITS_RU or bare in _SCALES_RU:
-            buffer.append(token)
+            # Знак препинания разрывает число. Раньше он снимался при
+            # strip и группа продолжалась дальше, поэтому «три, четыре
+            # дня» складывалось в «7 дня», а «один, два, три, поехали!» —
+            # в «6 поехали!». Сам знак при этом терялся: числительное с
+            # точкой в конце оставляло фразу без точки.
+            tail = token[len(token.rstrip(trailing)):]
+            buffer.append(token[:len(token) - len(tail)] if tail else token)
+            if tail:
+                flush()
+                if out:
+                    out[-1] = out[-1] + tail
             continue
         flush()
         out.append(token)
@@ -368,6 +379,16 @@ def _builtin_itn_ru(text: str) -> str:
     return normalize_spaces(result)
 
 
+def _magnitude(value: int) -> int:
+    """Разряд младшей значащей цифры: 123 -> 1, 120 -> 10, 100 -> 100."""
+    if value <= 0:
+        return 1
+    step = 1
+    while value % (step * 10) == 0 and step < 1000:
+        step *= 10
+    return step
+
+
 def _parse_number_ru(words: list[str]) -> int | None:
     total = 0
     current = 0
@@ -375,7 +396,14 @@ def _parse_number_ru(words: list[str]) -> int | None:
     for raw in words:
         word = raw.lower().strip(".,!?;:…()«»\"'")
         if word in _UNITS_RU:
-            current += _UNITS_RU[word]
+            value = _UNITS_RU[word]
+            # Разряды числительного идут по убыванию: «сто двадцать три».
+            # Одинаковый или растущий разряд — это не одно число, а
+            # перечисление: «три три три» складывалось в «9», а «код пять
+            # пять» — в «10». Такую группу оставляем словами.
+            if current and value >= _magnitude(current):
+                return None
+            current += value
             seen = True
         elif word in _SCALES_RU:
             scale = _SCALES_RU[word]
@@ -421,7 +449,15 @@ def apply_glossary(text: str, glossary: dict[str, str]) -> tuple[str, int]:
             except re.error as exc:
                 log.warning("Некорректное регулярное выражение «%s»: %s", source, exc)
                 continue
-            text, n = pattern.subn(target, text)
+            try:
+                # subn тоже разбирает строку замены как шаблон, и ошибка в
+                # ней — например ссылка \1 на несуществующую группу — летела
+                # мимо перехвата выше. Одна опечатка в словаре пользователя
+                # обрушивала весь шаг постобработки и теряла расшифровку.
+                text, n = pattern.subn(target, text)
+            except re.error as exc:
+                log.warning("Некорректная замена для «%s»: %s", source, exc)
+                continue
             count += n
             continue
         pattern = re.compile(rf"(?<![\w-]){re.escape(source)}(?![\w-])",
@@ -453,8 +489,16 @@ _PROFANITY_ROOTS = ["хуй", "хуе", "хуё", "пизд", "ебат", "еб�
 def filter_profanity(text: str, mode: str = "off") -> tuple[str, int]:
     if mode == "off" or not text:
         return text, 0
+    # Корень ищется с начала слова, а не в любом его месте. Прежний
+    # ведущий \w* ловил корень внутри нейтральных слов: «хлебать» и
+    # «нахлебался» приходили пользователю как «х******» — фильтр портил
+    # обычный текст. Приставки при этом остаются нужны, поэтому для них
+    # заведён короткий явный список.
+    prefixes = "|".join(("", "на", "за", "по", "от", "до", "пере", "под", "вы",
+                         "при", "про", "раз", "рас", "с", "у", "о", "об"))
     pattern = re.compile(
-        r"\b\w*(?:" + "|".join(_PROFANITY_ROOTS) + r")\w*\b", re.IGNORECASE | re.UNICODE)
+        r"\b(?:" + prefixes + r")(?:" + "|".join(_PROFANITY_ROOTS) + r")\w*\b",
+        re.IGNORECASE | re.UNICODE)
     hits = 0
 
     def _replace(match: re.Match[str]) -> str:
@@ -501,7 +545,15 @@ def merge_segments(segments: list[dict[str, Any]], min_duration: float = 1.5,
 
 
 def build_paragraphs(segments: list[dict[str, Any]], mode: str = "speaker",
-                     pause_s: float = 2.0, sentences: int = 4) -> list[str]:
+                     pause_s: float = 2.0, sentences: int = 4,
+                     speaker_labels: bool = True) -> list[str]:
+    """Собирает абзацы из сегментов.
+
+    speaker_labels=False убирает префикс «Говорящий N: ». Он нужен в тексте
+    для чтения, но мешает в двух местах: настройка include_speaker_labels
+    на txt раньше не действовала вовсе, а в расчёте точности каждый префикс
+    добавлял к эталону две лишние вставки и завышал WER.
+    """
     if not segments:
         return []
     if mode == "none":
@@ -526,7 +578,7 @@ def build_paragraphs(segments: list[dict[str, Any]], mode: str = "speaker",
             paragraphs.append(normalize_spaces(" ".join(current)))
             current = []
             sentence_count = 0
-        if mode == "speaker" and speaker and (not current):
+        if mode == "speaker" and speaker and speaker_labels and (not current):
             current.append(f"{speaker}: {text}")
         else:
             current.append(text)

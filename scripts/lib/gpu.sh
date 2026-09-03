@@ -179,8 +179,13 @@ gpu_driver_state() {
     nvidia)
       if have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then printf 'ready'; return 0; fi
       if [[ -e /proc/driver/nvidia/version ]]; then printf 'loaded-nofunc'; return 0; fi
-      if have nvidia-smi || [[ -d /usr/lib/modules/$(uname -r)/updates/dkms ]] \
-         && ls /usr/lib/modules/"$(uname -r)"/updates/dkms/nvidia*.ko* >/dev/null 2>&1
+      # Скобки обязательны: «A || B && C» разбирается как «(A || B) && C»,
+      # и при наличии nvidia-smi без модуля в updates/dkms ветка не
+      # срабатывала — состояние «драйвер стоит, нужна перезагрузка»
+      # читалось как «драйвера нет», и скрипт шёл ставить его заново.
+      local dkms="/usr/lib/modules/$(uname -r)/updates/dkms"
+      if have nvidia-smi \
+         || { [[ -d "${dkms}" ]] && ls "${dkms}"/nvidia*.ko* >/dev/null 2>&1; }
       then printf 'installed-noload'; return 0; fi
       printf 'absent' ;;
     amd)

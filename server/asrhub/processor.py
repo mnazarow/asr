@@ -169,7 +169,8 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
 
     check_cancel()
     report(0.04, "подготовка аудио")
-    channels = audio_mod.prepare(source, workdir, settings)
+    prepared_audio = audio_mod.prepare(source, workdir, settings)
+    channels = prepared_audio.channels
     levels = audio_mod.analyze_levels(source)
     if levels:
         outcome.stats["levels"] = levels
@@ -186,6 +187,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     all_segments: list[Segment] = []
     engine_meta: dict[str, Any] = {}
     languages: list[str] = []
+    silent_channels: list[str] = []
 
     for channel_index, (label, prepared) in enumerate(channels):
         check_cancel()
@@ -198,12 +200,15 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             spans = vad.detect(prepared, settings)
             speech_stats = vad.speech_statistics(spans, info.duration_s)
             timer.stop()
-            if not spans and info.duration_s > 1.0:
-                raise NoSpeechDetected(
-                    f"В файле «{source.name}» не обнаружено речи "
-                    f"(длительность {info.duration_s:.1f} с).")
             outcome.stats.setdefault("speech", {})[label or "моно"] = speech_stats
             outcome.stats["speech_ratio"] = speech_stats.get("speech_ratio")
+            if not spans and info.duration_s > 1.0:
+                # Раньше здесь стоял raise, и на стереозаписи молчащий канал
+                # уносил с собой уже распознанный первый: в записи звонка,
+                # где клиент не сказал ни слова, задание падало целиком.
+                # Тишина в одном канале — это не отказ, а факт о записи.
+                silent_channels.append(label or "моно")
+                continue
 
         # ---- 3. Распознавание -------------------------------------------
         check_cancel()
@@ -237,6 +242,31 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             if label:
                 segment.speaker = segment.speaker or label
             all_segments.append(segment)
+
+    # Речи нет ни в одном канале — вот это уже отказ. Если молчал только
+    # один, отмечаем это предупреждением и работаем с остальными.
+    if silent_channels and not all_segments:
+        raise NoSpeechDetected(
+            f"В файле «{source.name}» не обнаружено речи "
+            f"(длительность {info.duration_s:.1f} с).")
+    if silent_channels:
+        outcome.warnings.append(
+            "Речь не обнаружена в каналах: " + ", ".join(silent_channels))
+
+    # Подготовка сместила систему координат: обрезка начальной тишины
+    # сдвинула всё на offset_s, изменение темпа сжало в speed раз. Движок
+    # работал уже в новых координатах, и без возврата назад субтитры
+    # разъезжаются с исходной записью ровно на длину обрезанной тишины.
+    if prepared_audio.shifted:
+        for segment in all_segments:
+            segment.start = round(prepared_audio.to_source_time(segment.start), 3)
+            segment.end = round(prepared_audio.to_source_time(segment.end), 3)
+            for word in segment.words or []:
+                for key in ("start", "end"):
+                    if isinstance(word.get(key), (int, float)):
+                        word[key] = round(prepared_audio.to_source_time(float(word[key])), 3)
+        log.debug("Таймкоды возвращены в координаты исходной записи: "
+                  "сдвиг %.3f с, темп %.3f", prepared_audio.offset_s, prepared_audio.speed)
 
     all_segments.sort(key=lambda s: s.start)
 
@@ -278,24 +308,6 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             outcome.warnings.append(f"Диаризация не выполнена: {exc}")
         timer.stop()
 
-    # ---- 5а. Огибающая громкости -------------------------------------------
-    # Считается после диаризации: на монозаписи кривая строится на каждого
-    # говорящего, а до этого шага говорящие ещё не расставлены.
-    if settings.get("waveform_enabled", True):
-        check_cancel()
-        timer.start("waveform")
-        report(0.86, "полоса громкости")
-        try:
-            from .pipeline.waveform import build as build_waveform
-
-            outcome.waveform = build_waveform(channels, all_segments, settings)
-        except Exception as exc:                            # noqa: BLE001
-            # Полоса громкости — вспомогательные данные: её отсутствие не
-            # повод терять уже посчитанную расшифровку.
-            log.warning("Огибающая не построена: %s", exc)
-            outcome.warnings.append(f"Полоса громкости не построена: {exc}")
-        timer.stop()
-
     # ---- 6. Постобработка -------------------------------------------------
     check_cancel()
     timer.start("postprocess")
@@ -303,8 +315,17 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     raw_segments = [s.to_dict() for s in all_segments]
     model_punct = bool(engine_meta.get("punctuation_from_model")) or (
         spec is not None and spec.punctuation)
-    processed, pp_stats = postprocess.process(raw_segments, settings,
-                                              model_has_punctuation=model_punct)
+    try:
+        processed, pp_stats = postprocess.process(raw_segments, settings,
+                                                  model_has_punctuation=model_punct)
+    except Exception as exc:                                # noqa: BLE001
+        # Единственный шаг после распознавания, который не имел защиты, — а
+        # ронять его умеет и опечатка в пользовательском словаре замен.
+        # Расшифровка к этому моменту уже получена, и терять её из-за
+        # пунктуации или замен нельзя: отдаём сырые сегменты.
+        log.warning("Постобработка не выполнена: %s", exc)
+        outcome.warnings.append(f"Постобработка не выполнена: {exc}")
+        processed, pp_stats = raw_segments, {}
     timer.stop()
 
     outcome.segments = processed
@@ -324,9 +345,40 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     outcome.stats["chars"] = sum(len(s.get("text", "")) for s in processed)
     outcome.stats["speaking_rate_wpm"] = metrics.speaking_rate(words_total, info.duration_s)
 
+    # ---- 6а. Огибающая громкости -------------------------------------------
+    # После постобработки, а не до неё: на монозаписи кривые подписываются
+    # именами говорящих, а переименование по speaker_names происходит именно
+    # в постобработке. Раньше полоса шла раньше и оставалась с подписями
+    # «Говорящий 1», тогда как в расшифровке стояло «Оператор» — сопоставить
+    # одно с другим было нельзя.
+    if settings.get("waveform_enabled", True):
+        check_cancel()
+        timer.start("waveform")
+        report(0.86, "полоса громкости")
+        try:
+            from .pipeline.waveform import build as build_waveform
+
+            outcome.waveform = build_waveform(channels, outcome.segments, settings)
+        except Exception as exc:                            # noqa: BLE001
+            # Полоса громкости — вспомогательные данные: её отсутствие не
+            # повод терять уже посчитанную расшифровку.
+            log.warning("Огибающая не построена: %s", exc)
+            outcome.warnings.append(f"Полоса громкости не построена: {exc}")
+        timer.stop()
+
     reference = str(settings.get("reference_text") or "").strip()
     if reference:
-        detail = metrics.detailed(reference, outcome.text)
+        # Точность считаем по тексту без меток говорящих: в эталоне их нет,
+        # и каждая реплика добавляла две лишние вставки, завышая WER.
+        plain = "\n\n".join(postprocess.build_paragraphs(
+            processed, str(settings.get("paragraph_mode") or "speaker"),
+            speaker_labels=False))
+        try:
+            detail = metrics.detailed(reference, plain)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Точность не рассчитана: %s", exc)
+            outcome.warnings.append(f"Точность не рассчитана: {exc}")
+            detail = {}
         outcome.stats["accuracy"] = detail
 
     # ---- 7. Выгрузка ------------------------------------------------------

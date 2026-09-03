@@ -114,7 +114,16 @@ catch { Write-Info 'Служба не запущена.' }
 
 if (-not $EnginesOnly) {
     Write-Step 'Обновление файлов'
-    if (-not (Get-DryRun)) {
+    # Источник по умолчанию — каталог рядом со скриптом, а скрипт скрипт
+    # запускают из самой установки: именно эту команду печатает установщик.
+    # Без проверки цикл удалял каталог и копировал его сам в себя, оставляя
+    # установку без server.
+    $srcReal = [System.IO.Path]::GetFullPath($Source)
+    $dstReal = [System.IO.Path]::GetFullPath($Prefix)
+    if ($srcReal -eq $dstReal) {
+        Write-Info 'Источник совпадает с установкой — файлы уже на месте.'
+        Write-Hint 'Чтобы обновиться из другого места: update.ps1 -Source C:\путь\к\новой\версии'
+    } elseif (-not (Get-DryRun)) {
         foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'VERSION', 'README.md')) {
             $sourcePath = Join-Path $Source $item
             if (Test-Path $sourcePath) {

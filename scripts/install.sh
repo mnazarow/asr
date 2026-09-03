@@ -585,7 +585,15 @@ ok "Каталоги готовы"
 
 step "Копирование файлов приложения"
 
-if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+# Запуск из уже установленной копии — обычное дело: установщик сам печатает
+# путь вида /opt/asrhub/scripts/. Без этой проверки цикл удалял каталог и
+# тут же пытался скопировать его сам в себя: установка оставалась без
+# server, а шапка файла обещала «повторный запуск не ломает установку».
+SRC_REAL="$(cd "${REPO_DIR}" 2>/dev/null && pwd -P || echo "${REPO_DIR}")"
+DST_REAL="$(cd "${PREFIX}" 2>/dev/null && pwd -P || echo "${PREFIX}")"
+if [[ "${SRC_REAL}" == "${DST_REAL}" ]]; then
+  info "Источник совпадает с установкой — файлы уже на месте, копирование пропущено."
+elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
   for item in server scripts config requirements docker VERSION README.md; do
     [[ -e "${REPO_DIR}/${item}" ]] || continue
     rm -rf "${PREFIX:?}/${item}"
@@ -629,8 +637,10 @@ ENVEOF
 
   # Владелец каталога данных: контейнер приведёт права к нему при запуске.
   {
-    echo "ASRHUB_UID=$(id -u)"
-    echo "ASRHUB_GID=$(id -g)"
+    # Под sudo id -u даёт ноль, и контейнер запускался от root, минуя
+    # понижение прав через gosu. Берём того, кто вызвал sudo.
+    echo "ASRHUB_UID=${SUDO_UID:-$(id -u)}"
+    echo "ASRHUB_GID=${SUDO_GID:-$(id -g)}"
   } >> "${ENV_FILE}"
 
   info "Сборка образа (первый раз занимает 10–25 минут)…"
@@ -872,6 +882,34 @@ fi
 
 if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
   step "Настройка автозапуска"
+
+  # Служба по умолчанию работала от root: пользователь не задавался, а
+  # service.sh подставлял root для системного юнита. Сервер принимает
+  # загрузку файлов из сети, распаковывает архивы моделей и исполняет код
+  # движков — делать это от root незачем. Заводим отдельную учётную запись
+  # без домашнего каталога и оболочки входа.
+  if [[ -z "${SERVICE_USER}" && "${OS}" == "linux" ]] && is_root; then
+    if id -u asrhub >/dev/null 2>&1; then
+      SERVICE_USER="asrhub"
+      info "Служба будет работать от существующего пользователя asrhub."
+    elif have useradd; then
+      if run useradd --system --no-create-home --shell /usr/sbin/nologin asrhub 2>/dev/null \
+         || run useradd --system --no-create-home --shell /sbin/nologin asrhub 2>/dev/null; then
+        SERVICE_USER="asrhub"
+        add_rollback "userdel asrhub 2>/dev/null || true"
+        ok "Создан системный пользователь asrhub для службы."
+      else
+        warn "Не удалось создать пользователя asrhub — служба будет работать от root."
+      fi
+    else
+      warn "Команда useradd недоступна — служба будет работать от root."
+    fi
+    if [[ -n "${SERVICE_USER}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+      run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
+        warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
+    fi
+  fi
+
   bash "${SCRIPT_DIR}/service.sh" install \
     --prefix "${PREFIX}" --data "${DATA_DIR}" \
     --port "${PORT}" --host "${HOST}" \

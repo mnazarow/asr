@@ -73,6 +73,20 @@ def _envelope(samples: Any, sample_rate: int, interval_s: float) -> list[dict[st
     return points
 
 
+def _field(segment: Any, name: str, default: Any = None) -> Any:
+    """Поле сегмента независимо от того, объект это или словарь.
+
+    До постобработки сегменты — объекты Segment, после неё — словари.
+    Полоса строится после постобработки (чтобы подписи совпадали с именами
+    говорящих в расшифровке), но вызывать её с объектами тоже должно быть
+    можно: обращение через getattr к словарю молча давало None, и кривые
+    по говорящим переставали строиться вовсе.
+    """
+    if isinstance(segment, dict):
+        return segment.get(name, default)
+    return getattr(segment, name, default)
+
+
 def _by_speakers(samples: Any, sample_rate: int, interval_s: float,
                  segments: list[Any]) -> dict[str, list[dict[str, float]]]:
     """Отдельная кривая на каждого говорящего.
@@ -83,7 +97,7 @@ def _by_speakers(samples: Any, sample_rate: int, interval_s: float,
     """
     speakers: list[str] = []
     for segment in segments:
-        name = getattr(segment, "speaker", None)
+        name = _field(segment, "speaker")
         if name and name not in speakers:
             speakers.append(name)
     if len(speakers) < 2:
@@ -102,10 +116,10 @@ def _by_speakers(samples: Any, sample_rate: int, interval_s: float,
     for speaker in speakers:
         masked = np.zeros_like(data)
         for segment in segments:
-            if getattr(segment, "speaker", None) != speaker:
+            if _field(segment, "speaker") != speaker:
                 continue
-            start = max(0, int(float(segment.start) * sample_rate))
-            end = min(len(data), int(float(segment.end) * sample_rate))
+            start = max(0, int(float(_field(segment, "start", 0.0)) * sample_rate))
+            end = min(len(data), int(float(_field(segment, "end", 0.0)) * sample_rate))
             if end > start:
                 masked[start:end] = data[start:end]
         curves[speaker] = _envelope(masked, sample_rate, interval_s)

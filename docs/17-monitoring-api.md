@@ -122,7 +122,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 21.9
+asrhub_uptime_seconds 65.4
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -156,8 +156,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788391116.7527401,
-  "collected_at": "2026-09-02T23:18:36+0000",
+  "timestamp": 1788396720.1844041,
+  "collected_at": "2026-09-03T00:52:00+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -234,14 +234,14 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 21.9,
+  "uptime_s": 65.5,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 22 с",
+        "detail": "работает 66 с",
         "hint": ""
       },
       {
@@ -270,7 +270,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 29.2 ГБ",
+        "detail": "свободно 29.1 ГБ",
         "hint": ""
       },
       {
@@ -337,7 +337,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 29.2 ГБ",
+      "detail": "свободно 29.1 ГБ",
       "hint": ""
     },
     {
@@ -737,8 +737,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 1,
-  "samples": 147,
+  "scrapes": 2,
+  "samples": 453,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {

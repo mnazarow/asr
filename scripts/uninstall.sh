@@ -182,7 +182,10 @@ fi
 if [[ -n "${PREFIX}" && -d "${PREFIX}" ]]; then
   if [[ "${PURGE}" -eq 0 && "${DATA_DIR}" == "${PREFIX}"/* ]]; then
     info "Каталог данных находится внутри каталога программы — удаляем выборочно."
-    for sub in server scripts config requirements docker venv VERSION README.md; do
+    # whisper.cpp собирается внутри каталога программы и вместе с каталогом
+    # build занимает несколько гигабайт. В списке его не было, и после
+    # «полного удаления» он оставался на диске.
+    for sub in server scripts config requirements docker venv whisper.cpp VERSION README.md; do
       if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
         printf '  [пробный запуск] rm -rf %s\n' "${PREFIX}/${sub}"
       else
@@ -218,8 +221,11 @@ fi
 
 step "Проверка остатков"
 LEFTOVERS=()
+# Снимок перед обновлением кладётся рядом с каталогом программы и весит
+# столько же, сколько сама установка: без него список остатков врал.
 for path in /etc/asrhub /usr/local/bin/asrctl "${HOME}/.config/asrhub" \
-            /etc/systemd/system/asrhub.service "${HOME}/Library/LaunchAgents/com.asrhub.server.plist"; do
+            /etc/systemd/system/asrhub.service "${HOME}/Library/LaunchAgents/com.asrhub.server.plist" \
+            "${PREFIX}/whisper.cpp" "$(dirname "${PREFIX}")/asrhub-snapshot"; do
   [[ -e "${path}" ]] && LEFTOVERS+=("${path}")
 done
 if [[ ${#LEFTOVERS[@]} -gt 0 ]]; then

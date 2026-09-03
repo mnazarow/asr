@@ -18,7 +18,7 @@ from ..analytics import Analytics
 from ..config import Settings, load
 from ..db import Database
 from ..engines import EngineRegistry
-from ..errors import ASRHubError
+from ..errors import ASRHubError, FileTooLarge
 from ..job_queue import JobQueue
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
@@ -127,24 +127,42 @@ def _route_fallback(path: str) -> str:
 
 
 class EventHub:
-    """Рассылка событий подписчикам WebSocket."""
+    """Рассылка событий подписчикам WebSocket.
+
+    Событие о задании адресное. Раньше рассылка шла всем подряд, и любой
+    ключ — включая readonly — читал в ленте имена чужих файлов и тексты
+    чужих ошибок, а при подключении получал ещё и двадцать последних
+    событий с историей. Теперь у каждого подписчика запомнены владелец и
+    роль, и сообщение доходит только владельцу задания и администратору.
+    """
 
     def __init__(self) -> None:
-        self._clients: set[WebSocket] = set()
+        #: WebSocket -> (владелец, администратор ли)
+        self._clients: dict[WebSocket, tuple[str, bool]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._history: list[dict[str, Any]] = []
 
     def bind(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    async def register(self, websocket: WebSocket) -> None:
+    async def register(self, websocket: WebSocket, owner: str = "",
+                       is_admin: bool = False) -> None:
         await websocket.accept()
-        self._clients.add(websocket)
+        self._clients[websocket] = (owner, is_admin)
         RUNTIME.websocket_clients = len(self._clients)
 
     def unregister(self, websocket: WebSocket) -> None:
-        self._clients.discard(websocket)
+        self._clients.pop(websocket, None)
         RUNTIME.websocket_clients = len(self._clients)
+
+    @staticmethod
+    def _visible(message: dict[str, Any], owner: str, is_admin: bool) -> bool:
+        if is_admin:
+            return True
+        source = message.get("_owner")
+        if source is None:          # событие не про задание — общее для всех
+            return True
+        return str(source) == owner
 
     def publish(self, kind: str, data: dict[str, Any]) -> None:
         """Вызывается из рабочих потоков — переносим в цикл событий."""
@@ -161,19 +179,29 @@ class EventHub:
             pass
 
     async def _broadcast(self, message: dict[str, Any]) -> None:
-        payload = json.dumps(message, ensure_ascii=False, default=str)
+        # Служебное поле с владельцем наружу не уходит: по нему решают,
+        # кому отправлять, а клиенту оно ничего не даёт.
+        public = {k: v for k, v in message.items() if k != "_owner"}
+        payload = json.dumps(public, ensure_ascii=False, default=str)
         dead: list[WebSocket] = []
-        for client in list(self._clients):
+        for client, (owner, is_admin) in list(self._clients.items()):
+            if not self._visible(message, owner, is_admin):
+                continue
             try:
                 await client.send_text(payload)
             except Exception:
                 dead.append(client)
         for client in dead:
-            self._clients.discard(client)
+            self._clients.pop(client, None)
+
+    def history_for(self, owner: str, is_admin: bool) -> list[dict[str, Any]]:
+        """История в том же объёме, в каком подписчик получал бы её вживую."""
+        return [{k: v for k, v in m.items() if k != "_owner"}
+                for m in self._history if self._visible(m, owner, is_admin)]
 
     @property
     def history(self) -> list[dict[str, Any]]:
-        return list(self._history)
+        return [{k: v for k, v in m.items() if k != "_owner"} for m in self._history]
 
     @property
     def count(self) -> int:
@@ -234,6 +262,37 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    @app.middleware("http")
+    async def limit_body_size(request: Request, call_next):
+        """Отсекает слишком большое тело до того, как его начнут принимать.
+
+        Предел `max_upload_mb` проверялся в обработчике, а FastAPI к тому
+        моменту уже разобрал multipart целиком: файловая часть оседала во
+        временном файле без всякого верхнего предела. Запрос на десятки
+        гигабайт забивал /tmp и только потом получал 413. Здесь мы смотрим
+        на Content-Length до маршрутизации — это не полная защита (заголовок
+        можно не прислать), но она закрывает и обычного клиента, и простой
+        способ забить диск.
+        """
+        if request.method in ("POST", "PUT", "PATCH"):
+            declared = request.headers.get("content-length")
+            if declared and declared.isdigit():
+                limit_mb = float(settings.get("max_upload_mb") or 2048)
+                # Пакетная загрузка везёт несколько файлов одним запросом.
+                multiplier = 1
+                if request.url.path.rstrip("/").endswith("/batch"):
+                    multiplier = max(1, int(settings.get("max_batch_files") or 20))
+                # Небольшой запас на границы multipart и остальные поля формы.
+                limit = int(limit_mb * 1024 * 1024) * multiplier + (1 << 20)
+                if int(declared) > limit:
+                    error = FileTooLarge(int(declared) / 1024 / 1024,
+                                         int(limit_mb * multiplier))
+                    RUNTIME.note_error(error.code, error.retryable)
+                    # Тело ответа той же формы, что у остальных ошибок API,
+                    # иначе клиент не найдёт привычный code и hint.
+                    return JSONResponse(status_code=413, content=error.to_dict())
+        return await call_next(request)
 
     @app.middleware("http")
     async def add_timing(request: Request, call_next):
@@ -317,13 +376,20 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             if not info or info.get("enabled") is False:
                 await websocket.close(code=4401, reason="Ключ доступа отсутствует или недействителен")
                 return
+            # Имя выводим ровно так же, как authenticate строит Principal.name,
+            # иначе владелец события и владелец задания не совпадут.
+            ws_owner = str(info.get("name") or "ключ")
+            ws_admin = str(info.get("role") or "user") == "admin"
+        else:
+            # Проверка ключей выключена — разделять некого, все равны.
+            ws_owner, ws_admin = "", True
 
-        await hub.register(websocket)
+        await hub.register(websocket, owner=ws_owner, is_admin=ws_admin)
         try:
             await websocket.send_text(json.dumps({
                 "type": "hello",
                 "queue": queue.status(),
-                "history": hub.history[-20:],
+                "history": hub.history_for(ws_owner, ws_admin)[-20:],
             }, ensure_ascii=False, default=str))
             while True:
                 message = await websocket.receive_text()

@@ -243,9 +243,14 @@ have curl && check "curl" ok "есть" || check "curl" warn "не найден"
 heading "Движки распознавания"
 
 if [[ -x "${PREFIX}/venv/bin/python" ]]; then
-  "${PREFIX}/venv/bin/python" - <<'PYEOF' 2>/dev/null || check "Проверка движков" fail "не удалось выполнить"
+  # Путь к пакету относительный, а doctor.sh запускают откуда угодно —
+  # установщик прямо предлагает «bash /opt/asrhub/scripts/doctor.sh». Без
+  # перехода в каталог сервера импорт падал, и весь раздел движков
+  # объявлялся сломанным на исправной установке.
+  ( cd "${PREFIX}/server" 2>/dev/null || cd "${SCRIPT_DIR}/../server" 2>/dev/null || exit 1
+    "${PREFIX}/venv/bin/python" - <<'PYEOF'
 import sys
-sys.path.insert(0, "server")
+sys.path.insert(0, ".")
 try:
     from asrhub.engines import engine_status
 except Exception as exc:
@@ -261,6 +266,8 @@ for item in engine_status():
     if not item["available"] and item.get("requirements_file"):
         print(f"      {grey}Установить: bash scripts/models.sh install-engine {name}{reset}")
 PYEOF
+  ) || check "Проверка движков" fail "не удалось выполнить" \
+        "Проверьте, что каталог ${PREFIX}/server на месте и venv собран."
 else
   check "Движки" fail "нет виртуального окружения" "Сначала установите сервер."
 fi

@@ -376,17 +376,36 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
             f"Задание в состоянии «{job['status']}» — результата пока нет.",
             hint="Дождитесь завершения обработки."))
 
-    result_dir = Path(job.get("result_path") or "")
+    # Path("") — это Path("."), то есть рабочий каталог сервера. Пустой
+    # result_path (так бывает, когда каталог-источник исчез между проверкой
+    # кеша и копированием) превращал поиск файла результата в обход текущего
+    # каталога процесса: первый попавшийся файл с нужным расширением уходил
+    # клиенту. Поэтому пустое значение — это «каталога нет», а не «корень».
+    raw_path = str(job.get("result_path") or "").strip()
+    result_dir = Path(raw_path) if raw_path else None
+
     if fmt not in export_mod.FORMATS:
         raise error_response(ConfigError(
             f"Неизвестный формат «{fmt}».",
             hint="Доступные форматы: " + ", ".join(export_mod.FORMATS)))
 
-    if result_dir.exists():
-        for candidate in result_dir.glob(f"*.{fmt}"):
-            media, _ = mimetypes.guess_type(candidate.name)
-            return FileResponse(str(candidate), filename=candidate.name,
-                                media_type=media or "application/octet-stream")
+    if result_dir is not None and result_dir.is_dir():
+        try:
+            base = result_dir.resolve(strict=True)
+        except OSError:
+            base = None
+        if base is not None:
+            for candidate in sorted(base.glob(f"*.{fmt}")):
+                # Симлинк внутри каталога результатов не должен уводить наружу.
+                try:
+                    real = candidate.resolve(strict=True)
+                except OSError:
+                    continue
+                if not real.is_file() or base not in real.parents:
+                    continue
+                media, _ = mimetypes.guess_type(real.name)
+                return FileResponse(str(real), filename=real.name,
+                                    media_type=media or "application/octet-stream")
 
     # Формат не сохранялся при обработке — строим на лету из сегментов.
     segments = state.db.get_segments(job_id)

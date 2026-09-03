@@ -64,17 +64,17 @@ function Install-AsService {
         return
     }
 
-    Write-Info 'NSSM не найден — создаётся служба через sc.exe'
-    Write-Hint 'Для более надёжного управления установите NSSM: winget install NSSM.NSSM'
-    $binPath = "`"$python`" -m asrhub --host $BindHost --port $Port"
-    & sc.exe create $serviceName binPath= $binPath start= auto `
-        DisplayName= "ASR Hub — сервер распознавания речи" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Не удалось создать службу (код $LASTEXITCODE)" }
-    & sc.exe description $serviceName "Распознавание речи на свободных моделях" | Out-Null
-    & sc.exe failure $serviceName reset= 86400 actions= restart/10000/restart/30000/restart/60000 | Out-Null
+    # Через sc.exe обычную консольную программу службой не сделать: она не
+    # вызывает StartServiceCtrlDispatcher, и диспетчер через полминуты
+    # возвращает ошибку 1053. Раньше служба при этом оставалась
+    # зарегистрированной с автозапуском и тремя попытками перезапуска —
+    # Windows безуспешно поднимала её при каждой загрузке. Поэтому без NSSM
+    # идём в задачу планировщика: она работает и ничего за собой не тянет.
+    Write-Info 'NSSM не найден — служба Windows создана не будет.'
+    Write-Hint 'Для настоящей службы установите NSSM: winget install NSSM.NSSM'
+    Write-Hint 'Пока используем задачу планировщика — она запускает сервер при входе.'
     [Environment]::SetEnvironmentVariable('ASRHUB_DATA_DIR', $DataDir, 'Machine')
-    Start-Service -Name $serviceName
-    Write-Ok "Служба «$serviceName» создана"
+    Install-AsTask
 }
 
 function Install-AsTask {

@@ -598,7 +598,12 @@
     box.className = 'chart-legend';
     items.forEach((item) => {
       const span = document.createElement('span');
-      span.innerHTML = `<i style="background:${item.color}"></i>${item.name}`;
+      // Имя вставляем текстом: в легенду попадают имена говорящих, а их
+      // задаёт пользователь настройкой speaker_names.
+      const swatch = document.createElement('i');
+      swatch.style.background = item.color;
+      span.appendChild(swatch);
+      span.appendChild(document.createTextNode(item.name));
       box.appendChild(span);
     });
     host.appendChild(box);

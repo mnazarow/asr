@@ -28,9 +28,10 @@ def test_prepare_converts(sample_wav: Path, tmp_path: Path):
         "audio_sample_rate": 16000, "audio_channels": "mono",
         "audio_normalize": False, "audio_trim_silence": False,
     })
-    assert len(outputs) == 1
-    label, path = outputs[0]
+    assert len(outputs.channels) == 1
+    label, path = outputs.channels[0]
     assert path.exists() and path.stat().st_size > 1000
+    assert not outputs.shifted, "без обрезки и смены темпа сдвига быть не должно"
 
 
 def test_file_hash_stable(sample_wav: Path):
@@ -210,8 +211,23 @@ def test_json_export_is_valid(result_payload):
 
 
 def test_subtitle_wrapping():
+    """Разбивка на строки не теряет текст.
+
+    Раньше лишние строки просто отрезались вместе со словами: из реплики в
+    пятнадцать слов до субтитра доходило четырнадцать. Теперь при нехватке
+    места строка становится длиннее заданной ширины — это заметно, но
+    поправимо, в отличие от бесследно пропавшего текста.
+    """
     text = export.wrap_subtitle("а" * 100, 42, 2)
-    assert all(len(line) <= 55 for line in text.split("\n"))
+    lines = text.split("\n")
+    assert len(lines) <= 2
+    assert sum(len(line) for line in lines) >= 100, "часть текста потерялась"
+
+    phrase = ("Мы обсудили условия поставки и договорились перенести отгрузку "
+              "на следующий понедельник, потому что склад закрыт")
+    wrapped = export.wrap_subtitle(phrase, 42, 2)
+    assert wrapped.replace("\n", " ").split() == phrase.split()
+    assert len(wrapped.split("\n")) == 2
 
 
 # ---------------------------------------------------------------------------

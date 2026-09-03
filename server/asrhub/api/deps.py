@@ -174,7 +174,11 @@ def require_owner(principal: Principal, job: dict[str, Any]) -> None:
     if principal.is_admin:
         return
     owner = str(job.get("owner") or "")
-    if owner and owner != principal.name:
+    # Пустой владелец раньше означал «проверять нечего», и любое такое
+    # задание — созданное клиентом командной строки, ключом без имени или
+    # ещё до появления поля — читал и удалял кто угодно. Задание без
+    # владельца считаем чужим для всех, кроме администратора.
+    if owner != principal.name:
         raise ForbiddenError(
             f"Задание принадлежит другому ключу («{owner}»).",
             hint="Распоряжаться чужими заданиями может только ключ с ролью admin.")

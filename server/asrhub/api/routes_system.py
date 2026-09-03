@@ -58,18 +58,26 @@ def auth_ticket(request: Request,
 def system(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     hardware = detect(str(state.settings.paths.data))
-    return {
+    data: dict[str, Any] = {
         "version": "3.0.0",
         "uptime_s": round(time.time() - state.started_at, 1),
         "hardware": hardware.to_dict(),
         "recommended": recommended_settings(hardware),
-        "database": state.db.stats(),
-        "paths": {k: str(v) for k, v in vars(state.settings.paths).items()},
-        "config_file": str(state.settings.config_file) if state.settings.config_file else None,
         "log_counts": log_counts(),
         "catalog": catalog.catalog_summary(),
         "params_stats": catalog.params_stats(),
     }
+    # Раскладка файловой системы и путь к базе — это разведка перед атакой,
+    # а не сведения, нужные обычному пользователю для работы. Интерфейс
+    # показывает их в разделе «Сервер», который и так открыт только админу.
+    if principal.is_admin:
+        data.update({
+            "database": state.db.stats(),
+            "paths": {k: str(v) for k, v in vars(state.settings.paths).items()},
+            "config_file": (str(state.settings.config_file)
+                            if state.settings.config_file else None),
+        })
+    return data
 
 
 @router.get("/queue", summary="Состояние очереди")
@@ -77,8 +85,15 @@ def queue_status(request: Request,
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     status = state.queue.status()
+    # Тот же принцип, что и в списке заданий: всё, кроме администратора,
+    # видит только своё. Прошлый заход закрыл GET /api/jobs, а этот маршрут
+    # остался открытым — и отдавал имена чужих файлов, пути на диске, готовые
+    # расшифровки и адреса уведомлений вместе с токенами в них.
+    # light=True здесь ещё и по делу: интерфейс рисует таблицу, текст ему
+    # не нужен, а на сотне часовых записей это мегабайты на каждый опрос.
     status["items"] = state.db.list_jobs(
-        status=["queued", "running", "retry", "paused"], limit=200, order="priority DESC")
+        status=["queued", "running", "retry", "paused"], limit=200,
+        order="priority DESC", owner=scope_owner(principal), light=True)
     return status
 
 
@@ -242,7 +257,15 @@ def events(request: Request, limit: int = 100,
         return {"items": items}
 
     own = {j["id"] for j in state.db.list_jobs(owner=principal.name, limit=2000, light=True)}
-    mine = [e for e in items if not e.get("job_id") or e.get("job_id") in own]
+    # События без job_id — это ровно административные: создание и отзыв
+    # ключей, изменение настроек, загрузка моделей. Условие «нет job_id —
+    # значит можно» пропускало их всем, включая readonly, вместе с именами
+    # ключей и их ролями. Из общесистемных оставляем то, что и так видно
+    # по состоянию очереди.
+    public_kinds = {"queue_paused", "queue_resumed", "queue_cleared"}
+    mine = [e for e in items
+            if e.get("job_id") in own
+            or (not e.get("job_id") and e.get("kind") in public_kinds)]
     return {"items": mine[:limit]}
 
 
@@ -254,6 +277,11 @@ def list_keys(request: Request,
     items = []
     for key, info in state.settings.api_keys.items():
         items.append({
+            # Отдельно от превью: отзыв требует не меньше двенадцати символов,
+            # а из «ah_8AD…anCu» столько не выкроить. Интерфейс раньше слал
+            # первые шесть символов превью и получал 400 на любом ключе —
+            # отозвать ключ через интерфейс было невозможно в принципе.
+            "key_id": key[:16] if len(key) > 16 else key,
             "key_preview": f"{key[:6]}…{key[-4:]}" if len(key) > 12 else "***",
             "name": info.get("name"),
             "role": info.get("role", "user"),
