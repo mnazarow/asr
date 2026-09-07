@@ -947,6 +947,75 @@ port_owner() {
   printf '%s' "${line}"
 }
 
+# Порт, на котором сервер слушает на самом деле.
+#
+# Единственный надёжный источник — не файл, а сама работающая служба.
+# Порт задаётся в трёх местах сразу (config.yaml, строка запуска в юните,
+# docker/.env), и они расходятся: `--port` в юните перекрывает
+# конфигурацию навсегда, поэтому смена порта в веб-интерфейсе меняет файл,
+# но не то, что слушает сервер. Проверка, доверявшая файлу, стучалась не
+# туда и объявляла работающий сервер мёртвым.
+#
+#   running_server_port [ИМЯ_СЛУЖБЫ]
+running_server_port() {
+  local name="${1:-asrhub}" pid="" exec_line="" port="" line=""
+  if have systemctl; then
+    pid="$(systemctl show -p MainPID --value "${name}.service" 2>/dev/null || true)"
+    if [[ -z "${pid}" || "${pid}" == "0" ]]; then
+      pid="$(systemctl --user show -p MainPID --value "${name}.service" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "${pid}" || "${pid}" == "0" ]] && have pgrep; then
+    pid="$(set +o pipefail; pgrep -f 'm asrhub' 2>/dev/null | head -1 || true)"
+  fi
+
+  # Что слушает процесс — самый прямой ответ, какой вообще есть.
+  if [[ -n "${pid}" && "${pid}" != "0" ]] && have ss; then
+    line="$(set +o pipefail; ss -ltnp 2>/dev/null | grep "pid=${pid}," | head -1 || true)"
+    if [[ -n "${line}" ]]; then
+      port="$(awk '{print $4}' <<<"${line}")"
+      port="${port##*:}"
+      if [[ "${port}" =~ ^[0-9]{1,5}$ ]]; then printf '%s' "${port}"; return 0; fi
+    fi
+  fi
+  if [[ -n "${pid}" && "${pid}" != "0" && -r "/proc/${pid}/cmdline" ]]; then
+    port="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null \
+            | grep -oE -- '--port[= ]+[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
+    if [[ "${port}" =~ ^[0-9]{1,5}$ ]]; then printf '%s' "${port}"; return 0; fi
+  fi
+  # Служба может быть остановлена — тогда спрашиваем её строку запуска.
+  if have systemctl; then
+    exec_line="$(systemctl show -p ExecStart --value "${name}.service" 2>/dev/null || true)"
+    [[ -z "${exec_line}" ]] && exec_line="$(systemctl --user show -p ExecStart --value "${name}.service" 2>/dev/null || true)"
+    port="$(grep -oE -- '--port[= ]+[0-9]+' <<<"${exec_line}" | grep -oE '[0-9]+' | head -1 || true)"
+    if [[ "${port}" =~ ^[0-9]{1,5}$ ]]; then printf '%s' "${port}"; return 0; fi
+  fi
+  return 1
+}
+
+# Порт для проверки: сперва то, что слушает служба, потом файлы.
+#
+#   server_port_hint КАТАЛОГ_ДАННЫХ КАТАЛОГ_ПРОГРАММЫ [РЕЖИМ] [ИМЯ_СЛУЖБЫ]
+server_port_hint() {
+  local data_dir="${1:-}" prefix="${2:-}" mode="${3:-native}" name="${4:-asrhub}" port=""
+  if [[ "${mode}" != "docker" ]]; then
+    port="$(running_server_port "${name}" || true)"
+    if [[ "${port}" =~ ^[0-9]{1,5}$ ]]; then printf '%s' "${port}"; return 0; fi
+  fi
+  if [[ "${mode}" == "docker" && -n "${prefix}" ]]; then
+    port="$(grep -E '^ASRHUB_PORT=' "${prefix}/docker/.env" 2>/dev/null | cut -d= -f2 | head -1 || true)"
+  elif [[ -n "${data_dir}" ]]; then
+    port="$(grep -E '^[[:space:]]*server_port:' "${data_dir}/config.yaml" 2>/dev/null \
+            | awk '{print $2}' | head -1 || true)"
+  fi
+  port="$(printf '%s' "${port}" | tr -d "\"'\r" | awk '{print $1}')"
+  if [[ "${port}" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )); then
+    printf '%s' "${port}"; return 0
+  fi
+  printf '%s' "${ASRHUB_DEFAULT_PORT:-8080}"
+  return 0
+}
+
 # Состояние службы одним словом: running, activating, failed, inactive,
 # unknown. Возвращает 0, только когда служба действительно работает.
 #
@@ -1083,15 +1152,19 @@ diagnose_startup_failure() {
     fi
     return 0
   fi
-  if grep -qiE "undefined symbol|GLIBC_|cannot open shared object|wrong ELF class|incompatible architecture" <<<"${text}"; then
-    error "Двоичный модуль в окружении собран не под эту систему."
-    hint "Пересоберите окружение поверх нынешнего: bash ${prefix}/scripts/install.sh --force"
-    return 0
-  fi
-  if grep -qiE "libcu|CUDA|nvidia" <<<"${text}"; then
+  # Только настоящий сбой, а не всякое упоминание карты: в журнале
+  # исправного сервера строка «Обнаружена видеокарта NVIDIA…» стоит первой,
+  # и по слову «nvidia» разбор уверенно объявлял поломку драйвера там, где
+  # всё работало.
+  if grep -qiE "libcu[a-z0-9_.+-]*\.so[^ ]*: cannot open|CUDA error|CUDA driver version|no CUDA-capable device|libcuda\.so[^ ]* (not found|cannot open)|NVIDIA driver.*(too old|not loaded)" <<<"${text}"; then
     error "Не загружаются библиотеки видеокарты."
     hint "Проверьте драйвер: nvidia-smi"
     hint "Полная проверка окружения: bash ${prefix}/scripts/doctor.sh"
+    return 0
+  fi
+  if grep -qiE "undefined symbol|GLIBC_|cannot open shared object|wrong ELF class|incompatible architecture" <<<"${text}"; then
+    error "Двоичный модуль в окружении собран не под эту систему."
+    hint "Пересоберите окружение поверх нынешнего: bash ${prefix}/scripts/install.sh --force"
     return 0
   fi
   module="$(set +o pipefail; grep -oiE "no module named '[^']+'" <<<"${text}" \
@@ -1113,6 +1186,13 @@ diagnose_startup_failure() {
     return 0
   fi
   return 1
+}
+
+# Виден ли в тексте успешный запуск сервера. Нужен, чтобы не искать причину
+# падения в журнале, где сервер как раз поднялся: разбор на таком тексте
+# ловится за случайные слова и уверенно называет несуществующую поломку.
+server_started_ok() {
+  grep -qE "Uvicorn running on|Application startup complete|ASR Hub запущен" <<<"${1:-}"
 }
 
 # Ждёт, пока сервер начнёт отвечать.
@@ -1189,6 +1269,23 @@ diagnose_server_down() {
     fi
   fi
 
+  # Самая частая причина «не отвечает» у работающего сервера: стучались не
+  # в тот порт. Порт живёт сразу в трёх местах — в config.yaml, в строке
+  # запуска юнита и в docker/.env, — и они расходятся молча.
+  local real_port=""
+  if [[ "${mode}" != "docker" ]]; then
+    real_port="$(running_server_port "${name}" || true)"
+  fi
+  if [[ -n "${real_port}" && "${real_port}" != "${port}" ]]; then
+    printf '\n' >&2
+    error "Сервер слушает порт ${real_port}, а проверялся ${port}."
+    hint "Проверьте сами: curl -i http://${host}:${real_port}/api/health"
+    hint "Порт из строки запуска службы перекрывает config.yaml, поэтому смена"
+    hint "порта в настройках меняет файл, но не то, что слушает сервер."
+    hint "Привести к одному: bash ${prefix}/scripts/service.sh install --port ${real_port}"
+    return 0
+  fi
+
   if [[ -n "${logs}" ]]; then
     printf '\n%sПоследние строки журнала%s\n' "${C_BOLD}" "${C_RESET}" >&2
     printf '%s\n' "${logs}" | tail -30 | sed 's/^/  /' >&2
@@ -1199,7 +1296,15 @@ diagnose_server_down() {
 
   # Пробный импорт тем же python: почти всегда причина именно здесь, и
   # только он показывает её текстом, а не кодом выхода.
+  #
+  # Журнал берём как текст сбоя, только если сервер в нём не поднялся: на
+  # журнале успешного запуска разбор цепляется за случайные слова и
+  # называет поломку, которой нет.
   local probe_text="${logs}"
+  if server_started_ok "${logs}"; then
+    info "В журнале сервер запустился без ошибок — причина не в запуске."
+    probe_text=""
+  fi
   if [[ "${mode}" != "docker" ]] && [[ -x "${python}" ]]; then
     if ! import_probe "${python}" "${prefix}/server"; then
       printf '\n%sПробный запуск пакета%s\n' "${C_BOLD}" "${C_RESET}" >&2

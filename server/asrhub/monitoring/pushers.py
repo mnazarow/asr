@@ -29,6 +29,9 @@ log = logging.getLogger("asrhub.monitoring")
 
 KINDS = ("prometheus_pushgateway", "influxdb", "otlp", "statsd", "webhook")
 
+#: Как часто жаловаться в журнал на один и тот же недоступный приёмник.
+COMPLAIN_INTERVAL_S = 3600.0
+
 
 @dataclass
 class Target:
@@ -86,6 +89,11 @@ class TargetState:
     last_error: str = ""
     sent: int = 0
     failed: int = 0
+    #: Когда о неудаче последний раз писали в журнал. Отправка идёт раз в
+    #: минуту, и недоступный приёмник давал по строке в минуту круглосуточно:
+    #: за ночь это полторы тысячи одинаковых предупреждений, в которых тонет
+    #: всё остальное — в том числе причина, по которой пришли в журнал.
+    last_complaint: float = 0.0
 
     @property
     def healthy(self) -> bool:
@@ -296,13 +304,30 @@ class PushManager:
         try:
             send(target, payload)
         except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+            now = time.time()
             with self._lock:
                 state.failed += 1
                 state.last_error = f"{type(exc).__name__}: {exc}"
-            log.warning("Не удалось отправить метрики в «%s»: %s", target.name, exc)
+                # Первая неудача — вслух, дальше не чаще раза в час. Само
+                # состояние никуда не девается: оно целиком видно в
+                # /api/monitoring/push и в разделе наблюдения.
+                complain = now - state.last_complaint > COMPLAIN_INTERVAL_S
+                if complain:
+                    state.last_complaint = now
+                    failures = state.failed
+            if complain:
+                log.warning("Не удалось отправить метрики в «%s»: %s", target.name, exc)
+                if failures > 1:
+                    log.warning("Это %s-я неудача подряд; следующая жалоба — не раньше "
+                                "чем через час. Состояние: /api/monitoring/push",
+                                failures)
             return {"ok": False, "error": state.last_error}
         with self._lock:
+            if state.failed and state.last_complaint:
+                log.info("Отправка метрик в «%s» восстановилась после %s неудач",
+                         target.name, state.failed)
             state.sent += 1
             state.last_success = time.time()
             state.last_error = ""
+            state.last_complaint = 0.0
         return {"ok": True, "sent_metrics": len(payload)}

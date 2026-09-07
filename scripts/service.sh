@@ -98,6 +98,13 @@ WorkingDirectory=${WORKDIR_Q}
 Environment="ASRHUB_DATA_DIR=${DATA_DIR}"
 Environment="PYTHONUNBUFFERED=1"
 Environment="HF_HOME=${DATA_DIR}/models"
+# Домашний каталог службы смонтирован только на чтение (ProtectHome), и
+# библиотеки, которые кладут кеш в ~/.config, при каждом запуске ругались в
+# журнал и заново собирали его во временном каталоге. Показываем им место,
+# куда писать можно.
+Environment="MPLCONFIGDIR=${DATA_DIR}/cache/matplotlib"
+Environment="XDG_CACHE_HOME=${DATA_DIR}/cache"
+Environment="NUMBA_CACHE_DIR=${DATA_DIR}/cache/numba"
 EnvironmentFile=-${DATA_DIR}/env.sh
 ExecStart=${EXEC_Q} -m asrhub --host ${HOST} --port ${PORT}
 ExecReload=/bin/kill -HUP \$MAINPID
@@ -132,6 +139,14 @@ UNITEOF
   if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
     printf '%s\n' "${content}"
     return 0
+  fi
+
+  # Каталоги для кеша библиотек: без них MPLCONFIGDIR и его соседи указывают
+  # на несуществующий путь, и всё возвращается к жалобе в журнал.
+  mkdir -p "${DATA_DIR}/cache/matplotlib" "${DATA_DIR}/cache/numba" 2>/dev/null || \
+    as_root mkdir -p "${DATA_DIR}/cache/matplotlib" "${DATA_DIR}/cache/numba" 2>/dev/null || true
+  if [[ -n "${run_user}" && "${run_user}" != "root" ]]; then
+    as_root chown -R "${run_user}" "${DATA_DIR}/cache" 2>/dev/null || true
   fi
 
   if [[ "${user_mode}" -eq 1 ]]; then

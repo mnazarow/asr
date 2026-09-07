@@ -1293,11 +1293,16 @@ else
     ""|0.0.0.0|::|"*"|localhost|127.0.0.1) : ;;
     *) PROBE_HOST="${HOST}" ;;
   esac
-  wait_for_health "${PORT}" 60 asrhub "${PROBE_HOST}" || HEALTH_RC=$?
+  # Служба уже поставлена — спрашиваем порт у неё: если установка выбрала
+  # другой (занятый порт, ручной ключ), файл и служба могут разойтись.
+  PROBE_PORT="$(server_port_hint "${DATA_DIR}" "${PREFIX}" \
+                "$( [[ "${MODE}" == "docker" ]] && echo docker || echo native )")"
+  [[ "${PROBE_PORT}" =~ ^[0-9]{1,5}$ ]] || PROBE_PORT="${PORT}"
+  wait_for_health "${PROBE_PORT}" 60 asrhub "${PROBE_HOST}" || HEALTH_RC=$?
 fi
 
 if [[ "${HEALTH_RC}" -eq 0 ]]; then
-  ok "Сервер отвечает на http://${PROBE_HOST:-127.0.0.1}:${PORT}"
+  ok "Сервер отвечает на http://${PROBE_HOST:-127.0.0.1}:${PROBE_PORT:-${PORT}}"
 elif [[ "${HEALTH_RC}" -eq 2 ]]; then
   warn "Сервер запустился, но сообщает о неисправности (код ${HTTP_STATUS})."
   printf '%s\n' "${HTTP_BODY}" | head -20 | sed 's/^/  /' >&2
@@ -1307,7 +1312,7 @@ elif [[ "${HEALTH_RC}" -ne 3 ]]; then
   # Установка на этом не обрывается: файлы на месте, и человеку нужнее
   # причина и остальная часть итога, чем прерванный на предпоследнем шаге
   # сценарий. Поэтому здесь разбор, а не выход с ошибкой.
-  diagnose_server_down "${PORT}" "${PREFIX}" "${DATA_DIR}" \
+  diagnose_server_down "${PROBE_PORT:-${PORT}}" "${PREFIX}" "${DATA_DIR}" \
     "$( [[ "${MODE}" == "docker" ]] && echo docker || echo native )" \
     asrhub "${PROBE_HOST:-127.0.0.1}" || true
 fi

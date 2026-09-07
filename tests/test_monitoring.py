@@ -687,3 +687,31 @@ def test_unknown_paths_collapse_to_single_label(client):
     assert _route_fallback("/api/health") == "/api/health"
     assert _route_fallback("/api/jobs/job_abc123/download") == "/api/jobs/{id}/download"
     assert _route_fallback("/api/monitoring/metrics") == "/api/monitoring/metrics"
+
+
+def test_a_dead_target_does_not_flood_the_log(caplog):
+    """Недоступный приёмник давал по предупреждению в минуту круглосуточно.
+
+    За ночь это полторы тысячи одинаковых строк, в которых тонет всё
+    остальное — включая ту причину, ради которой в журнал и пришли. Само
+    состояние приёмника при этом никуда не девается: оно целиком видно в
+    /api/monitoring/push.
+    """
+    import logging
+
+    from asrhub.monitoring import pushers
+
+    target = pushers.Target(kind="prometheus_pushgateway", url="http://127.0.0.1:1/x")
+    manager = pushers.PushManager(lambda: [], [target])
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(30):
+            answer = manager.push_once(target)
+            assert answer["ok"] is False       # неудача остаётся неудачей
+    жалобы = [r for r in caplog.records if "Не удалось отправить метрики" in r.getMessage()]
+    assert len(жалобы) == 1, f"журнал снова забит повторами: {len(жалобы)}"
+
+    состояние = manager.targets()[0]
+    assert состояние["failed"] == 30, "неудачи должны считаться все до одной"
+    assert состояние["healthy"] is False
+    assert состояние["last_error"], "причина должна остаться видимой"

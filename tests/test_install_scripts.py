@@ -134,16 +134,17 @@ def test_update_survives_a_missing_config(repo_root: Path):
     Установка без файла конфигурации — случай штатный и самый частый; код и
     зависимости к этому моменту уже заменены, а вызывающий видел провал.
     """
-    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
-    line = next(row for row in source.splitlines()
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    # Продолжения строк склеиваем: страховка `|| true` стоит на следующей.
+    текст = common.read_text(encoding="utf-8").replace("\\\n", " ")
+    line = next(row for row in текст.splitlines()
                 if "server_port:" in row and "grep" in row)
     assert "|| true" in line, "grep по config.yaml снова без страховки"
     script = f'''
       set -o errexit -o pipefail
-      DATA_DIR=/несуществующий
-      {line.strip()}
-      PORT="${{PORT:-8080}}"
-      echo "порт ${{PORT}}"
+      source "{common}"
+      running_server_port() {{ return 1; }}     # службы нет, отвечать некому
+      echo "порт $(server_port_hint /несуществующий /тоже-нет native)"
     '''
     result = run_bash(script)
     assert result.returncode == 0, f"строка всё ещё обрывает обновление: {result.stderr}"
@@ -1802,6 +1803,8 @@ def test_health_check_gives_up_when_the_service_is_dead(repo_root: Path):
     ("sqlite3.OperationalError: unable to open database file", "не смог открыть базу"),
     ("OSError: [Errno 28] No space left on device", "кончилось место"),
     ("ImportError: libcudart.so.12: cannot open shared object file",
+     "библиотеки видеокарты"),
+    ("ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: undefined symbol: _ZTIN2at6TensorE",
      "собран не под эту систему"),
 ])
 def test_startup_failure_is_named(repo_root: Path, вывод: str, ожидание: str):
@@ -1855,16 +1858,34 @@ def test_update_does_not_check_a_server_it_did_not_start(repo_root: Path):
     assert "exit 0" in блок.group(0), "после отказа от запуска идёт проверка живости"
 
 
-def test_port_from_config_is_read_safely(repo_root: Path):
-    """Порт из YAML приходит с кавычками и комментариями — и ломал проверку."""
-    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
-    блок = re.search(r"(# Порт из конфигурации.*?\nfi\n)", source, re.S)
-    assert блок, "не найдена очистка порта"
-    script = "set -euo pipefail\n" + "\n".join(
-        f'PORT={значение!r}\n' + блок.group(1) + 'printf "%s\\n" "${PORT}"'
-        for значение in ('"8080"', "9000 # порт", "  8443  ", "не-число", "", "70000"))
-    строки = run_bash("warn() { :; }\n" + script).stdout.split()
-    assert строки == ["8080", "9000", "8443", "8080", "8080", "8080"], строки
+@pytest.mark.parametrize("строка, ожидание", [
+    ('  server_port: "8080"', "8080"),
+    ("  server_port: 9000 # порт", "9000"),
+    ("  server_port:   8443  ", "8443"),
+    ("  server_port: не-число", "8080"),
+    ("  server_port:", "8080"),
+    ("  server_port: 70000", "8080"),
+    ("", "8080"),
+])
+def test_port_from_config_is_read_safely(repo_root: Path, tmp_path: Path,
+                                         строка: str, ожидание: str):
+    """Порт из YAML приходит с кавычками и комментариями — и ломал проверку.
+
+    Всё, что не похоже на порт, должно сводиться к умолчанию: иначе
+    проверка стучится по несуществующему адресу и объявляет исправный
+    сервер мёртвым.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    data = tmp_path / "данные"
+    data.mkdir()
+    (data / "config.yaml").write_text(f"server:\n{строка}\n", encoding="utf-8")
+    script = f'''
+      set -euo pipefail
+      source "{common}"
+      running_server_port() {{ return 1; }}     # спрашиваем именно файл
+      server_port_hint "{data}" "" native
+    '''
+    assert run_bash(script).stdout.strip() == ожидание, строка
 
 
 def test_health_check_asks_the_address_the_server_listens_on(repo_root: Path):
@@ -1876,7 +1897,7 @@ def test_health_check_asks_the_address_the_server_listens_on(repo_root: Path):
     for name in ("update.sh", "install.sh"):
         source = (repo_root / "scripts" / name).read_text(encoding="utf-8")
         assert "PROBE_HOST" in source, f"{name}: адрес проверки не вычисляется"
-        assert 'wait_for_health "${PORT}"' in source and "PROBE_HOST" in source, name
+        assert "wait_for_health" in source and "PROBE_HOST" in source, name
     common = repo_root / "scripts" / "lib" / "common.sh"
     script = f'''
       source "{common}"
@@ -1927,3 +1948,114 @@ def test_start_reports_a_service_that_dies_right_away(repo_root: Path, tmp_path:
     assert result.returncode == 1, f"падение службы выдано за успех: {вывод!r}"
     assert "Служба не поднялась" in вывод, вывод
     assert "fastapi" in вывод, "журнал не показан — причина снова спрятана"
+
+
+def test_port_is_asked_of_the_service_not_of_the_file(repo_root: Path, tmp_path: Path):
+    """Порт живёт в трёх местах сразу, и они расходятся молча.
+
+    `--port` в строке запуска юнита перекрывает config.yaml навсегда:
+    сервер слушал 8081, в файле стояло 8080, и проверка исправного сервера
+    стучалась не туда. Спрашивать нужно у того, кто работает.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    data = tmp_path / "данные"
+    data.mkdir()
+    (data / "config.yaml").write_text("server:\n  server_port: 8080\n", encoding="utf-8")
+    script = f'''
+      source "{common}"
+      running_server_port() {{ printf '8081'; }}   # служба слушает другой порт
+      server_port_hint "{data}" "" native
+    '''
+    assert run_bash(script).stdout.strip() == "8081", "порт снова берётся из файла"
+
+
+def test_a_running_server_on_another_port_is_named_as_the_cause(repo_root: Path,
+                                                                tmp_path: Path):
+    """Работающий сервер на другом порту — это ответ, а не повод гадать."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    prefix = tmp_path / "программа"
+    (prefix / "venv" / "bin").mkdir(parents=True)
+    script = f'''
+      source "{common}"
+      service_state() {{ printf 'running'; return 0; }}
+      server_log_tail() {{ printf 'INFO: Uvicorn running on http://0.0.0.0:8081\\n'; }}
+      running_server_port() {{ printf '8081'; }}
+      port_open() {{ return 1; }}
+      diagnose_server_down 8080 "{prefix}" "{tmp_path}/данные" native
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+    assert "слушает порт 8081" in текст, f"порт-виновник не назван: {текст!r}"
+    assert "8081/api/health" in текст, "нет команды, которой это проверяют"
+
+
+def test_a_healthy_gpu_line_is_not_a_driver_failure(repo_root: Path):
+    """Разбор ловился на слово «NVIDIA» в строке об успешно найденной карте.
+
+    Журнал исправного сервера начинается со строки «Обнаружена видеокарта
+    NVIDIA…», и по одному этому слову разбор уверенно сообщал о поломке
+    драйвера — диагноз, уводящий ровно в противоположную сторону.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    здоровый = ("INFO asrhub.app Обнаружена видеокарта NVIDIA GeForce RTX 5090 (32 ГБ). "
+                "Выбраны вычисления float16.\n"
+                "WARNING asrhub.monitoring Не удалось отправить метрики в "
+                "«prometheus_pushgateway»: <urlopen error [Errno 111] Connection refused>\n"
+                "INFO: Uvicorn running on http://0.0.0.0:8081\n")
+    сломанный = "ImportError: libcudart.so.12: cannot open shared object file"
+    script = f'''
+      source "{common}"
+      if diagnose_startup_failure {здоровый!r} "" /opt/asrhub; then
+        echo "ПРИДУМАЛ ПРИЧИНУ"
+      else
+        echo "здоровый журнал — молчим"
+      fi
+      diagnose_startup_failure {сломанный!r} "" /opt/asrhub || echo "НЕ ОПОЗНАЛ СБОЙ"
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+    assert "ПРИДУМАЛ ПРИЧИНУ" not in текст, f"снова ложный диагноз: {текст!r}"
+    assert "здоровый журнал — молчим" in текст
+    assert "НЕ ОПОЗНАЛ СБОЙ" not in текст, "перестал видеть настоящую поломку драйвера"
+    assert "библиотеки видеокарты" in текст
+
+
+def test_a_successful_start_in_the_log_is_not_searched_for_causes(repo_root: Path,
+                                                                  tmp_path: Path):
+    """Журнал, в котором сервер поднялся, не является текстом сбоя."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    prefix = tmp_path / "программа"
+    (prefix / "venv" / "bin").mkdir(parents=True)
+    script = f'''
+      source "{common}"
+      service_state() {{ printf 'running'; return 0; }}
+      running_server_port() {{ return 1; }}
+      port_open() {{ return 0; }}
+      server_log_tail() {{
+        printf 'INFO asrhub.app Обнаружена видеокарта NVIDIA GeForce RTX 5090\\n'
+        printf 'INFO: Application startup complete.\\n'
+      }}
+      diagnose_server_down 8080 "{prefix}" "{tmp_path}/данные" native
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+    assert "запустился без ошибок" in текст, текст
+    assert "видеокарты" not in текст, f"причина всё ещё выдумывается: {текст!r}"
+
+
+def test_unit_gives_libraries_a_writable_cache(repo_root: Path):
+    """ProtectHome=read-only, а библиотеки лезут писать кеш в домашний каталог.
+
+    matplotlib при каждом запуске ругался в журнал («Read-only file
+    system») и заново собирал кеш во временном каталоге — то есть медленно
+    и с шумом ровно в том месте, где потом ищут причины поломок.
+    """
+    result = subprocess.run(
+        [BASH, str(repo_root / "scripts" / "service.sh"), "install", "--dry-run",
+         "--prefix", "/opt/asrhub", "--data", "/var/lib/asrhub", "--user", "asrhub"],
+        capture_output=True, text=True, timeout=60, cwd=str(repo_root))
+    unit = result.stdout
+    assert "ProtectHome=read-only" in unit, "изоляция домашнего каталога снята"
+    for переменная in ("MPLCONFIGDIR", "XDG_CACHE_HOME", "NUMBA_CACHE_DIR"):
+        assert f'Environment="{переменная}=/var/lib/asrhub' in unit, \
+            f"{переменная} не указывает в каталог данных"
