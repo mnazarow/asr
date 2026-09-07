@@ -269,26 +269,36 @@ step "Обновление зависимостей"
 # Установлен ли движок: спрашиваем pip про пакеты, перечисленные в файле
 # требований. Имена пакетов и имена модулей совпадают далеко не всегда, а
 # `pip show` знает ровно то, что установлено.
-engine_installed() {
-  local req="$1" name file
-  for file in "${req}" "$(dirname "${req}")/no-deps/$(basename "${req}")"; do
-    [[ -f "${file}" ]] || continue
-    while IFS= read -r line; do
-      line="${line%%#*}"
-      # Прямая ссылка PEP 508 — «пакет @ git+https://…». Без среза по «@»
-      # именем пакета становилась вся строка с адресом, и pip про неё,
-      # разумеется, ничего не знал: движок, поставленный из репозитория,
-      # выглядел неустановленным и не обновлялся никогда.
-      line="${line%%@*}"
-      line="${line%%[<>=!;[]*}"
-      name="$(printf '%s' "${line}" | tr -d '[:space:]')"
-      [[ -z "${name}" ]] && continue
-      if "${VPIP}" show "${name}" >/dev/null 2>&1; then
-        return 0
-      fi
-    done < "${file}"
-  done
+# Имя собственного пакета движка: первая настоящая строка требований.
+# Файлы так и написаны — сначала сам движок, потом его окружение, — а для
+# движков из репозитория пакет перечислен в файле-спутнике.
+engine_package() {
+  local req="$1" file line name
+  file="$(dirname "${req}")/no-deps/$(basename "${req}")"
+  [[ -f "${file}" ]] || file="${req}"
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    # Прямая ссылка PEP 508 — «пакет @ git+https://…». Без среза по «@»
+    # именем пакета становилась вся строка с адресом, и pip про неё,
+    # разумеется, ничего не знал: движок, поставленный из репозитория,
+    # выглядел неустановленным и не обновлялся никогда.
+    line="${line%%@*}"
+    line="${line%%[<>=!;[]*}"
+    name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+    [[ -n "${name}" ]] && { printf '%s' "${name}"; return 0; }
+  done < "${file}"
   return 1
+}
+
+engine_installed() {
+  local req="$1" name
+  # Судим по собственному пакету движка, а не по любому из файла требований.
+  # Раньше годилась любая строка — и whisperx считался установленным из-за
+  # pyannote.audio, который стоит ради диаризации. Обновление такого «движка»
+  # каждый раз падало и пугало пользователя ошибкой на ровном месте.
+  name="$(engine_package "${req}" || true)"
+  [[ -n "${name}" ]] || return 1
+  "${VPIP}" show "${name}" >/dev/null 2>&1
 }
 
 if [[ "${DOCKER_MODE}" -eq 1 ]]; then
@@ -343,6 +353,13 @@ elif [[ "${WAS_RUNNING}" -eq 1 ]]; then
   bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" || true
 else
   info "До обновления служба не работала — не запускаем."
+  printf '\n%s%sОбновление завершено: %s → %s%s\n\n' "${C_BOLD}" "${C_GREEN}" \
+    "${CURRENT_VERSION}" "${NEW_VERSION}" "${C_RESET}"
+  # Проверять здоровье остановленного сервера бессмысленно: раньше проверка
+  # шла и в этом случае, и обновление, прошедшее без единой ошибки,
+  # заканчивалось строкой «сервер не отвечает».
+  hint "Запустить: bash ${PREFIX}/scripts/service.sh start"
+  exit 0
 fi
 
 # `|| true` здесь обязателен: grep возвращает 2, когда файла нет, и 1, когда
@@ -354,29 +371,58 @@ if [[ "${DOCKER_MODE}" -eq 1 ]]; then
 else
   PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1 || true)"
 fi
-PORT="${PORT:-8080}"
-HEALTH_OK=0
-for _ in $(seq 1 20); do
-  if have curl && curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
-    HEALTH_OK=1; break
-  fi
-  sleep 2
-done
+# Порт из конфигурации приходит как есть: в YAML он может быть в кавычках,
+# с комментарием в конце строки или вовсе не числом. Всё, что не число,
+# сводим к умолчанию — иначе проверка стучится по несуществующему адресу и
+# объявляет исправный сервер мёртвым.
+PORT="$(printf '%s' "${PORT}" | tr -d "\"'\r" | awk '{print $1}')"
+if [[ ! "${PORT}" =~ ^[0-9]{1,5}$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  [[ -n "${PORT}" ]] && warn "В конфигурации указан неподходящий порт «${PORT}» — проверяем 8080."
+  PORT=8080
+fi
 
-if [[ "${HEALTH_OK}" -eq 1 ]]; then
+# Адрес для проверки. Сервер, привязанный к одному адресу в локальной сети,
+# на 127.0.0.1 не отвечает вовсе — и исправное обновление заканчивалось
+# сообщением о мёртвом сервере.
+PROBE_HOST="127.0.0.1"
+if [[ "${DOCKER_MODE}" -eq 0 ]]; then
+  HOST_CFG="$(grep -E '^[[:space:]]*server_host:' "${DATA_DIR}/config.yaml" 2>/dev/null \
+              | awk '{print $2}' | head -1 || true)"
+  HOST_CFG="$(printf '%s' "${HOST_CFG}" | tr -d "\"'\r")"
+  case "${HOST_CFG}" in
+    ""|0.0.0.0|::|"*"|localhost|127.0.0.1) : ;;
+    *) PROBE_HOST="${HOST_CFG}" ;;
+  esac
+fi
+
+# Ждём не «сколько-нибудь», а пока сервер не ответит либо пока не станет
+# ясно, что он и не ответит: wait_for_health бросает ожидание, когда служба
+# уже упала. Раньше здесь молча капало сорок секунд, после чего печаталась
+# одна строка «не отвечает» — и человек оставался с ней один на один.
+HEALTH_RC=0
+wait_for_health "${PORT}" "${HEALTH_WAIT_S:-60}" asrhub "${PROBE_HOST}" || HEALTH_RC=$?
+
+if [[ "${HEALTH_RC}" -eq 0 ]]; then
   ok "Сервер отвечает — обновление успешно"
   printf '\n%s%sОбновление завершено: %s → %s%s\n\n' "${C_BOLD}" "${C_GREEN}" \
     "${CURRENT_VERSION}" "${NEW_VERSION}" "${C_RESET}"
   hint "Откат при необходимости: bash ${PREFIX}/scripts/update.sh --rollback"
+elif [[ "${HEALTH_RC}" -eq 2 ]]; then
+  # Сервер поднялся, но сам сообщает о неисправности. Это не повод для
+  # отката: код обновился и работает, сломано что-то под ним — чаще всего
+  # база или диск, и откат этого не лечит.
+  warn "Сервер отвечает, но сообщает о неисправности (код ${HTTP_STATUS})."
+  printf '%s\n' "${HTTP_BODY}" | head -20 | sed 's/^/  /' >&2
+  hint "Подробности: bash ${PREFIX}/scripts/doctor.sh"
+  hint "Журнал службы: bash ${PREFIX}/scripts/service.sh logs -n 100"
+  exit 1
 else
   error "Сервер не отвечает после обновления."
+  diagnose_server_down "${PORT}" "${PREFIX}" "${DATA_DIR}" \
+    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" asrhub "${PROBE_HOST}"
   if confirm "Откатиться к предыдущей версии?"; then
     exec bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" --yes
   fi
-  if [[ "${DOCKER_MODE}" -eq 1 ]]; then
-    hint "Журнал контейнера: cd ${PREFIX}/docker && docker compose logs --tail 100"
-  else
-    hint "Журнал службы: bash ${PREFIX}/scripts/service.sh logs"
-  fi
+  hint "Откатиться позже: bash ${PREFIX}/scripts/update.sh --rollback"
   exit 1
 fi

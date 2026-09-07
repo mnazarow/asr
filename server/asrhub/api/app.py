@@ -231,7 +231,17 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     state.accounts = Accounts(db, float(settings.get("session_ttl_hours") or 168))
     # Первый запуск: заводим admin с временным паролем. Без этого открыть
     # интерфейс можно было только сходив на сервер за api-key.txt.
-    state.accounts.ensure_default_admin()
+    #
+    # Ошибка здесь не должна мешать серверу подняться: вход по логину — это
+    # удобство поверх ключей доступа, а не условие работы. Сервер, который
+    # не стартовал из-за заведения учётной записи, отнимает и распознавание,
+    # и единственный способ увидеть, что пошло не так.
+    try:
+        state.accounts.ensure_default_admin()
+    except Exception as exc:                                   # noqa: BLE001
+        log.error("Не удалось завести учётную запись по умолчанию: %s", exc)
+        log.error("Вход по логину и паролю недоступен; ключи доступа работают. "
+                  "Задать пароль вручную: python -m asrhub --set-password admin")
     state.monitoring = MonitoringService(state)
 
     @asynccontextmanager

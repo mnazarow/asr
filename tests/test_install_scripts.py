@@ -1201,8 +1201,11 @@ def test_engine_from_a_repository_is_recognised_as_installed(repo_root: Path,
     движок не обновлялся никогда — `update.sh` его просто не видел.
     """
     source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
-    body = re.search(r"(engine_installed\(\) \{\n.*?\n\}\n)", source, re.S)
-    assert body, "не найдена функция engine_installed"
+    # Берём обе функции: имя пакета движка ищет engine_package, а решение
+    # принимает engine_installed — по отдельности они не работают.
+    body = re.search(r"(# Имя собственного пакета движка.*?\n\}\n\nengine_installed\(\) \{.*?\n\}\n)",
+                     source, re.S)
+    assert body, "не найдено определение установленного движка"
 
     engines = tmp_path / "engines"
     (engines / "no-deps").mkdir(parents=True)
@@ -1296,6 +1299,20 @@ ERROR: Could not find a version that satisfies the requirement fastapi (from ver
 ERROR: No matching distribution found for fastapi
 """, offline="1")
     assert "Автономный режим" in text and "кеш" in text
+
+    # Пакет прямо объявил, что не работает на этой версии Python. Настоящий
+    # вывод pip для whisperx на 3.14 — это не «колёса ещё не собрали», а
+    # верхняя граница в метаданных, и ждать её снятия бессмысленно.
+    text = _diagnose(repo_root, tmp_path, """
+ERROR: Ignored the following yanked versions: 3.1.1, 3.1.2
+ERROR: Ignored the following versions that require a different python version: 3.6.2 Requires-Python >=3.9,<3.13; 3.7.0 Requires-Python >=3.9,<3.14; 3.8.6 Requires-Python >=3.10,<3.14
+ERROR: Could not find a version that satisfies the requirement whisperx>=3.8 (from versions: 3.2.0)
+ERROR: No matching distribution found for whisperx>=3.8
+""")
+    assert "не поддерживает" in text
+    assert "whisperx>=3.8" in text, "не названо, какой пакет отказался"
+    assert ">=3.10,<3.14" in text, "не названы поддерживаемые версии Python"
+    assert "не задержка сборки" in text, "совет «подождите» здесь вреден"
 
     # Остальные распознаваемые причины.
     for sample, expected in (
@@ -1614,3 +1631,299 @@ def test_pip_output_reaches_the_log(repo_root: Path, tmp_path: Path):
     body = log.read_text(encoding="utf-8")
     assert "очень подробная причина отказа" in body, "вывод pip не попал в журнал"
     assert "вывод pip" in body, "нет разметки, по которой его найти"
+
+
+def test_engine_presence_is_judged_by_its_own_package(repo_root: Path, tmp_path: Path):
+    """Движок считался установленным из-за чужой зависимости.
+
+    Годилась любая строка файла требований, а `whisperx.txt` перечисляет ещё
+    и `pyannote.audio`, который стоит ради диаризации. Обновление принимало
+    whisperx за установленный, пыталось его обновить и падало — каждый раз,
+    на ровном месте, пугая пользователя ошибкой про несовместимый Python.
+    """
+    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
+    block = re.search(r"(# Имя собственного пакета движка.*?\n\}\n\nengine_installed\(\) \{.*?\n\}\n)",
+                      source, re.S)
+    assert block, "не найдено определение установленного движка"
+
+    engines = tmp_path / "engines"
+    (engines / "no-deps").mkdir(parents=True)
+    # Как в жизни: свой пакет первым, общая зависимость следом.
+    (engines / "движок.txt").write_text("своя-библиотека>=3.8\nобщая-зависимость>=3.1\n",
+                                        encoding="utf-8")
+    # Движок из репозитория: его пакет перечислен только в спутнике.
+    (engines / "изрепы.txt").write_text("общая-зависимость>=1\n", encoding="utf-8")
+    (engines / "no-deps" / "изрепы.txt").write_text(
+        "пакет-из-репы @ git+https://example.invalid/п.git\n", encoding="utf-8")
+
+    fake_pip = tmp_path / "pip"
+    fake_pip.write_text('#!/usr/bin/env bash\n'
+                        'case "$2" in общая-зависимость|пакет-из-репы) exit 0 ;; esac\n'
+                        'exit 1\n', encoding="utf-8")
+    fake_pip.chmod(0o755)
+
+    script = f'''
+      set -Eeuo pipefail
+      VPIP="{fake_pip}"
+{block.group(1)}
+      for f in "{engines}/движок.txt" "{engines}/изрепы.txt"; do
+        if engine_installed "$f"; then echo "ДА"; else echo "НЕТ"; fi
+      done
+    '''
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    answers = result.stdout.split()
+    assert answers[0] == "НЕТ", "чужая зависимость выдана за установленный движок"
+    assert answers[1] == "ДА", "движок из репозитория снова не опознан"
+
+
+# ---------------------------------------------------------------------------
+# Проверка живости сервера
+# ---------------------------------------------------------------------------
+#
+# «Сервер не отвечает после обновления» — вся диагностика, которую человек
+# получал после неудачного обновления. Ни причины, ни журнала, ни даже того,
+# жива ли служба. Дальше — регрессии на то, что этой строкой дело больше не
+# заканчивается.
+
+
+def _fake_server(tmp_path: Path, status: int, body: str = '{"status":"ok"}'):
+    """Поднимает крошечный HTTP-сервер и возвращает (процесс, порт)."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    source = tmp_path / "сервер.py"
+    source.write_text(
+        "import http.server\n"
+        f"STATUS, BODY = {status}, {body!r}.encode()\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(STATUS)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(BODY)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(BODY)\n"
+        "    def log_message(self, *a): pass\n"
+        f"http.server.HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n",
+        encoding="utf-8")
+    process = subprocess.Popen([os.sys.executable, str(source)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        with socket.socket() as check:
+            check.settimeout(0.2)
+            if check.connect_ex(("127.0.0.1", port)) == 0:
+                return process, port
+        import time as _t
+        _t.sleep(0.1)
+    process.kill()
+    pytest.skip("не удалось поднять проверочный сервер")
+
+
+def test_health_check_sees_the_answer_code_not_just_success(repo_root: Path, tmp_path: Path):
+    """`curl -f` сводил 503 к пустой ошибке, и живой сервер считался мёртвым.
+
+    Сервер, сообщающий «мне плохо», и сервер, которого нет, — это две разные
+    поломки: первую откат не лечит, а вторую только он и лечит.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    process, port = _fake_server(tmp_path, 503, '{"status":"degraded"}')
+    try:
+        script = f'''
+          source "{common}"
+          rc=0; wait_for_health {port} 10 || rc=$?
+          echo "код возврата: ${{rc}}"
+          echo "ответ: ${{HTTP_STATUS}} ${{HTTP_BODY}}"
+        '''
+        out = run_bash(script).stdout
+    finally:
+        process.kill()
+    assert "код возврата: 2" in out, f"неисправный сервер не опознан: {out!r}"
+    assert "503" in out and "degraded" in out, out
+
+
+def test_health_check_works_without_curl(repo_root: Path, tmp_path: Path):
+    """Проверка держалась на одном curl: без него сервер «не отвечал» всегда.
+
+    На голой системе curl может и не быть — а вывод при этом был ровно тот
+    же, что у по-настоящему упавшего сервера.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    process, port = _fake_server(tmp_path, 200)
+    пусто = tmp_path / "без-curl"
+    пусто.mkdir()
+    # Каталог только с python и awk: curl и wget недоступны намеренно.
+    for name in ("python3", "awk", "sed", "grep", "tr", "uname", "sleep", "cat", "head", "tail"):
+        source = shutil.which(name)
+        if source:
+            os.symlink(source, пусто / name)
+    try:
+        script = f'''
+          PATH="{пусто}"
+          source "{common}"
+          rc=0; http_probe "http://127.0.0.1:{port}/api/health" 3 || rc=$?
+          echo "код возврата: ${{rc}} ответ: ${{HTTP_STATUS}}"
+        '''
+        out = run_bash(script).stdout
+    finally:
+        process.kill()
+    assert "код возврата: 0 ответ: 200" in out, f"без curl проверка ослепла: {out!r}"
+
+
+def test_health_check_gives_up_when_the_service_is_dead(repo_root: Path):
+    """Сорок секунд ожидания от процесса, которого нет, — просто задержка.
+
+    Раньше цикл в любом случае выкапывал весь свой запас времени, и человек
+    ждал минуту, чтобы получить ту же ошибку, которая была известна сразу.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      service_state() {{ printf 'failed'; return 1; }}
+      http_probe() {{ return 1; }}
+      started=${{SECONDS}}
+      rc=0; wait_for_health 65500 60 || rc=$?
+      echo "код возврата: ${{rc}} ожидание: $(( SECONDS - started ))"
+    '''
+    out = run_bash(script).stdout
+    assert "код возврата: 1" in out, out
+    прошло = int(re.search(r"ожидание: (\d+)", out).group(1))
+    assert прошло < 15, f"ожидание не прервалось: {прошло} с"
+
+
+@pytest.mark.parametrize("вывод, ожидание", [
+    ("ModuleNotFoundError: No module named 'fastapi'", "нет пакета «fastapi»"),
+    ("assert isinstance(value, typing.ForwardRef)\nTypeError: _eval_type() got an "
+     "unexpected keyword argument 'prefer_fwd_module'", "несовместима с этой версией Python"),
+    ("OSError: [Errno 98] Address already in use", "Порт уже занят"),
+    ("PermissionError: [Errno 13] Permission denied: '/var/lib/asrhub/asrhub.db'",
+     "Не хватает прав"),
+    ("sqlite3.OperationalError: unable to open database file", "не смог открыть базу"),
+    ("OSError: [Errno 28] No space left on device", "кончилось место"),
+    ("ImportError: libcudart.so.12: cannot open shared object file",
+     "собран не под эту систему"),
+])
+def test_startup_failure_is_named(repo_root: Path, вывод: str, ожидание: str):
+    """Причина падения называется словами, а не оставляется в трассировке."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      diagnose_startup_failure {вывод!r} "" /opt/asrhub || echo "ПРИЧИНА НЕ НАЙДЕНА"
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+    assert "ПРИЧИНА НЕ НАЙДЕНА" not in текст, f"причина не опознана: {вывод!r}"
+    assert ожидание in текст, f"ожидали «{ожидание}», получили: {текст!r}"
+
+
+def test_startup_diagnosis_does_not_invent_reasons(repo_root: Path):
+    """Неизвестный текст не должен получать наугад выбранный диагноз."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      if diagnose_startup_failure "нечто совершенно постороннее" "" /opt/asrhub; then
+        echo "ПРИДУМАЛ"
+      else
+        echo "честно промолчал"
+      fi
+    '''
+    out = run_bash(script).stdout
+    assert "честно промолчал" in out, out
+
+
+def test_update_says_why_the_server_is_silent(repo_root: Path):
+    """Одна строка «сервер не отвечает» — это вопрос, а не ответ."""
+    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
+    assert "diagnose_server_down" in source, "обновление снова молчит о причине"
+    assert "wait_for_health" in source, "проверка живости не подключена"
+    assert "curl -fsS --max-time 3" not in source, "остался слепой цикл на curl"
+    install = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    assert "diagnose_server_down" in install, "установка молчит о причине"
+
+
+def test_update_does_not_check_a_server_it_did_not_start(repo_root: Path):
+    """Обновление без запуска не должно кончаться словами «не отвечает».
+
+    Служба не работала до обновления — мы её и не поднимаем; проверять после
+    этого нечего, а прежний порядок печатал ошибку на безупречно прошедшем
+    обновлении.
+    """
+    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
+    блок = re.search(r'info "До обновления служба не работала.*?\nfi\n', source, re.S)
+    assert блок, "не найдена ветка «служба не работала»"
+    assert "exit 0" in блок.group(0), "после отказа от запуска идёт проверка живости"
+
+
+def test_port_from_config_is_read_safely(repo_root: Path):
+    """Порт из YAML приходит с кавычками и комментариями — и ломал проверку."""
+    source = (repo_root / "scripts" / "update.sh").read_text(encoding="utf-8")
+    блок = re.search(r"(# Порт из конфигурации.*?\nfi\n)", source, re.S)
+    assert блок, "не найдена очистка порта"
+    script = "set -euo pipefail\n" + "\n".join(
+        f'PORT={значение!r}\n' + блок.group(1) + 'printf "%s\\n" "${PORT}"'
+        for значение in ('"8080"', "9000 # порт", "  8443  ", "не-число", "", "70000"))
+    строки = run_bash("warn() { :; }\n" + script).stdout.split()
+    assert строки == ["8080", "9000", "8443", "8080", "8080", "8080"], строки
+
+
+def test_health_check_asks_the_address_the_server_listens_on(repo_root: Path):
+    """Сервер на одном адресе в сети не отвечает на 127.0.0.1.
+
+    Проверка всегда стучалась в петлю, и установка с `--host 10.0.0.5`
+    завершалась сообщением о мёртвом сервере, который на самом деле работал.
+    """
+    for name in ("update.sh", "install.sh"):
+        source = (repo_root / "scripts" / name).read_text(encoding="utf-8")
+        assert "PROBE_HOST" in source, f"{name}: адрес проверки не вычисляется"
+        assert 'wait_for_health "${PORT}"' in source and "PROBE_HOST" in source, name
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      http_probe() {{ echo "запрос: $1"; return 1; }}
+      service_state() {{ printf 'inactive'; return 1; }}
+      wait_for_health 8080 1 asrhub 10.0.0.5 || true
+    '''
+    out = run_bash(script).stdout
+    assert "запрос: http://10.0.0.5:8080/api/health" in out, out
+
+
+def test_install_does_not_probe_a_server_it_never_starts(repo_root: Path):
+    """Без службы проверять нечего: «не отвечает» здесь ничего не значит."""
+    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    блок = re.search(r'if \[\[ "\$\{CREATE_SERVICE\}" -eq 0 && "\$\{MODE\}" == "native" \]\]; then'
+                     r'(.*?)\nelse', source, re.S)
+    assert блок, "не найдена ветка «служба не создавалась»"
+    assert "HEALTH_RC=3" in блок.group(1), "проверка живости всё равно запускается"
+
+
+def test_start_reports_a_service_that_dies_right_away(repo_root: Path, tmp_path: Path):
+    """«✓ Выполнено: start» означало лишь то, что команду приняли.
+
+    Служба, падавшая через секунду, отчитывалась галочкой, а причину
+    приходилось искать самому — обновление дальше сообщало «сервер не
+    отвечает», никак не связывая одно с другим.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "systemctl").write_text(
+        '#!/usr/bin/env bash\n'
+        'for arg in "$@"; do\n'
+        '  if [[ "${arg}" == "is-active" ]]; then echo failed; exit 3; fi\n'
+        'done\n'
+        'exit 0\n', encoding="utf-8")
+    (bin_dir / "systemctl").chmod(0o755)
+    (bin_dir / "journalctl").write_text(
+        '#!/usr/bin/env bash\necho "asrhub: ModuleNotFoundError: No module named \'fastapi\'"\n',
+        encoding="utf-8")
+    (bin_dir / "journalctl").chmod(0o755)
+
+    result = subprocess.run(
+        [BASH, str(repo_root / "scripts" / "service.sh"), "start",
+         "--prefix", str(tmp_path), "--data", str(tmp_path / "data")],
+        capture_output=True, text=True, timeout=90,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    вывод = result.stdout + result.stderr
+    assert result.returncode == 1, f"падение службы выдано за успех: {вывод!r}"
+    assert "Служба не поднялась" in вывод, вывод
+    assert "fastapi" in вывод, "журнал не показан — причина снова спрятана"

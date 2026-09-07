@@ -244,7 +244,25 @@ case "${ACTION}" in
     else
       error "Управление службой недоступно на этой системе."; exit 1
     fi
-    ok "Выполнено: ${ACTION}" ;;
+    # «Выполнено: start» означало только то, что команду приняли. Служба,
+    # падавшая через секунду после запуска, отчитывалась галочкой — и дальше
+    # обновление сообщало «сервер не отвечает», не связывая одно с другим.
+    if [[ "${ACTION}" != "stop" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+      sleep 2
+      STATE="$(service_state "${SERVICE_NAME}" || true)"
+      case "${STATE}" in
+        running)    ok "Служба запущена" ;;
+        activating) ok "Служба запускается" ;;
+        failed)
+          error "Служба не поднялась."
+          server_log_tail 20 "${DATA_DIR}" "${SERVICE_NAME}" | sed 's/^/  /' >&2
+          hint "Полный журнал: bash ${SCRIPT_DIR}/service.sh logs -n 200"
+          exit 1 ;;
+        *)          ok "Выполнено: ${ACTION}" ;;
+      esac
+    else
+      ok "Выполнено: ${ACTION}"
+    fi ;;
 
   status)
     if [[ "${OS}" == "macos" ]]; then

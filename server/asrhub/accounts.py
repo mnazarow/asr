@@ -188,6 +188,7 @@ class Accounts:
     def __init__(self, db: Database, session_ttl_hours: float = 168.0) -> None:
         self.db = db
         self.session_ttl_s = max(1.0, float(session_ttl_hours)) * 3600.0
+        self._warned = False
 
     # --- записи ---------------------------------------------------------
 
@@ -198,6 +199,23 @@ class Accounts:
     def count(self) -> int:
         row = self.db.query_one("SELECT COUNT(*) AS n FROM users")
         return int(row["n"]) if row else 0
+
+    def available(self) -> bool:
+        """Готова ли база к работе с учётными записями."""
+        try:
+            self.db.query_one("SELECT 1 FROM users LIMIT 1")
+            return True
+        except Exception:                                      # noqa: BLE001
+            return False
+
+    def _warn_unavailable(self, exc: Exception) -> None:
+        """Жалуется один раз, а не на каждый запрос: иначе журнал не читается."""
+        if getattr(self, "_warned", False):
+            return
+        self._warned = True
+        log.error("Учётные записи недоступны: %s", exc)
+        log.error("Вход по логину и паролю выключен, ключи доступа работают. "
+                  "Проверьте базу: python -m asrhub --list-users")
 
     def get(self, user_id: str) -> Account | None:
         row = self.db.query_one("SELECT * FROM users WHERE id = ?", [user_id])
@@ -352,13 +370,23 @@ class Accounts:
         return token, expires
 
     def session_account(self, token: str) -> Account | None:
-        """Возвращает владельца сессии, продлевая её срок."""
+        """Возвращает владельца сессии, продлевая её срок.
+
+        Отсутствие таблиц — не ошибка запроса, а состояние базы, до которой
+        не дошла миграция. Такой сервер обязан продолжать работать по ключам
+        доступа: иначе одна незавершённая миграция превращает «нельзя войти
+        паролем» в «не работает ничего».
+        """
         if not token:
             return None
-        row = self.db.query_one(
-            "SELECT s.user_id AS user_id, s.expires_at AS expires_at, "
-            "s.last_seen AS last_seen FROM sessions s WHERE s.token_hash = ?",
-            [_token_hash(token)])
+        try:
+            row = self.db.query_one(
+                "SELECT s.user_id AS user_id, s.expires_at AS expires_at, "
+                "s.last_seen AS last_seen FROM sessions s WHERE s.token_hash = ?",
+                [_token_hash(token)])
+        except Exception as exc:                               # noqa: BLE001
+            self._warn_unavailable(exc)
+            return None
         if row is None:
             return None
         now = time.time()
@@ -417,9 +445,13 @@ class Accounts:
 
     def uses_default_password(self) -> bool:
         """Стоит ли где-то ещё пароль по умолчанию — для предупреждения в интерфейсе."""
-        row = self.db.query_one(
-            "SELECT password_hash FROM users WHERE username = ? COLLATE NOCASE",
-            [DEFAULT_USERNAME])
+        try:
+            row = self.db.query_one(
+                "SELECT password_hash FROM users WHERE username = ? COLLATE NOCASE",
+                [DEFAULT_USERNAME])
+        except Exception as exc:                               # noqa: BLE001
+            self._warn_unavailable(exc)
+            return False
         if row is None:
             return False
         return verify_password(DEFAULT_PASSWORD, str(row["password_hash"]))

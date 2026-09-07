@@ -501,3 +501,62 @@ def test_the_key_field_lives_in_one_place(repo_root: Path):
     # «войти по ключу» на экране входа — туда попадают, ещё не войдя, — и
     # раздел «Доступ». Третье место означало бы, что поля снова разошлись.
     assert app.count("localStorage.setItem('asrhub_key'") == 2
+
+
+# ---------------------------------------------------------------------------
+# Незавершённая миграция
+# ---------------------------------------------------------------------------
+
+
+def _drop_account_tables(db) -> None:
+    """Приводит базу к состоянию «миграция не доехала»."""
+    with db.write() as conn:
+        conn.execute("DROP TABLE IF EXISTS sessions")
+        conn.execute("DROP TABLE IF EXISTS users")
+
+
+def test_missing_tables_do_not_break_every_request(tmp_path):
+    """Без таблиц вход выключается, а сервер продолжает работать.
+
+    Раньше отсутствие `users` роняло `session_account` исключением на каждом
+    запросе, который приносил куку, — то есть на всём интерфейсе. Одна
+    незавершённая миграция превращалась из «нельзя войти паролем» в «не
+    работает ничего», притом что ключи доступа к базе не обращаются вовсе.
+    """
+    from asrhub.accounts import Accounts
+    from asrhub.db import Database
+
+    db = Database(tmp_path / "asrhub.db")
+    accounts = Accounts(db)
+    account = accounts.create("пётр", "пароль-подлиннее")
+    token, _ = accounts.open_session(account.id)
+    assert accounts.session_account(token) is not None
+    assert accounts.available() is True
+
+    _drop_account_tables(db)
+
+    assert accounts.available() is False
+    assert accounts.session_account(token) is None      # не исключение, а «нет входа»
+    assert accounts.uses_default_password() is False
+    db.close()
+
+
+def test_account_failure_is_reported_once(tmp_path, caplog):
+    """Жалоба на сломанную базу пишется один раз, а не на каждый запрос."""
+    import logging
+
+    from asrhub.accounts import Accounts
+    from asrhub.db import Database
+
+    db = Database(tmp_path / "asrhub.db")
+    accounts = Accounts(db)
+    account = accounts.create("пётр", "пароль-подлиннее")
+    token, _ = accounts.open_session(account.id)
+    _drop_account_tables(db)
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(20):
+            accounts.session_account(token)
+    complaints = [r for r in caplog.records if "Учётные записи недоступны" in r.getMessage()]
+    assert len(complaints) == 1, f"журнал забит повторами: {len(complaints)}"
+    db.close()

@@ -1280,20 +1280,36 @@ if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-HEALTH_OK=0
-for attempt in $(seq 1 20); do
-  if have curl && curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
-    HEALTH_OK=1; break
-  fi
-  sleep 2
-done
-
-if [[ "${HEALTH_OK}" -eq 1 ]]; then
-  ok "Сервер отвечает на http://127.0.0.1:${PORT}"
+HEALTH_RC=0
+if [[ "${CREATE_SERVICE}" -eq 0 && "${MODE}" == "native" ]]; then
+  # Службы нет — стучаться некуда, и «сервер не отвечает» здесь означало бы
+  # только то, что мы сами его не запускали.
+  info "Служба не создавалась — сервер нужно запустить вручную."
+  HEALTH_RC=3
 else
-  warn "Сервер пока не отвечает."
-  hint "Проверьте состояние: bash ${PREFIX}/scripts/service.sh status"
-  hint "Журнал службы: bash ${PREFIX}/scripts/service.sh logs"
+  # Сервер, привязанный к конкретному адресу, на 127.0.0.1 не ответит.
+  PROBE_HOST="127.0.0.1"
+  case "${HOST}" in
+    ""|0.0.0.0|::|"*"|localhost|127.0.0.1) : ;;
+    *) PROBE_HOST="${HOST}" ;;
+  esac
+  wait_for_health "${PORT}" 60 asrhub "${PROBE_HOST}" || HEALTH_RC=$?
+fi
+
+if [[ "${HEALTH_RC}" -eq 0 ]]; then
+  ok "Сервер отвечает на http://${PROBE_HOST:-127.0.0.1}:${PORT}"
+elif [[ "${HEALTH_RC}" -eq 2 ]]; then
+  warn "Сервер запустился, но сообщает о неисправности (код ${HTTP_STATUS})."
+  printf '%s\n' "${HTTP_BODY}" | head -20 | sed 's/^/  /' >&2
+  hint "Проверка окружения: bash ${PREFIX}/scripts/doctor.sh"
+elif [[ "${HEALTH_RC}" -ne 3 ]]; then
+  warn "Сервер не отвечает."
+  # Установка на этом не обрывается: файлы на месте, и человеку нужнее
+  # причина и остальная часть итога, чем прерванный на предпоследнем шаге
+  # сценарий. Поэтому здесь разбор, а не выход с ошибкой.
+  diagnose_server_down "${PORT}" "${PREFIX}" "${DATA_DIR}" \
+    "$( [[ "${MODE}" == "docker" ]] && echo docker || echo native )" \
+    asrhub "${PROBE_HOST:-127.0.0.1}" || true
 fi
 
 clear_rollback

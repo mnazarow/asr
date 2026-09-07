@@ -448,9 +448,8 @@ def test_health_says_degraded_when_the_database_is_gone(data_dir, monkeypatch):
     Иначе балансировщик держит в строю сервер, который принимает запросы и
     падает на каждом: 200 при мёртвой базе — это не «здоров», а «врёт».
     """
-    from fastapi.testclient import TestClient
-
     from asrhub.api.app import create_app
+    from fastapi.testclient import TestClient
 
     monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
     app = create_app(start_queue=False)
@@ -495,3 +494,27 @@ def test_paused_queue_is_not_an_unhealthy_server(client):
         assert paused.json()["checks"]["queue"] == "приостановлена"
     finally:
         client.post("/api/queue/resume")
+
+
+def test_server_starts_even_when_login_setup_fails(data_dir, monkeypatch):
+    """Сбой при заведении admin не должен мешать серверу подняться.
+
+    Вход по логину — удобство поверх ключей доступа, а не условие работы.
+    Пока `ensure_default_admin` вызывался без прикрытия, любая заминка в нём
+    (права на базу, недоехавшая миграция) убивала процесс на старте — и
+    забирала с собой распознавание, интерфейс и саму возможность увидеть в
+    журнале, что именно случилось.
+    """
+    from asrhub import accounts as accounts_module
+
+    def взрыв(self):
+        raise RuntimeError("база только для чтения")
+
+    monkeypatch.setattr(accounts_module.Accounts, "ensure_default_admin", взрыв)
+    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
+    app = create_app(load(), start_queue=False)
+    with TestClient(app) as broken:
+        assert broken.get("/api/health").status_code == 200
+        # Ключи доступа продолжают работать: они базы учётных записей не
+        # касаются вовсе.
+        assert broken.get("/api/catalog").status_code == 200

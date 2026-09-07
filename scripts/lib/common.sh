@@ -411,6 +411,29 @@ diagnose_pip_failure() {
     return 0
   fi
 
+  # Пакет прямо объявил, что не работает на этой версии Python. Это видно по
+  # строке «Ignored the following versions that require a different python
+  # version» — и это совсем не то же самое, что «колёса ещё не собрали»:
+  # ждать бесполезно, ограничение стоит в метаданных пакета.
+  if [[ "${text}" == *"require a different python version"* \
+     && ( "${text}" == *"No matching distribution found"* \
+       || "${text}" == *"Could not find a version that satisfies"* ) ]]; then
+    local wanted supported
+    wanted="$(printf '%s' "${text}" \
+      | sed -n 's/.*No matching distribution found for \(.*\)/\1/p' | head -1)"
+    # Ограничения перечислены по возрастанию версий — берём последнее, оно
+    # относится к самому свежему выпуску.
+    supported="$(printf '%s' "${text}" \
+      | grep -o 'Requires-Python [^;]*' | tail -1 | sed 's/Requires-Python //')"
+    error "Пакет${wanted:+ «${wanted}»} не поддерживает ${pyname}."
+    [[ -n "${supported}" ]] && hint "Последний выпуск требует Python ${supported}."
+    hint "Это ограничение автора пакета, а не задержка сборки: ждать нечего."
+    hint "Соберите окружение на проверенной версии:"
+    hint "  sudo bash scripts/install.sh --python /usr/bin/python${ASRHUB_MAX_PYTHON} --force"
+    hint "Либо оставьте этот движок неустановленным — на распознавание он не влияет."
+    return 0
+  fi
+
   # Автономный режим отличаем до общего разбора: без индекса pip говорит ровно
   # то же самое — «нет подходящей версии», — и совет про версию Python увёл бы
   # в сторону от настоящей причины, пустого кеша.
@@ -827,6 +850,376 @@ check_network() {
     wget -q --timeout=8 --spider "https://${host}" 2>/dev/null && return 0
   fi
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Живость сервера: проверка и разбор причин
+# ---------------------------------------------------------------------------
+#
+# «Сервер не отвечает» — не диагноз, а вопрос. Дальше идёт всё, чем на него
+# отвечают: кто слушает порт, жива ли служба, что в её журнале и запускается
+# ли пакет тем python, которым его запускает служба. Без этого человек после
+# неудачного обновления оставался с одной строкой на экране и шёл искать
+# причину сам.
+
+#: Заполняются http_probe.
+HTTP_STATUS=""
+HTTP_BODY=""
+
+# Один HTTP-запрос, не привязанный к конкретной утилите.
+#
+#   http_probe АДРЕС [ТАЙМАУТ]
+#
+#   0 — ответ получен: код в HTTP_STATUS, тело в HTTP_BODY;
+#   1 — соединения нет;
+#   2 — проверять нечем (нет ни curl, ни python3, ни wget).
+#
+# Код ответа нужен целиком, а не «получилось/нет»: 503 от живого сервера и
+# отказ в соединении — это две разные поломки с разным лечением, а `curl -f`
+# сводит их к одному пустому «не удалось».
+http_probe() {
+  local url="$1" timeout="${2:-3}" out="" status=0
+  HTTP_STATUS=""; HTTP_BODY=""
+  if have curl; then
+    out="$(curl -sS --max-time "${timeout}" -w $'\n%{http_code}' "${url}" 2>/dev/null)" || return 1
+    HTTP_STATUS="${out##*$'\n'}"
+    HTTP_BODY="${out%$'\n'*}"
+    [[ "${HTTP_STATUS}" =~ ^[0-9]{3}$ ]] || return 1
+    return 0
+  fi
+  local py=""
+  for py in "${ASRHUB_PROBE_PYTHON:-}" python3 python; do
+    [[ -n "${py}" ]] && have "${py}" && break
+    py=""
+  done
+  if [[ -n "${py}" ]]; then
+    out="$("${py}" - "${url}" "${timeout}" <<'PYEOF' 2>/dev/null
+import sys, urllib.error, urllib.request
+url, timeout = sys.argv[1], float(sys.argv[2])
+try:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        code, body = response.status, response.read(4096)
+except urllib.error.HTTPError as exc:          # ответ есть, просто неуспешный
+    code, body = exc.code, exc.read(4096)
+except Exception:                              # соединения нет вовсе
+    sys.exit(1)
+sys.stdout.write(f"{code}\n")
+sys.stdout.write(body.decode("utf-8", "replace"))
+PYEOF
+    )" || return 1
+    HTTP_STATUS="${out%%$'\n'*}"
+    HTTP_BODY="${out#*$'\n'}"
+    [[ "${HTTP_STATUS}" =~ ^[0-9]{3}$ ]] || return 1
+    return 0
+  fi
+  if have wget; then
+    # wget не показывает код ответа отдельно от тела, поэтому различаем
+    # только «ответил» и «нет»: код 8 — это ответ сервера об ошибке.
+    HTTP_BODY="$(wget -q -O - --tries=1 --timeout="${timeout}" "${url}" 2>/dev/null)" || status=$?
+    if [[ ${status} -eq 0 ]]; then HTTP_STATUS="200"; return 0; fi
+    if [[ ${status} -eq 8 ]]; then HTTP_STATUS="500"; return 0; fi
+    return 1
+  fi
+  return 2
+}
+
+# Открыт ли TCP-порт. Последний рубеж: работает и там, где нет ни одной
+# сетевой утилиты, — bash умеет открывать сокеты сам.
+port_open() {
+  local host="${1:-127.0.0.1}" port="$2"
+  if have curl; then
+    curl -sS --max-time 2 -o /dev/null "http://${host}:${port}/" 2>/dev/null && return 0
+  fi
+  ( exec 3<>"/dev/tcp/${host}/${port}" ) >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# Кто занял порт — строкой для человека. Пусто, если выяснить нечем.
+port_owner() {
+  local port="$1" line=""
+  if have ss; then
+    line="$(set +o pipefail; ss -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -3 || true)"
+  elif have lsof; then
+    line="$(set +o pipefail; lsof -iTCP:"${port}" -sTCP:LISTEN -n -P 2>/dev/null | sed -n '2,4p' || true)"
+  elif have netstat; then
+    line="$(set +o pipefail; netstat -anp 2>/dev/null | grep -E "[:.]${port}[[:space:]].*LISTEN" | head -3 || true)"
+  fi
+  printf '%s' "${line}"
+}
+
+# Состояние службы одним словом: running, activating, failed, inactive,
+# unknown. Возвращает 0, только когда служба действительно работает.
+#
+#   service_state [ИМЯ_СЛУЖБЫ]
+service_state() {
+  local name="${1:-asrhub}" state=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && have launchctl; then
+    if [[ "$(set +o pipefail; launchctl list 2>/dev/null \
+             | grep -c com.asrhub.server || true)" -gt 0 ]]; then
+      printf 'running'; return 0
+    fi
+    printf 'inactive'; return 1
+  fi
+  if have systemctl; then
+    state="$(systemctl is-active "${name}.service" 2>/dev/null || true)"
+    if [[ -z "${state}" || "${state}" == "unknown" || "${state}" == "inactive" ]]; then
+      # Служба могла быть поставлена не в систему, а текущему пользователю.
+      local user_state
+      user_state="$(systemctl --user is-active "${name}.service" 2>/dev/null || true)"
+      [[ -n "${user_state}" && "${user_state}" != "unknown" ]] && state="${user_state}"
+    fi
+    case "${state}" in
+      active)      printf 'running';    return 0 ;;
+      activating|reloading) printf 'activating'; return 1 ;;
+      failed)      printf 'failed';     return 1 ;;
+      inactive|deactivating) printf 'inactive'; return 1 ;;
+      *)           printf 'unknown';    return 1 ;;
+    esac
+  fi
+  if pgrep -f "m asrhub" >/dev/null 2>&1; then printf 'running'; return 0; fi
+  printf 'unknown'; return 1
+}
+
+# Хвост журнала службы — тем способом, каким он вообще доступен на этой
+# машине. Печатает в stdout; молчит, если журнала нет.
+#
+#   server_log_tail СТРОК КАТАЛОГ_ДАННЫХ [ИМЯ_СЛУЖБЫ]
+server_log_tail() {
+  local lines="${1:-30}" data_dir="${2:-}" name="${3:-asrhub}" text=""
+  if have journalctl; then
+    text="$(journalctl -u "${name}.service" -n "${lines}" --no-pager 2>/dev/null || true)"
+    # journalctl на пустой журнал печатает «-- No entries --»: это не строки
+    # журнала, а сообщение об их отсутствии, и показывать его как причину
+    # падения — значит показывать пустоту с видом ответа.
+    grep -qE '^-- No entries --' <<<"${text}" && text=""
+    if [[ -z "${text}" ]]; then
+      text="$(journalctl --user -u "${name}.service" -n "${lines}" --no-pager 2>/dev/null || true)"
+      grep -qE '^-- No entries --' <<<"${text}" && text=""
+    fi
+  fi
+  if [[ -z "${text}" && -n "${data_dir}" ]]; then
+    local candidate
+    for candidate in "${data_dir}/logs/service.log" "${data_dir}/logs/asrhub.log" \
+                     "${data_dir}/logs/error.log"; do
+      [[ -s "${candidate}" ]] || continue
+      text="$(tail -n "${lines}" "${candidate}" 2>/dev/null || true)"
+      [[ -n "${text}" ]] && break
+    done
+  fi
+  printf '%s' "${text}"
+}
+
+# Пробный запуск пакета тем же python, которым его запускает служба.
+# Возвращает 0, если пакет импортируется; иначе кладёт вывод в
+# STARTUP_TRACEBACK и возвращает 1.
+#
+#   import_probe ПУТЬ_К_PYTHON [КАТАЛОГ_С_ИСХОДНИКАМИ]
+STARTUP_TRACEBACK=""
+import_probe() {
+  local python="$1" src="${2:-}" out="" status=0
+  STARTUP_TRACEBACK=""
+  [[ -x "${python}" ]] || return 2
+  # Импорт, а не запуск: сервер уже, возможно, пытается стартовать в фоне, и
+  # второй настоящий запуск занял бы тот же порт и добавил путаницы.
+  out="$(PYTHONPATH="${src}${src:+:}${PYTHONPATH:-}" "${python}" -c 'import asrhub.api.app' 2>&1)" || status=$?
+  if [[ ${status} -ne 0 ]]; then
+    STARTUP_TRACEBACK="${out}"
+    return 1
+  fi
+  return 0
+}
+
+# Называет причину, по которой сервер не поднялся, по тексту его вывода.
+# Возвращает 0, если причина опознана и напечатана, 1 — если нет.
+#
+#   diagnose_startup_failure ТЕКСТ [ПУТЬ_К_PYTHON] [КАТАЛОГ_ПРОГРАММЫ] [КАТАЛОГ_ДАННЫХ]
+#
+# Порядок — от частного к общему: несовместимая библиотека выглядит как
+# обычная ошибка импорта, и общее правило перехватило бы её первым.
+diagnose_startup_failure() {
+  local text="$1" python="${2:-}" prefix="${3:-.}" data_dir="${4:-}" module=""
+  [[ -n "${text}" ]] || return 1
+
+  if grep -qiE "no space left on device" <<<"${text}"; then
+    error "На диске кончилось место — сервер не может писать ни журнал, ни базу."
+    hint "Освободите место и запустите: bash ${prefix}/scripts/service.sh restart"
+    return 0
+  fi
+  if grep -qiE "address already in use|errno 98|only one usage of each socket" <<<"${text}"; then
+    error "Порт уже занят другим процессом — сервер не смог его открыть."
+    hint "Кто занял: ss -ltnp | grep :ПОРТ"
+    hint "Либо остановите тот процесс, либо задайте другой порт в config.yaml."
+    return 0
+  fi
+  if grep -qiE "permission denied|operation not permitted|errno 13" <<<"${text}"; then
+    error "Не хватает прав на каталог данных или файлы программы."
+    hint "Владелец каталога должен совпадать с пользователем службы."
+    hint "Кто владелец: ls -ld ${data_dir:-КАТАЛОГ_ДАННЫХ}"
+    hint "От кого служба: systemctl show -p User asrhub.service"
+    return 0
+  fi
+  if grep -qiE "unable to open database|database is locked|database disk image is malformed|file is not a database" <<<"${text}"; then
+    error "Сервер не смог открыть базу данных."
+    hint "Проверьте права и свободное место: ls -l ${data_dir:-КАТАЛОГ_ДАННЫХ}/asrhub.db"
+    hint "Проверить целостность: sqlite3 ${data_dir:-КАТАЛОГ_ДАННЫХ}/asrhub.db 'PRAGMA integrity_check;'"
+    return 0
+  fi
+  if grep -qiE "prefer_fwd_module|_eval_type\(\)|typing\._eval_type|unexpected keyword argument.*(annotationlib|fwd)" <<<"${text}"; then
+    error "Библиотека в окружении несовместима с этой версией Python."
+    hint "Чаще всего это pydantic или fastapi: типизация в новых версиях Python"
+    hint "меняется, и старая библиотека на ней просто не импортируется."
+    hint "Обновить: ${python:-python3} -m pip install -U pydantic fastapi"
+    local pyver=""
+    [[ -n "${python}" ]] && pyver="$("${python}" -V 2>&1 | head -1)"
+    if [[ -n "${pyver}" ]]; then
+      hint "Версия Python: ${pyver}"
+      # Предварительные сборки (rc, beta, alpha) — отдельный случай: под них
+      # никто не собирает, и обновление библиотек здесь не поможет.
+      if grep -qiE '(rc|a|b)[0-9]+$|\+?dev' <<<"${pyver}"; then
+        hint "Это предварительная сборка Python — под неё библиотеки не выпускают."
+        hint "Поставьте итоговый выпуск (например, python3.13) и пересоберите окружение:"
+        hint "bash ${prefix}/scripts/install.sh --force --python /usr/bin/python3.13"
+      fi
+    fi
+    return 0
+  fi
+  if grep -qiE "undefined symbol|GLIBC_|cannot open shared object|wrong ELF class|incompatible architecture" <<<"${text}"; then
+    error "Двоичный модуль в окружении собран не под эту систему."
+    hint "Пересоберите окружение поверх нынешнего: bash ${prefix}/scripts/install.sh --force"
+    return 0
+  fi
+  if grep -qiE "libcu|CUDA|nvidia" <<<"${text}"; then
+    error "Не загружаются библиотеки видеокарты."
+    hint "Проверьте драйвер: nvidia-smi"
+    hint "Полная проверка окружения: bash ${prefix}/scripts/doctor.sh"
+    return 0
+  fi
+  module="$(set +o pipefail; grep -oiE "no module named '[^']+'" <<<"${text}" \
+            | head -1 | sed "s/.*'\\(.*\\)'/\\1/" || true)"
+  if [[ -n "${module}" ]]; then
+    error "В окружении нет пакета «${module}» — сервер не смог запуститься."
+    [[ -n "${python}" ]] && hint "Доставить: ${python} -m pip install -r ${prefix}/requirements/base.txt"
+    hint "Или переустановить поверх нынешнего: bash ${prefix}/scripts/install.sh --force"
+    return 0
+  fi
+  if grep -qiE "SyntaxError|IndentationError" <<<"${text}"; then
+    error "Файлы программы повреждены или не соответствуют версии Python."
+    hint "Откатитесь на прежнюю версию: bash ${prefix}/scripts/update.sh --rollback"
+    return 0
+  fi
+  if grep -qiE "yaml|ScannerError|ParserError|Ошибка конфигурации" <<<"${text}"; then
+    error "Сервер не смог прочитать config.yaml."
+    hint "Проверьте отступы и кавычки в файле конфигурации."
+    return 0
+  fi
+  return 1
+}
+
+# Ждёт, пока сервер начнёт отвечать.
+#
+#   wait_for_health ПОРТ [СЕКУНД] [ИМЯ_СЛУЖБЫ] [АДРЕС]
+#
+#   0 — отвечает;
+#   2 — отвечает, но сообщает о неисправности (тело в HTTP_BODY);
+#   1 — не отвечает.
+#
+# Ожидание прерывается досрочно, когда служба уже упала: ждать сорок секунд
+# от процесса, которого нет, — это только задержка перед той же ошибкой.
+wait_for_health() {
+  local port="$1" seconds="${2:-40}" name="${3:-asrhub}" host="${4:-127.0.0.1}"
+  local deadline=$(( SECONDS + seconds )) state="" dead=0
+  while (( SECONDS < deadline )); do
+    if http_probe "http://${host}:${port}/api/health" 3; then
+      [[ "${HTTP_STATUS}" == 2* ]] && return 0
+      return 2
+    fi
+    state="$(service_state "${name}" || true)"
+    if [[ "${state}" == "failed" ]]; then
+      dead=$(( dead + 1 ))
+      # Два раза подряд: systemd между перезапусками показывает failed и
+      # сам же поднимает службу снова — на одном замере это неотличимо от
+      # окончательного падения.
+      if (( dead >= 2 )); then return 1; fi
+    else
+      dead=0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# Печатает всё, что известно о том, почему сервер не отвечает.
+#
+#   diagnose_server_down ПОРТ КАТАЛОГ_ПРОГРАММЫ КАТАЛОГ_ДАННЫХ [РЕЖИМ] [ИМЯ] [АДРЕС]
+#
+# РЕЖИМ: native (по умолчанию) или docker.
+diagnose_server_down() {
+  local port="$1" prefix="$2" data_dir="$3" mode="${4:-native}" name="${5:-asrhub}"
+  local host="${6:-127.0.0.1}"
+  local state="" owner="" logs="" python="${2}/venv/bin/python"
+  [[ -x "${python}" ]] || python="${prefix}/venv/bin/python3"
+
+  printf '\n%sЧто известно%s\n' "${C_BOLD}" "${C_RESET}" >&2
+
+  if [[ "${mode}" == "docker" ]]; then
+    if have docker; then
+      logs="$(cd "${prefix}/docker" 2>/dev/null && docker compose logs --tail 40 2>&1 || true)"
+      [[ -z "${logs}" ]] && logs="$(docker logs --tail 40 asrhub 2>&1 || true)"
+    fi
+  else
+    state="$(service_state "${name}" || true)"
+    case "${state}" in
+      running)    info "Служба запущена, но на запросы не отвечает." ;;
+      activating) info "Служба ещё запускается — возможно, ей нужно больше времени." ;;
+      failed)     error "Служба упала (systemd: failed)." ;;
+      inactive)   error "Служба остановлена и не поднимается." ;;
+      *)          info "Состояние службы определить не удалось." ;;
+    esac
+    logs="$(server_log_tail 40 "${data_dir}" "${name}")"
+  fi
+
+  if port_open "${host}" "${port}"; then
+    info "Порт ${port} открыт, но /api/health не отвечает — сервер занят или отвечает ошибкой."
+  else
+    info "Порт ${port} на ${host} закрыт — сервера на нём нет."
+    owner="$(port_owner "${port}")"
+    if [[ -n "${owner}" ]]; then
+      warn "Порт ${port} занят другой программой:"
+      printf '%s\n' "${owner}" >&2
+    fi
+  fi
+
+  if [[ -n "${logs}" ]]; then
+    printf '\n%sПоследние строки журнала%s\n' "${C_BOLD}" "${C_RESET}" >&2
+    printf '%s\n' "${logs}" | tail -30 | sed 's/^/  /' >&2
+    _log_raw LOGTAIL "${logs}"
+  else
+    info "Журнал службы пуст или недоступен."
+  fi
+
+  # Пробный импорт тем же python: почти всегда причина именно здесь, и
+  # только он показывает её текстом, а не кодом выхода.
+  local probe_text="${logs}"
+  if [[ "${mode}" != "docker" ]] && [[ -x "${python}" ]]; then
+    if ! import_probe "${python}" "${prefix}/server"; then
+      printf '\n%sПробный запуск пакета%s\n' "${C_BOLD}" "${C_RESET}" >&2
+      printf '%s\n' "${STARTUP_TRACEBACK}" | tail -20 | sed 's/^/  /' >&2
+      probe_text="${STARTUP_TRACEBACK}"
+      _log_raw IMPORTFAIL "${STARTUP_TRACEBACK}"
+    else
+      info "Пакет asrhub импортируется — дело не в зависимостях."
+    fi
+  fi
+
+  printf '\n' >&2
+  diagnose_startup_failure "${probe_text}" "${python}" "${prefix}" "${data_dir}" || {
+    error "Причину назвать не удалось."
+    hint "Полный журнал: bash ${prefix}/scripts/service.sh logs -n 200"
+    hint "Запуск вручную (покажет ошибку целиком): ${python} -m asrhub --port ${port}"
+    hint "Состояние службы: bash ${prefix}/scripts/service.sh status"
+    hint "Проверка окружения: bash ${prefix}/scripts/doctor.sh"
+  }
+  return 0
 }
 
 # ---------------------------------------------------------------------------
