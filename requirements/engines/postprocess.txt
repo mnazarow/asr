@@ -1,4 +1,7 @@
 # Пунктуация и нормализация чисел для русского языка.
 # RUPunct (MIT) и sbert_punc_case_ru (Apache-2.0) ставятся через transformers.
 transformers>=4.48
-nemo-text-processing>=1.0
+
+# Нормализация чисел от NeMo вынесена в optional/postprocess.txt:
+# ей нужен компилятор C++, а без неё движок работает — на rus2num
+# или встроенной русской нормализации.

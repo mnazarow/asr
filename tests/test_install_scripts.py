@@ -1514,8 +1514,8 @@ def test_removing_an_engine_also_removes_the_package_itself(repo_root: Path,
     скрипт умирал бы под errexit молча, ничего не удалив.
     """
     source = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
-    block = re.search(r'(  NODEPS="\$\(dirname "\$\{REQ\}"\)/no-deps/\$\(basename "\$\{REQ\}"\)"\n'
-                      r'  PACKAGES=.*?\|\| true\)"\n)', source, re.S)
+    block = re.search(r'(  NODEPS="\$\(dirname "\$\{REQ\}"\)/no-deps/.*?\|\| true\)"\n)',
+                      source, re.S)
     assert block, "не найдена сборка списка пакетов"
 
     engines = tmp_path / "engines"
@@ -1535,8 +1535,15 @@ def test_removing_an_engine_also_removes_the_package_itself(repo_root: Path,
         result = run_bash(script)
         return result.returncode, result.stdout.strip()
 
+    # Необязательная часть ставится вместе с движком — значит и снимается
+    # вместе с ним, иначе её пакеты остаются в окружении насовсем.
+    (engines / "optional").mkdir()
+    (engines / "optional" / "движок.txt").write_text("# лишнее\nтяжёлый>=2\n",
+                                                     encoding="utf-8")
+
     code, out = packages(engines / "движок.txt")
     assert code == 0, "сборка списка оборвалась"
+    assert "тяжёлый" in out, "необязательная часть остаётся в окружении после удаления"
     assert "сам-движок" in out, "движок из репозитория не попал в список"
     assert "git+" not in out, "в список попал адрес репозитория"
     assert "хydra-core" in out and ">=" not in out
@@ -2103,3 +2110,151 @@ def test_update_replaces_files_without_overwriting_them_in_place(repo_root: Path
     плохо = run_bash(f'bash "{опасно}"')
     assert "конец" not in плохо.stdout, \
         "запись поверх перестала быть опасной — проверка выше потеряла смысл"
+
+
+def test_missing_compiler_and_missing_headers_are_different_answers(repo_root: Path):
+    """«Нужны компилятор и заголовки» отправляло ставить оба, когда нет одного."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    без_компилятора = (
+        "      building '_pywrapfst' extension\n"
+        "      x86_64-linux-gnu-g++ -fPIC -I/usr/include/python3.14 -c extensions/_pywrapfst.cpp\n"
+        "      error: [Errno 2] No such file or directory: 'x86_64-linux-gnu-g++'\n"
+        "  ERROR: Failed building wheel for pynini\n")
+    без_заголовков = ("      fatal error: Python.h: No such file or directory\n"
+                      "  ERROR: Failed building wheel for editdistance\n")
+
+    def разбор(вывод: str, tmp: Path) -> str:
+        файл = tmp / "pip.log"
+        файл.write_text(вывод, encoding="utf-8")
+        result = run_bash(f'source "{common}"; diagnose_pip_failure "{файл}" "" 0')
+        return result.stdout + result.stderr
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as каталог:
+        tmp = Path(каталог)
+        первый = разбор(без_компилятора, tmp)
+        assert "компилятора" in первый and "заголовки Python на месте" in первый, первый
+        assert "-dev" not in первый, "предлагает ставить заголовки, которых хватает"
+        assert "pynini" in первый, "не назван пакет, на котором всё встало"
+
+        второй = разбор(без_заголовков, tmp)
+        assert "заголовков Python" in второй and "-dev" in второй, второй
+        assert "build-essential" not in второй, "предлагает компилятор, который есть"
+
+
+@pytest.mark.parametrize("вывод, постоянная", [
+    ("error: [Errno 2] No such file or directory: 'x86_64-linux-gnu-g++'\n"
+     "ERROR: Failed building wheel for pynini", True),
+    ("ERROR: ResolutionImpossible: for help visit …", True),
+    ("ERROR: Ignored the following versions that require a different python version", True),
+    ("ERROR: Could not install packages … No space left on device", True),
+    ("WARNING: Retrying … Read timed out.", False),
+    ("ERROR: Connection refused", False),
+    ("ERROR: Temporary failure in name resolution", False),
+])
+def test_hopeless_pip_failures_are_not_retried(repo_root: Path, tmp_path: Path,
+                                               вывод: str, постоянная: bool):
+    """Повтор сборки без компилятора — это те же минуты ради того же отказа.
+
+    И в журнале от него два одинаковых полотна вместо одного: причину в них
+    искать ровно вдвое дольше.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    файл = tmp_path / "pip.log"
+    файл.write_text(вывод, encoding="utf-8")
+    script = f'''
+      source "{common}"
+      if pip_failure_is_permanent "{файл}"; then echo "постоянная"; else echo "повторяем"; fi
+    '''
+    ответ = run_bash(script).stdout.strip()
+    assert ответ == ("постоянная" if постоянная else "повторяем"), f"{вывод!r} -> {ответ}"
+
+
+def test_pip_stops_after_the_first_hopeless_attempt(repo_root: Path, tmp_path: Path):
+    """Проверяем не намерение, а число запусков pip."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    счётчик = tmp_path / "запуски"
+    поддельный_pip = tmp_path / "pip"
+    поддельный_pip.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo x >> "{счётчик}"\n'
+        'echo "ERROR: Failed building wheel for pynini"\n'
+        'echo "error: [Errno 2] No such file or directory: \'x86_64-linux-gnu-g++\'"\n'
+        'exit 1\n', encoding="utf-8")
+    поддельный_pip.chmod(0o755)
+
+    result = run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+                      f'pip_install "{поддельный_pip}" 3 -r требования.txt || true')
+    запусков = len(счётчик.read_text(encoding="utf-8").split()) if счётчик.exists() else 0
+    assert запусков == 1, f"pip запускался {запусков} раза вместо одного"
+    assert "компилятора" in result.stdout + result.stderr, "причина не названа"
+
+    # А сетевой сбой по-прежнему заслуживает второй попытки.
+    счётчик.unlink()
+    поддельный_pip.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo x >> "{счётчик}"\n'
+        'echo "WARNING: Retrying … Read timed out."\n'
+        'exit 1\n', encoding="utf-8")
+    поддельный_pip.chmod(0o755)
+    run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+             f'pip_install "{поддельный_pip}" 2 -r требования.txt || true')
+    assert len(счётчик.read_text(encoding="utf-8").split()) == 2, "сетевой сбой не повторили"
+
+
+def test_optional_part_of_an_engine_does_not_sink_the_engine(repo_root: Path,
+                                                             tmp_path: Path):
+    """Движок не должен пропадать целиком из-за необязательной части.
+
+    postprocess ставится ради расстановки знаков препинания, а падал на
+    нормализаторе чисел, которому нужен компилятор C++. Человек оставался
+    без всего движка из-за возможности, о которой мог и не знать, — притом
+    что сервер и без неё нормализует числа встроенными средствами.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    engines = tmp_path / "engines"
+    (engines / "optional").mkdir(parents=True)
+    (engines / "движок.txt").write_text("основной-пакет>=1\n", encoding="utf-8")
+    (engines / "optional" / "движок.txt").write_text(
+        "# комментарий\nтяжёлый-пакет>=2\n", encoding="utf-8")
+
+    журнал = tmp_path / "вызовы"
+    pip = tmp_path / "pip"
+    pip.write_text('#!/usr/bin/env bash\n'
+                   f'printf "%s\\n" "$*" >> "{журнал}"\n'
+                   # Необязательный файл не собирается: нет компилятора.
+                   # Шаблон со слэшами: каталог самого теста тоже содержит
+                   # слово «optional», и без них совпадал бы любой вызов.
+                   'case "$*" in */optional/*) '
+                   'echo "ERROR: Failed building wheel for тяжёлый-пакет"; '
+                   'echo "error: [Errno 2] No such file or directory: \'x86_64-linux-gnu-g++\'"; '
+                   'exit 1 ;; esac\n'
+                   'exit 0\n', encoding="utf-8")
+    pip.chmod(0o755)
+
+    result = run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+                      f'install_engine_requirements "{pip}" "{engines}/движок.txt"; '
+                      f'echo "код: $?"')
+    вывод = result.stdout + result.stderr
+    assert "код: 0" in вывод, f"движок объявлен неустановленным: {вывод[-500:]!r}"
+    assert "Необязательная часть" in вывод, "молча пропущенная часть — это тоже плохо"
+    assert "тяжёлый-пакет" in вывод, "не сказано, чего именно не хватает"
+    вызовы = журнал.read_text(encoding="utf-8").splitlines()
+    assert len(вызовы) == 2, f"необязательную часть повторяли: {вызовы}"
+    assert вызовы[0].endswith("engines/движок.txt"), вызовы
+    assert вызовы[1].endswith("engines/optional/движок.txt"), вызовы
+
+
+def test_postprocess_installs_without_a_compiler(repo_root: Path):
+    """Требования движка postprocess не должны требовать сборки из исходников."""
+    основной = (repo_root / "requirements" / "engines" / "postprocess.txt").read_text(
+        encoding="utf-8")
+    строки = [s.strip() for s in основной.splitlines()
+              if s.strip() and not s.strip().startswith("#")]
+    assert "nemo-text-processing>=1.0" not in строки, \
+        "нормализатор с компилятором снова в обязательной части"
+    assert any(s.startswith("transformers") for s in строки), "потеряна пунктуация"
+
+    необязательный = repo_root / "requirements" / "engines" / "optional" / "postprocess.txt"
+    assert необязательный.exists(), "нормализатор потерян, а не вынесен"
+    assert "nemo-text-processing" in необязательный.read_text(encoding="utf-8")

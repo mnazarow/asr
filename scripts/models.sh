@@ -475,7 +475,11 @@ remove-engine)
   # то есть на файле из одних комментариев — и под errexit скрипт умирал бы
   # молча, ничего не удалив.
   NODEPS="$(dirname "${REQ}")/no-deps/$(basename "${REQ}")"
-  PACKAGES="$(cat "${REQ}" "${NODEPS}" 2>/dev/null \
+  # И необязательную часть: она ставится вместе с движком, значит и
+  # снимается вместе с ним — иначе в окружении оставался бы пакет, которого
+  # в списке движка уже нет.
+  OPTIONAL="$(dirname "${REQ}")/optional/$(basename "${REQ}")"
+  PACKAGES="$(cat "${REQ}" "${NODEPS}" "${OPTIONAL}" 2>/dev/null \
     | grep -vE '^\s*(#|$|--)' \
     | sed -e 's/[[:space:]]*@.*//' -e 's/[<>=!].*//' \
     | tr '\n' ' ' || true)"

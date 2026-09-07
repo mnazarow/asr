@@ -474,11 +474,42 @@ diagnose_pip_failure() {
   if [[ "${text}" == *"Could not build wheels"* || "${text}" == *"Failed building wheel"* \
      || "${text}" == *"error: command '"* || "${text}" == *"gcc: fatal error"* \
      || "${text}" == *"Python.h: No such file"* ]]; then
-    local package
+    local package build_pkg="build-essential" dev_pkg="python${pyver:-3}-dev"
     package="$(printf '%s' "${text}" | sed -n 's/.*Failed building wheel for \(.*\)/\1/p' | head -1)"
+    # Имена пакетов у каждого дистрибутива свои; detect.sh знает их, но
+    # подключён не всегда — тогда остаются имена Debian.
+    if declare -f system_package_names >/dev/null 2>&1; then
+      build_pkg="$(system_package_names build)"
+    fi
+
+    # Компилятора нет и заголовков нет — это две разные установки, и звучали
+    # они одинаково: человек ставил оба пакета, хотя не хватало одного.
+    # Признак первой: сборка не смогла запустить сам компилятор.
+    local no_compiler=0 no_headers=0
+    if [[ "${text}" == *"No such file or directory: '"*"g++'"* \
+       || "${text}" == *"No such file or directory: '"*"gcc'"* \
+       || "${text}" == *"unable to execute"*"cc"* \
+       || "${text}" == *"command 'gcc' failed: No such file"* \
+       || "${text}" == *"command 'cc' failed: No such file"* \
+       || "${text}" == *"command 'g++' failed: No such file"* ]]; then
+      no_compiler=1
+    fi
+    [[ "${text}" == *"Python.h: No such file"* ]] && no_headers=1
+
     error "Готового пакета нет, а собрать из исходников нечем${package:+ (${package})}."
-    hint "Нужны компилятор и заголовки Python:"
-    hint "  sudo apt install build-essential python${pyver:-3}-dev"
+    if [[ ${no_compiler} -eq 1 && ${no_headers} -eq 0 ]]; then
+      hint "Не хватает компилятора C++ — заголовки Python на месте:"
+      hint "  sudo apt install ${build_pkg}"
+    elif [[ ${no_headers} -eq 1 && ${no_compiler} -eq 0 ]]; then
+      hint "Компилятор есть, не хватает заголовков Python:"
+      hint "  sudo apt install ${dev_pkg}"
+    else
+      hint "Нужны компилятор и заголовки Python:"
+      hint "  sudo apt install ${build_pkg} ${dev_pkg}"
+    fi
+    hint "Собирать приходится потому, что готового колеса у пакета нет${pyver:+ под Python ${pyver}}."
+    hint "Если ставить компилятор не хочется — движок можно пропустить,"
+    hint "остальные продолжат работать."
     return 0
   fi
 
@@ -531,11 +562,27 @@ diagnose_pip_failure() {
 # update.sh, и файл-спутник попал бы в него как отдельный «движок».
 install_engine_requirements() {
   local pip="$1" req="$2"; shift 2
-  local nodeps
-  nodeps="$(dirname "${req}")/no-deps/$(basename "${req}")"
+  local dir names nodeps optional
+  dir="$(dirname "${req}")"
+  nodeps="${dir}/no-deps/$(basename "${req}")"
+  optional="${dir}/optional/$(basename "${req}")"
   pip_install "${pip}" 2 "$@" -r "${req}" || return 1
   if [[ -f "${nodeps}" ]]; then
     pip_install "${pip}" 2 "$@" --no-deps -r "${nodeps}" || return 1
+  fi
+  if [[ -f "${optional}" ]]; then
+    # Необязательная часть: движок работает и без неё, просто беднее. Ронять
+    # из-за такой части весь движок нельзя — человек остаётся без всего
+    # сразу, хотя не хватает одной возможности, о которой он мог и не знать.
+    # Так и вышло с postprocess: расстановка знаков препинания не ставилась
+    # из-за нормализатора чисел, которому нужен компилятор C++.
+    if ! pip_install "${pip}" 1 "$@" -r "${optional}"; then
+      names="$(set +o pipefail; grep -vE '^[[:space:]]*(#|$)' "${optional}" 2>/dev/null \
+               | sed 's/[<>=!;[].*//' | tr -d '[:space:]' | paste -sd, - || true)"
+      warn "Необязательная часть движка не установилась${names:+: ${names}}."
+      hint "Движок будет работать без неё; что именно теряется — в описании движка."
+      hint "Причина названа выше; поставить позже: ${pip} install -r ${optional}"
+    fi
   fi
   return 0
 }
@@ -548,6 +595,40 @@ install_engine_requirements() {
 # повторять бессмысленно, когда колеса под эту версию Python просто нет:
 # причина называется сразу после последней попытки, и пользователю не нужно
 # искать её в выводе pip.
+# Можно ли надеяться, что следующая попытка пройдёт удачнее.
+#
+#   pip_failure_is_permanent ФАЙЛ_С_ВЫВОДОМ
+#
+# 0 — причина не зависит от попытки (нет компилятора, конфликт версий, нет
+# колеса под этот Python, кончилось место), 1 — могло не повезти со связью.
+#
+# Повтор сборки, упавшей из-за отсутствия компилятора, — это ещё раз скачать
+# сотни мегабайт и ещё раз потратить минуты на тот же отказ. В журнале при
+# этом два одинаковых полотна вместо одного, и найти в них причину вдвое
+# труднее.
+pip_failure_is_permanent() {
+  local file="$1" text=""
+  [[ -f "${file}" ]] || return 1
+  text="$(cat "${file}" 2>/dev/null || true)"
+  [[ -n "${text}" ]] || return 1
+  if [[ "${text}" == *"ResolutionImpossible"* \
+     || "${text}" == *"conflicting dependencies"* \
+     || "${text}" == *"No matching distribution found"* \
+     || "${text}" == *"Ignored the following versions that require a different python version"* \
+     || "${text}" == *"requires a different Python"* \
+     || "${text}" == *"Failed building wheel"* \
+     || "${text}" == *"Could not build wheels"* \
+     || "${text}" == *"Python.h: No such file"* \
+     || "${text}" == *"externally-managed-environment"* \
+     || "${text}" == *"No space left on device"* \
+     || "${text}" == *"Permission denied"* \
+     || "${text}" == *"is not a valid editable requirement"* \
+     || "${text}" == *"Invalid requirement"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
 pip_install() {
   local pip="$1" attempts="$2"; shift 2
   local capture status=0 label="" arg offline=0
@@ -560,11 +641,28 @@ pip_install() {
   done
   capture="$(mktemp "${TMPDIR:-/tmp}/asrhub-pip.XXXXXX")"
   register_temp "${capture}"
-  # Присваивание перед вызовом функции в разных bash ведёт себя по-разному
-  # (в 3.2 на macOS оно переживает вызов), поэтому ставим и снимаем вручную.
-  ASRHUB_RETRY_LABEL="установка пакетов (${label:-без имени})"
-  retry "${attempts}" run_pip "${capture}" "${pip}" install "$@" || status=$?
-  unset ASRHUB_RETRY_LABEL
+  # Свой цикл вместо retry: повторять стоит только то, что могло не выйти
+  # случайно. Отказ из-за отсутствия компилятора или конфликта версий второй
+  # раз даст ровно тот же отказ, но вдвое дольше и вдвое длиннее в журнале.
+  local attempt=1 delay=2
+  while true; do
+    : > "${capture}"                    # разбираем последнюю попытку, не смесь
+    status=0
+    run_pip "${capture}" "${pip}" install "$@" || status=$?
+    [[ ${status} -eq 0 ]] && break
+    if pip_failure_is_permanent "${capture}"; then
+      [[ ${attempt} -gt 1 ]] && error "Установка не удалась: установка пакетов (${label:-без имени})"
+      break
+    fi
+    if [[ ${attempt} -ge ${attempts} ]]; then
+      error "Не удалось выполнить после ${attempts} попыток: установка пакетов (${label:-без имени})"
+      break
+    fi
+    warn "Попытка ${attempt} из ${attempts} не удалась (код ${status}), повтор через ${delay} с…"
+    sleep "${delay}"
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
   if [[ ${status} -ne 0 ]]; then
     diagnose_pip_failure "${capture}" "$(dirname "${pip}")/python" "${offline}" || true
     # Полный вывод кладём в журнал: скрипты обещают его строкой «Полный
