@@ -451,6 +451,26 @@ def test_api_key_is_accepted_in_the_request_body(data_dir, monkeypatch):
         assert refused.status_code == 401
         assert refused.json()["code"] == "auth_error"
 
+        # Пустое поле называется прямо. «Ключ отсутствует или недействителен»
+        # отправляло проверять правильность ключа того, у кого ключа в
+        # запросе просто нет, — а искать причину он шёл на сервере.
+        пустой = client.post("/api/process-call", json=dict(body, api_key=""))
+        assert пустой.status_code == 401
+        тело = пустой.json()
+        assert "api_key" in тело["message"] and "пуст" in тело["message"], тело
+        assert "ah_" in тело["hint"], "не сказано, что вписывать в поле"
+
+        # Поля нет вовсе — подсказка обязана назвать все три способа, а не
+        # только заголовки: этот адрес читает ключ и из тела.
+        без_поля = dict(body)
+        без_поля.pop("api_key")
+        нет = client.post("/api/process-call", json=без_поля)
+        assert нет.status_code == 401
+        assert "api_key" in нет.json()["hint"], нет.json()
+
+        # Неверный ключ — другой разговор: поле заполнено, лечение иное.
+        assert "недействителен" in refused.json()["message"], refused.json()
+
         # Тот же адрес без префикса /api — как у phone_asr.
         assert client.post("/process-call", json=body).status_code != 401
 
@@ -512,3 +532,59 @@ class _FakeSettings:
 
     def get(self, key, default=None):
         return {"webhook_secret": "", "webhook_workers": 1}.get(key, default)
+
+
+@pytest.mark.parametrize("адрес, ожидание", [
+    # Каталог — как в phone_asr: суффикс дописывается.
+    ("https://vdk.kholod.space/проект",
+     "https://vdk.kholod.space/проект/callback-endpoint.php"),
+    ("https://vdk.kholod.space",
+     "https://vdk.kholod.space/callback-endpoint.php"),
+    # Точка в имени каталога — ещё не приёмник.
+    ("https://host/v1.2", "https://host/v1.2/callback-endpoint.php"),
+    # Полный адрес приёмника остаётся собой.
+    ("https://vdk.kholod.space/callback-endpoint.php",
+     "https://vdk.kholod.space/callback-endpoint.php"),
+    ("https://host/cb.php?token=1", "https://host/cb.php?token=1"),
+    ("https://host/приём/handler.aspx", "https://host/приём/handler.aspx"),
+])
+def test_callback_address_is_not_glued_twice(адрес: str, ожидание: str):
+    """base_url, уже указывающий на приёмник, не получает суффикс второй раз.
+
+    Раньше получалось «…/callback-endpoint.php/callback-endpoint.php»:
+    разговор принимался, расшифровывался целиком, а результат уходил в
+    никуда — и молча, потому что 404 отвечает чужой сервер, а у нас это
+    выглядит просто неудачной доставкой.
+    """
+    from asrhub import phone_compat
+
+    call = phone_compat.PhoneRequest(call_id="1", files=[],
+                                     base_url=phone_compat.normalise_base_url(адрес))
+    assert call.target_url() == ожидание
+
+
+def test_accepted_answer_names_the_real_callback_address(data_dir, monkeypatch):
+    """В ответе 202 стоит тот адрес, на который результат придёт на самом деле."""
+    from pathlib import Path
+
+    from asrhub.api.app import create_app
+    from fastapi.testclient import TestClient
+
+    from asrhub.api import routes_phone
+
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    # Приём запускает скачивание записи в отдельном потоке; здесь проверяется
+    # ответ, а не загрузка, и ходить в сеть из теста незачем.
+    monkeypatch.setattr(routes_phone, "_accept", lambda *a, **k: None)
+    with TestClient(create_app(start_queue=False)) as client:
+        key = (Path(data_dir) / "api-key.txt").read_text(encoding="utf-8").strip()
+        ответ = client.post("/api/process-call", json={
+            "call_id": "5595633350",
+            "base_url": "https://пример.рф/callback-endpoint.php",
+            "api_key": key,
+            "files": ["https://пример.рф/calls/5595633350_a.wav"],
+        })
+        assert ответ.status_code == 202, ответ.text
+        сообщение = ответ.json()["message"]
+        assert сообщение.count("callback-endpoint.php") == 1, сообщение

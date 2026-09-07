@@ -217,7 +217,17 @@ def authenticate(request: Request,
         session = _session_principal(request, state)
         if session is not None:
             return session
-        raise AuthError("Ключ доступа отсутствует или недействителен.")
+        # «Отсутствует или недействителен» — это два разных случая с разным
+        # лечением, а звучали они одинаково: тот, кто вовсе не передал ключ,
+        # шёл проверять его правильность, а тот, у кого ключ отозван, —
+        # искать, куда его вписать. Различать их безопасно: ответ не
+        # рассказывает, какие ключи существуют.
+        if not token:
+            raise AuthError("Ключ доступа не передан.")
+        raise AuthError("Ключ доступа недействителен.",
+                        hint="Проверьте, что ключ скопирован целиком (он начинается "
+                             "с «ah_») и не отозван. Список ключей — в разделе "
+                             "«Доступ» веб-интерфейса.")
     if info.get("enabled") is False:
         raise ForbiddenError("Ключ доступа отключён.")
 
@@ -250,6 +260,7 @@ async def authenticate_body_key(request: Request) -> Principal:
     его как обычно и вторым чтением ничего не ломает.
     """
     token = ""
+    field_present = False
     content_type = request.headers.get("content-type", "")
     if content_type.split(";", 1)[0].strip() == "application/json":
         try:
@@ -257,10 +268,28 @@ async def authenticate_body_key(request: Request) -> Principal:
         except Exception:                       # тело не JSON — не наша забота
             payload = None
         if isinstance(payload, dict):
+            field_present = "api_key" in payload
             token = str(payload.get("api_key") or "")
-    return authenticate(request,
-                        x_api_key=token or request.headers.get("X-API-Key"),
-                        authorization=request.headers.get("Authorization"))
+    try:
+        return authenticate(request,
+                            x_api_key=token or request.headers.get("X-API-Key"),
+                            authorization=request.headers.get("Authorization"))
+    except AuthError as exc:
+        # Подсказка по умолчанию зовёт в заголовки, а этот адрес читает ключ
+        # ещё и из тела — именно так его и присылают. Пустое поле api_key
+        # при этом называется прямо: догадаться по «ключ не передан», что
+        # поле есть, но в нём ничего нет, нельзя.
+        if not token and field_present:
+            raise AuthError(
+                "Поле api_key в теле запроса пустое.",
+                hint="Впишите в него ключ доступа (начинается с «ah_») — или "
+                     "передайте ключ заголовком X-API-Key.") from None
+        if not token:
+            raise AuthError(
+                exc.message,
+                hint="Передайте ключ полем api_key в теле запроса, заголовком "
+                     "X-API-Key или Authorization: Bearer <ключ>.") from None
+        raise
 
 
 def scope_owner(principal: Principal,

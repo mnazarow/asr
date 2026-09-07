@@ -39,6 +39,10 @@ log = get_logger("phone")
 #: умолчанию, а не выдумка: приёмник у пользователя называется именно так.
 DEFAULT_CALLBACK_SUFFIX = "/callback-endpoint.php"
 
+#: Расширения, по которым видно, что base_url — уже сам приёмник, а не
+#: каталог, в котором он лежит.
+ENDPOINT_EXTENSIONS = (".php", ".asp", ".aspx", ".jsp", ".cgi", ".pl", ".py", ".do")
+
 #: Метки говорящих. В phone_asr первый канал всегда SPEAKER_00, второй —
 #: SPEAKER_01, и принимающая сторона различает стороны разговора по ним.
 SPEAKER_LEFT = "SPEAKER_00"
@@ -77,7 +81,28 @@ class PhoneRequest:
     swap_sides: bool = False
 
     def target_url(self, suffix: str = DEFAULT_CALLBACK_SUFFIX) -> str:
-        return f"{self.base_url}{suffix}"
+        """Адрес, на который уйдёт результат.
+
+        phone_asr дописывает суффикс всегда: base_url там — каталог, в
+        котором лежит приёмник. Но тот же запрос присылают и с полным
+        адресом приёмника, и тогда получалось
+        «…/callback-endpoint.php/callback-endpoint.php»: расшифровка
+        проходила целиком, а результат уходил в никуда. Хуже всего, что
+        молча — 404 отвечает чужой сервер, в наших журналах это лишь
+        неудачная доставка, а звонок выглядит принятым.
+
+        Поэтому: адрес, который уже указывает на приёмник, оставляем как
+        есть. Каталог — как было, с суффиксом.
+        """
+        base = self.base_url
+        # Запрос и якорь в конце — законная часть адреса приёмника, но
+        # расширение прячется за ними: «/cb.php?token=1» не оканчивается
+        # на «.php», хотя приёмником является.
+        path = base.split("#", 1)[0].split("?", 1)[0]
+        tail = path.rsplit("/", 1)[-1].lower()
+        if path.lower().endswith(suffix.lower()) or tail.endswith(ENDPOINT_EXTENSIONS):
+            return base
+        return f"{base}{suffix}"
 
     @property
     def uuid(self) -> str:
