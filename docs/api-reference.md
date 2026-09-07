@@ -561,7 +561,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:10622",
+  "instance": "vm:18209",
   "instances": [],
   "workers": [
     {
@@ -1141,51 +1141,51 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788450728.236366,
+    "generated_at": 1788458177.1319575,
     "jobs": {
-      "total": 260,
-      "completed": 243,
+      "total": 256,
+      "completed": 240,
       "failed": 9,
-      "cancelled": 8,
+      "cancelled": 7,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 0.9346
+      "success_rate": 0.9375
     },
     "volume": {
-      "audio_seconds": 319409.4,
-      "audio_hours": 88.72,
-      "processing_seconds": 42958.0,
-      "words": 727916,
-      "characters": 4367496,
-      "segments": 34446,
-      "files_per_hour": 1.45,
-      "audio_hours_per_hour": 0.53
+      "audio_seconds": 313935.4,
+      "audio_hours": 87.2,
+      "processing_seconds": 41051.4,
+      "words": 717126,
+      "characters": 4302756,
+      "segments": 33603,
+      "files_per_hour": 1.43,
+      "audio_hours_per_hour": 0.52
     },
     "performance": {
       "rtf": {
-        "count": 243,
-        "avg": 0.136356,
+        "count": 240,
+        "avg": 0.135373,
         "min": 0.0176,
         "max": 0.5409,
-        "p50": 0.1102,
-        "p90": 0.29608,
-        "p95": 0.38067,
-        "p99": 0.448596,
-        "stdev": 0.107123
+        "p50": 0.10985,
+        "p90": 0.29566,
+        "p95": 0.381125,
+        "p99": 0.449682,
+        "stdev": 0.106567
       },
       "processing_time_s": {
-        "count": 243,
-        "avg": 176.781934,
+        "count": 240,
+        "avg": 171.047667,
         "min": 0.97,
         "max": 2014.66,
-        "p50": 54.45,
-        "p90": 513.754,
-        "p95": 638.647,
-        "p99": 1309.2366,
-        "stdev": 288.730874
+        "p50": 54.565,
+        "p90": 504.388,
+        "p95": 621.4515,
+        "p99": 1258.9897,
+        "stdev": 268.665181
       },
       "queue_time_s": {
-        "count": 243,
+        "count": 240,
 …
 ```
 
@@ -1237,7 +1237,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 165.9,
+  "uptime_s": 86.8,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1316,7 +1316,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 165.9,
+  "uptime_s": 86.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1731,14 +1731,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 165.9,
+  "uptime_s": 86.9,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 166 с",
+        "detail": "работает 87 с",
         "hint": ""
       },
       {
@@ -1775,6 +1775,7 @@ curl http://сервер:8080/api/monitoring/health
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
+      }
 …
 ```
 
