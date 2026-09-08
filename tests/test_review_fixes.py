@@ -7,12 +7,16 @@
 """
 from __future__ import annotations
 
+import builtins
+import io
 import math
+import re
 import struct
 import subprocess
 import sys
 import time
 import wave
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -1111,12 +1115,14 @@ def test_peak_memory_counter_is_reset_before_the_job_not_after(monkeypatch):
     assert события == ["сброс", "замер"], события
 
 
-def test_process_job_resets_the_counter_only_when_it_measures(tmp_path: Path,
-                                                              monkeypatch):
+def test_process_job_resets_the_counter_only_when_it_is_alone(tmp_path: Path,
+                                                             monkeypatch):
     """Сброс — не бесплатная операция для соседа по очереди.
 
-    Когда рядом идёт второе задание, замер не делается вовсе (см. очередь),
-    и трогать общий счётчик тоже нельзя.
+    Замер делается всегда: иначе на занятом сервере — то есть там, где
+    вопрос о памяти и стоит, — раздел «Ресурсы» пуст. А вот обнулять общий
+    счётчик, когда рядом идёт второе задание, нельзя: это стирает то, что
+    сосед уже накопил, и его собственный замер выходит заниженным.
     """
     from asrhub import processor as proc
     from asrhub.errors import AudioError
@@ -1127,13 +1133,14 @@ def test_process_job_resets_the_counter_only_when_it_measures(tmp_path: Path,
     # Задание падает сразу на несуществующем файле — сброс к тому моменту
     # уже должен был случиться: он идёт до всякой работы.
     источник = tmp_path / "нет.wav"
-    for мерить, ожидание in ((False, 0), (True, 1)):
+    for обнулять, ожидание in ((False, 0), (True, 1)):
         сбросов.clear()
         with pytest.raises(AudioError):
             proc.process_job(источник, {"model": "нет-такой"},
                              registry=None, workdir=tmp_path, outdir=tmp_path,
-                             basename="x", measure_memory=мерить)
-        assert len(сбросов) == ожидание, (мерить, сбросов)
+                             basename="x", measure_memory=True,
+                             reset_memory=обнулять)
+        assert len(сбросов) == ожидание, (обнулять, сбросов)
 
 
 def test_gpu_samples_are_cleaned_like_every_other_metric(tmp_path: Path):
@@ -1399,3 +1406,678 @@ def test_the_quality_cards_say_something_when_there_is_nothing(repo_root):
     кусок = app_js[начало:начало + 900]
     assert "!(qt.buckets || []).length" in кусок, кусок[:300]
     assert кусок.count("Charts.empty") >= 2, "пустые карточки снова молчат"
+
+
+def test_the_interface_is_not_served_from_a_stale_browser_cache(client, repo_root: Path):
+    """После обновления сервера в браузере оставался прежний интерфейс.
+
+    Starlette не ставит на статику `Cache-Control` вовсе, а ответ без явного
+    срока браузер волен держать по своему усмотрению — обычно десятую часть
+    возраста файла. Для двухмесячного `app.js` это почти неделя, в течение
+    которой браузер не спрашивает сервер ни разу: обновление проходило,
+    файлы на диске менялись, а человек видел старую версию.
+
+    Воспроизведено в настоящем Chromium: файл с давней отметкой времени,
+    подмена содержимого, обычная перезагрузка — и прежний скрипт из кеша.
+    """
+    страница = client.get("/")
+    assert страница.status_code == 200
+    assert страница.headers.get("cache-control") == "no-cache", (
+        "саму страницу кешировать нельзя: в ней лежат ссылки на всё остальное")
+
+    ссылки = re.findall(r"/static/([A-Za-z0-9_.-]+)\?v=([a-f0-9]+)", страница.text)
+    имена = {имя for имя, _ in ссылки}
+    assert {"app.js", "charts.js", "styles.css"} <= имена, имена
+    assert all(len(отпечаток) >= 8 for _, отпечаток in ссылки), ссылки
+
+    # Отпечаток — по содержимому: правка файла обязана менять адрес.
+    app_js = repo_root / "server" / "asrhub" / "web" / "app.js"
+    было = app_js.read_text(encoding="utf-8")
+    прежний = dict(ссылки)["app.js"]
+    try:
+        app_js.write_text(было + "\n// проверка отпечатка\n", encoding="utf-8")
+        новый = dict(re.findall(r"/static/([A-Za-z0-9_.-]+)\?v=([a-f0-9]+)",
+                                client.get("/").text))["app.js"]
+    finally:
+        app_js.write_text(было, encoding="utf-8")
+    assert новый != прежний, "правка файла не изменила адрес — обновление снова не дойдёт"
+
+    # Со отпечатком содержимое неизменно, поэтому его можно держать долго;
+    # без отпечатка за свежесть отвечать нечему — только с перепроверкой.
+    с_меткой = client.get(f"/static/app.js?v={прежний}")
+    assert "immutable" in с_меткой.headers.get("cache-control", ""), с_меткой.headers
+    без_метки = client.get("/static/app.js")
+    assert без_метки.headers.get("cache-control") == "no-cache", без_метки.headers
+
+
+# ---------------------------------------------------------------------------
+# Поиск по расшифровкам
+# ---------------------------------------------------------------------------
+
+def _архив(path: Path, разговоры: list[tuple[str, list[str]]]):
+    """База с расшифровками: имя файла и реплики."""
+    from asrhub.db import Database
+
+    database = Database(path)
+    номера = []
+    for имя, реплики in разговоры:
+        job_id = database.create_job({"model": "gigaam-v3-rnnt", "filename": имя})
+        database.update_job(job_id, status="completed", text=" ".join(реплики))
+        database.save_segments(job_id, [
+            {"start": i * 10.0, "end": i * 10.0 + 9.0, "text": t,
+             "speaker": f"S{i % 2}"}
+            for i, t in enumerate(реплики)])
+        номера.append(job_id)
+    return database, номера
+
+
+def test_search_finds_the_phrase_and_says_where_it_was_said(tmp_path: Path):
+    """Список отвечал «нашлось в этом разговоре» и замолкал.
+
+    Дальше человек открывал карточку и искал глазами — при том что сервер
+    уже знал и фразу, и секунду, на которой она сказана.
+    """
+    database, (первый, второй) = _архив(tmp_path / "a.sqlite3", [
+        ("переговоры.wav", ["Добрый день, обсудим договор поставки",
+                            "Сроки нас не устраивают",
+                            "Клиент грозит передать спор в арбитраж"]),
+        ("поддержка.wav", ["Не работает личный кабинет",
+                           "Попробуйте сбросить пароль"]),
+    ])
+    assert database.fts_ready, "указатель не собрался — остальное проверять нечего"
+
+    найдено = database.list_jobs(search="арбитраж", limit=10, light=True)
+    assert [j["id"] for j in найдено] == [первый], найдено
+
+    реплики = database.search_segments("арбитраж")
+    assert len(реплики) == 1, реплики
+    r = реплики[0]
+    assert r["job_id"] == первый
+    assert r["start_s"] == 20.0, r
+    assert "‹арбитраж›" in r["snippet"], r["snippet"]
+
+    # Ищется и по началу слова: поиск должен работать по ходу набора.
+    assert database.jobs_matching("арбитр") == [первый]
+    # И без разницы «ещё»/«еще» — иначе надо угадывать, как набрано.
+    assert database.jobs_matching("несуществующее") == []
+    assert второй not in database.jobs_matching("договор")
+
+
+def test_the_index_forgets_what_was_deleted(tmp_path: Path):
+    """Реплики удаляются из четырёх мест, и любое забывшее оставит призраков.
+
+    Поэтому указатель держат триггеры, а не код: код можно забыть поправить,
+    триггер лежит в самой схеме.
+    """
+    database, (первый, второй) = _архив(tmp_path / "b.sqlite3", [
+        ("один.wav", ["говорим про арбитраж"]),
+        ("два.wav", ["говорим про доставку"]),
+    ])
+    assert database.jobs_matching("арбитраж") == [первый]
+
+    database.delete_job(первый)
+    assert database.jobs_matching("арбитраж") == [], "удалённый разговор ищется"
+    assert database.jobs_matching("доставку") == [второй], "заодно потерялся живой"
+
+
+def test_re_running_a_job_does_not_leave_the_old_words_in_the_index(tmp_path: Path):
+    """Повтор задания заменяет реплики целиком.
+
+    Если старые остаются в указателе, поиск находит слова, которых в
+    расшифровке уже нет, — и открытая карточка их не содержит.
+    """
+    database, (job_id,) = _архив(tmp_path / "c.sqlite3", [
+        ("запись.wav", ["прежнее слово арбитраж"]),
+    ])
+    assert database.jobs_matching("арбитраж") == [job_id]
+
+    database.save_segments(job_id, [
+        {"start": 0.0, "end": 5.0, "text": "новое слово доставка"}])
+    assert database.jobs_matching("арбитраж") == [], "старое слово всё ещё ищется"
+    assert database.jobs_matching("доставка") == [job_id]
+
+
+def test_search_still_works_without_the_index(tmp_path: Path):
+    """FTS5 — необязательный модуль SQLite.
+
+    На сборке без него сервер обязан подняться и искать перебором: медленно,
+    но искать. Сервер, который не стартует, не работает никак.
+    """
+    database, (первый, _) = _архив(tmp_path / "d.sqlite3", [
+        ("один.wav", ["говорим про арбитраж"]),
+        ("два.wav", ["говорим про доставку"]),
+    ])
+    database.fts_ready = False
+    найдено = database.list_jobs(search="арбитраж", limit=10, light=True)
+    assert [j["id"] for j in найдено] == [первый], найдено
+    # Фразы без указателя нет — и это честнее, чем выдумать её.
+    assert database.search_segments("арбитраж") == []
+
+
+def test_a_query_typed_by_a_person_is_never_a_syntax_error(tmp_path: Path):
+    """У FTS5 свой язык запросов.
+
+    Одинокая кавычка, звёздочка или слово AND — это не поиск, а
+    синтаксическая ошибка прямо в лицо человеку, который искал «договор».
+    """
+    database, (job_id,) = _архив(tmp_path / "e.sqlite3", [
+        ("один.wav", ["обсудили договор и сроки"]),
+    ])
+    for запрос in ('"', '*', 'AND', 'OR NOT', 'договор"', '(', ')', '^', '-',
+                   'NEAR(', 'договор AND', '  ', 'a' * 300, 'договор ' * 40):
+        найдено = database.list_jobs(search=запрос, limit=5, light=True)
+        assert isinstance(найдено, list), запрос
+
+    assert database.list_jobs(search="договор", limit=5, light=True), "обычный запрос сломался"
+
+
+def test_an_existing_archive_becomes_searchable_on_upgrade(tmp_path: Path):
+    """У накопленного архива указателя ещё нет.
+
+    Без наполнения при первом открытии поиск не нашёл бы ни одного старого
+    разговора — то есть возможность, ради которой всё делалось, не работала
+    бы ровно там, где она нужнее всего.
+    """
+    from asrhub.db import Database
+
+    путь = tmp_path / "f.sqlite3"
+    database, (job_id,) = _архив(путь, [("старая.wav", ["древнее слово арбитраж"])])
+    # Ровно то состояние, в котором база приезжает с прошлой версии:
+    # реплики есть, указателя нет.
+    database.execute("DROP TABLE IF EXISTS segments_fts")
+    database.execute("PRAGMA user_version=7")
+    database.close()
+
+    заново = Database(путь)
+    assert заново.fts_ready, "указатель не завёлся на существующей базе"
+    assert заново.jobs_matching("арбитраж") == [job_id], "старый архив не проиндексирован"
+
+
+# ---------------------------------------------------------------------------
+# Действия над выборкой
+# ---------------------------------------------------------------------------
+
+def test_one_bad_job_does_not_cancel_the_whole_batch(client, tmp_path: Path):
+    """В выборку почти всегда попадает что-то, к чему действие неприменимо.
+
+    Прерывать всю команду из-за одной такой строки означало бы, что
+    пакетное действие работает только на идеально подобранной выборке — то
+    есть почти никогда.
+    """
+    номера = []
+    for i in range(3):
+        файл = tmp_path / f"з-{i}.wav"
+        _wav_with_lead_silence(файл, silence_s=0.05, total_s=0.4)
+        with файл.open("rb") as fh:
+            ответ = client.post("/api/jobs",
+                                files={"file": (файл.name, fh, "audio/wav")})
+        assert ответ.status_code in (200, 201), ответ.text
+        номера.append(ответ.json()["id"])
+
+    ответ = client.post("/api/jobs/bulk", json={
+        "action": "tag", "ids": [*номера, "job_несуществующее"], "tags": "продажи"})
+    assert ответ.status_code == 200, ответ.text
+    итог = ответ.json()
+    assert sorted(итог["done"]) == sorted(номера), итог
+    assert [f["id"] for f in итог["failed"]] == ["job_несуществующее"], итог
+    # Причина — строка для человека, а не словарь в кавычках.
+    assert "не найдено" in итог["failed"][0]["error"], итог["failed"][0]
+
+    for job_id in номера:
+        assert client.get(f"/api/jobs/{job_id}").json()["tags"] == "продажи"
+
+
+def test_a_batch_refuses_an_unknown_action_and_says_which_it_knows(client):
+    """Молчаливое «ничего не произошло» на опечатке — худший ответ."""
+    ответ = client.post("/api/jobs/bulk",
+                        json={"action": "взорвать", "ids": ["job_x"]})
+    assert ответ.status_code == 400, ответ.text
+    тело = ответ.json()
+    assert "взорвать" in тело["message"], тело
+    for действие in ("retry", "delete", "tag"):
+        assert действие in тело["hint"], тело["hint"]
+
+
+def test_a_batch_has_a_ceiling(client):
+    """Пакет в десятки тысяч заданий занял бы блокировку записи на минуты.
+
+    Очередь на это время встала бы целиком: каждое действие — это запись в
+    базу и работа с файлами.
+    """
+    from asrhub.api.routes_jobs import BULK_LIMIT
+
+    ответ = client.post("/api/jobs/bulk", json={
+        "action": "tag", "ids": [f"job_{i}" for i in range(BULK_LIMIT + 1)]})
+    assert ответ.status_code == 400, ответ.text
+    assert str(BULK_LIMIT) in ответ.json()["message"], ответ.json()
+
+    ответ = client.post("/api/jobs/bulk", json={"action": "tag", "ids": []})
+    assert ответ.status_code == 400, ответ.text
+
+
+def test_a_batch_does_not_touch_other_owners_jobs(auth_client, two_users):
+    """Выборку присылает клиент, и в ней может оказаться что угодно.
+
+    Пакетное действие обязано проверять права на каждое задание отдельно —
+    иначе оно становится способом удалить чужой архив, зная только номера.
+    """
+    чужой_id = two_users["job_id"]                 # задание Алисы
+
+    ответ = auth_client.post("/api/jobs/bulk",
+                             json={"action": "delete", "ids": [чужой_id]},
+                             headers={"X-API-Key": two_users["bob"]})
+    assert ответ.status_code == 200, ответ.text
+    итог = ответ.json()
+    assert итог["done"] == [], "пакет удалил чужое задание"
+    assert [f["id"] for f in итог["failed"]] == [чужой_id], итог
+
+    # Задание на месте — видно администратору.
+    цел = auth_client.get(f"/api/jobs/{чужой_id}",
+                          headers={"X-API-Key": two_users["admin"]})
+    assert цел.status_code == 200, цел.text
+
+
+def test_deleting_one_and_deleting_many_do_the_same_thing(repo_root: Path):
+    """Две копии удаления разъедутся: одна забудет файлы, вторая — записи.
+
+    Поэтому обе ручки зовут одну функцию.
+    """
+    текст = (repo_root / "server" / "asrhub" / "api" / "routes_jobs.py").read_text(
+        encoding="utf-8")
+    assert текст.count("def _delete_one(") == 1, "копий удаления стало больше одной"
+    начало = текст.index('@router.delete("/{job_id}"')
+    одиночное = текст[начало:начало + 700]
+    assert "_delete_one(" in одиночное, "одиночное удаление снова живёт своей жизнью"
+    assert "shutil.rmtree" not in одиночное, одиночное
+
+
+# ---------------------------------------------------------------------------
+# Пик памяти на занятом сервере
+# ---------------------------------------------------------------------------
+
+def test_peak_memory_is_measured_even_when_the_server_is_busy(repo_root: Path):
+    """Замер делался только когда задание в очереди одно.
+
+    То есть на сервере с двумя воркерами — там, где вопрос «хватит ли
+    карты» и стоит, — раздел «Ресурсы» оставался пустым всегда.
+    """
+    очередь = (repo_root / "server" / "asrhub" / "job_queue.py").read_text(
+        encoding="utf-8")
+    assert "measure_memory=True" in очередь, "замер снова стал условным"
+    assert "reset_memory=одно" in очередь, (
+        "обнуление должно оставаться условным: иначе оно стирает то, "
+        "что накопил сосед по очереди")
+
+
+def test_the_peak_is_recorded_together_with_how_many_ran_at_once(tmp_path: Path):
+    """«27 ГБ» — это ответ или нет, смотря сколько заданий шло разом.
+
+    Счётчики памяти общие на процесс и по модели её не делят; число
+    одновременных заданий превращает бесполезную цифру в ответ на вопрос
+    «сколько их выдержит карта».
+    """
+    from asrhub.analytics import Analytics
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "m.sqlite3")
+    момент = time.time()
+    for разом, память in ((1, 9000.0), (1, 9200.0), (2, 17500.0), (3, 26000.0)):
+        job_id = database.create_job({"model": "gigaam-v3-rnnt",
+                                      "media_duration_s": 60.0,
+                                      "created_at": момент})
+        database.update_job(job_id, status="completed", finished_at=момент + 10,
+                            processing_time_s=10.0, device="cuda",
+                            peak_memory_mb=память, peak_memory_jobs=разом)
+
+    разрез = Analytics(database).resources("month")
+    строки = {c["jobs_at_once"]: c for c in разрез["concurrency"]}
+    assert set(строки) == {1, 2, 3}, разрез["concurrency"]
+    assert строки[1]["measurements"] == 2, строки[1]
+    assert строки[3]["peak_mb"] == 26000.0, строки[3]
+    # Разрез по моделям при этом остаётся: он отвечает на другой вопрос.
+    assert разрез["models"][0]["model"] == "gigaam-v3-rnnt", разрез["models"]
+
+
+def test_concurrency_counts_the_spike_not_the_ends(tmp_path: Path, monkeypatch):
+    """Всплеск в середине — ровно тот случай, когда памяти и не хватает.
+
+    Считать одновременность по началу и концу задания значит его не
+    заметить.
+    """
+    from asrhub.job_queue import JobQueue
+
+    очередь = JobQueue.__new__(JobQueue)
+    очередь._running = {}
+    очередь._concurrency = {}
+
+    очередь._running["a"] = 0.0
+    очередь._concurrency["a"] = 0
+    очередь._note_concurrency()
+    assert очередь._concurrency["a"] == 1
+
+    # Всплеск: пока «a» работает, приходят и уходят двое.
+    for имя in ("b", "c"):
+        очередь._running[имя] = 0.0
+        очередь._concurrency[имя] = 0
+        очередь._note_concurrency()
+    for имя in ("b", "c"):
+        очередь._running.pop(имя)
+        очередь._concurrency.pop(имя)
+        очередь._note_concurrency()
+
+    assert len(очередь._running) == 1, "состояние разъехалось"
+    assert очередь._concurrency["a"] == 3, (
+        f"всплеск не замечен: {очередь._concurrency['a']}")
+
+
+# ---------------------------------------------------------------------------
+# Выгрузка аналитики
+# ---------------------------------------------------------------------------
+
+def test_the_report_can_be_taken_away_as_a_table(client):
+    """Отчёт можно было только смотреть.
+
+    Чтобы отдать месячные числа руководителю, их переписывали руками — и
+    переписывали с округлённых значений на экране, а не с тех, что посчитал
+    сервер.
+    """
+    import openpyxl
+
+    ответ = client.get("/api/analytics/export?period=month&fmt=xlsx")
+    assert ответ.status_code == 200, ответ.text
+    assert "spreadsheetml" in ответ.headers["content-type"], ответ.headers
+    assert "xlsx" in ответ.headers["content-disposition"], ответ.headers
+    # Выгрузка считается на момент запроса: закешированная — это вчерашние
+    # числа под сегодняшним именем.
+    assert ответ.headers.get("cache-control") == "no-store", ответ.headers
+
+    книга = openpyxl.load_workbook(io.BytesIO(ответ.content))
+    assert книга.sheetnames, "книга без листов"
+    # Подписи русские: файл уходит бухгалтеру, а не разработчику.
+    for лист in книга.worksheets:
+        заголовки = [c.value for c in лист[1]]
+        assert all(isinstance(з, str) and з for з in заголовки), (лист.title, заголовки)
+        assert any(re.search(r"[А-Яа-яЁё]", str(з)) for з in заголовки), \
+            f"лист «{лист.title}» подписан не по-русски: {заголовки}"
+        assert лист.freeze_panes == "A2", лист.title
+
+
+def test_the_csv_archive_opens_in_excel_by_double_click(client):
+    """«Правильный» CSV с запятыми Excel с русскими настройками не разбирает.
+
+    Он показывает его одной колонкой кракозябр — то есть выгрузка есть, а
+    воспользоваться ей нельзя.
+    """
+    ответ = client.get("/api/analytics/export?period=month&fmt=csv")
+    assert ответ.status_code == 200, ответ.text
+    assert ответ.headers["content-type"] == "application/zip", ответ.headers
+
+    with zipfile.ZipFile(io.BytesIO(ответ.content)) as архив:
+        имена = архив.namelist()
+        assert "period.txt" in имена, имена
+        таблицы = [и for и in имена if и.endswith(".csv")]
+        assert таблицы, имена
+        содержимое = архив.read(таблицы[0]).decode("utf-8")
+    assert содержимое.startswith("﻿"), "нет метки порядка байтов — Excel даст кракозябры"
+    первая = содержимое.splitlines()[0]
+    assert ";" in первая, f"разделитель не точка с запятой: {первая!r}"
+
+
+def test_the_export_names_its_time_zone(client):
+    """Отчёт открывают в другом городе.
+
+    Excel про часовые пояса не знает вовсе, поэтому в клетку идёт местное
+    время сервера — и молчать об этом нельзя: «14:35» без пояса это число,
+    к которому нельзя применить ничего.
+    """
+    import openpyxl
+
+    ответ = client.get("/api/analytics/export?period=month&fmt=xlsx")
+    книга = openpyxl.load_workbook(io.BytesIO(ответ.content))
+    ряды = [л for л in книга.worksheets if str(л[1][0].value or "").startswith("Момент")]
+    if not ряды:
+        pytest.skip("в этой базе нет рядов по времени")
+    for лист in ряды:
+        подпись = str(лист[1][0].value)
+        assert "UTC" in подпись, подпись
+        значение = лист.cell(row=2, column=1).value
+        assert hasattr(значение, "year"), f"момент записан не датой: {значение!r}"
+        assert значение.microsecond == 0, значение
+
+
+def test_without_openpyxl_the_export_says_so_instead_of_failing(monkeypatch):
+    """Пакета может не быть: сервер ставят и в закрытом контуре.
+
+    Пятисотая ошибка вместо отчёта не объясняет ничего, а CSV собирается и
+    без единого стороннего пакета.
+    """
+    from asrhub import analytics_export
+    from asrhub.errors import ASRHubError
+
+    настоящий = builtins.__import__
+
+    def без_openpyxl(name, *args, **kwargs):
+        if name.startswith("openpyxl"):
+            raise ImportError("нет такого пакета")
+        return настоящий(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", без_openpyxl)
+    with pytest.raises(ASRHubError) as отказ:
+        analytics_export.to_xlsx({"overview": {"period": "month"}}, "month")
+    assert "openpyxl" in отказ.value.message
+    assert "CSV" in (отказ.value.hint or ""), отказ.value.hint
+
+    # А CSV в это же время собирается.
+    архив = analytics_export.to_csv_zip({"overview": {"period": "month"}}, "month")
+    assert zipfile.ZipFile(io.BytesIO(архив)).namelist()
+
+
+def test_one_broken_section_does_not_take_the_whole_export_with_it(caplog):
+    """У человека должен остаться файл без одного листа, а не ошибка."""
+    from asrhub import analytics_export
+
+    отчёт = {
+        "overview": {"period": "month", "jobs": {"total": 5}},
+        "models": "внезапно строка, а не список",
+    }
+    with caplog.at_level("WARNING"):
+        книга = analytics_export.to_xlsx(отчёт, "month")
+    assert книга[:2] == b"PK", "получился не файл xlsx"
+    assert any("не попал в выгрузку" in r.message for r in caplog.records), caplog.records
+
+
+# ---------------------------------------------------------------------------
+# Обслуживание по расписанию
+# ---------------------------------------------------------------------------
+
+class _Настройки:
+    """Настройки для обслуживания без поднятия всего сервера."""
+
+    def __init__(self, каталог: Path, **значения):
+        class paths:
+            data = str(каталог)
+        self.paths = paths
+        self._v = значения
+
+    def get(self, key, default=None):
+        return self._v.get(key, default)
+
+
+def _база_с_заданиями(каталог: Path, сколько: int = 20):
+    from asrhub.db import Database
+
+    каталог.mkdir(parents=True, exist_ok=True)
+    database = Database(каталог / "asrhub.db")
+    момент = time.time()
+    for i in range(сколько):
+        job_id = database.create_job({
+            "model": "gigaam-v3-rnnt", "engine": "gigaam", "language": "ru",
+            "filename": f"звонок-{i}.wav", "media_duration_s": 300.0,
+            "created_at": момент - i * 3600})
+        database.update_job(
+            job_id, status="failed" if i % 7 == 0 else "completed",
+            finished_at=момент - i * 3600 + 60, processing_time_s=44.0,
+            queue_time_s=2.0 + i, rtf=0.15, words_count=700, segments_count=40,
+            avg_confidence=0.93, device="cuda",
+            error_code="decode_error" if i % 7 == 0 else None)
+    return database
+
+
+def test_a_backup_is_a_real_copy_not_a_file_copy(tmp_path: Path):
+    """База работает в режиме WAL, рядом лежат -wal и -shm.
+
+    Обычная копия файла получается несогласованной: выглядит как копия и ею
+    не является. Глава «Эксплуатация» предупреждает об этом человека —
+    сервер обязан делать так же, как советует.
+    """
+    from asrhub import maintenance
+    from asrhub.db import Database
+
+    данные = tmp_path / "data"
+    database = _база_с_заданиями(данные, 30)
+    настройки = _Настройки(данные, backup_keep=7)
+
+    копия = maintenance.make_backup(database, настройки)
+    assert копия is not None and копия.exists(), "копия не сделана"
+    assert копия.parent == данные / "backups", копия
+
+    открытая = Database(копия)
+    assert открытая.count_jobs() == 30, "в копии не все задания"
+    открытая.close()
+
+
+def test_old_backups_are_removed_but_never_all_of_them(tmp_path: Path):
+    """Копия весит примерно столько же, сколько база.
+
+    Без уборки каталог копий растёт быстрее самой базы. Но и обнулять его
+    нельзя: последняя копия должна оставаться всегда, каким бы ни было
+    значение настройки.
+    """
+    from asrhub import maintenance
+
+    данные = tmp_path / "data"
+    database = _база_с_заданиями(данные, 5)
+
+    for держать, ожидание in ((3, 3), (1, 1), (0, 1)):
+        каталог = maintenance.backup_dir(_Настройки(данные))
+        for файл in каталог.glob("asrhub-*.db"):
+            файл.unlink()
+        настройки = _Настройки(данные, backup_keep=держать)
+        for i in range(5):
+            копия = maintenance.make_backup(database, настройки)
+            assert копия is not None
+            # Имя копии — по секундам; без сдвига времени пять заходов
+            # перезаписали бы один файл, и проверка ничего бы не проверила.
+            копия.rename(копия.with_name(f"asrhub-2026010{i}-000000.db"))
+            maintenance._подчистить(каталог, держать)
+        осталось = list(каталог.glob("asrhub-*.db"))
+        assert len(осталось) == ожидание, (держать, [p.name for p in осталось])
+
+
+def test_restore_checks_the_copy_before_touching_the_live_database(tmp_path: Path):
+    """Битый файл, обнаруженный после подмены, оставляет вообще без базы.
+
+    Человек получает два нерабочих файла вместо одного — и это худший
+    возможный итог операции, которую затевают ради спасения данных.
+    """
+    from asrhub import maintenance
+
+    данные = tmp_path / "data"
+    данные.mkdir()
+    рабочая = данные / "asrhub.db"
+    рабочая.write_bytes("рабочая база".encode())
+    битая = tmp_path / "битая.db"
+    битая.write_bytes("это не база".encode())
+
+    with pytest.raises(ValueError) as отказ:
+        maintenance.restore(битая, рабочая)
+    assert "не похож на базу" in str(отказ.value), отказ.value
+    assert рабочая.read_bytes() == "рабочая база".encode(), "рабочую базу всё же тронули"
+
+    with pytest.raises(FileNotFoundError):
+        maintenance.restore(tmp_path / "нет.db", рабочая)
+
+
+def test_restore_keeps_the_previous_database_and_its_journal(tmp_path: Path):
+    """Восстановление не из той копии — обычная ошибка, и она обратима.
+
+    Файлы -wal и -shm обязаны уйти вместе с прежней базой: иначе SQLite
+    достроит по ним состояние, которого в восстановленной копии нет.
+    """
+    from asrhub import maintenance
+    from asrhub.db import Database
+
+    данные = tmp_path / "data"
+    database = _база_с_заданиями(данные, 12)
+    копия = maintenance.make_backup(database, _Настройки(данные))
+    assert копия is not None
+    database.close()
+
+    рабочая = данные / "asrhub.db"
+    рабочая.write_bytes("испорчено".encode())
+    Path(str(рабочая) + "-wal").write_bytes("старый журнал".encode())
+
+    maintenance.restore(копия, рабочая)
+    assert Database(рабочая).count_jobs() == 12
+    assert list(данные.glob("asrhub.db.before-restore-*")), "прежняя база потеряна"
+    assert list(данные.glob("asrhub.db-wal.before-restore-*")), "журнал остался на месте"
+
+
+def test_the_digest_says_the_same_thing_in_words(tmp_path: Path):
+    """Приёмник входящих сообщений показывает поле text и ничего больше.
+
+    Без строки словами в чат приходил бы свёрнутый JSON, который никто не
+    разворачивает.
+    """
+    from asrhub import maintenance
+    from asrhub.analytics import Analytics
+
+    данные = tmp_path / "data"
+    database = _база_с_заданиями(данные, 40)
+    сводка = maintenance.build_digest(Analytics(database),
+                                      _Настройки(данные, digest_period="month"))
+    текст = сводка["text"]
+    assert "ASR Hub" in текст
+    assert "Заданий: 40" in текст, текст
+    assert "—" not in текст.split("Скорость:")[1].split("\n")[0], \
+        f"скорость не посчиталась: {текст}"
+    assert "уверенность" in текст.lower(), текст
+    assert "decode_error" in текст, текст
+    assert сводка["instance"], "сводка без имени отправителя"
+
+
+def test_scheduled_work_waits_its_term_and_does_not_repeat(tmp_path: Path,
+                                                           monkeypatch):
+    """Отметка «когда в последний раз» лежит в базе и переживает перезапуск.
+
+    Без неё копия делалась бы при каждом старте сервера, а сводка приходила
+    бы по разу на перезапуск.
+    """
+    from asrhub import maintenance
+    from asrhub.analytics import Analytics
+
+    данные = tmp_path / "data"
+    database = _база_с_заданиями(данные, 5)
+    настройки = _Настройки(данные, backup_interval_hours=24, backup_keep=3)
+    аналитика = Analytics(database)
+
+    # Первый заход только ставит отметку: сервер только поднялся.
+    assert maintenance.run_scheduled(database, настройки, аналитика) == {}
+    assert maintenance.run_scheduled(database, настройки, аналитика) == {}
+
+    database.set_kv(maintenance.KV_BACKUP, time.time() - 25 * 3600)
+    итог = maintenance.run_scheduled(database, настройки, аналитика)
+    assert итог.get("backup"), итог
+    # И сразу следом — уже нет.
+    assert maintenance.run_scheduled(database, настройки, аналитика) == {}
+
+
+def test_a_digest_that_cannot_be_delivered_never_breaks_the_server(tmp_path: Path):
+    """Сводка — удобство, а не часть обработки заданий."""
+    from asrhub import maintenance
+
+    # Адрес, которого нет: порт закрыт.
+    assert maintenance.send_digest({"kind": "asrhub.digest"},
+                                   "http://127.0.0.1:9/hook") is False
+    # И совсем негодный адрес тоже не роняет.
+    assert maintenance.send_digest({"kind": "asrhub.digest"}, "не адрес") is False

@@ -6,7 +6,12 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
 
 from .. import catalog
 from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, KeyNotFound
@@ -312,6 +317,44 @@ def analytics(request: Request, period: str = Query(default="week"),
     # имена файлов, а «по владельцам» — весь список тех, кто пользуется
     # сервером.
     return state.analytics.full_report(period, owner=scope_owner(principal))
+
+
+@router.get("/analytics/export", summary="Выгрузка аналитики в таблицу")
+def analytics_export(request: Request, period: str = Query(default="month"),
+                     fmt: str = Query(default="xlsx", pattern="^(xlsx|csv)$"),
+                     principal: Principal = Depends(authenticate)) -> Any:
+    """Тот же отчёт, что на экране, — книгой Excel или архивом CSV.
+
+    Отчёт можно было только смотреть: чтобы отдать месячные числа
+    руководителю, их переписывали руками — и переписывали с округлённых
+    значений на экране, а не с тех, что посчитал сервер.
+
+    Разрез по владельцу здесь тот же, что и у самого отчёта: обычный ключ
+    выгружает только свои задания.
+    """
+    from ..analytics_export import to_csv_zip, to_xlsx
+    from .routes_jobs import content_disposition
+
+    state = get_state(request)
+    отчёт = state.analytics.full_report(period, owner=scope_owner(principal))
+    метка = time.strftime("%Y-%m-%d")
+    if fmt == "csv":
+        тело = to_csv_zip(отчёт, period)
+        имя, тип = f"asrhub-аналитика-{period}-{метка}.zip", "application/zip"
+    else:
+        try:
+            тело = to_xlsx(отчёт, period)
+        except ASRHubError as exc:
+            raise error_response(exc) from exc
+        имя = f"asrhub-аналитика-{period}-{метка}.xlsx"
+        тип = ("application/vnd.openxmlformats-officedocument."
+               "spreadsheetml.sheet")
+    return Response(content=тело, media_type=тип, headers={
+        "Content-Disposition": content_disposition(имя),
+        # Отчёт считается на момент запроса: закешированная выгрузка —
+        # это вчерашние числа под сегодняшним именем.
+        "Cache-Control": "no-store",
+    })
 
 
 @router.get("/analytics/{section}", summary="Отдельный раздел аналитики")

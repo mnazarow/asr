@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **80**, операций: **90**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **83**, операций: **93**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -123,6 +123,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | Метод | Адрес | Что делает | Доступ |
 |---|---|---|---|
 | `GET` | `/api/analytics` | Сводная аналитика | любой ключ; выборка сужается до его заданий |
+| `GET` | `/api/analytics/export` | Выгрузка аналитики в таблицу | любой действующий ключ |
 | `GET` | `/api/analytics/{section}` | Отдельный раздел аналитики | любой ключ; выборка сужается до его заданий |
 | `POST` | `/api/auth/login` | Вход по логину и паролю | без ключа: это и есть вход |
 | `POST` | `/api/auth/logout` | Выход | без ключа: это и есть вход |
@@ -136,6 +137,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/jobs` | Список заданий | любой ключ; выборка сужается до его заданий |
 | `POST` | `/api/jobs` | Поставить файл в очередь | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/jobs/batch` | Поставить несколько файлов одной группой | ключ с правом записи (**admin** или **user**) |
+| `POST` | `/api/jobs/bulk` | Действие сразу над несколькими заданиями | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}` | Карточка задания | любой действующий ключ |
 | `DELETE` | `/api/jobs/{job_id}` | Удалить задание и результаты | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}/audio` | Исходная запись задания | любой действующий ключ |
@@ -147,6 +149,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/jobs/{job_id}/reference` | Задать эталонный текст и пересчитать WER | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/jobs/{job_id}/resume` | Возобновить задание | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/jobs/{job_id}/retry` | Повторить задание | ключ с правом записи (**admin** или **user**) |
+| `GET` | `/api/jobs/{job_id}/search` | Поиск по репликам одного задания | любой действующий ключ |
 | `GET` | `/api/jobs/{job_id}/segments` | Сегменты задания | любой действующий ключ |
 | `POST` | `/api/jobs/{job_id}/top` | Поднять в начало очереди | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}/waveform` | Полоса громкости записи | любой действующий ключ |
@@ -249,33 +252,33 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 {
   "items": [
     {
-      "id": "job_d7fe59ed55244a82",
+      "id": "job_91cf429f11bc471d",
       "status": "completed",
-      "model": "gigaam-v3-rnnt",
-      "engine": "gigaam",
+      "model": "demo-simulator",
+      "engine": "demo",
       "language": "ru",
-      "owner": "admin",
-      "source": "api",
+      "owner": "создан автоматически при первом запуске",
+      "source": "web",
       "priority": 50,
-      "filename": "звонок-0.wav",
+      "filename": "отчёт-за-квартал.wav",
       "deadline": null,
-      "created_at": 1788893287.5892565,
-      "queued_at": 1788893287.5892887,
-      "started_at": null,
-      "finished_at": 1788893337.5892565,
-      "media_duration_s": 300.0,
-      "processing_time_s": 44.0,
-      "queue_time_s": 1.0,
-      "audio_prep_s": null,
-      "model_load_s": null,
-      "inference_s": null,
-      "postprocess_s": null,
-      "rtf": 0.15,
-      "words_count": 760,
-      "chars_count": 0,
-      "segments_count": 48,
-      "speakers_count": 2,
-      "avg_confidence": 0.93,
+      "created_at": 1788898606.9904368,
+      "queued_at": 1788898606.9904368,
+      "started_at": 1788898609.9839222,
+      "finished_at": 1788898611.4827294,
+      "media_duration_s": 60.0,
+      "processing_time_s": 1.498,
+      "queue_time_s": 2.993485689163208,
+      "audio_prep_s": 1.2709,
+      "model_load_s": 0.0,
+      "inference_s": 0.2092,
+      "postprocess_s": 0.0004,
+      "rtf": 0.0248,
+      "words_count": 21,
+      "chars_count": 158,
+      "segments_count": 3,
+      "speakers_count": 0,
+      "avg_confidence": 0.9144,
       "wer": null,
       "cer": null,
       "error_code": null,
@@ -283,23 +286,19 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "error_hint": null,
       "retries": 0,
       "cached_from": null,
-      "device": "cuda",
-      "file_size": 9600000,
-      "progress": 0.0,
-      "stage": "",
-      "tags": "продажи",
-      "peak_memory_mb": 23400.0,
-      "file_hash": null,
+      "device": "cpu",
+      "file_size": 1920044,
+      "progress": 1.0,
+      "stage": "готово",
+      "tags": "квартальный",
+      "peak_memory_mb": 77.3,
+      "peak_memory_jobs": 1,
+      "file_hash": "72d4c872184aeb8eee74934f1b2a22a6",
       "cancelled_by": null,
       "webhook_status": null
     },
     {
-      "id": "job_01a10ee12e814776",
-      "status": "completed",
-      "model": "whisper-large-v3",
-      "engine": "whisper",
-      "language": null,
-      "owner": "admin",
+      "id": "job_8aa107d44aa445f8",
 …
 ```
 
@@ -340,6 +339,33 @@ curl -H 'X-API-Key: $КЛЮЧ' \
 ```
 
 Общий объём ограничен параметром `max_upload_mb`, число файлов — `max_batch_files`. Задания получают общий `batch_id`, по нему их удобно отбирать в списке.
+
+### `POST /api/jobs/bulk`
+
+Действие сразу над несколькими заданиями.
+
+Повторить, отменить, удалить, пометить или сменить приоритет — пачкой.
+
+Все действия были поштучными, и после обновления модели пятьсот
+разговоров переобрабатывались по одному, вручную.
+
+Отказ на одном задании не отменяет остальных: в выборку почти всегда
+попадает что-то, к чему действие неприменимо — уже завершённое среди
+отменяемых, чужое среди своих. Прерывать всю команду из-за одной такой
+строки означало бы, что пакетное действие работает только на идеально
+подобранной выборке, то есть почти никогда. Поэтому каждое задание
+обрабатывается отдельно, а в ответе стоит, что получилось и что нет.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "$ref": "#/components/schemas/Body_bulk_api_jobs_bulk_post"
+}
+```
 
 ### `GET /api/jobs/{job_id}`
 
@@ -521,6 +547,26 @@ curl -H 'X-API-Key: $КЛЮЧ' \
 }
 ```
 
+### `GET /api/jobs/{job_id}/search`
+
+Поиск по репликам одного задания.
+
+Найденные реплики одного разговора: фраза, её время и говорящий.
+
+Часовой разговор — это сотни реплик, и «найти, где обсуждали сроки»
+поиском по странице означает пролистать их все. Здесь то же самое
+делает указатель, а щелчок по находке переводит проигрыватель на её
+начало.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `job_id` | в пути | string | обязателен | — |
+| `q` | в адресе | string | обязателен | Что искать в расшифровке |
+| `limit` | в адресе | integer | `100` | — |
+
 ### `GET /api/jobs/{job_id}/segments`
 
 Сегменты задания.
@@ -583,7 +629,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:23402",
+  "instance": "vm:5975",
   "instances": [],
   "workers": [
     {
@@ -601,9 +647,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 321,
-    "failed": 12,
-    "cancelled": 5
+    "completed": 5,
+    "failed": 0,
+    "cancelled": 0
   },
   "queue_depth": 0,
   "active": 0,
@@ -1163,53 +1209,76 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788894080.9917765,
+    "generated_at": 1788899401.3522727,
     "jobs": {
-      "total": 337,
-      "completed": 320,
-      "failed": 12,
-      "cancelled": 5,
+      "total": 5,
+      "completed": 5,
+      "failed": 0,
+      "cancelled": 0,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 0.9496
+      "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 343391.6,
-      "audio_hours": 95.39,
-      "processing_seconds": 50304.0,
-      "words": 789184,
-      "characters": 4673574,
-      "segments": 35786,
-      "files_per_hour": 1.9,
-      "audio_hours_per_hour": 0.57
+      "audio_seconds": 200.0,
+      "audio_hours": 0.06,
+      "processing_seconds": 5.9,
+      "words": 91,
+      "characters": 598,
+      "segments": 11,
+      "files_per_hour": 0.03,
+      "audio_hours_per_hour": 0.0
     },
     "performance": {
       "rtf": {
-        "count": 320,
-        "avg": 0.145888,
-        "min": 0.0177,
-        "max": 0.5543,
-        "p50": 0.10845,
-        "p90": 0.32673,
-        "p95": 0.418765,
-        "p99": 0.506942,
-        "stdev": 0.11697
+        "count": 5,
+        "avg": 0.03098,
+        "min": 0.0248,
+        "max": 0.0419,
+        "p50": 0.0281,
+        "p90": 0.03834,
+        "p95": 0.04012,
+        "p99": 0.041544,
+        "stdev": 0.006081
       },
       "processing_time_s": {
-        "count": 320,
-        "avg": 157.199887,
-        "min": 0.72,
-        "max": 2411.75,
-        "p50": 46.17,
-        "p90": 385.194,
-        "p95": 658.23,
-        "p99": 1792.7622,
-        "stdev": 321.034667
+        "count": 5,
+        "avg": 1.1764,
+        "min": 0.894,
+        "max": 1.498,
+        "p50": 1.132,
+        "p90": 1.4444,
+        "p95": 1.4712,
+        "p99": 1.49264,
+        "stdev": 0.225216
       },
       "queue_time_s": {
-        "count": 320,
+        "count": 5,
+        "avg": 1.393189,
+        "min": 0.002718,
 …
 ```
+
+### `GET /api/analytics/export`
+
+Выгрузка аналитики в таблицу.
+
+Тот же отчёт, что на экране, — книгой Excel или архивом CSV.
+
+Отчёт можно было только смотреть: чтобы отдать месячные числа
+руководителю, их переписывали руками — и переписывали с округлённых
+значений на экране, а не с тех, что посчитал сервер.
+
+Разрез по владельцу здесь тот же, что и у самого отчёта: обычный ключ
+выгружает только свои задания.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `month` | — |
+| `fmt` | в адресе | string | `xlsx` | — |
 
 ### `GET /api/analytics/{section}`
 
@@ -1259,7 +1328,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 23.9,
+  "uptime_s": 19.7,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1338,7 +1407,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 24.0,
+  "uptime_s": 19.8,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1348,7 +1417,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 7.0,
-    "disk_free_gb": 14.5,
+    "disk_free_gb": 13.2,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1359,7 +1428,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 14.5 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 13.2 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -1532,9 +1601,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
   ],
   "window": "последние сутки",
   "used": {
-    "jobs": 1,
-    "audio_hours": 0.0056,
-    "storage_gb": 0.0003
+    "jobs": 5,
+    "audio_hours": 0.0556,
+    "storage_gb": 0.006
   },
   "limits": {
     "jobs": null,
@@ -1753,14 +1822,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 24.0,
+  "uptime_s": 19.8,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 24 с",
+        "detail": "работает 20 с",
         "hint": ""
       },
       {
@@ -1789,7 +1858,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 14.5 ГБ",
+        "detail": "свободно 13.2 ГБ",
         "hint": ""
       },
       {

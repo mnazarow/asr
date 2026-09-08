@@ -14,10 +14,8 @@
 """
 from __future__ import annotations
 
-import os
 import random
 import shutil
-import socket
 import threading
 import time
 from collections.abc import Callable
@@ -39,6 +37,7 @@ from .errors import (
     StorageError,
     classify_exception,
 )
+from .instance import INSTANCE_ID as _INSTANCE_ID
 from .logging_setup import get_logger
 from .monitoring.collector import (
     JOB_DURATION_BUCKETS,
@@ -50,10 +49,9 @@ from .processor import cleanup_workdir, process_job, safe_workdir, settings_dige
 log = get_logger("queue")
 
 
-#: Кто мы такие среди серверов на общей базе. Имя машины плюс идентификатор
-#: процесса: достаточно, чтобы отличить два экземпляра, и понятно человеку,
-#: который смотрит в базу и хочет знать, на какой машине висит задание.
-INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}"
+#: Кто мы такие среди серверов на общей базе (см. `instance`). Имя
+#: сохранено здесь же: на него ссылается и код, и тесты.
+INSTANCE_ID = _INSTANCE_ID
 
 #: Через сколько секунд без отметки задание считается брошенным. Пять минут
 #: с запасом покрывают паузу на выгрузке большой модели: отметка ставится
@@ -118,6 +116,11 @@ class JobQueue:
         self._retiring: set[int] = set()
         self._webhooks: Any = None
         self._running: dict[str, float] = {}
+        #: Сколько заданий шло разом, пока выполнялось это. Замер памяти —
+        #: цифра на весь процесс, и без этого числа она не говорит ничего:
+        #: 27 ГБ при одном задании и 27 ГБ при трёх — разные ответы на
+        #: вопрос «хватит ли карты».
+        self._concurrency: dict[str, int] = {}
         self._model_counts: dict[str, int] = {}
         self._max_queue = int(getattr(settings, "get", lambda *_: 1000)("max_queue_size", 1000) or 1000)
         self._started = False
@@ -551,6 +554,8 @@ class JobQueue:
                 return None
 
             self._running[chosen["id"]] = time.time()
+            self._concurrency[chosen["id"]] = 0
+            self._note_concurrency()
             model = chosen.get("model") or ""
             self._model_counts[model] = self._model_counts.get(model, 0) + 1
 
@@ -587,10 +592,25 @@ class JobQueue:
             return None
         return job
 
+    def _note_concurrency(self) -> None:
+        """Отмечает нынешнюю занятость у каждого идущего задания.
+
+        Вызывается под общей блокировкой при каждом изменении состава
+        работающих. Считать одновременность по началу и концу задания
+        нельзя: всплеск в середине — а это ровно тот случай, когда памяти и
+        не хватает, — не попал бы ни в одну из двух точек.
+        """
+        сейчас = len(self._running)
+        for job_id in self._concurrency:
+            if self._concurrency[job_id] < сейчас:
+                self._concurrency[job_id] = сейчас
+
     def _release_slot(self, job_id: str, model: str) -> None:
         """Возвращает занятый слот и счётчик модели."""
         with self._lock:
             self._running.pop(job_id, None)
+            self._concurrency.pop(job_id, None)
+            self._note_concurrency()
             if model in self._model_counts:
                 self._model_counts[model] = max(0, self._model_counts[model] - 1)
 
@@ -766,11 +786,21 @@ class JobQueue:
         log.info("Задание %s: старт (%s)", job_id, job.get("model"),
                  extra={"job_id": job_id, "model": job.get("model")})
 
-        # Пик памяти замеряем, только когда задание в процессе одно.
-        # Счётчики и torch, и psutil — на весь процесс: при двух заданиях
-        # разом соседи делят одну цифру, а сброс пика одним заданием стирает
-        # то, что копило другое. Цифра, полученная так, не относится ни к
-        # одной модели, и лучше её не показывать вовсе, чем показывать чужую.
+        # Счётчики пика — и у torch, и у psutil — общие на процесс, поэтому
+        # замер всегда получается «сколько занял сервер», а не «сколько
+        # заняла эта модель». Раньше из-за этого замер делался только когда
+        # задание в очереди одно — и на сервере с двумя воркерами, то есть
+        # там, где вопрос «хватит ли карты» и стоит, раздел «Ресурсы»
+        # оставался пустым.
+        #
+        # Теперь мерим всегда, а рядом пишем, сколько заданий шло разом.
+        # «При двух заданиях карта поднималась до 27 ГБ из 32» — это и есть
+        # ответ, нужный для планирования, и он не требует делить память
+        # между заданиями, чего счётчики всё равно не умеют.
+        #
+        # Обнуление — только когда задание стартует в одиночестве: иначе оно
+        # стёрло бы то, что уже накопил сосед по очереди, и его собственный
+        # замер оказался бы заниженным.
         with self._lock:
             одно = len(self._running) <= 1
         try:
@@ -779,7 +809,7 @@ class JobQueue:
                 workdir=workdir, outdir=outdir,
                 basename=Path(job.get("filename") or job_id).stem,
                 progress=progress, cancelled=cancelled,
-                measure_memory=одно)
+                measure_memory=True, reset_memory=одно)
         except ASRHubError as exc:
             self._handle_failure(job, exc, merged, outdir=outdir)
             return
@@ -823,6 +853,7 @@ class JobQueue:
             language=outcome.language,
             device=str(outcome.stats.get("device") or merged.get("device") or ""),
             peak_memory_mb=outcome.peak_memory_mb or None,
+            peak_memory_jobs=max(1, self._concurrency.get(job_id, 1)),
             wer=accuracy.get("wer"), cer=accuracy.get("cer"),
             waveform=outcome.waveform,
         )
@@ -1208,6 +1239,20 @@ class JobQueue:
                             log.warning("Служебный шаг %s дал сбой (%d-й раз): %s",
                                         getattr(step_fn, "__name__", step_fn), failures, exc)
                 self._reclaim_stale_jobs()
+                # Обслуживание по расписанию: копия базы и сводка о работе.
+                # Свой заход, а не внутри уборки: у уборки собственный час,
+                # а у этих дел — собственные сроки из настроек, и связывать
+                # их значит либо делать копию каждый час, либо не делать
+                # вовсе, когда уборка отключена.
+                try:
+                    from .maintenance import run_scheduled  # noqa: PLC0415
+
+                    run_scheduled(self.db, self.settings, self._analytics())
+                except Exception as exc:                # noqa: BLE001
+                    failures += 1
+                    if failures <= 3 or failures % 180 == 0:
+                        log.warning("Обслуживание по расписанию дало сбой "
+                                    "(%d-й раз): %s", failures, exc)
                 if time.time() - last_cleanup > 3600:
                     retention = int(self.settings.get("result_retention_days") or 30)
                     removed = self.db.cleanup(results_days=retention)
@@ -1230,6 +1275,20 @@ class JobQueue:
                 if failures:
                     log.info("Служебный цикл восстановился после %d сбоев", failures)
                 failures = 0
+
+    def _analytics(self) -> Any:
+        """Аналитика для сводки. Заводится по требованию и один раз.
+
+        Держать её в конструкторе незачем: сводка отключена по умолчанию, и
+        на серверах, где её не включили, объект не понадобится никогда.
+        """
+        готовая = getattr(self, "_analytics_obj", None)
+        if готовая is None:
+            from .analytics import Analytics  # noqa: PLC0415
+
+            готовая = Analytics(self.db)
+            self._analytics_obj = готовая
+        return готовая
 
     def _sample_gpus(self) -> list[dict[str, Any]]:
         """Замер по каждой видеокарте, а не только по первой.

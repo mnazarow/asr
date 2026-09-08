@@ -8,7 +8,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import catalog
@@ -350,11 +360,47 @@ def list_jobs(
     jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
                               order=order, light=light)
+    # При поиске к каждой строке добавляется сама найденная фраза с
+    # обрамлением и её время. Без этого список отвечал «нашлось в этом
+    # разговоре» и замолкал: дальше человек открывал карточку и искал
+    # глазами — при том что сервер уже знал и фразу, и секунду.
+    if search:
+        находки = state.db.best_snippets(search, [str(j["id"]) for j in jobs])
+        for job in jobs:
+            найдено = находки.get(str(job["id"]))
+            if найдено:
+                job["match"] = {
+                    "snippet": найдено.get("snippet") or "",
+                    "start_s": найдено.get("start_s"),
+                    "speaker": найдено.get("speaker"),
+                }
     return {
         "items": jobs,
         "total": state.db.count_jobs(status=statuses, owner=scope),
         "limit": limit,
         "offset": offset,
+    }
+
+
+@router.get("/{job_id}/search", summary="Поиск по репликам одного задания")
+def search_in_job(request: Request, job_id: str,
+                  q: str = Query(min_length=1, description="Что искать в расшифровке"),
+                  limit: int = Query(default=100, ge=1, le=500),
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Найденные реплики одного разговора: фраза, её время и говорящий.
+
+    Часовой разговор — это сотни реплик, и «найти, где обсуждали сроки»
+    поиском по странице означает пролистать их все. Здесь то же самое
+    делает указатель, а щелчок по находке переводит проигрыватель на её
+    начало.
+    """
+    state = get_state(request)
+    _owned_job(request, job_id, principal)
+    реплики = state.db.search_segments(q, job_id=job_id, limit=limit)
+    return {
+        "query": q,
+        "indexed": state.db.fts_ready,
+        "items": реплики,
     }
 
 
@@ -674,16 +720,102 @@ def delete_job(request: Request, job_id: str,
     state = get_state(request)
     _owned_job(request, job_id, principal)
     require_write(principal)
-    job = state.queue.get(job_id)
+    _delete_one(state, state.queue.get(job_id), principal)
+    return {"deleted": job_id}
+
+
+#: Что умеет делать сразу над многими заданиями.
+BULK_ACTIONS = ("retry", "cancel", "delete", "tag", "priority")
+
+#: Предел на одну команду. Не из осторожности: каждое действие — это запись
+#: в базу и работа с файлами, и пакет в десятки тысяч заданий занял бы
+#: единственную блокировку записи на минуты, остановив всю очередь. Больше
+#: предела — это несколько команд подряд, и о ходе видно по ответу каждой.
+BULK_LIMIT = 500
+
+
+@router.post("/bulk", summary="Действие сразу над несколькими заданиями")
+def bulk(request: Request,
+         action: str = Body(embed=True),
+         ids: list[str] = Body(embed=True),
+         tags: str = Body(default="", embed=True),
+         priority: int = Body(default=50, embed=True, ge=0, le=100),
+         principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Повторить, отменить, удалить, пометить или сменить приоритет — пачкой.
+
+    Все действия были поштучными, и после обновления модели пятьсот
+    разговоров переобрабатывались по одному, вручную.
+
+    Отказ на одном задании не отменяет остальных: в выборку почти всегда
+    попадает что-то, к чему действие неприменимо — уже завершённое среди
+    отменяемых, чужое среди своих. Прерывать всю команду из-за одной такой
+    строки означало бы, что пакетное действие работает только на идеально
+    подобранной выборке, то есть почти никогда. Поэтому каждое задание
+    обрабатывается отдельно, а в ответе стоит, что получилось и что нет.
+    """
+    require_write(principal)
+    if action not in BULK_ACTIONS:
+        raise error_response(ConfigError(
+            f"Неизвестное действие «{action}».",
+            hint="Возможные: " + ", ".join(BULK_ACTIONS)))
+    if not ids:
+        raise error_response(ConfigError(
+            "Не указано ни одного задания.",
+            hint="Отметьте строки в списке и повторите."))
+    if len(ids) > BULK_LIMIT:
+        raise error_response(ConfigError(
+            f"За один раз можно обработать не больше {BULK_LIMIT} заданий, "
+            f"а указано {len(ids)}.",
+            hint="Разбейте выборку на части: каждое действие — это запись в "
+                 "базу, и слишком большой пакет остановит очередь."))
+
+    state = get_state(request)
+    сделано: list[str] = []
+    отказы: list[dict[str, str]] = []
+
+    for job_id in dict.fromkeys(ids):          # без повторов, порядок сохранён
+        try:
+            job = _owned_job(request, job_id, principal)
+            if action == "retry":
+                state.queue.retry(job_id, None)
+            elif action == "cancel":
+                state.queue.cancel(job_id, by=principal.name)
+            elif action == "delete":
+                _delete_one(state, job, principal)
+            elif action == "tag":
+                state.db.update_job(job_id, tags=tags)
+            elif action == "priority":
+                state.queue.set_priority(job_id, priority)
+            сделано.append(job_id)
+        except HTTPException as exc:
+            # `error_response` кладёт разбор ошибки в detail; человеку нужна
+            # одна строка причины, а не весь словарь в кавычках.
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            отказы.append({"id": job_id,
+                           "error": str(detail.get("message") or exc.detail)})
+        except ASRHubError as exc:
+            отказы.append({"id": job_id, "error": exc.message})
+        except Exception as exc:               # noqa: BLE001
+            log.warning("Пакетное действие %s не удалось на %s: %s",
+                        action, job_id, exc, extra={"job_id": job_id})
+            отказы.append({"id": job_id, "error": str(exc)})
+
+    log.info("Пакетное действие «%s»: получилось %d, отказов %d",
+             action, len(сделано), len(отказы))
+    return {"action": action, "done": сделано, "failed": отказы,
+            "requested": len(dict.fromkeys(ids))}
+
+
+def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
+    """Удаление одного задания вместе с его файлами."""
+    job_id = str(job["id"])
     if job["status"] in ACTIVE_STATUSES:
         state.queue.cancel(job_id, by=principal.name)
-    result_dir = job.get("result_path")
-    if result_dir:
-        shutil.rmtree(result_dir, ignore_errors=True)
+    if job.get("result_path"):
+        shutil.rmtree(job["result_path"], ignore_errors=True)
     if job.get("file_path"):
         Path(job["file_path"]).unlink(missing_ok=True)
     state.db.delete_job(job_id)
-    return {"deleted": job_id}
 
 
 @router.post("/{job_id}/reference", summary="Задать эталонный текст и пересчитать WER")

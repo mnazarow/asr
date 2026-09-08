@@ -183,7 +183,8 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
                 *, workdir: Path, outdir: Path, basename: str,
                 progress: ProgressFn | None = None,
                 cancelled: Callable[[], bool] | None = None,
-                measure_memory: bool = False) -> ProcessOutcome:
+                measure_memory: bool = False,
+                reset_memory: bool = False) -> ProcessOutcome:
     """Полный цикл обработки одного файла."""
 
     def report(value: float, stage: str) -> None:
@@ -203,7 +204,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
                 "Задание отменено пользователем.",
                 hint="Повторить можно кнопкой «Повторить» в карточке задания.")
 
-    if measure_memory:
+    if reset_memory:
         _reset_peak_memory()
 
     timer = Timer()

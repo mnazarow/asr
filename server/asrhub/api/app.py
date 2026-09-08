@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 import time
@@ -12,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -214,6 +215,74 @@ class EventHub:
     @property
     def count(self) -> int:
         return len(self._clients)
+
+
+#: Отпечатки файлов статики: путь -> (mtime, размер, отпечаток).
+_ASSET_VERSIONS: dict[str, tuple[float, int, str]] = {}
+
+
+def _asset_version(path: Path) -> str:
+    """Короткий отпечаток содержимого файла — для ссылки на него.
+
+    Страница ссылалась на `/static/app.js` без всякой версии, а Starlette
+    не ставит на статику `Cache-Control` вовсе. По правилам кеширования
+    ответ без явного срока браузер волен держать по своему усмотрению —
+    обычно десятую часть возраста файла. То есть после обновления сервера
+    браузер продолжал показывать прежний интерфейс, ничего не спрашивая, и
+    человек видел старую версию, при том что на сервере лежала новая.
+    Ровно об этом и пришёл вопрос: «после обновления не обновился веб
+    интерфейс».
+
+    Отпечаток считается по содержимому, а не по номеру версии: между
+    выпусками интерфейс правится чаще, чем меняется VERSION, и версия бы
+    не спасла. Пересчитывается, когда файл на диске изменился, — сервер
+    после обновления перезапускается, но с работающим тоже должно быть
+    правильно.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return "0"
+    ключ = str(path)
+    было = _ASSET_VERSIONS.get(ключ)
+    if было and было[0] == st.st_mtime and было[1] == st.st_size:
+        return было[2]
+    try:
+        отпечаток = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "0"
+    _ASSET_VERSIONS[ключ] = (st.st_mtime, st.st_size, отпечаток)
+    return отпечаток
+
+
+def _index_html(web_dir: Path) -> str:
+    """Разметка главной страницы со ссылками, помеченными отпечатком."""
+    html = (web_dir / "index.html").read_text(encoding="utf-8")
+
+    def подставить(match: re.Match[str]) -> str:
+        имя = match.group(1)
+        return f"/static/{имя}?v={_asset_version(web_dir / имя)}"
+
+    return re.sub(r"/static/([A-Za-z0-9_.-]+)", подставить, html)
+
+
+class _CachedStatic(StaticFiles):
+    """Статика со сроком хранения, зависящим от того, как её попросили.
+
+    Со ссылкой из главной страницы приходит `?v=<отпечаток>`: содержимое по
+    такому адресу измениться не может, поэтому его разрешено держать год и
+    не спрашивать сервер вовсе. Прямое обращение без отпечатка (закладка,
+    сторонний клиент) кешируется только с перепроверкой: там за свежесть
+    отвечать нечему.
+    """
+
+    async def get_response(self, path: str, scope: Any) -> Any:
+        response = await super().get_response(path, scope)
+        запрос = scope.get("query_string") or b""
+        помечено = b"v=" in запрос
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if помечено else "no-cache")
+        return response
 
 
 def create_app(settings: Settings | None = None, *, start_queue: bool = True) -> FastAPI:
@@ -601,11 +670,14 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
 
     web_dir = Path(__file__).resolve().parent.parent / "web"
     if web_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
+        app.mount("/static", _CachedStatic(directory=str(web_dir)), name="static")
 
         @app.get("/", include_in_schema=False)
         async def index():
-            return FileResponse(str(web_dir / "index.html"))
+            # Страница отдаётся с запретом на кеш и со ссылками, в которых
+            # стоит отпечаток содержимого. Почему так — см. `_asset_version`.
+            return HTMLResponse(_index_html(web_dir),
+                                headers={"Cache-Control": "no-cache"})
 
         @app.get("/favicon.ico", include_in_schema=False)
         async def favicon():

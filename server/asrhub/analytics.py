@@ -675,6 +675,12 @@ class Analytics:
         Отвечает на вопрос, который задают перед покупкой второй карты:
         какая модель сколько памяти просит на пике и сколько заданий вообще
         уехало на процессор вместо видеокарты.
+
+        Пик — величина на весь процесс, а не на модель: счётчики и torch, и
+        psutil другого не умеют. Поэтому рядом с ним идёт число заданий,
+        шедших разом. «27 ГБ при одном задании» и «27 ГБ при трёх» — разные
+        ответы на вопрос о железе, и разрез по этому числу отвечает на
+        главное: сколько заданий разом карта выдержит.
         """
         since = self._since(period)
         jobs = [j for j in self._jobs(since=since or None, limit=100000,
@@ -682,11 +688,14 @@ class Analytics:
                 if j["status"] == "completed"]
 
         по_модели: dict[str, list[float]] = {}
+        по_одновременности: dict[int, list[float]] = {}
         устройства: dict[str, dict[str, float]] = {}
         for job in jobs:
             память = float(job.get("peak_memory_mb") or 0)
             if память:
                 по_модели.setdefault(str(job.get("model") or "—"), []).append(память)
+                разом = int(job.get("peak_memory_jobs") or 1)
+                по_одновременности.setdefault(max(1, разом), []).append(память)
             dev = str(job.get("device") or "неизвестно")
             запись = устройства.setdefault(dev, {"jobs": 0, "audio_hours": 0.0,
                                                  "processing_s": 0.0})
@@ -712,7 +721,15 @@ class Analytics:
                 "rtf": round(данные["processing_s"] / (звук * 3600), 4) if звук else None,
             })
 
-        return {"period": period, "models": модели, "devices": разрез}
+        одновременно = []
+        for сколько, значения in sorted(по_одновременности.items()):
+            сводка = M.summarize(значения)
+            одновременно.append({"jobs_at_once": сколько, "measurements": len(значения),
+                                 "peak_mb": сводка["max"], "avg_mb": сводка["avg"],
+                                 "p95_mb": сводка["p95"]})
+
+        return {"period": period, "models": модели, "devices": разрез,
+                "concurrency": одновременно}
 
     # --- качество во времени ------------------------------------------------
 

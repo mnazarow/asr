@@ -199,6 +199,21 @@ function fmtBytes(bytes) {
   return `${value.toFixed(value < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }
 function num(value, digits) { return window.Charts.fmtNum(value, digits); }
+/**
+ * Русское склонение по числу: 1 находка, 2 находки, 5 находок.
+ *
+ * «Найдено: 5» вместо «5 находок» — обычный способ обойти склонение, но
+ * читается он как отчёт машины, а не как ответ человеку.
+ */
+function plural(n, одна, две, много) {
+  const число = Math.abs(Math.trunc(n)) % 100;
+  const хвост = число % 10;
+  if (число > 10 && число < 20) return много;
+  if (хвост === 1) return одна;
+  if (хвост >= 2 && хвост <= 4) return две;
+  return много;
+}
+
 function pct(value, digits) {
   if (value === null || value === undefined) return '—';
   return (value * 100).toFixed(digits === undefined ? 1 : digits) + ' %';
@@ -2197,6 +2212,101 @@ window.__asrhub.jobAction = async (id, action) => {
 };
 
 // ==========================================================================
+// Выбор строк и действия над выборкой
+// ==========================================================================
+
+/* Все действия были поштучными.
+ *
+ * После обновления модели пятьсот разговоров переобрабатывались по одному,
+ * руками. Здесь строки отмечаются, а действие уходит одной командой.
+ *
+ * Выбор живёт в памяти раздела, а не в разметке: таблица перерисовывается
+ * при каждом обновлении списка, и отметки в разметке пропадали бы вместе с
+ * ней — вместе с тем, что человек успел выбрать.
+ */
+const Bulk = {
+  ids: new Set(),
+  bar: null,
+  reload: null,
+
+  has(id) { return this.ids.has(id); },
+
+  attach(bar, reload) {
+    this.ids.clear();
+    this.bar = bar;
+    this.reload = reload;
+    if (!bar) return;
+    qsa('button[data-bulk]', bar).forEach((b) =>
+      b.addEventListener('click', () => this.run(b.dataset.bulk)));
+    const clear = qs('#r-bulk-clear', bar);
+    if (clear) clear.addEventListener('click', () => { this.ids.clear(); this.sync(); });
+    this.sync();
+  },
+
+  bind(host) {
+    qsa('.pick-one', host).forEach((box) => box.addEventListener('change', () => {
+      if (box.checked) this.ids.add(box.value); else this.ids.delete(box.value);
+      this.sync();
+    }));
+    const all = qs('#r-pick-all', host);
+    if (all) all.addEventListener('change', () => {
+      qsa('.pick-one', host).forEach((box) => {
+        box.checked = all.checked;
+        if (all.checked) this.ids.add(box.value); else this.ids.delete(box.value);
+      });
+      this.sync();
+    });
+    this.sync();
+  },
+
+  sync() {
+    if (!this.bar) return;
+    const n = this.ids.size;
+    this.bar.hidden = n === 0;
+    const count = qs('#r-bulk-count', this.bar);
+    if (count) {
+      count.textContent = `${n} ${plural(n, 'задание', 'задания', 'заданий')} выбрано`;
+    }
+  },
+
+  async run(action) {
+    const ids = [...this.ids];
+    if (!ids.length) return;
+    const тело = { action, ids };
+    if (action === 'tag') {
+      const метка = prompt(
+        `Метка для ${ids.length} ${plural(ids.length, 'задания', 'заданий', 'заданий')}` +
+        ' (пустая строка снимет метку):', '');
+      if (метка === null) return;
+      тело.tags = метка.trim();
+    }
+    if (action === 'delete' && !confirm(
+        `Удалить ${ids.length} ${plural(ids.length, 'задание', 'задания', 'заданий')} ` +
+        'вместе с записями и результатами? Это не отменить.')) return;
+    if (action === 'retry' && !confirm(
+        `Поставить ${ids.length} ${plural(ids.length, 'задание', 'задания', 'заданий')} ` +
+        'в очередь заново?')) return;
+    try {
+      const ответ = await API.post('/api/jobs/bulk', тело);
+      const сделано = (ответ.done || []).length;
+      const отказов = (ответ.failed || []).length;
+      // Отказы называем по первому: список из сотни строк в всплывающем
+      // сообщении не читает никто, а причина у них обычно одна.
+      if (отказов) {
+        toast(`Готово: ${сделано}, не удалось: ${отказов}. ` +
+              `Первая причина — ${ответ.failed[0].error}`, 'warn');
+      } else {
+        toast(`Готово: ${сделано} ${plural(сделано, 'задание', 'задания', 'заданий')}`, 'ok');
+      }
+      (ответ.done || []).forEach((id) => this.ids.delete(id));
+      this.sync();
+      if (this.reload) this.reload();
+      await refreshQueue();
+    } catch (err) { fail(err); }
+  },
+};
+
+// ==========================================================================
 // Вид: Результаты
 // ==========================================================================
 
@@ -2216,11 +2326,20 @@ RENDERERS.results = {
             <option value="rtf ASC">Самые быстрые</option>
           </select>
         </div>
+        <div class="bulk-bar" id="r-bulk" hidden>
+          <span class="count" id="r-bulk-count"></span>
+          <button class="btn sm" data-bulk="retry">Повторить</button>
+          <button class="btn sm" data-bulk="tag">Пометить</button>
+          <button class="btn sm danger" data-bulk="delete">Удалить</button>
+          <span class="spacer"></span>
+          <button class="ghost sm" id="r-bulk-clear">Снять выбор</button>
+        </div>
         <div class="table-wrap" id="results-table"></div>
       </section>`;
     let timer;
     qs('#r-search').oninput = () => { clearTimeout(timer); timer = setTimeout(() => this.load(), 300); };
     qs('#r-order').onchange = () => this.load();
+    Bulk.attach(qs('#r-bulk'), () => this.load());
     this.load();
   },
 
@@ -2233,14 +2352,24 @@ RENDERERS.results = {
       if (search) params.set('search', search);
       const data = await API.latest('results-table', `/api/jobs?${params}`);
       host.innerHTML = data.items.length ? `<table>
-        <thead><tr><th>Файл</th><th>Модель</th><th class="num">Длит.</th>
+        <thead><tr><th class="pick"><input type="checkbox" id="r-pick-all"
+            title="Выбрать все на странице"></th>
+          <th>Файл</th><th>Модель</th><th class="num">Длит.</th>
           <th class="num">Слов</th><th class="num">Сегм.</th><th class="num">RTF</th>
           <th class="num">Уверенность</th><th>Говорящие</th><th>Готово</th>
           <th style="width:230px">Выгрузка</th></tr></thead><tbody>
-        ${data.items.map((job) => `<tr>
-          <td><div class="truncate" style="max-width:240px">${esc(job.filename)}</div>
-            <div class="small faint truncate" style="max-width:240px">${
-              esc((job.text || '').slice(0, 70))}</div></td>
+        ${data.items.map((job) => `<tr data-id="${job.id}">
+          <td class="pick"><input type="checkbox" class="pick-one" value="${job.id}"
+            ${Bulk.has(job.id) ? 'checked' : ''}></td>
+          <td><div class="truncate" style="max-width:260px">${esc(job.filename)}</div>
+            ${job.match && job.match.snippet
+              ? `<div class="found small truncate" style="max-width:260px"
+                     title="Открыть на ${fmtDur(job.match.start_s)}"
+                     onclick="__asrhub.openAt('${job.id}', ${Number(job.match.start_s) || 0})">
+                   <span class="at">${fmtDur(job.match.start_s)}</span> ${markSnippet(job.match.snippet)}
+                 </div>`
+              : `<div class="small faint truncate" style="max-width:260px">${
+                  esc((job.text || '').slice(0, 70))}</div>`}</td>
           <td class="small dim">${esc(job.model || '')}</td>
           <td class="num">${fmtDur(job.media_duration_s)}</td>
           <td class="num">${num(job.words_count)}</td>
@@ -2258,6 +2387,7 @@ RENDERERS.results = {
             <button class="ghost sm" onclick="__asrhub.openJob('${job.id}')">Открыть</button>
           </div></td></tr>`).join('')}
       </tbody></table>` : '<div class="empty">Завершённых заданий пока нет</div>';
+      Bulk.bind(host);
     } catch (err) { fail(err); }
   },
 };
@@ -2440,6 +2570,61 @@ const Player = {
   },
 };
 window.__asrhub.playRecording = (id) => window.__asrhub.openJob(id, { play: true });
+/**
+ * Выгрузка отчёта в таблицу.
+ *
+ * Через fetch, а не ссылкой: ключ доступа живёт в заголовке, а адрес с
+ * ключом попадает в историю браузера и в журнал обратного прокси. Тот же
+ * приём, что и у выгрузки результатов задания.
+ */
+window.__asrhub.exportAnalytics = async (fmt) => {
+  const url = `/api/analytics/export?period=${encodeURIComponent(state.period)}` +
+              `&fmt=${encodeURIComponent(fmt)}`;
+  try {
+    const headers = {};
+    const key = localStorage.getItem('asrhub_key');
+    if (key) headers['X-API-Key'] = key;
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      let причина = `сервер ответил ${response.status}`;
+      try {
+        const тело = await response.json();
+        причина = тело.message || причина;
+        if (тело.hint) причина += ` — ${тело.hint}`;
+      } catch (e) { /* тело не разбирается: остаётся код ответа */ }
+      throw new Error(причина);
+    }
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = parseFilename(response.headers.get('Content-Disposition') || '')
+                    || `аналитика.${fmt === 'csv' ? 'zip' : 'xlsx'}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    toast('Выгрузка готова', 'ok');
+  } catch (err) {
+    toast(`Не удалось выгрузить: ${err.message}`, 'err');
+  }
+};
+
+window.__asrhub.openAt = (id, seconds) =>
+  window.__asrhub.openJob(id, { play: true, at: Number(seconds) || 0 });
+
+/**
+ * Найденная фраза с обрамлением: сервер помечает совпадение символами ‹ ›.
+ *
+ * Экранируем сами, а метки превращаем в разметку уже после: в расшифровке
+ * встречается что угодно, включая угловые скобки, и вставлять её как HTML
+ * нельзя. Метки выбраны такие, каких в русской речи не бывает, — обычные
+ * кавычки-ёлочки для этого не годятся, они в тексте попадаются.
+ */
+function markSnippet(text) {
+  return esc(String(text || ''))
+    .replaceAll('\u2039', '<mark>')
+    .replaceAll('\u203a', '</mark>');
+}
 window.__asrhub.saveRecording = (id) => Player.save(id);
 
 // ==========================================================================
@@ -2528,7 +2713,14 @@ function showJobModal(job, opts) {
   const tabs = {
     text: () => `<div class="transcript" style="white-space:pre-wrap;line-height:1.7">${
       esc(job.text || '—')}</div>`,
-    segments: () => segments.length ? `<div class="transcript">${segments.map((s, i) => `
+    segments: () => segments.length ? `
+      <div class="job-find">
+        <input type="search" id="job-find-input" placeholder="Найти в разговоре"
+               autocomplete="off">
+        <span class="count" id="job-find-count"></span>
+      </div>
+      <div class="find-hits" id="job-find-hits"></div>
+      <div class="transcript">${segments.map((s, i) => `
       <div class="segment" data-index="${i}" data-start="${s.start}" data-end="${s.end}">
         <div class="ts">${fmtDur(s.start)}<br><span style="opacity:.6">${
           fmtDur(s.end)}</span></div>
@@ -2560,6 +2752,7 @@ function showJobModal(job, opts) {
     body.innerHTML = tabs[name]();
     qsa('#job-tabs button', backdrop).forEach((b) =>
       b.classList.toggle('active', b.dataset.tab === name));
+    if (name === 'segments') setupJobFind(backdrop, job);
   };
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
@@ -2572,6 +2765,74 @@ function showJobModal(job, opts) {
   // идёт. Поэтому останавливаем его вместе с окном.
   backdrop.addEventListener('asrhub:closed', () => { if (player) player.destroy(); });
 }
+
+/* Поиск по репликам открытого разговора.
+ *
+ * Часовой разговор — это сотни реплик, и «где обсуждали сроки» поиском по
+ * странице означает пролистать их все. Ищет тот же указатель, что и общий
+ * поиск, поэтому находится и по началу слова, и без разницы «ещё»/«еще»;
+ * щелчок по находке переводит проигрыватель на её секунду.
+ *
+ * Запрос уходит не на каждую букву: набирающий «договор» иначе присылает
+ * семь запросов, из которых нужен последний.
+ */
+function setupJobFind(backdrop, job) {
+  const input = qs('#job-find-input', backdrop);
+  const hits = qs('#job-find-hits', backdrop);
+  const count = qs('#job-find-count', backdrop);
+  if (!input || !hits) return;
+
+  let таймер = null;
+  let поколение = 0;
+
+  const искать = async () => {
+    const запрос = input.value.trim();
+    hits.innerHTML = '';
+    if (!запрос) { count.textContent = ''; return; }
+    const своё = ++поколение;
+    count.textContent = 'ищем…';
+    let data;
+    try {
+      data = await API.get(
+        `/api/jobs/${job.id}/search?q=${encodeURIComponent(запрос)}`);
+    } catch (err) {
+      if (своё === поколение) count.textContent = 'не удалось найти';
+      return;
+    }
+    // Ответ на устаревший запрос: пока он шёл, набрали ещё букву.
+    if (своё !== поколение) return;
+    const items = data.items || [];
+    if (!items.length) {
+      count.textContent = data.indexed ? 'ничего не найдено'
+                                       : 'поиск по репликам недоступен';
+      return;
+    }
+    count.textContent = `${items.length} ${plural(items.length, 'находка', 'находки', 'находок')}`;
+    hits.innerHTML = items.map((r) => `
+      <div class="found" data-start="${r.start_s}">
+        <span class="at">${fmtDur(r.start_s)}</span>${
+          r.speaker ? `<b>${esc(r.speaker)}:</b> ` : ''}${markSnippet(r.snippet)}
+      </div>`).join('');
+  };
+
+  input.addEventListener('input', () => {
+    clearTimeout(таймер);
+    таймер = setTimeout(искать, 250);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { clearTimeout(таймер); искать(); }
+    if (e.key === 'Escape') { input.value = ''; искать(); }
+  });
+  hits.addEventListener('click', (e) => {
+    const node = e.target.closest('.found[data-start]');
+    if (!node) return;
+    // Тот же обработчик, что и у щелчка по сегменту: он живёт на теле
+    // вкладок и умеет и перемотку, и подсветку.
+    const сегмент = qs(`.segment[data-start="${node.dataset.start}"]`, backdrop);
+    if (сегмент) сегмент.click();
+  });
+}
+
 
 /* Проигрыватель в карточке и его связь с расшифровкой.
  *
@@ -2633,6 +2894,10 @@ function setupJobPlayer(backdrop, job, segments, show, options) {
   if (options && options.play) {
     show('segments');
     player.audio.addEventListener('loadedmetadata', () => {
+      // Секунда из результата поиска: открывать часовой разговор с начала,
+      // когда уже известно, где сказано искомое, — значит выбросить
+      // единственное, что поиск и добыл.
+      if (options.at) player.seek(options.at, false);
       player.audio.play().catch(() => { /* браузер запретил автозапуск */ });
     }, { once: true });
   }
@@ -2717,6 +2982,10 @@ RENDERERS.analytics = {
           ).join('')}
         </div>
         <span class="spacer"></span>
+        <button class="btn sm" onclick="__asrhub.exportAnalytics('xlsx')"
+          title="Тот же отчёт книгой Excel: по листу на разрез">Выгрузить в Excel</button>
+        <button class="ghost sm" onclick="__asrhub.exportAnalytics('csv')"
+          title="Архив CSV — если Excel под рукой нет">CSV</button>
         <a class="btn sm" href="/api/metrics" target="_blank">Метрики Prometheus</a>
       </div>
       <div id="analytics-body"><div class="empty">Загрузка аналитики…</div></div>`;
@@ -3152,7 +3421,20 @@ function drawExtraAnalytics(data) {
         style="max-width:180px">${esc(m.model)}</td>
         <td class="num">${fmtBytes(m.peak_mb * 1024 * 1024)}</td>
         <td class="num">${fmtBytes(m.p95_mb * 1024 * 1024)}</td>
-        <td class="num">${fmtBytes(m.avg_mb * 1024 * 1024)}</td></tr>`).join('')}</tbody></table>`
+        <td class="num">${fmtBytes(m.avg_mb * 1024 * 1024)}</td></tr>`).join('')}</tbody></table>
+      ${(res.concurrency || []).length > 1 ? `<table style="margin-top:10px"><thead><tr>
+        <th>Заданий разом</th><th class="num">Замеров</th><th class="num">Пик</th>
+        <th class="num">p95</th><th class="num">Среднее</th></tr></thead><tbody>
+      ${res.concurrency.map((c) => `<tr>
+        <td>${c.jobs_at_once} ${plural(c.jobs_at_once, 'задание', 'задания', 'заданий')}</td>
+        <td class="num">${c.measurements}</td>
+        <td class="num">${fmtBytes(c.peak_mb * 1024 * 1024)}</td>
+        <td class="num">${fmtBytes(c.p95_mb * 1024 * 1024)}</td>
+        <td class="num">${fmtBytes(c.avg_mb * 1024 * 1024)}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="small faint" style="margin-top:6px">Пик — величина на весь сервер, а не
+        на одну модель: счётчики памяти другого не умеют. Поэтому рядом стоит, сколько
+        заданий шло разом: по этой таблице видно, сколько их выдержит карта.</div>` : ''}`
       : `<div class="small faint" style="margin-top:8px">Пик памяти пишется начиная с этой
          версии — у заданий, выполненных раньше, его нет. На видеокарте это память
          ускорителя, на процессоре — резидентная память процесса.</div>`}`;

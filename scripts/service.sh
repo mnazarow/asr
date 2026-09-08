@@ -25,6 +25,7 @@ SERVICE_USER=""
 SERVICE_NAME="asrhub"
 FOLLOW=0
 LINES=100
+RESTORE_FROM=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,11 +37,24 @@ while [[ $# -gt 0 ]]; do
     --name)   SERVICE_NAME="${2:?}"; shift 2 ;;
     --follow|-f) FOLLOW=1; shift ;;
     --lines|-n) LINES="${2:?}"; shift 2 ;;
+    --from)   RESTORE_FROM="${2:?}"; shift 2 ;;
     --quiet|-q) ASRHUB_QUIET=1; shift ;;
     --dry-run) ASRHUB_DRY_RUN=1; shift ;;
     *) shift ;;
   esac
 done
+
+# Интерпретатор ASR Hub. Ставить пакеты в системный python нельзя, поэтому
+# всё живёт в venv рядом с программой; отдельный поиск нужен потому, что
+# обслуживание запускают и на машине, где venv собран другой версией.
+asrhub_python() {
+  local candidate
+  for candidate in "${PREFIX}/venv/bin/python" "${PREFIX}/venv/bin/python3" \
+                   "${PREFIX}/venv/Scripts/python.exe"; do
+    [[ -x "${candidate}" ]] && { printf '%s' "${candidate}"; return 0; }
+  done
+  return 1
+}
 
 OS="$(detect_os)"
 PLIST="${HOME}/Library/LaunchAgents/com.asrhub.server.plist"
@@ -351,6 +365,54 @@ case "${ACTION}" in
       tail -n "${LINES}" "${DATA_DIR}/logs/asrhub.log" 2>/dev/null || warn "Журнал не найден."
     fi ;;
 
+  backup)
+    # Копия снимается командой SQLite «.backup», а не копированием файла:
+    # база работает в режиме WAL, рядом лежат -wal и -shm, и обычная копия
+    # получается несогласованной — выглядит как копия и ею не является.
+    py="$(asrhub_python)" || { err "Не найден интерпретатор ASR Hub."; exit 1; }
+    ASRHUB_DATA_DIR="${DATA_DIR}" "${py}" - <<'PYCODE' || exit 1
+from pathlib import Path
+
+from asrhub.config import load
+from asrhub.db import Database
+from asrhub.maintenance import backup_dir, make_backup
+
+settings = load()
+db = Database(Path(settings.paths.data) / "asrhub.db")
+копия = make_backup(db, settings)
+if копия is None:
+    print("Копию сделать не удалось — причина в журнале выше.")
+    raise SystemExit(1)
+print(f"Копия: {копия}")
+print(f"Каталог копий: {backup_dir(settings)}")
+PYCODE
+    ok "Резервная копия готова" ;;
+
+  restore)
+    [[ -n "${RESTORE_FROM}" ]] || { err "Укажите файл копии: --from ПУТЬ"; exit 2; }
+    [[ -f "${RESTORE_FROM}" ]] || { err "Файл не найден: ${RESTORE_FROM}"; exit 1; }
+    # Восстановление на работающем сервере затрёт базу под ним, и он
+    # продолжит писать в файл, которого больше нет. Останавливаем сами: это
+    # не тот случай, где предупреждения достаточно.
+    warn "Служба будет остановлена на время восстановления."
+    bash "${BASH_SOURCE[0]}" stop --data "${DATA_DIR}" >/dev/null 2>&1 || true
+    py="$(asrhub_python)" || { err "Не найден интерпретатор ASR Hub."; exit 1; }
+    ASRHUB_DATA_DIR="${DATA_DIR}" ASRHUB_RESTORE_FROM="${RESTORE_FROM}"       "${py}" - <<'PYCODE' || exit 1
+import os
+from pathlib import Path
+
+from asrhub.config import load
+from asrhub.maintenance import restore
+
+settings = load()
+цель = Path(settings.paths.data) / "asrhub.db"
+restore(Path(os.environ["ASRHUB_RESTORE_FROM"]), цель)
+print(f"База восстановлена: {цель}")
+print("Прежняя база сохранена рядом с пометкой before-restore — "
+      "удалите её, когда убедитесь, что всё на месте.")
+PYCODE
+    ok "Восстановление завершено. Запустите службу: bash scripts/service.sh start" ;;
+
   *)
     cat <<'USAGE'
 Управление службой ASR Hub
@@ -358,9 +420,15 @@ case "${ACTION}" in
   bash scripts/service.sh install [--prefix ПУТЬ] [--data ПУТЬ] [--port N] [--user ИМЯ]
   bash scripts/service.sh start | stop | restart | status
   bash scripts/service.sh logs [-n 200] [-f]
+  bash scripts/service.sh backup
+  bash scripts/service.sh restore --from ПУТЬ_К_КОПИИ
   bash scripts/service.sh uninstall
 
 Linux — systemd (системная или пользовательская служба), macOS — launchd.
+
+Резервная копия снимается командой SQLite «.backup»: обычное копирование
+файла базы на работающем сервере даёт несогласованный результат. Сервер
+умеет делать копии и сам — настройка backup_interval_hours.
 USAGE
     exit 2 ;;
 esac

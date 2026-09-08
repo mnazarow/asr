@@ -9,7 +9,9 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -24,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -36,6 +38,50 @@ SERIES_MAX_BUCKETS = 2000
 #: Такт служебного цикла: с этим шагом пишутся замеры нагрузки. Здесь он
 #: потому, что от него зависит и запись, и чтение рядов.
 SAMPLE_PERIOD_S = 20.0
+
+#: Полнотекстовый указатель по репликам. Живёт отдельно от `_SCHEMA`, и это
+#: не украшение: FTS5 — необязательный модуль SQLite, и если он в сборке не
+#: собран, `CREATE VIRTUAL TABLE` откатит всю миграцию и сервер не поднимется
+#: вовсе. Поиск без указателя работает и так, только медленнее, — а сервер,
+#: который не стартует, не работает никак.
+#:
+#: Указатель внешний (`content='segments'`): текст реплик не дублируется, в
+#: базе лежит только сам индекс. Синхронизацию держат триггеры, а не код:
+#: реплики удаляются из четырёх мест (замена результата, удаление задания,
+#: уборка по сроку, каскад при повторе), и любое пятое, забывшее про
+#: указатель, оставило бы в поиске записи об удалённых разговорах.
+#:
+#: `remove_diacritics 2` здесь работает на русский: «ещё» и «еще» становятся
+#: одним словом, и человеку не приходится угадывать, как набрано в
+#: расшифровке.
+_FTS_SCHEMA = [
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
+        text,
+        content='segments',
+        content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2'
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS segments_fts_ai AFTER INSERT ON segments BEGIN
+        INSERT INTO segments_fts(rowid, text) VALUES (new.rowid, new.text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS segments_fts_ad AFTER DELETE ON segments BEGIN
+        INSERT INTO segments_fts(segments_fts, rowid, text)
+        VALUES ('delete', old.rowid, old.text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS segments_fts_au AFTER UPDATE ON segments BEGIN
+        INSERT INTO segments_fts(segments_fts, rowid, text)
+        VALUES ('delete', old.rowid, old.text);
+        INSERT INTO segments_fts(rowid, text) VALUES (new.rowid, new.text);
+    END
+    """,
+]
 
 _SCHEMA = [
     # --- версия 1: основные таблицы ---------------------------------------
@@ -77,6 +123,7 @@ _SCHEMA = [
         inference_s       REAL,
         postprocess_s     REAL,
         peak_memory_mb    REAL,
+        peak_memory_jobs  INTEGER,
         device            TEXT,
         retries           INTEGER DEFAULT 0,
         error_code        TEXT,
@@ -364,6 +411,9 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "inference_s": "REAL",
         "postprocess_s": "REAL",
         "peak_memory_mb": "REAL",
+        # Сколько заданий шло разом, когда снимался пик. Без этого числа
+        # сам пик не отвечает на вопрос, ради которого его смотрят.
+        "peak_memory_jobs": "INTEGER",
         "device": "TEXT",
         "retries": "INTEGER DEFAULT 0",
         "error_code": "TEXT",
@@ -469,6 +519,31 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
     },
 }
 
+def fts_query(text: str) -> str:
+    """Превращает набранное человеком в запрос к указателю.
+
+    Отдавать пользовательскую строку в MATCH напрямую нельзя: у FTS5 свой
+    язык запросов, и одинокая кавычка, звёздочка или слово AND — это не
+    поиск, а синтаксическая ошибка прямо в лицо человеку, который просто
+    искал «договор». Поэтому берём из строки слова, каждое заключаем в
+    кавычки как отдельное слово запроса, а последнему разрешаем
+    продолжение: набранное «догов» находит «договор», и поиск работает по
+    ходу набора, а не только после последней буквы.
+
+    Пустая строка на выходе означает «искать нечего» — вызывающий тогда
+    просто не ставит условия.
+    """
+    слова = re.findall(r"[^\W_]+", text or "", flags=re.UNICODE)
+    if not слова:
+        return ""
+    # Больше десятка слов в запросе — это уже не поиск, а вставленный абзац;
+    # каждое слово стоит времени, а пользы за пределами первых нет.
+    слова = слова[:12]
+    части = [f'"{w}"' for w in слова[:-1]]
+    части.append(f'"{слова[-1]}"*')
+    return " ".join(части)
+
+
 class Database:
     """Тонкая обёртка над SQLite с пулом соединений по потокам."""
 
@@ -477,8 +552,12 @@ class Database:
         self._local = threading.local()
         self._write_lock = threading.RLock()
         self._closed = False
+        #: Есть ли полнотекстовый указатель. False — сборка SQLite без FTS5;
+        #: поиск тогда работает перебором, как раньше.
+        self.fts_ready = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._migrate()
+        self._setup_fts()
 
     # --- соединения -----------------------------------------------------
 
@@ -555,6 +634,13 @@ class Database:
         except sqlite3.Error as exc:
             raise StorageError(f"База повреждена или недоступна: {exc}") from exc
         if current >= SCHEMA_VERSION:
+            # Номер версии — вещь, которую забывают поднять. Забыли — и
+            # новая колонка не появляется, а каждый запрос к таблице падает
+            # с «no such column» на боевом сервере. Проверка дешёвая
+            # (`PRAGMA table_info` по нескольким таблицам), поэтому идёт
+            # всегда, а не только при смене номера: недостающая колонка
+            # находится и молча дописывается.
+            self._catch_up_columns()
             return
         log.info("Обновление схемы базы: версия %s → %s", current, SCHEMA_VERSION)
         with self._write_lock:
@@ -570,6 +656,83 @@ class Database:
             except sqlite3.Error as exc:
                 conn.execute("ROLLBACK")
                 raise StorageError(f"Не удалось применить миграции: {exc}") from exc
+
+    def _setup_fts(self) -> None:
+        """Заводит полнотекстовый указатель — если сборка SQLite его умеет.
+
+        Отдельно от общих миграций и в своей транзакции. FTS5 — модуль
+        необязательный: на сборке без него `CREATE VIRTUAL TABLE` откатил бы
+        всю миграцию, и сервер не поднялся бы вовсе. Поиск без указателя
+        работает и так, только перебором, — а сервер, который не стартует,
+        не работает никак.
+
+        Наполнение идёт один раз: на уже накопленном архиве указателя ещё
+        нет, и без пересборки поиск не нашёл бы ни одного старого разговора.
+
+        Пустоту видно по теневой таблице `_docsize` — по строке на
+        проиндексированную реплику. Ни счётчик самого указателя, ни размер
+        `_data` для этого не годятся: у внешнего указателя
+        `SELECT COUNT(*) FROM segments_fts` считает строки таблицы-источника
+        и равен ему всегда, даже когда в указателе нет ничего. На этом и
+        попалась первая версия проверки — сервер уверенно решал, что архив
+        уже проиндексирован, и поиск по нему не находил ничего.
+        """
+        with self._write_lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for statement in _FTS_SCHEMA:
+                    conn.execute(statement)
+                реплик = conn.execute(
+                    "SELECT COUNT(*) FROM segments").fetchone()[0]
+                в_указателе = conn.execute(
+                    "SELECT COUNT(*) FROM segments_fts_docsize").fetchone()[0]
+                if реплик and not в_указателе:
+                    log.info("Сборка поискового указателя по %d репликам…", реплик)
+                    начало = time.time()
+                    conn.execute(
+                        "INSERT INTO segments_fts(segments_fts) VALUES('rebuild')")
+                    log.info("Поисковый указатель собран за %.1f с",
+                             time.time() - начало)
+                conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                log.warning(
+                    "Полнотекстовый поиск недоступен (%s). Поиск по расшифровкам "
+                    "будет идти перебором: на большом архиве это заметно "
+                    "медленнее. Обычная причина — сборка SQLite без модуля FTS5.",
+                    exc)
+                return
+        self.fts_ready = True
+
+    def _catch_up_columns(self) -> None:
+        """Дописывает колонки на базе, у которой номер версии уже нынешний."""
+        if not self._columns_differ():
+            return
+        with self._write_lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._add_missing_columns(conn)
+                conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                raise StorageError(
+                    f"Не удалось дописать колонки: {exc}") from exc
+
+    def _columns_differ(self) -> bool:
+        """Есть ли в схеме колонки, которых нет в базе."""
+        for table, columns in _EXPECTED_COLUMNS.items():
+            try:
+                existing = {row[1] for row in
+                            self.conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if existing and not set(columns) <= existing:
+                return True
+        return False
 
     def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
         """Добавляет колонки, которых нет в уже созданных таблицах.
@@ -655,7 +818,8 @@ class Database:
         # повторов, кто отменил и чем кончилось уведомление. Каждое поле
         # молча приходило как None, и разделы показывали пустоту — тот самый
         # случай, о котором предупреждает абзац выше.
-        "tags, peak_memory_mb, file_hash, cancelled_by, webhook_status"
+        "tags, peak_memory_mb, peak_memory_jobs, file_hash, cancelled_by, "
+        "webhook_status"
     )
 
     def list_jobs(self, *, status: str | list[str] | None = None,
@@ -688,9 +852,25 @@ class Database:
             where.append("created_at>=?")
             args.append(since)
         if search:
-            where.append("(filename LIKE ? OR text LIKE ? OR id LIKE ?)")
+            # Расшифровку ищет указатель, имя файла и номер — перебором.
+            # Перебор здесь дёшев: обе колонки короткие и лежат в начале
+            # записи, поэтому строку не приходится читать целиком. Дорого
+            # было именно `text LIKE '%…%'` — оно поднимало с диска все
+            # расшифровки подряд, и редкое слово (то есть ровно тот запрос,
+            # ради которого поиском и пользуются) читало таблицу насквозь.
+            найденные = self.jobs_matching(search) if self.fts_ready else None
             needle = f"%{search}%"
-            args.extend([needle, needle, needle])
+            if найденные is None:
+                where.append("(filename LIKE ? OR text LIKE ? OR id LIKE ?)")
+                args.extend([needle, needle, needle])
+            elif найденные:
+                места = ",".join("?" for _ in найденные)
+                where.append(
+                    f"(id IN ({места}) OR filename LIKE ? OR id LIKE ?)")
+                args.extend([*найденные, needle, needle])
+            else:
+                where.append("(filename LIKE ? OR id LIKE ?)")
+                args.extend([needle, needle])
         if ready_before is not None:
             # Отбор «время повтора уже наступило» обязан идти в SQL, а не
             # после LIMIT. Планировщик выбирает окно из 500 заданий; если в
@@ -720,6 +900,68 @@ class Database:
         for job in jobs:
             job.pop("waveform", None)
         return jobs
+
+    #: Сколько разговоров максимум приносит один поиск. Список на экране
+    #: всё равно листается страницами, а перечень номеров уезжает в SQL
+    #: условием `id IN (...)`, у которого есть свой предел на число
+    #: параметров.
+    SEARCH_LIMIT = 400
+
+    def jobs_matching(self, search: str, limit: int = 0) -> list[str]:
+        """Номера заданий, в расшифровках которых встретилось искомое."""
+        запрос = fts_query(search)
+        if not запрос or not self.fts_ready:
+            return []
+        try:
+            rows = self.query(
+                "SELECT DISTINCT s.job_id FROM segments_fts f "
+                "JOIN segments s ON s.rowid = f.rowid "
+                "WHERE f.text MATCH ? LIMIT ?",
+                (запрос, limit or self.SEARCH_LIMIT))
+        except StorageError as exc:
+            log.warning("Поиск по указателю не удался (%s) — идём перебором", exc)
+            return []
+        return [str(r["job_id"]) for r in rows]
+
+    def search_segments(self, search: str, *, job_id: str = "",
+                        limit: int = 200) -> list[dict[str, Any]]:
+        """Найденные реплики: где сказано, на какой секунде и что вокруг.
+
+        Список заданий отвечает «нашлось в этом разговоре» и на этом
+        замолкает — дальше человек открывал карточку и искал глазами.
+        Здесь возвращается сама фраза с обрамлением и её время, так что из
+        результата поиска можно сразу включить запись с нужного места.
+        """
+        запрос = fts_query(search)
+        if not запрос or not self.fts_ready:
+            return []
+        условие = "f.text MATCH ?"
+        args: list[Any] = [запрос]
+        if job_id:
+            условие += " AND s.job_id = ?"
+            args.append(job_id)
+        try:
+            rows = self.query(
+                "SELECT s.job_id, s.idx, s.start_s, s.end_s, s.speaker, s.text, "
+                "       snippet(segments_fts, 0, '\u2039', '\u203a', '…', 12) AS snippet "
+                "FROM segments_fts f JOIN segments s ON s.rowid = f.rowid "
+                f"WHERE {условие} ORDER BY s.job_id, s.idx LIMIT ?",
+                (*args, limit))
+        except StorageError as exc:
+            log.warning("Поиск по репликам не удался: %s", exc)
+            return []
+        return [dict(r) for r in rows]
+
+    def best_snippets(self, search: str, job_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """По одной лучшей находке на каждое задание — для списка результатов."""
+        if not job_ids or not self.fts_ready:
+            return {}
+        лучшее: dict[str, dict[str, Any]] = {}
+        # Берём с запасом: у одного разговора находок может быть много, а
+        # нужна по одной с каждого.
+        for реплика in self.search_segments(search, limit=len(job_ids) * 8 + 50):
+            лучшее.setdefault(str(реплика["job_id"]), реплика)
+        return {k: v for k, v in лучшее.items() if k in set(job_ids)}
 
     def owner_usage(self, owner: str | list[str], since: float) -> dict[str, float]:
         """Расход владельца (или подразделения) с указанного момента.
