@@ -49,6 +49,42 @@ USER_UNIT="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
 
 use_user_systemd() { [[ ! -w /etc/systemd/system ]] && ! is_root; }
 
+# Перечитывает определения юнитов, если файл на диске разошёлся с тем, что
+# systemd держит в памяти.
+#
+# Правка юнита сама по себе ни на что не влияет: служба продолжает работать
+# по определению, загруженному в прошлый раз. Перезагрузку делала только
+# установка, а update.sh юнит не переустанавливает — он лишь останавливает и
+# запускает службу. Из-за этого правки жили на диске, но не в работе:
+# переменные каталогов кеша (MPLCONFIGDIR и соседи) прописаны в файле, а
+# служба о них не знает, и в журнале снова копятся жалобы на недоступный
+# кеш. Сам systemd об этом честно предупреждает в каждой команде — «unit
+# file … changed on disk» — и он же умеет ответить, нужна ли перезагрузка.
+reload_units_if_needed() {
+  have systemctl || return 0
+  [[ "${OS}" == "macos" ]] && return 0
+  local need=""
+  if use_user_systemd; then
+    need="$(systemctl --user show "${SERVICE_NAME}.service" \
+             -p NeedDaemonReload --value 2>/dev/null || true)"
+  else
+    need="$(systemctl show "${SERVICE_NAME}.service" \
+             -p NeedDaemonReload --value 2>/dev/null || true)"
+  fi
+  [[ "${need}" == "yes" ]] || return 0
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '  [пробный запуск] systemctl daemon-reload\n'
+    return 0
+  fi
+  info "Определение службы на диске новее загруженного — перечитываем."
+  if use_user_systemd; then
+    systemctl --user daemon-reload 2>/dev/null || true
+  else
+    as_root systemctl daemon-reload 2>/dev/null || true
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 
 install_systemd() {
@@ -247,6 +283,9 @@ case "${ACTION}" in
     fi ;;
 
   start|stop|restart)
+    # До самой команды: запуск по устаревшему определению — это ровно та
+    # тихая поломка, ради которой всё и затевалось.
+    reload_units_if_needed
     if [[ "${OS}" == "macos" ]]; then
       case "${ACTION}" in
         start)   run launchctl load -w "${PLIST}" ;;

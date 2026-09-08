@@ -2767,6 +2767,78 @@ def test_deliberate_deviations_are_not_reported_as_findings(repo_root: Path,
     assert "nemo-text-processing 1.2.0" not in текст, "то же самое с nemo-text-processing"
 
 
+def _тело_функции(файл: Path, имя: str) -> str:
+    """Вырезает одну функцию из скрипта — чтобы проверять её, не запуская всё."""
+    текст = файл.read_text(encoding="utf-8")
+    начало = текст.index(имя + "() {")
+    глубина = 0
+    for i in range(начало, len(текст)):
+        if текст[i] == "{":
+            глубина += 1
+        elif текст[i] == "}":
+            глубина -= 1
+            if глубина == 0:
+                return текст[начало:i + 1]
+    raise AssertionError("не найдено тело функции " + имя)
+
+
+def _поддельный_systemctl(каталог: Path, журнал: Path, ответ: str) -> None:
+    путь = каталог / "systemctl"
+    путь.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" >> "' + str(журнал) + '"\n'
+        '[[ "$*" == *NeedDaemonReload* ]] && { echo ' + ответ + '; exit 0; }\n'
+        "exit 0\n", encoding="utf-8")
+    путь.chmod(0o755)
+
+
+def test_the_service_is_reloaded_when_its_unit_changed(repo_root: Path, tmp_path: Path):
+    """Правка юнита не влияет ни на что, пока systemd её не перечитал.
+
+    Перезагрузку делала только установка, а update.sh юнит не
+    переустанавливает — он лишь останавливает и запускает службу. Правки
+    жили на диске, но не в работе: переменные каталогов кеша прописаны в
+    файле, служба о них не знает, и жалобы на недоступный кеш копятся в
+    журнале снова. systemd честно предупреждает об этом в каждой команде и
+    сам же умеет ответить, нужна ли перезагрузка.
+    """
+    service = repo_root / "scripts" / "service.sh"
+    вызовы = tmp_path / "systemctl.log"
+    (tmp_path / "sudo").write_text('#!/usr/bin/env bash\nexec "$@"\n', encoding="utf-8")
+    (tmp_path / "sudo").chmod(0o755)
+
+    скрипт = (
+        'export PATH="' + str(tmp_path) + ':$PATH"\n'
+        'source "' + str(repo_root / "scripts" / "lib" / "common.sh") + '"\n'
+        'SERVICE_NAME=asrhub\n'
+        'OS=linux\n'
+        'is_root() { return 1; }\n'
+        'use_user_systemd() { return 1; }\n'
+        + _тело_функции(service, "reload_units_if_needed") + "\n"
+        'reload_units_if_needed\n')
+
+    _поддельный_systemctl(tmp_path, вызовы, "yes")
+    run_bash(скрипт)
+    записано = вызовы.read_text(encoding="utf-8") if вызовы.exists() else ""
+    assert "daemon-reload" in записано, (
+        "служба запустится по устаревшему определению:\n" + записано)
+
+    # А когда перечитывать нечего — лишней команды быть не должно.
+    вызовы.unlink()
+    _поддельный_systemctl(tmp_path, вызовы, "no")
+    run_bash(скрипт)
+    записано = вызовы.read_text(encoding="utf-8") if вызовы.exists() else ""
+    assert "daemon-reload" not in записано, "перезагрузка без нужды: " + записано
+
+
+def test_the_unit_is_reread_before_the_service_acts(repo_root: Path):
+    """Проверка должна стоять до команды, а не после неё."""
+    текст = (repo_root / "scripts" / "service.sh").read_text(encoding="utf-8")
+    блок = текст[текст.index("  start|stop|restart)"):]
+    assert блок.index("reload_units_if_needed") < блок.index('systemctl "${ACTION}"'), \
+        "служба запускается раньше, чем перечитано определение"
+
+
 def test_overrides_are_installed_without_dependency_resolution(repo_root: Path,
                                                                 tmp_path: Path):
     """overrides.txt спорит с метаданными пакетов — иначе он не нужен.
