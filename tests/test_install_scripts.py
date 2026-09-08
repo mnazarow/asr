@@ -2399,7 +2399,7 @@ def test_checklist_binds_problems_to_the_step_where_they_happened(repo_root: Pat
     assert "поставить позже" in итог, "подсказка рядом с бедой — это лечение"
     assert "—  3. Третий" in итог and "--skip-models" in итог
     assert "✕  4. Четвёртый" in итог and "сервер не отвечает" in итог
-    assert "ошибок: 1, предупреждений: 1" in итог, итог
+    assert "с ошибками: 1" in итог and "с замечаниями: 1" in итог, итог
 
 
 def test_checklist_does_not_collect_hints_from_a_healthy_step(repo_root: Path):
@@ -2581,3 +2581,63 @@ def test_base_requirements_do_not_downgrade_the_hub(repo_root: Path):
     строка = next(s for s in base.splitlines() if s.strip().startswith("huggingface-hub"))
     assert "<1.0" not in строка, "потолок вернулся — hub снова будет откатываться"
     assert ">=0.24" in строка, "нижняя граница потеряна"
+
+
+def test_deliberate_deviations_are_not_reported_as_findings(repo_root: Path,
+                                                            tmp_path: Path):
+    """Проверка, которая ругается на сделанное нарочно, учит себя пролистывать.
+
+    Два движка ставятся с --no-deps намеренно: gigaam (его пины onnx не
+    выполнимы под свежий Python) и nemo-text-processing (прибит к pynini без
+    колеса). Их собственные жалобы на версии — прямое следствие нашего
+    решения, и в списке находок им не место: настоящая находка утонет
+    вместе с ними.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    pip = tmp_path / "pip"
+    pip.write_text(
+        '#!/usr/bin/env bash\n'
+        'cat <<OUT\n'
+        'gigaam 0.2.0 has requirement onnxruntime==1.23.*, but you have onnxruntime 1.29.0.\n'
+        'nemo-text-processing 1.2.0 has requirement pynini==2.1.6.post1, '
+        'but you have pynini 2.1.7.\n'
+        'nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, but you have protobuf 7.36.1.\n'
+        'OUT\n'
+        'exit 1\n', encoding="utf-8")
+    pip.chmod(0o755)
+
+    script = f'''
+      source "{common}"
+      setup_logging "{tmp_path}"
+      step "Зависимости"
+      check_dependency_health "{pip}" "{repo_root}/requirements"
+      checklist_print 0
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+
+    assert "protobuf" in текст, "настоящий конфликт пропал вместе с намеренными"
+    assert "gigaam" not in текст, "жалоба на наше же решение выдана за находку"
+    assert "nemo-text-processing 1.2.0" not in текст, "то же самое с nemo-text-processing"
+
+
+def test_the_deviation_list_comes_from_the_files(repo_root: Path):
+    """Список берётся из самих спутников, а не пишется руками."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    вывод = run_bash(f'source "{common}"; '
+                     f'deliberate_deviations "{repo_root}/requirements"').stdout.split()
+    assert "gigaam" in вывод, вывод
+    assert "nemo-text-processing" in вывод, вывод
+    # Обычные требования сюда попадать не должны.
+    assert "transformers" not in вывод and "pynini" not in вывод, вывод
+
+
+def test_a_package_named_with_underscores_still_matches(repo_root: Path, tmp_path: Path):
+    """pip печатает имя то через дефис, то через подчёркивание."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      filter_deliberate "nemo_text_processing 1.2.0 has requirement pynini==2.1.6.post1." \\
+        "$(deliberate_deviations "{repo_root}/requirements")"
+    '''
+    assert run_bash(script).stdout.strip() == "", "имя с подчёркиванием не опознано"

@@ -277,9 +277,12 @@ checklist_print() {
   if [[ ${failed} -eq 0 && ${warned} -eq 0 ]]; then
     printf '  %s%sВсё прошло без замечаний.%s\n' "${C_BOLD}" "${C_GREEN}" "${C_RESET}" >&2
   else
+    # Считаем пункты, а не строки: «предупреждений: 1» рядом с девятью
+    # строками под пунктом читалось как ошибка счёта.
     local summary=""
-    [[ ${failed} -gt 0 ]] && summary="ошибок: ${failed}"
-    [[ ${warned} -gt 0 ]] && summary="${summary:+${summary}, }предупреждений: ${warned}"
+    [[ ${failed} -gt 0 ]] && summary="с ошибками: ${failed}"
+    [[ ${warned} -gt 0 ]] && summary="${summary:+${summary}, }с замечаниями: ${warned}"
+    summary="пунктов ${summary}"
     printf '  %s%s%s%s\n' "${C_BOLD}" "$( ((failed > 0)) && printf '%s' "${C_RED}" \
       || printf '%s' "${C_YELLOW}")" "Есть замечания — ${summary}." "${C_RESET}" >&2
   fi
@@ -841,18 +844,60 @@ pip_failure_is_permanent() {
   return 1
 }
 
+# Пакеты, которые мы ставим с --no-deps намеренно: их собственные жалобы на
+# версии — ожидаемое следствие нашего решения, а не находка.
+#
+#   deliberate_deviations КАТАЛОГ_ТРЕБОВАНИЙ
+#
+# Список берётся из самих файлов-спутников, а не пишется руками: иначе он
+# разошёлся бы с ними на первой же правке. Проверка, которая ругается на то,
+# что сделано нарочно, приучает пролистывать её целиком — и тогда настоящая
+# находка тонет вместе с остальными.
+deliberate_deviations() {
+  local root="${1:-}" file line name names=""
+  [[ -d "${root}" ]] || return 0
+  while IFS= read -r file; do
+    [[ -f "${file}" ]] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="${line%%@*}"
+      line="${line%%[<>=!;[]*}"
+      name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+      [[ -n "${name}" ]] && names="${names}${name}"$'\n'
+    done < "${file}"
+  done < <(find "${root}" -type d -name no-deps -exec find {} -name '*.txt' \; 2>/dev/null)
+  # Имена нормализуем: pip печатает и «nemo-text-processing», и
+  # «nemo_text_processing» в зависимости от источника метаданных.
+  printf '%s' "${names}" | tr '_' '-' | sort -u
+}
+
+# Отбрасывает строки, subject которых — пакет из намеренных отступлений.
+#
+#   filter_deliberate ТЕКСТ СПИСОК_ПАКЕТОВ
+filter_deliberate() {
+  local text="$1" known="$2" line subject
+  [[ -n "${known}" ]] || { printf '%s' "${text}"; return 0; }
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    subject="$(printf '%s' "${line}" | awk '{print $1}' | tr '_' '-')"
+    grep -qxF "${subject}" <<<"${known}" && continue
+    printf '%s\n' "${line}"
+  done <<< "${text}"
+}
+
 # Сводит итог по согласованности окружения: pip check знает про все пакеты
 # сразу, а не только про те, что ставились сейчас. Пустой вывод — всё сходится.
 #
-#   check_dependency_health ПУТЬ_К_PIP
+#   check_dependency_health ПУТЬ_К_PIP [КАТАЛОГ_ТРЕБОВАНИЙ]
 check_dependency_health() {
-  local pip="$1" out="" count=0 line
+  local pip="$1" root="${2:-}" out="" count=0 line
   [[ -x "${pip}" ]] || return 0
   [[ "${ASRHUB_DRY_RUN}" == "1" ]] && return 0
   out="$("${pip}" check 2>&1 || true)"
   # «No broken requirements found» — то, ради чего всё и затевалось.
   grep -qiE "no broken requirements" <<<"${out}" && return 0
   out="$(set +o pipefail; grep -E "requires|has requirement" <<<"${out}" | sort -u || true)"
+  out="$(filter_deliberate "${out}" "$(deliberate_deviations "${root}")")"
   [[ -n "${out}" ]] || return 0
   warn "Версии пакетов в окружении не сходятся:"
   while IFS= read -r line; do
@@ -871,13 +916,14 @@ check_dependency_health() {
 #
 #   pip_report_conflicts ФАЙЛ_С_ВЫВОДОМ
 pip_report_conflicts() {
-  local file="$1" lines="" line count=0
+  local file="$1" root="${2:-}" lines="" line count=0
   [[ -f "${file}" ]] || return 0
   grep -q "dependency conflicts" "${file}" 2>/dev/null || return 0
   # Строки конфликтов идут сразу после объявления и выглядят как
   # «пакет N требует X, но у вас Y». Берём именно их, а не весь хвост.
   lines="$(set +o pipefail; grep -E "requires .*, but you have " "${file}" 2>/dev/null \
            | sed 's/^[[:space:]]*//' | sort -u || true)"
+  lines="$(filter_deliberate "${lines}" "$(deliberate_deviations "${root}")")"
   [[ -n "${lines}" ]] || return 0
   warn "После установки версии пакетов разошлись:"
   while IFS= read -r line; do
@@ -886,7 +932,12 @@ pip_report_conflicts() {
     if [[ ${count} -le 5 ]]; then hint "${line}"; fi
   done <<< "${lines}"
   [[ ${count} -gt 5 ]] && hint "… и ещё $((count - 5)) — в журнале"
-  hint "Проверить окружение целиком: ${pip:-pip} check"
+  # Совет про pip check — один раз за прогон: он одинаковый, а места в
+  # чек-листе занимает столько же, сколько настоящая строка.
+  if [[ "${_PIP_CHECK_HINTED:-0}" != "1" ]]; then
+    _PIP_CHECK_HINTED=1
+    hint "Полная картина: ${ASRHUB_VPIP:-pip} check"
+  fi
   return 0
 }
 
@@ -929,7 +980,7 @@ pip_install() {
   # разбора и мимо чек-листа: обновление отчитывалось «без замечаний», а в
   # выводе стояли три жалобы на несовместимые версии.
   if [[ ${status} -eq 0 ]]; then
-    pip_report_conflicts "${capture}"
+    pip_report_conflicts "${capture}" "${ASRHUB_REQUIREMENTS_DIR:-}"
   fi
   if [[ ${status} -ne 0 ]]; then
     diagnose_pip_failure "${capture}" "$(dirname "${pip}")/python" "${offline}" || true

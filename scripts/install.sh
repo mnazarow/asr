@@ -950,6 +950,11 @@ else
   fi
   VPY="${VENV}/bin/python"
   VPIP="${VENV}/bin/pip"
+# Разбору внутри библиотеки нужны и pip, и каталог требований: по
+# спутникам --no-deps он отличает наши намеренные отступления от
+# настоящих находок.
+export ASRHUB_VPIP="${VPIP}"
+export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
   [[ "${ASRHUB_DRY_RUN}" == "1" ]] || {
     [[ -x "${VPY}" ]] || { error "Виртуальное окружение создано некорректно: нет ${VPY}"; exit 1; }
   }
@@ -1034,7 +1039,7 @@ else
   # версиях общих пакетов они не могут, и последний перетягивает на себя.
   # Спрашиваем итог у pip — иначе расхождение всплывёт много позже и
   # выглядеть будет как необъяснимый сбой загрузки модели.
-  check_dependency_health "${VPIP}"
+  check_dependency_health "${VPIP}" "${PREFIX}/requirements"
 
   if [[ "${ENGINES}" == *whisper_cpp* ]]; then
     step "Сборка whisper.cpp"

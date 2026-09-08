@@ -75,7 +75,11 @@ print_banner
 [[ -z "${PREFIX}" ]] && { error "Установка не найдена. Укажите --prefix."; exit 2; }
 
 VENV="${PREFIX}/venv"
+# Разбору внутри библиотеки нужны и pip, и каталог требований: по спутникам
+# --no-deps он отличает наши намеренные отступления от настоящих находок.
+export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
 VPIP="${VENV}/bin/pip"
+export ASRHUB_VPIP="${VPIP}"
 VPY="${VENV}/bin/python"
 SNAPSHOT_DIR="${PREFIX}/../asrhub-snapshot"
 CURRENT_VERSION="$(cat "${PREFIX}/VERSION" 2>/dev/null || echo 'неизвестна')"
@@ -326,7 +330,7 @@ elif [[ -x "${VPIP}" ]]; then
   # Каждый движок ставится своим вызовом pip, и договориться между собой они
   # не могут: последний перетягивает версию на себя. Спрашиваем pip, что
   # получилось в итоге, — иначе расхождение видно только по странным сбоям.
-  check_dependency_health "${VPIP}"
+  check_dependency_health "${VPIP}" "${PREFIX}/requirements"
   ok "Зависимости обновлены"
 else
   warn "Виртуальное окружение не найдено — зависимости не обновлялись."
