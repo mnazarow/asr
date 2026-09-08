@@ -814,6 +814,7 @@ class JobQueue:
             postprocess_s=outcome.timings.get("postprocess"),
             language=outcome.language,
             device=str(merged.get("device")),
+            peak_memory_mb=outcome.peak_memory_mb or None,
             wer=accuracy.get("wer"), cer=accuracy.get("cer"),
             waveform=outcome.waveform,
         )

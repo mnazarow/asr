@@ -294,7 +294,12 @@ def test_web_assets_wired(repo_root: Path):
     charts = (repo_root / "server" / "asrhub" / "web" / "charts.js").read_text(encoding="utf-8")
     app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
     assert "function waveform(host, config)" in charts
-    assert "spark, heat, waveform," in charts
+    # Проверяем смысл, а не порядок слов: важно, что полоса экспортируется
+    # вместе с остальными графиками. Дословное совпадение списка ломалось от
+    # добавления любого нового вида графика.
+    экспорт = charts[charts.index("global.Charts = {"):]
+    экспорт = экспорт[:экспорт.index("}")]
+    assert "waveform" in экспорт, экспорт
     assert "Charts.waveform(host" in app
     # Обработчики на window снимаются при закрытии карточки, иначе они копятся.
     assert "asrhub:closed" in app and "removeEventListener('resize', redraw)" in app

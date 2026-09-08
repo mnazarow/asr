@@ -150,7 +150,12 @@
     }));
     if (!isFinite(min)) min = 0;
     if (!isFinite(max)) max = 1;
-    if (min > 0) min = 0;
+    // Шкала от нуля — правило хорошее: для объёмов усечённая ось врёт про
+    // соотношение величин. Но оно безусловное, а есть ряды, которые живут в
+    // узкой полосе у потолка: средняя уверенность держится между 93 и 96 %,
+    // и от нуля это ровная черта, по которой ничего не видно. Явно заданный
+    // yMin — это заявление вызывающего, что он понимает, что делает.
+    if (config.yMin === undefined && min > 0) min = 0;
     if (max === min) max = min + 1;
     const ticks = niceTicks(min, max, 4);
     ctx.yMin = Math.min(min, ticks[0]);
@@ -448,6 +453,65 @@
     return svg;
   }
 
+  /* Двумерная карта: строки × столбцы.
+   *
+   * Суточный профиль (heat выше) — одна строка на 24 часа, и он усредняет
+   * будни с выходными. Планировать обслуживание приходится по неделе:
+   * понедельник в десять утра и воскресенье в десять вечера — разные миры,
+   * а в одной строке они складываются в одно число.
+   */
+  function grid(host, config) {
+    const rows = config.rows || [];
+    const values = config.values || [];
+    if (!rows.length || !values.length) return empty(host, config.emptyText);
+    host.innerHTML = '';
+    const cols = config.cols || [];
+    const cell = config.cell || 22;
+    const left = 34;
+    const width = left + cols.length * cell + 6;
+    const height = 20 + rows.length * cell + 6;
+    // Высоту не фиксируем: с ней карта рисуется в натуральную величину и
+    // висит посередине широкой карточки, оставляя половину пустой. С
+    // height:auto она растягивается на ширину и остаётся пропорциональной.
+    const svg = el('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`,
+                            width: '100%', style: 'width:100%;height:auto',
+                            preserveAspectRatio: 'xMidYMid meet' }, host);
+
+    let max = 0;
+    values.forEach((row) => row.forEach((v) => { if (v > max) max = v; }));
+    // Шкалу берём корневую, а не линейную. Один выброс (тридцать заданий в
+    // час против обычных трёх) при линейной шкале укладывает всю остальную
+    // неделю в один тон, и карта перестаёт что-либо показывать, кроме пика,
+    // — а пик и так подписан текстом.
+    const rampLight = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95'];
+    const ramp = mode() === 'light' ? rampLight : rampLight.slice().reverse();
+    const уровень = (v) => (max ? Math.min(ramp.length - 1,
+      Math.floor(Math.sqrt(v / max) * ramp.length)) : 0);
+
+    // Подписи столбцов — через две, иначе часы сливаются в кашу.
+    cols.forEach((label, c) => {
+      if (c % 3) return;
+      el('text', { x: left + c * cell + (cell - 2) / 2, y: 13, 'text-anchor': 'middle',
+                   fill: faint(), 'font-size': 9.5 }, svg).textContent = label;
+    });
+
+    rows.forEach((rowLabel, r) => {
+      el('text', { x: left - 6, y: 20 + r * cell + cell / 2 + 3, 'text-anchor': 'end',
+                   fill: faint(), 'font-size': 10 }, svg).textContent = rowLabel;
+      (values[r] || []).forEach((value, c) => {
+        const level = уровень(value);
+        const rect = el('rect', {
+          x: left + c * cell, y: 20 + r * cell, width: cell - 2, height: cell - 2, rx: 3,
+          fill: value ? ramp[level] : gridColor(),
+        }, svg);
+        const extra = config.secondary && config.secondary[r]
+          ? ` · ${fmtNum(config.secondary[r][c], 2)} ${config.secondaryUnit || ''}` : '';
+        attachTip(rect, `${rowLabel}, ${cols[c]}: ${fmtNum(value)}${extra}`);
+      });
+    });
+    return svg;
+  }
+
   // ---- полоса громкости -----------------------------------------------------
 
   /* Огибающая записи: по дорожке на канал или говорящего.
@@ -614,6 +678,6 @@
     return null;
   }
 
-  global.Charts = { line, bars, hbars, stacked, donut, spark, heat, waveform,
+  global.Charts = { line, bars, hbars, stacked, donut, spark, heat, grid, waveform,
                     palette, status, fmtNum, legend, empty };
 })(window);

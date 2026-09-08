@@ -367,6 +367,384 @@ class Analytics:
 
     # --- сводный отчёт -------------------------------------------------------
 
+    # --- нагрузка по дням недели ------------------------------------------
+
+    def weekly_heatmap(self, period: str = "month",
+                       owner: str | None = None) -> dict[str, Any]:
+        """Карта нагрузки «день недели × час».
+
+        Суточный профиль усредняет будни с выходными и потому отвечает не на
+        тот вопрос. Планировать обслуживание, окна обновления и запас
+        мощности приходится по неделе: у телефонии понедельник в десять утра
+        и воскресенье в десять вечера — это разные миры.
+        """
+        since = _since(period)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        счёт = [[0] * 24 for _ in range(7)]
+        часы = [[0.0] * 24 for _ in range(7)]
+        for job in jobs:
+            ts = float(job.get("created_at") or 0)
+            if not ts:
+                continue
+            стамп = time.localtime(ts)
+            день = стамп.tm_wday
+            час = стамп.tm_hour
+            счёт[день][час] += 1
+            часы[день][час] += float(job.get("media_duration_s") or 0) / 3600
+
+        плоско = [v for строка in счёт for v in строка]
+        пик = max(плоско) if плоско else 0
+        индекс = плоско.index(пик) if пик else -1
+        return {
+            "days": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+            "hours": list(range(24)),
+            "jobs": счёт,
+            "audio_hours": [[round(v, 3) for v in строка] for строка in часы],
+            "peak": {
+                "jobs": пик,
+                "day": индекс // 24 if индекс >= 0 else None,
+                "hour": индекс % 24 if индекс >= 0 else None,
+            },
+            "total": sum(плоско),
+        }
+
+    # --- экономия на повторах ---------------------------------------------
+
+    def cache_savings(self, period: str = "month",
+                      owner: str | None = None) -> dict[str, Any]:
+        """Сколько работы сняли повторы одного и того же файла.
+
+        Сервер узнаёт уже виденный файл по хешу и отдаёт готовый результат.
+        Пока это видно только счётчиком «из кеша», а вопрос у владельца
+        сервера другой: сколько часов звука и машинного времени это
+        сэкономило — то есть стоило ли оно того.
+        """
+        since = _since(period)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        из_кеша = [j for j in jobs if j.get("cached_from")]
+        свои = [j for j in jobs if not j.get("cached_from") and j["status"] == "completed"]
+
+        # Стоимость повтора считаем по средней скорости своих заданий: у
+        # взятого из кеша задания собственного времени обработки нет.
+        звук_кеш = sum(float(j.get("media_duration_s") or 0) for j in из_кеша)
+        звук_свой = sum(float(j.get("media_duration_s") or 0) for j in свои)
+        время_свой = sum(float(j.get("processing_time_s") or 0) for j in свои)
+        rtf = (время_свой / звук_свой) if звук_свой else 0.0
+
+        # Самые частые повторы: по ним видно, не шлёт ли клиент одно и то же
+        # по кругу из-за ошибки в своей очереди.
+        повторы: dict[str, dict[str, Any]] = {}
+        for job in из_кеша:
+            ключ = str(job.get("file_hash") or job.get("cached_from") or "")
+            if not ключ:
+                continue
+            запись = повторы.setdefault(ключ, {"hits": 0, "filename": job.get("filename") or "",
+                                               "audio_hours": 0.0})
+            запись["hits"] += 1
+            запись["audio_hours"] += float(job.get("media_duration_s") or 0) / 3600
+        топ = sorted(повторы.values(), key=lambda r: r["hits"], reverse=True)[:10]
+        for запись in топ:
+            запись["audio_hours"] = round(запись["audio_hours"], 3)
+
+        return {
+            "period": period,
+            "hits": len(из_кеша),
+            "misses": len(свои),
+            "hit_rate": round(len(из_кеша) / len(jobs), 4) if jobs else None,
+            "audio_hours_saved": round(звук_кеш / 3600, 3),
+            "processing_seconds_saved": round(звук_кеш * rtf, 1),
+            "assumed_rtf": round(rtf, 4) if rtf else None,
+            "repeats": топ,
+        }
+
+    # --- надёжность --------------------------------------------------------
+
+    def reliability(self, period: str = "month",
+                    owner: str | None = None) -> dict[str, Any]:
+        """Что происходит с заданием между приёмом и выдачей результата.
+
+        Доля успеха отвечает «сколько дошло», но не «какой ценой». Задание,
+        прошедшее с третьей попытки, считается успешным наравне с тем, что
+        прошло с первой, — а это разные состояния сервера.
+        """
+        since = _since(period)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        готово = [j for j in jobs if j["status"] == "completed"]
+        с_повтором = [j for j in готово if int(j.get("retries") or 0) > 0]
+        отменены = [j for j in jobs if j["status"] == "cancelled"]
+
+        кем: dict[str, int] = {}
+        for job in отменены:
+            кем[str(job.get("cancelled_by") or "неизвестно")] = \
+                кем.get(str(job.get("cancelled_by") or "неизвестно"), 0) + 1
+
+        вебхуки: dict[str, int] = {}
+        for job in jobs:
+            статус = str(job.get("webhook_status") or "")
+            if статус:
+                вебхуки[статус] = вебхуки.get(статус, 0) + 1
+
+        распределение: dict[int, int] = {}
+        for job in jobs:
+            n = int(job.get("retries") or 0)
+            распределение[n] = распределение.get(n, 0) + 1
+
+        return {
+            "period": period,
+            "total": len(jobs),
+            "first_attempt_success": len(готово) - len(с_повтором),
+            "first_attempt_rate": round((len(готово) - len(с_повтором)) / len(jobs), 4)
+                                  if jobs else None,
+            # Названия здесь важнее обычного: «повторялось: 0» рядом с
+            # «повторов всего: 7» читается как противоречие, хотя это разные
+            # вопросы — сколько заданий дошло со второй попытки и сколько
+            # повторов было вообще (включая те, что так и не дошли).
+            "completed_after_retry": len(с_повтором),
+            "jobs_with_retries": sum(1 for j in jobs if int(j.get("retries") or 0) > 0),
+            "retry_total": sum(int(j.get("retries") or 0) for j in jobs),
+            "retry_distribution": [{"retries": k, "jobs": v}
+                                   for k, v in sorted(распределение.items())],
+            "cancelled": len(отменены),
+            "cancelled_by": [{"who": k, "jobs": v}
+                             for k, v in sorted(кем.items(), key=lambda kv: -kv[1])],
+            "webhooks": [{"status": k, "jobs": v}
+                         for k, v in sorted(вебхуки.items(), key=lambda kv: -kv[1])],
+        }
+
+    # --- каким бывает звук --------------------------------------------------
+
+    def audio_profile(self, period: str = "month",
+                      owner: str | None = None) -> dict[str, Any]:
+        """Свойства самих записей: формат, битрейт, темп речи, говорящие.
+
+        Это разрез не про сервер, а про материал. Темп речи и доля тишины
+        объясняют, почему одна и та же модель на одном потоке работает
+        вдвое медленнее, чем на другом, — и стоит ли менять модель или
+        источник записи.
+        """
+        since = _since(period)
+        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
+                                             owner=owner, light=True)
+                if j["status"] == "completed"]
+
+        форматы: dict[str, dict[str, float]] = {}
+        темпы: list[float] = []
+        битрейты: list[float] = []
+        говорящие: dict[int, int] = {}
+        плотность: list[float] = []
+
+        for job in jobs:
+            имя = str(job.get("filename") or "")
+            расш = имя.rsplit(".", 1)[-1].lower() if "." in имя else "без расширения"
+            запись = форматы.setdefault(расш, {"jobs": 0, "audio_hours": 0.0, "bytes": 0.0})
+            запись["jobs"] += 1
+            запись["audio_hours"] += float(job.get("media_duration_s") or 0) / 3600
+            запись["bytes"] += float(job.get("file_size") or 0)
+
+            длительность = float(job.get("media_duration_s") or 0)
+            слова = int(job.get("words_count") or 0)
+            if длительность > 1 and слова:
+                темпы.append(слова / (длительность / 60))
+            размер = float(job.get("file_size") or 0)
+            if длительность > 1 and размер:
+                битрейты.append(размер * 8 / длительность / 1000)
+            n = int(job.get("speakers_count") or 0)
+            if n:
+                говорящие[n] = говорящие.get(n, 0) + 1
+            # Доля времени, занятая репликами: остальное — паузы и шум.
+            сегменты = float(job.get("segments_count") or 0)
+            if длительность > 1 and сегменты:
+                плотность.append(сегменты / (длительность / 60))
+
+        строки = []
+        for имя, данные in sorted(форматы.items(), key=lambda kv: -kv[1]["jobs"]):
+            строки.append({
+                "format": имя,
+                "jobs": int(данные["jobs"]),
+                "audio_hours": round(данные["audio_hours"], 2),
+                "avg_mb": round(данные["bytes"] / данные["jobs"] / 1024 / 1024, 2)
+                          if данные["jobs"] else 0,
+            })
+
+        return {
+            "period": period,
+            "formats": строки,
+            "speech_rate_wpm": M.summarize(темпы),
+            "bitrate_kbps": M.summarize(битрейты),
+            "segments_per_minute": M.summarize(плотность),
+            "speakers": [{"speakers": k, "jobs": v} for k, v in sorted(говорящие.items())],
+        }
+
+    # --- расход ресурсов ----------------------------------------------------
+
+    def resources(self, period: str = "month",
+                  owner: str | None = None) -> dict[str, Any]:
+        """Память и устройства в разрезе моделей.
+
+        Отвечает на вопрос, который задают перед покупкой второй карты:
+        какая модель сколько памяти просит на пике и сколько заданий вообще
+        уехало на процессор вместо видеокарты.
+        """
+        since = _since(period)
+        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
+                                             owner=owner, light=True)
+                if j["status"] == "completed"]
+
+        по_модели: dict[str, list[float]] = {}
+        устройства: dict[str, dict[str, float]] = {}
+        for job in jobs:
+            память = float(job.get("peak_memory_mb") or 0)
+            if память:
+                по_модели.setdefault(str(job.get("model") or "—"), []).append(память)
+            dev = str(job.get("device") or "неизвестно")
+            запись = устройства.setdefault(dev, {"jobs": 0, "audio_hours": 0.0,
+                                                 "processing_s": 0.0})
+            запись["jobs"] += 1
+            запись["audio_hours"] += float(job.get("media_duration_s") or 0) / 3600
+            запись["processing_s"] += float(job.get("processing_time_s") or 0)
+
+        модели = []
+        for имя, значения in sorted(по_модели.items(),
+                                    key=lambda kv: -max(kv[1])):
+            сводка = M.summarize(значения)
+            модели.append({"model": имя, "jobs": len(значения),
+                           "peak_mb": сводка["max"], "avg_mb": сводка["avg"],
+                           "p95_mb": сводка["p95"]})
+
+        разрез = []
+        for имя, данные in sorted(устройства.items(), key=lambda kv: -kv[1]["jobs"]):
+            звук = данные["audio_hours"]
+            разрез.append({
+                "device": имя,
+                "jobs": int(данные["jobs"]),
+                "audio_hours": round(звук, 2),
+                "rtf": round(данные["processing_s"] / (звук * 3600), 4) if звук else None,
+            })
+
+        return {"period": period, "models": модели, "devices": разрез}
+
+    # --- качество во времени ------------------------------------------------
+
+    def quality_trend(self, period: str = "month", buckets: int = 24,
+                      owner: str | None = None) -> dict[str, Any]:
+        """Уверенность и WER по времени.
+
+        Средняя уверенность за месяц — число, которое ничего не сообщает.
+        Полезен ход: провал в среду означает, что в среду что-то поменялось
+        — источник записей, модель или параметры.
+        """
+        since = _since(period)
+        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
+                                             owner=owner, light=True)
+                if j["status"] == "completed"]
+        if not jobs:
+            return {"period": period, "buckets": [], "confidence": [], "wer": [],
+                    "jobs": [], "low_confidence_share": []}
+
+        начало = since or min(float(j["created_at"]) for j in jobs)
+        конец = time.time()
+        шаг = max(1.0, (конец - начало) / buckets)
+
+        корзины: list[dict[str, list[float]]] = [
+            {"conf": [], "wer": [], "low": []} for _ in range(buckets)]
+        for job in jobs:
+            i = int((float(job["created_at"]) - начало) / шаг)
+            i = min(max(i, 0), buckets - 1)
+            c = job.get("avg_confidence")
+            if c is not None:
+                корзины[i]["conf"].append(float(c))
+                корзины[i]["low"].append(1.0 if float(c) < 0.75 else 0.0)
+            w = job.get("wer")
+            if w is not None:
+                корзины[i]["wer"].append(float(w))
+
+        среднее = lambda xs: round(sum(xs) / len(xs), 4) if xs else None  # noqa: E731
+        return {
+            "period": period,
+            "buckets": [round(начало + i * шаг) for i in range(buckets)],
+            "confidence": [среднее(k["conf"]) for k in корзины],
+            "wer": [среднее(k["wer"]) for k in корзины],
+            "low_confidence_share": [среднее(k["low"]) for k in корзины],
+            "jobs": [len(k["conf"]) for k in корзины],
+        }
+
+    # --- разрез по меткам ---------------------------------------------------
+
+    def by_tag(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+        """Метки — единственный разрез, который задаёт сам пользователь.
+
+        Всё остальное сервер знает про себя: модель, движок, источник. А
+        метка отвечает на вопрос «сколько ушло на этот проект» — и потому
+        для отчётности она важнее прочих разрезов.
+        """
+        since = _since(period)
+        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        собрано: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            метки = [t.strip() for t in str(job.get("tags") or "").split(",") if t.strip()]
+            for метка in метки or ["без метки"]:
+                запись = собрано.setdefault(метка, {
+                    "tag": метка, "jobs": 0, "completed": 0, "failed": 0,
+                    "audio_hours": 0.0, "processing_s": 0.0, "words": 0})
+                запись["jobs"] += 1
+                if job["status"] == "completed":
+                    запись["completed"] += 1
+                    запись["audio_hours"] += float(job.get("media_duration_s") or 0) / 3600
+                    запись["processing_s"] += float(job.get("processing_time_s") or 0)
+                    запись["words"] += int(job.get("words_count") or 0)
+                elif job["status"] == "failed":
+                    запись["failed"] += 1
+
+        строки = []
+        for запись in собрано.values():
+            звук = запись["audio_hours"]
+            строки.append({
+                **запись,
+                "audio_hours": round(звук, 2),
+                "processing_s": round(запись["processing_s"], 1),
+                "rtf": round(запись["processing_s"] / (звук * 3600), 4) if звук else None,
+            })
+        return sorted(строки, key=lambda r: -r["jobs"])
+
+    # --- ожидание в очереди -------------------------------------------------
+
+    def queue_latency(self, period: str = "month",
+                      owner: str | None = None) -> dict[str, Any]:
+        """Сколько задание ждало и от чего это зависело.
+
+        Среднее ожидание скрывает именно то, на что жалуются: хвост. Ждали
+        три секунды девятьсот заданий и сорок минут — десять, и среднее
+        покажет «всё хорошо».
+        """
+        since = _since(period)
+        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
+                                             owner=owner, light=True)
+                if j.get("queue_time_s") is not None]
+
+        по_приоритету: dict[str, list[float]] = {}
+        по_источнику: dict[str, list[float]] = {}
+        for job in jobs:
+            ожидание = float(job.get("queue_time_s") or 0)
+            приоритет = int(job.get("priority") or 50)
+            группа = ("высокий (>50)" if приоритет > 50 else
+                      "обычный (50)" if приоритет == 50 else "низкий (<50)")
+            по_приоритету.setdefault(группа, []).append(ожидание)
+            по_источнику.setdefault(str(job.get("source") or "api"), []).append(ожидание)
+
+        разрез = lambda d: [  # noqa: E731
+            {"name": k, "jobs": len(v), **M.summarize(v)}
+            for k, v in sorted(d.items(), key=lambda kv: -len(kv[1]))]
+
+        все = [float(j["queue_time_s"]) for j in jobs]
+        return {
+            "period": period,
+            "overall": M.summarize(все),
+            "by_priority": разрез(по_приоритету),
+            "by_source": разрез(по_источнику),
+            "waited_over_minute": sum(1 for v in все if v > 60),
+            "waited_over_10_minutes": sum(1 for v in все if v > 600),
+        }
+
     def full_report(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
         return {
             "overview": self.overview(period, owner),
@@ -380,6 +758,14 @@ class Analytics:
             "slowest": self.slowest(period, owner=owner),
             "profile": self.hourly_profile(period, owner),
             "efficiency": self.efficiency(period, owner),
+            "weekly": self.weekly_heatmap(period, owner),
+            "cache": self.cache_savings(period, owner),
+            "reliability": self.reliability(period, owner),
+            "audio": self.audio_profile(period, owner),
+            "resources": self.resources(period, owner),
+            "quality_trend": self.quality_trend(period, owner=owner),
+            "tags": self.by_tag(period, owner),
+            "queue": self.queue_latency(period, owner),
         }
 
     # --- экспорт метрик Prometheus --------------------------------------------

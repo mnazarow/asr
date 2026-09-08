@@ -47,6 +47,12 @@ class ProcessOutcome:
     #: Огибающая громкости: список кривых с полями audio_waveform,
     #: sample_rate, speaker и label.
     waveform: list[dict[str, Any]] = field(default_factory=list)
+    #: Пик памяти за задание, МБ. На видеокарте — память ускорителя, иначе
+    #: резидентная память процесса. Колонка под это была в базе с самого
+    #: начала, но её никто не заполнял, и разрез «сколько просит модель»
+    #: оставался пустым — а именно этот вопрос задают перед покупкой
+    #: второй карты.
+    peak_memory_mb: float = 0.0
 
     #: Стадии, которые входят в RTF. Загрузка весов исключена намеренно:
     #: она случается раз на несколько заданий и к скорости распознавания
@@ -127,6 +133,33 @@ class Timer:
             values[self._label] = values.get(self._label, 0.0) + (
                 time.perf_counter() - self._start)
         return values
+
+
+def _peak_memory_mb(device: str) -> float:
+    """Пик памяти за задание: у ускорителя — своей, иначе процесса.
+
+    Спрашиваем в конце задания, а не по ходу: torch ведёт счётчик пика сам,
+    и опрашивать его в цикле незачем. На процессоре точного пика нет —
+    берём текущую резидентную память, что для сравнения моделей между собой
+    достаточно, и честно об этом говорим в описании раздела.
+    """
+    if str(device).startswith("cuda"):
+        try:
+            import torch  # noqa: PLC0415
+
+            if torch.cuda.is_available():
+                значение = torch.cuda.max_memory_allocated() / 1024 / 1024
+                torch.cuda.reset_peak_memory_stats()
+                if значение > 0:
+                    return round(значение, 1)
+        except Exception:                                    # noqa: BLE001
+            pass                                             # нет torch или карты
+    try:
+        import psutil  # noqa: PLC0415
+
+        return round(psutil.Process().memory_info().rss / 1024 / 1024, 1)
+    except Exception:                                        # noqa: BLE001
+        return 0.0
 
 
 def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry,
@@ -438,6 +471,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     # и в метрики, где точность важнее совпадения с содержимым файла.
     timer.stop()
     outcome.timings = {k: round(v, 4) for k, v in timer.values.items()}
+    outcome.peak_memory_mb = _peak_memory_mb(str(settings.get("device") or ""))
     report(1.0, "готово")
     return outcome
 

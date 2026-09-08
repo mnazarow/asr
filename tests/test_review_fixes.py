@@ -923,3 +923,154 @@ def test_the_player_does_not_keep_playing_after_the_card_is_closed(repo_root: Pa
     окно = app[max(0, место - 3000):место]
     assert "asrhub:closed" in окно and "player.destroy()" in окно, (
         "проигрыватель не останавливается вместе с карточкой")
+
+
+# ---------------------------------------------------------------------------
+# Новые разрезы аналитики
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def rich_db(tmp_path: Path):
+    """База с разнообразием, на котором новые разрезы имеют смысл."""
+    from asrhub.analytics import Analytics
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "rich.sqlite3")
+    момент = time.time()
+    # Понедельник 10:00 по местному времени — чтобы карта недели была
+    # предсказуемой, а не зависела от дня прогона тестов.
+    понедельник = момент - (time.localtime(момент).tm_wday * 86400)
+    основа = time.mktime(time.localtime(понедельник)[:3] + (10, 0, 0, 0, 0, -1))
+
+    for i in range(6):
+        job_id = database.create_job({
+            "owner": "alice", "language": "ru", "engine": "gigaam",
+            "model": "gigaam-v3-rnnt", "media_duration_s": 120.0,
+            "filename": f"разговор-{i}.wav", "file_size": 2_000_000,
+            "created_at": основа, "tags": "продажи" if i % 2 else "поддержка",
+            "priority": 60 if i < 2 else 50, "source": "phone"})
+        database.update_job(job_id, status="completed", finished_at=основа + 40,
+                            processing_time_s=20.0, rtf=0.16, queue_time_s=float(i * 5),
+                            words_count=300, segments_count=12, avg_confidence=0.9 - i * 0.02,
+                            speakers_count=2, device="cuda", peak_memory_mb=2100.0 + i * 10)
+
+    # Задание с повторами, которое так и не дошло.
+    сломанное = database.create_job({"owner": "alice", "model": "m", "created_at": основа,
+                                     "media_duration_s": 30.0, "filename": "битый.mp3"})
+    database.update_job(сломанное, status="failed", retries=2, error_code="decode_error")
+
+    # Задание в другой день недели: без него карту нельзя проверить на то,
+    # ради чего она заведена, — что дни не складываются в один.
+    среда = database.create_job({"owner": "alice", "model": "m", "media_duration_s": 60.0,
+                                 "filename": "среда.wav",
+                                 "created_at": основа + 2 * 86400})
+    database.update_job(среда, status="completed", finished_at=основа + 2 * 86400 + 30,
+                        processing_time_s=10.0, queue_time_s=1.0, device="cpu")
+
+    # Повтор уже виденного файла.
+    повтор = database.create_job({"owner": "alice", "model": "gigaam-v3-rnnt",
+                                  "created_at": основа, "media_duration_s": 120.0,
+                                  "filename": "разговор-0.wav", "file_hash": "abc"})
+    database.update_job(повтор, status="completed", cached_from="job_первое",
+                        finished_at=основа + 1, queue_time_s=0.2)
+    return Analytics(database)
+
+
+def test_the_week_map_separates_weekdays_from_weekends(rich_db):
+    """Суточный профиль складывает понедельник с воскресеньем в одно число.
+
+    Планировать по нему обслуживание нельзя: у телефонии утро понедельника и
+    вечер воскресенья — разные миры, а в одной строке они неразличимы.
+    """
+    карта = rich_db.weekly_heatmap("month")
+    assert len(карта["jobs"]) == 7 and len(карта["jobs"][0]) == 24
+    assert карта["total"] == 9, карта["total"]
+
+    # Главное: задания в разные дни лежат в разных строках. Если дни
+    # схлопнуть, непустой строкой останется одна — и карта превратится в тот
+    # же суточный профиль, только выше.
+    непустые = [i for i, строка in enumerate(карта["jobs"]) if sum(строка)]
+    assert len(непустые) == 2, f"дни сложились в один: {непустые}"
+    assert непустые[1] - непустые[0] == 2, непустые
+
+    assert карта["peak"]["jobs"] == 8, карта["peak"]
+    assert карта["peak"]["hour"] == 10, карта["peak"]
+    сумма = sum(v for строка in карта["jobs"] for v in строка)
+    assert сумма == карта["total"], "сумма по карте разошлась с итогом"
+
+
+def test_reliability_separates_the_first_attempt_from_the_third(rich_db):
+    """Доля успеха не отличает безупречное задание от прошедшего с третьего раза."""
+    r = rich_db.reliability("month")
+    assert r["total"] == 9
+    assert r["jobs_with_retries"] == 1, r
+    assert r["retry_total"] == 2, r
+    # Повторявшееся задание не дошло — значит со второй попытки не дошёл никто.
+    assert r["completed_after_retry"] == 0, r
+    assert r["first_attempt_success"] == 8, r
+
+
+def test_cache_savings_are_counted_in_hours_not_in_hits(rich_db):
+    """«Из кеша: 1» не отвечает на вопрос, стоило ли оно того."""
+    c = rich_db.cache_savings("month")
+    assert c["hits"] == 1, c
+    # Две минуты записи, снятые повтором.
+    assert c["audio_hours_saved"] == pytest.approx(120 / 3600, rel=0.01), c
+    assert c["assumed_rtf"] and c["assumed_rtf"] > 0, "не по чему считать экономию"
+    assert c["processing_seconds_saved"] > 0, c
+
+
+def test_queue_latency_shows_the_tail_not_the_average(rich_db):
+    """На среднее ожидание не жалуются — жалуются на хвост."""
+    q = rich_db.queue_latency("month")
+    assert q["overall"]["count"] == 8, q["overall"]
+    assert q["overall"]["p95"] >= q["overall"]["p50"], "перцентили не по порядку"
+    группы = {r["name"] for r in q["by_priority"]}
+    assert "высокий (>50)" in группы and "обычный (50)" in группы, группы
+
+
+def test_audio_profile_describes_the_material(rich_db):
+    """Разрез не про сервер, а про то, что на него приносят."""
+    a = rich_db.audio_profile("month")
+    форматы = {f["format"]: f for f in a["formats"]}
+    assert "wav" in форматы, форматы
+    # 300 слов за две минуты — 150 слов в минуту.
+    assert a["speech_rate_wpm"]["avg"] == pytest.approx(150, rel=0.02), a["speech_rate_wpm"]
+    assert a["speakers"] and a["speakers"][0]["speakers"] == 2, a["speakers"]
+
+
+def test_resources_answer_the_question_asked_before_buying_a_card(rich_db):
+    """Сколько памяти просит модель на пике — и что уехало на процессор."""
+    r = rich_db.resources("month")
+    модели = {m["model"]: m for m in r["models"]}
+    assert "gigaam-v3-rnnt" in модели, модели
+    assert модели["gigaam-v3-rnnt"]["peak_mb"] == pytest.approx(2150, rel=0.01), модели
+    устройства = {d["device"]: d for d in r["devices"]}
+    assert "cuda" in устройства, устройства
+
+
+def test_tags_are_the_only_breakdown_the_user_defines(rich_db):
+    """Модель и движок сервер знает про себя, а метка отвечает «на какой проект»."""
+    метки = {t["tag"]: t for t in rich_db.by_tag("month")}
+    assert "продажи" in метки and "поддержка" in метки, метки
+    assert метки["продажи"]["jobs"] == 3, метки["продажи"]
+    assert метки["продажи"]["audio_hours"] > 0, метки["продажи"]
+
+
+def test_quality_trend_has_a_point_where_there_is_data(rich_db):
+    """Средняя уверенность за месяц — число ни о чём; полезен ход."""
+    q = rich_db.quality_trend("month", buckets=12)
+    assert len(q["buckets"]) == 12
+    заполнено = [v for v in q["confidence"] if v is not None]
+    assert заполнено, "ход уверенности пуст при наличии данных"
+    assert 0 < заполнено[-1] <= 1, заполнено
+
+
+def test_every_new_section_is_reachable_by_its_own_url(repo_root: Path):
+    """Разделы аналитики забирают по одному — сводный отчёт весит десятки килобайт."""
+    источник = (repo_root / "server" / "asrhub" / "api" / "routes_system.py").read_text(
+        encoding="utf-8")
+    for раздел in ("weekly", "cache", "reliability", "audio", "resources",
+                   "quality", "tags", "queue"):
+        assert f'"{раздел}": state.analytics.' in источник, f"раздел {раздел} не отдаётся"

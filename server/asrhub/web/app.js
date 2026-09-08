@@ -2781,7 +2781,37 @@ RENDERERS.analytics = {
         ${card('По пользователям', '', '<div id="chart-owner"></div>')}
         ${card('Самые медленные задания', 'кандидаты на оптимизацию',
                '<div class="table-wrap" id="table-slow"></div>')}
-      </div>`;
+      </div>
+
+      ${card('Нагрузка по дням недели', 'день × час — планировать обслуживание по суточному профилю нельзя: он усредняет будни с выходными',
+             '<div id="chart-weekly"></div>')}
+
+      <div class="grid cols-2">
+        ${card('Ожидание в очереди', 'среднее скрывает хвост, а жалуются именно на него',
+               '<div id="queue-body"></div>')}
+        ${card('Уверенность во времени', 'провал означает, что что-то поменялось: источник, модель или параметры',
+               '<div id="chart-quality"></div>')}
+      </div>
+
+      <div class="grid cols-2">
+        ${card('Ошибки распознавания во времени', 'WER и доля заданий с низкой уверенностью',
+               '<div id="chart-quality2"></div>')}
+        ${card('Расход ресурсов', 'память моделей и разрез по устройствам',
+               '<div id="resources-body"></div>')}
+      </div>
+
+      <div class="grid cols-2">
+        ${card('Надёжность', 'что происходит между приёмом и выдачей результата',
+               '<div id="reliability-body"></div>')}
+        ${card('Повторы и экономия', 'сколько работы сняло узнавание уже виденных файлов',
+               '<div id="cache-body"></div>')}
+      </div>
+
+      ${card('Каким бывает звук', 'разрез не про сервер, а про материал',
+             '<div id="audio-body"></div>')}
+
+      ${card('По меткам', 'единственный разрез, который задаёт сам пользователь — для отчётности он важнее прочих',
+             '<div class="table-wrap full" id="table-tags"></div>')}`;
 
     const ts = data.timeseries;
     const labels = (ts.labels || []).map((t) => {
@@ -2927,8 +2957,196 @@ RENDERERS.analytics = {
         <td class="num">${num(j.rtf, 3)}</td>
         <td class="num">${fmtDur(j.duration_s)}</td></tr>`).join('')}
       </tbody></table>` : '<div class="empty small">Нет данных</div>';
+
+    drawExtraAnalytics(data);
   },
 };
+
+/* Разделы, добавленные поверх исходных двенадцати.
+ *
+ * Общий принцип отбора: показывать то, чего нельзя получить из уже
+ * имеющихся цифр. Средняя уверенность за месяц не отвечает ни на один
+ * вопрос — а её ход по дням отвечает; доля успеха не отличает задание,
+ * прошедшее с первой попытки, от прошедшего с третьей.
+ */
+function drawExtraAnalytics(data) {
+  const weekly = data.weekly || {};
+  if (qs('#chart-weekly') && (weekly.jobs || []).length) {
+    Charts.grid(qs('#chart-weekly'), {
+      rows: weekly.days, cols: (weekly.hours || []).map((h) => String(h).padStart(2, '0')),
+      values: weekly.jobs, secondary: weekly.audio_hours, secondaryUnit: 'ч аудио',
+      emptyText: 'Нет заданий за период',
+    });
+    const p = weekly.peak || {};
+    if (p.jobs) {
+      qs('#chart-weekly').insertAdjacentHTML('beforeend',
+        `<div class="small faint" style="margin-top:8px">Пик: ${esc(weekly.days[p.day])}, ${
+          String(p.hour).padStart(2, '0')}:00 — ${p.jobs} заданий. Всего за период: ${
+          num(weekly.total)}.</div>`);
+    }
+  }
+
+  const q = data.queue || {};
+  if (qs('#queue-body') && q.overall) {
+    const строка = (s) => `${num(s.p50, 1)} / ${num(s.p90, 1)} / ${num(s.p95, 1)} / ${num(s.p99, 1)}`;
+    qs('#queue-body').innerHTML = `
+      <div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Медиана', `${num(q.overall.p50, 1)} с`, 'половина ждала меньше')}
+        ${kpi('p95', `${num(q.overall.p95, 1)} с`, 'каждое двадцатое — дольше')}
+        ${kpi('Максимум', `${num(q.overall.max, 1)} с`, `дольше минуты: ${q.waited_over_minute}`)}
+      </div>
+      <table><thead><tr><th>Разрез</th><th class="num">Заданий</th>
+        <th class="num">p50 / p90 / p95 / p99, с</th></tr></thead><tbody>
+      ${(q.by_priority || []).map((r) => `<tr><td>${esc(r.name)}</td>
+        <td class="num">${r.jobs}</td><td class="num mono">${строка(r)}</td></tr>`).join('')}
+      ${(q.by_source || []).map((r) => `<tr><td class="dim">источник: ${esc(r.name)}</td>
+        <td class="num">${r.jobs}</td><td class="num mono">${строка(r)}</td></tr>`).join('')}
+      </tbody></table>
+      ${q.waited_over_10_minutes ? `<div class="small faint" style="margin-top:8px">
+        Дольше десяти минут ждали ${q.waited_over_10_minutes} заданий — стоит посмотреть,
+        не совпадает ли это с пиком на карте нагрузки выше.</div>` : ''}`;
+  }
+
+  const qt = data.quality_trend || {};
+  if (qs('#chart-quality') && (qt.buckets || []).length) {
+    const метки = qt.buckets.map((t) => new Date(t * 1000).toLocaleDateString('ru-RU',
+      { day: '2-digit', month: '2-digit' }));
+    const уверенность = (qt.confidence || []).map((v) => v === null ? null : v * 100);
+    const есть = уверенность.some((v) => v !== null);
+    if (есть) {
+      // Свой график и своя ось: уверенность держится у 95 %, а WER около
+      // единицы. На одной оси младший ряд ложится в ноль и не читается — а
+      // вторую ось рисовать нельзя, она врёт про соотношение величин.
+      // Заодно поджимаем низ шкалы: разница между 93 % и 96 % — это и есть
+      // всё, что здесь происходит, а от нуля она не видна.
+      const мин = Math.min(...уверенность.filter((v) => v !== null));
+      Charts.line(qs('#chart-quality'), {
+        labels: метки,
+        series: [{ name: 'Средняя уверенность', values: уверенность }],
+        yMin: Math.max(0, Math.floor(мин - 3)), yMax: 100, unit: ' %',
+      });
+    } else {
+      Charts.empty(qs('#chart-quality'), 'Уверенность за период не считалась');
+    }
+
+    const второй = qs('#chart-quality2');
+    if (второй) {
+      const ряды = [];
+      if ((qt.low_confidence_share || []).some((v) => v !== null)) {
+        ряды.push({ name: 'Доля заданий с низкой уверенностью',
+                    values: qt.low_confidence_share.map((v) => v === null ? null : v * 100) });
+      }
+      if ((qt.wer || []).some((v) => v !== null)) {
+        ряды.push({ name: 'WER', values: qt.wer.map((v) => v === null ? null : v * 100) });
+      }
+      if (ряды.length) {
+        Charts.line(второй, { labels: метки, series: ряды, unit: ' %' });
+      } else {
+        Charts.empty(второй, 'Эталонных текстов за период не задавали — WER не считался');
+      }
+    }
+  }
+
+  const r = data.reliability || {};
+  if (qs('#reliability-body') && r.total !== undefined) {
+    qs('#reliability-body').innerHTML = `<table>
+      <tr><td class="dim">Заданий всего</td><td class="num">${num(r.total)}</td></tr>
+      <tr><td class="dim">Прошло с первой попытки</td><td class="num">${
+        num(r.first_attempt_success)}${r.first_attempt_rate !== null
+          ? ` (${pct(r.first_attempt_rate, 1)})` : ''}</td></tr>
+      <tr><td class="dim">Дошло со второй и далее</td><td class="num">${
+        num(r.completed_after_retry)}</td></tr>
+      <tr><td class="dim">Заданий с повторами</td><td class="num">${
+        num(r.jobs_with_retries)}</td></tr>
+      <tr><td class="dim">Повторов всего</td><td class="num">${num(r.retry_total)}</td></tr>
+      <tr><td class="dim">Отменено</td><td class="num">${num(r.cancelled)}</td></tr>
+      </table>
+      ${(r.cancelled_by || []).length ? `<div class="small faint" style="margin-top:8px">
+        Кто отменял: ${r.cancelled_by.map((c) => `${esc(c.who)} — ${c.jobs}`).join(', ')}</div>` : ''}
+      ${(r.webhooks || []).length ? `<div class="small faint" style="margin-top:6px">
+        Уведомления: ${r.webhooks.map((w) => `${esc(w.status)} — ${w.jobs}`).join(', ')}</div>` : ''}
+      <div class="small faint" style="margin-top:8px">«Прошло с первой попытки» отличается от
+        доли успеха: задание, дошедшее с третьего раза, для доли успеха такое же, как
+        безупречное, — а для состояния сервера это разные вещи.</div>`;
+  }
+
+  const c = data.cache || {};
+  if (qs('#cache-body') && c.hits !== undefined) {
+    qs('#cache-body').innerHTML = `
+      <div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Повторов', num(c.hits), c.hit_rate !== null ? `доля: ${pct(c.hit_rate, 1)}` : '')}
+        ${kpi('Сэкономлено аудио', `${num(c.audio_hours_saved, 2)} ч`, 'не считалось заново')}
+        ${kpi('Машинного времени', `${num(c.processing_seconds_saved / 3600, 2)} ч`,
+              c.assumed_rtf ? `по RTF ${num(c.assumed_rtf, 3)}` : '')}
+      </div>
+      ${(c.repeats || []).length ? `<table><thead><tr><th>Файл</th>
+        <th class="num">Повторов</th><th class="num">Аудио, ч</th></tr></thead><tbody>
+      ${c.repeats.map((x) => `<tr><td class="truncate" style="max-width:200px">${
+        esc(x.filename || '—')}</td><td class="num">${x.hits}</td>
+        <td class="num">${num(x.audio_hours, 2)}</td></tr>`).join('')}</tbody></table>
+      <div class="small faint" style="margin-top:8px">Один и тот же файл, приходящий десятки раз,
+        обычно означает не бережливость, а ошибку в очереди на стороне клиента.</div>`
+      : '<div class="empty small">Повторов за период не было</div>'}`;
+  }
+
+  const a = data.audio || {};
+  if (qs('#audio-body') && a.formats) {
+    const s = a.speech_rate_wpm || {};
+    qs('#audio-body').innerHTML = `
+      <div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Темп речи', s.count ? `${num(s.avg, 0)} сл/мин` : '—',
+              s.count ? `p50 ${num(s.p50, 0)} · p95 ${num(s.p95, 0)}` : '')}
+        ${kpi('Битрейт', (a.bitrate_kbps || {}).count ? `${num(a.bitrate_kbps.avg, 0)} кбит/с` : '—',
+              'средний по записям')}
+        ${kpi('Реплик в минуту', (a.segments_per_minute || {}).count
+              ? num(a.segments_per_minute.avg, 1) : '—', 'плотность разговора')}
+      </div>
+      ${a.formats.length ? `<table><thead><tr><th>Формат</th><th class="num">Файлов</th>
+        <th class="num">Аудио, ч</th><th class="num">Средний размер</th></tr></thead><tbody>
+      ${a.formats.map((f) => `<tr><td class="mono">${esc(f.format)}</td>
+        <td class="num">${f.jobs}</td><td class="num">${num(f.audio_hours, 2)}</td>
+        <td class="num">${num(f.avg_mb, 1)} МБ</td></tr>`).join('')}</tbody></table>` : ''}
+      ${(a.speakers || []).length ? `<div class="small faint" style="margin-top:8px">
+        Говорящих в записи: ${a.speakers.map((x) => `${x.speakers} — ${x.jobs}`).join(', ')}</div>` : ''}`;
+  }
+
+  const res = data.resources || {};
+  if (qs('#resources-body') && res.devices) {
+    qs('#resources-body').innerHTML = `
+      ${res.devices.length ? `<table><thead><tr><th>Устройство</th><th class="num">Заданий</th>
+        <th class="num">Аудио, ч</th><th class="num">RTF</th></tr></thead><tbody>
+      ${res.devices.map((d) => `<tr><td class="mono">${esc(d.device)}</td>
+        <td class="num">${d.jobs}</td><td class="num">${num(d.audio_hours, 2)}</td>
+        <td class="num">${d.rtf !== null ? num(d.rtf, 3) : '—'}</td></tr>`).join('')}
+      </tbody></table>` : ''}
+      ${(res.models || []).length ? `<table style="margin-top:10px"><thead><tr><th>Модель</th>
+        <th class="num">Пик, МБ</th><th class="num">p95</th><th class="num">Среднее</th>
+        </tr></thead><tbody>
+      ${res.models.slice(0, 10).map((m) => `<tr><td class="mono truncate"
+        style="max-width:180px">${esc(m.model)}</td>
+        <td class="num">${num(m.peak_mb, 0)}</td><td class="num">${num(m.p95_mb, 0)}</td>
+        <td class="num">${num(m.avg_mb, 0)}</td></tr>`).join('')}</tbody></table>`
+      : `<div class="small faint" style="margin-top:8px">Пик памяти пишется начиная с этой
+         версии — у заданий, выполненных раньше, его нет. На видеокарте это память
+         ускорителя, на процессоре — резидентная память процесса.</div>`}`;
+  }
+
+  const tags = data.tags || [];
+  if (qs('#table-tags')) {
+    qs('#table-tags').innerHTML = tags.length ? `<table>
+      <thead><tr><th>Метка</th><th class="num">Заданий</th><th class="num">Готово</th>
+        <th class="num">Ошибок</th><th class="num">Аудио, ч</th>
+        <th class="num">Машинное время</th><th class="num">RTF</th>
+        <th class="num">Слов</th></tr></thead><tbody>
+      ${tags.map((t) => `<tr><td><b>${esc(t.tag)}</b></td>
+        <td class="num">${t.jobs}</td><td class="num">${t.completed}</td>
+        <td class="num">${t.failed || 0}</td><td class="num">${num(t.audio_hours, 2)}</td>
+        <td class="num">${fmtDur(t.processing_s)}</td>
+        <td class="num">${t.rtf !== null ? num(t.rtf, 3) : '—'}</td>
+        <td class="num">${num(t.words)}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty small">Метки заданиям не присваивались</div>';
+  }
+}
 
 // ==========================================================================
 // Вид: Модели

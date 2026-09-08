@@ -331,6 +331,14 @@ def analytics_section(request: Request, section: str, period: str = "week",
         "slowest": state.analytics.slowest,
         "profile": state.analytics.hourly_profile,
         "efficiency": state.analytics.efficiency,
+        "weekly": state.analytics.weekly_heatmap,
+        "cache": state.analytics.cache_savings,
+        "reliability": state.analytics.reliability,
+        "audio": state.analytics.audio_profile,
+        "resources": state.analytics.resources,
+        "quality": state.analytics.quality_trend,
+        "tags": state.analytics.by_tag,
+        "queue": state.analytics.queue_latency,
     }
     handler = handlers.get(section)
     if handler is None:
