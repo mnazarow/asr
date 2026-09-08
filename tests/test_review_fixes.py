@@ -702,3 +702,195 @@ def test_light_listing_keeps_fields_the_interface_needs(auth_client):
     item = auth_client.get("/api/queue").json()["items"][0]
     assert item["progress"] == 0.42 and item["stage"] == "распознавание"
     assert "text" not in item, "облегчённый список снова тянет расшифровку"
+
+
+# ---------------------------------------------------------------------------
+# Загрузка GigaAM: куда пишем, что качаем и как называем причину отказа
+# ---------------------------------------------------------------------------
+
+
+РЕАЛЬНЫЙ_ОТКАЗ = [
+    "v3_e2e_rnnt: OSError: [Errno 30] Read-only file system: '/home/asrhub'",
+    "ai-sage/GigaAM-v3: ValueError: Model 'ai-sage/GigaAM-v3' not found. "
+    "Available model names: ['ctc', 'rnnt', 'e2e_ctc', 'e2e_rnnt', 'ssl', 'emo', "
+    "'v1_ctc', 'v1_rnnt', 'v1_ssl', 'v2_ctc', 'v2_rnnt', 'v2_ssl', 'v3_ctc', "
+    "'v3_rnnt', 'v3_e2e_ctc', 'v3_e2e_rnnt', 'v3_ssl', 'multilingual_ctc']",
+    "transformers: InstantiationException: Error in call to target "
+    "'modeling_gigaam.GigaAMASR': RuntimeError('Tensor on device cpu is not on "
+    "the expected device meta!')",
+]
+
+
+def test_a_model_name_in_the_error_does_not_become_a_diagnosis():
+    """«ssl» в перечне доступных моделей выдавалось за отказ сети.
+
+    Отказ был из-за прав на запись, а разбор нашёл в тексте подстроку «ssl» —
+    внутри имени модели «ssl» из перечня, который печатает вторая попытка, —
+    и объявил, что сервер не достучался до хранилища весов. Человек ушёл
+    проверять интернет, а дело было в каталоге.
+    """
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("gigaam-v3-e2e-rnnt", РЕАЛЬНЫЙ_ОТКАЗ, "cuda",
+                          "/var/lib/asrhub/models")
+    текст = str(отказ)
+    assert "хранилищу весов" not in текст, "сеть по-прежнему назначена виноватой"
+    assert "только для чтения" in текст, текст
+
+
+def test_the_failing_path_is_named():
+    """«Куда именно не удалось записать» — самое полезное в таком отказе."""
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("gigaam-v3-e2e-rnnt", РЕАЛЬНЫЙ_ОТКАЗ, "cuda", "")
+    # Путь есть и в общем списке попыток — но там он тонет. Нужна своя строка.
+    строки = [s for s in отказ.hint.splitlines() if s.startswith("Путь,")]
+    assert строки, "отдельной строки с путём нет:\n" + отказ.hint
+    assert "/home/asrhub" in строки[0], строки
+
+
+def test_the_first_attempt_decides_the_reason():
+    """Первая попытка — штатный путь; остальные падают по своим поводам.
+
+    Разбор шёл по склейке всех попыток, и текст запасных мог перебить
+    причину из первой. Порядок попыток не случаен, и разбор обязан его
+    уважать.
+    """
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("m", [
+        "v3_rnnt: OSError: [Errno 28] No space left on device",
+        "transformers: ConnectionError: Connection refused",
+    ], "cpu", "")
+    assert "места на диске" in str(отказ), str(отказ)
+
+
+def test_a_tokenizer_is_not_mistaken_for_a_token():
+    """«token» живёт внутри «tokenizer», а его GigaAM качает каждый раз."""
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("m", [
+        "v3_e2e_rnnt: RuntimeError: Download of v3_e2e_rnnt_tokenizer.model "
+        "failed after 3 attempts.",
+    ], "cpu", "")
+    assert "токен" not in str(отказ).lower(), str(отказ)
+
+
+def test_weights_go_where_the_service_may_write(monkeypatch, tmp_path):
+    """Библиотека по умолчанию пишет в ~/.cache/gigaam — службе туда нельзя.
+
+    Юнит работает с ProtectHome=read-only, и загрузка падала с OSError
+    [Errno 30] на «/home/asrhub». Переменная GIGAAM_MODEL_DIR, на которую мы
+    рассчитывали, не читается никем: библиотека берёт каталог только из
+    аргумента download_root.
+    """
+    import sys
+    import types
+
+    from asrhub.catalog import get_model
+    from asrhub.engines.gigaam_engine import GigaAMEngine
+
+    вызовы = {}
+
+    поддельный = types.ModuleType("gigaam")
+
+    def load_model(name, device=None, download_root=None):
+        вызовы["name"] = name
+        вызовы["download_root"] = download_root
+        return object()
+
+    поддельный.load_model = load_model
+    monkeypatch.setitem(sys.modules, "gigaam", поддельный)
+
+    движок = GigaAMEngine(get_model("gigaam-v3-e2e-rnnt"), {})
+    движок._load({"models_dir": str(tmp_path), "device": "cpu"})
+
+    assert вызовы["download_root"] == str(tmp_path), (
+        "загрузка снова пойдёт в домашний каталог: " + repr(вызовы))
+    assert вызовы["name"] == "v3_e2e_rnnt", вызовы
+
+
+def test_the_repository_id_is_not_attempted():
+    """Идентификатор репозитория библиотека не принимает никогда.
+
+    load_model берёт короткое имя варианта или путь к .ckpt, а на всё прочее
+    отвечает перечнем доступных имён. Попытка была не просто бесполезной —
+    её ответ и сбивал разбор причины.
+    """
+    import sys
+    import types
+
+    from asrhub.catalog import get_model
+    from asrhub.engines.gigaam_engine import GigaAMEngine
+    from asrhub.errors import ModelLoadError
+
+    попытки = []
+    поддельный = types.ModuleType("gigaam")
+
+    def load_model(name, device=None, download_root=None):
+        попытки.append(name)
+        raise ValueError(f"Model '{name}' not found. Available model names: ['ssl']")
+
+    поддельный.load_model = load_model
+    сохранённый = sys.modules.get("gigaam")
+    sys.modules["gigaam"] = поддельный
+    try:
+        движок = GigaAMEngine(get_model("gigaam-v3-e2e-rnnt"), {})
+        with pytest.raises(ModelLoadError):
+            движок._load({"models_dir": "", "device": "cpu"})
+    finally:
+        if сохранённый is None:
+            sys.modules.pop("gigaam", None)
+        else:
+            sys.modules["gigaam"] = сохранённый
+
+    assert попытки == ["v3_e2e_rnnt"], (
+        "идентификатор репозитория снова в попытках: " + repr(попытки))
+
+
+def test_the_first_gigaam_repository_does_not_serve_the_third_version():
+    """Голое «rnnt» библиотека сама разворачивает в v3_rnnt.
+
+    Значит репозиторий первой версии молча отдавал третью — подмена, которую
+    по выводу не заметить.
+    """
+    from asrhub.engines.gigaam_engine import variant_name
+
+    for ревизия in ("ctc", "rnnt", "ssl"):
+        имя = variant_name("ai-sage/GigaAM", ревизия)
+        assert имя.startswith("v1_"), f"{ревизия} → {имя}"
+
+
+def test_downloaded_gigaam_weights_are_seen_as_installed(tmp_path):
+    """Веса GigaAM — файл, а не каталог Hugging Face.
+
+    Поиск умел только раскладку `models--владелец--имя`, и скачанная модель
+    показывалась незагруженной навсегда, а её размер — нулевым.
+    """
+    from asrhub import model_files
+
+    assert model_files.find_local(tmp_path, "ai-sage/GigaAM-v3", "e2e_rnnt") is None
+    веса = tmp_path / "v3_e2e_rnnt.ckpt"
+    веса.write_bytes(b"x" * 2048)
+
+    найдено = model_files.find_local(tmp_path, "ai-sage/GigaAM-v3", "e2e_rnnt")
+    assert найдено == веса, найдено
+    assert model_files.directory_size(найдено) == 2048, "размер файла не считается"
+
+
+def test_a_short_word_cannot_match_inside_a_model_name():
+    """Слова разбора должны быть неспособны совпасть с посторонним текстом.
+
+    Правило «разбираем первую попытку» спасает лишь тогда, когда шум пришёл
+    из запасных. Если перечень доступных имён напечатала сама первая попытка,
+    защищают уже только сами слова: короткое «ssl» совпадёт с именем модели
+    «ssl», и отказ «такой модели нет» станет отказом сети.
+    """
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("m", [
+        "v9_rnnt: ValueError: Model 'v9_rnnt' not found. Available model names: "
+        "['ctc', 'rnnt', 'ssl', 'emo', 'v3_ssl']",
+    ], "cpu", "")
+    assert "хранилищу весов" not in str(отказ), (
+        "имя модели в перечне снова выдано за отказ сети: " + str(отказ))

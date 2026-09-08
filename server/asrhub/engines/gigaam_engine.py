@@ -25,27 +25,42 @@ _MAX_CHUNK_S = 22.0          # запас к жёсткому пределу м�
 
 #: По каким словам в ошибке узнаётся причина. Порядок важен: доступ к весам
 #: выглядит как «файл не найден», и общее правило перехватило бы его первым.
+#:
+#: Слова должны быть такими, чтобы их нельзя было встретить в постороннем
+#: тексте. Это не педантизм: короткое «ssl» однажды совпало с именем модели
+#: «ssl» в перечне доступных вариантов, и отказ из-за нехватки прав на запись
+#: был выдан за отсутствие интернета. Человек пошёл проверять сеть, а дело
+#: было в каталоге. По той же причине здесь нет «token» — оно живёт внутри
+#: «tokenizer», а токенизатор GigaAM качает при каждой загрузке e2e-модели.
 _LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
-    (("401", "403", "gated", "authorization", "unauthorized", "token"),
+    (("401", "403", "gated", "authorization", "unauthorized",
+      "invalid token", "token is required", "hf_token"),
      "к весам нужен доступ по токену Hugging Face",
      "Токен задаётся в разделе «Доступ» веб-интерфейса или ключом hf_token "
      "в config.yaml. Модель ai-sage/GigaAM-v3 требует принятия условий на "
      "странице модели."),
-    (("connection", "resolution", "resolve", "getaddrinfo", "timeout",
-      "temporarily", "temporary failure", "network", "unreachable", "proxy",
-      "ssl", "certificate", "errno -3", "errno -2"),
+    (("connectionerror", "connection refused", "connection reset",
+      "connection aborted", "name resolution", "getaddrinfo", "timed out",
+      "timeout", "temporary failure", "unreachable", "proxyerror",
+      "sslerror", "ssl:", "ssl certificate", "certificate verify",
+      "errno -3", "errno -2"),
      "сервер не смог обратиться к хранилищу весов",
      "Проверьте доступ в интернет с сервера или загрузите веса заранее: "
      "bash scripts/models.sh download <модель>"),
-    (("no space left", "disk"),
+    (("no space left", "errno 28"),
      "не хватило места на диске",
      "Освободите место в каталоге моделей и повторите."),
     (("out of memory", "cuda error", "cublas", "cudnn"),
      "не хватило памяти видеокарты или сломан её драйвер",
      "Попробуйте device=cpu или модель поменьше; проверьте nvidia-smi."),
-    (("permission", "errno 13", "read-only"),
-     "нет прав на каталог моделей",
-     "Каталог моделей должен принадлежать пользователю службы."),
+    (("read-only file system", "errno 30"),
+     "каталог, куда пишется библиотека, доступен только для чтения",
+     "Служба работает с ProtectHome=read-only, поэтому домашний каталог для "
+     "неё закрыт, а библиотеки по умолчанию складывают кеш именно туда. "
+     "Кеш нужно увести в каталог данных."),
+    (("permission denied", "errno 13"),
+     "нет прав на каталог",
+     "Каталог должен принадлежать пользователю службы."),
     (("modulenotfound", "no module named", "importerror", "undefined symbol"),
      "окружение движка неполное",
      "Переустановите движок: bash scripts/models.sh install-engine gigaam"),
@@ -53,6 +68,57 @@ _LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
      "веса не найдены на диске",
      "Загрузите их: bash scripts/models.sh download <модель>"),
 )
+
+
+#: Имя варианта, которым GigaAM называет свои веса. Библиотека принимает
+#: только эти короткие имена (или путь к .ckpt) — идентификатор репозитория
+#: Hugging Face она не понимает вовсе.
+_VARIANTS: dict[str, dict[str, str]] = {
+    "ai-sage/GigaAM-v3": {"ctc": "v3_ctc", "rnnt": "v3_rnnt",
+                          "e2e_ctc": "v3_e2e_ctc", "e2e_rnnt": "v3_e2e_rnnt",
+                          "ssl": "v3_ssl"},
+    "ai-sage/GigaAM-v2": {"ctc": "v2_ctc", "rnnt": "v2_rnnt", "ssl": "v2_ssl"},
+    # Голые «ctc»/«rnnt» тут были ошибкой: библиотека сама разворачивает
+    # короткое имя в v3_*, и репозиторий первой версии молча отдавал третью.
+    "ai-sage/GigaAM": {"ctc": "v1_ctc", "rnnt": "v1_rnnt",
+                       "ssl": "v1_ssl", "emo": "emo"},
+    "ai-sage/GigaAM-Multilingual": {"ctc": "multilingual_ctc",
+                                    "large_ctc": "multilingual_large_ctc",
+                                    "ssl": "multilingual_ssl"},
+}
+
+
+def variant_name(source: str, revision: str) -> str:
+    """Короткое имя варианта GigaAM по паре «источник + ревизия».
+
+    Вынесено из движка наружу, потому что тем же соответствием пользуется
+    предварительная загрузка весов: скачивать надо ровно тот файл, который
+    потом станет искать загрузчик, иначе на диске лежит одно, а движок ждёт
+    другого — ровно так и вышло, когда веса качались снапшотом с Hugging
+    Face, а библиотека брала .ckpt с CDN.
+    """
+    return _VARIANTS.get(source, {}).get(revision, revision)
+
+
+def weights_file(source: str, revision: str) -> str:
+    """Имя файла весов, которое библиотека кладёт в download_root."""
+    name = variant_name(source, revision)
+    # Короткие имена библиотека сама разворачивает в v3_*.
+    if name in ("ctc", "rnnt", "e2e_ctc", "e2e_rnnt", "ssl"):
+        name = f"v3_{name}"
+    return f"{name}.ckpt"
+
+
+def _failing_path(text: str) -> str:
+    """Достаёт путь, на котором споткнулась библиотека.
+
+    В сообщении вида «[Errno 30] Read-only file system: \'/home/asrhub\'» этот
+    путь — самое полезное, что есть: он один отвечает на вопрос «а куда,
+    собственно, она писала».
+    """
+    import re
+    match = re.search(r"[\'\"](/[^\'\"]{2,200})[\'\"]", text)
+    return match.group(1) if match else ""
 
 
 def _load_failure(model_id: str, errors: list[str], device: str,
@@ -64,11 +130,20 @@ def _load_failure(model_id: str, errors: list[str], device: str,
     обратный вызов телефонии не передаёт вовсе: у принимающей стороны
     оставалась одна строка без единой зацепки.
     """
-    haystack = " | ".join(errors).lower()
+    # Разбираем сначала первую попытку, и только потом остальные. Попытки
+    # идут по убыванию осмысленности: первая — штатный путь загрузки, и её
+    # отказ и есть причина. Дальше идут запасные, которые падают по своим
+    # поводам, и их текст может увести разбор в сторону — так и вышло, когда
+    # перечень доступных моделей из второй попытки перебил настоящую причину
+    # из первой.
     reason = hint = ""
-    for needles, text, advice in _LOAD_REASONS:
-        if any(needle in haystack for needle in needles):
-            reason, hint = text, advice
+    for scope in ([errors[0]] if errors else [], errors):
+        haystack = " | ".join(scope).lower()
+        for needles, text, advice in _LOAD_REASONS:
+            if any(needle in haystack for needle in needles):
+                reason, hint = text, advice
+                break
+        if reason:
             break
 
     message = f"Не удалось загрузить GigaAM «{model_id}»"
@@ -76,6 +151,11 @@ def _load_failure(model_id: str, errors: list[str], device: str,
     parts = [hint] if hint else [
         "Причина в тексте попыток ниже; проверьте установку движка и наличие весов.",
     ]
+    # Путь из ошибки — самое полезное, что в ней есть: он отвечает на вопрос
+    # «куда именно не удалось записать», на который иначе нет ответа вовсе.
+    путь = _failing_path(errors[0]) if errors else ""
+    if путь:
+        parts.append(f"Путь, на котором споткнулась загрузка: {путь}")
     if models_dir:
         parts.append(f"Каталог моделей: {models_dir}")
     parts.append(f"Устройство: {device}")
@@ -117,30 +197,41 @@ class GigaAMEngine(Engine):
         revision = self.spec.revision or "rnnt"
         models_dir = settings.get("models_dir") or ""
         if models_dir:
+            # GIGAAM_MODEL_DIR не читает никто: сама библиотека берёт каталог
+            # только из аргумента download_root, а без него — из
+            # os.path.expanduser("~/.cache/gigaam"). Служба работает с
+            # ProtectHome=read-only, и запись туда кончалась OSError [Errno 30]
+            # на «/home/asrhub». Переменную оставляем на случай, если её
+            # когда-нибудь начнут читать, но полагаемся на аргумент.
             os.environ.setdefault("GIGAAM_MODEL_DIR", str(models_dir))
             os.environ.setdefault("HF_HOME", str(models_dir))
 
         # Официальный путь загрузки: gigaam.load_model с именем варианта.
-        name_map = {
-            "ai-sage/GigaAM-v3": {"ctc": "v3_ctc", "rnnt": "v3_rnnt",
-                                  "e2e_ctc": "v3_e2e_ctc", "e2e_rnnt": "v3_e2e_rnnt",
-                                  "ssl": "v3_ssl"},
-            "ai-sage/GigaAM-v2": {"ctc": "v2_ctc", "rnnt": "v2_rnnt", "ssl": "v2_ssl"},
-            "ai-sage/GigaAM": {"ctc": "ctc", "rnnt": "rnnt", "emo": "emo"},
-            "ai-sage/GigaAM-Multilingual": {"ctc": "multilingual_ctc",
-                                            "large_ctc": "multilingual_large_ctc",
-                                            "ssl": "multilingual_ssl"},
-        }
-        name = name_map.get(self.spec.source, {}).get(revision, revision)
+        name = variant_name(self.spec.source, revision)
 
         errors: list[str] = []
         # Список без повторов: раньше первым и вторым шло одно и то же имя, и
         # в отчёт об ошибке попадали две одинаковые строки — вытесняя ту, что
         # объясняла настоящую причину.
-        attempts = list(dict.fromkeys([name, self.spec.source]))
+        #
+        # Идентификатор репозитория (ai-sage/GigaAM-v3) в этот список больше не
+        # входит. Он не мог сработать никогда: load_model принимает либо
+        # короткое имя варианта из своего перечня, либо путь к файлу .ckpt, а
+        # на всё прочее отвечает «Model not found. Available model names: […]».
+        # Попытка была не просто бесполезной — её ответ с перечнем имён и
+        # сбивал разбор причины.
+        attempts = list(dict.fromkeys(
+            [name] + ([self.spec.source] if os.path.isfile(
+                os.path.expanduser(self.spec.source or "")) else [])))
+        # download_root — единственный способ увести загрузку из домашнего
+        # каталога; иначе библиотека пишет в ~/.cache/gigaam.
+        root = str(models_dir) if models_dir else None
+        if root:
+            os.makedirs(root, exist_ok=True)
         for attempt in attempts:
             try:
-                model = gigaam.load_model(attempt, device=device)
+                model = gigaam.load_model(attempt, device=device,
+                                          download_root=root)
                 self.log.info("GigaAM: загружен вариант «%s» на %s", attempt, device)
                 return model
             except Exception as exc:      # пробуем следующий способ

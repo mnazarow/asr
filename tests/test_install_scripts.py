@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 

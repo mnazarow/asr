@@ -31,13 +31,29 @@ _cache: dict[str, tuple[float, str]] = {}
 _lock = threading.Lock()
 
 
-def find_local(models_dir: Path, source: str) -> Path | None:
-    """Каталог с весами модели, если они уже скачаны.
+def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None:
+    """Веса модели на диске, если они уже скачаны.
 
     Раскладка зависит от источника: Hugging Face кладёт веса в
-    `models--владелец--имя`, прямые ссылки — в каталог по имени архива.
+    `models--владелец--имя`, прямые ссылки — в каталог по имени архива,
+    а GigaAM — одним файлом `<вариант>.ckpt` рядом, потому что качает их не
+    с Hugging Face, а со своего CDN. Без последнего случая скачанная модель
+    GigaAM показывалась незагруженной навсегда.
     """
     if not models_dir.exists():
+        return None
+    if source.startswith("ai-sage/GigaAM"):
+        from .engines.gigaam_engine import weights_file
+        candidate = models_dir / weights_file(source, revision)
+        if candidate.exists():
+            return candidate
+        # Без ревизии сказать точнее нечего — считаем скачанным любой вариант
+        # этого семейства, иначе список «установленных» пустеет на ровном месте.
+        if not revision:
+            prefix = {"ai-sage/GigaAM-v3": "v3_", "ai-sage/GigaAM-v2": "v2_",
+                      "ai-sage/GigaAM-Multilingual": "multilingual_"}.get(source, "v1_")
+            found = sorted(models_dir.glob(f"{prefix}*.ckpt"))
+            return found[0] if found else None
         return None
     if source.startswith("http"):
         name = source.rsplit("/", 1)[-1].replace(".zip", "")
@@ -57,6 +73,13 @@ def find_local(models_dir: Path, source: str) -> Path | None:
 def directory_size(path: Path | None) -> int:
     if path is None or not path.exists():
         return 0
+    # Веса GigaAM — один файл, а не каталог: rglob по файлу не даёт ничего, и
+    # размер скачанной модели показывался нулевым.
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
     total = 0
     for item in path.rglob("*"):
         try:

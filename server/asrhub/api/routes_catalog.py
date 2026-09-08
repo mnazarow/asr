@@ -58,7 +58,8 @@ def list_models(
         state = get_state(request)
         models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
         items = [m for m in items
-                 if bool(model_files.find_local(models_dir, m.source)) is installed]
+                 if bool(model_files.find_local(models_dir, m.source, m.revision or ""))
+                 is installed]
     if search:
         needle = search.lower()
         items = [m for m in items
@@ -102,7 +103,7 @@ def model_status(request: Request, model_id: str,
     if spec is None:
         raise error_response(ModelNotFound(model_id, catalog.suggest_models(model_id)))
     models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
-    found = model_files.find_local(models_dir, spec.source)
+    found = model_files.find_local(models_dir, spec.source, spec.revision or "")
     cls = ENGINE_CLASSES.get(spec.engine)
     available, reason = cls.check_available() if cls else (False, "движок неизвестен")
     return {
@@ -170,7 +171,7 @@ def remove_model(request: Request, model_id: str,
     if spec is None:
         raise error_response(ModelNotFound(model_id, catalog.suggest_models(model_id)))
     models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
-    found = model_files.find_local(models_dir, spec.source)
+    found = model_files.find_local(models_dir, spec.source, spec.revision or "")
     if not found:
         return {"model": model_id, "removed": False, "message": "веса не найдены на диске"}
     freed = model_files.directory_size(found)

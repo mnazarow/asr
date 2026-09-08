@@ -567,10 +567,9 @@ def test_accepted_answer_names_the_real_callback_address(data_dir, monkeypatch):
     """В ответе 202 стоит тот адрес, на который результат придёт на самом деле."""
     from pathlib import Path
 
+    from asrhub.api import routes_phone
     from asrhub.api.app import create_app
     from fastapi.testclient import TestClient
-
-    from asrhub.api import routes_phone
 
     monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
     monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")

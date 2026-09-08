@@ -237,6 +237,41 @@ if spec.gated:
     if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
         print("Задайте токен: export HF_TOKEN=hf_xxx")
 
+# GigaAM качает веса не с Hugging Face, а со своего CDN, и кладёт их одним
+# файлом «<вариант>.ckpt». Снапшот репозитория, который тянулся раньше,
+# загрузчик библиотеки не открывает никогда: он ищет ровно этот файл в
+# download_root. То есть команда отрабатывала успешно, место занимала, а
+# движок потом всё равно шёл в интернет — или падал, если интернета нет.
+if spec.engine == "gigaam":
+    try:
+        import gigaam
+    except ModuleNotFoundError:
+        print("Движок gigaam не установлен.")
+        print("Установите: bash scripts/models.sh install-engine gigaam")
+        raise SystemExit(1)
+    from asrhub.engines.gigaam_engine import variant_name, weights_file
+    name = variant_name(spec.source, spec.revision or "")
+    root = str(models_dir)
+    target = models_dir / weights_file(spec.source, spec.revision or "")
+    if target.exists() and not force:
+        print(f"Уже загружено: {target}")
+        raise SystemExit(0)
+    print(f"Скачивание варианта «{name}» в {root}")
+    try:
+        # Свои же помощники библиотеки качают только файлы. Если их
+        # переименуют — грузим модель целиком: медленнее, но верно.
+        if hasattr(gigaam, "_download_model"):
+            gigaam._download_model(name, root)
+            if hasattr(gigaam, "_download_tokenizer"):
+                gigaam._download_tokenizer(name, root)
+        else:
+            gigaam.load_model(name, device="cpu", download_root=root)
+    except Exception as exc:
+        print(f"\nОшибка загрузки: {exc}")
+        raise SystemExit(1)
+    print(f"Готово: {target if target.exists() else root}")
+    raise SystemExit(0)
+
 if spec.source.startswith("http"):
     import zipfile, urllib.request
     target = models_dir / "vosk"
