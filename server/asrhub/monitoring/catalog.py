@@ -698,6 +698,15 @@ _m(MetricSpec(
 ))
 
 _m(MetricSpec(
+    name="asrhub_gpu_power_limit_watts", type="gauge", group="resources",
+    label="Предел мощности видеокарты", unit="Вт", labels=("gpu",),
+    description="Предел энергопотребления, установленный для карты.",
+    recommendation="Сам по себе не тревожен, но нужен рядом с потреблением: "
+                   "карта, упирающаяся в предел, снижает частоты, и падение "
+                   "скорости выглядит как проблема модели, а не питания.",
+))
+
+_m(MetricSpec(
     name="asrhub_process_threads", type="gauge", group="resources",
     label="Потоков процесса",
     description="Сколько потоков в процессе сервера.",

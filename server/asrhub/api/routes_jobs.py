@@ -417,11 +417,30 @@ def get_waveform(request: Request, job_id: str,
 
 #: Что отдавать браузеру для расширений, которые mimetypes не знает. Пустой
 #: тип заставил бы <audio> отказаться от файла молча.
+#: Тип содержимого для прослушивания исходной записи.
+#:
+#: Покрывает каждое расширение, которое сервер принимает на вход
+#: (`SUPPORTED_EXTENSIONS`), — за этим следит проверка. Раньше в таблице
+#: было двенадцать позиций из двадцати девяти, а остальные уходили в
+#: `mimetypes.guess_type`, который про «.caf», «.w64» и «.m2ts» ничего не
+#: знает: браузер получал «application/octet-stream» и даже не пробовал
+#: открыть файл. Ответ, который браузер не станет играть, — это тот же
+#: отказ, только без объяснения.
 _AUDIO_TYPES = {
-    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
-    ".mp4": "audio/mp4", ".ogg": "audio/ogg", ".oga": "audio/ogg",
-    ".opus": "audio/ogg", ".flac": "audio/flac", ".aac": "audio/aac",
-    ".webm": "audio/webm", ".amr": "audio/amr", ".wma": "audio/x-ms-wma",
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".mp2": "audio/mpeg",
+    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+    ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg",
+    ".wma": "audio/x-ms-wma", ".aiff": "audio/aiff", ".aif": "audio/aiff",
+    ".amr": "audio/amr", ".ac3": "audio/ac3", ".caf": "audio/x-caf",
+    ".w64": "audio/x-w64",
+    # Видео отдаётся своим типом, а не «audio/…»: браузер сам решит, что
+    # умеет открыть. У части контейнеров звук он достаёт, у части — нет,
+    # но врать ему про содержимое файла в любом случае незачем.
+    ".mp4": "video/mp4", ".m4v": "video/x-m4v", ".webm": "video/webm",
+    ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime", ".flv": "video/x-flv",
+    ".wmv": "video/x-ms-wmv", ".mpg": "video/mpeg", ".mpeg": "video/mpeg",
+    ".ts": "video/mp2t", ".m2ts": "video/mp2t", ".3gp": "video/3gpp",
 }
 
 

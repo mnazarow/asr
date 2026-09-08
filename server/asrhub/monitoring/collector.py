@@ -389,37 +389,39 @@ class Collector:
             if latest.get(column) is not None:
                 out.append(Sample(metric, float(latest[column]) * MB))
 
-        for column, metric in (("gpu_percent", "asrhub_gpu_percent"),
-                               ("gpu_mem_mb", "asrhub_gpu_memory_used_bytes"),
-                               ("gpu_mem_total", "asrhub_gpu_memory_total_bytes")):
-            if latest.get(column) is not None:
-                value = float(latest[column])
-                out.append(Sample(metric, value * (1 if metric.endswith("percent") else MB),
-                                  {"gpu": "0"}))
-
-        self._gpu_extra(out)
+        self._gpus(out, MB)
         self._process(out)
 
-    def _gpu_extra(self, out: list[Sample]) -> None:
-        """Температура и потребление: их нет в общем замере системы."""
-        from ..hardware import _run
+    def _gpus(self, out: list[Sample], MB: int) -> None:
+        """Метрики по каждой карте — из сохранённых замеров, а не из опроса.
 
-        result = _run(["nvidia-smi",
-                       "--query-gpu=index,temperature.gpu,power.draw",
-                       "--format=csv,noheader,nounits"])
-        if not result:
+        Раньше загрузка и память брались из system_samples, где под карту
+        отведено три колонки, то есть только первая; а температура с
+        потреблением запрашивались отдельным вызовом nvidia-smi прямо во
+        время выдачи метрик. Отсюда два неудобства: карт по-прежнему было
+        видно одну, и опрос метрик мог подвиснуть на внешней команде.
+        Теперь и то и другое берётся из таблицы замеров, которую наполняет
+        фоновый цикл очереди.
+        """
+        rows = self.state.db.gpu_samples(time.time() - 600, limit=200)
+        if not rows:
             return
-        for line in result.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 3:
-                continue
-            index = parts[0]
-            for value, metric in ((parts[1], "asrhub_gpu_temperature_celsius"),
-                                  (parts[2], "asrhub_gpu_power_watts")):
-                try:
-                    out.append(Sample(metric, float(value), {"gpu": index}))
-                except ValueError:
-                    continue
+        # Оставляем последний замер каждой карты.
+        latest: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            latest[int(row.get("gpu") or 0)] = row
+        for index in sorted(latest):
+            row = latest[index]
+            метка = {"gpu": str(index)}
+            for column, metric, множитель in (
+                    ("util_percent", "asrhub_gpu_percent", 1),
+                    ("mem_used_mb", "asrhub_gpu_memory_used_bytes", MB),
+                    ("mem_total_mb", "asrhub_gpu_memory_total_bytes", MB),
+                    ("temperature_c", "asrhub_gpu_temperature_celsius", 1),
+                    ("power_w", "asrhub_gpu_power_watts", 1),
+                    ("power_limit_w", "asrhub_gpu_power_limit_watts", 1)):
+                if row.get(column) is not None:
+                    out.append(Sample(metric, float(row[column]) * множитель, метка))
 
     def _process(self, out: list[Sample]) -> None:
         out.append(Sample("asrhub_process_threads", float(threading.active_count())))

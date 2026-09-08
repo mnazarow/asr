@@ -24,10 +24,18 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
+
+#: Потолок числа корзин у рядов нагрузки. График шире тысячи точек всё равно
+#: не читается, а число корзин задаёт стоимость запроса.
+SERIES_MAX_BUCKETS = 2000
+
+#: Такт служебного цикла: с этим шагом пишутся замеры нагрузки. Здесь он
+#: потому, что от него зависит и запись, и чтение рядов.
+SAMPLE_PERIOD_S = 20.0
 
 _SCHEMA = [
     # --- версия 1: основные таблицы ---------------------------------------
@@ -233,6 +241,30 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_samples_ts ON system_samples(ts DESC)",
+    # --- версия 7: замеры по каждой видеокарте отдельно --------------------
+    #
+    # В system_samples под видеокарту отведено три колонки — то есть ровно
+    # одна карта. Сборщик и брал только первую строку вывода nvidia-smi, так
+    # что вторая карта не существовала для сервера вовсе. Температуры и
+    # потребления там нет совсем, хотя они приходят тем же запросом даром, а
+    # без них «нагрузка на видеокарту» — это загрузка в процентах и больше
+    # ничего: ни троттлинга, ни упора в лимит мощности по ним не видно.
+    """
+    CREATE TABLE IF NOT EXISTS gpu_samples (
+        ts             REAL NOT NULL,
+        gpu            INTEGER NOT NULL,
+        name           TEXT,
+        util_percent   REAL,
+        mem_used_mb    REAL,
+        mem_total_mb   REAL,
+        temperature_c  REAL,
+        power_w        REAL,
+        power_limit_w  REAL,
+        PRIMARY KEY (ts, gpu)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_gpu_samples_ts ON gpu_samples(ts DESC)",
+
     # --- версия 3: сравнительные прогоны ----------------------------------
     """
     CREATE TABLE IF NOT EXISTS benchmarks (
@@ -943,7 +975,11 @@ class Database:
                 "(ts, cpu_percent, ram_used_mb, ram_total_mb, gpu_percent, gpu_mem_mb, "
                 " gpu_mem_total, disk_free_gb, queue_depth, active_jobs) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (now(), sample.get("cpu_percent"), sample.get("ram_used_mb"),
+                # Время берём из самого замера, если оно там есть: замеры по
+                # видеокартам пишутся отдельной таблицей и должны лечь на ту
+                # же ось времени, а не на «почти ту же».
+                (float(sample.get("ts") or now()),
+                 sample.get("cpu_percent"), sample.get("ram_used_mb"),
                  sample.get("ram_total_mb"), sample.get("gpu_percent"),
                  sample.get("gpu_mem_mb"), sample.get("gpu_mem_total"),
                  sample.get("disk_free_gb"), sample.get("queue_depth"),
@@ -958,6 +994,90 @@ class Database:
             "SELECT * FROM system_samples WHERE ts>=? ORDER BY ts DESC LIMIT ?",
             (since, limit))
         return [dict(r) for r in reversed(rows)]
+
+    def add_gpu_samples(self, ts: float, rows: list[dict[str, Any]]) -> None:
+        """Замеры по всем картам за один момент времени."""
+        if not rows:
+            return
+        self.executemany(
+            "INSERT OR REPLACE INTO gpu_samples "
+            "(ts, gpu, name, util_percent, mem_used_mb, mem_total_mb, "
+            " temperature_c, power_w, power_limit_w) VALUES (?,?,?,?,?,?,?,?,?)",
+            [(ts, int(r.get("gpu", 0)), r.get("name"), r.get("util_percent"),
+              r.get("mem_used_mb"), r.get("mem_total_mb"), r.get("temperature_c"),
+              r.get("power_w"), r.get("power_limit_w")) for r in rows])
+
+    def gpu_samples(self, since: float, limit: int = 4000) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT * FROM gpu_samples WHERE ts>=? ORDER BY ts DESC LIMIT ?",
+            (since, limit))
+        return [dict(r) for r in reversed(rows)]
+
+    def _bucket_step(self, since: float, until: float, buckets: int) -> tuple[int, float]:
+        """Число корзин и их шаг — общая арифметика обоих рядов.
+
+        Корзина уже такта сборщика бессмысленна: замеры приходят раз в
+        `SAMPLE_PERIOD_S` секунд, и в корзину шириной в такт то попадают два
+        замера, то ни одного. На графике это выглядело пунктиром — линия
+        рвалась не там, где сервер молчал, а там, где такт разошёлся с
+        границей корзины на долю секунды. Поэтому корзина не уже двух
+        тактов: одного мало, ровно на такой ширине дрожание такта и даёт
+        пустые корзины вперемешку с двойными.
+        """
+        окно = max(float(until) - float(since), 1e-6)
+        предел = max(1, int(окно / (2 * SAMPLE_PERIOD_S)))
+        buckets = max(1, min(int(buckets), SERIES_MAX_BUCKETS, предел))
+        return buckets, окно / buckets
+
+    def system_series(self, since: float, until: float,
+                      buckets: int) -> tuple[int, list[dict[str, Any]]]:
+        """Ряд нагрузки сервера, свёрнутый до `buckets` корзин силами SQLite.
+
+        Раньше ручка графиков читала все замеры окна в память и резала их
+        питоном. За неделю это тридцать тысяч строк на каждый опрос панели,
+        и цена запроса зависела от ширины окна, а не от числа точек на
+        графике, которых всегда меньше двух сотен. Свёртка в SQL считает то
+        же самое: среднее там, где важен уровень, максимум там, где важен
+        всплеск — минутный перегрев внутри получасовой корзины усреднение
+        стирает, а он и есть причина смотреть на график.
+        """
+        buckets, шаг = self._bucket_step(since, until, buckets)
+        rows = self.query(
+            "SELECT CAST((ts-?)/? AS INTEGER) AS bucket,"
+            "       AVG(cpu_percent)  AS cpu_percent,"
+            "       AVG(ram_used_mb)  AS ram_used_mb,"
+            "       MAX(ram_total_mb) AS ram_total_mb,"
+            "       AVG(disk_free_gb) AS disk_free_gb,"
+            "       MAX(queue_depth)  AS queue_depth,"
+            "       MAX(active_jobs)  AS active_jobs,"
+            "       COUNT(*)          AS samples "
+            "FROM system_samples WHERE ts>=? AND ts<? "
+            "GROUP BY bucket ORDER BY bucket",
+            (since, шаг, since, until))
+        return buckets, [dict(r) for r in rows]
+
+    def gpu_series(self, since: float, until: float,
+                   buckets: int) -> tuple[int, list[dict[str, Any]]]:
+        """То же по каждой видеокарте отдельно.
+
+        Отдельно, а не в среднем: «средняя загрузка видеокарты» на машине с
+        двумя картами — величина, из которой не следует ничего.
+        """
+        buckets, шаг = self._bucket_step(since, until, buckets)
+        rows = self.query(
+            "SELECT gpu, CAST((ts-?)/? AS INTEGER) AS bucket,"
+            "       MAX(name)             AS name,"
+            "       AVG(util_percent)     AS util_percent,"
+            "       AVG(mem_used_mb)      AS mem_used_mb,"
+            "       MAX(mem_total_mb)     AS mem_total_mb,"
+            "       MAX(temperature_c)    AS temperature_c,"
+            "       MAX(power_w)          AS power_w,"
+            "       MAX(power_limit_w)    AS power_limit_w,"
+            "       COUNT(*)              AS samples "
+            "FROM gpu_samples WHERE ts>=? AND ts<? "
+            "GROUP BY gpu, bucket ORDER BY gpu, bucket",
+            (since, шаг, since, until))
+        return buckets, [dict(r) for r in rows]
 
     # --- ключи и настройки ----------------------------------------------
 
@@ -978,7 +1098,8 @@ class Database:
 
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
                 events_days: int = 90) -> dict[str, int]:
-        removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0, "bytes": 0}
+        removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0,
+                   "gpu_samples": 0, "bytes": 0}
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
@@ -1009,8 +1130,15 @@ class Database:
         if metrics_days > 0:
             removed["metrics"] = self.execute(
                 "DELETE FROM metrics WHERE ts<?", (ts - metrics_days * 86400,))
+            # Обе таблицы замеров живут по одному сроку. gpu_samples пишется
+            # по строке на карту за такт, то есть растёт кратно числу карт —
+            # без этой строки она оставалась единственной таблицей в базе,
+            # которую не чистил никто.
+            граница = ts - metrics_days * 86400
             removed["samples"] = self.execute(
-                "DELETE FROM system_samples WHERE ts<?", (ts - metrics_days * 86400,))
+                "DELETE FROM system_samples WHERE ts<?", (граница,))
+            removed["gpu_samples"] = self.execute(
+                "DELETE FROM gpu_samples WHERE ts<?", (граница,))
         if events_days > 0:
             removed["events"] = self.execute(
                 "DELETE FROM events WHERE ts<?", (ts - events_days * 86400,))

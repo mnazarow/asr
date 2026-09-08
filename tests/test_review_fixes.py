@@ -14,6 +14,7 @@ import sys
 import time
 import wave
 from pathlib import Path
+from typing import Any
 
 import pytest
 from asrhub.pipeline import audio as audio_mod
@@ -1074,3 +1075,327 @@ def test_every_new_section_is_reachable_by_its_own_url(repo_root: Path):
     for раздел in ("weekly", "cache", "reliability", "audio", "resources",
                    "quality", "tags", "queue"):
         assert f'"{раздел}": state.analytics.' in источник, f"раздел {раздел} не отдаётся"
+
+
+def test_peak_memory_counter_is_reset_before_the_job_not_after(monkeypatch):
+    """Счётчик пика у torch общий на процесс и копится с самого запуска.
+
+    Если обнулять его после замера, первое задание отчитается за всё, что
+    успело выделиться до него. Сброс должен быть в начале — и до того, как
+    движок что-то посчитает.
+    """
+    from asrhub import processor as proc
+
+    события: list[str] = []
+
+    class ФейковаяCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def reset_peak_memory_stats() -> None:
+            события.append("сброс")
+
+        @staticmethod
+        def max_memory_allocated() -> int:
+            события.append("замер")
+            return 700 * 1024 * 1024
+
+    класс_torch = type(sys)("torch")
+    класс_torch.cuda = ФейковаяCuda
+    monkeypatch.setitem(sys.modules, "torch", класс_torch)
+
+    proc._reset_peak_memory()
+    assert proc._peak_memory_mb("cuda:0") == 700.0
+    assert события == ["сброс", "замер"], события
+
+
+def test_process_job_resets_the_counter_only_when_it_measures(tmp_path: Path,
+                                                              monkeypatch):
+    """Сброс — не бесплатная операция для соседа по очереди.
+
+    Когда рядом идёт второе задание, замер не делается вовсе (см. очередь),
+    и трогать общий счётчик тоже нельзя.
+    """
+    from asrhub import processor as proc
+    from asrhub.errors import AudioError
+
+    сбросов: list[int] = []
+    monkeypatch.setattr(proc, "_reset_peak_memory", lambda: сбросов.append(1))
+
+    # Задание падает сразу на несуществующем файле — сброс к тому моменту
+    # уже должен был случиться: он идёт до всякой работы.
+    источник = tmp_path / "нет.wav"
+    for мерить, ожидание in ((False, 0), (True, 1)):
+        сбросов.clear()
+        with pytest.raises(AudioError):
+            proc.process_job(источник, {"model": "нет-такой"},
+                             registry=None, workdir=tmp_path, outdir=tmp_path,
+                             basename="x", measure_memory=мерить)
+        assert len(сбросов) == ожидание, (мерить, сбросов)
+
+
+def test_gpu_samples_are_cleaned_like_every_other_metric(tmp_path: Path):
+    """Замеры по картам — единственная таблица, которую не чистил никто.
+
+    Пишется по строке на карту за такт, то есть на машине с двумя картами
+    растёт вдвое быстрее общих замеров. Срок хранения у обеих таблиц один.
+    """
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "g.sqlite3")
+    сейчас = time.time()
+    давно = сейчас - 400 * 86400
+    for метка in (давно, сейчас):
+        database.add_system_sample({"ts": метка, "cpu_percent": 10.0})
+        database.add_gpu_samples(метка, [
+            {"gpu": 0, "name": "RTX 5090", "util_percent": 50.0,
+             "mem_used_mb": 1000.0},
+            {"gpu": 1, "name": "RTX 5090", "util_percent": 60.0,
+             "mem_used_mb": 1100.0},
+        ])
+
+    removed = database.cleanup(results_days=30, metrics_days=30)
+    assert removed["gpu_samples"] == 2, removed
+    осталось = database.gpu_samples(since=0)
+    assert len(осталось) == 2, осталось
+    assert all(r["ts"] >= сейчас - 1 for r in осталось), осталось
+
+
+def test_the_report_reads_the_archive_once_not_twenty_times(rich_db):
+    """Два десятка разрезов — два десятка полных проходов по архиву.
+
+    Каждый разрез читал базу сам: на архиве в сорок тысяч заданий сводный
+    отчёт собирался тринадцать секунд вместо двух. Разрезы по завершённым и
+    по упавшим — отдельные выборки, поэтому проходов остаётся несколько, но
+    не по одному на разрез.
+    """
+    запросы: list[tuple[Any, ...]] = []
+    исходный = rich_db.db.list_jobs
+
+    def учёт(**kw):
+        запросы.append((kw.get("since"), kw.get("status"), kw.get("owner")))
+        return исходный(**kw)
+
+    rich_db.db.list_jobs = учёт
+    try:
+        отчёт = rich_db.full_report("month")
+    finally:
+        rich_db.db.list_jobs = исходный
+
+    assert len(отчёт) >= 19, "разрезы потерялись"
+    assert len(запросы) <= 5, f"{len(запросы)} проходов по архиву: {запросы}"
+    assert len(set(запросы)) == len(запросы), "один и тот же запрос выполнен дважды"
+
+
+def test_all_sections_of_one_report_cover_the_same_window(rich_db):
+    """Иначе «месяц» у первого разреза начинался раньше, чем у последнего.
+
+    Границу окна каждый разрез считал сам, от текущего времени. За секунды
+    сборки отчёта она уезжала — разрезы расходились между собой, и общая
+    выборка не попадала в кеш ни разу.
+    """
+    границы: list[float] = []
+    исходный = rich_db.db.list_jobs
+
+    def учёт(**kw):
+        if kw.get("since") is not None:
+            границы.append(float(kw["since"]))
+        return исходный(**kw)
+
+    rich_db.db.list_jobs = учёт
+    try:
+        rich_db.full_report("month")
+    finally:
+        rich_db.db.list_jobs = исходный
+
+    assert границы, "ни один разрез не ограничил окно"
+    assert len(set(границы)) == 1, f"окна разъехались: {sorted(set(границы))}"
+
+
+def test_outside_a_report_each_section_still_reads_fresh(rich_db):
+    """Кеш живёт ровно один отчёт — иначе это просто устаревшие данные.
+
+    Аналитика существует всё время работы приложения; выборка, пережившая
+    свой отчёт, показывала бы вчерашний архив как сегодняшний.
+    """
+    assert rich_db._выборки is None, "кеш остался включённым после отчёта"
+    rich_db.overview("month")
+    assert rich_db._выборки is None, "разрез вне отчёта включил кеш"
+
+
+def test_a_recording_with_an_ascii_name_keeps_it_on_save(client, tmp_path: Path):
+    """Кнопка «Скачать запись» теряла имя у обычных латинских файлов.
+
+    Заголовок сервер шлёт по-разному: `filename*=` по RFC 5987 появляется
+    только у имён с кириллицей, а у «record.wav» его нет. Разбор в плеере
+    искал только его, и такой файл сохранялся как «запись-job_….wav».
+    """
+    исходник = tmp_path / "record.wav"
+    _wav_with_lead_silence(исходник, silence_s=0.1, total_s=0.5)
+
+    with исходник.open("rb") as fh:
+        ответ = client.post("/api/jobs", files={"file": ("record.wav", fh, "audio/wav")})
+    assert ответ.status_code in (200, 201), ответ.text
+    job_id = ответ.json()["id"]
+
+    аудио = client.get(f"/api/jobs/{job_id}/audio")
+    assert аудио.status_code == 200, аудио.text
+    заголовок = аудио.headers.get("content-disposition", "")
+    assert "record.wav" in заголовок, заголовок
+    assert "filename*=" not in заголовок, (
+        "если сервер стал слать RFC 5987 и для латиницы — проверка устарела")
+
+    # Плеер разбирает заголовок общей функцией, а не своей копией.
+    app_js = (Path(__file__).resolve().parent.parent / "server" / "asrhub"
+              / "web" / "app.js").read_text(encoding="utf-8")
+    сохранение = app_js[app_js.index("  async save(id) {"):]
+    сохранение = сохранение[:сохранение.index("\n  },")]
+    assert "parseFilename(disposition)" in сохранение, сохранение
+    assert "filename\\*=utf-8" not in сохранение, "своя копия разбора вернулась"
+
+
+def test_a_status_code_is_not_recognised_inside_a_file_path():
+    """«401» в имени файла отправляло чинить токен вместо загрузки весов.
+
+    Приметы кодов состояния были обычными подстроками, и «401» находилось
+    внутри «v3_rnnt-8401.ckpt» и внутри номера порта прокси. Отсутствующий
+    на диске файл сервер объявлял отказом в доступе к Hugging Face.
+    """
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    def причина(*ошибки: str) -> str:
+        текст = str(_load_failure("gigaam-v3-rnnt", list(ошибки), "cuda", "/opt"))
+        return текст.split("«gigaam-v3-rnnt»", 1)[1].split(".")[0].strip(": ")
+
+    assert причина(
+        "v3_rnnt: FileNotFoundError: [Errno 2] No such file or directory: "
+        "'/opt/asrhub/models/gigaam/v3_rnnt-8401.ckpt'"
+    ) == "веса не найдены на диске"
+
+    assert причина(
+        "ConnectionError: HTTPConnectionPool(host='proxy', port=8403): "
+        "Max retries exceeded"
+    ) == "сервер не смог обратиться к хранилищу весов"
+
+    # А настоящие коды по-прежнему опознаются.
+    assert причина(
+        "HTTPError: 401 Client Error: Unauthorized for url: https://huggingface.co/x"
+    ) == "к весам нужен доступ по токену Hugging Face"
+    assert причина(
+        "GatedRepoError: 403 Client Error. Access to model is restricted."
+    ) == "к весам нужен доступ по токену Hugging Face"
+
+
+def test_the_two_cache_savings_figures_agree(rich_db):
+    """На одной странице стояли два числа про экономию от кеша.
+
+    Разрез «эффективность» считал её по вбитой в код скорости 0.2, а
+    разрез «кеш» — по измеренной на своих же заданиях. Расходились вдвое.
+    """
+    отчёт = rich_db.full_report("month")
+    э, к = отчёт["efficiency"], отчёт["cache"]
+
+    assert э["assumed_rtf"] == к["assumed_rtf"], (э["assumed_rtf"], к["assumed_rtf"])
+    assert э["assumed_rtf"], "скорость не измерена — экономию не по чему считать"
+    assert э["cache_hits"] == к["hits"], (э["cache_hits"], к["hits"])
+    # Часы округлены до трёх знаков — это 3.6 секунды; сравниваем в пределах
+    # половины этого шага, иначе тест меряет округление, а не согласие.
+    assert э["saved_compute_hours"] == pytest.approx(
+        к["processing_seconds_saved"] / 3600, abs=0.0005), (э, к)
+
+
+def test_the_measured_speed_ignores_jobs_taken_from_cache(rich_db):
+    """У задания из кеша своего времени обработки нет.
+
+    Включать его в среднее — занижать цену работы тем сильнее, чем чаще
+    срабатывает кеш, то есть тем сильнее, чем важнее ответ.
+    """
+    задания = [
+        {"status": "completed", "media_duration_s": 100.0, "processing_time_s": 50.0},
+        {"status": "completed", "media_duration_s": 100.0, "cached_from": "job_x",
+         "processing_time_s": 0.0},
+        {"status": "failed", "media_duration_s": 100.0, "processing_time_s": 90.0},
+    ]
+    assert rich_db._measured_rtf(задания) == pytest.approx(0.5), "кеш попал в среднее"
+
+
+def test_every_accepted_format_has_a_content_type_for_playback():
+    """Ответ, который браузер не станет играть, — тот же отказ, без объяснения.
+
+    В таблице было двенадцать расширений из двадцати девяти принимаемых, а
+    остальные уходили в `mimetypes.guess_type`, который про «.caf», «.w64» и
+    «.m2ts» не знает ничего: браузер получал «application/octet-stream».
+    """
+    from asrhub.api.routes_jobs import _AUDIO_TYPES
+    from asrhub.pipeline.audio import SUPPORTED_EXTENSIONS
+
+    без_типа = sorted(SUPPORTED_EXTENSIONS - set(_AUDIO_TYPES))
+    assert not без_типа, f"принимаем, но не отдаём на прослушивание: {без_типа}"
+    лишние = sorted(set(_AUDIO_TYPES) - SUPPORTED_EXTENSIONS)
+    assert not лишние, f"тип есть, а файл такой сервер не принимает: {лишние}"
+    for расш, тип in _AUDIO_TYPES.items():
+        assert тип.startswith(("audio/", "video/")), (расш, тип)
+
+
+def test_an_unknown_gigaam_repository_is_not_silently_taken_for_v3(caplog):
+    """Голое «rnnt» библиотека разворачивает в v3_rnnt — молча.
+
+    Если в справочник добавят четвёртую версию, не поправив таблицу
+    вариантов, сервер будет уверенно качать и грузить веса третьей. Угадать
+    тут нечего, но сказать об этом надо.
+    """
+    from asrhub.engines.gigaam_engine import weights_file
+
+    with caplog.at_level("WARNING"):
+        assert weights_file("ai-sage/GigaAM-v4", "rnnt") == "v3_rnnt.ckpt"
+    assert any("не описан в таблице вариантов" in r.message for r in caplog.records), \
+        caplog.records
+
+    # Известные репозитории предупреждений не дают.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert weights_file("ai-sage/GigaAM", "rnnt") == "v1_rnnt.ckpt"
+        assert weights_file("ai-sage/GigaAM-v3", "e2e_rnnt") == "v3_e2e_rnnt.ckpt"
+    assert not caplog.records, caplog.records
+
+
+def test_the_quality_axis_is_labelled_by_the_width_of_its_bucket(rich_db, repo_root):
+    """На часовом окне ход качества подписывал все точки одной датой.
+
+    Подпись была жёстко «день.месяц», а корзина за час — две с половиной
+    минуты: двадцать четыре одинаковых подписи вместо оси.
+    """
+    for период, шире in (("hour", 7200), ("month", 0)):
+        ход = rich_db.quality_trend(период)
+        assert "bucket_seconds" in ход, "ширина корзины не отдаётся"
+        assert ход["bucket_seconds"] > 0, ход["bucket_seconds"]
+        if период == "hour":
+            assert ход["bucket_seconds"] < шире, (
+                "часовое окно должно подписываться временем, а не датой")
+
+    # Пустой ход тоже отдаёт поле — иначе подпись выбирается наугад.
+    пустой = rich_db.quality_trend("hour", buckets=4)
+    assert "bucket_seconds" in пустой
+
+    app_js = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(
+        encoding="utf-8")
+    assert "подписьВремени(t, qt.bucket_seconds)" in app_js, \
+        "ход качества снова подписывается сам по себе"
+    assert "подписьВремени(t, ts.bucket_seconds)" in app_js, \
+        "поток заданий перестал пользоваться общей подписью"
+
+
+def test_the_quality_cards_say_something_when_there_is_nothing(repo_root):
+    """Две дырки без объяснения — худший из возможных ответов.
+
+    Когда завершённых заданий за период нет, разрез отдаёт пустые корзины, и
+    карточки оставались нарисованными, но пустыми внутри.
+    """
+    app_js = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(
+        encoding="utf-8")
+    начало = app_js.index("const qt = data.quality_trend")
+    кусок = app_js[начало:начало + 900]
+    assert "!(qt.buckets || []).length" in кусок, кусок[:300]
+    assert кусок.count("Charts.empty") >= 2, "пустые карточки снова молчат"

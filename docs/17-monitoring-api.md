@@ -4,7 +4,7 @@
 
 Раздел собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
-Всего маршрутов: **19**, операций: **21**.
+Всего маршрутов: **20**, операций: **22**.
 
 ## Как обращаться
 
@@ -82,6 +82,7 @@ curl -H "X-API-Key: $КЛЮЧ" "$СЕРВЕР/api/monitoring/catalog"
 | `GET` | `/api/monitoring/metrics` | Метрики во всех поддерживаемых форматах | без ключа при `monitoring_public: true`, иначе любой действующий ключ |
 | `GET` | `/api/monitoring/metrics.json` | Снимок в JSON с описанием каждой метрики | без ключа при `monitoring_public: true`, иначе любой действующий ключ |
 | `GET` | `/api/monitoring/ready` | Проба готовности | без ключа при `monitoring_public: true`, иначе любой действующий ключ |
+| `GET` | `/api/monitoring/resources` | Ряды нагрузки: сервер и видеокарты | любой действующий ключ |
 | `GET` | `/api/monitoring/startup` | Проба завершения запуска | без ключа при `monitoring_public: true`, иначе любой действующий ключ |
 | `GET` | `/api/monitoring/targets` | Приёмники метрик и состояние доставки | любой действующий ключ |
 | `PUT` | `/api/monitoring/targets` | Заменить список приёмников | ключ с ролью **admin** |
@@ -122,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 86.9
+asrhub_uptime_seconds 520.3
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -156,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788458177.3274534,
-  "collected_at": "2026-09-03T17:56:17+0000",
+  "timestamp": 1788894577.385588,
+  "collected_at": "2026-09-08T19:09:37+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -233,15 +234,15 @@ curl 'http://сервер:8080/api/monitoring/health'
 
 ```json
 {
-  "status": "ok",
-  "uptime_s": 87.0,
+  "status": "warning",
+  "uptime_s": 520.3,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 87 с",
+        "detail": "работает 520 с",
         "hint": ""
       },
       {
@@ -270,7 +271,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 16.2 ГБ",
+        "detail": "свободно 14.2 ГБ",
         "hint": ""
       },
       {
@@ -278,7 +279,6 @@ curl 'http://сервер:8080/api/monitoring/health'
         "status": "ok",
         "detail": "ждёт 0, выполняется 0",
         "hint": ""
-      }
 …
 ```
 
@@ -337,7 +337,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 16.2 ГБ",
+      "detail": "свободно 14.2 ГБ",
       "hint": ""
     },
     {
@@ -503,13 +503,32 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 {
   "summary": {
     "rules": 34,
-    "firing": 0,
-    "pending": 4,
+    "firing": 1,
+    "pending": 3,
     "critical": 0,
-    "warning": 0,
-    "worst": "ok"
+    "warning": 1,
+    "worst": "warning"
   },
-  "alerts": []
+  "alerts": [
+    {
+      "id": "asrhub_disk_free_bytes|warning",
+      "state": "firing",
+      "severity": "warning",
+      "metric": "asrhub_disk_free_bytes",
+      "label": "Свободно на диске",
+      "unit": "Б",
+      "value": 15219769344.0,
+      "threshold": 21474836480.0,
+      "direction": "below",
+      "since": 1788894081.09635,
+      "active_seconds": 496.3,
+      "fired_at": 1788894577.3796144,
+      "resolved_at": null,
+      "breaches": 4,
+      "summary": "Свободно на диске: ниже 21474836480 Б",
+      "hint": "POST /api/maintenance/cleanup, затем bash scripts/models.sh disk"
+    }
+  ]
 }
 ```
 
@@ -737,23 +756,54 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 2,
-  "samples": 515,
+  "scrapes": 4,
+  "samples": 528,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {
     "rules": 34,
-    "firing": 0,
-    "pending": 4,
+    "firing": 1,
+    "pending": 3,
     "critical": 0,
-    "warning": 0,
-    "worst": "ok"
+    "warning": 1,
+    "worst": "warning"
   },
   "targets": []
 }
 ```
 
 Поле `collection_errors` перечисляет источники, которые не удалось опросить. Пустой список — все источники отвечают.
+
+## Прочие маршруты
+
+### `GET /api/monitoring/resources`
+
+Ряды нагрузки: сервер и видеокарты.
+
+Ряды по времени для графиков нагрузки.
+
+Раздел мониторинга был целиком табличным: пробы, тревоги, приёмники,
+справочник. По таблице видно текущее значение и не видно ничего из того,
+ради чего мониторинг заводят, — растёт ли нагрузка, упирается ли карта в
+лимит мощности, совпадает ли провал скорости с ростом очереди.
+
+Свёртка идёт в SQL: цена запроса определяется числом точек на графике, а
+не шириной окна. Раньше неделя замеров означала тридцать тысяч строк в
+память на каждый опрос панели — при открытом по умолчанию доступе к
+мониторингу этого хватало, чтобы держать базу занятой одним лишь
+обновлением графика.
+
+Замеры по картам отдаются по каждой отдельно: у сервера их может быть
+несколько, и «средняя загрузка видеокарты» — величина, из которой не
+следует ничего.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `minutes` | в адресе | integer | `60` | — |
+| `points` | в адресе | integer | `180` | — |
 
 ## Примеры интеграции
 

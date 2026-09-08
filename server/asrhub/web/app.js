@@ -204,6 +204,27 @@ function pct(value, digits) {
   return (value * 100).toFixed(digits === undefined ? 1 : digits) + ' %';
 }
 
+/**
+ * Подпись точки на оси времени по ширине корзины.
+ *
+ * Одна и та же на всех графиках с временной осью. Ход качества подписывал
+ * точки как «день.месяц» всегда — на часовом окне это была одна и та же
+ * дата двадцать четыре раза подряд, то есть ось без единой подсказки о
+ * том, где на ней находишься.
+ */
+function подписьВремени(секунды, ширинаКорзины) {
+  const d = new Date(секунды * 1000);
+  if (!(ширинаКорзины > 0) || ширинаКорзины < 7200) {
+    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  }
+  if (ширинаКорзины < 86400 * 20) {
+    return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+  }
+  // Корзина шире трёх недель бывает только на годовом окне: там день
+  // не значит ничего, а месяц с годом отвечают на вопрос «когда».
+  return d.toLocaleDateString('ru-RU', { month: 'short', year: '2-digit' });
+}
+
 const STATUS_LABELS = {
   queued: 'в очереди', running: 'обработка', completed: 'готово',
   failed: 'ошибка', cancelled: 'отменено', paused: 'пауза', retry: 'повтор',
@@ -2401,9 +2422,11 @@ const Player = {
       const response = await fetch(Player.url(id), { headers });
       if (!response.ok) throw new Error(`сервер ответил ${response.status}`);
       const blob = await response.blob();
+      // Разбор имени — общий с выгрузкой результатов. Своя копия здесь
+      // искала только filename*= по RFC 5987, а его сервер шлёт лишь для
+      // неascii-имён: файл «record.wav» сохранялся как «запись-job_….wav».
       const disposition = response.headers.get('Content-Disposition') || '';
-      const match = /filename\*=utf-8''([^;]+)/i.exec(disposition);
-      const name = match ? decodeURIComponent(match[1]) : `запись-${id}.wav`;
+      const name = parseFilename(disposition) || `запись-${id}.wav`;
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
       link.download = name;
@@ -2564,8 +2587,10 @@ function setupJobPlayer(backdrop, job, segments, show, options) {
   let current = -1;
   const highlight = (seconds) => {
     if (!segments.length) return;
-    // Ищем от текущего места: за время воспроизведения соседний сегмент
-    // наступает почти всегда, и обходить весь список на каждом тике незачем.
+    // Перебор с начала на каждом такте. Тактов у звука около четырёх в
+    // секунду, а сегментов даже у часовой записи меньше тысячи — на этом
+    // поиск не виден. Умный поиск «от текущего места» здесь был бы ошибкой
+    // с перемоткой назад в обмен на выигрыш, которого не измерить.
     let index = -1;
     for (let i = 0; i < segments.length; i += 1) {
       if (segments[i].start <= seconds && seconds < segments[i].end) { index = i; break; }
@@ -2814,12 +2839,7 @@ RENDERERS.analytics = {
              '<div class="table-wrap full" id="table-tags"></div>')}`;
 
     const ts = data.timeseries;
-    const labels = (ts.labels || []).map((t) => {
-      const d = new Date(t * 1000);
-      return ts.bucket_seconds < 7200
-        ? d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
-        : d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
-    });
+    const labels = (ts.labels || []).map((t) => подписьВремени(t, ts.bucket_seconds));
 
     Charts.line(qs('#chart-flow'), {
       labels, height: 210, area: true,
@@ -3008,9 +3028,15 @@ function drawExtraAnalytics(data) {
   }
 
   const qt = data.quality_trend || {};
-  if (qs('#chart-quality') && (qt.buckets || []).length) {
-    const метки = qt.buckets.map((t) => new Date(t * 1000).toLocaleDateString('ru-RU',
-      { day: '2-digit', month: '2-digit' }));
+  if (qs('#chart-quality') && !(qt.buckets || []).length) {
+    // Пустой ход — это не повод оставить на странице две дырки без
+    // объяснения: карточки нарисованы, а внутри ничего.
+    Charts.empty(qs('#chart-quality'), 'За период нет завершённых заданий');
+    if (qs('#chart-quality2')) {
+      Charts.empty(qs('#chart-quality2'), 'За период нет завершённых заданий');
+    }
+  } else if (qs('#chart-quality')) {
+    const метки = qt.buckets.map((t) => подписьВремени(t, qt.bucket_seconds));
     const уверенность = (qt.confidence || []).map((v) => v === null ? null : v * 100);
     const есть = уверенность.some((v) => v !== null);
     if (есть) {
@@ -3120,12 +3146,13 @@ function drawExtraAnalytics(data) {
         <td class="num">${d.rtf !== null ? num(d.rtf, 3) : '—'}</td></tr>`).join('')}
       </tbody></table>` : ''}
       ${(res.models || []).length ? `<table style="margin-top:10px"><thead><tr><th>Модель</th>
-        <th class="num">Пик, МБ</th><th class="num">p95</th><th class="num">Среднее</th>
+        <th class="num">Пик</th><th class="num">p95</th><th class="num">Среднее</th>
         </tr></thead><tbody>
       ${res.models.slice(0, 10).map((m) => `<tr><td class="mono truncate"
         style="max-width:180px">${esc(m.model)}</td>
-        <td class="num">${num(m.peak_mb, 0)}</td><td class="num">${num(m.p95_mb, 0)}</td>
-        <td class="num">${num(m.avg_mb, 0)}</td></tr>`).join('')}</tbody></table>`
+        <td class="num">${fmtBytes(m.peak_mb * 1024 * 1024)}</td>
+        <td class="num">${fmtBytes(m.p95_mb * 1024 * 1024)}</td>
+        <td class="num">${fmtBytes(m.avg_mb * 1024 * 1024)}</td></tr>`).join('')}</tbody></table>`
       : `<div class="small faint" style="margin-top:8px">Пик памяти пишется начиная с этой
          версии — у заданий, выполненных раньше, его нет. На видеокарте это память
          ускорителя, на процессоре — резидентная память процесса.</div>`}`;
@@ -4125,6 +4152,19 @@ RENDERERS.monitoring = {
         <ul style="margin:0;padding-left:18px" class="small">
           ${info.collection_errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></section>` : ''}
 
+      ${card('Нагрузка сервера', 'ряды за выбранное окно — таблица показывает текущее значение, а нужен ход',
+             `<div class="settings-toolbar" style="position:static;padding:0 0 10px">
+                <span class="small dim">Окно:</span>
+                <div class="group-nav" id="mon-window">
+                  ${[[15, '15 мин'], [60, 'час'], [360, '6 часов'], [1440, 'сутки'],
+                     [10080, 'неделя']].map(([m, л]) =>
+                    `<button data-minutes="${m}"${m === 60 ? ' class="active"' : ''}>${л}</button>`).join('')}
+                </div>
+                <span class="spacer"></span>
+                <span class="small faint" id="mon-sampled"></span>
+              </div>
+              <div id="mon-charts"><div class="empty">Загрузка рядов…</div></div>`)}
+
       ${card('Пробы состояния',
              'liveness — перезапустить контейнер; readiness — снять нагрузку',
              `<div class="grid cols-3">${
@@ -4173,7 +4213,107 @@ RENDERERS.monitoring = {
       } catch (err) { fail(err); }
     };
     qs('#mon-add-target').onclick = () => targetDialog(targets);
+    qsa('#mon-window button').forEach((b) => b.addEventListener('click', () => {
+      qsa('#mon-window button').forEach((x) => x.classList.toggle('active', x === b));
+      this.loadResources(Number(b.dataset.minutes));
+    }));
+    this.loadResources(60);
     this.loadCatalog();
+  },
+
+  /* Графики нагрузки: сервер и каждая видеокарта отдельно.
+   *
+   * «Средняя загрузка видеокарты» — величина, из которой ничего не следует,
+   * поэтому карты никогда не складываются в один ряд, даже когда их две.
+   */
+  async loadResources(minutes) {
+    const host = qs('#mon-charts');
+    if (!host) return;
+    let data;
+    try {
+      data = await API.latest('mon-res', `/api/monitoring/resources?minutes=${minutes}`);
+    } catch (err) {
+      if (!(err && err.silent)) host.innerHTML =
+        `<div class="empty">Не удалось получить ряды: ${esc(err.message)}</div>`;
+      return;
+    }
+    const счётчик = qs('#mon-sampled');
+    if (счётчик) счётчик.textContent = `замеров: ${num(data.sampled)}`;
+    if (!data.sampled) {
+      host.innerHTML = '<div class="empty">За это окно замеров ещё нет — сервер их пишет раз в несколько секунд</div>';
+      return;
+    }
+
+    const s = data.system || {};
+    const метки = (s.ts || []).map((t) => new Date(t * 1000).toLocaleTimeString('ru-RU',
+      { hour: '2-digit', minute: '2-digit' }));
+    const памятьВсего = s.ram_total_mb || 0;
+
+    host.innerHTML = `
+      <div class="grid cols-2">
+        <div><b class="small">Процессор</b><div id="mon-cpu"></div></div>
+        <div><b class="small">Оперативная память${памятьВсего
+          ? `, всего ${num(памятьВсего / 1024, 1)} ГБ` : ''}</b><div id="mon-ram"></div></div>
+      </div>
+      <div class="grid cols-2">
+        <div><b class="small">Очередь и работа</b><div id="mon-queue"></div></div>
+        <div><b class="small">Свободно на диске</b><div id="mon-disk"></div></div>
+      </div>
+      ${(data.gpus || []).map((g) => `
+        <div class="card tight" style="margin-top:12px">
+          <div class="row" style="margin-bottom:8px">
+            <b>${esc(g.name)}</b>
+            <span class="chip">GPU ${g.gpu}</span>
+            ${g.mem_total_mb ? `<span class="chip">${num(g.mem_total_mb / 1024, 1)} ГБ</span>` : ''}
+            ${g.power_limit_w ? `<span class="chip">предел ${num(g.power_limit_w, 0)} Вт</span>` : ''}
+          </div>
+          <div class="grid cols-2">
+            <div><b class="small">Загрузка и память</b><div id="mon-gpu-${g.gpu}"></div></div>
+            <div><b class="small">Температура и потребление</b>
+                 <div id="mon-gpu-t-${g.gpu}"></div></div>
+          </div>
+        </div>`).join('')
+      || '<div class="empty small" style="margin-top:12px">Видеокарты не обнаружены — рядов по ним нет</div>'}`;
+
+    Charts.line(qs('#mon-cpu'), { labels: метки, area: true, unit: ' %', yMax: 100,
+      series: [{ name: 'Загрузка', values: s.cpu_percent || [] }] });
+    Charts.line(qs('#mon-ram'), { labels: метки, area: true, unit: ' МБ',
+      yMax: памятьВсего || undefined,
+      series: [{ name: 'Занято', values: s.ram_used_mb || [] }] });
+    Charts.line(qs('#mon-queue'), { labels: метки,
+      series: [{ name: 'В очереди', values: s.queue_depth || [] },
+               { name: 'В работе', values: s.active_jobs || [] }] });
+    Charts.line(qs('#mon-disk'), { labels: метки, area: true, unit: ' ГБ',
+      series: [{ name: 'Свободно', values: s.disk_free_gb || [] }] });
+
+    (data.gpus || []).forEach((g) => {
+      const их = (g.ts || []).map((t) => new Date(t * 1000).toLocaleTimeString('ru-RU',
+        { hour: '2-digit', minute: '2-digit' }));
+      // Загрузка в процентах и память в мегабайтах — величины разного
+      // порядка, поэтому память переводим в проценты от установленной. Так
+      // обе линии живут на одной шкале честно, без второй оси.
+      const памятьДоля = g.mem_total_mb
+        ? (g.mem_used_mb || []).map((v) => v === null ? null : (v / g.mem_total_mb) * 100)
+        : null;
+      Charts.line(qs(`#mon-gpu-${g.gpu}`), {
+        labels: их, unit: ' %', yMax: 100,
+        series: [{ name: 'Загрузка', values: g.util_percent || [] },
+                 ...(памятьДоля ? [{ name: 'Память занята', values: памятьДоля }] : [])],
+      });
+      const ряды = [];
+      if ((g.temperature_c || []).some((v) => v !== null)) {
+        ряды.push({ name: 'Температура, °C', values: g.temperature_c });
+      }
+      if ((g.power_w || []).some((v) => v !== null)) {
+        ряды.push({ name: 'Потребление, Вт', values: g.power_w });
+      }
+      const узел = qs(`#mon-gpu-t-${g.gpu}`);
+      if (ряды.length) {
+        Charts.line(узел, { labels: их, series: ряды });
+      } else {
+        Charts.empty(узел, 'Карта не отдаёт телеметрию по температуре и мощности');
+      }
+    });
   },
 
   async loadCatalog() {

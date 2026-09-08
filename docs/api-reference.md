@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **78**, операций: **88**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **80**, операций: **90**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -138,6 +138,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/jobs/batch` | Поставить несколько файлов одной группой | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}` | Карточка задания | любой действующий ключ |
 | `DELETE` | `/api/jobs/{job_id}` | Удалить задание и результаты | ключ с правом записи (**admin** или **user**) |
+| `GET` | `/api/jobs/{job_id}/audio` | Исходная запись задания | любой действующий ключ |
 | `POST` | `/api/jobs/{job_id}/bottom` | Опустить в конец очереди | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/jobs/{job_id}/cancel` | Отменить задание | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}/download` | Скачать результат в выбранном формате | любой действующий ключ |
@@ -179,6 +180,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/monitoring/metrics` | Метрики во всех поддерживаемых форматах | без ключа при `monitoring_public: true`, иначе любой ключ |
 | `GET` | `/api/monitoring/metrics.json` | Снимок в JSON с описанием каждой метрики | без ключа при `monitoring_public: true`, иначе любой ключ |
 | `GET` | `/api/monitoring/ready` | Проба готовности | без ключа при `monitoring_public: true`, иначе любой ключ |
+| `GET` | `/api/monitoring/resources` | Ряды нагрузки: сервер и видеокарты | любой действующий ключ |
 | `GET` | `/api/monitoring/startup` | Проба завершения запуска | без ключа при `monitoring_public: true`, иначе любой ключ |
 | `GET` | `/api/monitoring/targets` | Приёмники метрик и состояние доставки | любой действующий ключ |
 | `PUT` | `/api/monitoring/targets` | Заменить список приёмников | ключ с ролью **admin** |
@@ -247,33 +249,33 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 {
   "items": [
     {
-      "id": "job_e752ac214ed04848",
+      "id": "job_d7fe59ed55244a82",
       "status": "completed",
-      "model": "gigaam-v3-e2e-rnnt",
+      "model": "gigaam-v3-rnnt",
       "engine": "gigaam",
       "language": "ru",
-      "owner": "Сидорчук Д.",
-      "source": "web",
-      "priority": 10,
-      "filename": "вебинар-165.wav",
+      "owner": "admin",
+      "source": "api",
+      "priority": 50,
+      "filename": "звонок-0.wav",
       "deadline": null,
-      "created_at": 1788400043.3269281,
-      "queued_at": 1788400043.3269281,
-      "started_at": 1788400118.4813502,
-      "finished_at": 1788400138.1381946,
-      "media_duration_s": 223.2230510519809,
-      "processing_time_s": 19.66,
-      "queue_time_s": 75.15,
-      "audio_prep_s": 1.614,
-      "model_load_s": 3.062,
-      "inference_s": 14.765,
-      "postprocess_s": 1.225,
-      "rtf": 0.0881,
-      "words_count": 577,
-      "chars_count": 3462,
-      "segments_count": 36,
-      "speakers_count": 3,
-      "avg_confidence": 0.9829,
+      "created_at": 1788893287.5892565,
+      "queued_at": 1788893287.5892887,
+      "started_at": null,
+      "finished_at": 1788893337.5892565,
+      "media_duration_s": 300.0,
+      "processing_time_s": 44.0,
+      "queue_time_s": 1.0,
+      "audio_prep_s": null,
+      "model_load_s": null,
+      "inference_s": null,
+      "postprocess_s": null,
+      "rtf": 0.15,
+      "words_count": 760,
+      "chars_count": 0,
+      "segments_count": 48,
+      "speakers_count": 2,
+      "avg_confidence": 0.93,
       "wer": null,
       "cer": null,
       "error_code": null,
@@ -282,19 +284,22 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "retries": 0,
       "cached_from": null,
       "device": "cuda",
-      "file_size": 7143137,
-      "progress": 1.0,
-      "stage": "готово"
+      "file_size": 9600000,
+      "progress": 0.0,
+      "stage": "",
+      "tags": "продажи",
+      "peak_memory_mb": 23400.0,
+      "file_hash": null,
+      "cancelled_by": null,
+      "webhook_status": null
     },
     {
-      "id": "job_23413cf83c3a4c82",
+      "id": "job_01a10ee12e814776",
       "status": "completed",
-      "model": "parakeet-tdt-0.6b-v3",
-      "engine": "nemo",
-      "language": "ru",
-      "owner": "Петрова М.",
-      "source": "web-batch",
-      "priority": 50,
+      "model": "whisper-large-v3",
+      "engine": "whisper",
+      "language": null,
+      "owner": "admin",
 …
 ```
 
@@ -362,6 +367,23 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/jobs/j_a1b2c3
 Удалить задание и результаты.
 
 **Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `job_id` | в пути | string | обязателен | — |
+
+### `GET /api/jobs/{job_id}/audio`
+
+Исходная запись задания.
+
+Отдаёт исходный файл записи — для прослушивания и скачивания.
+
+Отдаётся через FileResponse, а он умеет отвечать на заголовок Range. Это
+не мелочь: без частичных ответов встроенный проигрыватель браузера не
+может перемотать запись, он способен только слушать её с начала.
+
+**Доступ:** любой действующий ключ.
 
 
 | Параметр | Где | Тип | По умолчанию | Описание |
@@ -561,7 +583,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:18209",
+  "instance": "vm:23402",
   "instances": [],
   "workers": [
     {
@@ -579,9 +601,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 256,
-    "failed": 10,
-    "cancelled": 8
+    "completed": 321,
+    "failed": 12,
+    "cancelled": 5
   },
   "queue_depth": 0,
   "active": 0,
@@ -1004,7 +1026,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/settings
 {
   "values": {
     "engine": "auto",
-    "model": "demo-simulator",
+    "model": "faster-whisper-small",
     "language": "ru",
     "task": "transcribe",
     "model_fallback": "",
@@ -1141,51 +1163,51 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788458177.1319575,
+    "generated_at": 1788894080.9917765,
     "jobs": {
-      "total": 256,
-      "completed": 240,
-      "failed": 9,
-      "cancelled": 7,
+      "total": 337,
+      "completed": 320,
+      "failed": 12,
+      "cancelled": 5,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 0.9375
+      "success_rate": 0.9496
     },
     "volume": {
-      "audio_seconds": 313935.4,
-      "audio_hours": 87.2,
-      "processing_seconds": 41051.4,
-      "words": 717126,
-      "characters": 4302756,
-      "segments": 33603,
-      "files_per_hour": 1.43,
-      "audio_hours_per_hour": 0.52
+      "audio_seconds": 343391.6,
+      "audio_hours": 95.39,
+      "processing_seconds": 50304.0,
+      "words": 789184,
+      "characters": 4673574,
+      "segments": 35786,
+      "files_per_hour": 1.9,
+      "audio_hours_per_hour": 0.57
     },
     "performance": {
       "rtf": {
-        "count": 240,
-        "avg": 0.135373,
-        "min": 0.0176,
-        "max": 0.5409,
-        "p50": 0.10985,
-        "p90": 0.29566,
-        "p95": 0.381125,
-        "p99": 0.449682,
-        "stdev": 0.106567
+        "count": 320,
+        "avg": 0.145888,
+        "min": 0.0177,
+        "max": 0.5543,
+        "p50": 0.10845,
+        "p90": 0.32673,
+        "p95": 0.418765,
+        "p99": 0.506942,
+        "stdev": 0.11697
       },
       "processing_time_s": {
-        "count": 240,
-        "avg": 171.047667,
-        "min": 0.97,
-        "max": 2014.66,
-        "p50": 54.565,
-        "p90": 504.388,
-        "p95": 621.4515,
-        "p99": 1258.9897,
-        "stdev": 268.665181
+        "count": 320,
+        "avg": 157.199887,
+        "min": 0.72,
+        "max": 2411.75,
+        "p50": 46.17,
+        "p90": 385.194,
+        "p95": 658.23,
+        "p99": 1792.7622,
+        "stdev": 321.034667
       },
       "queue_time_s": {
-        "count": 240,
+        "count": 320,
 …
 ```
 
@@ -1237,7 +1259,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 86.8,
+  "uptime_s": 23.9,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1316,17 +1338,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 86.9,
+  "uptime_s": 24.0,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
-    "disk_free_gb": 16.2,
+    "ram_available_gb": 7.0,
+    "disk_free_gb": 14.5,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1337,7 +1359,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 16.2 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 14.5 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -1510,9 +1532,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
   ],
   "window": "последние сутки",
   "used": {
-    "jobs": 0,
-    "audio_hours": 0.0,
-    "storage_gb": 0.0
+    "jobs": 1,
+    "audio_hours": 0.0056,
+    "storage_gb": 0.0003
   },
   "limits": {
     "jobs": null,
@@ -1731,14 +1753,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 86.9,
+  "uptime_s": 24.0,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 87 с",
+        "detail": "работает 24 с",
         "hint": ""
       },
       {
@@ -1767,7 +1789,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 16.2 ГБ",
+        "detail": "свободно 14.5 ГБ",
         "hint": ""
       },
       {
@@ -1848,6 +1870,35 @@ curl 'http://сервер:8080/api/monitoring/metrics?format=influx'
 
 **Доступ:** без ключа при `monitoring_public: true`, иначе любой ключ.
 
+
+### `GET /api/monitoring/resources`
+
+Ряды нагрузки: сервер и видеокарты.
+
+Ряды по времени для графиков нагрузки.
+
+Раздел мониторинга был целиком табличным: пробы, тревоги, приёмники,
+справочник. По таблице видно текущее значение и не видно ничего из того,
+ради чего мониторинг заводят, — растёт ли нагрузка, упирается ли карта в
+лимит мощности, совпадает ли провал скорости с ростом очереди.
+
+Свёртка идёт в SQL: цена запроса определяется числом точек на графике, а
+не шириной окна. Раньше неделя замеров означала тридцать тысяч строк в
+память на каждый опрос панели — при открытом по умолчанию доступе к
+мониторингу этого хватало, чтобы держать базу занятой одним лишь
+обновлением графика.
+
+Замеры по картам отдаются по каждой отдельно: у сервера их может быть
+несколько, и «средняя загрузка видеокарты» — величина, из которой не
+следует ничего.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `minutes` | в адресе | integer | `60` | — |
+| `points` | в адресе | integer | `180` | — |
 
 ### `GET /api/monitoring/startup`
 

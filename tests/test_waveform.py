@@ -10,6 +10,7 @@ import json
 import math
 import sqlite3
 import struct
+import sys
 import time
 import wave
 from pathlib import Path
@@ -304,3 +305,30 @@ def test_web_assets_wired(repo_root: Path):
     # Обработчики на window снимаются при закрытии карточки, иначе они копятся.
     assert "asrhub:closed" in app and "removeEventListener('resize', redraw)" in app
     assert "asrhub:theme" in app
+
+
+def test_generated_chapters_match_their_generator(repo_root: Path):
+    """Четыре главы собираются из каталога, а не пишутся руками.
+
+    Правка прямо в такой главе живёт до первой сборки документации и молча
+    исчезает — вместе с работой, которую в неё вложили. Пусть об этом
+    говорит тест, а не пропавший из PDF раздел.
+    """
+    sys.path.insert(0, str(repo_root / "docs"))
+    sys.path.insert(0, str(repo_root / "server"))
+    import generate  # noqa: PLC0415
+
+    главы = {
+        "04-parameters.md": generate.generate_parameters,
+        "03-models.md": generate.generate_models,
+        "13-presets.md": generate.generate_presets,
+        "16-monitoring.md": generate.generate_monitoring,
+    }
+    разошлись = []
+    for имя, сборка in главы.items():
+        на_диске = (repo_root / "docs" / имя).read_text(encoding="utf-8")
+        if сборка() != на_диске:
+            разошлись.append(имя)
+    assert not разошлись, (
+        f"главы правились руками и пропадут при сборке: {разошлись}. "
+        "Править надо docs/generate.py, потом запустить python3 docs/generate.py")

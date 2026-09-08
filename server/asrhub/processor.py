@@ -135,11 +135,29 @@ class Timer:
         return values
 
 
+def _reset_peak_memory() -> None:
+    """Обнулить счётчик пика видеопамяти перед заданием.
+
+    Счётчик у torch общий на процесс и копится с самого запуска. Сбрасывать
+    его после замера нельзя: так стирается то, что успел накопить сосед по
+    очереди. Поэтому обнуляем в начале — и только когда задание в очереди
+    одно (см. `job_queue`), иначе замер всё равно был бы общим на двоих.
+    """
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:                                        # noqa: BLE001
+        pass                                                 # нет torch или карты
+
+
 def _peak_memory_mb(device: str) -> float:
     """Пик памяти за задание: у ускорителя — своей, иначе процесса.
 
     Спрашиваем в конце задания, а не по ходу: torch ведёт счётчик пика сам,
-    и опрашивать его в цикле незачем. На процессоре точного пика нет —
+    и опрашивать его в цикле незачем. Начало отсчёта задаёт
+    `_reset_peak_memory` в начале задания. На процессоре точного пика нет —
     берём текущую резидентную память, что для сравнения моделей между собой
     достаточно, и честно об этом говорим в описании раздела.
     """
@@ -149,7 +167,6 @@ def _peak_memory_mb(device: str) -> float:
 
             if torch.cuda.is_available():
                 значение = torch.cuda.max_memory_allocated() / 1024 / 1024
-                torch.cuda.reset_peak_memory_stats()
                 if значение > 0:
                     return round(значение, 1)
         except Exception:                                    # noqa: BLE001
@@ -165,7 +182,8 @@ def _peak_memory_mb(device: str) -> float:
 def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry,
                 *, workdir: Path, outdir: Path, basename: str,
                 progress: ProgressFn | None = None,
-                cancelled: Callable[[], bool] | None = None) -> ProcessOutcome:
+                cancelled: Callable[[], bool] | None = None,
+                measure_memory: bool = False) -> ProcessOutcome:
     """Полный цикл обработки одного файла."""
 
     def report(value: float, stage: str) -> None:
@@ -184,6 +202,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             raise JobCancelled(
                 "Задание отменено пользователем.",
                 hint="Повторить можно кнопкой «Повторить» в карточке задания.")
+
+    if measure_memory:
+        _reset_peak_memory()
 
     timer = Timer()
     outcome = ProcessOutcome()
@@ -471,7 +492,12 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     # и в метрики, где точность важнее совпадения с содержимым файла.
     timer.stop()
     outcome.timings = {k: round(v, 4) for k, v in timer.values.items()}
-    outcome.peak_memory_mb = _peak_memory_mb(str(settings.get("device") or ""))
+    # Устройство берём у движка: в настройках лежит «auto», и по нему не
+    # понять, спрашивать ли память у видеокарты.
+    outcome.stats["device"] = str(engine_meta.get("device")
+                                  or settings.get("device") or "")
+    if measure_memory:
+        outcome.peak_memory_mb = _peak_memory_mb(outcome.stats["device"])
     report(1.0, "готово")
     return outcome
 

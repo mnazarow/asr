@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from .catalog import get_model
@@ -41,12 +43,75 @@ def _escape_label(value: Any) -> str:
 class Analytics:
     def __init__(self, db: Database):
         self.db = db
+        #: Кеш выборок заданий на время одного сводного отчёта. Вне отчёта —
+        #: None, то есть каждый разрез читает базу сам, как и раньше.
+        self._выборки: dict[tuple[Any, ...], list[dict[str, Any]]] | None = None
+        #: Границы окон, замороженные на время отчёта (см. `_since`).
+        self._окна: dict[str, float] | None = None
+
+    def _since(self, period: str) -> float:
+        """Начало окна разреза; внутри отчёта — общее для всех разрезов.
+
+        Каждый разрез считал границу сам, от текущего времени. За те
+        секунды, что собирается отчёт, «месяц» у последнего разреза
+        начинался позже, чем у первого: разрезы одного отчёта расходились
+        между собой, а общая выборка заданий не попадала в кеш ни разу —
+        ключ у каждого получался свой.
+        """
+        if self._окна is None:
+            return _since(period)
+        if period not in self._окна:
+            self._окна[period] = _since(period)
+        return self._окна[period]
+
+    def _jobs(self, *, since: float | None = None,
+              status: str | None = None, owner: str | None = None,
+              limit: int = 100000) -> list[dict[str, Any]]:
+        """Выборка заданий для разреза — с общим кешом внутри отчёта.
+
+        Сводный отчёт собирает два десятка разрезов, и каждый читал базу
+        сам: на архиве в сто тысяч заданий это два десятка полных проходов
+        по одному и тому же окну ради одних и тех же строк. Ключ кеша —
+        сам запрос, так что разрезы по завершённым и по упавшим остаются
+        отдельными выборками, а не сводятся к одной «на все случаи».
+
+        Строки только читают: ни один разрез не пишет в них, поэтому общий
+        список можно отдавать всем сразу.
+        """
+        ключ = (since, status, owner, limit)
+        готовое = self._выборки.get(ключ) if self._выборки is not None else None
+        if готовое is not None:
+            return готовое
+        строки = self.db.list_jobs(since=since, status=status, limit=limit,
+                                   owner=owner, light=True)
+        if self._выборки is not None:
+            self._выборки[ключ] = строки
+        return строки
+
+    @contextmanager
+    def _общая_выборка(self) -> Iterator[None]:
+        """Включает кеш на время сборки одного отчёта и гасит его после.
+
+        Вложенность допустима: внутренний вызов не сбрасывает чужой кеш.
+        Держать его дольше отчёта нельзя — аналитика живёт в приложении
+        всё время его работы, и кеш стал бы просто устаревшими данными.
+        """
+        свой = self._выборки is None
+        if свой:
+            self._выборки = {}
+            self._окна = {}
+        try:
+            yield
+        finally:
+            if свой:
+                self._выборки = None
+                self._окна = None
 
     # --- сводка ---------------------------------------------------------
 
     def overview(self, period: str = "day", owner: str | None = None) -> dict[str, Any]:
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         done = [j for j in jobs if j["status"] == "completed"]
         failed = [j for j in jobs if j["status"] == "failed"]
         cancelled = [j for j in jobs if j["status"] == "cancelled"]
@@ -123,10 +188,10 @@ class Analytics:
 
     def timeseries(self, period: str = "day", buckets: int = 48,
                    owner: str | None = None) -> dict[str, Any]:
-        since = _since(period) or (time.time() - PERIODS["week"])
+        since = self._since(period) or (time.time() - PERIODS["week"])
         span = max(time.time() - since, 60.0)
         width = span / buckets
-        jobs = self.db.list_jobs(since=since, limit=100000, owner=owner, light=True)
+        jobs = self._jobs(since=since, limit=100000, owner=owner)
 
         series = {
             "labels": [], "completed": [], "failed": [], "audio_minutes": [],
@@ -181,8 +246,8 @@ class Analytics:
     # --- сравнение моделей -------------------------------------------------
 
     def by_model(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for job in jobs:
             grouped.setdefault(str(job.get("model") or "—"), []).append(job)
@@ -240,8 +305,8 @@ class Analytics:
 
     def _group(self, period: str, field: str, fallback: str,
                owner: str | None = None) -> list[dict[str, Any]]:
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for job in jobs:
             grouped.setdefault(str(job.get(field) or fallback), []).append(job)
@@ -263,8 +328,8 @@ class Analytics:
         return rows
 
     def errors(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
-        since = _since(period)
-        jobs = self.db.list_jobs(status="failed", since=since or None, limit=10000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(status="failed", since=since or None, limit=10000, owner=owner)
         by_code: dict[str, dict[str, Any]] = {}
         for job in jobs:
             code = str(job.get("error_code") or "unknown")
@@ -295,8 +360,8 @@ class Analytics:
 
     def duration_histogram(self, period: str = "month", bins: int = 10,
                           owner: str | None = None) -> dict[str, Any]:
-        since = _since(period)
-        jobs = [j for j in self.db.list_jobs(status="completed", since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = [j for j in self._jobs(status="completed", since=since or None, limit=100000, owner=owner)
                 if j.get("media_duration_s")]
         durations = [float(j["media_duration_s"]) for j in jobs]
         if not durations:
@@ -315,8 +380,8 @@ class Analytics:
 
     def slowest(self, period: str = "month", limit: int = 15,
                 owner: str | None = None) -> list[dict[str, Any]]:
-        since = _since(period)
-        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(status="completed", since=since or None, limit=100000, owner=owner)
         jobs = [j for j in jobs if j.get("rtf")]
         jobs.sort(key=lambda j: float(j["rtf"]), reverse=True)
         return [{
@@ -328,8 +393,8 @@ class Analytics:
 
     def hourly_profile(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         """Распределение нагрузки по часам суток и дням недели."""
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         hours = [0] * 24
         weekdays = [0] * 7
         for job in jobs:
@@ -344,25 +409,50 @@ class Analytics:
             "peak_hour": max(range(24), key=lambda h: hours[h]) if any(hours) else None,
         }
 
+    @staticmethod
+    def _measured_rtf(jobs: list[dict[str, Any]]) -> float:
+        """Во сколько раз обработка медленнее реального времени.
+
+        Считается по заданиям, которые сервер действительно считал сам:
+        у взятого из кеша собственного времени обработки нет, и включать
+        его в среднее — значит занижать цену работы тем сильнее, чем чаще
+        срабатывает кеш.
+
+        Раньше экономию от кеша в одном разрезе считали по этой измеренной
+        величине, а в другом — по вбитой в код 0.2, и на одной странице
+        стояли два числа про одно и то же, различавшиеся вдвое.
+        """
+        свои = [j for j in jobs
+                if j.get("status") == "completed" and not j.get("cached_from")]
+        звук = sum(float(j.get("media_duration_s") or 0) for j in свои)
+        время = sum(float(j.get("processing_time_s") or 0) for j in свои)
+        return (время / звук) if звук else 0.0
+
     def efficiency(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         """Оценка эффективности: сколько ресурсов уходит на час аудио."""
-        since = _since(period)
-        jobs = self.db.list_jobs(status="completed", since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(status="completed", since=since or None, limit=100000, owner=owner)
         audio = sum(float(j.get("media_duration_s") or 0) for j in jobs)
         proc = sum(float(j.get("processing_time_s") or 0) for j in jobs)
         load = sum(float(j.get("model_load_s") or 0) for j in jobs)
-        cached = sum(1 for j in jobs if j.get("cached_from"))
+        из_кеша = [j for j in jobs if j.get("cached_from")]
+        rtf = self._measured_rtf(jobs)
         return {
             "audio_hours": round(audio / 3600, 2),
             "compute_hours": round(proc / 3600, 2),
+            # Здесь кеш учитывается: это фактическая цена часа выданного
+            # звука, и снижать её — ровно то, ради чего кеш существует.
             "compute_per_audio_hour": round(proc / audio, 3) if audio else None,
             "model_load_share": round(load / proc, 4) if proc else None,
             "model_load_seconds": round(load, 1),
-            "cache_hits": cached,
-            "cache_hit_rate": round(cached / len(jobs), 4) if jobs else 0.0,
+            "cache_hits": len(из_кеша),
+            "cache_hit_rate": round(len(из_кеша) / len(jobs), 4) if jobs else 0.0,
+            # А здесь — нет: экономия считается по цене работы, которую
+            # пришлось бы выполнить, то есть по скорости своих заданий.
+            "assumed_rtf": round(rtf, 4) if rtf else None,
             "saved_compute_hours": round(
-                sum(float(j.get("media_duration_s") or 0) for j in jobs if j.get("cached_from"))
-                * 0.2 / 3600, 3),
+                sum(float(j.get("media_duration_s") or 0) for j in из_кеша)
+                * rtf / 3600, 3),
         }
 
     # --- сводный отчёт -------------------------------------------------------
@@ -378,8 +468,8 @@ class Analytics:
         мощности приходится по неделе: у телефонии понедельник в десять утра
         и воскресенье в десять вечера — это разные миры.
         """
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         счёт = [[0] * 24 for _ in range(7)]
         часы = [[0.0] * 24 for _ in range(7)]
         for job in jobs:
@@ -419,17 +509,15 @@ class Analytics:
         сервера другой: сколько часов звука и машинного времени это
         сэкономило — то есть стоило ли оно того.
         """
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         из_кеша = [j for j in jobs if j.get("cached_from")]
         свои = [j for j in jobs if not j.get("cached_from") and j["status"] == "completed"]
 
         # Стоимость повтора считаем по средней скорости своих заданий: у
         # взятого из кеша задания собственного времени обработки нет.
         звук_кеш = sum(float(j.get("media_duration_s") or 0) for j in из_кеша)
-        звук_свой = sum(float(j.get("media_duration_s") or 0) for j in свои)
-        время_свой = sum(float(j.get("processing_time_s") or 0) for j in свои)
-        rtf = (время_свой / звук_свой) if звук_свой else 0.0
+        rtf = self._measured_rtf(jobs)
 
         # Самые частые повторы: по ним видно, не шлёт ли клиент одно и то же
         # по кругу из-за ошибки в своей очереди.
@@ -467,8 +555,8 @@ class Analytics:
         прошедшее с третьей попытки, считается успешным наравне с тем, что
         прошло с первой, — а это разные состояния сервера.
         """
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         готово = [j for j in jobs if j["status"] == "completed"]
         с_повтором = [j for j in готово if int(j.get("retries") or 0) > 0]
         отменены = [j for j in jobs if j["status"] == "cancelled"]
@@ -522,9 +610,9 @@ class Analytics:
         вдвое медленнее, чем на другом, — и стоит ли менять модель или
         источник записи.
         """
-        since = _since(period)
-        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
-                                             owner=owner, light=True)
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000,
+                                   owner=owner)
                 if j["status"] == "completed"]
 
         форматы: dict[str, dict[str, float]] = {}
@@ -551,7 +639,10 @@ class Analytics:
             n = int(job.get("speakers_count") or 0)
             if n:
                 говорящие[n] = говорящие.get(n, 0) + 1
-            # Доля времени, занятая репликами: остальное — паузы и шум.
+            # Сегментов на минуту записи: по этому числу видно, что за
+            # материал приносят. Диктовка даёт единицы, живой диалог с
+            # перебиваниями — десятки. Это не доля времени под речью:
+            # длину сегментов сервер в разрезе не хранит.
             сегменты = float(job.get("segments_count") or 0)
             if длительность > 1 and сегменты:
                 плотность.append(сегменты / (длительность / 60))
@@ -585,9 +676,9 @@ class Analytics:
         какая модель сколько памяти просит на пике и сколько заданий вообще
         уехало на процессор вместо видеокарты.
         """
-        since = _since(period)
-        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
-                                             owner=owner, light=True)
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000,
+                                   owner=owner)
                 if j["status"] == "completed"]
 
         по_модели: dict[str, list[float]] = {}
@@ -633,13 +724,14 @@ class Analytics:
         Полезен ход: провал в среду означает, что в среду что-то поменялось
         — источник записей, модель или параметры.
         """
-        since = _since(period)
-        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
-                                             owner=owner, light=True)
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000,
+                                   owner=owner)
                 if j["status"] == "completed"]
         if not jobs:
-            return {"period": period, "buckets": [], "confidence": [], "wer": [],
-                    "jobs": [], "low_confidence_share": []}
+            return {"period": period, "buckets": [], "bucket_seconds": 0,
+                    "confidence": [], "wer": [], "jobs": [],
+                    "low_confidence_share": []}
 
         начало = since or min(float(j["created_at"]) for j in jobs)
         конец = time.time()
@@ -662,6 +754,11 @@ class Analytics:
         return {
             "period": period,
             "buckets": [round(начало + i * шаг) for i in range(buckets)],
+            # Ширина корзины — чтобы подписать ось. За час она в минутах, за
+            # год — в датах; без неё все подписи печатались как «день.месяц»
+            # и на часовом окне читались как одна и та же дата двадцать
+            # четыре раза подряд.
+            "bucket_seconds": round(шаг),
             "confidence": [среднее(k["conf"]) for k in корзины],
             "wer": [среднее(k["wer"]) for k in корзины],
             "low_confidence_share": [среднее(k["low"]) for k in корзины],
@@ -677,8 +774,8 @@ class Analytics:
         метка отвечает на вопрос «сколько ушло на этот проект» — и потому
         для отчётности она важнее прочих разрезов.
         """
-        since = _since(period)
-        jobs = self.db.list_jobs(since=since or None, limit=100000, owner=owner, light=True)
+        since = self._since(period)
+        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         собрано: dict[str, dict[str, Any]] = {}
         for job in jobs:
             метки = [t.strip() for t in str(job.get("tags") or "").split(",") if t.strip()]
@@ -716,9 +813,9 @@ class Analytics:
         три секунды девятьсот заданий и сорок минут — десять, и среднее
         покажет «всё хорошо».
         """
-        since = _since(period)
-        jobs = [j for j in self.db.list_jobs(since=since or None, limit=100000,
-                                             owner=owner, light=True)
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000,
+                                   owner=owner)
                 if j.get("queue_time_s") is not None]
 
         по_приоритету: dict[str, list[float]] = {}
@@ -746,6 +843,16 @@ class Analytics:
         }
 
     def full_report(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+        """Все разрезы сразу — по одной выборке заданий на каждый запрос.
+
+        Отдельные разрезы забирают по своим адресам и читают базу сами;
+        здесь их два десятка подряд, и общий кеш убирает два десятка
+        одинаковых проходов по архиву.
+        """
+        with self._общая_выборка():
+            return self._full_report(period, owner)
+
+    def _full_report(self, period: str, owner: str | None) -> dict[str, Any]:
         return {
             "overview": self.overview(period, owner),
             "timeseries": self.timeseries(period, owner=owner),

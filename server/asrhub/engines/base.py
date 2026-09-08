@@ -196,6 +196,11 @@ class Engine(ABC):
         result.model_load_s = load_time
         result.meta.setdefault("engine", self.id)
         result.meta.setdefault("model", self.spec.id)
+        # Разрешённое устройство, а не то, что попросили. В базу уходило
+        # значение параметра, у которого умолчание «auto», — и разрез
+        # аналитики «сколько заданий уехало на процессор» состоял из одной
+        # строки «auto», а замер пика памяти никогда не спрашивал видеокарту.
+        result.meta.setdefault("device", self.resolve_device(settings))
         self.last_used = time.time()
         return result
 

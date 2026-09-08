@@ -133,6 +133,43 @@
     }
   }
 
+  /* Есть ли на графике место под кружки точек.
+   *
+   * Каждая точка — кружок радиусом 4 с двухпиксельной обводкой цветом
+   * фона. При плотном ряде обводки соседей затирают линию между ними, и
+   * график из линии превращается в цепочку шариков. Мерять надо
+   * расстояние в пикселях, а не число точек: одно и то же их количество
+   * на широком графике разрежено, а на узком слипается.
+   *
+   * Потерю кружков подсказка переживает: у линейного графика есть слой
+   * перекрестия на всю площадь, и он показывает все ряды сразу.
+   */
+  function dotsFit(points, minGap) {
+    if (points.length > 40) return false;
+    const порог = minGap === undefined ? 14 : minGap;
+    for (let i = 1; i < points.length; i += 1) {
+      if (points[i][0] - points[i - 1][0] < порог) return false;
+    }
+    return true;
+  }
+
+  /* Режет ряд на непрерывные куски по номеру точки.
+   *
+   * Пропуск — это перерыв в сборе, и линия на нём должна рваться.
+   * Соединять края прямой нельзя: на графике нагрузки это ровно тот случай,
+   * ради которого на него смотрят, — остановка сервера выглядела бы как
+   * спокойный участок между двумя замерами.
+   */
+  function splitRuns(points) {
+    const куски = [];
+    points.forEach((p) => {
+      const хвост = куски[куски.length - 1];
+      if (хвост && p[2] === хвост[хвост.length - 1][2] + 1) хвост.push(p);
+      else куски.push([p]);
+    });
+    return куски;
+  }
+
   // ---- линейный график ---------------------------------------------------
 
   function line(host, config) {
@@ -172,18 +209,29 @@
       const points = [];
       s.values.forEach((v, i) => { if (v !== null && v !== undefined) points.push([xAt(i), yAt(v), i, v]); });
       if (!points.length) return;
-      if (config.area) {
-        const d = 'M' + points.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('L') +
-          `L${points[points.length - 1][0].toFixed(1)},${yAt(ctx.yMin).toFixed(1)}` +
-          `L${points[0][0].toFixed(1)},${yAt(ctx.yMin).toFixed(1)}Z`;
-        el('path', { d, fill: color, opacity: 0.13 }, ctx.svg);
-      }
-      el('path', {
-        d: 'M' + points.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('L'),
-        fill: 'none', stroke: color, 'stroke-width': 2,
-        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-      }, ctx.svg);
-      if (points.length <= 40) {
+      const куски = splitRuns(points);
+      const путь = (кусок) => {
+        const точки = кусок.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`);
+        // Одиночный замер между двумя перерывами — тоже данные. Путь из
+        // одного «M» браузер не рисует вовсе, поэтому повторяем точку:
+        // круглый торец превращает её в видимую точку.
+        if (точки.length === 1) точки.push(точки[0]);
+        return 'M' + точки.join('L');
+      };
+      куски.forEach((кусок) => {
+        if (config.area && кусок.length > 1) {
+          const d = путь(кусок) +
+            `L${кусок[кусок.length - 1][0].toFixed(1)},${yAt(ctx.yMin).toFixed(1)}` +
+            `L${кусок[0][0].toFixed(1)},${yAt(ctx.yMin).toFixed(1)}Z`;
+          el('path', { d, fill: color, opacity: 0.13 }, ctx.svg);
+        }
+        el('path', {
+          d: путь(кусок),
+          fill: 'none', stroke: color, 'stroke-width': 2,
+          'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+        }, ctx.svg);
+      });
+      if (dotsFit(points)) {
         points.forEach((p) => {
           const dot = el('circle', { cx: p[0], cy: p[1], r: 4, fill: color,
                                      stroke: surface(), 'stroke-width': 2 }, ctx.svg);
@@ -679,5 +727,5 @@
   }
 
   global.Charts = { line, bars, hbars, stacked, donut, spark, heat, grid, waveform,
-                    palette, status, fmtNum, legend, empty };
+                    palette, status, fmtNum, legend, empty, splitRuns, dotsFit };
 })(window);

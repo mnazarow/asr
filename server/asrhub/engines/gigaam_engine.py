@@ -11,14 +11,18 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from ..errors import DependencyMissing, EngineError, ModelLoadError
+from ..logging_setup import get_logger
 from ..pipeline import vad
 from ..pipeline.audio import probe, slice_wav
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
+
+log = get_logger("engine.gigaam")
 
 _MAX_CHUNK_S = 22.0          # запас к жёсткому пределу модели в 25 секунд
 
@@ -32,9 +36,18 @@ _MAX_CHUNK_S = 22.0          # запас к жёсткому пределу м�
 #: был выдан за отсутствие интернета. Человек пошёл проверять сеть, а дело
 #: было в каталоге. По той же причине здесь нет «token» — оно живёт внутри
 #: «tokenizer», а токенизатор GigaAM качает при каждой загрузке e2e-модели.
+#: Причины отказа при загрузке весов: набор примет, короткая причина,
+#: подсказка. Приметы — регулярные выражения по тексту попытки в нижнем
+#: регистре; порядок важен, срабатывает первая подошедшая строка.
+#:
+#: Коды состояния пишутся как «(?<!\d)401(?!\d)», а не просто «401»:
+#: обычная подстрока находилась внутри пути «v3_rnnt-8401.ckpt», и
+#: отсутствующий на диске файл сервер объявлял отказом в доступе к
+#: Hugging Face — то есть отправлял чинить токен вместо того, чтобы
+#: сказать «скачайте веса».
 _LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
-    (("401", "403", "gated", "authorization", "unauthorized",
-      "invalid token", "token is required", "hf_token"),
+    ((r"(?<!\d)401(?!\d)", r"(?<!\d)403(?!\d)", "gated", "authorization",
+      "unauthorized", "invalid token", "token is required", "hf_token"),
      "к весам нужен доступ по токену Hugging Face",
      "Токен задаётся в разделе «Доступ» веб-интерфейса или ключом hf_token "
      "в config.yaml. Модель ai-sage/GigaAM-v3 требует принятия условий на "
@@ -70,6 +83,9 @@ _LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
 )
 
 
+#: Короткие имена, которые библиотека сама разворачивает в v3_*.
+_SHORT_NAMES = frozenset({"ctc", "rnnt", "e2e_ctc", "e2e_rnnt", "ssl"})
+
 #: Имя варианта, которым GigaAM называет свои веса. Библиотека принимает
 #: только эти короткие имена (или путь к .ckpt) — идентификатор репозитория
 #: Hugging Face она не понимает вовсе.
@@ -96,15 +112,31 @@ def variant_name(source: str, revision: str) -> str:
     потом станет искать загрузчик, иначе на диске лежит одно, а движок ждёт
     другого — ровно так и вышло, когда веса качались снапшотом с Hugging
     Face, а библиотека брала .ckpt с CDN.
+
+    Неизвестный репозиторий — повод предупредить, а не молча угадать:
+    короткое имя вроде «rnnt» библиотека разворачивает в v3_*, и если в
+    справочник когда-нибудь добавят четвёртую версию, не поправив таблицу,
+    сервер будет уверенно качать и грузить веса третьей.
     """
-    return _VARIANTS.get(source, {}).get(revision, revision)
+    таблица = _VARIANTS.get(source)
+    if таблица is None:
+        if revision in _SHORT_NAMES:
+            log.warning(
+                "Репозиторий GigaAM «%s» не описан в таблице вариантов: "
+                "короткое имя «%s» библиотека развернёт в «v3_%s». "
+                "Если это не третья версия, добавьте репозиторий в _VARIANTS.",
+                source, revision, revision)
+        return revision
+    return таблица.get(revision, revision)
 
 
 def weights_file(source: str, revision: str) -> str:
     """Имя файла весов, которое библиотека кладёт в download_root."""
     name = variant_name(source, revision)
-    # Короткие имена библиотека сама разворачивает в v3_*.
-    if name in ("ctc", "rnnt", "e2e_ctc", "e2e_rnnt", "ssl"):
+    # Короткие имена библиотека сама разворачивает в v3_*. Повторяем это
+    # правило здесь, чтобы искать на диске ровно тот файл, который она
+    # положит, а не тот, который назвал справочник.
+    if name in _SHORT_NAMES:
         name = f"v3_{name}"
     return f"{name}.ckpt"
 
@@ -116,7 +148,6 @@ def _failing_path(text: str) -> str:
     путь — самое полезное, что есть: он один отвечает на вопрос «а куда,
     собственно, она писала».
     """
-    import re
     match = re.search(r"[\'\"](/[^\'\"]{2,200})[\'\"]", text)
     return match.group(1) if match else ""
 
@@ -140,7 +171,7 @@ def _load_failure(model_id: str, errors: list[str], device: str,
     for scope in ([errors[0]] if errors else [], errors):
         haystack = " | ".join(scope).lower()
         for needles, text, advice in _LOAD_REASONS:
-            if any(needle in haystack for needle in needles):
+            if any(re.search(needle, haystack) for needle in needles):
                 reason, hint = text, advice
                 break
         if reason:

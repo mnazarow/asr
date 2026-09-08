@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -715,3 +717,222 @@ def test_a_dead_target_does_not_flood_the_log(caplog):
     assert состояние["failed"] == 30, "неудачи должны считаться все до одной"
     assert состояние["healthy"] is False
     assert состояние["last_error"], "причина должна остаться видимой"
+
+
+# ---------------------------------------------------------------------------
+# Замеры по каждой видеокарте и ряды нагрузки
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_sampling_reads_every_card(monkeypatch):
+    """Сбор читал `splitlines()[0]` — вторая карта не существовала для сервера.
+
+    Под видеокарту в system_samples отведено три колонки, то есть ровно одна
+    карта, и разбор вывода nvidia-smi это повторял. На машине с двумя картами
+    вторая не попадала ни в графики, ни в метрики, ни в тревоги.
+    """
+    from asrhub.job_queue import JobQueue
+
+    вывод = (
+        "0, NVIDIA GeForce RTX 5090, 84, 21000, 32607, 71, 402.5, 575\n"
+        "1, NVIDIA RTX A4000, 12, 2200, 16376, 44, 61.2, 140\n")
+    monkeypatch.setattr("asrhub.hardware._run", lambda *a, **k: вывод)
+
+    карты = JobQueue._sample_gpus(object())
+    assert len(карты) == 2, f"вторая карта потеряна: {карты}"
+    assert карты[0]["name"] == "NVIDIA GeForce RTX 5090"
+    assert карты[1]["gpu"] == 1
+    # Температура и потребление приходят тем же запросом даром — без них
+    # «нагрузка на видеокарту» это загрузка в процентах и больше ничего.
+    assert карты[0]["temperature_c"] == 71.0, карты[0]
+    assert карты[0]["power_w"] == 402.5, карты[0]
+    assert карты[0]["power_limit_w"] == 575.0, карты[0]
+
+
+def test_a_card_without_telemetry_does_not_lose_the_whole_row(monkeypatch):
+    """nvidia-smi пишет «[N/A]» там, где датчика нет."""
+    from asrhub.job_queue import JobQueue
+
+    monkeypatch.setattr("asrhub.hardware._run",
+                        lambda *a, **k: "0, Tesla T4, 33, 900, 15360, [N/A], [N/A], [N/A]\n")
+    карты = JobQueue._sample_gpus(object())
+    assert len(карты) == 1
+    assert карты[0]["util_percent"] == 33.0, карты[0]
+    assert карты[0]["temperature_c"] is None, карты[0]
+
+
+def test_resource_series_are_thinned_but_keep_the_peak(tmp_path: Path):
+    """Прореживание не должно стирать пик.
+
+    Минутный перегрев внутри получасовой корзины — ровно тот случай, ради
+    которого на график и смотрят, а усреднение превращает его в спокойную
+    линию. Свёртка идёт в SQL, поэтому и проверяем её на настоящей базе.
+    """
+    from asrhub.db import SAMPLE_PERIOD_S, Database
+
+    database = Database(tmp_path / "s.sqlite3")
+    начало = 1_800_000_000.0
+    # Замеры идут с настоящим тактом сборщика: сто штук, по два на корзину.
+    замеров, корзин_надо = 100, 50
+    окно = замеров * SAMPLE_PERIOD_S
+    for i in range(замеров):
+        database.add_gpu_samples(начало + i * SAMPLE_PERIOD_S, [{
+            "gpu": 0, "name": "RTX 5090", "util_percent": 50.0,
+            "temperature_c": 92.0 if i == 50 else 50.0,
+        }])
+
+    корзин, строки = database.gpu_series(начало, начало + окно, корзин_надо)
+    assert корзин == корзин_надо
+    пики = [r["temperature_c"] for r in строки]
+    assert max(пики) == 92.0, "пик стёрт свёрткой"
+    средние = [r["util_percent"] for r in строки]
+    assert max(средние) == 50.0, "средняя загрузка поехала"
+    # Пик остаётся в своей корзине, а не размазывается по соседним.
+    горячие = [r["bucket"] for r in строки if r["temperature_c"] > 50.0]
+    assert горячие == [25], горячие
+
+
+def test_series_cost_does_not_grow_with_the_window(tmp_path: Path):
+    """Цену запроса задаёт число точек графика, а не ширина окна.
+
+    Раньше ручка читала в память все замеры окна: неделя — тридцать тысяч
+    строк на каждый опрос панели, при том что доступ к мониторингу по
+    умолчанию открыт без ключа.
+    """
+    from asrhub.db import SERIES_MAX_BUCKETS, Database
+
+    database = Database(tmp_path / "w.sqlite3")
+    начало = 1_800_000_000.0
+    for i in range(5000):
+        database.add_system_sample({"ts": начало + i * 20, "cpu_percent": 10.0})
+
+    _, строки = database.system_series(начало, начало + 5000 * 20, 180)
+    assert len(строки) <= 180, f"вернулось {len(строки)} строк вместо корзин"
+
+    # Потолок на корзины — иначе точки заказывает клиент.
+    корзин, строки = database.system_series(начало, начало + 5000 * 20, 10 ** 6)
+    assert корзин == SERIES_MAX_BUCKETS, корзин
+    assert len(строки) <= SERIES_MAX_BUCKETS
+
+
+def test_an_empty_bucket_still_has_a_time():
+    """У перерыва в сборе есть время — иначе на оси появляется начало эпохи.
+
+    Пустая корзина отдавала ts=null, и график подписывал её «00:00»: перерыв
+    выглядел как замер в полночь посреди дневного окна.
+    """
+    from asrhub.api.routes_monitoring import _ряд
+
+    # Метки времени настоящие, а не с нуля: у нуля своя беда — он и есть
+    # начало эпохи, и тест не отличил бы его от потерянного значения.
+    начало = 1_800_000_000.0
+    корзин = 40
+    свёрнутые = ([{"bucket": i, "cpu_percent": 10.0} for i in range(12)]
+                 + [{"bucket": i, "cpu_percent": 10.0} for i in range(28, 40)])
+    времена = [round(начало + i * 25) for i in range(корзин)]
+    значения = _ряд(свёрнутые, корзин, "cpu_percent")
+
+    assert len(значения) == корзин == len(времена)
+    assert [i for i, v in enumerate(значения) if v is None], "дыра не воспроизвелась"
+    assert all(t >= начало for t in времена), "у пустой корзины потерялось время"
+    assert времена == sorted(времена)
+
+
+def test_the_monitoring_section_has_charts(repo_root: Path):
+    """Раздел был целиком табличным: пробы, тревоги, приёмники, справочник.
+
+    По таблице видно текущее значение и не видно ничего из того, ради чего
+    мониторинг заводят: растёт ли нагрузка, упирается ли карта в лимит
+    мощности, совпадает ли провал скорости с ростом очереди.
+    """
+    app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "loadResources" in app, "рядов нагрузки в разделе нет"
+    for узел in ("mon-cpu", "mon-ram", "mon-queue", "mon-disk"):
+        assert f"#{узел}" in app, f"нет графика {узел}"
+    # Карты рисуются по одной: «средняя загрузка видеокарты» — величина, из
+    # которой ничего не следует.
+    assert "mon-gpu-${g.gpu}" in app, "карты не разделены"
+    assert "mon-gpu-t-${g.gpu}" in app, "нет графика температуры и мощности"
+
+
+def test_a_bucket_is_never_narrower_than_the_sampler_tick(tmp_path: Path):
+    """Корзина уже такта сборщика превращает график в пунктир.
+
+    Замеры приходят раз в `SAMPLE_PERIOD_S` секунд. В корзину такой же
+    ширины то попадают два замера, то ни одного, и линия рвётся не там, где
+    сервер молчал, а там, где такт разошёлся с границей корзины.
+    """
+    from asrhub.db import SAMPLE_PERIOD_S, Database
+
+    database = Database(tmp_path / "t.sqlite3")
+    начало = 1_800_000_000.0
+    окно = 3600.0
+    тактов = int(окно / SAMPLE_PERIOD_S)
+    for i in range(тактов):
+        database.add_system_sample({"ts": начало + i * SAMPLE_PERIOD_S,
+                                    "cpu_percent": 40.0})
+
+    # Просим заведомо больше точек, чем в окне тактов: клиент их назначает,
+    # а данных под них взяться неоткуда.
+    корзин, строки = database.system_series(начало, начало + окно, тактов * 3)
+    assert корзин <= тактов // 2, f"{корзин} корзин на {тактов} замеров"
+    assert len(строки) == корзин, (
+        f"{корзин - len(строки)} пустых корзин при непрерывном сборе")
+    assert all(r["cpu_percent"] == 40.0 for r in строки), строки[:3]
+
+
+def test_a_gap_in_the_series_breaks_the_line(repo_root: Path):
+    """График нагрузки не должен соединять края перерыва прямой.
+
+    Остановка сервера на графике выглядела спокойным участком между двумя
+    замерами — то есть ровно то, ради чего на график смотрят, он и скрывал.
+    """
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        pytest.skip("нужен node")
+
+    charts = repo_root / "server" / "asrhub" / "web" / "charts.js"
+    сценарий = f"""
+      const global = {{}};
+      {charts.read_text(encoding='utf-8').replace('})(window);', '})(global);')}
+      const т = (i) => [i * 10, 50, i, 50];
+      const куски = global.Charts.splitRuns(
+          [т(0), т(1), т(2), т(7), т(8), т(12)]);
+      console.log(JSON.stringify(куски.map((k) => k.map((p) => p[2]))));
+    """
+    вывод = subprocess.run([node, "-e", сценарий], capture_output=True,
+                           text=True, timeout=60)
+    assert вывод.returncode == 0, вывод.stderr
+    assert json.loads(вывод.stdout) == [[0, 1, 2], [7, 8], [12]], вывод.stdout
+
+
+def test_dots_are_dropped_when_they_would_cover_the_line(repo_root: Path):
+    """Плотный ряд превращался из линии в цепочку шариков.
+
+    Каждая точка — кружок с обводкой цветом фона; когда соседи ближе, чем
+    их обводки, они затирают линию между собой. Считать надо расстояние в
+    пикселях: одно и то же число точек на широком графике разрежено, а на
+    узком слипается.
+    """
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        pytest.skip("нужен node")
+
+    charts = repo_root / "server" / "asrhub" / "web" / "charts.js"
+    сценарий = f"""
+      const global = {{}};
+      {charts.read_text(encoding='utf-8').replace('})(window);', '})(global);')}
+      const ряд = (n, шаг) => Array.from({{length: n}}, (_, i) => [i * шаг, 10, i, 10]);
+      console.log(JSON.stringify({{
+        редкий:  global.Charts.dotsFit(ряд(20, 30)),
+        плотный: global.Charts.dotsFit(ряд(35, 5)),
+        длинный: global.Charts.dotsFit(ряд(90, 30)),
+        пустой:  global.Charts.dotsFit([]),
+      }}));
+    """
+    вывод = subprocess.run([node, "-e", сценарий], capture_output=True,
+                           text=True, timeout=60)
+    assert вывод.returncode == 0, вывод.stderr
+    ответ = json.loads(вывод.stdout)
+    assert ответ == {"редкий": True, "плотный": False,
+                     "длинный": False, "пустой": True}, ответ

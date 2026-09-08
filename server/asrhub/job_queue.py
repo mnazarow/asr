@@ -27,7 +27,7 @@ from typing import Any
 
 from . import model_files
 from .catalog import get_model
-from .db import Database, new_id, now
+from .db import SAMPLE_PERIOD_S, Database, new_id, now
 from .engines import EngineRegistry
 from .errors import (
     ASRHubError,
@@ -766,12 +766,20 @@ class JobQueue:
         log.info("Задание %s: старт (%s)", job_id, job.get("model"),
                  extra={"job_id": job_id, "model": job.get("model")})
 
+        # Пик памяти замеряем, только когда задание в процессе одно.
+        # Счётчики и torch, и psutil — на весь процесс: при двух заданиях
+        # разом соседи делят одну цифру, а сброс пика одним заданием стирает
+        # то, что копило другое. Цифра, полученная так, не относится ни к
+        # одной модели, и лучше её не показывать вовсе, чем показывать чужую.
+        with self._lock:
+            одно = len(self._running) <= 1
         try:
             outcome = process_job(
                 Path(job["file_path"]), merged, self.registry,
                 workdir=workdir, outdir=outdir,
                 basename=Path(job.get("filename") or job_id).stem,
-                progress=progress, cancelled=cancelled)
+                progress=progress, cancelled=cancelled,
+                measure_memory=одно)
         except ASRHubError as exc:
             self._handle_failure(job, exc, merged, outdir=outdir)
             return
@@ -813,7 +821,7 @@ class JobQueue:
             inference_s=outcome.timings.get("inference"),
             postprocess_s=outcome.timings.get("postprocess"),
             language=outcome.language,
-            device=str(merged.get("device")),
+            device=str(outcome.stats.get("device") or merged.get("device") or ""),
             peak_memory_mb=outcome.peak_memory_mb or None,
             wer=accuracy.get("wer"), cer=accuracy.get("cer"),
             waveform=outcome.waveform,
@@ -1185,7 +1193,7 @@ class JobQueue:
     def _janitor_loop(self) -> None:
         last_cleanup = 0.0
         failures = 0
-        while not self._stop.wait(timeout=20.0):
+        while not self._stop.wait(timeout=SAMPLE_PERIOD_S):
             # Каждый шаг в своей обёртке: раньше сбой первого (например,
             # ошибка при выгрузке модели с видеокарты) означал, что уборка
             # хранилища не выполняется НИКОГДА — last_cleanup не обновлялся,
@@ -1223,8 +1231,56 @@ class JobQueue:
                     log.info("Служебный цикл восстановился после %d сбоев", failures)
                 failures = 0
 
+    def _sample_gpus(self) -> list[dict[str, Any]]:
+        """Замер по каждой видеокарте, а не только по первой.
+
+        Прежний сбор читал `splitlines()[0]`, то есть вторая карта для
+        сервера не существовала. Температура и потребление приходят тем же
+        запросом даром, а без них «нагрузка на видеокарту» — это загрузка в
+        процентах и больше ничего: ни троттлинга, ни упора в лимит мощности
+        по ней не видно.
+        """
+        try:
+            from .hardware import _run
+
+            out = _run(["nvidia-smi",
+                        "--query-gpu=index,name,utilization.gpu,memory.used,"
+                        "memory.total,temperature.gpu,power.draw,power.limit",
+                        "--format=csv,noheader,nounits"])
+        except Exception:                                   # noqa: BLE001
+            return []
+        if not out:
+            return []
+
+        def число(текст: str) -> float | None:
+            # nvidia-smi отдаёт «[N/A]» там, где датчика нет: у части карт
+            # нет телеметрии по мощности, и это не повод терять всю строку.
+            try:
+                return float(текст)
+            except ValueError:
+                return None
+
+        карты: list[dict[str, Any]] = []
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5 or not parts[0].isdigit():
+                continue
+            карты.append({
+                "gpu": int(parts[0]),
+                "name": parts[1],
+                "util_percent": число(parts[2]),
+                "mem_used_mb": число(parts[3]),
+                "mem_total_mb": число(parts[4]),
+                "temperature_c": число(parts[5]) if len(parts) > 5 else None,
+                "power_w": число(parts[6]) if len(parts) > 6 else None,
+                "power_limit_w": число(parts[7]) if len(parts) > 7 else None,
+            })
+        return карты
+
     def _sample_system(self) -> None:
+        момент = now()
         sample: dict[str, Any] = {
+            "ts": момент,
             "queue_depth": self.db.count_jobs(status=[STATUS_QUEUED, STATUS_RETRY]),
             "active_jobs": len(self._running),
         }
@@ -1250,19 +1306,16 @@ class JobQueue:
                 sample["ram_used_mb"] = round(total - avail)
             except OSError:
                 pass
-        try:
-            from .hardware import _run
-
-            out = _run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
-                        "--format=csv,noheader,nounits"])
-            if out:
-                parts = [p.strip() for p in out.splitlines()[0].split(",")]
-                if len(parts) >= 3:
-                    sample["gpu_percent"] = float(parts[0])
-                    sample["gpu_mem_mb"] = float(parts[1])
-                    sample["gpu_mem_total"] = float(parts[2])
-        except Exception:
-            pass
+        gpus = self._sample_gpus()
+        if gpus:
+            # В system_samples под видеокарту три колонки — оставляем там
+            # первую карту, как было: на этих колонках держатся прежние
+            # метрики Prometheus и графики аналитики. Полная картина по всем
+            # картам лежит рядом, в своей таблице.
+            первая = gpus[0]
+            sample["gpu_percent"] = первая.get("util_percent")
+            sample["gpu_mem_mb"] = первая.get("mem_used_mb")
+            sample["gpu_mem_total"] = первая.get("mem_total_mb")
         try:
             import shutil as shutil_mod
 
@@ -1271,6 +1324,10 @@ class JobQueue:
         except Exception:
             pass
         self.db.add_system_sample(sample)
+        if gpus:
+            # Тем же временем, что и общий замер: иначе ряды по картам и по
+            # системе не совместить на одной оси.
+            self.db.add_gpu_samples(момент, gpus)
 
     # --- состояние --------------------------------------------------------
 
