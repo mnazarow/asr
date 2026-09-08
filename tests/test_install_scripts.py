@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -2733,6 +2734,10 @@ def test_deliberate_deviations_are_not_reported_as_findings(repo_root: Path,
     колеса). Их собственные жалобы на версии — прямое следствие нашего
     решения, и в списке находок им не место: настоящая находка утонет
     вместе с ними.
+
+    Пример настоящей находки здесь — whisperx с ctranslate2. Раньше им был
+    protobuf, но с появлением overrides.txt его версию задаём мы сами, и
+    жалоба на неё стала таким же эхом нашего решения, как и остальные две.
     """
     common = repo_root / "scripts" / "lib" / "common.sh"
     pip = tmp_path / "pip"
@@ -2742,7 +2747,7 @@ def test_deliberate_deviations_are_not_reported_as_findings(repo_root: Path,
         'gigaam 0.2.0 has requirement onnxruntime==1.23.*, but you have onnxruntime 1.29.0.\n'
         'nemo-text-processing 1.2.0 has requirement pynini==2.1.6.post1, '
         'but you have pynini 2.1.7.\n'
-        'nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, but you have protobuf 7.36.1.\n'
+        'whisperx 3.4.3 requires ctranslate2<5, but you have ctranslate2 5.1.0.\n'
         'OUT\n'
         'exit 1\n', encoding="utf-8")
     pip.chmod(0o755)
@@ -2757,9 +2762,160 @@ def test_deliberate_deviations_are_not_reported_as_findings(repo_root: Path,
     result = run_bash(script)
     текст = result.stdout + result.stderr
 
-    assert "protobuf" in текст, "настоящий конфликт пропал вместе с намеренными"
+    assert "ctranslate2" in текст, "настоящий конфликт пропал вместе с намеренными"
     assert "gigaam" not in текст, "жалоба на наше же решение выдана за находку"
     assert "nemo-text-processing 1.2.0" not in текст, "то же самое с nemo-text-processing"
+
+
+def test_overrides_are_installed_without_dependency_resolution(repo_root: Path,
+                                                                tmp_path: Path):
+    """overrides.txt спорит с метаданными пакетов — иначе он не нужен.
+
+    Без --no-deps pip обязан отказать: строка «protobuf>=6.33.5» прямо
+    несовместима с требованием NeMo «protobuf~=5.29.5», и резолвер вернёт
+    ResolutionImpossible вместо установки.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    корень = tmp_path / "requirements"
+    корень.mkdir()
+    (корень / "overrides.txt").write_text("# нарочно\nprotobuf>=6.33.5\n",
+                                          encoding="utf-8")
+    вызовы = tmp_path / "вызовы.txt"
+    pip = tmp_path / "pip"
+    pip.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{вызовы}"\nexit 0\n',
+                   encoding="utf-8")
+    pip.chmod(0o755)
+
+    run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+             f'apply_overrides "{pip}" "{корень}"')
+    строки = вызовы.read_text(encoding="utf-8")
+    assert "--no-deps" in строки, f"без --no-deps pip откажет:\n{строки}"
+    assert "overrides.txt" in строки, строки
+
+
+def test_a_version_we_chose_ourselves_is_not_a_finding(repo_root: Path,
+                                                       tmp_path: Path):
+    """Жалоба на версию, которую мы задали сами, — не находка, а эхо.
+
+    Отступление бывает с двух сторон. Про пакет, поставленный с --no-deps,
+    жалуется он сам (отступление в подлежащем) — это уже отсеивалось. А про
+    версию из overrides.txt жалуется чужой пакет (отступление в дополнении):
+    «nemo-toolkit-asr … has requirement protobuf~=5.29.5». Без отсева
+    чек-лист сообщал бы о нашем собственном решении после каждого
+    обновления, до конца времён.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    корень = tmp_path / "requirements"
+    корень.mkdir()
+    (корень / "overrides.txt").write_text("protobuf>=6.33.5\n", encoding="utf-8")
+    pip = tmp_path / "pip"
+    pip.write_text(
+        '#!/usr/bin/env bash\n'
+        '[[ "$1" == "check" ]] || exit 0\n'
+        'cat <<CHECK\n'
+        'nemo-toolkit-asr 2.8.0rc2 has requirement protobuf~=5.29.5, '
+        'but you have protobuf 7.36.1.\n'
+        'whisperx 3.4.3 has requirement ctranslate2<5, but you have ctranslate2 5.1.0.\n'
+        'CHECK\n'
+        'exit 1\n', encoding="utf-8")
+    pip.chmod(0o755)
+
+    результат = run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+                         f'step "Зависимости"; '
+                         f'check_dependency_health "{pip}" "{корень}"; checklist_print 0')
+    текст = результат.stdout + результат.stderr
+    assert "ctranslate2" in текст, "настоящая находка пропала вместе с нашей"
+    assert "protobuf" not in текст, (
+        "жалоба на заданную нами версию выдана за находку:\n" + текст)
+
+
+def test_a_failed_override_is_still_a_finding(repo_root: Path, tmp_path: Path):
+    """Молчать надо про исполнившееся решение, а не про пакет вообще.
+
+    Первая версия отсева выбрасывала любую строку, где упомянут пакет из
+    overrides.txt, — и вместе с эхом нашего выбора замолчала бы прямо
+    противоположное: состояние, где восстановление версий не сработало и
+    protobuf остался внизу. А это и есть та самая поломка, ради которой
+    файл заведён: на protobuf 5.29 диаризация падает при импорте.
+
+    Различить их можно по самой строке — она называет установленную версию.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    корень = tmp_path / "requirements"
+    корень.mkdir()
+    (корень / "overrides.txt").write_text("protobuf>=6.33.5\n", encoding="utf-8")
+
+    def отсев(строка: str) -> str:
+        return run_bash(f'source "{common}"; '
+                        f'filter_deliberate {shlex.quote(строка)} "" '
+                        f'"$(overridden_packages "{корень}")"').stdout.strip()
+
+    эхо = ("nemo-toolkit-asr 2.8.0rc2 has requirement protobuf~=5.29.5, "
+           "but you have protobuf 7.36.1.")
+    assert отсев(эхо) == "", "жалоба на исполнившееся решение осталась в находках"
+
+    провал = ("googleapis-common-protos 1.75.2 has requirement protobuf<8.0.0,>=6.33.5, "
+              "but you have protobuf 5.29.6.")
+    assert "protobuf" in отсев(провал), (
+        "замолчали состояние, в котором диаризация не работает")
+
+
+def test_overrides_are_applied_after_the_engines(repo_root: Path):
+    """Порядок здесь важен не меньше ключа --no-deps.
+
+    Движок, поставленный после восстановления версий, снова утащит общий
+    пакет за собой — и окружение вернётся ровно туда, откуда его вытащили.
+    """
+    for имя in ("install.sh", "update.sh"):
+        текст = (repo_root / "scripts" / имя).read_text(encoding="utf-8")
+        восстановление = текст.index("apply_overrides")
+        проверка = текст.index("check_dependency_health")
+        assert восстановление < проверка, (
+            f"{имя}: проверка отчитается о состоянии, которое мы сами исправим")
+        # Установка движков должна идти раньше восстановления.
+        движки = текст.rindex("install_engine_requirements")
+        assert движки < восстановление, (
+            f"{имя}: движок поставлен после восстановления и снова утащит пакет")
+
+
+def test_removing_an_engine_keeps_the_versions_we_chose(repo_root: Path):
+    """overrides.txt не принадлежит движку и не снимается вместе с ним.
+
+    Соблазн положить строку в no-deps/nemo.txt велик — она и появляется
+    из-за NeMo. Но тогда `remove-engine nemo` снял бы protobuf, а на нём
+    держатся onnxruntime и диаризация: удаление одного движка выносило бы
+    два чужих.
+    """
+    источник = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
+    блок = источник[источник.index("remove-engine)"):источник.index("disk)")]
+    assert "overrides" not in блок, "overrides.txt попал в список к удалению"
+
+    спутники = repo_root / "requirements" / "engines" / "no-deps"
+    for файл in спутники.glob("*.txt"):
+        строки = [s.split("#")[0].strip() for s in файл.read_text(encoding="utf-8").splitlines()]
+        assert not any(s.startswith("protobuf") for s in строки if s), (
+            f"{файл.name}: protobuf снимется вместе с движком")
+
+
+def test_protobuf_floor_protects_diarization(repo_root: Path):
+    """Опускать protobuf ниже 6.33.5 нельзя — это не вкус, а отказ импорта.
+
+    Проверено на живых пакетах: рантайм 5.29.6 отказывается загружать код,
+    сгенерированный 6.33.5, и падает с VersionError — а такой код приезжает
+    с googleapis-common-protos внутри pyannote.audio. Обратное направление
+    безопасно: рантайм 7.36.1 читает генкод 5.x без замечаний. Поэтому пин
+    NeMo мы перешагиваем, а не подчиняемся ему.
+    """
+    файл = repo_root / "requirements" / "overrides.txt"
+    assert файл.exists(), "overrides.txt исчез — движки снова будут спорить"
+    строка = next(s for s in файл.read_text(encoding="utf-8").splitlines()
+                  if s.strip().startswith("protobuf"))
+    граница = re.search(r">=\s*(\d+)\.(\d+)\.(\d+)", строка)
+    assert граница, f"нижняя граница protobuf потерялась: {строка}"
+    assert tuple(int(g) for g in граница.groups()) >= (6, 33, 5), (
+        f"граница опущена ниже проверенной — диаризация упадёт при импорте: {строка}")
+    # Причина обязана быть записана рядом, иначе строку снимут как случайную.
+    assert "VersionError" in файл.read_text(encoding="utf-8"), "обоснование не записано"
 
 
 def test_the_deviation_list_comes_from_the_files(repo_root: Path):

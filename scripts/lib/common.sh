@@ -848,6 +848,51 @@ pip_failure_is_permanent() {
   return 1
 }
 
+# Применяет requirements/overrides.txt — версии, которые мы держим вопреки
+# требованиям движков.
+#
+#   apply_overrides ПУТЬ_К_PIP КАТАЛОГ_ТРЕБОВАНИЙ
+#
+# Ставится после всех движков и обязательно с --no-deps: строки файла прямо
+# спорят с метаданными пакетов, и обычной установкой pip их не выпустил бы —
+# он вернул бы ResolutionImpossible. Порядок важен не меньше ключа: движок,
+# поставленный последним, иначе снова утащит общий пакет за собой.
+apply_overrides() {
+  local pip="$1" root="${2:-}"
+  local file="${root}/overrides.txt"
+  [[ -f "${file}" ]] || return 0
+  [[ -x "${pip}" ]] || return 0
+  # Молча: файл существует ради того, чтобы человек о нём не думал. Причина
+  # каждой строки записана в самом файле и в описании неполадок.
+  debug "восстановление версий: ${file}"
+  pip_install "${pip}" 2 --no-deps --upgrade -r "${file}" || {
+    warn "Не удалось вернуть версии из overrides.txt."
+    hint "Проверьте вручную: ${pip} install --no-deps -r ${file}"
+    return 0
+  }
+  return 0
+}
+
+# Пакеты, версию которых мы задали сами, вместе с нижней границей:
+# строками «имя граница» (граница пустая, если задана не через >=).
+#
+#   overridden_packages КАТАЛОГ_ТРЕБОВАНИЙ
+overridden_packages() {
+  local root="${1:-}" line name floor names=""
+  local file="${root}/overrides.txt"
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(printf '%s' "${line}" | tr -d '[:space:]')"
+    [[ -n "${line}" ]] || continue
+    floor=""
+    [[ "${line}" == *">="* ]] && floor="${line##*>=}" && floor="${floor%%,*}"
+    name="${line%%[<>=!;[]*}"
+    [[ -n "${name}" ]] && names="${names}$(printf '%s' "${name}" | tr '_' '-') ${floor}"$'\n'
+  done < "${file}"
+  printf '%s' "${names}" | sort -u
+}
+
 # Пакеты, которые мы ставим с --no-deps намеренно: их собственные жалобы на
 # версии — ожидаемое следствие нашего решения, а не находка.
 #
@@ -875,16 +920,46 @@ deliberate_deviations() {
   printf '%s' "${names}" | tr '_' '-' | sort -u
 }
 
-# Отбрасывает строки, subject которых — пакет из намеренных отступлений.
+# Отбрасывает жалобы, которые описывают наше же решение.
 #
-#   filter_deliberate ТЕКСТ СПИСОК_ПАКЕТОВ
+#   filter_deliberate ТЕКСТ СПИСОК_ПАКЕТОВ [СПИСОК_ЗАДАННЫХ_ВЕРСИЙ]
+#
+# Отступление бывает с двух сторон, и по строке они различаются местом:
+#   «gigaam 0.2.0 has requirement onnxruntime==1.23.*…» — жалуется пакет,
+#     который мы поставили с --no-deps; отступление в подлежащем;
+#   «nemo-toolkit-asr … has requirement protobuf~=5.29.5…» — жалуются на
+#     версию, которую мы задали сами в overrides.txt; отступление в дополнении.
+# Второй случай появился вместе с overrides.txt: без него чек-лист сообщал бы
+# о нашем собственном выборе после каждого обновления, до конца времён.
 filter_deliberate() {
-  local text="$1" known="$2" line subject
-  [[ -n "${known}" ]] || { printf '%s' "${text}"; return 0; }
+  local text="$1" known="$2" overridden="${3:-}" line subject object floor installed
+  [[ -n "${known}${overridden}" ]] || { printf '%s' "${text}"; return 0; }
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
-    subject="$(printf '%s' "${line}" | awk '{print $1}' | tr '_' '-')"
-    grep -qxF "${subject}" <<<"${known}" && continue
+    if [[ -n "${known}" ]]; then
+      subject="$(printf '%s' "${line}" | awk '{print $1}' | tr '_' '-')"
+      grep -qxF "${subject}" <<<"${known}" && continue
+    fi
+    if [[ -n "${overridden}" ]]; then
+      # Имя после «requires» или «has requirement», без версии и запятой.
+      object="$(printf '%s' "${line}" \
+        | sed -e 's/.*has requirement //' -e 's/.*requires //' \
+              -e 's/[<>=!~,].*//' -e 's/ .*//' | tr -d '[:space:]' | tr '_' '-')"
+      if [[ -n "${object}" ]] && floor="$(awk -v n="${object}" \
+             '$1==n {print $2; found=1; exit} END {exit !found}' <<<"${overridden}")"; then
+        # Молчим не про пакет, а про исполнившееся решение. Строка сама
+        # называет установленную версию («…but you have protobuf 7.36.1»):
+        # если она удовлетворяет нашей границе, жалоба — эхо нашего выбора.
+        # Если нет — значит восстановление версий не сработало, и это находка,
+        # причём куда более важная, чем обычное расхождение.
+        installed="$(printf '%s' "${line}" | sed -n 's/.*but you have [^ ]* \([^ ,]*\).*/\1/p')"
+        installed="${installed%.}"
+        if [[ -z "${floor}" || -z "${installed}" ]] \
+           || version_ge "${installed}" "${floor}"; then
+          continue
+        fi
+      fi
+    fi
     printf '%s\n' "${line}"
   done <<< "${text}"
 }
@@ -914,7 +989,8 @@ check_dependency_health() {
     return 0
   fi
   out="$(set +o pipefail; grep -E "requires|has requirement" <<<"${out}" | sort -u || true)"
-  out="$(filter_deliberate "${out}" "$(deliberate_deviations "${root}")")"
+  out="$(filter_deliberate "${out}" "$(deliberate_deviations "${root}")" \
+                          "$(overridden_packages "${root}")")"
   if [[ -z "${out}" ]]; then
     _pip_conflicts_resolved
     return 0
@@ -946,7 +1022,8 @@ pip_report_conflicts() {
   # «пакет N требует X, но у вас Y». Берём именно их, а не весь хвост.
   lines="$(set +o pipefail; grep -E "requires .*, but you have " "${file}" 2>/dev/null \
            | sed 's/^[[:space:]]*//' | sort -u || true)"
-  lines="$(filter_deliberate "${lines}" "$(deliberate_deviations "${root}")")"
+  lines="$(filter_deliberate "${lines}" "$(deliberate_deviations "${root}")" \
+                            "$(overridden_packages "${root}")")"
   [[ -n "${lines}" ]] || return 0
 
   # Промежуточное состояние в чек-лист не выносим. Движки ставятся по
