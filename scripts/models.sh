@@ -87,25 +87,18 @@ models_dir = Path(sys.argv[3])
 
 G, Y, R, D, B, RS = "\033[32m", "\033[33m", "\033[31m", "\033[90m", "\033[1m", "\033[0m"
 
+# Поиск весов — один на всю программу. Своя копия тут уже была, и она знала
+# только раскладку каталогов Hugging Face: после того как GigaAM стал качать
+# .ckpt, эта копия показывала бы скачанную модель незагруженной, а её размер
+# нулевым. Две копии одного правила расходятся на первой же правке — поэтому
+# берём ту, которой пользуется сам сервер.
+from asrhub import model_files
+
 def local_path(spec):
-    if not models_dir.exists():
-        return None
-    if spec.source.startswith("http"):
-        name = spec.source.rsplit("/", 1)[-1].replace(".zip", "")
-        for p in models_dir.rglob(f"*{name}*"):
-            if p.is_dir():
-                return p
-        return None
-    slug = "models--" + spec.source.replace("/", "--")
-    for base in (models_dir, models_dir / "hub"):
-        if (base / slug).exists():
-            return base / slug
-    return None
+    return model_files.find_local(models_dir, spec.source, spec.revision or "")
 
 def size_mb(path):
-    if path is None or not path.exists():
-        return 0
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1024 / 1024
+    return model_files.directory_size(path) / 1024 / 1024
 
 rows, families = [], {}
 for spec in MODELS:
@@ -336,16 +329,26 @@ spec = get_model(sys.argv[1])
 models_dir = Path(sys.argv[2])
 if spec is None:
     print("Модель не найдена в каталоге."); raise SystemExit(1)
-slug = "models--" + spec.source.replace("/", "--")
-candidates = [models_dir / slug, models_dir / "hub" / slug]
+from asrhub import model_files
+
+candidates = []
+found = model_files.find_local(models_dir, spec.source, spec.revision or "")
+if found is not None:
+    candidates.append(found)
+# Прямые ссылки распаковываются в несколько каталогов сразу, поэтому здесь
+# берём их все, а не только первый.
 if spec.source.startswith("http"):
     name = spec.source.rsplit("/", 1)[-1].replace(".zip", "")
-    candidates += list(models_dir.rglob(f"*{name}*"))
+    candidates += [p for p in models_dir.rglob(f"*{name}*") if p not in candidates]
 removed = 0
 for path in candidates:
     if path.exists():
-        size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-        shutil.rmtree(path, ignore_errors=True)
+        size = model_files.directory_size(path)
+        # Веса GigaAM — один файл: rmtree на файле не работает.
+        if path.is_file():
+            path.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
         print(f"Удалено: {path} ({size/1024/1024:.0f} МБ)")
         removed += 1
 if removed == 0:
@@ -367,12 +370,13 @@ spec = get_model(sys.argv[1])
 if spec is None:
     print("Модель не найдена."); raise SystemExit(1)
 models_dir = Path(sys.argv[2])
-slug = "models--" + spec.source.replace("/", "--")
-path = next((p for p in (models_dir / slug, models_dir / "hub" / slug) if p.exists()), None)
+from asrhub import model_files
+
+path = model_files.find_local(models_dir, spec.source, spec.revision or "")
 print(f"Веса на диске:   {'да, ' + str(path) if path else 'нет'}")
 if path:
-    files = [f for f in path.rglob("*") if f.is_file()]
-    size = sum(f.stat().st_size for f in files)
+    files = [path] if path.is_file() else [f for f in path.rglob("*") if f.is_file()]
+    size = model_files.directory_size(path)
     print(f"Файлов:          {len(files)}")
     print(f"Размер:          {size/1024/1024:.0f} МБ (в каталоге заявлено {spec.disk_mb or '?'} МБ)")
     if spec.disk_mb and size / 1024 / 1024 < spec.disk_mb * 0.5:

@@ -3010,3 +3010,53 @@ def test_a_package_named_with_underscores_still_matches(repo_root: Path, tmp_pat
         "$(deliberate_deviations "{repo_root}/requirements")"
     '''
     assert run_bash(script).stdout.strip() == "", "имя с подчёркиванием не опознано"
+
+
+def test_the_weights_lookup_exists_in_one_place_only(repo_root: Path):
+    """Своя копия поиска весов в models.sh знала только раскладку Hugging Face.
+
+    Копий было три — в `list`, `remove` и `verify`, — и все три после
+    перехода GigaAM на .ckpt показывали бы скачанную модель незагруженной,
+    её размер нулевым, а удаление — несостоявшимся. Две копии одного правила
+    расходятся на первой же правке, и это ровно тот случай: серверную
+    поправили, а эти три остались.
+    """
+    источник = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
+    assert "models--" not in источник, (
+        "в models.sh снова заведён свой поиск весов вместо общего")
+    assert источник.count("model_files.find_local") >= 3, (
+        "не все команды пользуются общим поиском")
+
+
+def test_model_commands_see_both_layouts(repo_root: Path, tmp_path: Path):
+    """Проверяем на живых командах, а не по исходнику.
+
+    Раскладки две и обе настоящие: один файл `.ckpt` у GigaAM и каталог
+    `models--владелец--имя` у всего, что приезжает с Hugging Face.
+    """
+    models = tmp_path / "models"
+    models.mkdir()
+    веса = models / "v3_e2e_rnnt.ckpt"
+    with open(веса, "wb") as f:
+        f.truncate(449 * 1024 * 1024)
+
+    def запуск(*args: str) -> str:
+        результат = subprocess.run(
+            [BASH, str(repo_root / "scripts" / "models.sh"), *args,
+             "--data", str(tmp_path)],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "ASRHUB_NO_COLOR": "1"})
+        return результат.stdout + результат.stderr
+
+    вывод = запуск("verify", "gigaam-v3-e2e-rnnt")
+    assert "да, " in вывод and "v3_e2e_rnnt.ckpt" in вывод, вывод
+    assert "449 МБ" in вывод or "448 МБ" in вывод, (
+        "размер одного файла снова считается нулевым:\n" + вывод)
+
+    вывод = запуск("list", "--installed")
+    assert "gigaam-v3-e2e-rnnt" in вывод, (
+        "скачанная модель показана незагруженной:\n" + вывод)
+
+    вывод = запуск("remove", "gigaam-v3-e2e-rnnt", "--yes")
+    assert "Удалено" in вывод, вывод
+    assert not веса.exists(), "файл весов остался на диске"
