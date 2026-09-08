@@ -61,6 +61,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# shellcheck disable=SC2034  # читается в common.sh при печати итога
+ASRHUB_CHECKLIST_TITLE="Чек-лист обновления"
 enable_error_handling
 setup_logging "${TMPDIR:-/tmp}"
 print_banner
@@ -331,6 +333,7 @@ fi
 step "Запуск и проверка"
 if [[ "${NO_RESTART}" -eq 1 ]]; then
   info "Перезапуск пропущен (--no-restart)."
+  checklist_skip "выбран ключ --no-restart"
   exit 0
 fi
 
@@ -354,6 +357,7 @@ elif [[ "${WAS_RUNNING}" -eq 1 ]]; then
   bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" || true
 else
   info "До обновления служба не работала — не запускаем."
+  checklist_skip "до обновления служба не работала"
   printf '\n%s%sОбновление завершено: %s → %s%s\n\n' "${C_BOLD}" "${C_GREEN}" \
     "${CURRENT_VERSION}" "${NEW_VERSION}" "${C_RESET}"
   # Проверять здоровье остановленного сервера бессмысленно: раньше проверка

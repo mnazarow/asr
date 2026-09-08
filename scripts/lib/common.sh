@@ -60,6 +60,13 @@ export ASRHUB_DRY_RUN
 : "${ASRHUB_QUIET:=0}"
 : "${ASRHUB_NO_COLOR:=0}"
 
+# Чек-лист определяется ниже, а warn/error объявлены выше него: до загрузки
+# всего файла это лишь имена. Пустые заглушки нужны, чтобы вызов из warn не
+# падал, если библиотеку подключили частично.
+checklist_note() { return 0; }
+_checklist_hint() { return 0; }
+checklist_open() { return 0; }
+
 declare -a _ROLLBACK_ACTIONS=()
 declare -a _CLEANUP_PATHS=()
 _STEP_CURRENT=""
@@ -91,10 +98,15 @@ _log_raw() {
 log()      { [[ "${ASRHUB_QUIET}" == "1" ]] || printf '%s\n' "$*"; _log_raw INFO "$*"; }
 info()     { [[ "${ASRHUB_QUIET}" == "1" ]] || printf '%s—%s %s\n' "${C_CYAN}" "${C_RESET}" "$*"; _log_raw INFO "$*"; }
 ok()       { [[ "${ASRHUB_QUIET}" == "1" ]] || printf '%s✓%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; _log_raw OK "$*"; }
-warn()     { printf '%s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; _log_raw WARN "$*"; }
-error()    { printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; _log_raw ERROR "$*"; }
+warn()     { printf '%s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; _log_raw WARN "$*"
+             checklist_note "!" warn "$*"; }
+error()    { printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; _log_raw ERROR "$*"
+             checklist_note "✕" fail "$*"; }
 debug()    { [[ "${ASRHUB_DEBUG:-0}" == "1" ]] && printf '%s· %s%s\n' "${C_GREY}" "$*" "${C_RESET}" >&2; _log_raw DEBUG "$*"; return 0; }
-hint()     { printf '  %s%s%s\n' "${C_DIM}" "$*" "${C_RESET}" >&2; _log_raw HINT "$*"; }
+hint()     { printf '  %s%s%s\n' "${C_DIM}" "$*" "${C_RESET}" >&2; _log_raw HINT "$*"
+             # Подсказку вешаем на пункт только рядом с бедой: в обычном ходе
+             # их десятки, и чек-лист превратился бы в тот же вывод целиком.
+             _checklist_hint "$*"; }
 
 heading() {
   [[ "${ASRHUB_QUIET}" == "1" ]] && return 0
@@ -106,6 +118,7 @@ heading() {
 step() {
   _STEP_INDEX=$((_STEP_INDEX + 1))
   _STEP_CURRENT="$*"
+  checklist_open "$*"
   [[ "${ASRHUB_QUIET}" == "1" ]] && return 0
   if [[ ${_STEP_TOTAL} -gt 0 ]]; then
     printf '\n%s[%d/%d]%s %s\n' "${C_BOLD}${C_BLUE}" "${_STEP_INDEX}" "${_STEP_TOTAL}" "${C_RESET}" "$*"
@@ -116,6 +129,165 @@ step() {
 }
 
 set_step_total() { _STEP_TOTAL="$1"; _STEP_INDEX=0; }
+
+# ---------------------------------------------------------------------------
+# Чек-лист
+# ---------------------------------------------------------------------------
+#
+# Установка печатает десять шагов и сотни строк вывода; если что-то пошло не
+# так на третьем, к последнему это уже уехало за пределы экрана. Итоговый
+# чек-лист собирает шаги в один список и вешает предупреждения и ошибки на
+# тот пункт, где они случились, — чтобы «что сломалось» читалось за секунду,
+# а не поиском по журналу.
+#
+# Пункты заводятся сами: каждый вызов step() открывает новый, а warn/error
+# пишут в текущий. Отдельно размечать ничего не нужно — иначе разметка
+# разошлась бы с кодом на первой же правке.
+
+declare -a _CHECK_NAMES=()
+declare -a _CHECK_STATE=()      # pending | ok | warn | fail | skip
+declare -a _CHECK_NOTES=()
+_CHECK_CURRENT=-1
+_CHECK_PRINTED=0
+#: Сколько заметок показывать на пункт. Остальные остаются в журнале: экран
+#: с полусотней строк под одним пунктом ничем не лучше исходного вывода.
+_CHECK_NOTES_LIMIT=6
+
+# Открывает новый пункт. Предыдущий, если его никто не пометил, считается
+# выполненным: шаг дошёл до конца и не пожаловался.
+checklist_open() {
+  if [[ ${_CHECK_CURRENT} -ge 0 && "${_CHECK_STATE[${_CHECK_CURRENT}]}" == "pending" ]]; then
+    _CHECK_STATE[${_CHECK_CURRENT}]="ok"
+  fi
+  _CHECK_NAMES+=("$*")
+  _CHECK_STATE+=("pending")
+  _CHECK_NOTES+=("")
+  _CHECK_CURRENT=$(( ${#_CHECK_NAMES[@]} - 1 ))
+}
+
+# Привязывает сообщение к текущему пункту и, если нужно, ухудшает его
+# состояние. Порядок строгий: ошибка сильнее предупреждения, и успешный
+# конец шага её уже не отменяет.
+#
+#   checklist_note ЗНАЧОК СОСТОЯНИЕ ТЕКСТ
+checklist_note() {
+  local mark="$1" state="$2"; shift 2
+  [[ ${_CHECK_CURRENT} -ge 0 ]] || return 0
+  local index=${_CHECK_CURRENT} current="${_CHECK_STATE[${_CHECK_CURRENT}]}"
+  case "${state}:${current}" in
+    fail:*)        _CHECK_STATE[${index}]="fail" ;;
+    warn:fail)     : ;;
+    warn:*)        _CHECK_STATE[${index}]="warn" ;;
+  esac
+  local text="$*" notes="${_CHECK_NOTES[${index}]}"
+  # Одинаковые строки подряд не копим: повтор попытки печатает то же самое.
+  [[ "${notes##*$'\n'}" == "${mark} ${text}" ]] && return 0
+  _CHECK_NOTES[${index}]="${notes}${notes:+$'\n'}${mark} ${text}"
+  return 0
+}
+
+# Подсказка попадает в чек-лист, только когда пункту уже плохо: в обычном
+# ходе установки их десятки, и список превратился бы в тот же вывод целиком.
+# А рядом с ошибкой подсказка — это и есть лечение, и без неё пункт
+# сообщает о беде, но не о выходе из неё.
+_checklist_hint() {
+  [[ ${_CHECK_CURRENT} -ge 0 ]] || return 0
+  case "${_CHECK_STATE[${_CHECK_CURRENT}]}" in
+    warn|fail) checklist_note "·" keep "$*" ;;
+  esac
+  return 0
+}
+
+# Пункт пропущен намеренно — это не ошибка и не успех.
+checklist_skip() {
+  [[ ${_CHECK_CURRENT} -ge 0 ]] || return 0
+  _CHECK_STATE[${_CHECK_CURRENT}]="skip"
+  [[ $# -gt 0 ]] && checklist_note "·" "skip" "$*"
+  return 0
+}
+
+# Помечает текущий пункт выполненным принудительно.
+checklist_done() {
+  [[ ${_CHECK_CURRENT} -ge 0 ]] || return 0
+  [[ "${_CHECK_STATE[${_CHECK_CURRENT}]}" == "pending" ]] && _CHECK_STATE[${_CHECK_CURRENT}]="ok"
+  return 0
+}
+
+# Печатает итог. Вызывается из ловушки EXIT, поэтому обязан быть безобидным
+# и когда шагов не было вовсе (справка, --check), и когда его позвали дважды.
+checklist_print() {
+  [[ ${_CHECK_PRINTED} -eq 1 ]] && return 0
+  [[ ${#_CHECK_NAMES[@]} -gt 0 ]] || return 0
+  if [[ ${_CHECK_CURRENT} -ge 0 && "${_CHECK_STATE[${_CHECK_CURRENT}]}" == "pending" ]]; then
+    # Последний шаг остался незакрытым: либо всё хорошо, либо скрипт
+    # оборвали. Разбираем по коду выхода — он у ловушки под рукой.
+    if [[ "${1:-0}" -eq 0 ]]; then
+      _CHECK_STATE[${_CHECK_CURRENT}]="ok"
+    else
+      _CHECK_STATE[${_CHECK_CURRENT}]="fail"
+      checklist_note "✕" "fail" "Шаг не завершён (код ${1})."
+    fi
+  fi
+  _CHECK_PRINTED=1
+
+  local failed=0 warned=0 index=0
+  for index in "${!_CHECK_STATE[@]}"; do
+    case "${_CHECK_STATE[${index}]}" in
+      fail) failed=$((failed + 1)) ;;
+      warn) warned=$((warned + 1)) ;;
+    esac
+  done
+  # В тихом режиме печатаем, только если есть о чём: молчание там просили
+  # ради успешного прогона, а не ради спрятанных ошибок.
+  if [[ "${ASRHUB_QUIET}" == "1" && ${failed} -eq 0 && ${warned} -eq 0 ]]; then
+    return 0
+  fi
+
+  local title="${ASRHUB_CHECKLIST_TITLE:-Чек-лист}"
+  printf '\n%s%s%s\n' "${C_BOLD}" "${title}" "${C_RESET}" >&2
+  printf '%s%s%s\n' "${C_GREY}" "$(printf '─%.0s' $(seq 1 ${#title}))" "${C_RESET}" >&2
+
+  local mark color note
+  for index in "${!_CHECK_NAMES[@]}"; do
+    case "${_CHECK_STATE[${index}]}" in
+      ok)   mark="✓"; color="${C_GREEN}" ;;
+      warn) mark="!"; color="${C_YELLOW}" ;;
+      fail) mark="✕"; color="${C_RED}" ;;
+      skip) mark="—"; color="${C_GREY}" ;;
+      *)    mark="?"; color="${C_GREY}" ;;
+    esac
+    printf '  %s%s%s  %d. %s\n' "${color}" "${mark}" "${C_RESET}" \
+      $((index + 1)) "${_CHECK_NAMES[${index}]}" >&2
+    [[ -n "${_CHECK_NOTES[${index}]}" ]] || continue
+    local shown=0 total=0
+    while IFS= read -r note; do
+      [[ -n "${note}" ]] || continue
+      total=$((total + 1))
+      if [[ ${shown} -lt ${_CHECK_NOTES_LIMIT} ]]; then
+        printf '      %s%s%s\n' "${C_DIM}" "${note}" "${C_RESET}" >&2
+        shown=$((shown + 1))
+      fi
+    done <<< "${_CHECK_NOTES[${index}]}"
+    if [[ ${total} -gt ${shown} ]]; then
+      printf '      %s… и ещё %d — в журнале%s\n' "${C_DIM}" $((total - shown)) "${C_RESET}" >&2
+    fi
+  done
+
+  printf '\n' >&2
+  if [[ ${failed} -eq 0 && ${warned} -eq 0 ]]; then
+    printf '  %s%sВсё прошло без замечаний.%s\n' "${C_BOLD}" "${C_GREEN}" "${C_RESET}" >&2
+  else
+    local summary=""
+    [[ ${failed} -gt 0 ]] && summary="ошибок: ${failed}"
+    [[ ${warned} -gt 0 ]] && summary="${summary:+${summary}, }предупреждений: ${warned}"
+    printf '  %s%s%s%s\n' "${C_BOLD}" "$( ((failed > 0)) && printf '%s' "${C_RED}" \
+      || printf '%s' "${C_YELLOW}")" "Есть замечания — ${summary}." "${C_RESET}" >&2
+  fi
+  [[ -n "${ASRHUB_LOG_FILE:-}" ]] && \
+    printf '  %sПолный журнал: %s%s\n' "${C_DIM}" "${ASRHUB_LOG_FILE}" "${C_RESET}" >&2
+  printf '\n' >&2
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Обработка ошибок
@@ -192,7 +364,10 @@ on_interrupt() {
 enable_error_handling() {
   trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
   trap 'on_interrupt' INT TERM
-  trap 'cleanup_temp' EXIT
+  # Чек-лист печатается из ловушки, а не в конце сценария: до конца доходят
+  # не все запуски, а итог нужен как раз тогда, когда не дошли. Код выхода
+  # передаём внутрь — по нему видно, закрылся последний шаг или оборвался.
+  trap 'checklist_print "$?"; cleanup_temp' EXIT
 }
 
 # ---------------------------------------------------------------------------

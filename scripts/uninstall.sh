@@ -53,6 +53,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# shellcheck disable=SC2034  # читается в common.sh при печати итога
+ASRHUB_CHECKLIST_TITLE="Чек-лист удаления"
 enable_error_handling
 setup_logging "${TMPDIR:-/tmp}"
 print_banner

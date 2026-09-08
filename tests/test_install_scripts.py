@@ -2359,3 +2359,120 @@ def test_optional_companion_is_installed_with_no_deps(repo_root: Path, tmp_path:
     assert "--no-deps" not in вызовы[0] and "--no-deps" not in вызовы[1], вызовы
     assert "--no-deps" in вызовы[2] and вызовы[2].endswith("optional/no-deps/движок.txt"), \
         вызовы
+
+
+# ---------------------------------------------------------------------------
+# Чек-лист
+# ---------------------------------------------------------------------------
+
+
+def test_checklist_binds_problems_to_the_step_where_they_happened(repo_root: Path):
+    """Установка печатает сотни строк; беда с третьего шага уезжает с экрана.
+
+    Чек-лист собирает шаги в один список и вешает каждое предупреждение и
+    каждую ошибку на тот пункт, где они случились. Ничего размечать руками
+    не нужно: пункт открывает step, а пишут в него warn и error — иначе
+    разметка разошлась бы с кодом на первой же правке.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      set_step_total 4
+      step "Первый"
+      ok "всё хорошо"
+      step "Второй"
+      warn "движок не встал"
+      hint "поставить позже: pip install ..."
+      step "Третий"
+      checklist_skip "выбран ключ --skip-models"
+      step "Четвёртый"
+      error "сервер не отвечает"
+      checklist_print 0
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+    итог = текст.split("Чек-лист")[-1]
+
+    assert "✓  1. Первый" in итог, итог
+    assert "всё хорошо" not in итог, "успешные сообщения не должны засорять итог"
+    assert "!  2. Второй" in итог and "движок не встал" in итог
+    assert "поставить позже" in итог, "подсказка рядом с бедой — это лечение"
+    assert "—  3. Третий" in итог and "--skip-models" in итог
+    assert "✕  4. Четвёртый" in итог and "сервер не отвечает" in итог
+    assert "ошибок: 1, предупреждений: 1" in итог, итог
+
+
+def test_checklist_does_not_collect_hints_from_a_healthy_step(repo_root: Path):
+    """Подсказки идут десятками; в итоге нужны только те, что лечат беду."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      step "Спокойный шаг"
+      hint "справочная подсказка, к беде отношения не имеет"
+      checklist_print 0
+    '''
+    итог = (run_bash(script).stdout + run_bash(script).stderr).split("Чек-лист")[-1]
+    assert "справочная подсказка" not in итог, итог
+    assert "Всё прошло без замечаний" in итог
+
+
+def test_checklist_survives_an_interrupted_run(repo_root: Path):
+    """Итог нужен как раз тогда, когда до конца сценария не дошли."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      enable_error_handling
+      step "Первый"
+      step "Второй, на котором всё оборвётся"
+      exit 3
+    '''
+    result = run_bash(script)
+    текст = result.stdout + result.stderr
+    assert result.returncode == 3
+    assert "✓  1. Первый" in текст, текст
+    assert "✕  2. Второй" in текст, "незакрытый шаг выдан за выполненный"
+    assert "код 3" in текст, текст
+
+
+def test_checklist_is_printed_once(repo_root: Path):
+    """Ловушка EXIT и явный вызов не должны печатать итог дважды."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    script = f'''
+      source "{common}"
+      enable_error_handling
+      step "Единственный"
+      checklist_print 0
+    '''
+    текст = run_bash(script).stdout + run_bash(script).stderr
+    assert текст.count("Единственный") == 2, \
+        f"пункт напечатан не один раз (плюс сам шаг): {текст!r}"
+
+
+def test_quiet_run_still_shows_problems(repo_root: Path):
+    """Тишину просили ради успешного прогона, а не ради спрятанных ошибок."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    тихо_и_хорошо = f'source "{common}"; ASRHUB_QUIET=1; step "Шаг"; checklist_print 0'
+    тихо_и_плохо = (f'source "{common}"; ASRHUB_QUIET=1; step "Шаг"; '
+                    'error "всё сломалось"; checklist_print 0')
+    первый = run_bash(тихо_и_хорошо)
+    assert "Чек-лист" not in первый.stdout + первый.stderr, "тихий успешный прогон шумит"
+    второй = run_bash(тихо_и_плохо)
+    assert "Чек-лист" in второй.stdout + второй.stderr, "ошибки спрятаны тишиной"
+
+
+def test_dry_run_does_not_warn_about_files_it_never_copied(repo_root: Path,
+                                                           tmp_path: Path):
+    """Пробный прогон обязан предсказывать настоящий, а не пугать зря.
+
+    Файлы движков ищутся в каталоге установки, а копирование в пробном
+    прогоне тоже пробное — и `--dry-run` сообщал, что движков нет, хотя в
+    настоящей установке они будут на месте.
+    """
+    result = subprocess.run(
+        [BASH, str(repo_root / "scripts" / "install.sh"), "--dry-run", "--yes",
+         "--no-interactive", "--prefix", str(tmp_path / "программа"),
+         "--data", str(tmp_path / "данные"), "--profile", "light", "--skip-models"],
+        capture_output=True, text=True, timeout=300, cwd=str(repo_root))
+    текст = result.stdout + result.stderr
+    assert "Нет файла зависимостей" not in текст, текст[-800:]
+    assert "Чек-лист установки" in текст, "итог не напечатан"

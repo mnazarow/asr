@@ -197,6 +197,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# shellcheck disable=SC2034  # читается в common.sh при печати итога
+ASRHUB_CHECKLIST_TITLE="Чек-лист установки"
 enable_error_handling
 setup_logging "${TMPDIR:-/tmp}"
 print_banner
@@ -1002,6 +1004,13 @@ else
     engine="$(printf '%s' "${engine}" | tr -d ' ')"
     [[ -z "${engine}" ]] && continue
     REQ="${PREFIX}/requirements/engines/${engine//_/-}.txt"
+    # В пробном запуске файлы ещё не копировались — шаг копирования тоже был
+    # пробным. Без этой поблажки `--dry-run` ругался на отсутствие движков,
+    # которых в настоящей установке не будет: проверка предсказывала не тот
+    # прогон, который собиралась предсказать.
+    if [[ ! -f "${REQ}" && "${ASRHUB_DRY_RUN}" == "1" ]]; then
+      REQ="${REPO_DIR}/requirements/engines/${engine//_/-}.txt"
+    fi
     if [[ ! -f "${REQ}" ]]; then
       warn "Нет файла зависимостей для движка «${engine}» — пропускаем."
       continue
@@ -1267,6 +1276,7 @@ if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
     }
 else
   info "Служба автозапуска не создаётся."
+  checklist_skip "выбран ключ --no-service"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1285,6 +1295,7 @@ if [[ "${CREATE_SERVICE}" -eq 0 && "${MODE}" == "native" ]]; then
   # Службы нет — стучаться некуда, и «сервер не отвечает» здесь означало бы
   # только то, что мы сами его не запускали.
   info "Служба не создавалась — сервер нужно запустить вручную."
+  checklist_skip "службы нет — проверять нечего"
   HEALTH_RC=3
 else
   # Сервер, привязанный к конкретному адресу, на 127.0.0.1 не ответит.
