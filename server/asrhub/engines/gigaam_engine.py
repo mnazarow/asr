@@ -23,6 +23,67 @@ from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 _MAX_CHUNK_S = 22.0          # запас к жёсткому пределу модели в 25 секунд
 
 
+#: По каким словам в ошибке узнаётся причина. Порядок важен: доступ к весам
+#: выглядит как «файл не найден», и общее правило перехватило бы его первым.
+_LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("401", "403", "gated", "authorization", "unauthorized", "token"),
+     "к весам нужен доступ по токену Hugging Face",
+     "Токен задаётся в разделе «Доступ» веб-интерфейса или ключом hf_token "
+     "в config.yaml. Модель ai-sage/GigaAM-v3 требует принятия условий на "
+     "странице модели."),
+    (("connection", "resolution", "resolve", "getaddrinfo", "timeout",
+      "temporarily", "temporary failure", "network", "unreachable", "proxy",
+      "ssl", "certificate", "errno -3", "errno -2"),
+     "сервер не смог обратиться к хранилищу весов",
+     "Проверьте доступ в интернет с сервера или загрузите веса заранее: "
+     "bash scripts/models.sh download <модель>"),
+    (("no space left", "disk"),
+     "не хватило места на диске",
+     "Освободите место в каталоге моделей и повторите."),
+    (("out of memory", "cuda error", "cublas", "cudnn"),
+     "не хватило памяти видеокарты или сломан её драйвер",
+     "Попробуйте device=cpu или модель поменьше; проверьте nvidia-smi."),
+    (("permission", "errno 13", "read-only"),
+     "нет прав на каталог моделей",
+     "Каталог моделей должен принадлежать пользователю службы."),
+    (("modulenotfound", "no module named", "importerror", "undefined symbol"),
+     "окружение движка неполное",
+     "Переустановите движок: bash scripts/models.sh install-engine gigaam"),
+    (("no such file", "does not exist", "checkpoint", "no file named"),
+     "веса не найдены на диске",
+     "Загрузите их: bash scripts/models.sh download <модель>"),
+)
+
+
+def _load_failure(model_id: str, errors: list[str], device: str,
+                  models_dir: str) -> ModelLoadError:
+    """Собирает отказ, который называет причину, а не только факт.
+
+    «Не удалось загрузить GigaAM» — это факт, известный и без нас. Причина же
+    лежит в тексте попыток, и раньше она уезжала в подсказку, которую
+    обратный вызов телефонии не передаёт вовсе: у принимающей стороны
+    оставалась одна строка без единой зацепки.
+    """
+    haystack = " | ".join(errors).lower()
+    reason = hint = ""
+    for needles, text, advice in _LOAD_REASONS:
+        if any(needle in haystack for needle in needles):
+            reason, hint = text, advice
+            break
+
+    message = f"Не удалось загрузить GigaAM «{model_id}»"
+    message += f": {reason}." if reason else "."
+    parts = [hint] if hint else [
+        "Причина в тексте попыток ниже; проверьте установку движка и наличие весов.",
+    ]
+    if models_dir:
+        parts.append(f"Каталог моделей: {models_dir}")
+    parts.append(f"Устройство: {device}")
+    # Попытки — целиком: их две-три, и каждая объясняет свой способ загрузки.
+    parts.append("Попытки: " + " | ".join(errors))
+    return ModelLoadError(message, hint="\n".join(parts))
+
+
 class GigaAMEngine(Engine):
     id = "gigaam"
     supports_word_timestamps = True
@@ -73,13 +134,17 @@ class GigaAMEngine(Engine):
         name = name_map.get(self.spec.source, {}).get(revision, revision)
 
         errors: list[str] = []
-        for attempt in (name, f"{name}", self.spec.source):
+        # Список без повторов: раньше первым и вторым шло одно и то же имя, и
+        # в отчёт об ошибке попадали две одинаковые строки — вытесняя ту, что
+        # объясняла настоящую причину.
+        attempts = list(dict.fromkeys([name, self.spec.source]))
+        for attempt in attempts:
             try:
                 model = gigaam.load_model(attempt, device=device)
                 self.log.info("GigaAM: загружен вариант «%s» на %s", attempt, device)
                 return model
             except Exception as exc:      # пробуем следующий способ
-                errors.append(f"{attempt}: {exc}")
+                errors.append(f"{attempt}: {type(exc).__name__}: {exc}")
 
         # Запасной путь — через transformers с trust_remote_code
         try:
@@ -92,13 +157,9 @@ class GigaAMEngine(Engine):
             self.log.info("GigaAM: загружен через transformers, ревизия «%s»", revision)
             return model
         except Exception as exc:
-            errors.append(f"transformers: {exc}")
+            errors.append(f"transformers: {type(exc).__name__}: {exc}")
 
-        raise ModelLoadError(
-            f"Не удалось загрузить GigaAM «{self.spec.id}».",
-            hint=("Проверьте установку: pip install "
-                  "git+https://github.com/salute-developers/GigaAM.git\n"
-                  "Попытки: " + " | ".join(errors[-3:])))
+        raise _load_failure(self.spec.id, errors, device, str(models_dir))
 
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:

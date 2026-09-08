@@ -474,6 +474,26 @@ bash scripts/models.sh engines              # что установлено и �
 bash scripts/models.sh install-engine nemo
 ```
 
+### `model_load_error` — модель не загрузилась
+
+Сообщение теперь называет причину, а не только факт: «не удалось загрузить GigaAM «gigaam-v3-e2e-rnnt»: **веса не найдены на диске**». Что различается по тексту сбоя:
+
+| Что видно | Что это на самом деле |
+|---|---|
+| `401`, `403`, `gated`, `unauthorized` | к весам нужен доступ по токену Hugging Face — задайте его в разделе «Доступ» или ключом `hf_token`, приняв условия на странице модели |
+| `Temporary failure in name resolution`, `Connection`, `timeout`, `certificate` | сервер не достучался до хранилища весов: нет интернета, прокси или подменённый сертификат |
+| `No such file`, `checkpoint` | весов нет на диске — `bash scripts/models.sh download <модель>` |
+| `CUDA error`, `out of memory` | не хватило видеопамяти или сломан драйвер |
+| `Permission denied` | каталог моделей принадлежит не тому пользователю, от которого работает служба |
+| `ModuleNotFoundError`, `undefined symbol` | окружение движка неполное — `bash scripts/models.sh install-engine gigaam` |
+
+Полный текст всех попыток загрузки остаётся в подсказке к заданию, и она же теперь пишется в журнал службы (раньше туда шёл только факт) и уходит в обратный вызов телефонии — в схеме phone_asr под ошибку отведено одно поле `error_message`, поэтому причина и лечение складываются в него.
+
+```bash
+bash scripts/service.sh logs -n 200 | grep -A 5 "провалено"
+curl -H "X-API-Key: ключ" http://127.0.0.1:8080/api/jobs/<id>
+```
+
 ### `model_not_downloaded`
 
 ```bash

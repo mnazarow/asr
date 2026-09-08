@@ -290,6 +290,27 @@ def _merge_to_stereo(left: Path, right: Path, target: Path) -> Path:
     return target
 
 
+def _failure_text(job: dict[str, Any]) -> str | None:
+    """Одна строка с причиной отказа — вместе с подсказкой.
+
+    В схеме phone_asr под ошибку отведено единственное поле, и подсказка,
+    где лежит вся полезная часть (чего не хватает и чем лечится), до
+    принимающей стороны не доезжала. Она получала «Не удалось загрузить
+    модель» и ни одной зацепки: ни кода, ни причины, ни команды.
+    """
+    message = str(job.get("error_message") or "").strip()
+    if not message:
+        return None
+    hint = " ".join(str(job.get("error_hint") or "").split())
+    code = str(job.get("error_code") or "").strip()
+    parts = [message]
+    if code and code not in message:
+        parts.append(f"[{code}]")
+    if hint:
+        parts.append(hint)
+    return " ".join(parts)
+
+
 def callback_body(request: PhoneRequest, job: dict[str, Any],
                   segments: list[dict[str, Any]]) -> dict[str, Any]:
     """Тело обратного вызова — поле в поле как у phone_asr.
@@ -329,5 +350,5 @@ def callback_body(request: PhoneRequest, job: dict[str, Any],
         "formatted_dialogue": dialogue,
         "transcription": " ".join(item["dialogue"] for item in dialogue),
         "status": status,
-        "error_message": job.get("error_message") or None,
+        "error_message": _failure_text(job),
     }

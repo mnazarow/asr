@@ -925,6 +925,14 @@ class JobQueue:
         self.db.add_event(job_id, "failed", error.message, error.to_dict())
         log.error("Задание %s провалено: %s", job_id, error.message,
                   extra={"job_id": job_id, "error_code": error.code})
+        # Подсказка — это и есть причина с лечением. В журнал она не
+        # попадала вовсе: там оставался тот же факт, что и в карточке
+        # задания, и разбираться приходилось наугад.
+        if error.hint:
+            for строка in str(error.hint).splitlines():
+                if строка.strip():
+                    log.error("Задание %s: %s", job_id, строка.strip(),
+                              extra={"job_id": job_id, "error_code": error.code})
         self._emit("job.failed", {"id": job_id, "error": error.to_dict()})
         self._discard_results(outdir)
         self._send_webhook(job_id)

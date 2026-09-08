@@ -588,3 +588,75 @@ def test_accepted_answer_names_the_real_callback_address(data_dir, monkeypatch):
         assert ответ.status_code == 202, ответ.text
         сообщение = ответ.json()["message"]
         assert сообщение.count("callback-endpoint.php") == 1, сообщение
+
+
+@pytest.mark.parametrize("попытка, ожидание", [
+    ("HTTPError: 401 Client Error: Unauthorized for url: https://huggingface.co/ai-sage",
+     "токен"),
+    ("OSError: [Errno -3] Temporary failure in name resolution", "хранилищу весов"),
+    ("FileNotFoundError: No such file or directory: '/models/v3.ckpt'", "не найдены"),
+    ("RuntimeError: CUDA error: out of memory", "памяти видеокарты"),
+    ("PermissionError: [Errno 13] Permission denied: '/var/lib/asrhub/models'", "нет прав"),
+    ("ModuleNotFoundError: No module named 'onnxruntime'", "окружение движка"),
+])
+def test_model_load_failure_names_the_reason(попытка: str, ожидание: str):
+    """«Не удалось загрузить модель» — это факт, а не причина.
+
+    Причина лежала в тексте попыток, а он уезжал в подсказку, которой
+    обратный вызов телефонии не передаёт. Принимающая сторона получала одну
+    строку без единой зацепки: ни кода, ни причины, ни команды.
+    """
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("gigaam-v3-e2e-rnnt", [f"v3_e2e_rnnt: {попытка}"],
+                          "cuda", "/var/lib/asrhub/models")
+    assert ожидание in отказ.message, отказ.message
+    assert "gigaam-v3-e2e-rnnt" in отказ.message, "не названа сама модель"
+    assert попытка.split(":")[0] in отказ.hint, "текст попытки потерян"
+
+
+def test_unknown_load_failure_does_not_invent_a_reason():
+    """Незнакомый сбой не должен получать наугад выбранное объяснение."""
+    from asrhub.engines.gigaam_engine import _load_failure
+
+    отказ = _load_failure("gigaam-v3-rnnt", ["v3_rnnt: ValueError: нечто небывалое"],
+                          "cpu", "")
+    assert отказ.message.endswith("«gigaam-v3-rnnt»."), отказ.message
+    assert "нечто небывалое" in отказ.hint, "текст сбоя должен остаться на виду"
+
+
+def test_callback_carries_the_reason_not_just_the_fact():
+    """В схеме phone_asr под ошибку одно поле — значит, туда и подсказку."""
+    from asrhub import phone_compat
+
+    строка = phone_compat._failure_text({
+        "error_message": "Не удалось загрузить GigaAM «gigaam-v3-e2e-rnnt»: "
+                         "веса не найдены на диске.",
+        "error_hint": "Загрузите их: bash scripts/models.sh download gigaam-v3-e2e-rnnt\n"
+                      "Каталог моделей: /var/lib/asrhub/models",
+        "error_code": "model_load_error",
+    })
+    assert "веса не найдены" in строка
+    assert "models.sh download" in строка, "лечение снова не доехало"
+    assert "model_load_error" in строка, "код ошибки потерян"
+    assert "\n" not in строка, "перевод строки в поле схемы phone_asr"
+
+    assert phone_compat._failure_text({"error_message": ""}) is None
+
+    # И то же самое в готовом теле обратного вызова — там, где его увидит
+    # принимающая сторона.
+    запрос = phone_compat.PhoneRequest(
+        call_id="5595633350", files=["https://пример.рф/запись.wav"],
+        base_url="https://пример.рф")
+    тело = phone_compat.callback_body(запрос, {
+        "status": "failed",
+        "error_message": "Не удалось загрузить GigaAM «gigaam-v3-e2e-rnnt».",
+        "error_hint": "Загрузите веса: bash scripts/models.sh download …",
+        "error_code": "model_load_error",
+    }, [])
+    assert "models.sh download" in тело["error_message"], \
+        f"подсказка снова не доехала до телефонии: {тело['error_message']!r}"
+    # Код не дублируется, если он уже назван в сообщении.
+    один_раз = phone_compat._failure_text(
+        {"error_message": "Сбой model_load_error", "error_code": "model_load_error"})
+    assert один_раз.count("model_load_error") == 1, один_раз

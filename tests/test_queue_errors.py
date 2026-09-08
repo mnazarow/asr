@@ -319,3 +319,35 @@ def test_install_scripts_have_no_known_defects():
     # На Windows каталог данных лежит внутри каталога программы.
     assert "dataInsidePrefix" in uninstall_ps, \
         "удаление на Windows снова снесёт данные вместе с программой"
+
+
+def test_failed_job_writes_the_reason_to_the_log(caplog):
+    """В журнал попадал факт и не попадала причина.
+
+    Карточка задания хранит и сообщение, и подсказку, а журнал видел только
+    первое — то есть ровно то, что человек уже прочитал в ответе. Причина с
+    лечением оставалась недоступной именно там, куда идут разбираться.
+    """
+    import logging
+    import re
+    from pathlib import Path
+
+    источник = Path("server/asrhub/job_queue.py").read_text(encoding="utf-8")
+    блок = re.search(r'log\.error\("Задание %s провалено.*?\n\n', источник, re.S)
+    assert блок, "не найдена запись о провале задания"
+    assert "error.hint" in блок.group(0), "подсказка снова не пишется в журнал"
+
+    # И само поведение: многострочная подсказка ложится строками.
+    from asrhub.errors import ModelLoadError
+
+    отказ = ModelLoadError("Не удалось загрузить модель.",
+                           hint="Загрузите веса: models.sh download …\nКаталог: /var/lib")
+    log = logging.getLogger("проверка")
+    with caplog.at_level(logging.ERROR):
+        log.error("Задание %s провалено: %s", "job_1", отказ.message)
+        for строка in str(отказ.hint).splitlines():
+            if строка.strip():
+                log.error("Задание %s: %s", "job_1", строка.strip())
+    записи = [r.getMessage() for r in caplog.records]
+    assert any("models.sh download" in r for r in записи), записи
+    assert any("Каталог: /var/lib" in r for r in записи), записи
