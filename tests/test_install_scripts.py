@@ -2476,3 +2476,108 @@ def test_dry_run_does_not_warn_about_files_it_never_copied(repo_root: Path,
     текст = result.stdout + result.stderr
     assert "Нет файла зависимостей" not in текст, текст[-800:]
     assert "Чек-лист установки" in текст, "итог не напечатан"
+
+
+def test_pip_conflicts_reach_the_checklist(repo_root: Path, tmp_path: Path):
+    """pip умеет завершиться успешно и тут же сообщить о раздоре версий.
+
+    Такой ERROR: — не сбой команды, поэтому он проходил мимо разбора и мимо
+    чек-листа: обновление отчитывалось «всё прошло без замечаний», а в
+    выводе стояли три жалобы на несовместимые версии. Именно из них потом
+    вырастают необъяснимые сбои загрузки моделей.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    вывод = tmp_path / "pip.log"
+    вывод.write_text(
+        "Successfully uninstalled huggingface_hub-1.30.0\n"
+        "ERROR: pip's dependency resolver does not currently take into account all "
+        "the packages that are installed. This behaviour is the source of the "
+        "following dependency conflicts.\n"
+        "transformers 5.16.1 requires huggingface-hub<2.0,>=1.5.0, but you have "
+        "huggingface-hub 0.36.2 which is incompatible.\n"
+        "nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, but you have "
+        "protobuf 7.36.1 which is incompatible.\n"
+        "Successfully installed huggingface-hub-0.36.2\n", encoding="utf-8")
+    # Через настоящий pip_install: pip завершился успешно, и именно поэтому
+    # раньше жалоба никуда не попадала.
+    pip = tmp_path / "pip"
+    pip.write_text(f'#!/usr/bin/env bash\ncat "{вывод}"\nexit 0\n', encoding="utf-8")
+    pip.chmod(0o755)
+    script = f'''
+      source "{common}"
+      setup_logging "{tmp_path}"
+      step "Обновление зависимостей"
+      pip_install "{pip}" 2 -r требования.txt
+      checklist_print 0
+    '''
+    result = run_bash(script)
+    итог = (result.stdout + result.stderr).split("Чек-лист")[-1]
+    assert "Всё прошло без замечаний" not in итог, "ложное «всё хорошо» вернулось"
+    assert "версии пакетов разошлись" in итог, итог
+    assert "huggingface-hub" in итог and "protobuf" in итог, итог
+
+
+def test_a_clean_pip_run_stays_quiet(repo_root: Path, tmp_path: Path):
+    """Обычная установка без раздора не должна порождать предупреждений."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    вывод = tmp_path / "pip.log"
+    вывод.write_text("Requirement already satisfied: fastapi\n"
+                     "Successfully installed uvicorn-0.52.4\n", encoding="utf-8")
+    pip = tmp_path / "pip"
+    pip.write_text(f'#!/usr/bin/env bash\ncat "{вывод}"\nexit 0\n', encoding="utf-8")
+    pip.chmod(0o755)
+    script = f'''
+      source "{common}"
+      setup_logging "{tmp_path}"
+      step "Обновление зависимостей"
+      pip_install "{pip}" 2 -r требования.txt
+      checklist_print 0
+    '''
+    итог = (run_bash(script).stdout + run_bash(script).stderr).split("Чек-лист")[-1]
+    assert "Всё прошло без замечаний" in итог, итог
+
+
+def test_environment_health_is_asked_of_pip_itself(repo_root: Path, tmp_path: Path):
+    """Движки ставятся по одному, и последний перетягивает версии на себя.
+
+    Ни один вызов pip при этом не видит картины целиком — а `pip check`
+    видит. Без него расхождение всплывает много позже и выглядит как
+    необъяснимый сбой загрузки модели.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    сломанный = tmp_path / "pip-broken"
+    сломанный.write_text(
+        '#!/usr/bin/env bash\n'
+        '[[ "$1" == "check" ]] && { echo "transformers 5.16.1 requires '
+        'huggingface-hub<2.0,>=1.5.0, but you have huggingface-hub 0.36.2."; exit 1; }\n'
+        'exit 0\n', encoding="utf-8")
+    сломанный.chmod(0o755)
+    целый = tmp_path / "pip-ok"
+    целый.write_text('#!/usr/bin/env bash\necho "No broken requirements found."\nexit 0\n',
+                     encoding="utf-8")
+    целый.chmod(0o755)
+
+    плохо = run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+                     f'step "Зависимости"; check_dependency_health "{сломанный}"; '
+                     'checklist_print 0')
+    текст = плохо.stdout + плохо.stderr
+    assert "не сходятся" in текст, текст
+    assert "huggingface-hub" in текст, "не сказано, что именно разошлось"
+
+    хорошо = run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+                      f'step "Зависимости"; check_dependency_health "{целый}"; '
+                      'checklist_print 0')
+    assert "Всё прошло без замечаний" in хорошо.stdout + хорошо.stderr
+
+
+def test_base_requirements_do_not_downgrade_the_hub(repo_root: Path):
+    """Потолок huggingface-hub<1.0 откатывал пакет и ломал transformers.
+
+    Каждое обновление опускало hub до 0.x — transformers 5.x требует 1.5+, —
+    а следующий движок возвращал его обратно. Так окружение перекраивалось
+    на каждом прогоне, и итог зависел от того, чья очередь была последней.
+    """
+    base = (repo_root / "requirements" / "base.txt").read_text(encoding="utf-8")
+    строка = next(s for s in base.splitlines() if s.strip().startswith("huggingface-hub"))
+    assert "<1.0" not in строка, "потолок вернулся — hub снова будет откатываться"
+    assert ">=0.24" in строка, "нижняя граница потеряна"

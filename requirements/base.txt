@@ -8,7 +8,12 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 pydantic>=2.7,<3.0
 PyYAML>=6.0
-huggingface-hub>=0.24,<1.0
+# Верхнюю границу пришлось снять: transformers 5.x требует hub >=1.5, и
+# каждое обновление откатывало hub до 0.x, ломая transformers, — а следующий
+# движок возвращал его обратно. Всё, чем пользуется сервер
+# (snapshot_download с cache_dir, revision и token), в 1.x на месте: проверено
+# на 1.30.
+huggingface-hub>=0.24,<3
 
 # Аудио и документы
 soundfile>=0.12

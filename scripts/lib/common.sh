@@ -841,6 +841,55 @@ pip_failure_is_permanent() {
   return 1
 }
 
+# Сводит итог по согласованности окружения: pip check знает про все пакеты
+# сразу, а не только про те, что ставились сейчас. Пустой вывод — всё сходится.
+#
+#   check_dependency_health ПУТЬ_К_PIP
+check_dependency_health() {
+  local pip="$1" out="" count=0 line
+  [[ -x "${pip}" ]] || return 0
+  [[ "${ASRHUB_DRY_RUN}" == "1" ]] && return 0
+  out="$("${pip}" check 2>&1 || true)"
+  # «No broken requirements found» — то, ради чего всё и затевалось.
+  grep -qiE "no broken requirements" <<<"${out}" && return 0
+  out="$(set +o pipefail; grep -E "requires|has requirement" <<<"${out}" | sort -u || true)"
+  [[ -n "${out}" ]] || return 0
+  warn "Версии пакетов в окружении не сходятся:"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    count=$((count + 1))
+    [[ ${count} -le 5 ]] && hint "${line}"
+  done <<< "${out}"
+  [[ ${count} -gt 5 ]] && hint "… и ещё $((count - 5)); полный список: ${pip} check"
+  hint "Движки требуют несовместимых версий одного пакета. Работать это чаще"
+  hint "всего продолжает, но именно отсюда берутся необъяснимые сбои загрузки."
+  return 0
+}
+
+# Показывает жалобы pip на несогласованные версии — те, что он печатает
+# после успешной установки.
+#
+#   pip_report_conflicts ФАЙЛ_С_ВЫВОДОМ
+pip_report_conflicts() {
+  local file="$1" lines="" line count=0
+  [[ -f "${file}" ]] || return 0
+  grep -q "dependency conflicts" "${file}" 2>/dev/null || return 0
+  # Строки конфликтов идут сразу после объявления и выглядят как
+  # «пакет N требует X, но у вас Y». Берём именно их, а не весь хвост.
+  lines="$(set +o pipefail; grep -E "requires .*, but you have " "${file}" 2>/dev/null \
+           | sed 's/^[[:space:]]*//' | sort -u || true)"
+  [[ -n "${lines}" ]] || return 0
+  warn "После установки версии пакетов разошлись:"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    count=$((count + 1))
+    if [[ ${count} -le 5 ]]; then hint "${line}"; fi
+  done <<< "${lines}"
+  [[ ${count} -gt 5 ]] && hint "… и ещё $((count - 5)) — в журнале"
+  hint "Проверить окружение целиком: ${pip:-pip} check"
+  return 0
+}
+
 pip_install() {
   local pip="$1" attempts="$2"; shift 2
   local capture status=0 label="" arg offline=0
@@ -875,6 +924,13 @@ pip_install() {
     delay=$((delay * 2))
     attempt=$((attempt + 1))
   done
+  # pip умеет завершиться успешно и тут же сообщить, что окружение осталось
+  # несогласованным. Такой ERROR: — не сбой команды, поэтому он проходил мимо
+  # разбора и мимо чек-листа: обновление отчитывалось «без замечаний», а в
+  # выводе стояли три жалобы на несовместимые версии.
+  if [[ ${status} -eq 0 ]]; then
+    pip_report_conflicts "${capture}"
+  fi
   if [[ ${status} -ne 0 ]]; then
     diagnose_pip_failure "${capture}" "$(dirname "${pip}")/python" "${offline}" || true
     # Полный вывод кладём в журнал: скрипты обещают его строкой «Полный
