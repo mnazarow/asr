@@ -471,6 +471,38 @@ diagnose_pip_failure() {
     return 0
   fi
 
+  # Не найден заголовок чужой библиотеки. Стоит перед общим разбором сборки:
+  # там же «Failed building wheel», и общее правило звало ставить компилятор,
+  # который на самом деле есть и честно доложил, чего ему не хватает.
+  local header=""
+  header="$(set +o pipefail; grep -oE "fatal error: [^:]+\.h: No such file" <<<"${text}" \
+            | head -1 | sed -e 's/fatal error: //' -e 's/: No such file//' || true)"
+  if [[ -n "${header}" && "${header}" != "Python.h" ]]; then
+    local package
+    package="$(set +o pipefail; grep -oE "Failed building wheel for [^ ]+" <<<"${text}" \
+               | head -1 | sed 's/.*for //' || true)"
+    error "Не хватает заголовков чужой библиотеки: ${header}${package:+ (нужны пакету ${package})}."
+    case "${header}" in
+      fst/*)
+        # pynini собирается только против OpenFst нужной версии, а в
+        # дистрибутиве почти всегда лежит другая. Готовое колесо снимает
+        # вопрос целиком: собирать нечего.
+        hint "Это OpenFst, его требует pynini. Собирать не нужно — есть готовое колесо:"
+        hint "  ${python:-pip} -m pip install 'pynini>=2.1.7'"
+        hint "Версия из дистрибутива (libfst-dev) обычно не та, что нужна pynini." ;;
+      sndfile.h)      hint "Поставьте: sudo apt install libsndfile1-dev" ;;
+      ffi.h)          hint "Поставьте: sudo apt install libffi-dev" ;;
+      openssl/*)      hint "Поставьте: sudo apt install libssl-dev" ;;
+      zlib.h)         hint "Поставьте: sudo apt install zlib1g-dev" ;;
+      lzma.h)         hint "Поставьте: sudo apt install liblzma-dev" ;;
+      portaudio.h)    hint "Поставьте: sudo apt install portaudio19-dev" ;;
+      *)
+        hint "Нужен пакет разработки той библиотеки, что поставляет этот файл."
+        hint "Найти его: apt-file search ${header}" ;;
+    esac
+    return 0
+  fi
+
   if [[ "${text}" == *"Could not build wheels"* || "${text}" == *"Failed building wheel"* \
      || "${text}" == *"error: command '"* || "${text}" == *"gcc: fatal error"* \
      || "${text}" == *"Python.h: No such file"* ]]; then
@@ -562,7 +594,7 @@ diagnose_pip_failure() {
 # update.sh, и файл-спутник попал бы в него как отдельный «движок».
 install_engine_requirements() {
   local pip="$1" req="$2"; shift 2
-  local dir names nodeps optional
+  local dir names nodeps optional opt_nodeps
   dir="$(dirname "${req}")"
   nodeps="${dir}/no-deps/$(basename "${req}")"
   optional="${dir}/optional/$(basename "${req}")"
@@ -571,12 +603,17 @@ install_engine_requirements() {
     pip_install "${pip}" 2 "$@" --no-deps -r "${nodeps}" || return 1
   fi
   if [[ -f "${optional}" ]]; then
+    opt_nodeps="${dir}/optional/no-deps/$(basename "${req}")"
     # Необязательная часть: движок работает и без неё, просто беднее. Ронять
     # из-за такой части весь движок нельзя — человек остаётся без всего
     # сразу, хотя не хватает одной возможности, о которой он мог и не знать.
     # Так и вышло с postprocess: расстановка знаков препинания не ставилась
     # из-за нормализатора чисел, которому нужен компилятор C++.
-    if ! pip_install "${pip}" 1 "$@" -r "${optional}"; then
+    if pip_install "${pip}" 1 "$@" -r "${optional}" \
+       && { [[ ! -f "${opt_nodeps}" ]] \
+            || pip_install "${pip}" 1 "$@" --no-deps -r "${opt_nodeps}"; }; then
+      :
+    else
       names="$(set +o pipefail; grep -vE '^[[:space:]]*(#|$)' "${optional}" 2>/dev/null \
                | sed 's/[<>=!;[].*//' | tr -d '[:space:]' | paste -sd, - || true)"
       warn "Необязательная часть движка не установилась${names:+: ${names}}."

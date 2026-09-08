@@ -2258,3 +2258,104 @@ def test_postprocess_installs_without_a_compiler(repo_root: Path):
     необязательный = repo_root / "requirements" / "engines" / "optional" / "postprocess.txt"
     assert необязательный.exists(), "нормализатор потерян, а не вынесен"
     assert "nemo-text-processing" in необязательный.read_text(encoding="utf-8")
+
+
+def test_a_missing_library_header_is_not_blamed_on_the_compiler(repo_root: Path,
+                                                                tmp_path: Path):
+    """Компилятор был на месте и честно доложил, чего ему не хватает.
+
+    Разбор всё равно советовал поставить компилятор и заголовки Python —
+    оба уже стояли. Не хватало заголовков чужой библиотеки (OpenFst), и
+    совет уводил в сторону ровно тогда, когда человек уже сделал всё, о чём
+    его просили в прошлый раз.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    вывод = (
+        "      building '_pywrapfst' extension\n"
+        "      x86_64-linux-gnu-g++ -fPIC -I/usr/include/python3.14 -c extensions/"
+        "_pywrapfst.cpp -o build/temp/_pywrapfst.o\n"
+        "      extensions/_pywrapfst.cpp:1317:10: fatal error: fst/util.h: "
+        "No such file or directory\n"
+        "       1317 | #include <fst/util.h>\n"
+        "      compilation terminated.\n"
+        "  ERROR: Failed building wheel for pynini\n")
+    файл = tmp_path / "pip.log"
+    файл.write_text(вывод, encoding="utf-8")
+    result = run_bash(f'source "{common}"; diagnose_pip_failure "{файл}" "" 0')
+    текст = result.stdout + result.stderr
+    assert "fst/util.h" in текст, "заголовок не назван"
+    assert "pynini>=2.1.7" in текст, "не назван путь без сборки — готовое колесо"
+    assert "build-essential" not in текст, "снова советует компилятор, который есть"
+    assert "-dev" not in текст.replace("libfst-dev", ""), \
+        "снова советует заголовки Python, которые есть"
+
+
+@pytest.mark.parametrize("заголовок, ожидание", [
+    ("sndfile.h", "libsndfile1-dev"),
+    ("ffi.h", "libffi-dev"),
+    ("zlib.h", "zlib1g-dev"),
+    ("openssl/ssl.h", "libssl-dev"),
+    ("невиданный.h", "apt-file search"),
+])
+def test_known_headers_map_to_packages(repo_root: Path, tmp_path: Path,
+                                       заголовок: str, ожидание: str):
+    """Имя заголовка — это уже половина ответа; вторую даёт соответствие пакету."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    файл = tmp_path / "pip.log"
+    файл.write_text(f"      fatal error: {заголовок}: No such file or directory\n"
+                    "  ERROR: Failed building wheel for нечто\n", encoding="utf-8")
+    result = run_bash(f'source "{common}"; diagnose_pip_failure "{файл}" "" 0')
+    текст = result.stdout + result.stderr
+    assert ожидание in текст, f"{заголовок}: ожидали «{ожидание}», получили {текст!r}"
+
+
+def test_nemo_normaliser_is_installed_without_building_anything_heavy(repo_root: Path):
+    """NeMo ставится готовым колесом pynini, а не сборкой против OpenFst.
+
+    nemo-text-processing прибит к pynini==2.1.6.post1, у которой колеса под
+    свежие Python нет: pip уходил собирать её и упирался в заголовки OpenFst.
+    У 2.1.7 колесо есть, поэтому pynini ставится отдельно, а сам пакет —
+    спутником с --no-deps. Проверено на Python 3.14 живым запуском.
+    """
+    optional = repo_root / "requirements" / "engines" / "optional"
+
+    def строки(путь: Path) -> list[str]:
+        """Только требования: пояснения в комментариях именуют те же пакеты."""
+        return [s.strip() for s in путь.read_text(encoding="utf-8").splitlines()
+                if s.strip() and not s.strip().startswith("#")]
+
+    основной = строки(optional / "postprocess.txt")
+    спутник = строки(optional / "no-deps" / "postprocess.txt")
+
+    assert "pynini>=2.1.7" in основной, "pynini снова оставлен на усмотрение nemo"
+    assert not any(s.startswith("nemo-text-processing") for s in основной), \
+        "nemo снова тянет за собой прибитую версию pynini"
+    assert any(s.startswith("nemo-text-processing") for s in спутник), \
+        "сам нормализатор потерян"
+    # Ставится без зависимостей, значит все нужные перечислены рядом.
+    for пакет in ("regex", "sacremoses", "inflect", "editdistance", "cdifflib", "pandas"):
+        assert пакет in основной, f"не перечислена зависимость {пакет}"
+
+
+def test_optional_companion_is_installed_with_no_deps(repo_root: Path, tmp_path: Path):
+    """Спутник необязательной части ставится именно с --no-deps."""
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    engines = tmp_path / "engines"
+    (engines / "optional" / "no-deps").mkdir(parents=True)
+    (engines / "движок.txt").write_text("основной>=1\n", encoding="utf-8")
+    (engines / "optional" / "движок.txt").write_text("лёгкий>=1\n", encoding="utf-8")
+    (engines / "optional" / "no-deps" / "движок.txt").write_text("прибитый>=1\n",
+                                                                 encoding="utf-8")
+    журнал = tmp_path / "вызовы"
+    pip = tmp_path / "pip"
+    pip.write_text('#!/usr/bin/env bash\n'
+                   f'printf "%s\\n" "$*" >> "{журнал}"\nexit 0\n', encoding="utf-8")
+    pip.chmod(0o755)
+
+    run_bash(f'source "{common}"; setup_logging "{tmp_path}"; '
+             f'install_engine_requirements "{pip}" "{engines}/движок.txt"')
+    вызовы = журнал.read_text(encoding="utf-8").splitlines()
+    assert len(вызовы) == 3, вызовы
+    assert "--no-deps" not in вызовы[0] and "--no-deps" not in вызовы[1], вызовы
+    assert "--no-deps" in вызовы[2] and вызовы[2].endswith("optional/no-deps/движок.txt"), \
+        вызовы
