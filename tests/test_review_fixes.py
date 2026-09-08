@@ -894,3 +894,32 @@ def test_a_short_word_cannot_match_inside_a_model_name():
     ], "cpu", "")
     assert "хранилищу весов" not in str(отказ), (
         "имя модели в перечне снова выдано за отказ сети: " + str(отказ))
+
+
+def test_the_results_section_offers_playback(repo_root: Path):
+    """Проигрыватель должен быть и в карточке, и строкой списка.
+
+    Проверка по разметке, а не по виду: она ловит случай, когда кнопку
+    потеряли при перекраивании списка, — а такое видно только глазами и
+    только если открыть нужный раздел.
+    """
+    app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
+    assert 'id="job-player"' in app, "в карточке задания нет проигрывателя"
+    assert "__asrhub.playRecording" in app, "в списке результатов нет кнопки прослушивания"
+    assert "__asrhub.saveRecording" in app, "запись нельзя скачать"
+
+    # Связь с расшифровкой — то, ради чего всё затевалось.
+    assert "segment[data-start]" in app, "щелчок по сегменту не переводит звук"
+    assert "classList.add('playing')" in app, "звучащий сегмент не подсвечивается"
+
+    css = (repo_root / "server" / "asrhub" / "web" / "styles.css").read_text(encoding="utf-8")
+    assert ".segment.playing" in css, "нет оформления для звучащего сегмента"
+
+
+def test_the_player_does_not_keep_playing_after_the_card_is_closed(repo_root: Path):
+    """Узел удалён, а звук идёт — так ведёт себя <audio>, если его не остановить."""
+    app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
+    место = app.index("function setupJobPlayer")
+    окно = app[max(0, место - 3000):место]
+    assert "asrhub:closed" in окно and "player.destroy()" in окно, (
+        "проигрыватель не останавливается вместе с карточкой")

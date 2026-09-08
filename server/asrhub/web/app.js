@@ -2229,6 +2229,8 @@ RENDERERS.results = {
           <td class="num">${job.speakers_count || '—'}</td>
           <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
           <td><div class="row" style="gap:3px">
+            <button class="ghost sm" onclick="__asrhub.playRecording('${job.id}')"
+              title="Прослушать запись">▶</button>
             ${['txt', 'srt', 'json', 'docx'].map((f) =>
               `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
                  title="Скачать в формате ${f}">${f}</button>`).join('')}
@@ -2240,17 +2242,196 @@ RENDERERS.results = {
 };
 
 // ==========================================================================
+// Проигрыватель записи
+// ==========================================================================
+
+/* Прослушивание исходной записи — в карточке задания и в списке результатов.
+ *
+ * Аутентификация здесь особая. Обычные запросы уходят с заголовком
+ * X-API-Key, но <audio src="…"> заголовков не шлёт: браузер сам ходит за
+ * файлом и отправляет только cookie. Тем, кто вошёл логином и паролем, этого
+ * достаточно — сервер принимает сессионную cookie. Тем, кто пользуется
+ * ключом, прямая ссылка ответит 401, и тогда мы забираем файл обычным
+ * запросом с заголовком и подсовываем проигрывателю как blob.
+ *
+ * Порядок именно такой, а не наоборот: прямая ссылка даёт частичные запросы
+ * (Range), то есть перемотку по большому файлу без выкачивания целиком.
+ * Blob — запасной путь: он тянет запись полностью, и для часового разговора
+ * это заметно.
+ */
+const Player = {
+  url: (id) => `/api/jobs/${encodeURIComponent(id)}/audio`,
+
+  /** Подключает источник к <audio>, с запасным путём через blob. */
+  attach(el, id, onFail) {
+    const direct = Player.url(id);
+    // Ключ в хранилище означает, что сессионной cookie нет, а заголовок
+    // <audio> не пошлёт — прямая ссылка ответит 401 гарантированно. Идти за
+    // предсказуемым отказом незачем: он стоит запроса и оставляет в консоли
+    // красную строку, по которой потом ищут несуществующую поломку.
+    const keyOnly = !!localStorage.getItem('asrhub_key');
+    let fallbackTried = false;
+    const fallback = async () => {
+      if (fallbackTried) return;
+      fallbackTried = true;
+      try {
+        const headers = {};
+        const key = localStorage.getItem('asrhub_key');
+        if (key) headers['X-API-Key'] = key;
+        const response = await fetch(direct, { headers });
+        if (!response.ok) {
+          let reason = `сервер ответил ${response.status}`;
+          try {
+            const body = await response.json();
+            reason = (body.error && (body.error.message || body.error.hint)) || reason;
+          } catch (e) { /* тело не разобралось — оставляем код ответа */ }
+          throw new Error(reason);
+        }
+        const blob = await response.blob();
+        el.__blobUrl = URL.createObjectURL(blob);
+        el.src = el.__blobUrl;
+      } catch (err) {
+        if (onFail) onFail(err.message || 'запись недоступна');
+      }
+    };
+    el.addEventListener('error', fallback);
+    if (keyOnly) fallback(); else el.src = direct;
+    return () => { if (el.__blobUrl) URL.revokeObjectURL(el.__blobUrl); };
+  },
+
+  /** Панель управления. Возвращает объект с seek() и подпиской на время. */
+  mount(host, id, opts) {
+    const options = opts || {};
+    host.innerHTML = `
+      <audio preload="metadata" style="display:none"></audio>
+      <button class="play" type="button" title="Пуск и пауза (пробел)" disabled>▶</button>
+      <button class="skip" type="button" title="Назад на 5 секунд">−5с</button>
+      <span class="time">--:-- / --:--</span>
+      <input class="scrub" type="range" min="0" max="1000" value="0"
+             title="Перемотка" aria-label="Позиция в записи">
+      <button class="skip" type="button" title="Вперёд на 5 секунд">+5с</button>
+      <select title="Скорость воспроизведения" aria-label="Скорость">
+        <option value="0.5">0.5×</option>
+        <option value="0.75">0.75×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.25">1.25×</option>
+        <option value="1.5">1.5×</option>
+        <option value="1.75">1.75×</option>
+        <option value="2">2×</option>
+      </select>
+      <button class="skip" type="button" title="Скачать исходную запись">↓</button>
+      <span class="note"></span>`;
+
+    const el = qs('audio', host);
+    const play = qs('.play', host);
+    const scrub = qs('.scrub', host);
+    const time = qs('.time', host);
+    const note = qs('.note', host);
+    const speed = qs('select', host);
+    const [back, forward, save] = qsa('.skip', host);
+
+    let dragging = false;
+    const fail = (message) => {
+      note.textContent = `Запись недоступна: ${message}`;
+      note.classList.add('err');
+      play.disabled = true;
+      scrub.disabled = true;
+    };
+    const release = Player.attach(el, id, fail);
+
+    const paint = () => {
+      const total = el.duration && isFinite(el.duration) ? el.duration : 0;
+      time.textContent = `${fmtDur(el.currentTime)} / ${total ? fmtDur(total) : '--:--'}`;
+      if (!dragging && total) scrub.value = String((el.currentTime / total) * 1000);
+    };
+
+    el.addEventListener('loadedmetadata', () => { play.disabled = false; paint(); });
+    el.addEventListener('timeupdate', () => {
+      paint();
+      if (options.onTime) options.onTime(el.currentTime);
+    });
+    el.addEventListener('play', () => { play.textContent = '❚❚'; });
+    el.addEventListener('pause', () => { play.textContent = '▶'; });
+    el.addEventListener('ended', () => { play.textContent = '▶'; });
+
+    play.addEventListener('click', () => { el.paused ? el.play() : el.pause(); });
+    back.addEventListener('click', () => { el.currentTime = Math.max(0, el.currentTime - 5); });
+    forward.addEventListener('click', () => {
+      const total = el.duration && isFinite(el.duration) ? el.duration : 0;
+      el.currentTime = total ? Math.min(total, el.currentTime + 5) : el.currentTime + 5;
+    });
+    speed.addEventListener('change', () => { el.playbackRate = Number(speed.value); });
+    save.addEventListener('click', () => Player.save(id));
+
+    // Ползунок ведём по вводу, а позицию ставим по отпусканию: иначе каждое
+    // движение мыши превращается в запрос куска файла, и по сети уходит
+    // вся запись вместо одного перехода.
+    scrub.addEventListener('input', () => {
+      dragging = true;
+      const total = el.duration && isFinite(el.duration) ? el.duration : 0;
+      if (total) time.textContent = `${fmtDur((Number(scrub.value) / 1000) * total)} / ${fmtDur(total)}`;
+    });
+    const commit = () => {
+      const total = el.duration && isFinite(el.duration) ? el.duration : 0;
+      if (total) el.currentTime = (Number(scrub.value) / 1000) * total;
+      dragging = false;
+    };
+    scrub.addEventListener('change', commit);
+
+    return {
+      audio: el,
+      seek(seconds, andPlay) {
+        if (!isFinite(seconds)) return;
+        el.currentTime = Math.max(0, seconds);
+        if (andPlay && el.paused) el.play().catch(() => { /* автозапуск запрещён — не беда */ });
+      },
+      destroy() {
+        try { el.pause(); } catch (e) { /* уже удалён из документа */ }
+        release();
+      },
+    };
+  },
+
+  /** Скачивание исходной записи — тем же способом, что и остальные файлы. */
+  async save(id) {
+    try {
+      const headers = {};
+      const key = localStorage.getItem('asrhub_key');
+      if (key) headers['X-API-Key'] = key;
+      const response = await fetch(Player.url(id), { headers });
+      if (!response.ok) throw new Error(`сервер ответил ${response.status}`);
+      const blob = await response.blob();
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const match = /filename\*=utf-8''([^;]+)/i.exec(disposition);
+      const name = match ? decodeURIComponent(match[1]) : `запись-${id}.wav`;
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    } catch (err) {
+      toast(`Не удалось скачать запись: ${err.message}`, 'err');
+    }
+  },
+};
+window.__asrhub.playRecording = (id) => window.__asrhub.openJob(id, { play: true });
+window.__asrhub.saveRecording = (id) => Player.save(id);
+
+// ==========================================================================
 // Карточка задания
 // ==========================================================================
 
-window.__asrhub.openJob = async (id) => {
+window.__asrhub.openJob = async (id, opts) => {
   try {
     const job = await API.get(`/api/jobs/${id}?with_segments=true`);
-    showJobModal(job);
+    showJobModal(job, opts || {});
   } catch (err) { fail(err); }
 };
 
-function showJobModal(job) {
+function showJobModal(job, opts) {
+  const options = opts || {};
   const segments = job.segments || [];
   const params = job.params || {};
   const changed = Object.entries(params).filter(([k, v]) =>
@@ -2280,13 +2461,16 @@ function showJobModal(job) {
         ${job.error_hint ? `<div class="small dim" style="margin-top:6px;white-space:pre-wrap">${
           esc(job.error_hint)}</div>` : ''}</div>` : ''}
 
+      ${job.status === 'completed' || job.status === 'failed'
+        ? '<div class="player" id="job-player"></div>' : ''}
+
       ${(job.waveform || []).length ? `<div class="wave-block" id="job-waveform-block">
         <div class="row small dim" style="margin-bottom:6px">
           <b class="small">Громкость записи</b>
           <span class="spacer"></span>
           <span class="faint">средний уровень за ${
             num((job.params || {}).waveform_interval_s || 1, 2)} с${
-            segments.length ? ' · щелчок — переход к месту в расшифровке' : ''}</span>
+            segments.length ? ' · щелчок — переход к этому месту' : ''}</span>
         </div>
         <div id="job-waveform"></div>
         <div id="job-waveform-legend"></div>
@@ -2303,6 +2487,8 @@ function showJobModal(job) {
     <div class="modal-foot">
       <span class="small faint mono">${esc(job.id)}</span>
       <span class="spacer"></span>
+      <button class="btn sm" onclick="__asrhub.saveRecording('${job.id}')"
+        title="Скачать исходную запись">запись</button>
       ${job.status === 'completed' ? ['txt', 'srt', 'vtt', 'json', 'csv', 'docx'].map((f) =>
         `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
            title="Скачать в формате ${f}">${f}</button>`).join('') : ''}
@@ -2355,7 +2541,77 @@ function showJobModal(job) {
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
   show('text');
-  drawJobWaveform(backdrop, job, segments, show);
+
+  const player = setupJobPlayer(backdrop, job, segments, show, options);
+  drawJobWaveform(backdrop, job, segments, show, player);
+
+  // Проигрыватель продолжал бы играть из закрытого окна: узел удалён, звук
+  // идёт. Поэтому останавливаем его вместе с окном.
+  backdrop.addEventListener('asrhub:closed', () => { if (player) player.destroy(); });
+}
+
+/* Проигрыватель в карточке и его связь с расшифровкой.
+ *
+ * Ради этой связи всё и затевалось. Просто послушать запись можно и скачав
+ * файл; ценно другое — слышать и одновременно видеть, что распознал сервер.
+ * Поэтому звучащий сегмент подсвечивается сам, а щелчок по сегменту
+ * переводит звук на его начало.
+ */
+function setupJobPlayer(backdrop, job, segments, show, options) {
+  const host = qs('#job-player', backdrop);
+  if (!host) return null;
+
+  let current = -1;
+  const highlight = (seconds) => {
+    if (!segments.length) return;
+    // Ищем от текущего места: за время воспроизведения соседний сегмент
+    // наступает почти всегда, и обходить весь список на каждом тике незачем.
+    let index = -1;
+    for (let i = 0; i < segments.length; i += 1) {
+      if (segments[i].start <= seconds && seconds < segments[i].end) { index = i; break; }
+    }
+    if (index === current) return;
+    current = index;
+    const active = qs('.segment.playing', backdrop);
+    if (active) active.classList.remove('playing');
+    if (index < 0) return;
+    const node = qs(`.segment[data-index="${index}"]`, backdrop);
+    if (!node) return;                       // открыта другая вкладка
+    node.classList.add('playing');
+    // Подводим к строке, только если она ушла из поля зрения: иначе список
+    // дёргается на каждой реплике, и читать его невозможно.
+    const box = node.closest('.transcript');
+    if (box) {
+      const top = node.offsetTop - box.scrollTop;
+      if (top < 0 || top > box.clientHeight - node.offsetHeight) {
+        node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+    }
+  };
+
+  const player = Player.mount(host, job.id, { onTime: highlight });
+
+  // Щелчок по сегменту — переход к нему. Слушаем на теле вкладок, а не на
+  // самих сегментах: вкладка перерисовывается целиком, и обработчики,
+  // навешанные на строки, пропали бы при первом же переключении.
+  const body = qs('#job-tab-body', backdrop);
+  if (body) {
+    body.addEventListener('click', (event) => {
+      const node = event.target.closest('.segment[data-start]');
+      if (!node) return;
+      player.seek(Number(node.dataset.start), true);
+      qsa('.segment.active', backdrop).forEach((n) => n.classList.remove('active'));
+      node.classList.add('active');
+    });
+  }
+
+  if (options && options.play) {
+    show('segments');
+    player.audio.addEventListener('loadedmetadata', () => {
+      player.audio.play().catch(() => { /* браузер запретил автозапуск */ });
+    }, { once: true });
+  }
+  return player;
 }
 
 /* Полоса громкости в карточке: дорожка на канал или говорящего.
@@ -2365,12 +2621,15 @@ function showJobModal(job) {
  * что в середине разговора кто-то долго молчал, а найти это место в
  * расшифровке всё равно приходится вручную.
  */
-function drawJobWaveform(backdrop, job, segments, show) {
+function drawJobWaveform(backdrop, job, segments, show, player) {
   const host = qs('#job-waveform', backdrop);
   if (!host || !window.Charts || !Charts.waveform) return;
   const curves = job.waveform || [];
 
   const seek = (seconds) => {
+    // Полоса громкости — это карта записи, и щелчок по ней должен вести
+    // звук, а не только текст.
+    if (player) player.seek(seconds, false);
     if (!segments.length) return;
     show('segments');
     let index = segments.findIndex((s) => s.start <= seconds && seconds < s.end);
@@ -2394,7 +2653,7 @@ function drawJobWaveform(backdrop, job, segments, show) {
     duration: job.media_duration_s || 0,
     interval: (job.params || {}).waveform_interval_s || 1,
     timeFormat: fmtDur,
-    onSeek: segments.length ? seek : null,
+    onSeek: (segments.length || player) ? seek : null,
   });
   draw();
 

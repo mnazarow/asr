@@ -415,6 +415,72 @@ def get_waveform(request: Request, job_id: str,
     }
 
 
+#: Что отдавать браузеру для расширений, которые mimetypes не знает. Пустой
+#: тип заставил бы <audio> отказаться от файла молча.
+_AUDIO_TYPES = {
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+    ".opus": "audio/ogg", ".flac": "audio/flac", ".aac": "audio/aac",
+    ".webm": "audio/webm", ".amr": "audio/amr", ".wma": "audio/x-ms-wma",
+}
+
+
+def _source_audio(request: Request, job: dict[str, Any]) -> Path:
+    """Путь к исходной записи задания — с проверкой, что он не увёл наружу.
+
+    Все три места, где заводится задание, кладут файл в каталог загрузок под
+    именем, которое придумал сервер. Но проверка здесь всё равно нужна: этот
+    обработчик отдаёт файл наружу по значению из базы, и если однажды
+    появится четвёртый путь, забывший про это правило, ошибка превратится в
+    чтение произвольного файла с сервера. Дешевле не полагаться на обещание.
+    """
+    state = get_state(request)
+    raw = str(job.get("file_path") or "").strip()
+    if not raw:
+        raise error_response(ConfigError(
+            "У задания не сохранён путь к записи.",
+            hint="Так бывает у заданий, заведённых до появления этой возможности."))
+
+    uploads = Path(state.settings.paths.uploads)
+    try:
+        base = uploads.resolve(strict=True)
+        real = Path(raw).resolve(strict=True)
+    except OSError as exc:
+        raise error_response(ConfigError(
+            "Запись не найдена на диске.",
+            hint="Файл удалён: либо сработал параметр delete_source_after, либо "
+                 "запись убрала очистка хранилища по сроку хранения.")) from exc
+
+    if not real.is_file() or (base != real.parent and base not in real.parents):
+        raise error_response(ConfigError(
+            "Запись лежит вне каталога загрузок — отдавать её нельзя.",
+            hint=f"Каталог загрузок: {base}"))
+    return real
+
+
+@router.get("/{job_id}/audio", summary="Исходная запись задания")
+def get_audio(request: Request, job_id: str,
+              principal: Principal = Depends(authenticate)):
+    """Отдаёт исходный файл записи — для прослушивания и скачивания.
+
+    Отдаётся через FileResponse, а он умеет отвечать на заголовок Range. Это
+    не мелочь: без частичных ответов встроенный проигрыватель браузера не
+    может перемотать запись, он способен только слушать её с начала.
+    """
+    job = _owned_job(request, job_id, principal)
+    real = _source_audio(request, job)
+    media = _AUDIO_TYPES.get(real.suffix.lower())
+    if media is None:
+        media, _ = mimetypes.guess_type(real.name)
+    # Имя для скачивания берём человеческое, а не служебное «up-xxxx.wav».
+    name = str(job.get("filename") or "").strip() or real.name
+    if not Path(name).suffix:
+        name = f"{name}{real.suffix}"
+    return FileResponse(str(real), media_type=media or "application/octet-stream",
+                        filename=name,
+                        content_disposition_type="inline")
+
+
 @router.get("/{job_id}/segments", summary="Сегменты задания")
 def get_segments(request: Request, job_id: str,
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:

@@ -518,3 +518,111 @@ def test_server_starts_even_when_login_setup_fails(data_dir, monkeypatch):
         # Ключи доступа продолжают работать: они базы учётных записей не
         # касаются вовсе.
         assert broken.get("/api/catalog").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Прослушивание записи
+# ---------------------------------------------------------------------------
+
+
+def _ждём_готовности(client, job_id: str) -> dict:
+    for _ in range(80):
+        current = client.get(f"/api/jobs/{job_id}").json()
+        if current["status"] in ("completed", "failed"):
+            return current
+        time.sleep(0.25)
+    raise AssertionError("задание не завершилось")
+
+
+def test_the_recording_can_be_played_back(client, sample_wav: Path):
+    """Раздел результатов показывал текст, но не давал послушать запись.
+
+    Проверить распознавание на слух было нечем: файл лежал на сервере, а
+    добраться до него из интерфейса было нельзя.
+    """
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("запись.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    _ждём_готовности(client, job["id"])
+
+    ответ = client.get(f"/api/jobs/{job['id']}/audio")
+    assert ответ.status_code == 200, ответ.text
+    assert ответ.headers["content-type"].startswith("audio/"), ответ.headers
+    assert ответ.content[:4] == b"RIFF", "отдан не тот файл"
+    # Имя для скачивания — человеческое, а не служебное «up-xxxx.wav».
+    from urllib.parse import unquote
+    расположение = ответ.headers.get("content-disposition", "")
+    assert "запись.wav" in unquote(расположение), расположение
+    # inline, иначе браузер предложит сохранить файл вместо проигрывания.
+    assert расположение.startswith("inline"), расположение
+
+
+def test_seeking_needs_partial_answers(client, sample_wav: Path):
+    """Без ответов на Range проигрыватель умеет только «слушать с начала».
+
+    Перемотка в браузере — это запрос куска файла. Если сервер отвечает
+    целым файлом и кодом 200, ползунок в проигрывателе не двигается, и вся
+    затея с переходом к нужному сегменту не работает.
+    """
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("перемотка.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    _ждём_готовности(client, job["id"])
+
+    целиком = client.get(f"/api/jobs/{job['id']}/audio")
+    assert целиком.headers.get("accept-ranges") == "bytes", целиком.headers
+
+    кусок = client.get(f"/api/jobs/{job['id']}/audio", headers={"Range": "bytes=100-199"})
+    assert кусок.status_code == 206, кусок.status_code
+    assert len(кусок.content) == 100, len(кусок.content)
+    assert кусок.content == целиком.content[100:200], "отдан не тот кусок"
+
+
+def test_a_missing_recording_says_why(client, sample_wav: Path):
+    """«Запись не найдена» без причины отправляет искать наугад.
+
+    Файл исчезает по двум понятным поводам: параметр delete_source_after и
+    очистка хранилища по сроку. Оба стоит назвать сразу.
+    """
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("исчезнет.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    карточка = _ждём_готовности(client, job["id"])
+    Path(карточка["file_path"]).unlink()
+
+    ответ = client.get(f"/api/jobs/{job['id']}/audio")
+    assert ответ.status_code >= 400
+    текст = ответ.text
+    assert "delete_source_after" in текст or "очистка" in текст, текст
+
+
+def test_a_recording_outside_the_uploads_directory_is_refused(client, sample_wav: Path,
+                                                              tmp_path: Path):
+    """Обработчик отдаёт файл по пути из базы — граница обязана проверяться.
+
+    Сейчас все три места, где заводится задание, кладут файл в каталог
+    загрузок. Но обработчик об этом только знает со слов, а отдаёт наружу:
+    четвёртый путь, забывший про правило, превратил бы это в чтение любого
+    файла с сервера.
+    """
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("подмена.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    _ждём_готовности(client, job["id"])
+
+    чужой = tmp_path / "секрет.wav"
+    чужой.write_bytes("RIFF____WAVEсекретные данные".encode())
+    client.app.state.hub.db.update_job(job["id"], file_path=str(чужой))
+
+    ответ = client.get(f"/api/jobs/{job['id']}/audio")
+    assert ответ.status_code >= 400, "файл вне каталога загрузок отдан наружу"
+    assert "секретные".encode() not in ответ.content, (
+        "содержимое чужого файла ушло клиенту")

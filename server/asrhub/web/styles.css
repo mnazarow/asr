@@ -605,3 +605,60 @@ body.modal-open { overflow: hidden; }
   background: var(--ok);
   transition: width 0.1s linear;
 }
+
+/* ==========================================================================
+   Проигрыватель записи
+   ========================================================================== */
+
+/* Своя панель вместо <audio controls>: встроенная у каждого браузера своя,
+   скорость воспроизведения прячет в меню, а для проверки распознавания она
+   нужна чаще всего — сомнительное слово слушают на 0.75×, а знакомый кусок
+   пролистывают на 1.75×. */
+.player {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; margin-bottom: 10px;
+  background: var(--bg-elev-2); border: 1px solid var(--border);
+  border-radius: 8px; flex-wrap: wrap;
+}
+.player .play {
+  flex: none; width: 34px; height: 34px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 13px; line-height: 1;
+  background: var(--accent); color: #fff; border: none; cursor: pointer;
+}
+.player .play:hover { filter: brightness(1.1); }
+.player .play:disabled { opacity: .45; cursor: default; filter: none; }
+.player .time { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text-dim); flex: none; }
+.player .scrub { flex: 1 1 180px; min-width: 120px; }
+/* Общее правило форм задаёт полям width:100%, и выпадающий список скорости
+   уезжал на всю строку, выталкивая кнопку скачивания на третью. Ширину
+   поэтому задаём явно. */
+.player select, .player .skip {
+  flex: none; width: auto; font-size: 12px; padding: 3px 6px;
+  background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer;
+}
+.player select { min-width: 66px; padding-right: 4px; }
+.player .skip { min-width: 34px; }
+.player .note { flex-basis: 100%; font-size: 12px; color: var(--text-faint); }
+.player .note.err { color: var(--err); }
+
+/* Ползунок: одинаковый в обоих движках, иначе в Firefox он вдвое толще. */
+.player input[type=range] {
+  -webkit-appearance: none; appearance: none; height: 4px; border-radius: 3px;
+  background: var(--border); outline: none; cursor: pointer;
+}
+.player input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 13px; height: 13px;
+  border-radius: 50%; background: var(--accent); border: none;
+}
+.player input[type=range]::-moz-range-thumb {
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--accent); border: none;
+}
+
+/* Сегмент, который звучит прямо сейчас. Отличается от .active — та метка
+   означает «сюда перешли», а эта «это слышно», и они могут разойтись, когда
+   человек листает расшифровку во время воспроизведения. */
+.segment.playing { background: var(--accent-soft); }
+.segment.playing .ts { color: var(--accent); font-weight: 600; }
+.segment[data-start] { cursor: pointer; }
