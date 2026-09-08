@@ -1555,6 +1555,67 @@ def test_removing_an_engine_also_removes_the_package_itself(repo_root: Path,
     assert out == ""
 
 
+def _поддельное_окружение(корень: Path, проверка: str, код: int = 1) -> Path:
+    """Каталог, похожий на установленный ASR Hub, с pip-заглушкой."""
+    prefix = корень / "prefix"
+    (prefix / "server").mkdir(parents=True)
+    (prefix / "venv" / "bin").mkdir(parents=True)
+    (prefix / "requirements" / "engines").mkdir(parents=True)
+    (prefix / "requirements" / "engines" / "тест.txt").write_text(
+        "пакет>=1\n", encoding="utf-8")
+    pip = prefix / "venv" / "bin" / "pip"
+    pip.write_text(
+        '#!/usr/bin/env bash\n'
+        'if [[ "$1" == "check" ]]; then\n'
+        f'  cat <<\'CHECK\'\n{проверка}\nCHECK\n'
+        f'  exit {код}\n'
+        'fi\n'
+        'echo "Successfully installed пакет-1.0"\n'
+        'exit 0\n', encoding="utf-8")
+    pip.chmod(0o755)
+    python = prefix / "venv" / "bin" / "python"
+    python.write_text('#!/usr/bin/env bash\nexit 1\n', encoding="utf-8")
+    python.chmod(0o755)
+    return prefix
+
+
+def test_installing_an_engine_checks_the_environment_afterwards(repo_root: Path,
+                                                                tmp_path: Path):
+    """Движок ставится в общее окружение и двигает версии соседей.
+
+    install.sh и update.sh подводят итог `pip check`, а `models.sh
+    install-engine` — нет: движок, поставленный отдельной командой, ломал
+    соседа молча, и расхождение всплывало через неделю как необъяснимый
+    отказ загрузки модели.
+    """
+    prefix = _поддельное_окружение(
+        tmp_path,
+        "nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, but you have protobuf 7.36.1.")
+    result = run_bash(f'bash "{repo_root}/scripts/models.sh" install-engine тест '
+                      f'--prefix "{prefix}" --yes')
+    текст = result.stdout + result.stderr
+    assert "не сходятся" in текст, f"окружение после установки движка не проверено:\n{текст}"
+    assert "protobuf" in текст, текст
+
+
+def test_removing_an_engine_checks_the_environment_afterwards(repo_root: Path,
+                                                              tmp_path: Path):
+    """«Некоторые пакеты могут использоваться другими движками» — кем именно?
+
+    Предупреждение перед удалением честное, но безадресное. Ответ на него
+    даёт та же проверка, и дать его надо сразу, пока причина очевидна.
+    """
+    prefix = _поддельное_окружение(
+        tmp_path,
+        "whisperx 3.4.3 requires ctranslate2<5, but you have ctranslate2 5.1.0.")
+    # remove-engine ищет файл требований в репозитории, не в prefix.
+    result = run_bash(f'bash "{repo_root}/scripts/models.sh" remove-engine gigaam '
+                      f'--prefix "{prefix}" --yes')
+    текст = result.stdout + result.stderr
+    assert "не сходятся" in текст, f"окружение после удаления движка не проверено:\n{текст}"
+    assert "ctranslate2" in текст, текст
+
+
 def test_engine_list_does_not_offer_a_directory(repo_root: Path):
     """Каталог no-deps не должен выглядеть движком.
 
@@ -2478,43 +2539,123 @@ def test_dry_run_does_not_warn_about_files_it_never_copied(repo_root: Path,
     assert "Чек-лист установки" in текст, "итог не напечатан"
 
 
-def test_pip_conflicts_reach_the_checklist(repo_root: Path, tmp_path: Path):
-    """pip умеет завершиться успешно и тут же сообщить о раздоре версий.
+ЖУРНАЛ_КОНФЛИКТА = (
+    "Successfully uninstalled huggingface_hub-1.30.0\n"
+    "ERROR: pip's dependency resolver does not currently take into account all "
+    "the packages that are installed. This behaviour is the source of the "
+    "following dependency conflicts.\n"
+    "transformers 5.16.1 requires huggingface-hub<2.0,>=1.5.0, but you have "
+    "huggingface-hub 0.36.2 which is incompatible.\n"
+    "nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, but you have "
+    "protobuf 7.36.1 which is incompatible.\n"
+    "Successfully installed huggingface-hub-0.36.2\n"
+)
 
-    Такой ERROR: — не сбой команды, поэтому он проходил мимо разбора и мимо
-    чек-листа: обновление отчитывалось «всё прошло без замечаний», а в
-    выводе стояли три жалобы на несовместимые версии. Именно из них потом
-    вырастают необъяснимые сбои загрузки моделей.
+
+def _пишем_pip(путь: Path, вывод: str, проверка: str = "", код_проверки: int = 0):
+    """Поддельный pip: обычный вызов печатает `вывод`, `pip check` — своё."""
+    путь.write_text(
+        '#!/usr/bin/env bash\n'
+        'if [[ "$1" == "check" ]]; then\n'
+        f'  cat <<\'CHECK\'\n{проверка or "No broken requirements found."}\nCHECK\n'
+        f'  exit {код_проверки}\n'
+        'fi\n'
+        f'cat <<\'OUT\'\n{вывод}OUT\n'
+        'exit 0\n', encoding="utf-8")
+    путь.chmod(0o755)
+
+
+def test_pip_conflicts_reach_the_journal_but_not_the_checklist(repo_root: Path,
+                                                               tmp_path: Path):
+    """Жалоба на середине пути описывает состояние, которого к концу уже нет.
+
+    Движки ставятся по очереди и перетягивают общие пакеты друг у друга.
+    Первый прогон на сервере это и показал: pip после третьего движка
+    пожаловался, что protobuf 5.29.6 мал для googleapis-common-protos, — а к
+    концу установки в окружении стоял protobuf 7.36.1, и жалоба указывала на
+    версию, которой там уже не было. Гонять человека за призраком хуже, чем
+    промолчать, поэтому в чек-лист промежуточное состояние не выносится.
+    Но и терять его нельзя: в журнале строка остаётся.
     """
     common = repo_root / "scripts" / "lib" / "common.sh"
-    вывод = tmp_path / "pip.log"
-    вывод.write_text(
-        "Successfully uninstalled huggingface_hub-1.30.0\n"
-        "ERROR: pip's dependency resolver does not currently take into account all "
-        "the packages that are installed. This behaviour is the source of the "
-        "following dependency conflicts.\n"
-        "transformers 5.16.1 requires huggingface-hub<2.0,>=1.5.0, but you have "
-        "huggingface-hub 0.36.2 which is incompatible.\n"
-        "nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, but you have "
-        "protobuf 7.36.1 which is incompatible.\n"
-        "Successfully installed huggingface-hub-0.36.2\n", encoding="utf-8")
-    # Через настоящий pip_install: pip завершился успешно, и именно поэтому
-    # раньше жалоба никуда не попадала.
     pip = tmp_path / "pip"
-    pip.write_text(f'#!/usr/bin/env bash\ncat "{вывод}"\nexit 0\n', encoding="utf-8")
-    pip.chmod(0o755)
+    _пишем_pip(pip, ЖУРНАЛ_КОНФЛИКТА)          # pip check к концу чист
+    журнал = tmp_path / "прогон.log"
+    script = f'''
+      export ASRHUB_LOG_FILE="{журнал}"
+      source "{common}"
+      step "Обновление зависимостей"
+      pip_install "{pip}" 2 -r требования.txt
+      check_dependency_health "{pip}"
+      checklist_print 0
+    '''
+    result = run_bash(script)
+    итог = (result.stdout + result.stderr).split("Чек-лист")[-1]
+    assert "Всё прошло без замечаний" in итог, (
+        "промежуточная жалоба попала в чек-лист, хотя к концу её предмет исчез:\n" + итог)
+
+    записано = журнал.read_text(encoding="utf-8")
+    assert "CONFLICT" in записано and "protobuf" in записано, (
+        "строка не сохранена даже в журнале — восстановить ход установки нечем:\n"
+        + записано)
+
+
+def test_the_final_check_still_speaks_when_the_conflict_survives(repo_root: Path,
+                                                                 tmp_path: Path):
+    """Молчание промежуточных жалоб не должно приводить к молчанию вообще.
+
+    Если расхождение дожило до конца установки, о нём обязан сказать
+    `pip check` — он один видит окружение целиком и после всех установок.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    pip = tmp_path / "pip"
+    _пишем_pip(pip, ЖУРНАЛ_КОНФЛИКТА,
+               проверка="nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, "
+                        "but you have protobuf 7.36.1.",
+               код_проверки=1)
     script = f'''
       source "{common}"
       setup_logging "{tmp_path}"
       step "Обновление зависимостей"
       pip_install "{pip}" 2 -r требования.txt
+      check_dependency_health "{pip}"
       checklist_print 0
     '''
     result = run_bash(script)
     итог = (result.stdout + result.stderr).split("Чек-лист")[-1]
-    assert "Всё прошло без замечаний" not in итог, "ложное «всё хорошо» вернулось"
-    assert "версии пакетов разошлись" in итог, итог
-    assert "huggingface-hub" in итог and "protobuf" in итог, итог
+    assert "Всё прошло без замечаний" not in итог, "настоящее расхождение замолчали"
+    assert "не сходятся" in итог and "protobuf" in итог, итог
+
+
+def test_one_conflict_is_reported_once(repo_root: Path, tmp_path: Path):
+    """Один и тот же раздор показывался трижды — по разу на каждый источник.
+
+    Движков в установке шесть, и общий пакет перетягивают несколько подряд:
+    каждая установка печатала свою копию жалобы, а в конце её же печатала
+    итоговая проверка. Человек читал три абзаца об одном и том же и искал
+    три разные поломки.
+    """
+    common = repo_root / "scripts" / "lib" / "common.sh"
+    pip = tmp_path / "pip"
+    _пишем_pip(pip, ЖУРНАЛ_КОНФЛИКТА,
+               проверка="nemo-toolkit-asr 2.8.0rc2 requires protobuf~=5.29.5, "
+                        "but you have protobuf 7.36.1.",
+               код_проверки=1)
+    script = f'''
+      source "{common}"
+      setup_logging "{tmp_path}"
+      step "Движки"
+      pip_install "{pip}" 2 -r nemo.txt
+      pip_install "{pip}" 2 -r postprocess.txt
+      pip_install "{pip}" 2 -r diarization.txt
+      check_dependency_health "{pip}"
+      checklist_print 0
+    '''
+    result = run_bash(script)
+    итог = (result.stdout + result.stderr).split("Чек-лист")[-1]
+    строки = [s for s in итог.splitlines() if "protobuf" in s]
+    assert len(строки) == 1, (
+        f"жалоба показана {len(строки)} раз(а) вместо одного:\n{итог}")
 
 
 def test_a_clean_pip_run_stays_quiet(repo_root: Path, tmp_path: Path):

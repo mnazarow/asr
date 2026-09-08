@@ -72,6 +72,10 @@ declare -a _CLEANUP_PATHS=()
 _STEP_CURRENT=""
 _STEP_INDEX=0
 _STEP_TOTAL=0
+# Замечал ли pip расхождение версий по ходу установки. Само по себе это не
+# находка (см. pip_report_conflicts), но итоговой проверке полезно знать,
+# рассосалось расхождение к концу или его просто не было.
+_PIP_CONFLICTS_SEEN=0
 
 # Цвета включаем только для терминала и когда их не запретили
 if [[ -t 1 && "${ASRHUB_NO_COLOR}" != "1" && -z "${NO_COLOR:-}" ]]; then
@@ -885,6 +889,16 @@ filter_deliberate() {
   done <<< "${text}"
 }
 
+# Оставляет в журнале след, почему промежуточные жалобы pip никуда не вышли:
+# к концу установки их предмет исчез. Без этой строки в журнале остаются
+# CONFLICT-записи, за которыми не следует ни находки, ни объяснения, — и
+# читающий журнал думает, что проверка их проглядела.
+_pip_conflicts_resolved() {
+  [[ "${_PIP_CONFLICTS_SEEN}" == "1" ]] || return 0
+  debug "расхождения версий, замеченные по ходу, к концу установки разошлись"
+  return 0
+}
+
 # Сводит итог по согласованности окружения: pip check знает про все пакеты
 # сразу, а не только про те, что ставились сейчас. Пустой вывод — всё сходится.
 #
@@ -895,11 +909,19 @@ check_dependency_health() {
   [[ "${ASRHUB_DRY_RUN}" == "1" ]] && return 0
   out="$("${pip}" check 2>&1 || true)"
   # «No broken requirements found» — то, ради чего всё и затевалось.
-  grep -qiE "no broken requirements" <<<"${out}" && return 0
+  if grep -qiE "no broken requirements" <<<"${out}"; then
+    _pip_conflicts_resolved
+    return 0
+  fi
   out="$(set +o pipefail; grep -E "requires|has requirement" <<<"${out}" | sort -u || true)"
   out="$(filter_deliberate "${out}" "$(deliberate_deviations "${root}")")"
-  [[ -n "${out}" ]] || return 0
+  if [[ -z "${out}" ]]; then
+    _pip_conflicts_resolved
+    return 0
+  fi
   warn "Версии пакетов в окружении не сходятся:"
+  # Это итог после всех установок, поэтому он и заменяет промежуточные
+  # жалобы pip: те показывали состояние на середине пути.
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     count=$((count + 1))
@@ -908,6 +930,7 @@ check_dependency_health() {
   [[ ${count} -gt 5 ]] && hint "… и ещё $((count - 5)); полный список: ${pip} check"
   hint "Движки требуют несовместимых версий одного пакета. Работать это чаще"
   hint "всего продолжает, но именно отсюда берутся необъяснимые сбои загрузки."
+  hint "Полная картина: ${pip} check"
   return 0
 }
 
@@ -925,19 +948,21 @@ pip_report_conflicts() {
            | sed 's/^[[:space:]]*//' | sort -u || true)"
   lines="$(filter_deliberate "${lines}" "$(deliberate_deviations "${root}")")"
   [[ -n "${lines}" ]] || return 0
-  warn "После установки версии пакетов разошлись:"
+
+  # Промежуточное состояние в чек-лист не выносим. Движки ставятся по
+  # очереди и перетягивают общие пакеты друг у друга: жалоба после третьего
+  # движка к концу установки может уже не соответствовать действительности —
+  # так и вышло с protobuf, где в списке оказались обе стороны спора и одна
+  # из них была про версию, которой в окружении уже нет. Гонять человека за
+  # призраком хуже, чем промолчать: итог подведёт pip check, который видит
+  # окружение целиком и после всех установок.
+  _PIP_CONFLICTS_SEEN=1
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     count=$((count + 1))
-    if [[ ${count} -le 5 ]]; then hint "${line}"; fi
+    _log_raw CONFLICT "${line}"
   done <<< "${lines}"
-  [[ ${count} -gt 5 ]] && hint "… и ещё $((count - 5)) — в журнале"
-  # Совет про pip check — один раз за прогон: он одинаковый, а места в
-  # чек-листе занимает столько же, сколько настоящая строка.
-  if [[ "${_PIP_CHECK_HINTED:-0}" != "1" ]]; then
-    _PIP_CHECK_HINTED=1
-    hint "Полная картина: ${ASRHUB_VPIP:-pip} check"
-  fi
+  debug "разошлись версии (${count}) — итог подведёт проверка окружения"
   return 0
 }
 

@@ -431,6 +431,12 @@ install-engine)
     confirm "Всё равно установить в общее окружение?" "n" || exit 0
   fi
 
+  # Каталог требований берём тот же, из которого взят файл движка: в
+  # установленной копии это ${PREFIX}/requirements, в репозитории — соседний.
+  # Он нужен проверке, чтобы отличить намеренные отступления от находок.
+  REQ_ROOT="$(cd "$(dirname "${REQ}")/.." && pwd)"
+  export ASRHUB_REQUIREMENTS_DIR="${REQ_ROOT}"
+
   info "Установка движка «${ENGINE}»…"
   if install_engine_requirements "${VPIP}" "${REQ}" --disable-pip-version-check; then
     ok "Движок «${ENGINE}» установлен"
@@ -439,6 +445,10 @@ import sys; sys.path.insert(0,'${PREFIX}/server')
 from asrhub.engines import ENGINE_CLASSES
 cls = ENGINE_CLASSES.get('${ENGINE}')
 print('Проверка:', cls.check_available() if cls else 'движок неизвестен')" 2>/dev/null || true
+    # Движок ставится в общее окружение и тянет за собой чужие пакеты. Если
+    # он подвинул версию, на которой держится сосед, узнать об этом лучше
+    # здесь, а не через неделю по необъяснимому отказу загрузки.
+    check_dependency_health "${VPIP}" "${REQ_ROOT}"
   else
     error "Установка не удалась."
     # Самая частая причина отказа не в самом движке, а в версии Python:
@@ -488,6 +498,10 @@ remove-engine)
   confirm "Продолжить?" "n" || exit 0
   run "${VPIP}" uninstall -y ${PACKAGES} || warn "Часть пакетов удалить не удалось."
   ok "Движок «${ENGINE}» удалён"
+  # Удаление ломает окружение не реже установки: предупреждение выше говорит
+  # «могут использоваться другими движками», но кем именно — не говорит.
+  # Проверка отвечает на это прямо, и сразу, пока понятно, из-за чего.
+  check_dependency_health "${VPIP}" "$(cd "$(dirname "${REQ}")/.." && pwd)"
   ;;
 
 disk)
