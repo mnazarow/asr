@@ -241,11 +241,26 @@ class Settings:
     #: вместе с настройками. webhook_secret подписывает уведомления: ключ
     #: «только чтение» получал возможность подделывать результаты для
     #: принимающей стороны.
-    SECRET_KEYS = ("webhook_secret",)
+    #: Значения, которые нельзя отдавать наружу без прав администратора.
+    #:
+    #: Адрес обратного вызова и адрес сводки — это тоже секреты, хотя и не
+    #: выглядят ими: входящий адрес чата (Slack, Teams, Mattermost) несёт
+    #: токен прямо в строке адреса, и знающий его пишет в чат от имени
+    #: сервера. Раньше в перечне стоял один webhook_secret, и оба адреса
+    #: уходили открытым текстом любому ключу, включая доступ «только чтение».
+    SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token")
 
-    def to_dict(self, include_secrets: bool = False) -> dict[str, Any]:
+    def to_dict(self, for_admin: bool = False) -> dict[str, Any]:
+        """Настройки для выдачи наружу.
+
+        `for_admin` расширяет ответ ровно двумя вещами: раскладкой каталогов
+        и адресами обратных вызовов. Ключи доступа и токен Hugging Face не
+        отдаются никому и никогда: у токена есть своя ручка, которая
+        показывает шесть знаков и длину, а полное значение не нужно даже
+        тому, кто его задал, — он его и так знает.
+        """
         values = dict(self.values)
-        if not include_secrets:
+        if not for_admin:
             for key in self.SECRET_KEYS:
                 if values.get(key):
                     values[key] = "***"
@@ -253,13 +268,15 @@ class Settings:
             "values": values,
             "sources": dict(self.sources),
             "config_file": str(self.config_file) if self.config_file else None,
-            "paths": {k: str(v) for k, v in vars(self.paths).items()} if self.paths else {},
+            # Раскладка файловой системы — разведка перед атакой, и соседний
+            # GET /api/system прячет её за правами администратора с этой же
+            # мыслью. Здесь она уходила любому ключу, что делало ту защиту
+            # бессмысленной: путь к базе и каталогам был в двух запросах.
+            "paths": ({k: str(v) for k, v in vars(self.paths).items()}
+                      if (self.paths and for_admin) else {}),
             "hardware_hint": self.hardware_hint,
             "api_key_count": len(self.api_keys),
         }
-        if include_secrets:
-            data["api_keys"] = self.api_keys
-            data["hf_token"] = self.hf_token
         return data
 
     def save(self, path: Path | None = None) -> Path:

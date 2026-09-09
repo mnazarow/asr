@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,6 +18,10 @@ from .logging_setup import get_logger
 from .pipeline import metrics as M
 
 log = get_logger("analytics")
+
+#: Сколько меток показывать в разрезе. Метку задаёт клиент, и её мощность
+#: ничем не ограничена, в отличие от моделей, движков и языков.
+TAG_LIMIT = 100
 
 PERIODS = {
     "hour": 3600,
@@ -43,11 +48,32 @@ def _escape_label(value: Any) -> str:
 class Analytics:
     def __init__(self, db: Database):
         self.db = db
-        #: Кеш выборок заданий на время одного сводного отчёта. Вне отчёта —
-        #: None, то есть каждый разрез читает базу сам, как и раньше.
-        self._выборки: dict[tuple[Any, ...], list[dict[str, Any]]] | None = None
-        #: Границы окон, замороженные на время отчёта (см. `_since`).
-        self._окна: dict[str, float] | None = None
+        #: Кеш выборок и границы окон на время одного сводного отчёта.
+        #:
+        #: Потоко-локальные, и это не перестраховка. Объект `Analytics` один
+        #: на приложение, а обработчики синхронные и живут в пуле потоков:
+        #: общий кеш означал бы, что второй отчёт подхватывает чужую
+        #: заморозку окна, а когда первый заканчивается — теряет её на
+        #: середине. Половина разрезов посчиталась бы по одному окну, вторая
+        #: по другому, то есть ровно тот дефект, ради которого заморозка и
+        #: делалась, возвращался бы под нагрузкой и через раз.
+        self._местное = threading.local()
+
+    @property
+    def _выборки(self) -> dict[tuple[Any, ...], list[dict[str, Any]]] | None:
+        return getattr(self._местное, "выборки", None)
+
+    @_выборки.setter
+    def _выборки(self, значение: dict[tuple[Any, ...], list[dict[str, Any]]] | None) -> None:
+        self._местное.выборки = значение
+
+    @property
+    def _окна(self) -> dict[str, float] | None:
+        return getattr(self._местное, "окна", None)
+
+    @_окна.setter
+    def _окна(self, значение: dict[str, float] | None) -> None:
+        self._местное.окна = значение
 
     def _since(self, period: str) -> float:
         """Начало окна разреза; внутри отчёта — общее для всех разрезов.
@@ -65,7 +91,8 @@ class Analytics:
         return self._окна[period]
 
     def _jobs(self, *, since: float | None = None,
-              status: str | None = None, owner: str | None = None,
+              status: str | None = None,
+              owner: str | list[str] | None = None,
               limit: int = 100000) -> list[dict[str, Any]]:
         """Выборка заданий для разреза — с общим кешом внутри отчёта.
 
@@ -78,7 +105,13 @@ class Analytics:
         Строки только читают: ни один разрез не пишет в них, поэтому общий
         список можно отдавать всем сразу.
         """
-        ключ = (since, status, owner, limit)
+        # Владелец бывает списком: ключ в подразделении видит задания всей
+        # группы, и `scope_owner` отдаёт перечень. Список нехешируем, и без
+        # этого приведения любой такой ключ получал 500 на всей аналитике —
+        # ровно там, где разграничение по владельцу и работает.
+        ключ = (since, status,
+                tuple(owner) if isinstance(owner, (list, tuple)) else owner,
+                limit)
         готовое = self._выборки.get(ключ) if self._выборки is not None else None
         if готовое is not None:
             return готовое
@@ -818,7 +851,15 @@ class Analytics:
                 "processing_s": round(запись["processing_s"], 1),
                 "rtf": round(запись["processing_s"] / (звук * 3600), 4) if звук else None,
             })
-        return sorted(строки, key=lambda r: -r["jobs"])
+        # Предел: метку задаёт клиент в запросе, и она единственная в отчёте
+        # с неограниченной мощностью. Клиент, ставящий уникальную метку на
+        # каждое задание (номер разговора, отметка времени), превращал этот
+        # разрез в сто тысяч строк — и в таблице на экране, и в листе
+        # выгрузки, где остальные разрезы не длиннее полусотни. Верх списка
+        # отвечает на вопрос «куда ушло время», хвост из одиночных меток —
+        # нет.
+        строки.sort(key=lambda r: -r["jobs"])
+        return строки[:TAG_LIMIT]
 
     # --- ожидание в очереди -------------------------------------------------
 

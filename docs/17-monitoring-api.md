@@ -123,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 31.8
+asrhub_uptime_seconds 35.5
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788899413.5045025,
-  "collected_at": "2026-09-08T20:30:13+0000",
+  "timestamp": 1788914775.241837,
+  "collected_at": "2026-09-09T00:46:15+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -235,14 +235,14 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 31.9,
+  "uptime_s": 35.6,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 32 с",
+        "detail": "работает 36 с",
         "hint": ""
       },
       {
@@ -271,7 +271,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 13.2 ГБ",
+        "detail": "свободно 12.9 ГБ",
         "hint": ""
       },
       {
@@ -338,7 +338,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 13.2 ГБ",
+      "detail": "свободно 12.9 ГБ",
       "hint": ""
     },
     {
@@ -508,6 +508,13 @@ curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \
 ### `GET /api/monitoring/targets`
 
 Приёмники метрик и состояние доставки.
+
+Куда уходят метрики и как идёт доставка.
+
+Адрес приёмника отдаётся целиком только администратору. У InfluxDB и
+Pushgateway учётные данные сплошь и рядом стоят прямо в строке запроса,
+а входящий адрес чата — это токен: соседние PUT и «проверить» требуют
+администратора, а чтение отдавало то же самое ключу «только чтение».
 
 **Доступ:** любой действующий ключ.
 

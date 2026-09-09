@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Request, status
 from pydantic import BaseModel, Field, field_validator
 
 from .. import phone_compat
-from ..errors import ASRHubError, ForbiddenError
+from ..errors import ASRHubError, ConfigError, ForbiddenError
 from ..logging_setup import get_logger
 from .deps import (
     Principal,
@@ -141,8 +141,11 @@ def _phone_status(status_name: str) -> str:
 def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
             principal: Principal) -> None:
     """Скачивает запись и ставит её в обычную очередь."""
+    # path_key, а не uuid: call_id приходит от клиента, и в исходном виде он
+    # уводил и запись файла, и рекурсивную уборку за пределы своих каталогов.
+    ключ = call.path_key
     workdir = Path(state.settings.get("temp_dir") or state.settings.paths.tmp) / \
-        f"phone-{call.uuid}"
+        f"phone-{ключ}"
     try:
         limit_mb = int(state.settings.get("max_upload_mb") or 0)
         fetched = phone_compat.download(
@@ -151,7 +154,16 @@ def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
 
         uploads = Path(state.settings.paths.uploads)
         uploads.mkdir(parents=True, exist_ok=True)
-        stored = uploads / f"{call.uuid}-{fetched.path.name}"
+        stored = uploads / f"{ключ}-{fetched.path.name}"
+        # Проверка после очистки, а не вместо неё. Очистка отвечает за то,
+        # что сюда не приедет «..», а эта строка — за то, что путь не увёл
+        # наружу вообще никак: расширение задаёт адрес источника, и цена
+        # ошибки здесь — свой файл в каталоге, откуда сервер что-то отдаёт.
+        if uploads.resolve() not in stored.resolve().parents:
+            raise ConfigError(
+                "Имя записи уводит за пределы каталога загрузок.",
+                hint="Проверьте значение call_id: в нём не должно быть "
+                     "разделителей пути.")
         shutil.move(str(fetched.path), stored)
 
         settings = _settings_for(state, call, fetched)

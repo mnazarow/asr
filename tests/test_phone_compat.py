@@ -513,6 +513,10 @@ def test_callback_url_with_cyrillic_is_delivered(tmp_path, monkeypatch):
         queue = JobQueue.__new__(JobQueue)      # без запуска рабочих потоков
         queue.db = Database(tmp_path / "asrhub.db")
         queue.settings = _FakeSettings()
+        # Доставка сверяется с признаком остановки: пауза между попытками
+        # доходит до минуты, и без этого процесс не завершался ещё полторы
+        # минуты после того, как очередь объявлена остановленной.
+        queue._stop = threading.Event()
         job = {"id": "job_1", "webhook_url": f"http://127.0.0.1:{port}/проект/callback.php"}
         queue.db.execute(
             "INSERT INTO jobs (id, status, created_at, updated_at) "

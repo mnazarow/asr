@@ -339,6 +339,14 @@ class JobQueue:
             text=cached.get("text"), result_path=result_path,
             segments_count=cached.get("segments_count"),
             words_count=cached.get("words_count"),
+            # Знаки и говорящие переносятся вместе с остальным. Их не было, и
+            # строка «Знаков» в сводке занижалась ровно на долю попаданий в
+            # кеш — при том что «Слов» считалось полностью, так что расхождение
+            # выглядело как ошибка в подсчёте, а не как пропуск. Ноль
+            # говорящих вдобавок молча выбрасывал такие задания из разреза по
+            # числу собеседников.
+            chars_count=cached.get("chars_count"),
+            speakers_count=cached.get("speakers_count"),
             avg_confidence=cached.get("avg_confidence"),
             rtf=cached.get("rtf"), processing_time_s=0.0, queue_time_s=0.0,
             progress=1.0, stage="из кеша")
@@ -500,9 +508,15 @@ class JobQueue:
         workers = max(1, min(64, int(workers)))
         with self._lock:
             current = len(self._states)
+            # Снятие пометки — до ветвления, а не внутри «стало больше».
+            # Помеченный воркер уходит не сразу: он замечает пометку, только
+            # когда проснётся. Уменьшить и тут же вернуть обратно означало,
+            # что ни одна ветка не сработала — `current` ещё прежний, — и
+            # пометка оставалась. Воркеры досыпали, выходили, и сервер жил с
+            # половиной заявленных до самого перезапуска, показывая в
+            # состоянии полное число.
+            self._retiring -= set(range(workers))
             if workers > current:
-                # Вернувшиеся к работе индексы снимаем с выхода.
-                self._retiring -= set(range(workers))
                 for index in range(current, workers):
                     state = WorkerState(index=index)
                     self._states.append(state)
@@ -512,7 +526,11 @@ class JobQueue:
                     self._workers.append(thread)
             elif workers < current:
                 self._retiring.update(range(workers, current))
-            self._limit = workers
+            # Ушедшие потоки из перечня убираем: по его длине делится общий
+            # таймаут остановки, и с каждым изменением числа воркеров доля
+            # на поток становилась меньше — на давно живущем сервере
+            # остановка переставала ждать вообще.
+            self._workers = [t for t in self._workers if t.is_alive()]
         self.settings.set("max_concurrent_jobs", workers)
         self._wake.set()
 
@@ -739,11 +757,15 @@ class JobQueue:
             except Exception as exc:
                 log.exception("Непредвиденная ошибка воркера: %s", exc)
             finally:
-                with self._lock:
-                    self._running.pop(job["id"], None)
-                    model = job.get("model") or ""
-                    if model in self._model_counts:
-                        self._model_counts[model] = max(0, self._model_counts[model] - 1)
+                # Освобождение — одной функцией, а не второй копией здесь.
+                # Копия и разошлась: она снимала слот и счётчик модели, но не
+                # снимала отметку одновременности, и та копилась по записи на
+                # каждое проведённое задание. Мало того что без предела —
+                # `_note_concurrency` проходит этот словарь под общей
+                # блокировкой при каждом старте, и на сотне тысяч заданий
+                # выходило девять миллисекунд блокировки на задание. Со
+                # стороны это выглядит как «сервер к вечеру тупеет».
+                self._release_slot(job["id"], str(job.get("model") or ""))
                 state.busy = False
                 state.job_id = None
                 state.stage = ""
@@ -908,6 +930,29 @@ class JobQueue:
             except OSError:
                 pass
 
+    def _write_own(self, job_id: str, **fields: Any) -> bool:
+        """Записывает исход задания, только если оно всё ещё за нами.
+
+        Успешное завершение было защищено этим условием, а все три ветки
+        отказа писали безусловно — и защита оказывалась половинчатой.
+        Сценарий: наш экземпляр застрял дольше отметки жизни, сосед забрал
+        задание себе и считает; у нас всплывает ошибка движка и затирает его
+        работающее задание отказом. Когда сосед досчитает, его собственная
+        защищённая запись не пройдёт, и **готовая расшифровка будет
+        выброшена** — пользователь получит «ошибка» вместо результата.
+
+        Заодно снимается вторая беда: `retries` брался из снимка задания,
+        сделанного на старте, и перезаписывал увеличение, которое поставил
+        перехват. С этим условием такая запись просто не состоится.
+        """
+        записалось = self.db.update_job_if_status(
+            job_id, [STATUS_RUNNING], expected_instance=INSTANCE_ID, **fields)
+        if not записалось:
+            log.info("Задание %s больше не за нами — исход не записан "
+                     "(его перехватил другой экземпляр или оно уже завершено)",
+                     job_id, extra={"job_id": job_id})
+        return записалось
+
     def _handle_failure(self, job: dict[str, Any], error: ASRHubError,
                         merged: dict[str, Any], outdir: Path | None = None) -> None:
         job_id = job["id"]
@@ -915,8 +960,11 @@ class JobQueue:
             was_cancelled = job_id in self._cancelled
             self._cancelled.discard(job_id)
         if was_cancelled:
-            self.db.update_job(job_id, status=STATUS_CANCELLED, finished_at=now(),
-                               stage="отменено", instance_id=None, heartbeat_at=None)
+            if not self._write_own(job_id, status=STATUS_CANCELLED, finished_at=now(),
+                                   stage="отменено", instance_id=None,
+                                   heartbeat_at=None):
+                self._discard_results(outdir)
+                return
             RUNTIME.inc("asrhub_jobs_total", {"status": "cancelled"})
             self._discard_results(outdir)
             return
@@ -936,12 +984,15 @@ class JobQueue:
                     job_id, "retry_adjust",
                     f"Размер пакета уменьшен с {old_batch} до {params['batch_size']} "
                     f"из-за нехватки памяти")
-            self.db.update_job(
-                job_id, status=STATUS_RETRY, retries=retries + 1,
-                error_code=error.code, error_message=error.message, error_hint=error.hint,
-                stage=f"повтор через {int(delay)} с", progress=0.0,
-                instance_id=None, heartbeat_at=None,
-                queued_at=now() + delay, params=params)
+            if not self._write_own(
+                    job_id, status=STATUS_RETRY, retries=retries + 1,
+                    error_code=error.code, error_message=error.message,
+                    error_hint=error.hint,
+                    stage=f"повтор через {int(delay)} с", progress=0.0,
+                    instance_id=None, heartbeat_at=None,
+                    queued_at=now() + delay, params=params):
+                self._discard_results(outdir)
+                return
             self.db.add_event(job_id, "retry_scheduled",
                               f"Повтор {retries + 1} из {max_retries} через {int(delay)} с: "
                               f"{error.message}")
@@ -952,10 +1003,12 @@ class JobQueue:
                                      "delay_s": round(delay, 1), "error": error.message})
             return
 
-        self.db.update_job(
-            job_id, status=STATUS_FAILED, finished_at=now(), progress=0.0,
-            stage="ошибка", error_code=error.code, error_message=error.message,
-            error_hint=error.hint, instance_id=None, heartbeat_at=None)
+        if not self._write_own(
+                job_id, status=STATUS_FAILED, finished_at=now(), progress=0.0,
+                stage="ошибка", error_code=error.code, error_message=error.message,
+                error_hint=error.hint, instance_id=None, heartbeat_at=None):
+            self._discard_results(outdir)
+            return
         self.db.bump_model_stats(str(job.get("model") or ""), str(job.get("engine") or ""),
                                  ok=False)
         RUNTIME.inc("asrhub_jobs_total", {"status": "failed"})
@@ -999,6 +1052,13 @@ class JobQueue:
     def _send_webhook(self, job_id: str) -> None:
         job = self.db.get_job(job_id)
         if not job or not job.get("webhook_url"):
+            return
+        if self._stop.is_set():
+            # После остановки пул заводить нельзя: `stop` уже обнулил ссылку
+            # на него, и новый оказался бы непогашенным — его потоки не
+            # демоны и держали бы выход из процесса.
+            log.info("Уведомление для %s не отправлено: очередь остановлена",
+                     job_id, extra={"job_id": job_id})
             return
         self._webhook_pool().submit(self._webhook_worker, job)
 
@@ -1071,7 +1131,6 @@ class JobQueue:
         """Доставка с повторами. Одна на оба вида тела."""
         import hashlib
         import hmac
-        import time as time_mod
         import urllib.error
         import urllib.request
 
@@ -1093,6 +1152,10 @@ class JobQueue:
 
         attempts = 5
         for attempt in range(attempts):
+            if self._stop.is_set():
+                log.info("Доставка уведомления для %s не начата: очередь "
+                         "остановлена", job["id"], extra={"job_id": job["id"]})
+                return
             try:
                 request = urllib.request.Request(target, data=payload,
                                                  headers=headers, method="POST")
@@ -1105,7 +1168,17 @@ class JobQueue:
                 log.info("Уведомление для %s не доставлено (попытка %d из %d): %s",
                          job["id"], attempt + 1, attempts, exc)
             if attempt < attempts - 1:      # после последней попытки ждать незачем
-                time_mod.sleep(min(60, 2 ** attempt))
+                # Ждём на событии остановки, а не в sleep: пауза между
+                # попытками доходит до минуты, а всего попыток пять. Пул
+                # доставки гасится без ожидания, и уже запущенная попытка
+                # продолжала жить своей жизнью — процесс не завершался ещё
+                # полторы минуты после «Очередь остановлена», при недоступном
+                # приёмнике дольше. Остановка — это причина бросить доставку,
+                # а не повод её дождаться.
+                if self._stop.wait(timeout=min(60, 2 ** attempt)):
+                    log.info("Доставка уведомления для %s прервана остановкой",
+                             job["id"], extra={"job_id": job["id"]})
+                    return
         self.db.update_job(job["id"], webhook_status="failed")
         RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
 
@@ -1229,11 +1302,20 @@ class JobQueue:
             # ошибка при выгрузке модели с видеокарты) означал, что уборка
             # хранилища не выполняется НИКОГДА — last_cleanup не обновлялся,
             # и диск не чистился, пока сбой не пройдёт сам.
+            сбой_на_обороте = False
             try:
                 for step_fn in (self.registry.collect_idle, self._sample_system):
                     try:
                         step_fn()
                     except Exception as exc:            # noqa: BLE001
+                        # Пометка нужна, чтобы ветка else ниже не объявила
+                        # восстановление: сбой шага ловится здесь, внешний
+                        # try завершается штатно, и счётчик обнулялся на
+                        # каждом обороте. Ограничитель записей не включался
+                        # никогда, а в журнал каждые двадцать секунд шла пара
+                        # строк «дал сбой (1-й раз)» и «восстановился» —
+                        # ровно то заливание, против которого он и написан.
+                        сбой_на_обороте = True
                         failures += 1
                         if failures <= 3 or failures % 180 == 0:
                             log.warning("Служебный шаг %s дал сбой (%d-й раз): %s",
@@ -1272,9 +1354,9 @@ class JobQueue:
                 else:
                     log.debug("Служебный цикл: %s", exc)
             else:
-                if failures:
+                if failures and not сбой_на_обороте:
                     log.info("Служебный цикл восстановился после %d сбоев", failures)
-                failures = 0
+                    failures = 0
 
     def _analytics(self) -> Any:
         """Аналитика для сводки. Заводится по требованию и один раз.

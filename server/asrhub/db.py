@@ -924,6 +924,7 @@ class Database:
         return [str(r["job_id"]) for r in rows]
 
     def search_segments(self, search: str, *, job_id: str = "",
+                        job_ids: Sequence[str] = (),
                         limit: int = 200) -> list[dict[str, Any]]:
         """Найденные реплики: где сказано, на какой секунде и что вокруг.
 
@@ -940,6 +941,10 @@ class Database:
         if job_id:
             условие += " AND s.job_id = ?"
             args.append(job_id)
+        elif job_ids:
+            места = ",".join("?" for _ in job_ids)
+            условие += f" AND s.job_id IN ({места})"
+            args.extend(job_ids)
         try:
             rows = self.query(
                 "SELECT s.job_id, s.idx, s.start_s, s.end_s, s.speaker, s.text, "
@@ -957,11 +962,14 @@ class Database:
         if not job_ids or not self.fts_ready:
             return {}
         лучшее: dict[str, dict[str, Any]] = {}
-        # Берём с запасом: у одного разговора находок может быть много, а
-        # нужна по одной с каждого.
-        for реплика in self.search_segments(search, limit=len(job_ids) * 8 + 50):
+        # Отбор сразу по нужным заданиям, а не фильтром после. Общий поиск с
+        # отсевом выглядит тем же самым, но предел выборки съедали чужие
+        # совпадения: на оживлённом архиве фраза пропадала из строки тем
+        # чаще, чем активнее соседи, — и без всякой видимой причины.
+        for реплика in self.search_segments(
+                search, job_ids=list(job_ids), limit=len(job_ids) * 8 + 50):
             лучшее.setdefault(str(реплика["job_id"]), реплика)
-        return {k: v for k, v in лучшее.items() if k in set(job_ids)}
+        return лучшее
 
     def owner_usage(self, owner: str | list[str], since: float) -> dict[str, float]:
         """Расход владельца (или подразделения) с указанного момента.
@@ -1365,7 +1373,8 @@ class Database:
             for row in stale:
                 # Сначала файлы, потом запись: если удаление файлов упадёт,
                 # задание останется в базе и попадёт в следующую уборку.
-                removed["bytes"] = removed.get("bytes", 0) + _remove_job_files(dict(row))
+                removed["bytes"] = removed.get("bytes", 0) + _remove_job_files(
+                    dict(row), self.path.parent)
                 self.delete_job(row["id"])
             removed["jobs"] = len(stale)
             removed["more"] = 1 if len(stale) >= CLEANUP_BATCH else 0
@@ -1415,23 +1424,44 @@ class Database:
         self._closed = True
 
 
-def _remove_job_files(job: dict[str, Any]) -> int:
+def _within(base: Path, target: str) -> Path | None:
+    """Путь, если он лежит внутри каталога данных, иначе None.
+
+    Уборка удаляет по значениям из базы, а не по вычисленным на месте: путь
+    туда кладёт сервер, но если он попадёт в базу как-то иначе — правкой
+    руками, восстановлением из чужой копии, ошибкой в новом маршруте, —
+    уборка по сроку хранения превратится в удаление произвольного файла,
+    причём молча и раз в час. Все каталоги сервера лежат под каталогом
+    данных (см. `Paths.create`), так что проверка ровно одна.
+    """
+    if not target:
+        return None
+    try:
+        корень = base.resolve(strict=True)
+        путь = Path(target).resolve(strict=True)
+    except OSError:
+        return None
+    if корень != путь.parent and корень not in путь.parents:
+        log.warning("Уборка не трогает «%s»: путь вне каталога данных «%s»",
+                    путь, корень)
+        return None
+    return путь
+
+
+def _remove_job_files(job: dict[str, Any], base: Path) -> int:
     """Удаляет каталог результатов и исходник задания. Возвращает объём."""
     import shutil
 
     freed = 0
-    result_path = job.get("result_path")
-    if result_path:
-        directory = Path(result_path)
-        if directory.is_dir():
-            try:
-                freed += sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
-                shutil.rmtree(directory, ignore_errors=True)
-            except OSError as exc:
-                log.warning("Не удалось удалить результаты %s: %s", directory, exc)
-    source = job.get("file_path")
-    if source:
-        path = Path(source)
+    directory = _within(base, str(job.get("result_path") or ""))
+    if directory is not None and directory.is_dir():
+        try:
+            freed += sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
+            shutil.rmtree(directory, ignore_errors=True)
+        except OSError as exc:
+            log.warning("Не удалось удалить результаты %s: %s", directory, exc)
+    path = _within(base, str(job.get("file_path") or ""))
+    if path is not None:
         try:
             if path.is_file():
                 freed += path.stat().st_size

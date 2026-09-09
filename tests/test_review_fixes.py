@@ -2081,3 +2081,439 @@ def test_a_digest_that_cannot_be_delivered_never_breaks_the_server(tmp_path: Pat
                                    "http://127.0.0.1:9/hook") is False
     # И совсем негодный адрес тоже не роняет.
     assert maintenance.send_digest({"kind": "asrhub.digest"}, "не адрес") is False
+
+
+# ---------------------------------------------------------------------------
+# Разграничение доступа и недоверенный ввод
+# ---------------------------------------------------------------------------
+
+def test_call_id_cannot_walk_out_of_the_uploads_directory():
+    """`call_id` приходит от клиента и становился частью пути.
+
+    Значение вида «../../../имя» уводило запись скачанного файла за пределы
+    каталога загрузок, а расширение задавал адрес источника: маршрут
+    позволял положить свой .js или .html куда угодно, куда пишет служба, и
+    рекурсивно снести чужой каталог при уборке.
+    """
+    from asrhub.phone_compat import PhoneRequest, safe_path_key
+
+    uploads = Path("/var/lib/asrhub/uploads")
+    злые = ["../../../подброшено", "..", "....//..", "a/b/c", "\\\\сервер\\доля",
+            ".", "./..", "%2e%2e/", "\x00имя", "id\nимя"]
+    for call_id in злые:
+        запрос = PhoneRequest(call_id=call_id, part=1,
+                              files=["https://x/y.js"], base_url="https://x")
+        ключ = запрос.path_key
+        assert "/" not in ключ and "\\" not in ключ and ".." not in ключ, (call_id, ключ)
+        путь = (uploads / f"{ключ}-часть-0.js").resolve()
+        assert uploads.resolve() in путь.parents, (call_id, путь)
+
+    # Обычный идентификатор при этом узнаваем, а не превращён в хеш.
+    обычный = PhoneRequest(call_id="CALL-2026-0042", part=2,
+                           files=["https://x/y.wav"], base_url="https://x")
+    assert обычный.path_key == "CALL-2026-0042_2", обычный.path_key
+    # Сам call_id не тронут: он уходит в group_id и в обратный вызов как есть.
+    assert обычный.call_id == "CALL-2026-0042"
+    assert safe_path_key("") == "без-имени"
+
+
+def test_deleting_a_job_never_deletes_a_file_outside_the_data_directory(
+        client, tmp_path: Path, monkeypatch):
+    """Удаление шло по значению из базы без всякой проверки.
+
+    Путь туда кладёт сервер, но стоит ему попасть в базу иначе — правкой
+    руками, восстановлением из чужой копии, ошибкой в новом маршруте, — и
+    удаление задания превращается в удаление любого файла, до которого
+    дотягивается служба.
+    """
+    посторонний = tmp_path / "чужой-важный-файл.txt"
+    посторонний.write_text("не трогать", encoding="utf-8")
+    чужой_каталог = tmp_path / "чужой-каталог"
+    чужой_каталог.mkdir()
+    (чужой_каталог / "внутри.txt").write_text("тоже не трогать", encoding="utf-8")
+
+    state = client.app.state.hub
+    job_id = state.db.create_job({
+        "filename": "подделка.wav", "model": "demo-simulator",
+        "status": "completed",
+        "file_path": str(посторонний), "result_path": str(чужой_каталог)})
+
+    ответ = client.delete(f"/api/jobs/{job_id}")
+    assert ответ.status_code == 200, ответ.text
+    assert посторонний.exists(), "удаление задания снесло посторонний файл"
+    assert чужой_каталог.exists(), "удаление задания снесло посторонний каталог"
+    assert state.db.get_job(job_id) is None, "само задание должно быть удалено"
+
+
+def test_cleanup_never_deletes_files_outside_the_data_directory(tmp_path: Path):
+    """Та же проверка для уборки по сроку хранения.
+
+    Она идёт раз в час и молча: без проверки это удаление произвольного
+    файла по расписанию.
+    """
+    from asrhub.db import Database
+
+    данные = tmp_path / "data"
+    данные.mkdir()
+    database = Database(данные / "asrhub.db")
+
+    посторонний = tmp_path / "снаружи.txt"
+    посторонний.write_text("не трогать", encoding="utf-8")
+    свой = данные / "uploads"
+    свой.mkdir()
+    внутренний = свой / "своя-запись.wav"
+    внутренний.write_bytes(b"x" * 100)
+
+    давно = time.time() - 400 * 86400
+    for путь in (посторонний, внутренний):
+        job_id = database.create_job({"filename": путь.name, "model": "m",
+                                      "file_path": str(путь)})
+        database.update_job(job_id, status="completed", finished_at=давно)
+
+    database.cleanup(results_days=30)
+    assert посторонний.exists(), "уборка вышла за каталог данных"
+    assert not внутренний.exists(), "уборка не удалила свой же файл"
+
+
+def test_settings_do_not_leak_callback_addresses_and_paths(auth_client, two_users):
+    """Входящий адрес чата — это токен, а не просто адрес.
+
+    Кто его знает, тот пишет в чат от имени сервера. Раскладка каталогов —
+    разведка перед атакой, и соседний GET /api/system прячет её за правами
+    администратора; здесь она уходила любому ключу, что делало ту защиту
+    бессмысленной.
+    """
+    админ = {"X-API-Key": two_users["admin"]}
+    обычный = {"X-API-Key": two_users["bob"]}
+    секрет = "https://hooks.example.com/services/T0/B0/ОЧЕНЬ-СЕКРЕТНЫЙ-ТОКЕН"
+
+    установка = auth_client.put("/api/settings", json={"webhook_url": секрет},
+                                headers=админ)
+    assert установка.status_code == 200, установка.text
+
+    чужой = auth_client.get("/api/settings", headers=обычный)
+    assert чужой.status_code == 200, чужой.text
+    assert секрет not in чужой.text, "адрес обратного вызова ушёл наружу"
+    assert чужой.json()["values"]["webhook_url"] == "***"
+    assert чужой.json()["paths"] == {}, "раскладка каталогов ушла наружу"
+
+    свой = auth_client.get("/api/settings", headers=админ)
+    assert свой.json()["values"]["webhook_url"] == секрет, "администратор своего не видит"
+    assert свой.json()["paths"], "администратору раскладка нужна"
+
+    # Ключи доступа и токен не отдаются никому: у токена своя ручка.
+    for ответ in (чужой, свой):
+        assert "api_keys" not in ответ.json(), ответ.json().keys()
+        assert "hf_token" not in ответ.json(), ответ.json().keys()
+
+
+def test_metric_receivers_hide_their_credentials_from_ordinary_keys(auth_client,
+                                                                    two_users):
+    """У InfluxDB и Pushgateway пароль стоит прямо в строке запроса.
+
+    Соседние «заменить» и «проверить» требуют администратора, а чтение
+    отдавало тот же адрес ключу «только чтение».
+    """
+    админ = {"X-API-Key": two_users["admin"]}
+    только_чтение = {"X-API-Key": two_users["readonly"]}
+    адрес = "https://influx.local/write?u=admin&p=ОЧЕНЬ-СЕКРЕТНЫЙ-ПАРОЛЬ"
+
+    установка = auth_client.put("/api/monitoring/targets", headers=админ, json=[
+        {"name": "influx", "kind": "influxdb", "url": адрес, "interval_s": 60}])
+    if установка.status_code != 200:
+        pytest.skip(f"приёмник не завёлся: {установка.text[:120]}")
+
+    чужой = auth_client.get("/api/monitoring/targets", headers=только_чтение)
+    assert чужой.status_code == 200, чужой.text
+    assert "СЕКРЕТНЫЙ" not in чужой.text, "учётные данные приёмника ушли наружу"
+    # Но куда шлём — видно: «***» на этот вопрос не отвечает.
+    assert "influx.local" in чужой.text, чужой.text
+
+    свой = auth_client.get("/api/monitoring/targets", headers=админ)
+    assert адрес in свой.text, "администратор своего адреса не видит"
+
+
+def test_analytics_works_for_a_key_that_belongs_to_a_group(tmp_path: Path):
+    """Ключ в подразделении видит задания всей группы.
+
+    `scope_owner` отдаёт для него перечень владельцев, а список нехешируем:
+    общий кеш выборок падал с TypeError, и такой ключ получал 500 на всей
+    аналитике — ровно там, где разграничение и работает.
+    """
+    from asrhub.analytics import Analytics
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "g.sqlite3")
+    момент = time.time()
+    for кто in ("alice", "bob", "carol"):
+        job_id = database.create_job({"model": "m", "owner": кто,
+                                      "media_duration_s": 60.0,
+                                      "created_at": момент})
+        database.update_job(job_id, status="completed", finished_at=момент + 10,
+                            processing_time_s=10.0)
+
+    отчёт = Analytics(database).full_report("month", owner=["alice", "bob"])
+    assert отчёт["overview"]["jobs"]["total"] == 2, отчёт["overview"]["jobs"]
+    # И одиночный владелец не сломался заодно.
+    один = Analytics(database).full_report("month", owner="carol")
+    assert один["overview"]["jobs"]["total"] == 1, один["overview"]["jobs"]
+
+
+def test_the_snippet_search_is_limited_to_the_rows_being_shown(tmp_path: Path):
+    """Предел выборки съедали чужие совпадения.
+
+    Поиск шёл по всей таблице реплик, и только потом результат отсеивался по
+    показанным заданиям: на оживлённом архиве фраза пропадала из строки тем
+    чаще, чем активнее соседи, — и без всякой видимой причины.
+    """
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "n.sqlite3")
+    for i in range(400):
+        job_id = database.create_job({"model": "m", "owner": "сосед",
+                                      "filename": f"ч-{i}.wav"})
+        database.save_segments(job_id, [
+            {"start": 0.0, "end": 5.0, "text": "обсудили договор поставки"}])
+    свои = []
+    for i in range(3):
+        job_id = database.create_job({"model": "m", "owner": "мы",
+                                      "filename": f"с-{i}.wav"})
+        database.save_segments(job_id, [
+            {"start": 7.0, "end": 12.0, "text": "тоже про договор и сроки"}])
+        свои.append(job_id)
+
+    находки = database.best_snippets("договор", свои)
+    assert set(находки) == set(свои), (
+        f"фраза нашлась только для {len(находки)} из {len(свои)} показанных строк")
+    for находка in находки.values():
+        assert находка["start_s"] == 7.0, находка
+
+
+# ---------------------------------------------------------------------------
+# Надёжность: чужие задания, ресурсы, служебный цикл
+# ---------------------------------------------------------------------------
+
+def test_a_failure_never_overwrites_a_job_taken_over_by_a_neighbour(tmp_path: Path):
+    """Успешное завершение было защищено, а три ветки отказа — нет.
+
+    Экземпляр, застрявший дольше отметки жизни, оживал и писал свой отказ
+    поверх задания, которое уже считает сосед. Когда сосед досчитывал, его
+    защищённая запись не проходила, и **готовая расшифровка выбрасывалась**:
+    пользователь получал «ошибка» вместо результата.
+    """
+    import threading
+
+    from asrhub import job_queue as JQ
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "q.sqlite3")
+    очередь = JQ.JobQueue.__new__(JQ.JobQueue)
+    очередь.db = database
+    очередь._lock = threading.RLock()
+    очередь._cancelled = set()
+    очередь._discard_results = lambda *a: None
+
+    job_id = database.create_job({"model": "m", "filename": "разговор.wav"})
+    database.update_job(job_id, status=JQ.STATUS_RUNNING,
+                        instance_id=JQ.INSTANCE_ID, heartbeat_at=1.0)
+    assert очередь._write_own(job_id, status=JQ.STATUS_FAILED, finished_at=3.0), \
+        "своё задание записать не дали"
+
+    # Сосед забрал зависшее задание себе и считает.
+    database.update_job(job_id, status=JQ.STATUS_RUNNING, instance_id="сосед",
+                        heartbeat_at=9.0, retries=1)
+    assert not очередь._write_own(job_id, status=JQ.STATUS_FAILED, finished_at=4.0), \
+        "отказ записался поверх задания соседа"
+
+    итог = database.get_job(job_id)
+    assert итог["status"] == JQ.STATUS_RUNNING, итог["status"]
+    assert итог["instance_id"] == "сосед", итог["instance_id"]
+    assert итог["retries"] == 1, "счётчик повторов затёрт устаревшим снимком"
+
+
+def test_finished_jobs_do_not_pile_up_in_the_concurrency_table():
+    """Освобождение слота было написано дважды, и копии разошлись.
+
+    Вторая снимала слот и счётчик модели, но не отметку одновременности —
+    та копилась по записи на каждое проведённое задание. Мало того что без
+    предела: этот словарь обходится под общей блокировкой при каждом старте
+    задания, и на сотне тысяч выходило девять миллисекунд блокировки на
+    задание. Со стороны — «сервер к вечеру тупеет».
+    """
+    import threading
+
+    from asrhub.job_queue import JobQueue
+
+    очередь = JobQueue.__new__(JobQueue)
+    очередь._lock = threading.RLock()
+    очередь._running, очередь._concurrency, очередь._model_counts = {}, {}, {}
+
+    for i in range(50):
+        job_id = f"job{i}"
+        очередь._running[job_id] = 0.0
+        очередь._concurrency[job_id] = 0
+        очередь._model_counts["m"] = очередь._model_counts.get("m", 0) + 1
+        очередь._note_concurrency()
+        очередь._release_slot(job_id, "m")
+
+    assert очередь._running == {}, очередь._running
+    assert очередь._concurrency == {}, f"накопилось {len(очередь._concurrency)} записей"
+    assert очередь._model_counts == {"m": 0}, очередь._model_counts
+
+    # И освобождение живёт в одном месте, а не в двух.
+    источник = Path(__file__).resolve().parent.parent / "server" / "asrhub" / "job_queue.py"
+    текст = источник.read_text(encoding="utf-8")
+    начало = текст.index("            finally:\n                # Освобождение")
+    assert "_release_slot(" in текст[начало:начало + 800], "копия освобождения вернулась"
+
+
+def test_backups_keep_working_on_a_disk_that_is_almost_full(tmp_path: Path):
+    """Подчистка стояла после копирования, и до неё не доходило дело.
+
+    Каталог копий по умолчанию лежит на той же файловой системе, что и база.
+    Когда места хватало ровно на `backup_keep` копий, очередная не
+    помещалась, старые не удалялись — и свежих копий не появлялось больше
+    никогда, молча.
+    """
+    from asrhub import maintenance
+
+    данные = tmp_path / "data"
+    database = _база_с_заданиями(данные, 5)
+    каталог = maintenance.backup_dir(_Настройки(данные))
+    настройки = _Настройки(данные, backup_keep=2)
+
+    имена = []
+    for i in range(5):
+        копия = maintenance.make_backup(database, настройки)
+        assert копия is not None, f"копия {i + 1} не сделана"
+        имена.append(копия.name)
+        # Имя с точностью до секунды: без сдвига пять заходов легли бы в
+        # один файл, и проверка ничего бы не проверила.
+        копия.rename(копия.with_name(f"asrhub-2026010{i}-000000-x.db"))
+
+    осталось = sorted(p.name for p in каталог.glob("asrhub-*.db"))
+    assert len(осталось) == 2, осталось
+    # Именно последние, а не первые попавшиеся.
+    assert осталось == ["asrhub-20260103-000000-x.db",
+                        "asrhub-20260104-000000-x.db"], осталось
+    # Имя несёт экземпляр: на общей базе два сервера в одну секунду выбирали
+    # одно имя, и вместо двух копий оставалась одна.
+    assert all(len(и.split("-")) >= 4 for и in имена), имена
+
+
+def test_lowering_and_raising_the_worker_count_gets_the_workers_back(client):
+    """Помеченный воркер уходит не сразу — он замечает пометку, проснувшись.
+
+    Уменьшить и тут же вернуть обратно означало, что ни одна ветка не
+    сработала: число воркеров ещё прежнее, и пометка оставалась. Сервер жил
+    с половиной заявленных до перезапуска, показывая в состоянии полное
+    число.
+    """
+    import threading
+
+    очередь = client.app.state.hub.queue
+
+    def живых() -> int:
+        return sum(1 for t in threading.enumerate()
+                   if t.name.startswith("asrhub-worker-") and t.is_alive())
+
+    было = живых()
+    assert было >= 2, f"для проверки нужно хотя бы два воркера, а их {было}"
+
+    очередь.set_concurrency(1)
+    time.sleep(1.2)
+    очередь.set_concurrency(было)
+    time.sleep(2.5)
+
+    assert not очередь._retiring, f"пометка на выход осталась: {sorted(очередь._retiring)}"
+    assert живых() == было, f"вернулось {живых()} воркеров из {было}"
+
+
+def test_a_cached_result_carries_every_counter_the_analytics_reads(tmp_path: Path):
+    """Строка «Знаков» занижалась ровно на долю попаданий в кеш.
+
+    При том что «Слов» считалось полностью, так что расхождение выглядело
+    как ошибка в подсчёте, а не как пропуск. Ноль говорящих вдобавок молча
+    выбрасывал такие задания из разреза по числу собеседников.
+    """
+    источник = (Path(__file__).resolve().parent.parent / "server" / "asrhub"
+                / "job_queue.py").read_text(encoding="utf-8")
+    начало = источник.index("    def _clone_cached(")
+    тело = источник[начало:начало + 3200]
+    for поле in ("words_count", "chars_count", "segments_count",
+                 "speakers_count", "avg_confidence", "rtf"):
+        assert f"{поле}=cached.get(" in тело, f"из кеша не переносится {поле}"
+
+
+def test_a_broken_janitor_step_does_not_flood_the_log(tmp_path: Path, caplog):
+    """Ограничитель записей не включался никогда.
+
+    Сбой шага ловился вложенным `except`, внешний try завершался штатно, и
+    ветка «иначе» объявляла восстановление и обнуляла счётчик. В журнал
+    каждые двадцать секунд шла пара строк «дал сбой (1-й раз)» и
+    «восстановился» — ровно то заливание, против которого ограничитель и
+    написан.
+    """
+    import threading
+
+    from asrhub import job_queue as JQ
+    from asrhub.db import Database
+
+    очередь = JQ.JobQueue.__new__(JQ.JobQueue)
+    очередь.db = Database(tmp_path / "j.sqlite3")
+    очередь.settings = _Настройки(tmp_path)
+    очередь._stop = threading.Event()
+    очередь._lock = threading.RLock()
+    очередь._running, очередь._concurrency = {}, {}
+    очередь._sample_system = lambda: None
+    очередь._reclaim_stale_jobs = lambda: None
+    очередь._analytics = lambda: None
+
+    class Реестр:
+        @staticmethod
+        def collect_idle() -> None:
+            raise RuntimeError("датчик недоступен")
+
+    очередь.registry = Реестр()
+
+    прежний = JQ.SAMPLE_PERIOD_S
+    JQ.SAMPLE_PERIOD_S = 0.03
+    try:
+        with caplog.at_level("INFO", logger="asrhub.queue"):
+            поток = threading.Thread(target=очередь._janitor_loop, daemon=True)
+            поток.start()
+            time.sleep(0.8)
+            очередь._stop.set()
+            поток.join(timeout=3)
+    finally:
+        JQ.SAMPLE_PERIOD_S = прежний
+
+    записи = [r.getMessage() for r in caplog.records]
+    сбои = [r for r in записи if "дал сбой" in r]
+    assert 0 < len(сбои) <= 4, f"ограничитель не работает: {len(сбои)} записей о сбое"
+    assert not [r for r in записи if "восстановился" in r], \
+        "цикл объявил восстановление, хотя шаг падает по-прежнему"
+
+
+def test_the_tag_breakdown_has_a_ceiling(tmp_path: Path):
+    """Метку задаёт клиент, и её мощность ничем не ограничена.
+
+    Клиент, ставящий уникальную метку на каждое задание, превращал разрез в
+    сто тысяч строк — и в таблице на экране, и в листе выгрузки, где
+    остальные разрезы не длиннее полусотни.
+    """
+    from asrhub.analytics import TAG_LIMIT, Analytics
+    from asrhub.db import Database
+
+    database = Database(tmp_path / "t.sqlite3")
+    момент = time.time()
+    for i in range(TAG_LIMIT * 3):
+        job_id = database.create_job({"model": "m", "media_duration_s": 60.0,
+                                      "tags": f"метка-{i}", "created_at": момент})
+        database.update_job(job_id, status="completed", finished_at=момент + 5,
+                            processing_time_s=5.0)
+
+    метки = Analytics(database).by_tag("month")
+    assert len(метки) == TAG_LIMIT, len(метки)
+    # Верх списка — по числу заданий, а не по алфавиту.
+    assert метки == sorted(метки, key=lambda r: -r["jobs"]), метки[:3]

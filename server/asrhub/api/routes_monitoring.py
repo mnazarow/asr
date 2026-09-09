@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -348,7 +349,36 @@ def reset_alert_rules(request: Request,
 @router.get("/targets", summary="Приёмники метрик и состояние доставки")
 def targets(request: Request,
             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    return {"kinds": list(KINDS), "targets": _monitoring(request).push.targets()}
+    """Куда уходят метрики и как идёт доставка.
+
+    Адрес приёмника отдаётся целиком только администратору. У InfluxDB и
+    Pushgateway учётные данные сплошь и рядом стоят прямо в строке запроса,
+    а входящий адрес чата — это токен: соседние PUT и «проверить» требуют
+    администратора, а чтение отдавало то же самое ключу «только чтение».
+    """
+    список = _monitoring(request).push.targets()
+    if not principal.is_admin:
+        список = [{**t, "url": _hide_url(str(t.get("url") or ""))} for t in список]
+    return {"kinds": list(KINDS), "targets": список}
+
+
+def _hide_url(url: str) -> str:
+    """Оставляет от адреса схему и узел — по ним видно, куда идёт отправка.
+
+    Полностью прятать нельзя: страница мониторинга должна отвечать на
+    вопрос «а куда мы вообще шлём», и «***» на него не отвечает.
+    """
+    if not url:
+        return ""
+    try:
+        разбор = urlsplit(url)
+    except ValueError:
+        return "***"
+    if not разбор.scheme or not разбор.hostname:
+        return "***"
+    порт = f":{разбор.port}" if разбор.port else ""
+    хвост = "/…" if разбор.path not in ("", "/") or разбор.query else ""
+    return f"{разбор.scheme}://{разбор.hostname}{порт}{хвост}"
 
 
 @router.put("/targets", summary="Заменить список приёмников")

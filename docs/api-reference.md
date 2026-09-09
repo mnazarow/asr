@@ -250,56 +250,11 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 
 ```json
 {
-  "items": [
-    {
-      "id": "job_91cf429f11bc471d",
-      "status": "completed",
-      "model": "demo-simulator",
-      "engine": "demo",
-      "language": "ru",
-      "owner": "создан автоматически при первом запуске",
-      "source": "web",
-      "priority": 50,
-      "filename": "отчёт-за-квартал.wav",
-      "deadline": null,
-      "created_at": 1788898606.9904368,
-      "queued_at": 1788898606.9904368,
-      "started_at": 1788898609.9839222,
-      "finished_at": 1788898611.4827294,
-      "media_duration_s": 60.0,
-      "processing_time_s": 1.498,
-      "queue_time_s": 2.993485689163208,
-      "audio_prep_s": 1.2709,
-      "model_load_s": 0.0,
-      "inference_s": 0.2092,
-      "postprocess_s": 0.0004,
-      "rtf": 0.0248,
-      "words_count": 21,
-      "chars_count": 158,
-      "segments_count": 3,
-      "speakers_count": 0,
-      "avg_confidence": 0.9144,
-      "wer": null,
-      "cer": null,
-      "error_code": null,
-      "error_message": null,
-      "error_hint": null,
-      "retries": 0,
-      "cached_from": null,
-      "device": "cpu",
-      "file_size": 1920044,
-      "progress": 1.0,
-      "stage": "готово",
-      "tags": "квартальный",
-      "peak_memory_mb": 77.3,
-      "peak_memory_jobs": 1,
-      "file_hash": "72d4c872184aeb8eee74934f1b2a22a6",
-      "cancelled_by": null,
-      "webhook_status": null
-    },
-    {
-      "id": "job_8aa107d44aa445f8",
-…
+  "items": [],
+  "total": 0,
+  "limit": 2,
+  "offset": 0
+}
 ```
 
 Показан облегчённый список (`light=true`): только поля для таблицы. Без него в каждом задании приходят ещё расшифровка целиком и разбор по сегментам — на сотне часовых записей это единицы мегабайт вместо десятков килобайт.
@@ -629,7 +584,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:5975",
+  "instance": "vm:22153",
   "instances": [],
   "workers": [
     {
@@ -647,7 +602,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 5,
+    "completed": 0,
     "failed": 0,
     "cancelled": 0
   },
@@ -1057,6 +1012,13 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/presets
 
 Текущие настройки сервера.
 
+Значения параметров и откуда каждое взялось.
+
+Администратору отдаётся всё, включая раскладку каталогов и адреса
+обратных вызовов; остальным — только значения, и секреты в них
+замаскированы. Ключ «только чтение» получал полный ответ, а в нём
+входящий адрес чата с токеном внутри и путь к базе.
+
 **Доступ:** любой действующий ключ.
 
 
@@ -1071,8 +1033,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/settings
 ```json
 {
   "values": {
-    "engine": "auto",
-    "model": "faster-whisper-small",
+    "engine": "demo",
+    "model": "demo-simulator",
     "language": "ru",
     "task": "transcribe",
     "model_fallback": "",
@@ -1209,53 +1171,57 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788899401.3522727,
+    "generated_at": 1788914761.3378842,
     "jobs": {
-      "total": 5,
-      "completed": 5,
+      "total": 0,
+      "completed": 0,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 1.0
+      "success_rate": null
     },
     "volume": {
-      "audio_seconds": 200.0,
-      "audio_hours": 0.06,
-      "processing_seconds": 5.9,
-      "words": 91,
-      "characters": 598,
-      "segments": 11,
-      "files_per_hour": 0.03,
+      "audio_seconds": 0,
+      "audio_hours": 0.0,
+      "processing_seconds": 0,
+      "words": 0,
+      "characters": 0,
+      "segments": 0,
+      "files_per_hour": 0.0,
       "audio_hours_per_hour": 0.0
     },
     "performance": {
       "rtf": {
-        "count": 5,
-        "avg": 0.03098,
-        "min": 0.0248,
-        "max": 0.0419,
-        "p50": 0.0281,
-        "p90": 0.03834,
-        "p95": 0.04012,
-        "p99": 0.041544,
-        "stdev": 0.006081
+        "count": 0,
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "stdev": 0.0
       },
       "processing_time_s": {
-        "count": 5,
-        "avg": 1.1764,
-        "min": 0.894,
-        "max": 1.498,
-        "p50": 1.132,
-        "p90": 1.4444,
-        "p95": 1.4712,
-        "p99": 1.49264,
-        "stdev": 0.225216
+        "count": 0,
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "stdev": 0.0
       },
       "queue_time_s": {
-        "count": 5,
-        "avg": 1.393189,
-        "min": 0.002718,
+        "count": 0,
+        "avg": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
 …
 ```
 
@@ -1328,7 +1294,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 19.7,
+  "uptime_s": 21.7,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1372,7 +1338,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 3
+    "INFO": 5,
+    "WARNING": 2
   }
 }
 ```
@@ -1407,17 +1374,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 19.8,
+  "uptime_s": 21.7,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
-    "disk_free_gb": 13.2,
+    "ram_available_gb": 7.1,
+    "disk_free_gb": 12.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1428,7 +1395,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 13.2 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 12.9 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -1601,9 +1568,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
   ],
   "window": "последние сутки",
   "used": {
-    "jobs": 5,
-    "audio_hours": 0.0556,
-    "storage_gb": 0.006
+    "jobs": 0,
+    "audio_hours": 0.0,
+    "storage_gb": 0.0
   },
   "limits": {
     "jobs": null,
@@ -1822,14 +1789,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 19.8,
+  "uptime_s": 21.7,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 20 с",
+        "detail": "работает 22 с",
         "hint": ""
       },
       {
@@ -1858,7 +1825,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 13.2 ГБ",
+        "detail": "свободно 12.9 ГБ",
         "hint": ""
       },
       {
@@ -1981,6 +1948,13 @@ curl 'http://сервер:8080/api/monitoring/metrics?format=influx'
 ### `GET /api/monitoring/targets`
 
 Приёмники метрик и состояние доставки.
+
+Куда уходят метрики и как идёт доставка.
+
+Адрес приёмника отдаётся целиком только администратору. У InfluxDB и
+Pushgateway учётные данные сплошь и рядом стоят прямо в строке запроса,
+а входящий адрес чата — это токен: соседние PUT и «проверить» требуют
+администратора, а чтение отдавало то же самое ключу «только чтение».
 
 **Доступ:** любой действующий ключ.
 

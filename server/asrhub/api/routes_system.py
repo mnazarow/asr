@@ -203,8 +203,15 @@ def queue_concurrency(request: Request, workers: int = Body(embed=True, ge=1, le
 @router.get("/settings", summary="Текущие настройки сервера")
 def get_settings(request: Request,
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Значения параметров и откуда каждое взялось.
+
+    Администратору отдаётся всё, включая раскладку каталогов и адреса
+    обратных вызовов; остальным — только значения, и секреты в них
+    замаскированы. Ключ «только чтение» получал полный ответ, а в нём
+    входящий адрес чата с токеном внутри и путь к базе.
+    """
     state = get_state(request)
-    return state.settings.to_dict(include_secrets=False)
+    return state.settings.to_dict(for_admin=principal.is_admin)
 
 
 @router.put("/settings", summary="Изменить настройки сервера")

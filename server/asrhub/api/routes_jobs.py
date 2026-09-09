@@ -806,15 +806,41 @@ def bulk(request: Request,
             "requested": len(dict.fromkeys(ids))}
 
 
+def _inside(base: Path, target: str) -> Path | None:
+    """Путь, если он лежит внутри базового каталога, иначе None.
+
+    Удаление шло по значению из базы без всякой проверки: путь туда кладёт
+    сервер, но проверка нужна ровно по той же причине, что и при выдаче
+    записи наружу (см. `_source_audio`) — стоит появиться пути, попавшему в
+    базу иначе, и удаление задания превращается в удаление любого файла,
+    до которого дотягивается служба. Дешевле не полагаться на обещание.
+    """
+    if not target:
+        return None
+    try:
+        корень = base.resolve(strict=True)
+        путь = Path(target).resolve(strict=True)
+    except OSError:
+        return None
+    if корень != путь.parent and корень not in путь.parents:
+        log.warning("Отказ удалять «%s»: путь вне каталога «%s»", путь, корень)
+        return None
+    return путь
+
+
 def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
     """Удаление одного задания вместе с его файлами."""
     job_id = str(job["id"])
     if job["status"] in ACTIVE_STATUSES:
         state.queue.cancel(job_id, by=principal.name)
-    if job.get("result_path"):
-        shutil.rmtree(job["result_path"], ignore_errors=True)
-    if job.get("file_path"):
-        Path(job["file_path"]).unlink(missing_ok=True)
+    каталог = _inside(Path(state.settings.paths.results),
+                      str(job.get("result_path") or ""))
+    if каталог is not None:
+        shutil.rmtree(каталог, ignore_errors=True)
+    файл = _inside(Path(state.settings.paths.uploads),
+                   str(job.get("file_path") or ""))
+    if файл is not None:
+        файл.unlink(missing_ok=True)
     state.db.delete_job(job_id)
 
 
