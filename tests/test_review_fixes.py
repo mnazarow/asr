@@ -922,12 +922,18 @@ def test_the_results_section_offers_playback(repo_root: Path):
 
 
 def test_the_player_does_not_keep_playing_after_the_card_is_closed(repo_root: Path):
-    """Узел удалён, а звук идёт — так ведёт себя <audio>, если его не остановить."""
+    """Узел удалён, а звук идёт — так ведёт себя <audio>, если его не остановить.
+
+    Проверяем строку целиком, а не соседство двух подстрок в окне на три
+    тысячи знаков: окно первым же разрастанием карточки съезжало, и тест
+    падал на добавлении соседнего раздела, где всё было в порядке. Здесь же
+    остановка и подписка обязаны стоять в одном выражении — иначе это
+    подписка неизвестно на что.
+    """
     app = (repo_root / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
-    место = app.index("function setupJobPlayer")
-    окно = app[max(0, место - 3000):место]
-    assert "asrhub:closed" in окно and "player.destroy()" in окно, (
-        "проигрыватель не останавливается вместе с карточкой")
+    остановка = [строка for строка in app.splitlines()
+                 if "asrhub:closed" in строка and "player.destroy()" in строка]
+    assert остановка, "проигрыватель не останавливается вместе с карточкой"
 
 
 # ---------------------------------------------------------------------------
@@ -1374,6 +1380,18 @@ def test_the_quality_axis_is_labelled_by_the_width_of_its_bucket(rich_db, repo_r
     Подпись была жёстко «день.месяц», а корзина за час — две с половиной
     минуты: двадцать четыре одинаковых подписи вместо оси.
     """
+    # Своя свежая запись: общая заготовка кладёт задания на понедельник
+    # текущей недели, и часовое окно попадало на них ровно один час в
+    # неделю. Тест из-за этого проходил по понедельникам и падал в
+    # остальные дни — про часовую подпись он при этом не проверял ничего.
+    недавнее = rich_db.db.create_job({
+        "owner": "alice", "model": "gigaam-v3-rnnt", "engine": "gigaam",
+        "language": "ru", "media_duration_s": 90.0, "filename": "свежая.wav",
+        "created_at": time.time() - 600})
+    rich_db.db.update_job(недавнее, status="completed", finished_at=time.time() - 500,
+                          processing_time_s=15.0, rtf=0.17, words_count=200,
+                          segments_count=8, avg_confidence=0.88)
+
     for период, шире in (("hour", 7200), ("month", 0)):
         ход = rich_db.quality_trend(период)
         assert "bucket_seconds" in ход, "ширина корзины не отдаётся"

@@ -76,6 +76,8 @@ class AppState:
     started_at: float = field(default_factory=time.time)
     subscribers: set[Any] = field(default_factory=set)
     monitoring: Any = None
+    #: Разбор содержания записей: признаки, свод по корпусу, пересчёт архива.
+    content: Any = None
     version: str = "3.0.0"
     tickets: TicketStore = field(default_factory=TicketStore)
     #: Учётные записи и сессии веб-интерфейса. Ключи доступа живут отдельно и

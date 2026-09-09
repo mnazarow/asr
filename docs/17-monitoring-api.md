@@ -123,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 35.5
+asrhub_uptime_seconds 17.7
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788914775.241837,
-  "collected_at": "2026-09-09T00:46:15+0000",
+  "timestamp": 1788974365.534866,
+  "collected_at": "2026-09-09T17:19:25+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -232,55 +232,8 @@ curl 'http://сервер:8080/api/monitoring/health'
 
 **Ответ**
 
-```json
-{
-  "status": "ok",
-  "uptime_s": 35.6,
-  "liveness": {
-    "status": "ok",
-    "checks": [
-      {
-        "name": "process",
-        "status": "ok",
-        "detail": "работает 36 с",
-        "hint": ""
-      },
-      {
-        "name": "queue_thread",
-        "status": "ok",
-        "detail": "рабочие потоки запущены",
-        "hint": ""
-      }
-    ]
-  },
-  "readiness": {
-    "status": "ok",
-    "checks": [
-      {
-        "name": "database",
-        "status": "ok",
-        "detail": "отвечает",
-        "hint": ""
-      },
-      {
-        "name": "engines",
-        "status": "ok",
-        "detail": "доступно 1",
-        "hint": ""
-      },
-      {
-        "name": "disk",
-        "status": "ok",
-        "detail": "свободно 12.9 ГБ",
-        "hint": ""
-      },
-      {
-        "name": "queue",
-        "status": "ok",
-        "detail": "ждёт 0, выполняется 0",
-        "hint": ""
-      }
-…
+```
+(сервер недоступен: HTTP Error 503: Service Unavailable)
 ```
 
 Код ответа: 200 при состоянии `ok` и `warning`, 503 при `degraded` и `critical` — на него можно навесить проверку балансировщика без разбора тела.
@@ -338,7 +291,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 12.9 ГБ",
+      "detail": "свободно 11.5 ГБ",
       "hint": ""
     },
     {
@@ -388,8 +341,48 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/catalog?
 
 **Ответ**
 
-```
-(сервер недоступен: HTTP Error 401: Unauthorized)
+```json
+{
+  "groups": [
+    {
+      "id": "service",
+      "title": "Служба",
+      "description": "Жив ли сервис, сколько работает, какая версия и настройки."
+    },
+    {
+      "id": "queue",
+      "title": "Очередь",
+      "description": "Сколько заданий ждёт, сколько выполняется, как долго ждут."
+    },
+    {
+      "id": "jobs",
+      "title": "Задания",
+      "description": "Сколько заданий прошло, чем закончились, в каких разрезах."
+    },
+    {
+      "id": "performance",
+      "title": "Производительность",
+      "description": "Скорость обработки: RTF, время по стадиям, пропускная способность."
+    },
+    {
+      "id": "quality",
+      "title": "Качество",
+      "description": "Уверенность модели, WER и CER, доля записей без речи."
+    },
+    {
+      "id": "models",
+      "title": "Модели и движки",
+      "description": "Что загружено в память, сколько занимает, что доступно."
+    },
+    {
+      "id": "resources",
+      "title": "Оборудование",
+      "description": "Процессор, память, видеокарта, диск."
+    },
+    {
+      "id": "storage",
+      "title": "Хранилище",
+…
 ```
 
 ### `GET /api/monitoring/catalog/{name}`
@@ -411,8 +404,28 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/catalog/a
 
 **Ответ**
 
-```
-(сервер недоступен: HTTP Error 401: Unauthorized)
+```json
+{
+  "name": "asrhub_queue_depth",
+  "type": "gauge",
+  "group": "queue",
+  "label": "Заданий ждёт",
+  "description": "Сколько заданий стоит в очереди и ждёт свободного воркера. Считаются состояния «в очереди» и «ожидает повтора».",
+  "unit": "",
+  "labels": [],
+  "recommendation": "Главный показатель того, справляется ли сервер. Смотреть надо не на значение, а на тенденцию: очередь из ста заданий, которая тает, — это нормальный ночной прогон; очередь из двадцати, которая растёт третий час, — это нехватка мощности.",
+  "normal": "колеблется около нуля в рабочем режиме",
+  "threshold": {
+    "direction": "above",
+    "warning": 50,
+    "critical": 200,
+    "for_seconds": 900,
+    "note": "Пороги подбирайте под свой поток: значимо не число, а рост"
+  },
+  "troubleshooting": "Поднять max_concurrent_jobs (если хватает памяти), перевести массовые задания на низкий приоритет, включить scheduling_policy: shortest_first, взять модель полегче",
+  "since_restart": false,
+  "deprecated_for": "",
+…
 ```
 
 Если метрики нет, ответ 404 с кодом `metric_not_found` и списком похожих имён в подсказке.
@@ -440,8 +453,18 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 
 **Ответ**
 
-```
-(сервер недоступен: HTTP Error 401: Unauthorized)
+```json
+{
+  "summary": {
+    "rules": 34,
+    "firing": 0,
+    "pending": 1,
+    "critical": 0,
+    "warning": 0,
+    "worst": "ok"
+  },
+  "alerts": []
+}
 ```
 
 ### `GET /api/monitoring/alerts/history`
@@ -527,8 +550,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/targets
 
 **Ответ**
 
-```
-(сервер недоступен: HTTP Error 401: Unauthorized)
+```json
+{
+  "kinds": [
+    "prometheus_pushgateway",
+    "influxdb",
+    "otlp",
+    "statsd",
+    "webhook"
+  ],
+  "targets": []
+}
 ```
 
 ### `PUT /api/monitoring/targets`
@@ -664,8 +696,22 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 **Ответ**
 
-```
-(сервер недоступен: HTTP Error 401: Unauthorized)
+```json
+{
+  "scrapes": 1,
+  "samples": 130,
+  "collection_errors": [],
+  "cache_ttl_s": 5.0,
+  "alerts": {
+    "rules": 34,
+    "firing": 0,
+    "pending": 1,
+    "critical": 0,
+    "warning": 0,
+    "worst": "ok"
+  },
+  "targets": []
+}
 ```
 
 Поле `collection_errors` перечисляет источники, которые не удалось опросить. Пустой список — все источники отвечают.

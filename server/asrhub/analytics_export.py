@@ -227,8 +227,12 @@ def _таблицы(report: dict[str, Any]) -> list[tuple[str, list[str], list[l
     return out
 
 
-def to_csv_zip(report: dict[str, Any], period: str) -> bytes:
-    """Архив с файлом CSV на каждый разрез.
+#: Готовая таблица выгрузки: имя, заголовки, строки.
+Таблица = tuple[str, list[str], list[list[Any]]]
+
+
+def _собрать_csv(таблицы: list[Таблица], period: str) -> bytes:
+    """Архив с файлом CSV на каждую таблицу.
 
     Разделитель — точка с запятой, кодировка — UTF-8 с меткой порядка байтов.
     И то, и другое ради Excel с русскими настройками: он открывает такой
@@ -237,7 +241,7 @@ def to_csv_zip(report: dict[str, Any], period: str) -> bytes:
     """
     буфер = io.BytesIO()
     with zipfile.ZipFile(буфер, "w", zipfile.ZIP_DEFLATED) as архив:
-        for имя, заголовки, строки in _таблицы(report):
+        for имя, заголовки, строки in таблицы:
             текст = io.StringIO()
             писарь = csv.writer(текст, delimiter=";", lineterminator="\r\n")
             писарь.writerow(заголовки)
@@ -247,8 +251,26 @@ def to_csv_zip(report: dict[str, Any], period: str) -> bytes:
     return буфер.getvalue()
 
 
+def to_csv_zip(report: dict[str, Any], period: str) -> bytes:
+    """Архив с файлом CSV на каждый разрез аналитики сервера."""
+    return _собрать_csv(_таблицы(report), period)
+
+
 def to_xlsx(report: dict[str, Any], period: str) -> bytes:
-    """Книга Excel: по листу на разрез."""
+    """Книга Excel: по листу на разрез аналитики сервера."""
+    return _собрать_xlsx(_таблицы(report),
+                         f"ASR Hub — аналитика за период «{period}»")
+
+
+def _собрать_xlsx(таблицы: list[Таблица], title: str) -> bytes:
+    """Книга Excel: по листу на таблицу.
+
+    Отдельно от того, ЧТО выгружается: механику книги — ширину столбцов,
+    закреплённую шапку, свойства файла — делят между собой обе выгрузки
+    сервера. Две копии этого кода разошлись бы на первой же правке, и
+    объяснить человеку, почему у одного отчёта столбцы по содержимому, а у
+    второго «####», было бы нечем.
+    """
     try:
         from openpyxl import Workbook  # noqa: PLC0415
         from openpyxl.styles import Alignment, Font  # noqa: PLC0415
@@ -269,7 +291,7 @@ def to_xlsx(report: dict[str, Any], period: str) -> bytes:
     книга = Workbook()
     книга.remove(книга.active)
     шапка = Font(bold=True)
-    for имя, заголовки, строки in _таблицы(report):
+    for имя, заголовки, строки in таблицы:
         лист = книга.create_sheet(имя[:31])
         лист.append(заголовки)
         for клетка in лист[1]:
@@ -290,7 +312,7 @@ def to_xlsx(report: dict[str, Any], period: str) -> bytes:
     if not книга.sheetnames:
         книга.create_sheet("Пусто").append(["За период данных нет"])
     свойства = книга.properties
-    свойства.title = f"ASR Hub — аналитика за период «{period}»"
+    свойства.title = title
     свойства.creator = "ASR Hub"
     буфер = io.BytesIO()
     книга.save(буфер)

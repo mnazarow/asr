@@ -21,6 +21,16 @@ const state = {
   //: Кто вошёл: {name, role, kind: 'user'|'key', must_change_password}.
   me: null,
   analytics: null,
+  //: Раздел «Аналитика записей»: свой период и своя вкладка. Свои, а не
+  //: общие с аналитикой сервера: там смотрят сутки («что сейчас с очередью»),
+  //: здесь — месяц («как шли разговоры»), и один переключатель на двоих
+  //: сбрасывал бы выбор при каждом переходе между разделами.
+  contentPeriod: 'month',
+  contentTab: 'summary',
+  contentData: {},
+  contentKind: 'negative',
+  contentCoverageTimer: null,
+  resultsSearch: '',
   period: 'week',
   jobSettings: {},
   selectedJob: null,
@@ -580,6 +590,7 @@ const VIEWS = {
   queue:      { title: 'Очередь', subtitle: 'Управление заданиями, приоритетами и воркерами' },
   results:    { title: 'Результаты', subtitle: 'Выполненные задания и выгрузка' },
   analytics:  { title: 'Аналитика', subtitle: 'Показатели производительности и качества' },
+  content:    { title: 'Аналитика записей', subtitle: 'О чём и как говорили: тональность, речь, темы, обязательства, скрипт' },
   models:     { title: 'Модели', subtitle: 'Каталог моделей, лицензии, требования, загрузка весов' },
   compare:    { title: 'Сравнение моделей', subtitle: 'Качество, скорость и лицензии рядом' },
   settings:   { title: 'Настройки', subtitle: 'Все параметры с описаниями, рекомендациями и примерами' },
@@ -2337,6 +2348,14 @@ RENDERERS.results = {
         <div class="table-wrap" id="results-table"></div>
       </section>`;
     let timer;
+    // Переход сюда из аналитики записей («показать разговоры про сроки»)
+    // приносит запрос с собой. Забираем его один раз и гасим: иначе
+    // следующий заход в раздел молча подставлял бы прошлый поиск, и список
+    // выглядел бы наполовину пустым без видимой причины.
+    if (state.resultsSearch) {
+      qs('#r-search').value = state.resultsSearch;
+      state.resultsSearch = '';
+    }
     qs('#r-search').oninput = () => { clearTimeout(timer); timer = setTimeout(() => this.load(), 300); };
     qs('#r-order').onchange = () => this.load();
     Bulk.attach(qs('#r-bulk'), () => this.load());
@@ -2577,9 +2596,23 @@ window.__asrhub.playRecording = (id) => window.__asrhub.openJob(id, { play: true
  * ключом попадает в историю браузера и в журнал обратного прокси. Тот же
  * приём, что и у выгрузки результатов задания.
  */
-window.__asrhub.exportAnalytics = async (fmt) => {
-  const url = `/api/analytics/export?period=${encodeURIComponent(state.period)}` +
-              `&fmt=${encodeURIComponent(fmt)}`;
+window.__asrhub.exportAnalytics = (fmt) => downloadReport(
+  `/api/analytics/export?period=${encodeURIComponent(state.period)}` +
+  `&fmt=${encodeURIComponent(fmt)}`, fmt, 'аналитика');
+
+window.__asrhub.exportContent = (fmt) => downloadReport(
+  `/api/content/export?period=${encodeURIComponent(state.contentPeriod || state.period)}` +
+  `&fmt=${encodeURIComponent(fmt)}`, fmt, 'аналитика-записей');
+
+/**
+ * Скачивание отчёта: запрос с ключом, разбор имени файла, отдача браузеру.
+ *
+ * Общий для обеих выгрузок сервера намеренно. Две копии этого кода
+ * разошлись бы на первой правке — и объяснить человеку, почему одна
+ * выгрузка сообщает причину отказа, а вторая молча ничего не делает,
+ * было бы нечем.
+ */
+async function downloadReport(url, fmt, подпись) {
   try {
     const headers = {};
     const key = localStorage.getItem('asrhub_key');
@@ -2598,7 +2631,7 @@ window.__asrhub.exportAnalytics = async (fmt) => {
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     link.download = parseFilename(response.headers.get('Content-Disposition') || '')
-                    || `аналитика.${fmt === 'csv' ? 'zip' : 'xlsx'}`;
+                    || `${подпись}.${fmt === 'csv' ? 'zip' : 'xlsx'}`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -2607,7 +2640,7 @@ window.__asrhub.exportAnalytics = async (fmt) => {
   } catch (err) {
     toast(`Не удалось выгрузить: ${err.message}`, 'err');
   }
-};
+}
 
 window.__asrhub.openAt = (id, seconds) =>
   window.__asrhub.openJob(id, { play: true, at: Number(seconds) || 0 });
@@ -2688,6 +2721,8 @@ function showJobModal(job, opts) {
         <button class="active" data-tab="text">Текст</button>
         <button data-tab="segments">Сегменты (${segments.length})</button>
         <button data-tab="params">Параметры (${changed.length} изменено)</button>
+        ${job.status === 'completed' && job.text
+          ? '<button data-tab="analysis">Разбор</button>' : ''}
         <button data-tab="events">События</button>
       </div>
       <div id="job-tab-body"></div>
@@ -2740,6 +2775,7 @@ function showJobModal(job, opts) {
           <td class="mono faint">${esc(JSON.stringify(spec.default))}</td></tr>`;
       }).join('')}</tbody></table></div>
       ${changed.length === 0 ? '<div class="empty small">Использованы значения по умолчанию</div>' : ''}`,
+    analysis: () => `<div id="job-analysis"><div class="empty">Разбираем запись…</div></div>`,
     events: () => `<div class="table-wrap"><table>
       <thead><tr><th>Время</th><th>Событие</th><th>Сообщение</th></tr></thead><tbody>
       ${(job.events || []).map((e) => `<tr>
@@ -2753,6 +2789,10 @@ function showJobModal(job, opts) {
     qsa('#job-tabs button', backdrop).forEach((b) =>
       b.classList.toggle('active', b.dataset.tab === name));
     if (name === 'segments') setupJobFind(backdrop, job);
+    // Разбор грузится по требованию, а не вместе с карточкой: открывают её
+    // чаще всего ради текста, и лишний запрос на каждое открытие оплачивал
+    // бы вкладку, в которую не заходят.
+    if (name === 'analysis') loadJobAnalysis(backdrop, job);
   };
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
@@ -2764,6 +2804,195 @@ function showJobModal(job, opts) {
   // Проигрыватель продолжал бы играть из закрытого окна: узел удалён, звук
   // идёт. Поэтому останавливаем его вместе с окном.
   backdrop.addEventListener('asrhub:closed', () => { if (player) player.destroy(); });
+}
+
+/* Разбор одной записи в карточке задания.
+ *
+ * Отвечает на вопрос, ради которого запись и открывают повторно: что здесь
+ * было. Читать часовую расшифровку ради этого — не ответ, а работа.
+ *
+ * Всё, что показано, кликабельно по времени: щелчок по реплике переводит
+ * проигрыватель на её секунду. Без этого раздел остаётся справкой, а с ним
+ * становится оглавлением разговора.
+ */
+async function loadJobAnalysis(backdrop, job) {
+  const host = qs('#job-analysis', backdrop);
+  if (!host) return;
+  let данные;
+  try {
+    данные = await API.get(`/api/content/jobs/${job.id}`);
+  } catch (err) {
+    host.innerHTML = `<div class="empty">Разбор недоступен: ${esc(err.message)}</div>`;
+    return;
+  }
+  if (!host.isConnected) return;          // окно успели закрыть
+  const a = данные.analysis || {};
+  const тон = a.sentiment || {};
+  const речь = a.speech || {};
+  const сущности = a.entities || {};
+  const скрипт = a.compliance || {};
+  const обещания = a.commitments || {};
+  const вопросы = a.questions || {};
+  const тревога = a.alerts || {};
+
+  const реплика = (з, доп) => `<div class="analysis-line" data-start="${з.start_s || 0}">
+    <span class="ts mono">${fmtDur(з.start_s || 0)}</span>
+    <span class="who">${esc(з.speaker || '—')}</span>
+    <span class="what">${esc(з.text || '')}${доп ? ` <span class="chip">${esc(доп)}</span>` : ''}</span>
+  </div>`;
+
+  host.innerHTML = `
+    <div class="grid cols-4" style="margin-bottom:14px">
+      ${kpi('Тональность', num(тон.score, 2), esc(тон.label || ''))}
+      ${kpi('Разворот', num((тон.turn || {}).shift, 2),
+            esc((тон.turn || {}).shape || 'нет данных'))}
+      ${kpi('Темп речи', речь.wpm ? `${num(речь.wpm)} сл/мин` : '—',
+            `тишины ${речь.silence_share === null || речь.silence_share === undefined
+              ? '—' : pct(речь.silence_share, 0)}`)}
+      ${kpi('Скрипт', скрипт.score === null || скрипт.score === undefined
+              ? '—' : pct(скрипт.score, 0),
+            скрипт.checked ? `${скрипт.passed} из ${скрипт.checked} пунктов` : '')}
+    </div>
+
+    ${card('Ход тональности', 'форма разговора: упало и не поднялось, выправилось к концу, ровно',
+           '<div id="analysis-traj"></div>')}
+
+    ${(тон.by_speaker || []).length > 1 ? card('По говорящим',
+      'средняя по разговору смешивает раздражённого клиента с ровным оператором',
+      `<div class="table-wrap"><table>
+        <thead><tr><th>Говорящий</th><th class="num">Тональность</th>
+          <th class="num">Реплик</th><th class="num">Говорил</th>
+          <th class="num">Темп</th><th class="num">Паразитов</th></tr></thead>
+        <tbody>${(тон.by_speaker || []).map((г) => {
+          const р = (речь.speakers || []).find((s) => s.speaker === г.speaker) || {};
+          return `<tr><td>${esc(г.speaker)}</td>
+            <td class="num">${toneChip(г.score, г.label)}</td>
+            <td class="num mono">${num(г.segments)}</td>
+            <td class="num mono">${р.share === null || р.share === undefined
+              ? '—' : pct(р.share, 0)}</td>
+            <td class="num mono">${num(р.wpm, 0)}</td>
+            <td class="num mono">${р.filler_rate === null || р.filler_rate === undefined
+              ? '—' : pct(р.filler_rate, 1)}</td></tr>`;
+        }).join('')}</tbody></table></div>`) : ''}
+
+    <div class="grid cols-2">
+      ${card('О чём говорили', 'вес по TF-IDF: часто здесь и редко в остальных записях',
+             (a.keywords || []).length
+               ? `<div class="chips">${(a.keywords || []).slice(0, 24).map((к) =>
+                   `<span class="chip" title="упоминаний: ${к.count}">${esc(к.word)}</span>`
+                 ).join('')}</div>` +
+                 ((a.phrases || []).length
+                   ? `<div class="small dim" style="margin-top:10px">Сочетания: ${
+                       (a.phrases || []).slice(0, 8).map((ф) =>
+                         `<b>${esc(ф.phrase)}</b>`).join(', ')}</div>` : '')
+               : '<div class="empty small">Значимых слов не нашлось</div>')}
+      ${card('Что прозвучало', 'суммы, сроки, контакты и номера',
+             `<div class="table-wrap"><table><tbody>
+               ${[['Суммы', (сущности.money || []).map((с) => с.text)],
+                  ['Проценты', (сущности.percents || []).map((п) => `${п}%`)],
+                  ['Сроки', сущности.deadlines || []],
+                  ['Даты', сущности.dates || []],
+                  ['Телефоны', сущности.phones || []],
+                  ['Почта', сущности.emails || []],
+                  ['Номера', (сущности.numbers || []).map(
+                     (н) => `${н.kind} ${н.number}`)]]
+                 .filter(([, v]) => (v || []).length)
+                 .map(([имя, v]) => `<tr><td class="small dim">${имя}</td>
+                   <td>${v.slice(0, 12).map((x) => `<span class="chip">${esc(x)}</span>`).join(' ')}</td>
+                   </tr>`).join('') ||
+                 '<tr><td class="small dim">Ничего из этого в записи не прозвучало</td></tr>'}
+             </tbody></table></div>`)}
+    </div>
+
+    ${(тревога.items || []).length ? card('Тревожные упоминания',
+      'суд, жалоба, огласка — повод послушать запись целиком',
+      `<div class="analysis-lines">${(тревога.items || []).map(
+         (т) => реплика(т, (т.words || []).join(', '))).join('')}</div>`) : ''}
+
+    ${(обещания.items || []).length ? card(
+      `Обещания (${обещания.count}, со сроком ${обещания.with_deadline})`,
+      'то, за что потом спросят: в записи это есть, а в системе учёта — нет',
+      `<div class="analysis-lines">${(обещания.items || []).map(
+         (о) => реплика(о, о.deadline || 'срок не назван')).join('')}</div>`) : ''}
+
+    <div class="grid cols-2">
+      ${card('Самые тяжёлые реплики', '',
+             (тон.worst || []).length
+               ? `<div class="analysis-lines">${(тон.worst || []).map(
+                   (о) => реплика(о, num(о.score, 2))).join('')}</div>`
+               : '<div class="empty small">Отрицательных реплик нет</div>')}
+      ${card('Самые благополучные реплики', '',
+             (тон.best || []).length
+               ? `<div class="analysis-lines">${(тон.best || []).map(
+                   (о) => реплика(о, num(о.score, 2))).join('')}</div>`
+               : '<div class="empty small">Положительных реплик нет</div>')}
+    </div>
+
+    ${(скрипт.items || []).length ? card('Скрипт разговора',
+      скрипт.speaker ? `проверен по говорящему «${скрипт.speaker}»`
+                     : 'говорящий не определён — проверено по всей записи',
+      `<div class="table-wrap"><table>
+        <thead><tr><th></th><th>Пункт</th><th>Где искали</th><th>Что нашли</th></tr></thead>
+        <tbody>${(скрипт.items || []).map((п) => `<tr>
+          <td>${п.passed ? '<span class="chip ok">есть</span>'
+                         : '<span class="chip err">нет</span>'}</td>
+          <td>${esc(п.label)}</td>
+          <td class="small dim">${esc({ start: 'в начале', end: 'в конце',
+                                        any: 'в любом месте' }[п.where] || п.where)}</td>
+          <td class="small">${esc(п.matched || '—')}</td></tr>`).join('')}</tbody></table></div>`) : ''}
+
+    <div class="grid cols-2">
+      ${card(`Вопросы (${вопросы.count || 0})`, '',
+             (вопросы.items || []).length
+               ? `<div class="analysis-lines">${(вопросы.items || []).slice(0, 15)
+                   .map((в) => реплика(в)).join('')}</div>`
+               : '<div class="empty small">Вопросов не найдено</div>')}
+      ${card('Разговор', 'паузы, перебивания, вежливость',
+             `<div class="table-wrap"><table><tbody>
+               <tr><td class="small dim">Перебиваний</td><td class="mono">${num(речь.interruptions)}</td></tr>
+               <tr><td class="small dim">Долгих пауз</td><td class="mono">${num(речь.pauses)}${
+                 речь.longest_pause_s ? ` <span class="faint">(дольше всего ${
+                   num(речь.longest_pause_s, 1)} с)</span>` : ''}</td></tr>
+               <tr><td class="small dim">Самый долгий монолог</td><td class="mono">${
+                 (речь.monologue || {}).seconds
+                   ? `${num(речь.monologue.seconds, 0)} с — ${esc(речь.monologue.speaker || '—')}`
+                   : '—'}</td></tr>
+               <tr><td class="small dim">Слова-паразиты</td><td class="mono">${
+                 речь.filler_rate === null || речь.filler_rate === undefined
+                   ? '—' : pct(речь.filler_rate, 1)}</td></tr>
+               <tr><td class="small dim">Вежливость</td><td>${
+                 Object.entries(a.politeness || {}).map(([к, v]) =>
+                   `<span class="chip ${v ? 'ok' : ''}" title="${
+                     v ? 'прозвучало' : 'не прозвучало'}">${esc(к)}</span>`
+                 ).join(' ') || '—'}</td></tr>
+             </tbody></table></div>`)}
+    </div>
+
+    <p class="small faint" style="margin-top:12px">
+      Разбор версии ${esc(String(данные.version))}, посчитан
+      ${данные.computed_at ? fmtTime(данные.computed_at) : '—'}.
+      <button class="ghost sm" id="analysis-recompute">Пересчитать</button>
+    </p>`;
+
+  const точки = (тон.trajectory || []).filter((v) => v !== null && v !== undefined);
+  window.Charts.line(qs('#analysis-traj', backdrop), {
+    height: 160, yMin: -1, yMax: 1,
+    labels: (тон.trajectory || []).map((_, i) => {
+      const всего = (тон.trajectory || []).length || 1;
+      return fmtDur((данные.duration_s || 0) * i / всего);
+    }),
+    series: [{ name: 'тональность', values: тон.trajectory || [] }],
+    emptyText: точки.length ? '' : 'реплик слишком мало для хода тональности',
+  });
+
+  const кнопка = qs('#analysis-recompute', backdrop);
+  if (кнопка) кнопка.addEventListener('click', async () => {
+    кнопка.disabled = true;
+    try {
+      await API.post(`/api/content/jobs/${job.id}/recompute`, {});
+      loadJobAnalysis(backdrop, job);
+    } catch (err) { fail(err); кнопка.disabled = false; }
+  });
 }
 
 /* Поиск по репликам открытого разговора.
@@ -2883,11 +3112,14 @@ function setupJobPlayer(backdrop, job, segments, show, options) {
   const body = qs('#job-tab-body', backdrop);
   if (body) {
     body.addEventListener('click', (event) => {
-      const node = event.target.closest('.segment[data-start]');
+      // И реплики, и строки разбора: у обеих есть секунда, и обе для того
+      // и показаны — чтобы попасть в это место записи. Разбор без перехода
+      // остаётся справкой; с переходом становится оглавлением разговора.
+      const node = event.target.closest('.segment[data-start], .analysis-line[data-start]');
       if (!node) return;
       player.seek(Number(node.dataset.start), true);
       qsa('.segment.active', backdrop).forEach((n) => n.classList.remove('active'));
-      node.classList.add('active');
+      if (node.classList.contains('segment')) node.classList.add('active');
     });
   }
 
@@ -3460,6 +3692,534 @@ function drawExtraAnalytics(data) {
 // ==========================================================================
 // Вид: Модели
 // ==========================================================================
+
+// ==========================================================================
+// Аналитика записей
+// ==========================================================================
+
+/* Раздел отвечает не на те вопросы, что «Аналитика». Та — про сервер:
+ * сколько сделано, с какой скоростью, что падало. Этот — про разговоры:
+ * какими они были, чем отличаются друг от друга и что из этого следует.
+ *
+ * Разделы грузятся по отдельности, а не одним отчётом. Полный отчёт на
+ * архиве в сотню тысяч записей считается несколько секунд — это нормально
+ * для выгрузки, которую делают раз в месяц, и неприемлемо для страницы,
+ * которую открывают между делом. Каждая вкладка забирает своё за четверть
+ * секунды, и, пока человек читает свод, остальные разделы ему не нужны.
+ */
+
+const CONTENT_TABS = [
+  { key: 'summary',  title: 'Свод' },
+  { key: 'groups',   title: 'Разрезы' },
+  { key: 'topics',   title: 'Темы' },
+  { key: 'links',    title: 'Связи' },
+  { key: 'records',  title: 'Что послушать' },
+];
+
+/** Подпись тональности с цветом: одно число читается плохо, слово — сразу. */
+function toneChip(score, label) {
+  if (score === null || score === undefined) return '<span class="chip">нет оценки</span>';
+  const cls = score < -0.15 ? 'err' : score > 0.15 ? 'ok' : '';
+  return `<span class="chip ${cls}">${esc(label || '')} ${num(score, 2)}</span>`;
+}
+
+/** Полоска долей: отрицательные / нейтральные / положительные. */
+function toneBar(host, свод) {
+  const s = window.Charts.status();
+  window.Charts.stacked(host, {
+    height: 26,
+    parts: [
+      { label: 'отрицательные', value: свод.negative || 0, color: s.err },
+      { label: 'нейтральные', value: свод.neutral || 0, color: s.idle },
+      { label: 'положительные', value: свод.positive || 0, color: s.ok },
+    ],
+    emptyText: 'нет оценённых записей',
+  });
+}
+
+/** Изменение показателя к прошлому периоду — со знаком и направлением. */
+function delta(сейчас, раньше, признак) {
+  if (сейчас === null || сейчас === undefined ||
+      раньше === null || раньше === undefined) return '';
+  const знаков = признак && признак.digits !== undefined ? признак.digits : 2;
+  const d = сейчас - раньше;
+  // Изменение, неразличимое в показанной точности, — это не изменение.
+  // Без проверки таблица пестрела строками «−0» и «+0.000»: разница в
+  // седьмом знаке подавалась как новость, а глаз цеплялся за знак.
+  if (Math.abs(d) < Math.pow(10, -знаков) / 2) return '';
+  const лучше = (признак && признак.good) ? признак.good * Math.sign(d) : 0;
+  const dir = лучше > 0 ? 'up' : лучше < 0 ? 'down' : '';
+  const знак = d > 0 ? '+' : '−';
+  return `<div class="kpi-trend ${dir}">${знак}${num(Math.abs(d), знаков)} к прошлому периоду</div>`;
+}
+
+RENDERERS.content = {
+  async render(root) {
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <span class="small dim">Период:</span>
+        <div class="group-nav" id="content-period">
+          ${Object.entries(PERIOD_LABELS).map(([k, v]) =>
+            `<button data-period="${k}" class="${state.contentPeriod === k ? 'active' : ''}">${v}</button>`
+          ).join('')}
+        </div>
+        <span class="spacer"></span>
+        <button class="btn sm" onclick="__asrhub.exportContent('xlsx')"
+          title="Весь отчёт книгой Excel: по листу на раздел">Выгрузить в Excel</button>
+        <button class="ghost sm" onclick="__asrhub.exportContent('csv')"
+          title="Архив CSV — если Excel под рукой нет">CSV</button>
+        <button class="ghost sm" id="content-recompute"
+          title="Пересчитать разбор всего архива — после смены словарей или скрипта">Пересчитать</button>
+      </div>
+      <div id="content-coverage"></div>
+      <div class="tabs" id="content-tabs">
+        ${CONTENT_TABS.map((t) => `<button data-tab="${t.key}"
+          class="${state.contentTab === t.key ? 'active' : ''}">${esc(t.title)}</button>`).join('')}
+      </div>
+      <div id="content-body"><div class="empty">Загрузка…</div></div>`;
+
+    // Отрисовка раздела всегда начинается с чистого таймера: renderView
+    // гасит таймеры при каждой перерисовке, а leave() зовёт только при
+    // смене раздела. Смена периода перерисовывает тот же раздел — интервал
+    // погашен, а метка о нём осталась, и полоса разбора больше не
+    // обновлялась никогда, замирая на числе, с которым открыли страницу.
+    state.contentCoverageTimer = null;
+    qsa('#content-period button').forEach((b) => b.addEventListener('click', () => {
+      state.contentPeriod = b.dataset.period;
+      state.contentData = {};           // период сменился — прошлые ответы не про него
+      renderView();
+    }));
+    qsa('#content-tabs button').forEach((b) => b.addEventListener('click', () => {
+      state.contentTab = b.dataset.tab;
+      qsa('#content-tabs button').forEach((x) =>
+        x.classList.toggle('active', x.dataset.tab === state.contentTab));
+      this.showTab();
+    }));
+    qs('#content-recompute').addEventListener('click', () => this.recompute());
+
+    this.loadCoverage();
+    return this.showTab();
+  },
+
+  /** Полоса состояния разбора: пока архив не разобран, свод неполон. */
+  async loadCoverage() {
+    const host = qs('#content-coverage');
+    if (!host) return;
+    let с;
+    try { с = await API.background('/api/content/status'); } catch (e) { return; }
+    if (!host.isConnected) return;
+    state.contentData.coverage = с;
+    if (!с.total) {
+      host.innerHTML = `<div class="card tight"><b>Записей ещё нет</b>
+        <div class="small dim" style="margin-top:4px">Раздел наполнится, как только
+        появятся завершённые задания с расшифровкой.</div></div>`;
+      return;
+    }
+    if (!с.pending) {
+      host.innerHTML = `<p class="small dim" style="margin:0 0 10px">
+        Разобрано записей: ${num(с.analyzed)} из ${num(с.total)} · версия разбора
+        ${с.version} · словарь основ: ${num(с.vocabulary)}${
+        с.last_error ? ` · последняя ошибка: ${esc(с.last_error)}` : ''}</p>`;
+      return;
+    }
+    const доля = с.total ? с.analyzed / с.total : 0;
+    host.innerHTML = `<div class="card tight" style="border-color:var(--warn)">
+      <div class="row"><b>Архив ещё разбирается</b><span class="spacer"></span>
+        <span class="small dim">${num(с.analyzed)} из ${num(с.total)} · ${pct(доля, 0)}</span></div>
+      <div class="progress warn" style="margin-top:8px"><span style="width:${(доля * 100).toFixed(1)}%"></span></div>
+      <div class="small dim" style="margin-top:6px">Показатели ниже посчитаны по
+        разобранной части и ещё сдвинутся. Разбор идёт в фоне порциями и на
+        очередь не влияет.</div></div>`;
+    // Пока идёт разбор, полосу обновляем: иначе она замирает на числе,
+    // с которым человек открыл страницу, и выглядит как зависшая работа.
+    // Одного таймера довольно: следующий заход перезаведёт его сам, а до
+    // тех пор лишние обновления только шумят запросами.
+    if (!state.contentCoverageTimer) {
+      state.contentCoverageTimer = viewTimer(() => this.loadCoverage(), 15000);
+    }
+  },
+
+  /** Уход из раздела: таймер полосы разбора гасится общим механизмом. */
+  leave() { state.contentCoverageTimer = null; },
+
+  async recompute() {
+    if (!confirm('Пересчитать разбор всего архива?\n\nСчитается в фоне порциями; ' +
+                 'на большом архиве это часы. Нужно после смены словарей, ' +
+                 'скрипта разговора или обновления сервера.')) return;
+    try {
+      const r = await API.post('/api/content/recompute', {});
+      toast(`К пересчёту помечено записей: ${num(r.queued)}`, 'ok');
+      this.loadCoverage();
+    } catch (err) { fail(err); }
+  },
+
+  async showTab() {
+    const host = qs('#content-body');
+    if (!host) return;
+    host.innerHTML = '<div class="empty">Загрузка…</div>';
+    const вкладка = state.contentTab;
+    try {
+      await this[`tab_${вкладка}`](host);
+      // Проверка стоит и здесь, а не только в catch. Разрезы отвечают
+      // дольше остальных вкладок, и на успешном пути `host.innerHTML`
+      // выполнялся безусловно: подсвечены «Темы», показаны «Разрезы», и
+      // понять это можно было только по содержимому таблицы.
+      if (state.contentTab !== вкладка) { this.showTab(); return; }
+    } catch (err) {
+      if (err && err.silent) return;
+      if (state.contentTab !== вкладка) return;
+      host.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(err.message)}</div>`;
+    }
+  },
+
+  // --- свод ---------------------------------------------------------------
+
+  async tab_summary(host) {
+    const период = state.contentPeriod;
+    const [свод, лента, выводы] = await Promise.all([
+      API.latest('content-summary', `/api/content/summary?period=${период}`),
+      API.latest('content-timeline', `/api/content/timeline?period=${период}`),
+      API.latest('content-findings', `/api/content/findings?period=${период}`),
+    ]);
+    const c = свод.current || {};
+    const p = свод.previous || {};
+    const признак = (k) => (свод.features || []).find((f) => f.key === k) || {};
+    if (!c.records) {
+      host.innerHTML = '<div class="empty">За период разобранных записей нет</div>';
+      return;
+    }
+
+    host.innerHTML = `
+      <div class="grid cols-6" style="margin-bottom:16px">
+        ${kpi('Записей', num(c.records), `${num(c.hours)} ч звука`,
+              p.records ? { dir: c.records >= p.records ? 'up' : 'down',
+                            text: `было ${num(p.records)}` } : null)}
+        ${kpi('Тональность', num(c.sentiment, 2),
+              `разворот ${num(c.sentiment_shift, 2)}` +
+              delta(c.sentiment, p.sentiment, признак('sentiment')))}
+        ${kpi('Отрицательных',
+              c.negative_share === null ? '—' : `${num(c.negative_share, 1)}%`,
+              `${num(c.negative)} из ${num(c.scored)}` +
+              delta(c.negative_share, p.negative_share, { good: -1, digits: 1 }))}
+        ${kpi('Тревожных', num(c.alert_records),
+              c.alert_share === null ? 'записей с упоминанием суда и жалоб'
+                : `${num(c.alert_share, 1)}% записей — суд, жалобы, огласка`)}
+        ${kpi('Обещаний без срока', num(c.commitments_open),
+              `всего обещаний ${num(c.commitments)}`)}
+        ${kpi('Скрипт', c.compliance !== null ? pct(c.compliance, 0) : '—',
+              'средняя доля выполненных пунктов' +
+              delta(c.compliance, p.compliance, признак('compliance')))}
+      </div>
+
+      ${card('Как распределились разговоры', 'по оценке тональности',
+             `<div id="tone-bar"></div>
+              <div class="row small dim" style="margin-top:10px;gap:16px">
+                <span>отрицательных: <b>${num(c.negative)}</b></span>
+                <span>нейтральных: <b>${num(c.neutral)}</b></span>
+                <span>положительных: <b>${num(c.positive)}</b></span>
+              </div>`)}
+
+      ${(выводы.items || []).length ? card('Выводы',
+        'правила с порогами, а не пересказ цифр — каждый вывод называет числа, из которых сделан',
+        `<div class="findings">${(выводы.items || []).map((в) => `
+          <div class="finding ${esc(в.severity)}">${esc(в.text)}</div>`).join('')}</div>`) : ''}
+
+      <div class="grid cols-3">
+        ${card('Тональность во времени', 'форма важнее среднего',
+               '<div id="chart-tone-time"></div>')}
+        ${card('Доля отрицательных', 'проценты по тем же корзинам времени',
+               '<div id="chart-neg-time"></div>')}
+        ${card('Сколько записей', 'чтобы видеть, на чём посчитаны две соседние кривые',
+               '<div id="chart-vol-time"></div>')}
+      </div>
+
+      ${card('Речь и разговор', 'усреднённые характеристики записей периода',
+             `<div class="table-wrap full"><table>
+               <thead><tr><th>Показатель</th><th class="num">За период</th>
+                 <th class="num">Прошлый период</th><th class="num">Изменение</th></tr></thead>
+               <tbody>${(свод.features || []).map((f) => {
+                 const a = c[f.key], b = p[f.key];
+                 if (a === null || a === undefined) return '';
+                 let d = (b === null || b === undefined) ? null : a - b;
+                 // Разница мельче показанной точности — это ноль, а не
+                 // изменение: иначе столбец пестрит «−0» и «+0.000».
+                 if (d !== null && Math.abs(d) < Math.pow(10, -f.digits) / 2) d = 0;
+                 return `<tr><td>${esc(f.title)}${f.unit ? ` <span class="faint small">${esc(f.unit)}</span>` : ''}</td>
+                   <td class="num mono">${num(a, f.digits)}</td>
+                   <td class="num mono faint">${b === null || b === undefined ? '—' : num(b, f.digits)}</td>
+                   <td class="num mono ${d && f.good ? (Math.sign(d) * f.good > 0 ? 'ok-text' : 'err-text') : ''}">${
+                     d === null ? '—' : d === 0 ? 'без изменений'
+                       : (d > 0 ? '+' : '') + num(d, f.digits)}</td></tr>`;
+               }).join('')}</tbody></table></div>`)}`;
+
+    toneBar(qs('#tone-bar'), c);
+    const точки = (лента.buckets || []).filter((т) => т.records);
+    const метки = точки.map((т) => fmtTime(т.ts).slice(0, 5));
+    window.Charts.line(qs('#chart-tone-time'), {
+      height: 220, labels: метки, yMin: -1, yMax: 1,
+      series: [{ name: 'тональность', values: точки.map((т) => т.sentiment) }],
+      emptyText: 'нет данных за период',
+    });
+    // Проценты и штуки — на разных графиках. На одной оси это вторая шкала
+    // в маскировке: кривые сходятся и расходятся не потому, что связаны, а
+    // потому, что у них случайно похожие числа.
+    window.Charts.line(qs('#chart-neg-time'), {
+      height: 220, labels: метки, yMin: 0, unit: '%',
+      series: [{ name: 'доля отрицательных, %',
+                 values: точки.map((т) => т.negative_share) }],
+      emptyText: 'нет данных за период',
+    });
+    window.Charts.bars(qs('#chart-vol-time'), {
+      height: 220, values: точки.map((т) => т.records), labels: метки,
+      emptyText: 'нет данных за период',
+    });
+  },
+
+  // --- разрезы -------------------------------------------------------------
+
+  async tab_groups(host) {
+    const период = state.contentPeriod;
+    const разрезы = ['owner', 'speaker', 'tag', 'model', 'source', 'weekday', 'hour'];
+    const данные = await Promise.all(разрезы.map((d) =>
+      API.latest(`content-b-${d}`, `/api/content/breakdown/${d}?period=${период}`)
+        .catch(() => ({ items: [] }))));
+    const по_ключу = Object.fromEntries(разрезы.map((d, i) => [d, данные[i]]));
+
+    const таблица = (данные) => {
+      const items = данные.items || [];
+      if (!items.length) return '<div class="empty small">Групп с достаточным числом записей нет</div>';
+      return `<div class="table-wrap full"><table>
+        <thead><tr><th>${esc(данные.title)}</th><th class="num">Записей</th>
+          <th class="num">Тональность</th><th class="num">Отрицательных</th>
+          <th class="num">Тревожных</th><th class="num">Скрипт</th>
+          <th class="num">Темп</th><th class="num">Перебиваний</th>
+          <th class="num">Тишина</th><th class="num">Обещаний без срока</th></tr></thead>
+        <tbody>${items.map((г) => `<tr>
+          <td>${esc(г.label)}</td>
+          <td class="num mono">${num(г.records)}</td>
+          <td class="num">${toneChip(г.sentiment)}</td>
+          <td class="num mono">${г.negative_share === null ? '—'
+            : num(г.negative_share, 1) + '%'}</td>
+          <td class="num mono">${num(г.alert_records)}</td>
+          <td class="num mono">${г.compliance === null ? '—' : pct(г.compliance, 0)}</td>
+          <td class="num mono">${num(г.wpm, 0)}</td>
+          <td class="num mono">${num(г.interruptions, 1)}</td>
+          <td class="num mono">${г.silence_share === null ? '—' : pct(г.silence_share, 0)}</td>
+          <td class="num mono">${num(г.commitments_open)}</td></tr>`).join('')}</tbody></table>
+        ${данные.hidden ? `<p class="small faint" style="margin:8px 12px">
+          Скрыто групп с числом записей меньше пяти: ${данные.hidden}. На двух
+          разговорах группа всегда либо лучшая, либо худшая, и оба раза
+          это ничего не значит.</p>` : ''}</div>`;
+    };
+
+    host.innerHTML = `
+      <div class="grid cols-2">
+        ${card('Тональность по владельцам', 'сравнение с общим средним',
+               '<div id="chart-by-owner"></div>')}
+        ${card('Тональность по меткам', 'на что жалуются и о чём договариваются',
+               '<div id="chart-by-tag"></div>')}
+      </div>
+      <div class="grid cols-2">
+        ${card('По часам суток', 'когда разговоры даются тяжелее',
+               '<div id="chart-by-hour"></div>')}
+        ${card('По дням недели', '',
+               '<div id="chart-by-weekday"></div>')}
+      </div>
+      ${card('По владельцам', 'все показатели рядом', таблица(по_ключу.owner))}
+      ${card('По операторам', 'кто из говорящих вёл разговор', таблица(по_ключу.speaker))}
+      ${card('По меткам', 'метка задания', таблица(по_ключу.tag))}
+      <div class="grid cols-2">
+        ${card('По моделям', 'разбор зависит от качества расшифровки', таблица(по_ключу.model))}
+        ${card('По источникам', '', таблица(по_ключу.source))}
+      </div>`;
+
+    // Тональность — величина со знаком, поэтому столбцы рисуются от нуля
+    // посередине: цвет и сторона сразу показывают, кто ушёл в минус.
+    const столбики = (узел, данные, поле) => {
+      const items = (данные.items || []).filter((г) => г[поле] !== null &&
+                                                       г[поле] !== undefined);
+      window.Charts.hbars(qs(узел), {
+        diverging: true, absMin: 0.5, labelWidth: 130, emptyText: 'нет групп',
+        items: items.map((г) => ({
+          label: г.label, value: г[поле],
+          display: num(г[поле], 2),
+          note: `${num(г.records)} записей` + (г.negative_share === null ? ''
+            : ` · отрицательных ${num(г.negative_share, 1)} %`),
+        })),
+      });
+    };
+    столбики('#chart-by-owner', по_ключу.owner, 'sentiment');
+    столбики('#chart-by-tag', по_ключу.tag, 'sentiment');
+    const часы = (по_ключу.hour.items || []);
+    window.Charts.line(qs('#chart-by-hour'), {
+      height: 220, labels: часы.map((г) => г.label), yMin: -1, yMax: 1,
+      series: [{ name: 'тональность', values: часы.map((г) => г.sentiment) }],
+      emptyText: 'нет данных',
+    });
+    const дни = (по_ключу.weekday.items || []);
+    window.Charts.bars(qs('#chart-by-weekday'), {
+      height: 220, values: дни.map((г) => г.records),
+      labels: дни.map((г) => г.label.slice(0, 2)),
+      emptyText: 'нет данных',
+    });
+  },
+
+  // --- темы ----------------------------------------------------------------
+
+  async tab_topics(host) {
+    const период = state.contentPeriod;
+    const данные = await API.latest('content-topics',
+      `/api/content/topics?period=${период}`);
+    const темы = данные.items || [];
+    const тренд = данные.trend || [];
+    if (!темы.length) {
+      host.innerHTML = `<div class="empty">Тем пока нет: ни одна основа не
+        встретилась в двух записях. Появятся, когда разберётся архив.</div>`;
+      return;
+    }
+    host.innerHTML = `
+      ${card('О чём говорят', `по ${num(данные.corpus)} разобранным записям периода`,
+             '<div id="chart-topics"></div>')}
+      <div class="grid cols-2">
+        ${card('Стали звучать чаще', 'сравнение с предыдущим таким же периодом',
+               `<div class="table-wrap"><table>
+                 <thead><tr><th>Тема</th><th class="num">Сейчас</th>
+                   <th class="num">Было</th><th class="num">Изменение</th></tr></thead>
+                 <tbody>${тренд.filter((т) => т.delta > 0).slice(0, 12).map((т) => `<tr>
+                   <td>${esc(т.word)}</td>
+                   <td class="num mono">${num(т.share_now, 1)}%</td>
+                   <td class="num mono faint">${num(т.share_before, 1)}%</td>
+                   <td class="num mono ok-text">+${num(т.delta, 1)} п.п.</td></tr>`).join('')
+                 || '<tr><td colspan="4" class="small dim">Заметного роста нет</td></tr>'}
+                 </tbody></table></div>`)}
+        ${card('Стали звучать реже', '',
+               `<div class="table-wrap"><table>
+                 <thead><tr><th>Тема</th><th class="num">Сейчас</th>
+                   <th class="num">Было</th><th class="num">Изменение</th></tr></thead>
+                 <tbody>${тренд.filter((т) => т.delta < 0).slice(0, 12).map((т) => `<tr>
+                   <td>${esc(т.word)}</td>
+                   <td class="num mono">${num(т.share_now, 1)}%</td>
+                   <td class="num mono faint">${num(т.share_before, 1)}%</td>
+                   <td class="num mono err-text">${num(т.delta, 1)} п.п.</td></tr>`).join('')
+                 || '<tr><td colspan="4" class="small dim">Заметного спада нет</td></tr>'}
+                 </tbody></table></div>`)}
+      </div>
+      ${card('Все темы периода', 'вес — редкость темы: слово из девяти записей ' +
+             'из десяти это фон, а не тема',
+             `<div class="table-wrap full"><table>
+               <thead><tr><th>Тема</th><th class="num">Записей</th><th class="num">Доля</th>
+                 <th class="num">Упоминаний</th><th class="num">Вес</th>
+                 <th>Найти</th></tr></thead>
+               <tbody>${темы.map((т) => `<tr>
+                 <td>${esc(т.word)}<span class="faint small mono"> ${esc(т.stem)}</span></td>
+                 <td class="num mono">${num(т.records)}</td>
+                 <td class="num mono">${num(т.share, 1)}%</td>
+                 <td class="num mono">${num(т.mentions)}</td>
+                 <td class="num mono">${num(т.weight, 2)}</td>
+                 <td><button class="ghost sm" data-search="${esc(т.word)}"
+                       title="Найти эти разговоры в результатах">записи</button></td>
+                 </tr>`).join('')}</tbody></table></div>`)}`;
+
+    // Все столбцы — одна и та же величина (в скольких записях встретилось
+    // слово), поэтому и цвет один: разные цвета читались бы как разные
+    // виды тем, которых нет.
+    const цвет = window.Charts.palette()[0];
+    window.Charts.hbars(qs('#chart-topics'), {
+      items: темы.slice(0, 18).map((т) => ({
+        label: т.word, value: т.records, color: цвет,
+        display: `${num(т.records)} · ${num(т.share, 1)} %`,
+        note: `упоминаний: ${num(т.mentions)}` })),
+      labelWidth: 150, emptyText: 'нет тем',
+    });
+    qsa('#content-body button[data-search]').forEach((b) =>
+      b.addEventListener('click', () => {
+        state.resultsSearch = b.dataset.search;
+        go('results');
+      }));
+  },
+
+  // --- связи ---------------------------------------------------------------
+
+  async tab_links(host) {
+    const данные = await API.latest('content-corr',
+      `/api/content/correlations?period=${state.contentPeriod}`);
+    const items = данные.items || [];
+    host.innerHTML = card('Связи между признаками',
+      `посчитано по ${num(данные.sampled)} записям`,
+      items.length ? `<div class="table-wrap full"><table>
+        <thead><tr><th>Наблюдение</th>
+          <th class="num" title="Знак — направление связи, а не оценка: «чем длиннее разговор, тем меньше перебиваний» — тоже минус">Коэффициент</th>
+          <th>Сила</th><th class="num">Записей</th></tr></thead>
+        <tbody>${items.map((с) => `<tr>
+          <td>${esc(с.text)}<div class="small faint">${esc(с.x_title)} ↔ ${esc(с.y_title)}</div></td>
+          <td class="num mono">${с.r > 0 ? '+' : ''}${num(с.r, 2)}</td>
+          <td><span class="chip">${esc(с.strength)}</span></td>
+          <td class="num mono">${num(с.n)}</td></tr>`).join('')}</tbody></table></div>
+        <p class="small dim" style="margin:12px">${esc(данные.note)}</p>`
+      : `<div class="empty">Заметных связей за период не нашлось.<br>
+         <span class="small">Пары со слабой связью (меньше 0,2) и посчитанные
+         меньше чем по пятидесяти записям не показываются: отличить такую
+         цифру от случайности нельзя, а прочитана она будет как факт.</span></div>`);
+  },
+
+  // --- что послушать -------------------------------------------------------
+
+  async tab_records(host) {
+    const период = state.contentPeriod;
+    const перечень = await API.latest('content-kinds', '/api/content/kinds');
+    const виды = перечень.kinds || [];
+    state.contentKind = state.contentKind && виды.some((к) => к.key === state.contentKind)
+      ? state.contentKind : (виды[0] || {}).key;
+    host.innerHTML = `
+      <div class="settings-toolbar">
+        <span class="small dim">Отбор:</span>
+        <div class="group-nav" id="content-kind">
+          ${виды.map((к) => `<button data-kind="${esc(к.key)}"
+            class="${state.contentKind === к.key ? 'active' : ''}">${esc(к.title)}</button>`).join('')}
+        </div>
+      </div>
+      <div id="content-records"><div class="empty">Загрузка…</div></div>`;
+    qsa('#content-kind button').forEach((b) => b.addEventListener('click', () => {
+      state.contentKind = b.dataset.kind;
+      qsa('#content-kind button').forEach((x) =>
+        x.classList.toggle('active', x.dataset.kind === state.contentKind));
+      this.loadRecords();
+    }));
+    return this.loadRecords();
+  },
+
+  async loadRecords() {
+    const host = qs('#content-records');
+    if (!host) return;
+    const данные = await API.latest('content-records',
+      `/api/content/records?kind=${encodeURIComponent(state.contentKind)}` +
+      `&period=${state.contentPeriod}&limit=50`);
+    const items = данные.items || [];
+    host.innerHTML = card(данные.title, `${items.length} записей`,
+      items.length ? `<div class="table-wrap full"><table>
+        <thead><tr><th>Запись</th><th>Когда</th><th>Владелец</th>
+          <th class="num">Тональность</th><th class="num">Разворот</th>
+          <th class="num">Тревожных</th><th class="num">Обещаний</th>
+          <th class="num">Перебиваний</th><th class="num">Скрипт</th>
+          <th class="num">Длит.</th><th></th></tr></thead>
+        <tbody>${items.map((з) => `<tr>
+          <td class="truncate" style="max-width:240px">${esc(з.filename || з.job_id)}</td>
+          <td class="small faint nowrap">${fmtTime(з.created_at)}</td>
+          <td class="small">${esc(з.owner || '—')}</td>
+          <td class="num">${toneChip(з.sentiment, з.sentiment_label)}</td>
+          <td class="num mono">${з.sentiment_shift === null ? '—' : num(з.sentiment_shift, 2)}</td>
+          <td class="num mono">${num(з.alerts)}</td>
+          <td class="num mono">${num(з.commitments)}${
+            з.commitments > з.commitments_dated
+              ? `<span class="faint"> (${num(з.commitments - з.commitments_dated)} без срока)</span>` : ''}</td>
+          <td class="num mono">${num(з.interruptions)}</td>
+          <td class="num mono">${з.compliance === null ? '—' : pct(з.compliance, 0)}</td>
+          <td class="num mono nowrap">${fmtDur(з.media_duration_s)}</td>
+          <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(з.job_id)}')"
+                >Открыть</button></td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty">По этому отбору записей за период нет</div>');
+  },
+};
 
 RENDERERS.models = {
   render(root) {

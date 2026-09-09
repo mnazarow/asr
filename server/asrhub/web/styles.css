@@ -700,3 +700,49 @@ td.pick input, th.pick input { width: auto; margin: 0; cursor: pointer; }
 .bulk-bar .spacer { flex: 1; }
 .btn.danger { border-color: var(--err); color: var(--err); }
 .btn.danger:hover { background: var(--err-soft); }
+
+/* ---------- Аналитика записей ---------- */
+
+/* Вывод раздела: полоса слева цветом уровня. Цвет здесь не украшение —
+   он единственное, что отличает «требует внимания» от «к сведению» при
+   беглом взгляде; но и слово в тексте вывода это говорит, поэтому чтение
+   не зависит от различения цветов. */
+.findings { display: flex; flex-direction: column; gap: 8px; }
+.finding {
+  padding: 10px 13px; border-radius: 7px; line-height: 1.55;
+  background: var(--bg-elev-2); border-left: 3px solid var(--text-faint);
+}
+.finding.warning { border-left-color: var(--warn); }
+.finding.good    { border-left-color: var(--ok); }
+.finding.info    { border-left-color: var(--accent); }
+
+/* Изменение показателя к прошлому периоду: знак и цвет направления.
+   Отдельные классы, а не inline-стиль, — чтобы они переключались вместе
+   со светлой темой, как и всё остальное. */
+.ok-text  { color: var(--ok); }
+.err-text { color: var(--err); }
+
+/* Строки разбора: время, говорящий, реплика. Щелчок ведёт в это место
+   записи — потому и курсор указателя, и подсветка при наведении: без них
+   строка выглядит справкой, и никто не догадается по ней щёлкнуть. */
+.analysis-lines { display: flex; flex-direction: column; gap: 2px; }
+.analysis-line {
+  display: grid; grid-template-columns: 62px 96px 1fr; gap: 10px;
+  padding: 7px 9px; border-radius: 6px; cursor: pointer; line-height: 1.5;
+  align-items: baseline;
+}
+.analysis-line:hover { background: var(--bg-elev-2); }
+.analysis-line .ts { color: var(--accent); font-size: 12px; }
+.analysis-line .who { color: var(--text-faint); font-size: 12px;
+                      overflow: hidden; text-overflow: ellipsis; }
+.analysis-line .what { font-size: 13px; }
+
+/* Облако ключевых слов записи. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+@media (max-width: 760px) {
+  /* На узком экране три колонки не помещаются: время и говорящий уходят
+     в одну строку над репликой, а не сжимаются до нечитаемого. */
+  .analysis-line { grid-template-columns: 62px 1fr; }
+  .analysis-line .what { grid-column: 1 / -1; }
+}

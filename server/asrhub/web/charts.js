@@ -276,7 +276,12 @@
   function bars(host, config) {
     const values = config.values || [];
     if (!values.length) return empty(host, config.emptyText);
-    const ctx = frame(host, config);
+    // Подпись значения стоит над столбцом, и у самого высокого она
+    // упиралась в верхний край: число обрезалось ровно там, где столбец
+    // и интересен. Поэтому при подписях поле сверху шире.
+    const подписи = config.showValues !== false && values.length <= 14;
+    const ctx = frame(host, Object.assign({}, config, {
+      pad: Object.assign({ top: подписи ? 26 : 14 }, config.pad || {}) }));
     const colors = palette();
     const max = Math.max(...values.map((v) => v || 0), config.yMin || 0) || 1;
     const ticks = niceTicks(0, max, 4);
@@ -299,14 +304,25 @@
         d: roundedTop(x, y, barWidth, Math.max(height, v > 0 ? 2 : 0), radius),
         fill: color,
       }, ctx.svg);
-      attachTip(path, `${config.labels[index]}: ${fmtNum(v)}${config.unit || ''}`);
+      // Подпись в подсказке — необязательная: ниже её отсутствие уже
+      // предусмотрено, а здесь обращение шло без проверки, и любой график
+      // без `labels` падал на первом же столбце, уводя за собой весь раздел.
+      const подпись = (config.labels || [])[index];
+      attachTip(path, `${подпись ? подпись + ': ' : ''}${fmtNum(v)}${config.unit || ''}`);
       if (config.showValues !== false && values.length <= 14 && v > 0) {
         el('text', { x: x + barWidth / 2, y: y - 5, 'text-anchor': 'middle',
                      fill: ink(), 'font-size': 10.5 }, ctx.svg).textContent = fmtNum(v);
       }
       if (config.labels) {
-        const step = Math.max(1, Math.ceil(values.length / 14));
-        if (index % step === 0 || values.length <= 14) {
+        // Шаг подписей — по ширине, а не по числу столбцов. По числу было
+        // мало: двенадцать подписей по пять знаков помещаются на широком
+        // графике и сливаются в сплошную строку на узком, а узким он
+        // становится, как только карточка встаёт третьей в ряд.
+        const ширина_подписи = Math.max(...(config.labels || [""])
+          .map((л) => String(л).length)) * 6 + 12;
+        const шаг_по_ширине = Math.max(1, Math.ceil(ширина_подписи / slot));
+        const step = Math.max(шаг_по_ширине, Math.ceil(values.length / 14));
+        if (index % step === 0) {
           el('text', { x: x + barWidth / 2, y: ctx.pad.top + ctx.ih + 15,
                        'text-anchor': 'middle', fill: faint(), 'font-size': 10 },
              ctx.svg).textContent = config.labels[index];
@@ -331,25 +347,60 @@
     const rowHeight = config.rowHeight || 26;
     const height = items.length * rowHeight + 16;
     const labelWidth = config.labelWidth || 160;
+    const двусторонние = config.diverging ||
+      items.some((i) => (i.value || 0) < 0);
+    // Поле справа — под подпись значения, поэтому считается по самой
+    // длинной из них, а не по постоянной величине. С постоянной «778 ·
+    // 78.5 %» упиралась в край и обрезалась на последнем знаке — ровно
+    // на том, ради которого её и читают.
+    const самая_длинная = items.reduce((max, i) => Math.max(
+      max, String(i.display || fmtNum(i.value) + (config.unit || '')).length), 0);
     const ctx = frame(host, Object.assign({}, config, {
-      height, pad: { top: 8, right: 56, bottom: 8, left: labelWidth } }));
+      height, pad: { top: 8, right: Math.max(40, самая_длинная * 7 + 14),
+                     bottom: 8,
+                     left: labelWidth + (двусторонние ? 44 : 0) } }));
     const colors = palette();
-    const max = Math.max(...items.map((i) => i.value || 0)) || 1;
+    const значения = items.map((i) => i.value || 0);
+    // Величина со знаком (тональность, разворот, отклонение от среднего)
+    // рисуется от нуля посередине, а не от левого края. Иначе −0.8 давал
+    // отрицательную ширину и превращался в двухпиксельный огрызок — то
+    // есть худшая группа выглядела как отсутствие данных, ровно наоборот.
+    const двусторонний = config.diverging || значения.some((v) => v < 0);
+    const предел = Math.max(...значения.map(Math.abs), config.absMin || 0) || 1;
+    const max = Math.max(...значения, 0) || 1;
+    const s = status();
+    const ноль = ctx.pad.left + (двусторонний ? ctx.iw / 2 : 0);
+    if (двусторонний) {
+      el('line', { x1: ноль, y1: ctx.pad.top - 2, x2: ноль,
+                   y2: ctx.pad.top + ctx.ih + 2,
+                   stroke: gridColor(), 'stroke-width': 1 }, ctx.svg);
+    }
 
     items.forEach((item, index) => {
       const y = ctx.pad.top + index * rowHeight;
-      const width = Math.max(2, ((item.value || 0) / max) * ctx.iw);
+      const значение = item.value || 0;
+      const длина = двусторонний
+        ? Math.max(2, (Math.abs(значение) / предел) * (ctx.iw / 2))
+        : Math.max(2, (значение / max) * ctx.iw);
+      const x = двусторонний && значение < 0 ? ноль - длина : ноль;
       el('text', { x: ctx.pad.left - 10, y: y + rowHeight / 2 + 4, 'text-anchor': 'end',
                    fill: ink(), 'font-size': 12 }, ctx.svg).textContent = item.label;
+      const цвет = item.color || (двусторонний
+        ? (значение < 0 ? s.err : значение > 0 ? s.ok : s.idle)
+        : colors[index % colors.length]);
       const rect = el('rect', {
-        x: ctx.pad.left, y: y + 4, width, height: rowHeight - 10,
-        rx: 4, fill: item.color || colors[index % colors.length],
+        x, y: y + 4, width: длина, height: rowHeight - 10, rx: 4, fill: цвет,
       }, ctx.svg);
-      attachTip(rect, `${item.label}: ${fmtNum(item.value)}${config.unit || ''}` +
+      attachTip(rect, `${item.label}: ${fmtNum(значение)}${config.unit || ''}` +
         (item.note ? `\n${item.note}` : ''));
-      el('text', { x: ctx.pad.left + width + 8, y: y + rowHeight / 2 + 4,
-                   fill: ink(), 'font-size': 11.5 }, ctx.svg)
-        .textContent = item.display || (fmtNum(item.value) + (config.unit || ''));
+      // Подпись значения всегда снаружи столбца, со стороны его роста:
+      // внутри короткого столбца она не помещается, а поверх соседнего
+      // читается как его подпись.
+      const подпись = item.display || (fmtNum(значение) + (config.unit || ''));
+      el('text', { x: значение < 0 && двусторонний ? x - 8 : x + длина + 8,
+                   y: y + rowHeight / 2 + 4,
+                   'text-anchor': значение < 0 && двусторонний ? 'end' : 'start',
+                   fill: ink(), 'font-size': 11.5 }, ctx.svg).textContent = подпись;
     });
     return ctx.svg;
   }

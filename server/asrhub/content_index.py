@@ -1,0 +1,279 @@
+"""Разбор содержания записей: расчёт, хранение, пересчёт архива.
+
+Пакет `content` умеет разобрать одну расшифровку и ничего не знает ни о базе,
+ни о настройках — это чистые функции над текстом. Здесь всё остальное: когда
+считать, с какими словарями, куда положить и как разобрать то, что уже
+накоплено.
+
+Разделение не формальное. Разбор — самая изменчивая часть раздела: словари
+пополняются, правила уточняются, скрипт разговора у каждого свой. Держать его
+свободным от базы значит иметь возможность прогнать новый словарь по тысяче
+расшифровок в отдельном скрипте и посмотреть, что изменилось, — не поднимая
+сервер.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from typing import Any
+
+from . import content
+from .db import Database
+
+log = logging.getLogger("asrhub.content")
+
+#: Сколько живёт снимок корпусной частоты основ. Знаменатель TF-IDF меняется
+#: медленно: на архиве в десять тысяч записей сотня новых сдвигает вес слова в
+#: третьем знаке. Считать его на каждую запись — это лишний проход по таблице
+#: основ там, где ответ заведомо тот же.
+СРОК_ЧАСТОТ = 300.0
+
+#: Пауза между заходами разбора архива. Разбор держит блокировку записи, и без
+#: паузы фоновая работа соревновалась бы за неё с обновлениями прогресса
+#: заданий — то есть замедляла бы то, ради чего сервер и стоит.
+ПАУЗА_РАЗБОРА = 5.0
+
+#: Пауза, когда разбирать нечего. Заходить в базу каждые пять секунд ради
+#: ответа «ничего не изменилось» незачем.
+ПАУЗА_ПРОСТОЯ = 120.0
+
+
+class ContentIndex:
+    """Признаки содержания: расчёт при завершении задания и пересчёт архива."""
+
+    def __init__(self, db: Database, settings: Any):
+        self.db = db
+        self.settings = settings
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._частоты: dict[str, int] = {}
+        self._размер_корпуса = 0
+        self._частоты_на = 0.0
+        #: Последняя ошибка разбора — её показывает состояние раздела. Без
+        #: неё выключенный по сбою разбор выглядел бы просто как «архив ещё
+        #: не разобран», и разбираться было бы не с чем.
+        self.last_error: str | None = None
+        self.backfilled = 0
+
+    # --- корпусная частота ------------------------------------------------
+
+    def corpus_frequency(self, *, fresh: bool = False) -> tuple[dict[str, int], int]:
+        """Снимок частот основ по корпусу — знаменатель TF-IDF."""
+        with self._lock:
+            устарел = time.time() - self._частоты_на > СРОК_ЧАСТОТ
+            if fresh or устарел or not self._частоты_на:
+                try:
+                    self._частоты, self._размер_корпуса = self.db.document_frequency()
+                except Exception as exc:                     # noqa: BLE001
+                    # Без частот ключевые слова считаются по частоте внутри
+                    # записи — хуже, но работает. Ронять из-за этого разбор
+                    # целиком нельзя.
+                    log.warning("Не удалось получить частоты основ: %s", exc)
+                    self._частоты, self._размер_корпуса = {}, 0
+                self._частоты_на = time.time()
+            return self._частоты, self._размер_корпуса
+
+    def forget_frequency(self) -> None:
+        """Забыть снимок частот — после пересчёта архива он заведомо не тот."""
+        with self._lock:
+            self._частоты_на = 0.0
+
+    # --- настройки разбора ------------------------------------------------
+
+    def _скрипт(self) -> list[dict[str, Any]] | None:
+        значение = self.settings.get("content_script") if self.settings else None
+        return значение if isinstance(значение, list) and значение else None
+
+    def _оператор(self) -> str | None:
+        значение = str((self.settings.get("content_agent_speaker")
+                        if self.settings else "") or "").strip()
+        return значение or None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.settings.get("content_analysis", True)) if self.settings else True
+
+    # --- разбор одной записи ----------------------------------------------
+
+    def analyze_job(self, job_id: str, *, job: dict[str, Any] | None = None,
+                    segments: list[dict[str, Any]] | None = None,
+                    save: bool = True) -> dict[str, Any] | None:
+        """Разбирает одну запись и (по умолчанию) кладёт результат в базу."""
+        задание = job or self.db.get_job(job_id)
+        if not задание:
+            return None
+        текст = str(задание.get("text") or "")
+        if not текст.strip():
+            return None
+        реплики = segments if segments is not None else self.db.get_segments(job_id)
+        частоты, размер = self.corpus_frequency()
+        разбор = content.analyze(
+            text=текст, segments=реплики,
+            duration_s=float(задание.get("media_duration_s") or 0.0),
+            script=self._скрипт(), agent_speaker=self._оператор(),
+            document_frequency=частоты, corpus_size=размер)
+        свод, основы = content.features(разбор)
+        if save:
+            self.db.save_content(job_id, свод, основы)
+        # Возвращаем то же, что легло бы в базу: `features` убирает из
+        # разбора служебные основы для знаменателя TF-IDF. Без этого
+        # карточка свежей записи приходила с лишним полем, а карточка
+        # разобранной раньше — без него, и интерфейсу приходилось бы
+        # знать, каким путём она пришла.
+        return свод["detail"]
+
+    def on_job_completed(self, job_id: str, job: dict[str, Any],
+                         segments: list[dict[str, Any]] | None = None) -> None:
+        """Разбор сразу после распознавания — в потоке воркера.
+
+        Сбой разбора не должен трогать задание: запись распознана, результат
+        сохранён и отдан, а признаки — надстройка над ним. Раньше здесь не
+        было обёртки, и опечатка в пользовательском скрипте разговора роняла
+        задание уже после того, как оно завершилось: клиент получал ошибку на
+        готовый результат.
+        """
+        if not self.enabled:
+            return
+        try:
+            self.analyze_job(job_id, job=job, segments=segments)
+        except Exception as exc:                             # noqa: BLE001
+            self.last_error = str(exc)
+            log.warning("Разбор содержания задания %s не удался: %s", job_id, exc,
+                        extra={"job_id": job_id})
+
+    # --- пересчёт архива --------------------------------------------------
+
+    def backfill_once(self, limit: int | None = None) -> int:
+        """Разбирает порцию записей, у которых разбора нет или он устарел."""
+        размер = limit or int(self.settings.get("content_backfill_batch") or 50)
+        ожидают = self.db.content_pending(content.VERSION, размер)
+        if not ожидают:
+            return 0
+        частоты, корпус = self.corpus_frequency()
+        скрипт, оператор = self._скрипт(), self._оператор()
+        сделано = 0
+        for запись in ожидают:
+            if self._stop.is_set():
+                break
+            job_id = str(запись["id"])
+            try:
+                разбор = content.analyze(
+                    text=str(запись.get("text") or ""),
+                    segments=self.db.get_segments(job_id),
+                    duration_s=float(запись.get("media_duration_s") or 0.0),
+                    script=скрипт, agent_speaker=оператор,
+                    document_frequency=частоты, corpus_size=корпус)
+                свод, основы = content.features(разбор)
+                self.db.save_content(job_id, свод, основы)
+                сделано += 1
+            except Exception as exc:                         # noqa: BLE001
+                # Одна битая запись не должна останавливать разбор архива.
+                # Но и крутиться на ней вечно нельзя: `content_pending`
+                # отбирает по отсутствию разбора, и запись, на которой мы
+                # каждый раз падаем, возвращалась бы в следующую же порцию.
+                # Кладём пустой разбор текущей версии: из очереди она уйдёт,
+                # а в разделе будет видна как неразобранная.
+                self.last_error = f"{job_id}: {exc}"
+                log.warning("Разбор записи %s не удался: %s", job_id, exc,
+                            extra={"job_id": job_id})
+                try:
+                    self.db.save_content(
+                        job_id, {"version": content.VERSION,
+                                 "detail": {"error": str(exc)[:500]}}, {})
+                except Exception:                            # noqa: BLE001
+                    log.debug("Не удалось пометить запись %s", job_id)
+        self.backfilled += сделано
+        return сделано
+
+    def recompute(self, job_ids: list[str] | None = None) -> dict[str, Any]:
+        """Пересчёт по требованию: перечисленные записи или весь архив.
+
+        Весь архив пересчитывается не здесь, а фоновым потоком: пересчёт ста
+        тысяч записей в обработчике HTTP-запроса — это запрос, который висит
+        полчаса и обрывается по тайм-ауту, оставив работу наполовину
+        сделанной. Поэтому у записей просто снимается отметка версии, и
+        дальше их разбирает тот же поток, что разбирает архив.
+        """
+        if job_ids:
+            сделано = 0
+            for job_id in job_ids:
+                if self.analyze_job(job_id) is not None:
+                    сделано += 1
+            self.forget_frequency()
+            return {"recomputed": сделано, "queued": 0}
+        # Отметка версии — единственное, что отделяет разобранную запись от
+        # ожидающей разбора. Обнулять её, а не удалять строки: строка с
+        # прошлым разбором остаётся видна в разделе, пока не посчитан новый.
+        сброшено = self.db.execute("UPDATE content SET version=0")
+        self.forget_frequency()
+        return {"recomputed": 0, "queued": int(сброшено)}
+
+    def status(self) -> dict[str, Any]:
+        """Состояние разбора: сколько посчитано, сколько ждёт, чем занят.
+
+        Считается двумя счётчиками, а не снимком корпусных частот. Снимок
+        сбрасывается после каждой порции фонового разбора, поэтому во время
+        разбора — ровно тогда, когда интерфейс и опрашивает состояние раз в
+        пятнадцать секунд — он не попадал в кеш ни разу, и каждый опрос
+        делал полную группировку по таблице основ под общей блокировкой.
+        """
+        сведения = self.db.content_stats(content.VERSION)
+        return {
+            **сведения,
+            "version": content.VERSION,
+            "enabled": self.enabled,
+            "backfill": bool(self.settings.get("content_backfill", True))
+            if self.settings else True,
+            "running": bool(self._thread and self._thread.is_alive()),
+            "vocabulary": self.db.vocabulary_size(),
+            "corpus": self.db.content_window_size(),
+            "backfilled": self.backfilled,
+            "last_error": self.last_error,
+        }
+
+    # --- фоновый поток ----------------------------------------------------
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="asrhub-content",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        поток, self._thread = self._thread, None
+        if поток and поток.is_alive():
+            поток.join(timeout=timeout)
+
+    def _loop(self) -> None:
+        сбоев = 0
+        пауза = ПАУЗА_РАЗБОРА
+        while not self._stop.wait(timeout=пауза):
+            if not (self.enabled and (self.settings.get("content_backfill", True)
+                                      if self.settings else True)):
+                пауза = ПАУЗА_ПРОСТОЯ
+                continue
+            try:
+                сделано = self.backfill_once()
+            except Exception as exc:                         # noqa: BLE001
+                сбоев += 1
+                self.last_error = str(exc)
+                if сбоев <= 3 or сбоев % 60 == 0:
+                    log.warning("Разбор архива дал сбой (%d-й раз): %s", сбоев, exc)
+                пауза = ПАУЗА_ПРОСТОЯ
+                continue
+            сбоев = 0
+            if сделано:
+                # Разбор архива меняет знаменатель TF-IDF заметно: первые
+                # сотни записей могут увеличить корпус вдвое. Снимок частот
+                # сбрасываем, иначе весь архив разобрался бы по частотам,
+                # снятым на пустой базе.
+                self.forget_frequency()
+                пауза = ПАУЗА_РАЗБОРА
+                log.debug("Разобрано записей архива: %d", сделано)
+            else:
+                пауза = ПАУЗА_ПРОСТОЯ

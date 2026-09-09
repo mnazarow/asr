@@ -115,6 +115,11 @@ class JobQueue:
         # Индексы воркеров, помеченных на выход при уменьшении их числа.
         self._retiring: set[int] = set()
         self._webhooks: Any = None
+        #: Разбор содержания записей. Ставится снаружи (create_app), потому
+        #: что тем же объектом пользуются ручки раздела: два разбора с двумя
+        #: снимками корпусных частот считали бы по-разному одну и ту же
+        #: запись — в зависимости от того, кто её посчитал.
+        self.content_index: Any = None
         self._running: dict[str, float] = {}
         #: Сколько заданий шло разом, пока выполнялось это. Замер памяти —
         #: цифра на весь процесс, и без этого числа она не говорит ничего:
@@ -891,6 +896,15 @@ class JobQueue:
         self.db.save_segments(job_id, outcome.segments)
         with self._lock:
             self._cancelled.discard(job_id)
+
+        # Разбор содержания — здесь, а не в фоновом потоке: признаки нужны
+        # сразу, вместе с результатом. Стоит он десятки миллисекунд против
+        # минут распознавания, а ошибки внутри не выходят наружу.
+        if self.content_index is not None:
+            self.content_index.on_job_completed(
+                job_id, {**job, "text": outcome.text,
+                         "media_duration_s": job.get("media_duration_s")},
+                outcome.segments)
 
         RUNTIME.inc("asrhub_jobs_total", {"status": "completed"})
         RUNTIME.inc("asrhub_audio_seconds_total",
