@@ -163,14 +163,91 @@ def kinds(request: Request,
     готовых пунктов правильнее, чем с чистого листа: скрипт у каждого свой,
     но начинается он обычно не с нуля.
     """
+    from ..content import categories as категории  # noqa: PLC0415
     from ..content.compliance import ПО_УМОЛЧАНИЮ  # noqa: PLC0415
 
+    индекс = _index(request)
     return {
         "kinds": [{"key": к, "title": о["title"]} for к, о in ОТБОРЫ.items()],
         "dimensions": [{"key": к, "title": о["title"]}
                        for к, о in РАЗРЕЗЫ.items()],
         "features": ПРИЗНАКИ,
         "default_script": ПО_УМОЛЧАНИЮ,
+        # Категории — действующий набор (свой или готовый): по нему список
+        # заданий строит отбор «про оплату», а редактор — заготовки.
+        "categories": [к.to_dict() for к in индекс.categories()],
+        "categories_own": индекс.categories_own(),
+        "default_categories": категории.ГОТОВЫЕ,
+        "category_kinds": категории.ВИДЫ,
+        "category_who": категории.КТО,
+        "category_where": категории.ГДЕ,
+    }
+
+
+@router.get("/categories", summary="Категории обращений: счёт и динамика")
+def categories_report(request: Request, period: str = ПЕРИОД,
+                      principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Сколько записей в каждой категории, доля, изменение к прошлому
+    окну, что растёт и угасает, сколько записей без категории вовсе.
+
+    Категории считаются по правилам из настройки `content_categories`
+    (пустая — готовый набор). Правило пишется строкой: «оплата ИЛИ платёж»,
+    «возврат И НЕ брак», «дорого РЯДОМ(5) конкурент»; у категории есть
+    фильтр «кто сказал» и окно «где в разговоре».
+    """
+    return _insights(request).categories(period, owner=scope_owner(principal))
+
+
+@router.post("/categories/check", summary="Проверить набор категорий на записи")
+def categories_check(request: Request, body: dict[str, Any] = Body(default={}),
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Прогоняет категории по выбранной записи, ничего не сохраняя.
+
+    Ради этого редактор и существует: понять по правилу, годится ли оно,
+    нельзя — «оплата ИЛИ это» выглядит безобидно и покрывает весь архив.
+    Видно это только на настоящей записи: что совпало, в какой реплике, на
+    какой секунде. Ошибки разбора правил возвращаются по каждой категории
+    отдельно, с позицией в строке.
+
+    Набор приходит в теле и в базу не попадает: это черновик. Без набора в
+    теле проверяется действующий.
+    """
+    from ..content import categories as категории  # noqa: PLC0415
+    from ..content import compliance  # noqa: PLC0415
+
+    state = get_state(request)
+    job_id = str(body.get("job_id") or "")
+    задание = state.db.get_job(job_id) if job_id else None
+    if not задание:
+        raise error_response(JobNotFound(job_id))
+    require_owner(principal, задание)
+    набор = body.get("categories")
+    if набор is not None and not isinstance(набор, list):
+        raise error_response(ConfigError("Поле categories должно быть списком."))
+    индекс = _index(request)
+    сегменты = state.db.get_segments(job_id)
+    if not сегменты and задание.get("text"):
+        сегменты = [{"start": 0.0, "end": float(задание.get("media_duration_s") or 0.0),
+                     "text": задание["text"]}]
+    оператор = str(state.settings.get("content_agent_speaker") or "").strip() or None
+    # Стороны — те же, что у разбора записи: оператор по скрипту (первый
+    # заговоривший), клиент — самый говорливый из остальных.
+    from ..content.analyze import _клиент  # noqa: PLC0415
+
+    кто = compliance.agent(сегменты, оператор)
+    клиент = _клиент(сегменты, кто)
+    проверяемые = набор if набор is not None else индекс.categories()
+    итог = категории.apply(сегменты, проверяемые, agent=кто, customer=клиент,
+                           everything=True)
+    частоты, корпус = индекс.corpus_frequency()
+    return {
+        "job_id": job_id,
+        "filename": задание.get("filename"),
+        "agent": кто, "customer": клиент,
+        "result": итог,
+        "suspicious": категории.suspicious(проверяемые, частоты, корпус),
+        "errors": категории.validate(набор) if набор is not None else [],
+        "default": набор is None and not индекс.categories_own(),
     }
 
 

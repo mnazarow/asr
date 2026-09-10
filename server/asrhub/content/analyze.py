@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from . import categories as категории_модуль
 from . import compliance, entities, keywords, sentiment, speech
 from .lexicons import (
     ВЕЖЛИВОСТЬ,
@@ -41,7 +42,11 @@ from .stemmer import sentences, stem, words
 #: наложение в секундах, заметная тишина, смешанная тональность,
 #: фрустрация, признаки повторного обращения, нецензурная лексика, окно
 #: пункта скрипта в секундах.
-VERSION = 2
+#:
+#: 3 — категории обращений по правилам (И / ИЛИ / НЕ / РЯДОМ, кто сказал,
+#: где в разговоре) с таблицей совпадений; скрипт разговора проверяется
+#: тем же движком правил.
+VERSION = 3
 
 _НЕЦЕНЗУРНЫЕ = re.compile("|".join(НЕЦЕНЗУРНЫЕ_КОРНИ))
 
@@ -216,13 +221,16 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             agent_speaker: str | None = None,
             document_frequency: dict[str, int] | None = None,
             corpus_size: int = 0,
-            profanity: bool = False) -> dict[str, Any]:
+            profanity: bool = False,
+            categories: list[Any] | None = None) -> dict[str, Any]:
     """Разбор одной записи.
 
     `agent_speaker` — кто из говорящих оператор: по нему проверяется скрипт.
     `document_frequency` и `corpus_size` — сведения о корпусе для TF-IDF;
     без них ключевые слова считаются по простой частоте. `profanity` —
     считать ли нецензурную лексику: по умолчанию нет, см. словарь.
+    `categories` — набор категорий (сырые словари или уже разобранные);
+    None — готовый набор, пустой список — не искать вовсе.
     """
     сегменты = list(segments or [])
     if not сегменты and text:
@@ -248,6 +256,11 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
     фрустрация = _по_репликам(сегменты, кого=клиент, искать=_фрустрация)
     повторное = _по_репликам(сегменты, кого=клиент, искать=_повторное)
     мат = _по_репликам(сегменты, кого=None, искать=_мат) if profanity else []
+    # Категории — тем же оператором и клиентом, что и всё остальное:
+    # «нарушение оператора» обязано искать у того же человека, чей скрипт
+    # проверяется строкой выше.
+    набор = категории_модуль.ГОТОВЫЕ if categories is None else categories
+    категории = категории_модуль.apply(сегменты, набор, agent=оператор, customer=клиент)
 
     отрицательные = sorted((о for о in оценки if о["score"] < -sentiment.ПОРОГ),
                            key=lambda о: о["score"])
@@ -301,6 +314,7 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             "items": мат[:10],
         },
         "compliance": скрипт,
+        "categories": категории,
         # Основы записи для корпусного знаменателя. Считаются здесь, а не
         # отдельным проходом при сохранении: текст уже разобран на слова, и
         # второй проход по часовой расшифровке ради того же результата —
@@ -317,6 +331,9 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
     уходит в `detail` одним полем: карточке записи оно нужно целиком, а
     сводам — никогда, и поднимать килобайты JSON ради средней тональности
     за месяц не придётся.
+
+    Совпадения категорий едут в своде под ключом `hits` — это строки
+    отдельной таблицы, а не колонки; база забирает их при сохранении.
     """
     разбор = dict(разбор)
     основы = разбор.pop("terms", None) or {}
@@ -365,6 +382,7 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
                       if (разбор.get("profanity") or {}).get("enabled") else None),
         "profanity_agent": ((разбор.get("profanity") or {}).get("agent")
                             if (разбор.get("profanity") or {}).get("enabled") else None),
+        "hits": категории_модуль.for_db(разбор.get("categories") or {}),
         "detail": разбор,
     }
     return свод, основы

@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import rules
 from .lexicons import СЛУЖЕБНЫЕ
-from .stemmer import stem, words
+from .stemmer import stem
 
 #: Скрипт по умолчанию: то, что спрашивают почти в любой службе поддержки.
 #: Значение — список вариантов; достаточно одного совпадения.
@@ -76,19 +77,6 @@ from .stemmer import stem, words
 ДОЛЯ_КРАЯ = 0.2
 
 
-def _основы(текст: str) -> list[str]:
-    return [stem(w) for w in words(текст)]
-
-
-def _есть(последовательность: list[str], образец: list[str]) -> bool:
-    if not образец:
-        return False
-    for i in range(len(последовательность) - len(образец) + 1):
-        if последовательность[i:i + len(образец)] == образец:
-            return True
-    return False
-
-
 def suspicious(script: list[dict[str, Any]] | None,
                document_frequency: dict[str, int] | None = None,
                corpus_size: int = 0) -> list[dict[str, str]]:
@@ -106,34 +94,56 @@ def suspicious(script: list[dict[str, Any]] | None,
     """
     if not script:
         return []
-    порог = corpus_size * ДОЛЯ_ЧАСТОГО
     найдено: list[dict[str, str]] = []
     for пункт in script:
-        for примета in пункт.get("any") or []:
-            основы = _основы(примета)
+        подпись = str(пункт.get("label") or пункт.get("id") or "")
+        try:
+            дерево = _правило(пункт)
+        except rules.RuleError:
+            continue
+        for операнд in rules.operands(дерево):
             # Оборот из нескольких слов проверять незачем: «чем могу помочь»
             # частым не бывает, даже если каждое слово в нём частое.
-            if len(основы) != 1:
+            if len(операнд.words) != 1:
                 continue
-            # Служебное слово — подозрительно само по себе, без всякого
-            # корпуса. Это и есть главный случай: «это», «так», «то» в
-            # словарь частот вообще не попадают (их отсеивают на входе), то
-            # есть проверка по корпусу молчала бы ровно там, где ошибка
-            # опаснее всего. Голое «это» в пункте «Представился» именно так
-            # и прожило до первого снимка экрана.
-            #
-            # Сверяемся со служебными, а не со всеми стоп-словами: там же
-            # лежат «здравствуйте» и «спасибо», а они — правильные приметы,
-            # частые ровно потому, что скрипт их и требует.
-            частое = (основы[0] in СЛУЖЕБНЫЕ
-                      or (corpus_size >= 20
-                          and document_frequency is not None
-                          and document_frequency.get(основы[0], 0) >= порог))
-            if частое:
-                найдено.append({"word": примета,
-                                "label": str(пункт.get("label") or пункт.get("id") or "")})
+            основа = stem(операнд.words[0]) if операнд.exact else операнд.words[0]
+            if frequent_marker(основа, document_frequency, corpus_size):
+                найдено.append({"word": операнд.text, "label": подпись})
     return найдено
 
+
+def frequent_marker(основа: str, document_frequency: dict[str, int] | None,
+                    corpus_size: int) -> bool:
+    """Слишком ли часто слово, чтобы быть приметой.
+
+    Служебное слово — подозрительно само по себе, без всякого корпуса. Это
+    и есть главный случай: «это», «так», «то» в словарь частот вообще не
+    попадают (их отсеивают на входе), то есть проверка по корпусу молчала
+    бы ровно там, где ошибка опаснее всего. Голое «это» в пункте
+    «Представился» именно так и прожило до первого снимка экрана.
+
+    Сверяемся со служебными, а не со всеми стоп-словами: там же лежат
+    «здравствуйте» и «спасибо», а они — правильные приметы, частые ровно
+    потому, что скрипт их и требует.
+    """
+    if основа in СЛУЖЕБНЫЕ:
+        return True
+    return (corpus_size >= 20 and document_frequency is not None
+            and document_frequency.get(основа, 0) >= corpus_size * ДОЛЯ_ЧАСТОГО)
+
+
+def _правило(пункт: dict[str, Any]) -> Any:
+    """Дерево правила пункта: строка `rule`, а без неё — список примет.
+
+    Пункт скрипта — частный случай категории: «здравствуйте, добрый день»
+    — это «здравствуйте ИЛИ добрый день», и проверяет его тот же движок.
+    С полем `rule` пункту доступны и остальные операторы: «представился»
+    можно записать как «меня зовут ИЛИ на связи НЕ вы позвонили в».
+    """
+    правило = str(пункт.get("rule") or "").strip()
+    if правило:
+        return rules.parse(правило)
+    return rules.parse_any([str(в) for в in (пункт.get("any") or [])])
 
 
 def _время(сегмент: dict[str, Any], край: str) -> float:
@@ -163,6 +173,11 @@ def _оператор(сегменты: list[dict[str, Any]]) -> str | None:
     """
     метки = [str(с.get("speaker") or "") for с in сегменты if с.get("speaker")]
     return метки[0] if len(set(метки)) > 1 else None
+
+
+def agent(segments: list[dict[str, Any]], speaker: str | None = None) -> str | None:
+    """Кто оператор: заданный настройкой или определённый по записи."""
+    return speaker if speaker is not None else _оператор(list(segments or []))
 
 
 def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None = None,
@@ -197,8 +212,7 @@ def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None
         "end": сегменты[-край:],
         "any": сегменты,
     }
-    основы = {имя: _основы(" ".join(str(с.get("text") or "") for с in куски))
-              for имя, куски in области.items()}
+    тексты = {имя: rules.Text.of(куски) for имя, куски in области.items()}
     # Границы записи по времени — для пунктов с окном в секундах.
     первая = min((_время(с, "start") for с in все), default=0.0)
     последняя = max((_время(с, "end") for с in все), default=0.0)
@@ -217,20 +231,28 @@ def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None
             куски = [с for с in сегменты
                      if (_время(с, "start") - первая <= окно if где == "start"
                          else последняя - _время(с, "end") <= окно)]
-            последовательность = _основы(
-                " ".join(str(с.get("text") or "") for с in куски))
+            текст = rules.Text.of(куски)
         else:
-            последовательность = основы.get(где, основы["any"])
+            текст = тексты.get(где, тексты["any"])
         нашлось = None
-        for вариант in пункт.get("any") or []:
-            if _есть(последовательность, _основы(вариант)):
-                нашлось = вариант
-                break
-        if нашлось:
+        ошибка = None
+        try:
+            найдено = rules.evaluate(_правило(пункт), текст)
+        except rules.RuleError as exc:
+            # Пункт с негодным правилом не выполнен и говорит почему:
+            # молча пропустить его значило бы завысить соблюдение скрипта.
+            найдено = rules.Result(False, [])
+            ошибка = exc.message
+        if найдено.matched:
             выполнено += 1
+            # Что именно совпало: первая по порядку примета — как раньше, когда
+            # варианты перебирались по списку. Для правила с И это одна из
+            # обязательных частей, для ИЛИ — сработавшая.
+            нашлось = min(найдено.hits, key=lambda h: h.start).text if найдено.hits else "—"
         итог.append({"id": пункт.get("id"), "label": пункт.get("label"),
                      "where": где, "within_s": окно or None,
-                     "passed": нашлось is not None, "matched": нашлось})
+                     "passed": найдено.matched, "matched": нашлось,
+                     **({"error": ошибка} if ошибка else {})})
     return {
         "score": round(выполнено / len(пункты), 3) if пункты else None,
         "checked": len(пункты), "passed": выполнено,

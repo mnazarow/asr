@@ -224,7 +224,8 @@ def _digest_content(insights: Any, settings: Any,
         свод = insights.summary(срок)
         if not свод.get("records"):
             return None
-        выводы = insights.findings(срок)
+        категории = insights.categories(срок)
+        выводы = insights.findings(срок, категории=категории)
         послушать = {вид: insights.records(вид, срок, limit=3)
                      for вид in ("negative", "alerts", "open_commitments")}
     except Exception as exc:                                 # noqa: BLE001
@@ -233,6 +234,13 @@ def _digest_content(insights: Any, settings: Any,
     return {
         "summary": свод,
         "findings": выводы,
+        # Категории — верхние пять с долей и изменением: «о чём звонили»
+        # в трёх строках чата, без правил и примеров.
+        "categories": [
+            {к: з.get(к) for к in ("id", "label", "kind", "records", "share",
+                                   "previous", "share_previous", "delta")}
+            for з in (категории.get("items") or []) if з.get("records")][:5],
+        "uncategorized": категории.get("uncategorized"),
         "coverage": insights.index.status() if insights.index else {},
         "highlights": {вид: [
             {к: з.get(к) for к in ("job_id", "filename", "owner", "sentiment",
@@ -325,6 +333,19 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         if свод.get("profanity_agent_records"):
             строки.append(f"Нецензурная лексика у сотрудника: "
                           f"{свод['profanity_agent_records']} записей")
+        категории = (содержание or {}).get("categories") or []
+        if категории:
+            части = []
+            for к in категории:
+                сдвиг = к.get("delta")
+                знак = (f" ({'+' if сдвиг > 0 else '−'}{число(abs(сдвиг))} п.п.)"
+                        if сдвиг else "")
+                части.append(f"{к.get('label')} {число(к.get('share'))} %{знак}")
+            строки.append("О чём звонили: " + ", ".join(части))
+        без = (содержание or {}).get("uncategorized") or {}
+        if без.get("records"):
+            строки.append(f"Без категории: {без['records']} записей "
+                          f"({число(без.get('share'))} %)")
         for вывод in ((содержание or {}).get("findings") or [])[:3]:
             метка = {"warning": "!", "good": "+"}.get(вывод.get("severity"), "·")
             строки.append(f"  {метка} {вывод.get('text')}")

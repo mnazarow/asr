@@ -54,16 +54,28 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      ("/api/settings",)),
     ("Сведения о сервере",
      "Версия, оборудование, аналитика, журнал и лента событий.",
-     ("/api/health", "/api/system", "/api/analytics", "/api/logs",
+     ("/api/health", "/health", "/api/system", "/api/analytics", "/api/logs",
       "/api/events", "/api/reference")),
     ("Ключи доступа, подразделения и квоты",
      "Выпуск и отзыв ключей, одноразовые билеты для WebSocket, расход по "
      "суточным квотам. Ключи с одинаковым `group` видят задания друг друга.",
      ("/api/keys", "/api/auth", "/api/usage")),
+    ("Аналитика записей",
+     "Содержание разговоров: свод, разрезы, темы, категории обращений по "
+     "правилам, связи, выводы, отборы «что послушать», скрипт разговора и "
+     "разбор одной записи. Выборка сужается до записей самого ключа; "
+     "пересчёт всего архива — только администратору.",
+     ("/api/content",)),
     ("Обслуживание",
      "Освобождение места и памяти. Обе операции необратимы, поэтому требуют "
      "ключа администратора.",
      ("/api/maintenance",)),
+    ("Учётные записи и приём разговоров",
+     "Пользователи веб-интерфейса, приём разговоров по схеме phone_asr и "
+     "перечень статусов — с короткими адресами без префикса `/api`, которые "
+     "настраивают в чужих системах.",
+     ("/api/users", "/api/process-call", "/api/statuses", "/process-call",
+      "/statuses")),
     ("Мониторинг",
      "Метрики, пробы состояния и тревоги. Подробный разбор каждой метрики — "
      "в отдельном руководстве по мониторингу; здесь только интерфейс.",
@@ -80,7 +92,7 @@ ROOT_PATHS = {"/health", "/process-call", "/statuses"}
 OPEN_ROUTES = {"/api/health", "/health"}
 #: Маршруты, выборка которых сужается до заданий самого ключа.
 SCOPED_ROUTES = {"/api/jobs", "/api/analytics", "/api/analytics/{section}",
-                 "/api/events"}
+                 "/api/events", "/api/content"}
 #: Маршруты, требующие ключа администратора.
 ADMIN_ROUTES = {
     ("/api/keys", "get"), ("/api/keys", "post"), ("/api/keys/{preview}", "delete"),
@@ -88,6 +100,7 @@ ADMIN_ROUTES = {
     ("/api/settings", "put"), ("/api/settings/save", "post"),
     ("/api/settings/reset", "post"),
     ("/api/maintenance/cleanup", "post"), ("/api/maintenance/unload-models", "post"),
+    ("/api/content/recompute", "post"),
     ("/api/queue/concurrency", "post"), ("/api/queue/clear", "post"),
     ("/api/models/{model_id}", "delete"),
     ("/api/monitoring/alerts/rules", "put"),

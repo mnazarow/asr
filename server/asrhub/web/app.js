@@ -2394,13 +2394,36 @@ RENDERERS.results = {
     qs('#r-order').onchange = () => this.load();
     // Отбор по содержанию приходит и снаружи — из «Аналитики записей»,
     // где щелчок по отбору «что послушать» ведёт сюда за самим списком.
-    if (state.resultsContent) {
-      qs('#r-content').value = state.resultsContent;
-      state.resultsContent = '';
-    }
+    // Категории обращений дописываются в тот же список: их набор живёт в
+    // настройках, и зашитый в разметку перечень устарел бы с первой правкой.
+    const выбрать = state.resultsContent;
+    state.resultsContent = '';
+    if (выбрать) qs('#r-content').value = выбрать;
+    this.loadCategoryOptions(выбрать);
     qs('#r-content').onchange = () => this.load();
     Bulk.attach(qs('#r-bulk'), () => this.load());
     this.load();
+  },
+
+  /** Дописывает в отбор по содержанию действующие категории обращений. */
+  async loadCategoryOptions(выбрать) {
+    let перечни;
+    try { перечни = await API.background('/api/content/kinds'); } catch (e) { return; }
+    const select = qs('#r-content');
+    if (!select || !(перечни.categories || []).length) return;
+    const группа = document.createElement('optgroup');
+    группа.label = 'Категории обращений';
+    (перечни.categories || []).forEach((к) => {
+      const opt = document.createElement('option');
+      opt.value = `category:${к.id}`;
+      opt.textContent = к.label;
+      группа.appendChild(opt);
+    });
+    select.appendChild(группа);
+    if (выбрать && выбрать.startsWith('category:')) {
+      select.value = выбрать;
+      this.load();
+    }
   },
 
   async load() {
@@ -2895,6 +2918,7 @@ async function loadJobAnalysis(backdrop, job) {
   const раздражение = a.frustration || {};
   const повторное = a.repeat_contact || {};
   const мат = a.profanity || {};
+  const категории = a.categories || { items: [], matched: [], checked: 0 };
 
   const реплика = (з, доп) => `<div class="analysis-line" data-start="${з.start_s || 0}">
     <span class="ts mono">${fmtDur(з.start_s || 0)}</span>
@@ -2972,6 +2996,25 @@ async function loadJobAnalysis(backdrop, job) {
                  '<tr><td class="small dim">Ничего из этого в записи не прозвучало</td></tr>'}
              </tbody></table></div>`)}
     </div>
+
+    ${(категории.items || []).length ? card('Категории обращения',
+      `по правилам набора: ${категории.matched.length} из ${категории.checked} сработали`,
+      `<div class="chips" style="margin-bottom:10px">${(категории.items || []).map((к) =>
+        `<span class="chip ${КАТЕГОРИЯ_ЦВЕТ[к.kind] || ''}" title="${esc(КАТЕГОРИЯ_ВИД[к.kind] || к.kind)}: совпадений ${к.count}${
+          к.sides === false ? '; сторона не определена — искали по всей записи' : ''}">${esc(к.label)}${
+          к.count > 1 ? ` <span class="faint">×${к.count}</span>` : ''}</span>`).join('')}</div>
+       <div class="analysis-lines">${(категории.items || []).flatMap((к) => {
+         // Одна реплика — одна строка, сколько бы примет в ней ни совпало:
+         // «Сроки: срок, сорван», а не две строки с одним и тем же текстом.
+         const поРепликам = new Map();
+         (к.hits || []).forEach((h) => {
+           const ключ = `${h.start_s}|${h.speaker}`;
+           if (!поРепликам.has(ключ)) поРепликам.set(ключ, { ...h, слова: [] });
+           поРепликам.get(ключ).слова.push(h.matched);
+         });
+         return [...поРепликам.values()].slice(0, 2).map((h) =>
+           реплика(h, `${к.label}: ${h.слова.join(', ')}`));
+       }).join('')}</div>`) : ''}
 
     ${(тревога.items || []).length ? card('Тревожные упоминания',
       'суд, жалоба, огласка — повод послушать запись целиком',
@@ -3884,13 +3927,25 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
 };
 
 const CONTENT_TABS = [
-  { key: 'summary',  title: 'Свод' },
-  { key: 'groups',   title: 'Разрезы' },
+  { key: 'summary',    title: 'Свод' },
+  { key: 'categories', title: 'Категории' },
+  { key: 'groups',     title: 'Разрезы' },
   { key: 'topics',   title: 'Темы' },
   { key: 'links',    title: 'Связи' },
   { key: 'records',  title: 'Что послушать' },
   { key: 'script',   title: 'Скрипт разговора' },
 ];
+
+/** Виды категорий: подпись и цвет фишки. Один перечень на карточку,
+ *  вкладку и редактор — чтобы «нарушение» везде было красным. */
+const КАТЕГОРИЯ_ВИД = {
+  topic: 'категория обращения',
+  violation: 'нарушение оператора',
+  objection: 'возражение клиента',
+  handling: 'отработка возражения',
+};
+const КАТЕГОРИЯ_ЦВЕТ = { violation: 'err', objection: 'warn', handling: 'ok' };
+const КАТЕГОРИЯ_КТО = { any: 'любой', agent: 'оператор', customer: 'клиент' };
 
 /** Подпись тональности с цветом: одно число читается плохо, слово — сразу. */
 function toneChip(score, label) {
@@ -4032,8 +4087,14 @@ RENDERERS.content = {
     }
   },
 
-  /** Уход из раздела: таймер полосы разбора гасится общим механизмом. */
-  leave() { state.contentCoverageTimer = null; },
+  /** Уход из раздела: таймер полосы разбора гасится общим механизмом;
+   *  черновик категорий сбрасывается — как и черновик скрипта, он живёт
+   *  только на экране, пока его не сохранили. */
+  leave() {
+    state.contentCoverageTimer = null;
+    state.contentCategories = null;
+    state.contentCategoriesDirty = false;
+  },
 
   async recompute() {
     if (!confirm('Пересчитать разбор всего архива?\n\nСчитается в фоне порциями; ' +
@@ -4461,6 +4522,303 @@ RENDERERS.content = {
       go('results');
     });
   },
+};
+
+/* Категории обращений: счёт за период и редактор правил.
+ *
+ * Вкладка отвечает на вопрос «о чём звонят» — по правилам, которые тут же
+ * и правят. Верхняя таблица считается по сохранённому набору, редактор
+ * ниже держит черновик; проверка на записи гоняет черновик, ничего не
+ * сохраняя. Так у человека перед глазами и результат набора на архиве,
+ * и то, как правило сработает на одной настоящей записи, — второе без
+ * первого рождает категории, покрывающие весь архив, первое без второго
+ * — категории, не совпадающие ни с чем.
+ */
+
+RENDERERS.content.tab_categories = async function (host) {
+  const период = state.contentPeriod;
+  const [свод, перечни, перечень] = await Promise.all([
+    API.latest('content-categories', `/api/content/categories?period=${период}`),
+    API.latest('content-kinds', '/api/content/kinds'),
+    API.latest('content-script-jobs',
+      '/api/jobs?status=completed&limit=25&light=true&order=created_at DESC'),
+  ]);
+  state.contentCategoriesOwn = !!перечни.categories_own;
+  state.contentCategoriesReady = перечни.default_categories || [];
+  // Черновик заводится один раз на заход в раздел: смена периода
+  // перерисовывает вкладку, и терять при этом полчаса правки нельзя.
+  if (!state.contentCategories) {
+    state.contentCategories = JSON.parse(JSON.stringify(
+      (перечни.categories || []).map((к) => ({
+        id: к.id, label: к.label, rule: к.rule, kind: к.kind, who: к.who,
+        where: к.where, within_s: к.within_s || undefined, notify: !!к.notify,
+        penalty: к.penalty || 0, weight: к.weight === undefined ? 1 : к.weight }))));
+    state.contentCategoriesDirty = false;
+  }
+  state.contentScriptJobs = (перечень.items || []);
+  state.contentScriptJob = state.contentScriptJob ||
+    (state.contentScriptJobs[0] || {}).id || '';
+  this.drawCategories(host, свод);
+  if (state.contentScriptJob) this.checkCategories();
+};
+
+RENDERERS.content.drawCategories = function (host, свод) {
+  const набор = state.contentCategories || [];
+  const свой = state.contentCategoriesOwn;
+  const items = свод.items || [];
+  const без = свод.uncategorized || {};
+  const растут = new Set(свод.rising || []);
+  const угасают = new Set(свод.fading || []);
+  const сКатегорией = свод.corpus && без.records !== undefined
+    ? свод.corpus - без.records : null;
+  host.innerHTML = `
+    <div class="settings-toolbar">
+      <span class="small dim">Проверить на записи:</span>
+      <select id="cat-job" style="width:320px">
+        ${state.contentScriptJobs.map((j) => `<option value="${esc(j.id)}"
+          ${j.id === state.contentScriptJob ? 'selected' : ''}>${
+          esc(j.filename || j.id)}</option>`).join('') ||
+          '<option value="">завершённых записей пока нет</option>'}
+      </select>
+      <span class="spacer"></span>
+      ${свой ? `<button class="ghost sm" id="cat-default"
+        title="Вернуться к готовому набору из десяти категорий">Вернуть готовый набор</button>` : ''}
+      <select id="cat-ready" class="sm" style="width:200px" title="Добавить готовую категорию в набор">
+        <option value="">Добавить готовую…</option>
+        ${(state.contentCategoriesReady || [])
+          .filter((г) => !набор.some((к) => к.id === г.id))
+          .map((г) => `<option value="${esc(г.id)}">${esc(г.label)}</option>`).join('')}
+      </select>
+      <button class="btn sm" id="cat-add">Добавить категорию</button>
+      <button class="primary sm" id="cat-save" ${state.contentCategoriesDirty ? '' : 'disabled'}>Сохранить</button>
+    </div>
+
+    ${свой ? '' : `<div class="finding info" style="margin-bottom:14px">
+      Сейчас действует готовый набор — ${items.length} категорий, с которыми
+      сталкивается почти любая служба поддержки. Сохранение делает набор вашим:
+      с этого момента сервер размечает записи только по тому, что здесь написано.
+    </div>`}
+
+    <div class="grid cols-4" style="margin-bottom:14px">
+      ${kpi('Записей с категорией', сКатегорией === null ? '—' : num(сКатегорией),
+            свод.corpus ? `из ${num(свод.corpus)} разобранных за период` : 'за период записей нет')}
+      ${kpi('Без категории', без.records === undefined ? '—' : num(без.records),
+            без.share === undefined || без.share === null ? '' :
+              `${num(без.share, 1)} % — довод завести новую категорию`)}
+      ${kpi('Растут', num(растут.size), 'доля выросла на 5 п.п. и больше')}
+      ${kpi('Угасают', num(угасают.size), 'доля упала на 5 п.п. и больше')}
+    </div>
+
+    ${card('Категории за период',
+           'доля — от разобранных записей периода; изменение — к прошлому такому же периоду',
+           items.length ? `<div class="table-wrap full"><table id="cat-table">
+        <thead><tr><th>Категория</th><th>Вид</th><th>Кто</th>
+          <th class="num">Записей</th><th class="num">Доля</th>
+          <th class="num" title="записей в прошлом периоде">Было</th>
+          <th class="num" title="изменение доли, процентных пунктов">Изменение</th>
+          <th class="num" title="совпадений всего, по всем записям">Упоминаний</th>
+          <th></th></tr></thead>
+        <tbody>${items.map((к) => `<tr class="${к.error ? 'faint' : ''}">
+          <td><b>${esc(к.label)}</b>${к.stale ? ' <span class="chip">нет в наборе</span>' : ''}${
+            к.error ? ` <span class="chip err" title="${esc(к.error)}">ошибка правила</span>` : ''}${
+            растут.has(к.id) ? ' <span class="chip warn">растёт</span>' : ''}${
+            угасают.has(к.id) ? ' <span class="chip">угасает</span>' : ''}</td>
+          <td class="small"><span class="chip ${КАТЕГОРИЯ_ЦВЕТ[к.kind] || ''}">${
+            esc(КАТЕГОРИЯ_ВИД[к.kind] || к.kind)}</span></td>
+          <td class="small dim">${esc(КАТЕГОРИЯ_КТО[к.who] || к.who || '—')}</td>
+          <td class="num mono">${num(к.records)}</td>
+          <td class="num mono">${к.share === null || к.share === undefined ? '—' : `${num(к.share, 1)} %`}</td>
+          <td class="num mono faint">${num(к.previous)}</td>
+          <td class="num mono">${к.delta === null || к.delta === undefined ? '—' :
+            `<span class="${к.delta > 0 ? (к.kind === 'violation' ? 'err' : '') : ''}">${
+              к.delta > 0 ? '+' : ''}${num(к.delta, 1)}</span>`}</td>
+          <td class="num mono">${num(к.mentions)}</td>
+          <td>${к.records ? `<button class="ghost sm" data-category="${esc(к.id)}"
+                title="Все записи этой категории в разделе «Результаты»">Записи</button>` : ''}</td>
+        </tr>`).join('')}</tbody></table></div>`
+           : '<div class="empty small">За период разобранных записей нет</div>')}
+
+    ${card('Набор категорий',
+           'правило: слова и фразы с И, ИЛИ, НЕ, РЯДОМ(N) и скобками; без кавычек — по основам ' +
+           '(«уточнить» найдёт «уточню»), в кавычках — точно. Операторы — заглавными',
+           '<div class="script-list" id="cat-list"></div>')}
+
+    ${card('Что нашлось в выбранной записи',
+           'правило, совпадающее с частым словом, покрывает весь архив — здесь это видно сразу',
+           '<div id="cat-check"><div class="empty small">Выберите запись</div></div>')}`;
+
+  const список = qs('#cat-list', host);
+  const тронуто = () => {
+    state.contentCategoriesDirty = true;
+    qs('#cat-save').disabled = false;
+    clearTimeout(state.contentScriptTimer);
+    state.contentScriptTimer = setTimeout(() => RENDERERS.content.checkCategories(), 500);
+  };
+  const рисовать = () => {
+    список.innerHTML = набор.map((к, i) => `
+      <div class="script-item" data-index="${i}">
+        <div class="row" style="gap:8px">
+          <input type="text" class="cat-title" value="${esc(к.label || '')}"
+                 placeholder="Название категории" style="flex:1">
+          <select class="cat-kind" style="width:190px" title="Что означает срабатывание">
+            ${Object.entries(КАТЕГОРИЯ_ВИД).map(([v, t]) =>
+              `<option value="${v}" ${(к.kind || 'topic') === v ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+          <select class="cat-who" style="width:130px" title="Чьи реплики смотреть">
+            ${Object.entries(КАТЕГОРИЯ_КТО).map(([v, t]) =>
+              `<option value="${v}" ${(к.who || 'any') === v ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+          <select class="cat-where" style="width:170px">
+            ${Object.entries(ГДЕ_ИСКАТЬ).map(([v, t]) =>
+              `<option value="${v}" ${(к.where || 'any') === v ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+          <input type="number" class="cat-within" min="0" step="5" style="width:92px"
+                 value="${к.within_s ? esc(String(к.within_s)) : ''}"
+                 placeholder="секунд" ${(к.where || 'any') === 'any' ? 'hidden' : ''}
+                 title="Окно в секундах от начала или до конца записи; пусто — пятая часть реплик">
+          <button class="ghost icon cat-del" title="Убрать категорию">✕</button>
+        </div>
+        <input type="text" class="cat-rule mono" style="margin-top:6px"
+               value="${esc(к.rule || '')}"
+               placeholder='правило: оплата ИЛИ платёж ИЛИ "не прошла оплата"'>
+        <div class="script-hit small" data-hit="${esc(к.id || '')}"></div>
+      </div>`).join('') ||
+      '<div class="empty small">Категорий нет: записи размечаться не будут</div>';
+    qsa('.script-item', список).forEach((узел) => {
+      const i = Number(узел.dataset.index);
+      const менять = () => {
+        набор[i].label = qs('.cat-title', узел).value.trim();
+        набор[i].kind = qs('.cat-kind', узел).value;
+        набор[i].who = qs('.cat-who', узел).value;
+        набор[i].where = qs('.cat-where', узел).value;
+        const окно = qs('.cat-within', узел);
+        окно.hidden = набор[i].where === 'any';
+        const секунд = Number(окно.value);
+        if (секунд > 0 && набор[i].where !== 'any') набор[i].within_s = секунд;
+        else delete набор[i].within_s;
+        набор[i].rule = qs('.cat-rule', узел).value.trim();
+        тронуто();
+      };
+      qsa('input, select', узел).forEach((поле) => {
+        поле.addEventListener('change', менять);
+        if (поле.tagName === 'INPUT') поле.addEventListener('input', менять);
+      });
+      qs('.cat-del', узел).addEventListener('click', () => {
+        набор.splice(i, 1);
+        тронуто();
+        рисовать();
+      });
+    });
+  };
+  рисовать();
+
+  qs('#cat-job').addEventListener('change', (e) => {
+    state.contentScriptJob = e.target.value;
+    this.checkCategories();
+  });
+  qs('#cat-add').addEventListener('click', () => {
+    набор.push({ id: `к${Date.now().toString(36)}`, label: '', rule: '',
+                 kind: 'topic', who: 'any', where: 'any' });
+    тронуто();
+    рисовать();
+    const последний = qs('.script-item:last-child .cat-title', список);
+    if (последний) последний.focus();
+  });
+  qs('#cat-ready').addEventListener('change', (e) => {
+    const готовая = (state.contentCategoriesReady || []).find((г) => г.id === e.target.value);
+    if (!готовая) return;
+    набор.push(JSON.parse(JSON.stringify(готовая)));
+    e.target.value = '';
+    e.target.querySelector(`option[value="${CSS.escape(готовая.id)}"]`).remove();
+    тронуто();
+    рисовать();
+  });
+  const вернуть = qs('#cat-default');
+  if (вернуть) вернуть.addEventListener('click', () => this.saveCategories([]));
+  qs('#cat-save').addEventListener('click', () => this.saveCategories(набор));
+  qsa('[data-category]', host).forEach((b) => b.addEventListener('click', () => {
+    state.resultsContent = `category:${b.dataset.category}`;
+    go('results');
+  }));
+};
+
+/** Прогоняет черновик набора по выбранной записи и показывает, что нашлось. */
+RENDERERS.content.checkCategories = async function () {
+  const host = qs('#cat-check');
+  if (!host || !state.contentScriptJob) return;
+  let ответ;
+  try {
+    ответ = await API.post('/api/content/categories/check', {
+      job_id: state.contentScriptJob,
+      categories: state.contentCategories || [],
+    });
+  } catch (err) {
+    host.innerHTML = `<div class="empty small">Проверить не удалось: ${esc(err.message)}</div>`;
+    return;
+  }
+  const итог = ответ.result || {};
+  const items = итог.items || [];
+  // Ошибки правил — под самими правилами в редакторе, там их и правят.
+  qsa('#cat-list .script-item').forEach((узел, i) => {
+    const к = items[i] || {};
+    const строка = qs('.script-hit', узел);
+    if (!строка) return;
+    строка.textContent = к.error ? `Ошибка правила: ${к.error}`
+      : (к.count ? `В выбранной записи: ${к.count} совп., первое на ${fmtDur(к.first_s || 0)}` : '');
+    строка.classList.toggle('err', !!к.error);
+  });
+  host.innerHTML = `
+    <div class="row small dim" style="margin-bottom:10px">
+      <span>Сработало категорий: <b>${(итог.matched || []).length}</b> из ${итог.checked || 0}${
+        итог.errors ? `, с ошибкой правила: ${итог.errors}` : ''}</span>
+      <span class="spacer"></span>
+      <span>${ответ.agent ? `оператор — «${esc(ответ.agent)}»${
+        ответ.customer ? `, клиент — «${esc(ответ.customer)}»` : ''}`
+        : 'стороны не определены — «только оператор» и «только клиент» ищут по всей записи'}</span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Категория</th><th class="num">Совпадений</th><th>Первое</th><th>Что нашли</th></tr></thead>
+      <tbody>${items.map((к) => `<tr>
+        <td>${к.error ? '<span class="chip err">ошибка</span>' : к.count
+          ? '<span class="chip ok">есть</span>' : '<span class="chip">нет</span>'}</td>
+        <td>${esc(к.label || '—')} <span class="faint small">${esc(КАТЕГОРИЯ_ВИД[к.kind] || '')}</span></td>
+        <td class="num mono">${к.error ? '—' : num(к.count)}</td>
+        <td class="mono small">${к.first_s === null || к.first_s === undefined ? '—' : fmtDur(к.first_s)}</td>
+        <td class="small">${к.error ? `<span class="err">${esc(к.error)}</span>`
+          : (к.hits || []).slice(0, 3).map((h) =>
+              `<div><b>${esc(h.matched)}</b> — <span class="dim">${esc(h.speaker || '—')}:</span> ${esc(h.text)}</div>`
+            ).join('') || '—'}</td></tr>`).join('')}</tbody></table></div>
+    ${(ответ.suspicious || []).length ? `<div class="finding warning" style="margin-top:12px">
+      Операнды, совпадающие с частыми словами:
+      ${(ответ.suspicious || []).map((с) =>
+        `<b>${esc(с.word)}</b> (в категории «${esc(с.label)}»)`).join(', ')}.
+      Такая категория покроет почти весь архив — уберите слово или уточните его фразой.
+    </div>` : ''}
+    ${(ответ.errors || []).length ? `<div class="finding warning" style="margin-top:12px">
+      Набор не сохранится, пока есть ошибки: ${(ответ.errors || []).map(esc).join('; ')}
+    </div>` : ''}`;
+};
+
+/** Сохраняет набор категорий и предлагает пересчитать архив. */
+RENDERERS.content.saveCategories = async function (набор) {
+  const плохие = набор.filter((к) => !к.label || !к.rule);
+  if (плохие.length) {
+    toast('У каждой категории должно быть название и правило', 'err');
+    return;
+  }
+  try {
+    await API.put('/api/settings', { content_categories: набор });
+  } catch (err) { fail(err); return; }
+  toast(набор.length ? 'Набор категорий сохранён' : 'Возвращён готовый набор', 'ok');
+  if (confirm('Набор категорий изменился — пересчитать разбор архива?\n\n' +
+              'Без пересчёта старые записи останутся размечены прежним набором, ' +
+              'и счёт по категориям будет смешивать два набора.')) {
+    try { await API.post('/api/content/recompute', {}); } catch (err) { fail(err); }
+  }
+  state.contentData = {};
+  state.contentCategories = null;
+  state.contentCategoriesDirty = false;
+  this.showTab();
 };
 
 /* Редактор скрипта разговора.

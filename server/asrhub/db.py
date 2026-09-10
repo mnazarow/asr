@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -130,7 +130,25 @@ _CONTENT_VOCAB_SCHEMA = """
     ) WITHOUT ROWID
 """
 
+#: Совпадения категорий: по строке на пару «запись — категория». Отдельная
+#: таблица, а не колонка со списком в `content`: свод «сколько записей про
+#: оплату за неделю и сколько было на прошлой» — это группировка по
+#: категории, а группировать по списку в строке база не умеет. Вид
+#: категории хранится рядом: правила меняются, а «нарушение», найденное
+#: месяц назад, должно остаться нарушением в отчёте за тот месяц.
+_CONTENT_HITS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS content_hits (
+        job_id   TEXT NOT NULL,
+        category TEXT NOT NULL,
+        kind     TEXT NOT NULL DEFAULT 'topic',
+        count    INTEGER NOT NULL DEFAULT 1,
+        first_s  REAL,
+        PRIMARY KEY (job_id, category)
+    ) WITHOUT ROWID
+"""
+
 _CONTENT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_content_hits_category ON content_hits(category, job_id)",
     "CREATE INDEX IF NOT EXISTS idx_content_sentiment ON content(sentiment)",
     "CREATE INDEX IF NOT EXISTS idx_content_alerts ON content(alerts)",
     "CREATE INDEX IF NOT EXISTS idx_content_version ON content(version)",
@@ -193,6 +211,8 @@ _SCHEMA = [
     _CONTENT_SCHEMA,
     _CONTENT_TERMS_SCHEMA,
     _CONTENT_VOCAB_SCHEMA,
+    # --- версия 12: совпадения категорий обращений ----------------------
+    _CONTENT_HITS_SCHEMA,
     *_CONTENT_INDEXES,
     # --- версия 1: основные таблицы ---------------------------------------
     """
@@ -605,6 +625,13 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "profanity": "INTEGER",
         "profanity_agent": "INTEGER",
         "detail": "TEXT",
+    },
+    "content_hits": {
+        "job_id": "TEXT",
+        "category": "TEXT",
+        "kind": "TEXT DEFAULT 'topic'",
+        "count": "INTEGER DEFAULT 1",
+        "first_s": "REAL",
     },
     "events": {
         "id": "INTEGER  AUTOINCREMENT",
@@ -1071,6 +1098,11 @@ class Database:
                           "OR jobs.quality_flags LIKE '%compression%')"),
     }
 
+    #: Приставка отбора по категории обращения: `category:payment`. Имя
+    #: категории — значение из настроек, а не выражение, и в запрос оно
+    #: попадает только параметром.
+    CATEGORY_FILTER = "category:"
+
     def _jobs_where(self, *, status: str | list[str] | None = None,
                     owner: str | list[str] | None = None,
                     model: str | None = None, search: str | None = None,
@@ -1093,6 +1125,10 @@ class Database:
         соединение = ""
         if content in self.JOB_FILTERS:
             where.append(self.JOB_FILTERS[content])
+        elif content and content.startswith(self.CATEGORY_FILTER):
+            where.append("EXISTS (SELECT 1 FROM content_hits h "
+                         "WHERE h.job_id = jobs.id AND h.category = ?)")
+            args.append(content[len(self.CATEGORY_FILTER):])
         elif content:
             # Соединение с разбором добавляется, только когда отбор задан:
             # список заданий открывают чаще всего, и лишнее соединение
@@ -1311,12 +1347,25 @@ class Database:
         детали = поля.pop("detail", None)
         поля["detail"] = (json.dumps(детали, ensure_ascii=False)
                           if isinstance(детали, (dict, list)) else детали)
+        # Совпадения категорий — строки своей таблицы, а не колонка; едут
+        # в той же записи базы, что и свод, по той же причине, что и
+        # основы: разбор, попавший в щель между двумя записями, видел бы
+        # новую тональность со старыми категориями.
+        совпадения = поля.pop("hits", None)
         имена = ", ".join(поля)
         места = ",".join("?" for _ in поля)
         with self.write() as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO content ({имена}) VALUES ({места})",
                 list(поля.values()))
+            if совпадения is not None:
+                conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
+                conn.executemany(
+                    "INSERT OR REPLACE INTO content_hits "
+                    "(job_id, category, kind, count, first_s) VALUES (?,?,?,?,?)",
+                    [(job_id, str(с["category"]), str(с.get("kind") or "topic"),
+                      int(с.get("count") or 1), с.get("first_s"))
+                     for с in совпадения if с.get("category")])
             if terms is not None:
                 годные = [т for т in terms if т.get("stem")]
                 conn.execute("DELETE FROM content_terms WHERE job_id=?", (job_id,))
@@ -1592,6 +1641,41 @@ class Database:
             f"WHERE {условие}{хвост}", args)
         return [dict(r) for r in rows]
 
+    def category_counts(self, *, since: float | None = None,
+                        until: float | None = None,
+                        owner: str | list[str] | None = None,
+                        ) -> list[dict[str, Any]]:
+        """Сколько записей окна попало в каждую категорию и сколько раз.
+
+        Считается по таблице совпадений, соединённой с заданиями: окно и
+        владелец живут там. Категории, не встретившиеся ни разу, в ответе
+        нет — их дописывает вызывающая сторона по набору из настроек:
+        «0 записей про возврат» — тоже ответ, и его надо показать.
+        """
+        условие, args = self._content_where(since, until, owner)
+        rows = self.query(
+            "SELECT h.category, h.kind, COUNT(*) AS records, "
+            "       SUM(h.count) AS mentions, AVG(h.first_s) AS first_s "
+            "FROM content_hits h JOIN jobs j ON j.id = h.job_id "
+            f"WHERE {условие} GROUP BY h.category, h.kind "
+            "ORDER BY records DESC", args)
+        return [dict(r) for r in rows]
+
+    def uncategorized_count(self, *, since: float | None = None,
+                            until: float | None = None,
+                            owner: str | list[str] | None = None) -> int:
+        """Разобранные записи окна без единой категории обращения.
+
+        Считаются по таблице разбора, а не по всем заданиям: запись, до
+        которой разбор ещё не дошёл, не «без категории», а «не смотрели».
+        """
+        условие, args = self._content_where(since, until, owner)
+        row = self.query_one(
+            "SELECT COUNT(*) AS n FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"WHERE {условие} AND NOT EXISTS (SELECT 1 FROM content_hits h "
+            "WHERE h.job_id = c.job_id AND h.kind = 'topic')", args)
+        return int(row["n"]) if row else 0
+
     def content_series(self, *, since: float, until: float, buckets: int = 24,
                        owner: str | list[str] | None = None,
                        ) -> tuple[int, float, list[dict[str, Any]]]:
@@ -1835,6 +1919,7 @@ class Database:
             # оставались в знаменателе навсегда.
             conn.execute("DELETE FROM content WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_terms WHERE job_id=?", (job_id,))
+            conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
             # content_vocab не трогаем: это словарь форм на весь сервер, а не
             # данные задания. Строка «поставк → поставки» после удаления
             # записи остаётся верной, а перебирать ради неё все прочие записи

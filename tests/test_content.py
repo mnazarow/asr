@@ -262,8 +262,10 @@ def test_features_split_the_analysis_the_way_the_database_stores_it():
     свод, основы = content.features(разбор)
 
     колонки = {к.strip() for к in Database.CONTENT_COLUMNS.split(",")}
-    # job_id и computed_at проставляет сама запись в базу.
-    assert set(свод) - {"detail"} <= колонки, set(свод) - колонки
+    # job_id и computed_at проставляет сама запись в базу; совпадения
+    # категорий (`hits`) — строки своей таблицы, база забирает их сама.
+    assert set(свод) - {"detail", "hits"} <= колонки, set(свод) - колонки
+    assert all({"category", "kind", "count", "first_s"} <= set(с) for с in свод["hits"])
     assert свод["version"] == content.VERSION
     assert свод["alerts"] == разбор["alerts"]["count"]
     assert свод["commitments_dated"] == разбор["commitments"]["with_deadline"]
@@ -1938,3 +1940,360 @@ def test_the_job_list_accepts_the_quality_selections_too(data_dir, monkeypatch):
         assert c.get("/api/jobs?content=speakers_mismatch",
                      headers=заголовки).json()["items"] == []
         assert c.get("/api/jobs?content=нет-такого", headers=заголовки).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Категории обращений: движок правил
+# ---------------------------------------------------------------------------
+
+
+def _текст(*реплики):
+    from asrhub.content.rules import Text
+
+    return Text.of([{"text": т} for т in реплики])
+
+
+def test_rules_understand_and_or_not_near_and_precedence():
+    """Операторы и их старшинство — как у Genesys: НЕ, РЯДОМ, И, ИЛИ.
+
+    Проверяется не разбор сам по себе, а то, что правило значит то, что
+    прочитает человек: «возврат И НЕ брак» не срабатывает на записи про
+    бракованный возврат, а «а ИЛИ б И в» — это «а ИЛИ (б И в)».
+    """
+    from asrhub.content import rules
+
+    текст = _текст("Хочу оформить возврат, товар с браком, у конкурентов дешевле")
+
+    def значит(правило):
+        return rules.evaluate(rules.parse(правило), текст).matched
+
+    assert значит("возврат")
+    assert значит("возврат И брак")
+    assert not значит("возврат И НЕ брак")
+    assert not значит("возврат НЕ брак")            # то же самое без И
+    assert значит("доставка ИЛИ возврат И брак")
+    assert not значит("доставка ИЛИ возврат И НЕ брак")
+    assert значит("(доставка ИЛИ возврат) И НЕ доставка")
+    assert not значит("НЕ (возврат ИЛИ доставка)")
+    assert значит("конкурент РЯДОМ(2) дешевле")
+    # Между «возврат» и «дешевле» ровно пять слов: окно в пять — да, в
+    # четыре — нет; без числа — восемь, как у NICE.
+    assert значит("возврат РЯДОМ(5) дешевле")
+    assert not значит("возврат РЯДОМ(4) дешевле")
+    assert значит("возврат РЯДОМ дешевле")
+    # Скобки и старшинство — в каноническом виде, который показывает редактор.
+    assert rules.describe(rules.parse("а ИЛИ б И НЕ в")) == "а ИЛИ (б И НЕ в)"
+
+
+def test_rules_match_stems_without_quotes_and_forms_inside_them():
+    """Без кавычек — по основам, в кавычках — точно; строчное «и» — слово."""
+    from asrhub.content import rules
+
+    текст = _текст("Уточню по оплате: деньги списали, хлеб и соль привезли")
+    assert rules.evaluate(rules.parse("уточнить"), текст).matched
+    assert rules.evaluate(rules.parse("оплата"), текст).matched
+    assert not rules.evaluate(rules.parse('"оплата"'), текст).matched
+    assert rules.evaluate(rules.parse('"оплате"'), текст).matched
+    assert rules.evaluate(rules.parse("хлеб и соль"), текст).matched
+    assert not rules.evaluate(rules.parse("хлеб И соль И масло"), текст).matched
+    # Одно слово записи — одно совпадение, сколько бы примет на него ни
+    # указывало: «оплата ИЛИ оплатить» сводится к одной основе.
+    итог = rules.evaluate(rules.parse("оплата ИЛИ оплатить ИЛИ оплате"), текст)
+    assert len(итог.hits) == 1, итог.hits
+
+
+def test_rules_report_errors_with_a_position_and_respect_the_limits():
+    """Ошибка правила — с позицией и по-русски; пределы — как у Genesys."""
+    from asrhub.content import rules
+
+    for правило, слово in (("оплата ИЛИ", "оборвано"), ("(оплата", "не закрыта"),
+                           ("оплата)", "лишняя"), ("ИЛИ оплата", "без операнда"),
+                           ("", "пустое"), ('""', "кавычки"),
+                           ("((((а))))", "глубже 3"),
+                           (" ИЛИ ".join(f"с{i}" for i in range(21)), "больше 20"),
+                           ("а РЯДОМ(0) б", "от 1 до")):
+        ошибка = rules.check(правило)
+        assert слово in ошибка, (правило, ошибка)
+        assert "позиция" in ошибка, ошибка
+    with pytest.raises(rules.RuleError) as п:
+        rules.parse("оплата ИЛИ ИЛИ платёж")
+    assert п.value.position == 11
+    assert rules.check("оплата ИЛИ платёж") == ""
+
+
+def test_the_script_is_a_special_case_of_a_rule():
+    """Список примет — это ИЛИ; а пункту доступны и остальные операторы."""
+    from asrhub.content import compliance
+
+    сегменты = [{"start": 0.0, "end": 4.0, "speaker": "A",
+                 "text": "Алло, это опять вы? Меня зовут Анна"},
+                {"start": 4.0, "end": 8.0, "speaker": "B", "text": "Здравствуйте"}]
+    скрипт = [{"id": "intro", "label": "Представился",
+               "rule": '"меня зовут" НЕ "вы позвонили"', "where": "start"},
+              {"id": "bad", "label": "Сломанный", "rule": "меня ИЛИ (", "where": "any"},
+              {"id": "old", "label": "По списку", "any": ["опять вы"], "where": "any"}]
+    итог = compliance.check(сегменты, script=скрипт)
+    пункты = {п["id"]: п for п in итог["items"]}
+    assert пункты["intro"]["passed"] and пункты["intro"]["matched"] == "меня зовут"
+    assert not пункты["bad"]["passed"] and "оборвано" in пункты["bad"]["error"]
+    assert пункты["old"]["passed"] and пункты["old"]["matched"] == "опять вы"
+    assert итог["passed"] == 2 and итог["checked"] == 3
+    # Проверка примет на частые слова видит операнды правила, а не только список.
+    assert {с["word"] for с in compliance.suspicious(
+        [{"label": "x", "rule": 'оплата ИЛИ это ИЛИ "то"'}])} == {"это", "то"}
+
+
+def test_categories_respect_who_said_it_and_where():
+    """Фильтр «кто сказал» и окно «где» — то, чем категория отличается
+    от поиска по словам."""
+    from asrhub.content import categories
+
+    сегменты = [
+        {"start": 0.0, "end": 5.0, "speaker": "A", "text": "Здравствуйте, компания Ромашка"},
+        {"start": 5.0, "end": 12.0, "speaker": "B",
+         "text": "Я уже звонил вчера, оплата не прошла, это безобразие"},
+        {"start": 12.0, "end": 20.0, "speaker": "A",
+         "text": "Не знаю, проверю оплату и перезвоню"},
+        {"start": 20.0, "end": 60.0, "speaker": "B", "text": "Хорошо, жду, до свидания"},
+    ]
+    набор = [
+        {"id": "pay", "label": "Оплата", "rule": "оплата", "who": "any"},
+        {"id": "pay_c", "label": "Оплата (клиент)", "rule": "оплата", "who": "customer"},
+        {"id": "stop", "label": "Стоп-слова", "rule": '"не знаю"', "who": "agent",
+         "kind": "violation"},
+        {"id": "stop_c", "label": "Стоп у клиента", "rule": '"не знаю"', "who": "customer"},
+        {"id": "bye", "label": "Прощание", "rule": "до свидания", "where": "end",
+         "within_s": 30},
+        {"id": "bye_early", "label": "Прощание в начале", "rule": "до свидания",
+         "where": "start", "within_s": 10},
+        # Окно в 25 с от начала захватывает все реплики; без окна «начало»
+        # — это пятая часть реплик, то есть одна первая.
+        {"id": "bye_wide", "label": "Прощание в первые 25 с", "rule": "до свидания",
+         "where": "start", "within_s": 25},
+        {"id": "broken", "label": "Сломанная", "rule": "оплата И"},
+    ]
+    итог = categories.apply(сегменты, набор, agent="A", customer="B", everything=True)
+    по = {и["id"]: и for и in итог["items"]}
+    assert по["pay"]["count"] == 2 and по["pay"]["first_s"] == 5.0
+    assert по["pay_c"]["count"] == 1 and по["pay_c"]["hits"][0]["speaker"] == "B"
+    assert по["stop"]["count"] == 1 and по["stop"]["kind"] == "violation"
+    assert по["stop_c"]["count"] == 0
+    assert по["bye"]["count"] == 1 and по["bye_early"]["count"] == 0
+    assert по["bye_wide"]["count"] == 1
+    assert по["broken"]["error"] and по["broken"]["count"] == 0
+    assert итог["errors"] == 1 and set(итог["matched"]) == {"pay", "pay_c", "stop", "bye",
+                                                            "bye_wide"}
+    # В базу уходят только сработавшие — по строке на категорию.
+    строки = categories.for_db(итог)
+    assert {с["category"] for с in строки} == {"pay", "pay_c", "stop", "bye", "bye_wide"}
+    assert all({"category", "kind", "count", "first_s"} <= set(с) for с in строки)
+
+    # Без определённых сторон «только оператор» ищет по всей записи и
+    # честно об этом говорит.
+    без_сторон = categories.apply(сегменты, набор, everything=True)
+    по = {и["id"]: и for и in без_сторон["items"]}
+    assert по["stop"]["count"] == 1 and по["stop"]["sides"] is False
+    assert по["pay"]["sides"] is True
+
+
+def test_the_ready_made_categories_parse_and_are_used_when_nothing_is_saved():
+    """Готовый набор — годный целиком и действует по умолчанию."""
+    from asrhub import content
+    from asrhub.content import categories
+
+    assert categories.validate(categories.ГОТОВЫЕ) == []
+    assert len(categories.ГОТОВЫЕ) == 10
+    assert len({к["id"] for к in categories.ГОТОВЫЕ}) == 10
+    разбор = content.analyze(text="", segments=[
+        {"start": 0.0, "end": 4.0, "speaker": "A", "text": "Здравствуйте, компания Ромашка"},
+        {"start": 4.0, "end": 9.0, "speaker": "B",
+         "text": "Оплата не прошла, а курьер так и не приехал"}])
+    assert set(разбор["categories"]["matched"]) == {"payment", "delivery"}
+    assert разбор["categories"]["checked"] == 10
+    # Пустой список — «не искать», а не «готовый набор»: так просят
+    # выключить категории.
+    пусто = content.analyze(text="оплата", categories=[])
+    assert пусто["categories"]["checked"] == 0
+
+    # Проверка набора при сохранении: ошибка называет категорию и позицию.
+    ошибки = categories.validate([{"label": "Оплата", "rule": "оплата ИЛИ ("},
+                                  {"label": "", "rule": "х", "who": "кто-то"}])
+    assert any("Оплата" in о and "позиция" in о for о in ошибки), ошибки
+    assert any("нет названия" in о for о in ошибки), ошибки
+    assert any("who" in о for о in ошибки), ошибки
+
+
+def test_category_hits_reach_the_database_the_counts_and_the_job_list(tmp_path):
+    """Совпадения лежат своей таблицей: по ней считается счёт, динамика и
+    отбор списка заданий; удаление задания забирает их с собой."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, записей=30)
+    # Каждая третья запись — плохая, про сорванный срок и суд; остальные —
+    # про договор. Категория «Сроки» из готового набора должна собрать
+    # ровно плохие, «Эскалация» — их же (суд говорит клиент, SPEAKER_01).
+    индекс = ContentIndex(db, settings=None)
+    while индекс.backfill_once(limit=20):
+        pass
+    свод = Insights(db, индекс).categories("all")
+    по = {к["id"]: к for к in свод["items"]}
+    assert по["deadline"]["records"] == 10 and по["deadline"]["share"] == 33.3
+    assert по["escalation"]["records"] == 10
+    assert по["payment"]["records"] == 0 and по["payment"]["share"] == 0.0
+    assert свод["corpus"] == 30
+    assert свод["uncategorized"]["records"] == 20
+    # Совпадений в таблице — по строке на пару «запись — категория».
+    строк = db.query_one("SELECT COUNT(*) AS n FROM content_hits")["n"]
+    assert строк == 20, строк
+    # «Без категории» — про категории обращений: нарушение оператора в
+    # записи не делает её «про что-то».
+    db.save_content("job0001", {"version": 3, "hits": [
+        {"category": "stop", "kind": "violation", "count": 1, "first_s": 0.0}]})
+    assert Insights(db, индекс).categories("all")["uncategorized"]["records"] == 20
+
+    # Отбор списка заданий по категории — параметром, а не подстановкой.
+    список = db.list_jobs(status="completed", content="category:deadline", light=True)
+    assert len(список) == 10 and all(int(j["id"][3:]) % 3 == 0 for j in список)
+    assert db.count_jobs(status="completed", content="category:deadline") == 10
+    assert db.list_jobs(content="category:нет такой") == []
+
+    # Удаление задания уносит и его совпадения.
+    db.delete_job("job0000")
+    assert db.query_one("SELECT COUNT(*) AS n FROM content_hits WHERE job_id='job0000'")["n"] == 0
+    assert db.count_jobs(status="completed", content="category:deadline") == 9
+
+
+def test_category_dynamics_compare_shares_between_windows(tmp_path):
+    """«Растёт» и «угасает» — по доле к прошлому окну, не по числу."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, записей=40)
+    сейчас = time.time()
+    # Прошлая неделя: записи 20–39 (по часу назад каждая — все в текущей
+    # неделе). Сдвигаем половину на восемь дней назад и делаем их «про
+    # оплату», чтобы в текущем окне доля оплаты упала, а сроков — выросла.
+    for n in range(20, 40):
+        db.execute("UPDATE jobs SET created_at=? WHERE id=?",
+                   (сейчас - 8 * 86400 - n * 60, f"job{n:04d}"))
+        db.update_job(f"job{n:04d}", text="Оплата не прошла, деньги списали дважды.")
+        db.save_segments(f"job{n:04d}", [
+            {"start": 0.0, "end": 8.0, "speaker": "SPEAKER_00", "text": "Здравствуйте"},
+            {"start": 9.0, "end": 20.0, "speaker": "SPEAKER_01",
+             "text": "Оплата не прошла, деньги списали дважды."}])
+    индекс = ContentIndex(db, settings=None)
+    while индекс.backfill_once(limit=20):
+        pass
+    свод = Insights(db, индекс).categories("week")
+    по = {к["id"]: к for к in свод["items"]}
+    assert свод["corpus"] == 20 and свод["corpus_previous"] == 20
+    assert по["payment"]["records"] == 0 and по["payment"]["previous"] == 20
+    assert по["payment"]["share_previous"] == 100.0 and по["payment"]["delta"] == -100.0
+    assert по["deadline"]["previous"] == 0 and по["deadline"]["records"] == 7
+    assert по["deadline"]["delta"] == 35.0
+    assert "payment" in свод["fading"] and "deadline" in свод["rising"]
+    # Выводы называют категорию и оба числа.
+    выводы = Insights(db, индекс).findings("week")
+    тексты = [в["text"] for в in выводы if в.get("dimension") == "category"]
+    assert any("Сроки" in т and "0.0% → 35.0%" in т for т in тексты), тексты
+    assert any("Оплата" in т and "меньше" in т for т in тексты), тексты
+
+
+def test_the_categories_endpoints_check_a_draft_and_report_the_period(
+        tmp_path, monkeypatch, data_dir):
+    """Ручки: счёт за период, проверка черновика на записи, отбор в списке."""
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        job_id = db.create_job({"id": "кат", "filename": "x.wav",
+                                "owner": "админ", "media_duration_s": 20.0})
+        db.update_job(job_id, status="completed", finished_at=1.0,
+                      text="Здравствуйте. Оплата не прошла, это безобразие.")
+        db.save_segments(job_id, [
+            {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00", "text": "Здравствуйте."},
+            {"start": 5.0, "end": 10.0, "speaker": "SPEAKER_01",
+             "text": "Оплата не прошла, это безобразие."}])
+        ключ = {"X-API-Key": "ah_admin_k"}
+        черновик = [{"id": "pay", "label": "Оплата", "rule": "оплата ИЛИ это", "who": "customer"},
+                    {"id": "bad", "label": "Сломанная", "rule": "оплата ИЛИ"}]
+        ответ = c.post("/api/content/categories/check",
+                       json={"job_id": job_id, "categories": черновик}, headers=ключ)
+        assert ответ.status_code == 200, ответ.text
+        тело = ответ.json()
+        по = {и["id"]: и for и in тело["result"]["items"]}
+        assert по["pay"]["count"] == 2 and по["pay"]["hits"][0]["speaker"] == "SPEAKER_01"
+        assert "оборвано" in по["bad"]["error"]
+        assert {с["word"] for с in тело["suspicious"]} == {"это"}
+        assert тело["errors"] and "Сломанная" in тело["errors"][0]
+        assert тело["agent"] == "SPEAKER_00" and тело["customer"] == "SPEAKER_01"
+        # Черновик в настройки не попал.
+        assert app.state.hub.settings.get("content_categories") in (None, [])
+
+        # Сломанный набор не сохраняется; годный — сохраняется и действует.
+        плохо = c.put("/api/settings", json={"content_categories": черновик}, headers=ключ)
+        assert плохо.status_code == 400 and "Сломанная" in плохо.text
+        хорошо = c.put("/api/settings", json={"content_categories": черновик[:1]},
+                       headers=ключ)
+        assert хорошо.status_code == 200, хорошо.text
+        перечни = c.get("/api/content/kinds", headers=ключ).json()
+        assert перечни["categories_own"] is True
+        assert [к["id"] for к in перечни["categories"]] == ["pay"]
+        assert len(перечни["default_categories"]) == 10
+
+        # Разбор записи — по сохранённому набору; счёт за период видит его.
+        c.post(f"/api/content/jobs/{job_id}/recompute", headers=ключ)
+        свод = c.get("/api/content/categories?period=all", headers=ключ).json()
+        assert свод["own"] is True
+        assert {к["id"]: к["records"] for к in свод["items"]} == {"pay": 1}
+        assert свод["uncategorized"]["records"] == 0
+        список = c.get("/api/jobs?content=category:pay", headers=ключ).json()
+        assert [j["id"] for j in список["items"]] == [job_id]
+        assert c.get("/api/jobs?content=category:none", headers=ключ).json()["items"] == []
+        assert c.get("/api/jobs?content=nonsense", headers=ключ).status_code == 400
+        # Карточка записи несёт категории с примерами.
+        карточка = c.get(f"/api/content/jobs/{job_id}", headers=ключ).json()
+        assert карточка["analysis"]["categories"]["matched"] == ["pay"]
+        # Чужой ключ не видит чужую запись и в проверке.
+        assert c.post("/api/content/categories/check", json={"job_id": job_id},
+                      headers={"X-API-Key": "ah_user_k"}).status_code in (403, 404)
+
+
+def test_categories_reach_the_digest_and_the_export(tmp_path):
+    """Сводка называет, о чём звонили; выгрузка получает лист «Категории»."""
+    import io
+    import zipfile
+
+    from asrhub.content_export import to_csv_zip
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+    from asrhub.maintenance import _digest_content, digest_text
+
+    db = _корпус(tmp_path, записей=30)
+    индекс = ContentIndex(db, settings=None)
+    while индекс.backfill_once(limit=20):
+        pass
+    свод = Insights(db, индекс)
+
+    class Настройки:
+        @staticmethod
+        def get(key, default=None):
+            return default
+
+    содержание = _digest_content(свод, Настройки(), "all")
+    assert содержание["categories"], содержание
+    assert содержание["categories"][0]["label"] in ("Сроки", "Эскалация")
+    assert содержание["uncategorized"]["records"] == 20
+    текст = digest_text({}, {}, {}, содержание=содержание)
+    assert "О чём звонили" in текст and "Сроки 33.3 %" in текст, текст
+    assert "Без категории: 20 записей" in текст, текст
+
+    отчёт = свод.report("all")
+    assert отчёт["categories"]["items"]
+    архив = zipfile.ZipFile(io.BytesIO(to_csv_zip(отчёт, "all")))
+    имена = архив.namelist()
+    лист = next(и for и in имена if "Категории" in и)
+    содержимое = архив.read(лист).decode("utf-8-sig")
+    assert "Сроки" in содержимое and "Правило" in содержимое

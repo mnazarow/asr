@@ -366,10 +366,12 @@ def list_jobs(
     # часовых записей ответ со всем текстом — единицы мегабайт, и таблица в
     # интерфейсе ждала их только чтобы выбросить.
     отборы = {**state.db.CONTENT_FILTERS, **state.db.JOB_FILTERS}
-    if content and content not in отборы:
+    if (content and content not in отборы
+            and not content.startswith(state.db.CATEGORY_FILTER)):
         raise error_response(ConfigError(
             f"Неизвестный отбор по содержанию «{content}».",
-            hint="Доступные: " + ", ".join(sorted(отборы))))
+            hint="Доступные: " + ", ".join(sorted(отборы))
+                 + f", {state.db.CATEGORY_FILTER}<имя категории>"))
     jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
                               order=order, light=light, content=content)

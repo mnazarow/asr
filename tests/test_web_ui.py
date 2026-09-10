@@ -183,6 +183,7 @@ def _чисто(страница) -> None:
 
 @pytest.mark.parametrize("вкладка,что_ждём", [
     ("summary", "#tone-bar svg"),
+    ("categories", "#cat-table"),
     ("groups", "#chart-by-owner svg"),
     ("topics", "#chart-topics svg"),
     ("links", ".card"),
@@ -320,6 +321,60 @@ def test_the_script_editor_checks_a_marker_on_a_real_record(страница):
     поле = страница.query_selector(".script-item .script-any")
     поле.fill("здравствуйте, добрый день")
     страница.wait_for_timeout(1500)
+    _чисто(страница)
+
+
+def test_the_categories_tab_counts_edits_and_checks_a_rule(страница):
+    """Категории: счёт за период по сохранённому набору, черновик правила
+    проверяется на настоящей записи, ошибка правила показывается на месте,
+    а строка таблицы ведёт в «Результаты» с отбором по категории."""
+    _открыть(страница, "content")
+    страница.click('#content-tabs button[data-tab="categories"]')
+    страница.wait_for_selector("#cat-table", timeout=15000)
+    страница.wait_for_selector("#cat-check table", timeout=15000)
+
+    таблица = страница.inner_text("#cat-table")
+    # В наполнении «сорван срок» и «суд» есть в каждой третьей записи:
+    # готовые «Сроки» и «Эскалация» обязаны их собрать.
+    assert "Сроки" in таблица and "Эскалация" in таблица, таблица[:400]
+    assert "нет в наборе" not in таблица
+    проверка = страница.inner_text("#cat-check")
+    assert "Сработало категорий" in проверка, проверка[:300]
+
+    # Правка правила перепроверяет черновик; сломанное правило — с ошибкой
+    # под самим правилом, не сохраняя ничего.
+    поле = страница.query_selector(".script-item .cat-rule")
+    поле.fill("срок ИЛИ (")
+    страница.wait_for_timeout(1500)
+    assert "оборвано" in страница.inner_text("#cat-list .script-item .script-hit")
+    поле.fill("срок ИЛИ поставка")
+    страница.wait_for_timeout(1500)
+    подсказка = страница.inner_text("#cat-list .script-item .script-hit")
+    assert "совп." in подсказка or подсказка == "", подсказка
+    assert not страница.is_disabled("#cat-save")
+
+    # Переход к записям категории приносит отбор в «Результаты».
+    страница.click('#cat-table button[data-category="deadline"]')
+    страница.wait_for_selector("#results-table table", timeout=15000)
+    страница.wait_for_timeout(1500)
+    assert страница.input_value("#r-content") == "category:deadline"
+    строк = страница.evaluate(
+        "() => document.querySelectorAll('#results-table tbody tr').length")
+    assert строк == 10, строк
+    _чисто(страница)
+
+
+def test_the_record_card_lists_its_categories(страница):
+    """Карточка записи показывает категории с примерами реплик."""
+    _открыть(страница, "results")
+    страница.wait_for_selector("#results-table table", timeout=15000)
+    # ui001 — «плохая» запись: сорванный срок и суд.
+    страница.evaluate("() => __asrhub.openJob('ui001')")
+    страница.wait_for_selector('#job-tabs button[data-tab="analysis"]', timeout=15000)
+    страница.click('#job-tabs button[data-tab="analysis"]')
+    страница.wait_for_selector("#job-tab-body .analysis-line", timeout=15000)
+    текст = страница.inner_text("#job-tab-body")
+    assert "Категории обращения" in текст and "Сроки" in текст, текст[:600]
     _чисто(страница)
 
 

@@ -757,3 +757,5 @@ td.pick input, th.pick input { width: auto; margin: 0; cursor: pointer; }
 }
 .script-item .script-hit { margin-top: 6px; color: var(--text-faint); }
 .script-item .script-hit:empty { display: none; }
+.script-item .script-hit.err { color: var(--err); }
+.script-item .cat-rule { font-size: 13px; }

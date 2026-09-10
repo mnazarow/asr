@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -56,6 +57,8 @@ class ContentIndex:
         #: не разобран», и разбираться было бы не с чем.
         self.last_error: str | None = None
         self.backfilled = 0
+        self._категории: list[Any] = []
+        self._категории_ключ = ""
 
     # --- корпусная частота ------------------------------------------------
 
@@ -99,6 +102,30 @@ class ContentIndex:
         """Считать ли нецензурную лексику. По умолчанию — нет, см. словарь."""
         return bool(self.settings.get("content_profanity", False)) if self.settings else False
 
+    def categories(self) -> list[Any]:
+        """Набор категорий, разобранный один раз на значение настройки.
+
+        Пустая настройка — готовый набор, как у скрипта разговора. Разбор
+        правил дешёвый, но делать его на каждую запись архива незачем:
+        набор меняется раз в неделю, а записей — тысячи в день. Ключ кеша —
+        само значение настройки: сменилось — разберём заново.
+        """
+        from .content import categories as категории  # noqa: PLC0415
+
+        значение = self.settings.get("content_categories") if self.settings else None
+        сырой = значение if isinstance(значение, list) and значение else категории.ГОТОВЫЕ
+        ключ = json.dumps(сырой, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            if self._категории_ключ != ключ:
+                self._категории = категории.compile(сырой)
+                self._категории_ключ = ключ
+            return self._категории
+
+    def categories_own(self) -> bool:
+        """Сохранён ли свой набор категорий (иначе действует готовый)."""
+        значение = self.settings.get("content_categories") if self.settings else None
+        return isinstance(значение, list) and bool(значение)
+
     # --- разбор одной записи ----------------------------------------------
 
     def analyze_job(self, job_id: str, *, job: dict[str, Any] | None = None,
@@ -118,7 +145,7 @@ class ContentIndex:
             duration_s=float(задание.get("media_duration_s") or 0.0),
             script=self._скрипт(), agent_speaker=self._оператор(),
             document_frequency=частоты, corpus_size=размер,
-            profanity=self._мат())
+            profanity=self._мат(), categories=self.categories())
         свод, основы = content.features(разбор)
         if save:
             self.db.save_content(job_id, свод, основы)
@@ -175,6 +202,7 @@ class ContentIndex:
             return 0
         частоты, корпус = self.corpus_frequency()
         скрипт, оператор, мат = self._скрипт(), self._оператор(), self._мат()
+        набор = self.categories()
         сделано = 0
         for запись in ожидают:
             if self._stop.is_set():
@@ -188,7 +216,7 @@ class ContentIndex:
                     duration_s=float(запись.get("media_duration_s") or 0.0),
                     script=скрипт, agent_speaker=оператор,
                     document_frequency=частоты, corpus_size=корпус,
-                    profanity=мат)
+                    profanity=мат, categories=набор)
                 свод, основы = content.features(разбор)
                 self.db.save_content(job_id, свод, основы)
                 # Здоровье распознавания у записей, сделанных до его
@@ -249,9 +277,12 @@ class ContentIndex:
         делал полную группировку по таблице основ под общей блокировкой.
         """
         сведения = self.db.content_stats(content.VERSION)
+        набор = self.categories()
         return {
             **сведения,
             "version": content.VERSION,
+            "categories": len(набор),
+            "categories_broken": [к.label for к in набор if к.error],
             "enabled": self.enabled,
             "backfill": bool(self.settings.get("content_backfill", True))
             if self.settings else True,

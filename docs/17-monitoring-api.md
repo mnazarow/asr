@@ -123,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 17.7
+asrhub_uptime_seconds 1261.3
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1788974365.534866,
-  "collected_at": "2026-09-09T17:19:25+0000",
+  "timestamp": 1789026307.0711508,
+  "collected_at": "2026-09-10T07:45:07+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -291,7 +291,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 11.5 ГБ",
+      "detail": "свободно 12.2 ГБ",
       "hint": ""
     },
     {
@@ -456,15 +456,34 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 ```json
 {
   "summary": {
-    "rules": 34,
-    "firing": 0,
-    "pending": 1,
+    "rules": 47,
+    "firing": 2,
+    "pending": 3,
     "critical": 0,
-    "warning": 0,
-    "worst": "ok"
+    "warning": 2,
+    "worst": "warning"
   },
-  "alerts": []
-}
+  "alerts": [
+    {
+      "id": "asrhub_content_alert_records|warning",
+      "state": "firing",
+      "severity": "warning",
+      "metric": "asrhub_content_alert_records",
+      "label": "Записей с тревожными упоминаниями",
+      "unit": "",
+      "value": 4.0,
+      "threshold": 1.0,
+      "direction": "above",
+      "since": 1789025079.8895931,
+      "active_seconds": 1227.2,
+      "fired_at": 1789026251.4833367,
+      "resolved_at": null,
+      "breaches": 15,
+      "summary": "Записей с тревожными упоминаниями: выше 1",
+      "hint": "Раздел «Аналитика записей» → «Что послушать» → «С тревожными упоминаниями»"
+    },
+    {
+…
 ```
 
 ### `GET /api/monitoring/alerts/history`
@@ -698,17 +717,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 1,
-  "samples": 130,
+  "scrapes": 15,
+  "samples": 743,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {
-    "rules": 34,
-    "firing": 0,
-    "pending": 1,
+    "rules": 47,
+    "firing": 2,
+    "pending": 3,
     "critical": 0,
-    "warning": 0,
-    "worst": "ok"
+    "warning": 2,
+    "worst": "warning"
   },
   "targets": []
 }

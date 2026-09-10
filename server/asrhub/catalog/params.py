@@ -4082,6 +4082,53 @@ _p(P(
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
 ))
 
+_p(P(
+    key="content_categories",
+    label="Категории обращений",
+    group="content",
+    type="json",
+    default=[],
+    advanced=True,
+    description=(
+        "Набор категорий, по которым размечается каждая запись. Категория — "
+        "объект с полями id, label (название), rule (правило строкой), kind "
+        "(topic — категория обращения, violation — нарушение оператора, "
+        "objection — возражение клиента, handling — отработка возражения), "
+        "who (any, agent, customer — чьи реплики смотреть), where (any, start, "
+        "end) и within_s — окно в секундах для start/end. Правило пишется как "
+        "у Genesys: слова и фразы с операторами И, ИЛИ, НЕ, РЯДОМ(N) и "
+        "скобками; фраза без кавычек ищется по основам («уточнить» найдёт "
+        "«уточню»), в кавычках — точно. До 20 операндов и 3 уровней скобок. "
+        "Пустой список — готовый набор из десяти категорий: оплата, доставка, "
+        "возврат, качество, сроки, техподдержка, повторное обращение, "
+        "эскалация, конкуренты, цена и скидка."
+    ),
+    recommendation=(
+        "Начните с готового набора, посмотрите на вкладке «Категории», сколько "
+        "записей остаётся без категории, и заводите свои по новым словам "
+        "периода с вкладки «Темы». Каждое правило проверяйте на настоящей "
+        "записи в редакторе: «оплата ИЛИ это» покроет весь архив из-за «это». "
+        "После смены набора нажмите «Пересчитать», иначе старые записи "
+        "останутся размечены прежним."
+    ),
+    examples=[
+        Ex("Готовый набор", [], ""),
+        Ex("Свои категории", [
+            {"id": "payment", "label": "Оплата",
+             "rule": "оплата ИЛИ платёж ИЛИ \"не прошла оплата\"", "kind": "topic",
+             "who": "any", "where": "any"},
+            {"id": "objection_price", "label": "Возражение: дорого",
+             "rule": "дорого ИЛИ дешевле у ИЛИ подумаю", "kind": "objection",
+             "who": "customer", "where": "any"},
+            {"id": "stop_words", "label": "Стоп-слова",
+             "rule": "\"не знаю\" ИЛИ \"вы должны\" ИЛИ \"успокойтесь\"",
+             "kind": "violation", "who": "agent", "where": "any"},
+        ], "нарушение ищется только в репликах оператора"),
+    ],
+    see_also=["content_script", "content_agent_speaker", "content_analysis"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
 
 # ===========================================================================
 # Индексы и утилиты
@@ -4114,6 +4161,22 @@ def translate_key(key: str, engine_id: str) -> str:
     if spec is None:
         return key
     return spec.aliases.get(engine_id, key)
+
+
+def _проверить_категории(value: object) -> list[str]:
+    """Категории — со сверкой правил: набор с ошибкой в базу не попадает.
+
+    Проверка типа «это список» здесь недостаточна. Правило с незакрытой
+    скобкой прошло бы, а всплыло бы через сутки в фоновом разборе архива —
+    молча, у категории, которая с этого момента не совпадает ни с чем.
+    """
+    from ..content.categories import validate  # noqa: PLC0415
+
+    return validate(value)
+
+
+#: Проверки значений сверх типа — по ключу параметра.
+_ПРОВЕРКИ = {"content_categories": _проверить_категории}
 
 
 def validate_value(key: str, value: object) -> tuple[bool, str]:
@@ -4155,6 +4218,11 @@ def validate_value(key: str, value: object) -> tuple[bool, str]:
         elif t == "json":
             if not isinstance(value, (dict, list)):
                 return False, f"«{spec.label}»: ожидается объект JSON"
+            проверка = _ПРОВЕРКИ.get(key)
+            if проверка is not None:
+                ошибки = проверка(value)
+                if ошибки:
+                    return False, f"«{spec.label}»: " + "; ".join(ошибки[:5])
         elif t in ("str", "text"):
             if not isinstance(value, str):
                 return False, f"«{spec.label}»: ожидается строка"

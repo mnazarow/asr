@@ -604,6 +604,91 @@ class Insights:
         новые.sort(key=lambda т: -т["now"])
         return новые[:limit]
 
+    # --- категории обращений ---------------------------------------------
+
+    def categories(self, period: str = "week",
+                   owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Счёт и динамика по категориям: сколько записей, доля, что
+        изменилось к прошлому окну, что растёт и что угасает.
+
+        Доли считаются от числа разобранных записей окна — того же
+        знаменателя, что у тем. Категории набора, не встретившиеся ни разу,
+        в списке остаются с нулём: «про возврат за неделю не говорили» —
+        тоже ответ, и, возможно, самый важный.
+        """
+        from .content import categories as категории_модуль  # noqa: PLC0415
+
+        начало, прошлое = self.window(period)
+        набор = (self.index.categories() if self.index
+                 else категории_модуль.compile(категории_модуль.ГОТОВЫЕ))
+        сейчас = {с["category"]: с for с in self.db.category_counts(
+            since=начало, owner=owner)}
+        раньше = ({с["category"]: с for с in self.db.category_counts(
+            since=прошлое, until=начало, owner=owner)} if начало is not None else {})
+        n_сейчас = self.db.content_window_size(since=начало, owner=owner)
+        n_раньше = (self.db.content_window_size(since=прошлое, until=начало, owner=owner)
+                    if начало is not None else 0)
+        items = []
+        известные = set()
+        for к in набор:
+            известные.add(к.id)
+            items.append(self._категория(к.to_dict(), сейчас.get(к.id), раньше.get(к.id),
+                                         n_сейчас, n_раньше))
+        # Совпадения категорий, которых в наборе уже нет (набор сменили, а
+        # архив ещё не пересчитан): показываем как есть, с пометкой.
+        for имя, строка in сейчас.items():
+            if имя not in известные:
+                items.append(self._категория(
+                    {"id": имя, "label": имя, "kind": строка.get("kind") or "topic",
+                     "stale": True}, строка, раньше.get(имя), n_сейчас, n_раньше))
+        items.sort(key=lambda з: (-з["records"], з["label"]))
+        растут = sorted((з for з in items if (з["delta"] or 0) >= 5 and з["records"] >= МИН_ГРУППА),
+                        key=lambda з: -з["delta"])
+        угасают = sorted((з for з in items if (з["delta"] or 0) <= -5
+                          and (з["previous"] or 0) >= МИН_ГРУППА),
+                         key=lambda з: з["delta"])
+        return {"period": period, "corpus": n_сейчас, "corpus_previous": n_раньше,
+                "items": items, "rising": [з["id"] for з in растут],
+                "fading": [з["id"] for з in угасают],
+                "uncategorized": self._без_категории(начало, owner, n_сейчас),
+                "own": bool(self.index and self.index.categories_own()),
+                "kinds": категории_модуль.ВИДЫ, "who": категории_модуль.КТО}
+
+    @staticmethod
+    def _категория(описание: dict[str, Any], сейчас: dict[str, Any] | None,
+                   раньше: dict[str, Any] | None, n_сейчас: int,
+                   n_раньше: int) -> dict[str, Any]:
+        записей = int((сейчас or {}).get("records") or 0)
+        было = int((раньше or {}).get("records") or 0)
+        доля = _процент(записей, n_сейчас)
+        доля_было = _процент(было, n_раньше) if n_раньше else None
+        return {
+            "id": описание.get("id"), "label": описание.get("label"),
+            "kind": описание.get("kind") or "topic",
+            "who": описание.get("who"), "rule": описание.get("rule"),
+            "error": описание.get("error"), "stale": bool(описание.get("stale")),
+            "records": записей, "share": доля,
+            "mentions": int((сейчас or {}).get("mentions") or 0),
+            "first_s": _округлить((сейчас or {}).get("first_s"), 1),
+            "previous": было, "share_previous": доля_было,
+            # Изменение в процентных пунктах — только когда есть оба окна:
+            # рост «с нуля» на пустом прошлом окне — это не рост.
+            "delta": (round(доля - доля_было, 1)
+                      if доля is not None and доля_было is not None else None),
+        }
+
+    def _без_категории(self, начало: float | None, owner: Any,
+                       всего: int) -> dict[str, Any] | None:
+        """Сколько записей окна не попало ни в одну категорию обращения.
+
+        Это число — главный довод завести новую категорию: когда без
+        категории половина архива, набор описывает не то, о чём звонят.
+        """
+        if not всего:
+            return None
+        без = self.db.uncategorized_count(since=начало, owner=owner)
+        return {"records": без, "share": _процент(без, всего)}
+
     # --- связи ------------------------------------------------------------
 
     def correlations(self, period: str = "week",
@@ -663,7 +748,8 @@ class Insights:
     def findings(self, period: str = "week", owner: str | list[str] | None = None,
                  *, свод: dict[str, Any] | None = None,
                  прошлый: dict[str, Any] | None = None,
-                 разрезы: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                 разрезы: dict[str, Any] | None = None,
+                 категории: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Готовые выводы: правила с порогами, а не пересказ цифр.
 
         Каждый вывод несёт уровень внимания и числа, из которых сделан.
@@ -843,6 +929,41 @@ class Insights:
                      metric="profanity_agent_records",
                      value=свод["profanity_agent_records"])
 
+        # 6в. Категории обращений: что выросло, что угасло, сколько записей
+        #     не описано набором. Порог в пять процентных пунктов — тот же,
+        #     что у доли отрицательных: меньше на недельном окне — шум.
+        if категории is None:
+            try:
+                категории = self.categories(period, owner)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Категории для выводов не посчитаны: %s", exc)
+                категории = {}
+        по_имени = {к["id"]: к for к in (категории.get("items") or [])}
+        for имя in (категории.get("rising") or [])[:2]:
+            к = по_имени[имя]
+            добавить("warning" if к["kind"] == "violation" else "info",
+                     f"Обращений про «{к['label']}» стало больше: "
+                     f"{к['share_previous']}% → {к['share']}% записей "
+                     f"({к['previous']} → {к['records']})",
+                     metric="category", value=к["share"], previous=к["share_previous"],
+                     group=к["label"], dimension="category")
+        for имя in (категории.get("fading") or [])[:1]:
+            к = по_имени[имя]
+            добавить("info",
+                     f"Обращений про «{к['label']}» стало меньше: "
+                     f"{к['share_previous']}% → {к['share']}% записей "
+                     f"({к['previous']} → {к['records']})",
+                     metric="category", value=к["share"], previous=к["share_previous"],
+                     group=к["label"], dimension="category")
+        без = категории.get("uncategorized") or {}
+        if без.get("share") is not None and без["share"] >= 50 and по_имени:
+            добавить("info",
+                     f"{_каждый(без['share'])} разговор не попал ни в одну категорию "
+                     f"обращений ({без['share']}%, {без['records']} из "
+                     f"{категории.get('corpus')}): набор категорий описывает не то, "
+                     f"о чём звонят, — посмотрите новые слова периода на вкладке «Темы»",
+                     metric="uncategorized", value=без["share"])
+
         # 7. Часы, когда разговоры тяжелее.
         часы = (разрезы.get("hour") or {}).get("items") or []
         годные = [ч for ч in часы if ч["records"] >= max(МИН_ГРУППА, 10)
@@ -896,6 +1017,7 @@ class Insights:
         прошлый = (self.summary(period, owner, since=прошлое, until=начало)
                    if начало is not None else None)
         разрезы = {d: self.breakdown(d, period, owner) for d in dimensions}
+        категории = self.categories(period, owner)
         return {
             "period": period,
             "generated_at": time.time(),
@@ -908,8 +1030,9 @@ class Insights:
             "topics": self.topics(period, owner),
             "topic_trend": self.topic_trend(period, owner),
             "correlations": self.correlations(period, owner),
+            "categories": категории,
             "findings": self.findings(period, owner, свод=свод, прошлый=прошлый,
-                                      разрезы=разрезы),
+                                      разрезы=разрезы, категории=категории),
             "highlights": {k: self.records(k, period, owner, limit=10)
                            for k in ("negative", "downturn", "alerts",
                                      "open_commitments", "script")},
