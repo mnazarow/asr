@@ -1106,6 +1106,12 @@ class Analytics:
          "Заметная тишина (паузы от 3 с), секунд на запись"),
         ("content_objections_unhandled_share", "objections_unhandled_share",
          "Доля возражений клиента без отработки, процентов"),
+        ("content_agent_score_avg", "agent_score",
+         "Средний балл оператора, от 0 до 100"),
+        ("content_empathy_avg", "empathy",
+         "Средний индекс эмпатии оператора, от −100 до +100"),
+        ("content_violation_records", "violation_records",
+         "Записей с нарушениями оператора (стоп-слова и другие категории вида «нарушение»)"),
     )
 
     def _prometheus_content(self, insights: Any, add: Any) -> None:

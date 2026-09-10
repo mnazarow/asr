@@ -2364,6 +2364,9 @@ RENDERERS.results = {
             <option value="speakers_mismatch">говорящих не столько, сколько ожидалось</option>
             <option value="objection_unhandled">возражение без отработки</option>
             <option value="objection">с возражениями клиента</option>
+            <option value="violation">с нарушениями оператора</option>
+            <option value="low_score">балл оператора ниже 60</option>
+            <option value="impolite">невежливый оператор</option>
           </select>
           <select id="r-order" style="width:190px">
             <option value="created_at DESC">Сначала новые</option>
@@ -2922,6 +2925,8 @@ async function loadJobAnalysis(backdrop, job) {
   const мат = a.profanity || {};
   const категории = a.categories || { items: [], matched: [], checked: 0 };
   const возражения = категории.objections || { items: [], count: 0, unhandled: null };
+  const балл = a.scorecard || {};
+  const эмпатия = a.empathy || {};
 
   const реплика = (з, доп) => `<div class="analysis-line" data-start="${з.start_s || 0}">
     <span class="ts mono">${fmtDur(з.start_s || 0)}</span>
@@ -2940,6 +2945,27 @@ async function loadJobAnalysis(backdrop, job) {
       ${kpi('Скрипт', скрипт.score === null || скрипт.score === undefined
               ? '—' : pct(скрипт.score, 0),
             скрипт.checked ? `${скрипт.passed} из ${скрипт.checked} пунктов` : '')}
+    </div>
+    <div class="grid cols-4" style="margin-bottom:14px">
+      ${kpi('Балл оператора', балл.score === null || балл.score === undefined ? '—' : num(балл.score, 0),
+            балл.score === null || балл.score === undefined
+              ? 'без пунктов скрипта балла нет'
+              : `скрипт ${num(балл.base, 0)}${балл.penalty ? ` − штраф ${num(балл.penalty, 0)} (${
+                  (балл.penalties || []).map((ш) => esc(ш.label)).join(', ')})` : ''}`)}
+      ${kpi('Индекс эмпатии', эмпатия.index === null || эмпатия.index === undefined ? '—'
+              : `${эмпатия.index > 0 ? '+' : ''}${num(эмпатия.index, 0)}`,
+            эмпатия.index === null || эмпатия.index === undefined
+              ? 'ни одного вежливого или невежливого оборота'
+              : `вежливых ${num(эмпатия.polite)}, невежливых ${num(эмпатия.impolite)}${
+                  эмпатия.speaker ? ` — по репликам «${esc(эмпатия.speaker)}»` : ' — по всем репликам'}`)}
+      ${kpi('Нарушения оператора', num((категории.violations || []).length),
+            (категории.violations || []).length
+              ? (категории.violations || []).map((н) => `${esc(н.label)} ×${н.count}`).join(', ')
+              : 'стоп-слов и других нарушений не найдено')}
+      ${kpi('Возражения', num(возражения.count || 0),
+            возражения.unhandled === null || возражения.unhandled === undefined
+              ? (возражения.count ? 'отработку считать нечем' : 'возражений клиента нет')
+              : `без отработки: ${num(возражения.unhandled)}`)}
     </div>
 
     ${card('Ход тональности', 'форма разговора: упало и не поднялось, выправилось к концу, ровно',
@@ -3018,6 +3044,11 @@ async function loadJobAnalysis(backdrop, job) {
          return [...поРепликам.values()].slice(0, 2).map((h) =>
            реплика(h, `${к.label}: ${h.слова.join(', ')}`));
        }).join('')}</div>`) : ''}
+
+    ${(эмпатия.items || []).length ? card('Невежливые обороты оператора',
+      '«подождите», «вы должны», «я вам уже сказал» — то, что снижает индекс эмпатии',
+      `<div class="analysis-lines">${(эмпатия.items || []).map(
+         (т) => реплика(т, (т.words || []).join(', '))).join('')}</div>`) : ''}
 
     ${(возражения.items || []).length ? card(
       `Возражения клиента${возражения.unhandled === null || возражения.unhandled === undefined
@@ -3936,7 +3967,8 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
   monologue: 'monologue', mixed: 'mixed', dead_air: 'dead_air',
   frustrated: 'frustrated', repeat: 'repeat',
   profanity_agent: 'profanity_agent', profanity: 'profanity',
-  objections: 'objection_unhandled',
+  objections: 'objection_unhandled', violations: 'violation',
+  low_score: 'low_score', impolite: 'impolite',
 };
 
 const CONTENT_TABS = [
@@ -4188,12 +4220,17 @@ RENDERERS.content = {
               </div>`)}
 
       <div class="grid cols-4" style="margin-bottom:16px">
-        ${kpi('Клиент раздражён', num(c.frustrated),
-              c.frustrated_share === null ? 'по репликам клиента'
-                : `${num(c.frustrated_share, 1)}% записей — «сколько можно», «позовите руководителя»`)}
-        ${kpi('Повторные обращения', num(c.repeat),
-              c.repeat_share === null ? 'по репликам клиента'
-                : `${num(c.repeat_share, 1)}% записей — «уже звонил», «до сих пор не»`)}
+        ${kpi('Балл оператора', c.agent_score === null || c.agent_score === undefined ? '—' : num(c.agent_score, 0),
+              c.agent_score === null || c.agent_score === undefined
+                ? 'скрипт с весами минус штрафы; без пунктов скрипта балла нет'
+                : `из 100 по ${num(c.scored_agents)} записям — скрипт с весами минус штрафы стоп-слов`,
+              delta(c.agent_score, p.agent_score, признак('agent_score')))}
+        ${kpi('Нарушения оператора', num(c.violation_records),
+              c.violation_share === null || c.violation_share === undefined ? 'стоп-слова и другие категории вида «нарушение»'
+                : `${num(c.violation_share, 1)}% записей — стоп-слова и другие категории вида «нарушение»`)}
+        ${kpi('Индекс эмпатии', c.empathy === null || c.empathy === undefined ? '—' : `${c.empathy > 0 ? '+' : ''}${num(c.empathy, 0)}`,
+              '(вежливых − невежливых) ÷ сумму по репликам оператора; от −100 до +100',
+              delta(c.empathy, p.empathy, признак('empathy')))}
         ${kpi('Возражений без отработки',
               c.objections_unhandled_share === null || c.objections_unhandled_share === undefined
                 ? '—' : num(c.objections_unhandled),
@@ -4201,6 +4238,16 @@ RENDERERS.content = {
                 ? (c.objections ? `возражений ${num(c.objections)}; отработку считать нечем — в наборе нет категорий «отработка»`
                                 : 'возражений клиента за период нет')
                 : `${num(c.objections_unhandled_share, 1)}% из ${num(c.objections)} — за «дорого» и «подумаю» не последовало отработки`)}
+      </div>
+      <div class="grid cols-4" style="margin-bottom:16px">
+        ${kpi('Клиент раздражён', num(c.frustrated),
+              c.frustrated_share === null ? 'по репликам клиента'
+                : `${num(c.frustrated_share, 1)}% записей — «сколько можно», «позовите руководителя»`)}
+        ${kpi('Повторные обращения', num(c.repeat),
+              c.repeat_share === null ? 'по репликам клиента'
+                : `${num(c.repeat_share, 1)}% записей — «уже звонил», «до сих пор не»`)}
+        ${kpi('Противоречивых', num(c.mixed),
+              'и резкие, и тёплые реплики в одном разговоре')}
         ${kpi('Мат у сотрудника',
               c.profanity_checked ? num(c.profanity_agent_records) : '—',
               c.profanity_checked
@@ -4289,10 +4336,13 @@ RENDERERS.content = {
         <thead><tr><th>${esc(данные.title)}</th><th class="num">Записей</th>
           <th class="num">Тональность</th><th class="num">Отрицательных</th>
           <th class="num">Тревожных</th><th class="num">Скрипт</th>
-          <th class="num">Темп</th><th class="num">Перебиваний</th>
-          <th class="num">Тишина</th><th class="num">Обещаний без срока</th>
+          <th class="num">Темп</th><th class="num" title="перебиваний на запись">Перебив.</th>
+          <th class="num" title="доля тишины в записи">Тишина</th>
           <th class="num" title="доля времени речи оператора; ориентир 40–60 %">Речь опер.</th>
-          <th class="num" title="средний самый долгий монолог оператора, секунд">Монолог</th></tr></thead>
+          <th class="num" title="средний самый долгий монолог оператора, секунд">Монолог</th>
+          <th class="num" title="средний балл оператора из 100: скрипт с весами минус штрафы">Балл</th>
+          <th class="num" title="индекс эмпатии от −100 до +100">Эмпатия</th>
+          <th class="num" title="записей с нарушениями оператора">Наруш.</th></tr></thead>
         <tbody>${items.map((г) => `<tr>
           <td>${esc(г.label)}${г.kind && г.kind !== 'topic'
             ? ` <span class="chip ${КАТЕГОРИЯ_ЦВЕТ[г.kind] || ''}">${esc(КАТЕГОРИЯ_ВИД[г.kind] || г.kind)}</span>` : ''}</td>
@@ -4305,9 +4355,11 @@ RENDERERS.content = {
           <td class="num mono">${num(г.wpm, 0)}</td>
           <td class="num mono">${num(г.interruptions, 1)}</td>
           <td class="num mono">${г.silence_share === null ? '—' : pct(г.silence_share, 0)}</td>
-          <td class="num mono">${num(г.commitments_open)}</td>
           <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : pct(г.talk_share, 0)}</td>
-          <td class="num mono">${г.monologue_s === null || г.monologue_s === undefined ? '—' : num(г.monologue_s, 0) + ' с'}</td></tr>`).join('')}</tbody></table>
+          <td class="num mono">${г.monologue_s === null || г.monologue_s === undefined ? '—' : num(г.monologue_s, 0) + ' с'}</td>
+          <td class="num mono">${г.agent_score === null || г.agent_score === undefined ? '—' : num(г.agent_score, 0)}</td>
+          <td class="num mono">${г.empathy === null || г.empathy === undefined ? '—' : num(г.empathy, 0)}</td>
+          <td class="num mono">${num(г.violation_records)}</td></tr>`).join('')}</tbody></table>
         ${данные.hidden ? `<p class="small faint" style="margin:8px 12px">
           Скрыто групп с числом записей меньше пяти: ${данные.hidden}. На двух
           разговорах группа всегда либо лучшая, либо худшая, и оба раза
@@ -4576,7 +4628,7 @@ RENDERERS.content.tab_categories = async function (host) {
       (перечни.categories || []).map((к) => ({
         id: к.id, label: к.label, rule: к.rule, kind: к.kind, who: к.who,
         where: к.where, within_s: к.within_s || undefined, notify: !!к.notify,
-        penalty: к.penalty || 0, weight: к.weight === undefined ? 1 : к.weight }))));
+        penalty: к.penalty || 0 }))));
     state.contentCategoriesDirty = false;
   }
   state.contentScriptJobs = (перечень.items || []);
@@ -4741,6 +4793,10 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
                  value="${к.within_s ? esc(String(к.within_s)) : ''}"
                  placeholder="секунд" ${(к.where || 'any') === 'any' ? 'hidden' : ''}
                  title="Окно в секундах от начала или до конца записи; пусто — пятая часть реплик">
+          <input type="number" class="cat-penalty" min="0" step="5" style="width:86px"
+                 value="${к.penalty ? esc(String(к.penalty)) : ''}"
+                 placeholder="штраф"
+                 title="Штраф к баллу оператора в баллах из ста — за категорию, а не за каждое совпадение. Пусто — без штрафа">
           <label class="small nowrap" title="Трекер: срабатывание — событие в журнале и вызов на tracker_url, сразу после распознавания">
             <input type="checkbox" class="cat-notify" ${к.notify ? 'checked' : ''}> сообщать</label>
           <button class="ghost icon cat-del" title="Убрать категорию">✕</button>
@@ -4765,6 +4821,8 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
         else delete набор[i].within_s;
         набор[i].rule = qs('.cat-rule', узел).value.trim();
         набор[i].notify = qs('.cat-notify', узел).checked;
+        const штраф = Number(qs('.cat-penalty', узел).value);
+        набор[i].penalty = штраф > 0 ? штраф : 0;
         тронуто();
       };
       qsa('input, select', узел).forEach((поле) => {
@@ -4991,6 +5049,10 @@ RENDERERS.content.drawScript = function (host) {
                  value="${п.within_s ? esc(String(п.within_s)) : ''}"
                  placeholder="секунд" ${(п.where || 'any') === 'any' ? 'hidden' : ''}
                  title="Окно в секундах от начала или до конца записи. Пусто — пятая часть реплик, как раньше. «Разговор записывается» обязано прозвучать в первые 30 секунд — это и есть такое окно">
+          <input type="number" class="script-weight" min="0.1" step="0.5" style="width:78px"
+                 value="${п.weight !== undefined && п.weight !== null && п.weight !== 1 ? esc(String(п.weight)) : ''}"
+                 placeholder="вес 1"
+                 title="Вес пункта в балле оператора: балл = сумма весов выполненных ÷ сумма всех × 100 минус штрафы. Пусто — единица">
           <button class="ghost icon script-del" title="Убрать пункт">✕</button>
         </div>
         <input type="text" class="script-any" style="margin-top:6px"
@@ -5009,6 +5071,9 @@ RENDERERS.content.drawScript = function (host) {
         const секунд = Number(окно.value);
         if (секунд > 0 && пункты[i].where !== 'any') пункты[i].within_s = секунд;
         else delete пункты[i].within_s;
+        const вес = Number(qs('.script-weight', узел).value);
+        if (вес > 0 && вес !== 1) пункты[i].weight = вес;
+        else delete пункты[i].weight;
         пункты[i].any = qs('.script-any', узел).value
           .split(',').map((w) => w.trim()).filter(Boolean);
         qs('#script-save').disabled = false;

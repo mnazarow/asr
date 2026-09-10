@@ -2108,15 +2108,16 @@ def test_the_ready_made_categories_parse_and_are_used_when_nothing_is_saved():
     from asrhub.content import categories
 
     assert categories.validate(categories.ГОТОВЫЕ) == []
-    assert len(categories.ГОТОВЫЕ) == 12
-    assert len({к["id"] for к in categories.ГОТОВЫЕ}) == 12
-    assert {к["kind"] for к in categories.ГОТОВЫЕ} == {"topic", "objection", "handling"}
+    assert len(categories.ГОТОВЫЕ) == 13
+    assert len({к["id"] for к in categories.ГОТОВЫЕ}) == 13
+    assert {к["kind"] for к in categories.ГОТОВЫЕ} == {"topic", "objection", "handling",
+                                                     "violation"}
     разбор = content.analyze(text="", segments=[
         {"start": 0.0, "end": 4.0, "speaker": "A", "text": "Здравствуйте, компания Ромашка"},
         {"start": 4.0, "end": 9.0, "speaker": "B",
          "text": "Оплата не прошла, а курьер так и не приехал"}])
     assert set(разбор["categories"]["matched"]) == {"payment", "delivery"}
-    assert разбор["categories"]["checked"] == 12
+    assert разбор["categories"]["checked"] == 13
     # Пустой список — «не искать», а не «готовый набор»: так просят
     # выключить категории.
     пусто = content.analyze(text="оплата", categories=[])
@@ -2249,7 +2250,7 @@ def test_the_categories_endpoints_check_a_draft_and_report_the_period(
         перечни = c.get("/api/content/kinds", headers=ключ).json()
         assert перечни["categories_own"] is True
         assert [к["id"] for к in перечни["categories"]] == ["pay"]
-        assert len(перечни["default_categories"]) == 12
+        assert len(перечни["default_categories"]) == 13
 
         # Разбор записи — по сохранённому набору; счёт за период видит его.
         c.post(f"/api/content/jobs/{job_id}/recompute", headers=ключ)
@@ -2559,3 +2560,194 @@ def test_part_two_reaches_the_endpoints_the_digest_and_the_export(
     имена = архив.namelist()
     assert any("Драйверы" in и for и in имена) and any("По категориям" in и for и in имена)
     assert "Подъём" in архив.read(next(и for и in имена if "Драйверы" in и)).decode("utf-8-sig")
+
+
+# ---------------------------------------------------------------------------
+# Оценка оператора: веса, штрафы, балл, эмпатия, стоп-слова
+# ---------------------------------------------------------------------------
+
+
+_ЗВОНОК_СО_СТОП_СЛОВАМИ = [
+    {"start": 0.0, "end": 4.0, "speaker": "A",
+     "text": "Здравствуйте, компания Ромашка, меня зовут Анна, чем могу помочь?"},
+    {"start": 4.0, "end": 8.0, "speaker": "B", "text": "Добрый день, у меня не знаю что с заказом."},
+    {"start": 8.0, "end": 14.0, "speaker": "A",
+     "text": "Не знаю, подождите, вы должны сами посмотреть в кабинете."},
+    {"start": 14.0, "end": 18.0, "speaker": "B", "text": "Подождём тогда. Спасибо."},
+    {"start": 18.0, "end": 22.0, "speaker": "A", "text": "Пожалуйста, всего доброго."},
+]
+
+
+def test_the_agent_score_is_weighted_script_minus_penalties_and_never_leaves_0_100():
+    """Балл — как у Verint и Google: веса выполненных ÷ сумму всех × 100
+    минус штрафы; штраф — за категорию, не за совпадение; 0 и 100 — края."""
+    from asrhub import content
+
+    скрипт = [
+        {"id": "hi", "label": "Поздоровался", "any": ["здравствуйте"], "where": "start",
+         "weight": 3},
+        {"id": "bye", "label": "Попрощался", "any": ["всего доброго"], "where": "end"},
+        {"id": "promo", "label": "Предложил акцию", "any": ["акция"], "where": "any",
+         "weight": 4},
+    ]
+    стоп = {"id": "stop", "label": "Стоп-слова", "kind": "violation", "who": "agent",
+            "rule": '"не знаю" ИЛИ "вы должны" ИЛИ "подождите"', "penalty": 15}
+    разбор = content.analyze(text="", segments=_ЗВОНОК_СО_СТОП_СЛОВАМИ, script=скрипт,
+                             categories=[стоп])
+    балл = разбор["scorecard"]
+    # Выполнены «поздоровался» (3) и «попрощался» (1) из 8 → 50, а не две
+    # трети, как без весов; три совпадения стоп-слов в одной категории —
+    # один штраф в 15.
+    assert разбор["compliance"]["score"] == 0.5
+    assert балл["base"] == 50.0 and балл["penalty"] == 15.0 and балл["score"] == 35.0
+    assert [ш["id"] for ш in балл["penalties"]] == ["stop"]
+    assert разбор["categories"]["violations"][0]["count"] == 3
+    свод, _ = content.features(разбор)
+    assert свод["agent_score"] == 35.0 and свод["violations"] == 1
+
+    # Ниже нуля не уходит; без пунктов скрипта балла нет вовсе.
+    большой = dict(стоп, penalty=90)
+    assert content.analyze(text="", segments=_ЗВОНОК_СО_СТОП_СЛОВАМИ, script=скрипт,
+                           categories=[большой])["scorecard"]["score"] == 0.0
+    без = content.analyze(text="", segments=_ЗВОНОК_СО_СТОП_СЛОВАМИ, script=[],
+                          categories=[стоп])["scorecard"]
+    assert без["score"] is None and без["penalty"] == 0.0
+    # Вес по умолчанию единица: балл без весов равен прежней доле скрипта.
+    ровный = content.analyze(text="", segments=_ЗВОНОК_СО_СТОП_СЛОВАМИ,
+                             script=[dict(п, weight=None) for п in скрипт], categories=[])
+    assert ровный["scorecard"]["score"] == round(100 * 2 / 3, 1)
+    assert ровный["compliance"]["items"][0]["weight"] == 1.0
+
+
+def test_the_empathy_index_counts_the_operators_exact_turns_of_phrase():
+    """(вежливых − невежливых) ÷ сумму по репликам оператора; точные формы;
+    None, когда оборотов нет."""
+    from asrhub import content
+
+    разбор = content.analyze(text="", segments=_ЗВОНОК_СО_СТОП_СЛОВАМИ, categories=[])
+    э = разбор["empathy"]
+    # Оператор A: «здравствуйте», «пожалуйста», «всего доброго» — три
+    # вежливых; «подождите», «вы должны» — два невежливых. «Подождём» и
+    # «спасибо» сказал клиент, и они не считаются.
+    assert э["speaker"] == "A" and э["polite"] == 3 and э["impolite"] == 2
+    assert э["index"] == 20.0
+    assert э["items"][0]["words"] == ["подождите", "вы должны"]
+    свод, _ = content.features(разбор)
+    assert свод["empathy"] == 20.0
+
+    пусто = content.analyze(text="", segments=[
+        {"start": 0.0, "end": 3.0, "speaker": "A", "text": "Заказ отправлен вчера."},
+        {"start": 3.0, "end": 6.0, "speaker": "B", "text": "Понял."}], categories=[])
+    assert пусто["empathy"]["index"] is None
+    # Без оператора — по всем репликам, и это сказано.
+    общий = content.analyze(text="Подождите. Пожалуйста, спасибо.", categories=[])
+    assert общий["empathy"]["speaker"] is None and общий["empathy"]["index"] == 33.3
+
+
+def test_ready_made_stop_words_catch_the_operator_and_not_the_customer():
+    """Готовые стоп-слова ищутся только у оператора и штрафуют балл на 10."""
+    from asrhub import content
+    from asrhub.content import categories
+
+    стоп = next(к for к in categories.ГОТОВЫЕ if к["id"] == "stop_words")
+    assert стоп["kind"] == "violation" and стоп["who"] == "agent" and стоп["penalty"] == 10
+    разбор = content.analyze(text="", segments=_ЗВОНОК_СО_СТОП_СЛОВАМИ)
+    нарушения = {н["id"]: н for н in разбор["categories"]["violations"]}
+    # «не знаю» клиента (реплика B) не считается: только «не знаю» и «вы
+    # должны» оператора.
+    assert нарушения["stop_words"]["count"] == 2 and нарушения["stop_words"]["penalty"] == 10
+    assert разбор["scorecard"]["penalty"] == 10.0
+    # Разговор, где стоп-слова говорит только клиент, — чист.
+    разбор = content.analyze(text="", segments=[
+        {"start": 0.0, "end": 4.0, "speaker": "A", "text": "Здравствуйте, компания Ромашка."},
+        {"start": 4.0, "end": 8.0, "speaker": "B", "text": "Не знаю, вы должны были прислать."},
+        {"start": 8.0, "end": 12.0, "speaker": "A", "text": "Сейчас проверю, спасибо."}])
+    assert разбор["categories"]["violations"] == []
+
+
+def test_score_empathy_and_violations_reach_the_summary_selections_and_the_report(
+        tmp_path, monkeypatch, data_dir):
+    """Колонки, разрез по операторам, отборы, выводы, сводка, выгрузка,
+    метрики и отбор списка заданий — всё видит балл, эмпатию и нарушения."""
+    import io
+    import zipfile
+
+    from asrhub.analytics import Analytics
+    from asrhub.content_export import to_csv_zip
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import ОТБОРЫ, Insights
+    from asrhub.maintenance import _digest_content, digest_text
+    from asrhub.monitoring.alerts import default_rules
+    from fastapi.testclient import TestClient
+
+    db = _корпус(tmp_path, записей=30)
+    # У плохих записей оператор (SPEAKER_00, заговорил первым) говорит
+    # стоп-слова, у хороших — нет.
+    for n in range(30):
+        if n % 3 == 0:
+            db.save_segments(f"job{n:04d}", [
+                {"start": 0.0, "end": 8.0, "speaker": "SPEAKER_00",
+                 "text": "Не знаю, вы должны были смотреть сами, подождите."},
+                {"start": 9.0, "end": 20.0, "speaker": "SPEAKER_01",
+                 "text": "Срок поставки сорван, я крайне недоволен. Буду жаловаться в суд."}])
+    for n in range(30):
+        db.execute("UPDATE jobs SET created_at=? WHERE id=?",
+                   (time.time() - 600 - n, f"job{n:04d}"))
+    индекс = ContentIndex(db, _Настройки())
+    while индекс.backfill_once(limit=20):
+        pass
+    свод = Insights(db, индекс)
+    с = свод.summary("all")
+    assert с["violation_records"] == 10 and с["violation_share"] == 33.3
+    assert с["scored_agents"] == 30 and с["agent_score"] is not None
+    assert с["empathy"] is not None
+    # Плохие записи: балл ниже, эмпатия отрицательная.
+    худшие = свод.records("low_score", "all", limit=10)["items"]
+    assert len(худшие) == 10 and all(int(з["job_id"][3:]) % 3 == 0 for з in худшие)
+    assert {"violations", "low_score", "impolite"} <= set(ОТБОРЫ)
+    невежливые = свод.records("impolite", "all")["items"]
+    assert невежливые and all(з["empathy"] < 0 for з in невежливые)
+    # Разрез по операторам несёт балл, эмпатию и нарушения.
+    операторы = {г["key"]: г for г in свод.breakdown("speaker", "all")["items"]}
+    assert операторы["SPEAKER_00"]["violation_records"] == 10
+    assert операторы["SPEAKER_00"]["agent_score"] is not None
+    assert "empathy" in операторы["SPEAKER_00"]
+    # Вывод про нарушения называет долю.
+    выводы = свод.findings("all")
+    assert any(в.get("metric") == "violation_share" and "33.3%" in в["text"] for в in выводы), \
+        [в["text"] for в in выводы]
+    # Сводка и выгрузка.
+    содержание = _digest_content(свод, _Настройки(), "all")
+    текст = digest_text({}, {}, {}, содержание=содержание)
+    assert "Балл оператора:" in текст and "нарушений — в 10 записях" in текст, текст
+    assert "Индекс эмпатии операторов:" in текст, текст
+    отчёт = свод.report("all")
+    архив = zipfile.ZipFile(io.BytesIO(to_csv_zip(отчёт, "all")))
+    свод_лист = архив.read(next(и for и in архив.namelist() if "Свод" in и)).decode("utf-8-sig")
+    assert "Балл оператора, из 100" in свод_лист and "Индекс эмпатии" in свод_лист
+    # Метрики — с порогом из каталога.
+    метрики = Analytics(db).prometheus(свод)
+    assert "asrhub_content_agent_score_avg " in метрики
+    assert "asrhub_content_empathy_avg " in метрики
+    assert "asrhub_content_violation_records 10" in метрики
+    правила = {r.metric for r in default_rules()}
+    assert {"asrhub_content_agent_score_avg", "asrhub_content_empathy_avg"} <= правила
+
+    # Отборы списка заданий.
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db2 = app.state.hub.db
+        ключ = {"X-API-Key": "ah_admin_k"}
+        job_id = db2.create_job({"id": "балл", "filename": "x.wav", "owner": "админ",
+                                 "media_duration_s": 22.0})
+        db2.update_job(job_id, status="completed", finished_at=1.0,
+                       text=" ".join(с["text"] for с in _ЗВОНОК_СО_СТОП_СЛОВАМИ))
+        db2.save_segments(job_id, _ЗВОНОК_СО_СТОП_СЛОВАМИ)
+        c.post(f"/api/content/jobs/{job_id}/recompute", headers=ключ)
+        for отбор in ("violation", "low_score"):
+            assert [j["id"] for j in c.get(f"/api/jobs?content={отбор}",
+                                           headers=ключ).json()["items"]] == [job_id], отбор
+        # Эмпатия +20: не «невежливый».
+        assert c.get("/api/jobs?content=impolite", headers=ключ).json()["items"] == []
+        карточка = c.get(f"/api/content/jobs/{job_id}", headers=ключ).json()["analysis"]
+        assert карточка["scorecard"]["penalty"] == 10.0 and карточка["empathy"]["index"] == 20.0

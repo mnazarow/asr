@@ -543,6 +543,9 @@ class Collector:
             ("asrhub_content_reply_delay_avg", "reply_delay_s"),
             ("asrhub_content_dead_air_avg", "dead_air_s"),
             ("asrhub_content_objections_unhandled_share", "objections_unhandled_share"),
+            ("asrhub_content_agent_score_avg", "agent_score"),
+            ("asrhub_content_empathy_avg", "empathy"),
+            ("asrhub_content_violation_records", "violation_records"),
         ):
             значение = за_сутки.get(ключ)
             if значение is not None:

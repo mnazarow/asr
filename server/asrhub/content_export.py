@@ -62,6 +62,9 @@ log = get_logger("content.export")
     ("Возражений клиентов", "objections"),
     ("Возражений без отработки", "objections_unhandled"),
     ("Доля возражений без отработки, %", "objections_unhandled_share"),
+    ("Балл оператора, из 100", "agent_score"),
+    ("Записей с нарушениями оператора", "violation_records"),
+    ("Индекс эмпатии", "empathy"),
 ]
 
 #: Колонки карточки записи в списках «что послушать».
@@ -87,6 +90,9 @@ log = get_logger("content.export")
     ("Заметная тишина, с", "dead_air_s"),
     ("Возражений", "objections"),
     ("Возражений без отработки", "objections_unhandled"),
+    ("Балл оператора", "agent_score"),
+    ("Нарушений", "violations"),
+    ("Индекс эмпатии", "empathy"),
     ("Крупнейшая сумма", "money_max"),
     ("Длительность, с", "media_duration_s"),
 ]

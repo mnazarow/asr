@@ -347,6 +347,12 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         if без.get("records"):
             строки.append(f"Без категории: {без['records']} записей "
                           f"({число(без.get('share'))} %)")
+        if свод.get("agent_score") is not None:
+            строки.append(f"Балл оператора: {число(свод['agent_score'], 0)} из 100"
+                          + (f", нарушений — в {свод['violation_records']} записях"
+                             if свод.get("violation_records") else ""))
+        if свод.get("empathy") is not None:
+            строки.append(f"Индекс эмпатии операторов: {число(свод['empathy'], 0)}")
         if свод.get("objections") and свод.get("objections_unhandled_share") is not None:
             строки.append(f"Возражений без отработки: {свод.get('objections_unhandled') or 0} "
                           f"из {свод['objections']} "

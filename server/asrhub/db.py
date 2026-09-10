@@ -91,6 +91,11 @@ _CONTENT_SCHEMA = """
         -- (NULL, когда категорий отработки в наборе нет).
         objections        INTEGER,
         objections_unhandled INTEGER,
+        -- Нарушения оператора (сработавших категорий вида «нарушение»),
+        -- балл оператора 0–100 и индекс эмпатии −100…+100.
+        violations        INTEGER,
+        agent_score       REAL,
+        empathy           REAL,
         -- Подробности: сам разбор целиком, как его показывает карточка.
         detail            TEXT
     )
@@ -630,6 +635,9 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "profanity_agent": "INTEGER",
         "objections": "INTEGER",
         "objections_unhandled": "INTEGER",
+        "violations": "INTEGER",
+        "agent_score": "REAL",
+        "empathy": "REAL",
         "detail": "TEXT",
     },
     "content_hits": {
@@ -1093,6 +1101,9 @@ class Database:
         "profanity_agent": "COALESCE(c.profanity_agent,0) > 0",
         "objection_unhandled": "COALESCE(c.objections_unhandled,0) > 0",
         "objection": "COALESCE(c.objections,0) > 0",
+        "violation": "COALESCE(c.violations,0) > 0",
+        "low_score": "c.agent_score IS NOT NULL AND c.agent_score < 60",
+        "impolite": "c.empathy IS NOT NULL AND c.empathy < 0",
     }
 
     #: Отборы по самому заданию, без соединения с разбором содержания:
@@ -1340,7 +1351,7 @@ class Database:
         "money_max, speakers, agent_speaker, overlap_s, dead_air_s, switches, "
         "talk_share, monologue_s, customer_story_s, reply_delay_s, tempo_ratio, "
         "frustration, repeat_contact, profanity, profanity_agent, objections, "
-        "objections_unhandled"
+        "objections_unhandled, violations, agent_score, empathy"
     )
 
     def save_content(self, job_id: str, features: dict[str, Any],
@@ -1555,6 +1566,11 @@ class Database:
         ("objections_unhandled", "SUM(COALESCE(c.objections_unhandled,0))"),
         ("objections_checked",
          "SUM(CASE WHEN c.objections_unhandled IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("violations", "SUM(COALESCE(c.violations,0))"),
+        ("violation_records", "SUM(CASE WHEN COALESCE(c.violations,0) > 0 THEN 1 ELSE 0 END)"),
+        ("agent_score", "AVG(c.agent_score)"),
+        ("scored_agents", "SUM(CASE WHEN c.agent_score IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("empathy", "AVG(c.empathy)"),
     )
 
     #: Как группировать свод. Значение — выражение SQL; None — без
@@ -1613,6 +1629,9 @@ class Database:
         "repeat_contact": "c.repeat_contact",
         "objections": "c.objections",
         "objections_unhandled": "c.objections_unhandled",
+        "violations": "c.violations",
+        "agent_score": "c.agent_score",
+        "empathy": "c.empathy",
     }
 
     def _content_where(self, since: float | None, until: float | None,

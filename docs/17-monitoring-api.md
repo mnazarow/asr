@@ -123,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 204.9
+asrhub_uptime_seconds 329.4
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1789028456.7353878,
-  "collected_at": "2026-09-10T08:20:56+0000",
+  "timestamp": 1789030606.090088,
+  "collected_at": "2026-09-10T08:56:46+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -456,14 +456,33 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 ```json
 {
   "summary": {
-    "rules": 47,
-    "firing": 0,
+    "rules": 51,
+    "firing": 1,
     "pending": 5,
     "critical": 0,
-    "warning": 0,
-    "worst": "ok"
+    "warning": 1,
+    "worst": "warning"
   },
-  "alerts": []
+  "alerts": [
+    {
+      "id": "asrhub_disk_free_bytes|warning",
+      "state": "firing",
+      "severity": "warning",
+      "metric": "asrhub_disk_free_bytes",
+      "label": "Свободно на диске",
+      "unit": "Б",
+      "value": 13003321344.0,
+      "threshold": 21474836480.0,
+      "direction": "below",
+      "since": 1789030305.2589333,
+      "active_seconds": 300.8,
+      "fired_at": 1789030606.0132303,
+      "resolved_at": null,
+      "breaches": 9,
+      "summary": "Свободно на диске: ниже 21474836480 Б",
+      "hint": "POST /api/maintenance/cleanup, затем bash scripts/models.sh disk"
+    }
+  ]
 }
 ```
 
@@ -698,17 +717,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 5,
-  "samples": 797,
+  "scrapes": 9,
+  "samples": 820,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {
-    "rules": 47,
-    "firing": 0,
+    "rules": 51,
+    "firing": 1,
     "pending": 5,
     "critical": 0,
-    "warning": 0,
-    "worst": "ok"
+    "warning": 1,
+    "worst": "warning"
   },
   "targets": []
 }

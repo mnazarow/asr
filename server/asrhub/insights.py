@@ -132,6 +132,15 @@ log = get_logger("insights")
     {"key": "tempo_ratio", "title": "Темп оператора к темпу клиента", "unit": "",
      "good": 0, "digits": 2,
      "hint": "около 1 — подстраивается под собеседника (UIS)"},
+    # Оценка оператора. Балл — как у Verint и Google: веса выполненных
+    # пунктов скрипта к сумме всех, минус штрафы категорий; индекс эмпатии
+    # — по формуле Genesys: (вежливых − невежливых) ÷ сумму.
+    {"key": "agent_score", "title": "Балл оператора", "unit": "из 100",
+     "good": 1, "digits": 0,
+     "hint": "скрипт с весами минус штрафы стоп-слов (Verint, Google Quality AI)"},
+    {"key": "empathy", "title": "Индекс эмпатии", "unit": "от −100 до +100",
+     "good": 1, "digits": 0,
+     "hint": "(вежливых − невежливых) ÷ сумму по репликам оператора (Genesys)"},
 ]
 ПРИЗНАКИ_ПО_КЛЮЧУ = {п["key"]: п for п in ПРИЗНАКИ}
 
@@ -156,6 +165,8 @@ log = get_logger("insights")
     ("customer_story_s", "sentiment", "Чем дольше клиенту дают говорить, тем {} оценка"),
     ("dead_air_s", "sentiment", "Чем больше заметной тишины, тем {} оценка"),
     ("switches", "sentiment", "Чем живее разговор (смены говорящего), тем {} оценка"),
+    ("agent_score", "sentiment", "Чем выше балл оператора, тем {} оценка"),
+    ("empathy", "sentiment", "Чем выше индекс эмпатии, тем {} оценка"),
 ]
 
 #: Разрезы: ключ группировки в базе -> название и особенности показа.
@@ -262,6 +273,15 @@ _ДНИ = ("воскресенье", "понедельник", "вторник",
     "objections": {"title": "Возражения без отработки",
                    "order": "c.objections_unhandled DESC, c.objections DESC",
                    "where": "COALESCE(c.objections_unhandled,0) > 0"},
+    "violations": {"title": "С нарушениями оператора",
+                   "order": "c.violations DESC, c.agent_score ASC",
+                   "where": "COALESCE(c.violations,0) > 0"},
+    "low_score": {"title": "Самый низкий балл оператора",
+                  "order": "c.agent_score ASC",
+                  "where": "c.agent_score IS NOT NULL"},
+    "impolite": {"title": "Невежливый оператор",
+                 "order": "c.empathy ASC",
+                 "where": "c.empathy IS NOT NULL AND c.empathy < 0"},
 }
 
 
@@ -411,6 +431,10 @@ class Insights:
             "objections_unhandled_share": (
                 _процент(строка.get("objections_unhandled"), строка.get("objections"))
                 if int(строка.get("objections_checked") or 0) else None),
+            "violations": int(строка.get("violations") or 0),
+            "violation_records": int(строка.get("violation_records") or 0),
+            "violation_share": _процент(строка.get("violation_records"), всего),
+            "scored_agents": int(строка.get("scored_agents") or 0),
         }
         for признак in ПРИЗНАКИ:
             ключ = признак["key"]
@@ -1055,6 +1079,27 @@ class Insights:
                      f"({к['previous']} → {к['records']})",
                      metric="category", value=к["share"], previous=к["share_previous"],
                      group=к["label"], dimension="category")
+        # Балл оператора, нарушения и эмпатия.
+        балл = свод.get("agent_score")
+        if балл is not None and балл < 60 and int(свод.get("scored_agents") or 0) >= МИН_ГРУППА:
+            добавить("warning",
+                     f"Средний балл оператора — {round(балл)} из 100: скрипт с весами "
+                     f"минус штрафы за стоп-слова",
+                     metric="agent_score", value=балл)
+        нарушений = свод.get("violation_share")
+        if нарушений is not None and нарушений >= 10 and свод.get("violation_records"):
+            добавить("warning",
+                     f"{_каждый(нарушений)} разговор — с нарушением оператора: "
+                     f"{нарушений}% ({свод['violation_records']} из {свод['records']}); "
+                     f"стоп-слова и другие категории вида «нарушение»",
+                     metric="violation_share", value=нарушений)
+        эмпатия = свод.get("empathy")
+        if эмпатия is not None and эмпатия < 0:
+            добавить("warning",
+                     f"Индекс эмпатии операторов отрицательный: {round(эмпатия)} — "
+                     f"невежливых оборотов («подождите», «вы должны») больше, чем вежливых",
+                     metric="empathy", value=эмпатия)
+
         # Возражения без отработки — когда отработку было чем считать.
         доля_без_ответа = свод.get("objections_unhandled_share")
         if (доля_без_ответа is not None and доля_без_ответа >= 30

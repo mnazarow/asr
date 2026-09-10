@@ -157,6 +157,15 @@ def _время(сегмент: dict[str, Any], край: str) -> float:
     return 0.0
 
 
+def _вес(пункт: dict[str, Any]) -> float:
+    """Вес пункта; единица по умолчанию, отрицательный и негодный — единица."""
+    try:
+        вес = float(пункт.get("weight") if пункт.get("weight") is not None else 1)
+    except (TypeError, ValueError):
+        return 1.0
+    return вес if вес > 0 else 1.0
+
+
 def _окно(пункт: dict[str, Any]) -> float:
     """Окно пункта в секундах; ноль — окно не задано."""
     try:
@@ -219,9 +228,14 @@ def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None
 
     итог = []
     выполнено = 0
+    # Веса пунктов: у Verint и Google балл — сумма весов выполненных к
+    # сумме всех. Вес по умолчанию единица, и тогда это прежняя доля.
+    вес_всего = 0.0
+    вес_выполнено = 0.0
     for пункт in пункты:
         где = str(пункт.get("where") or "any")
         окно = _окно(пункт)
+        вес = _вес(пункт)
         if окно and где in ("start", "end"):
             # Окно в секундах, а не пятая часть реплик. «Разговор
             # записывается» обязано прозвучать в первые тридцать секунд —
@@ -243,18 +257,21 @@ def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None
             # молча пропустить его значило бы завысить соблюдение скрипта.
             найдено = rules.Result(False, [])
             ошибка = exc.message
+        вес_всего += вес
         if найдено.matched:
             выполнено += 1
+            вес_выполнено += вес
             # Что именно совпало: первая по порядку примета — как раньше, когда
             # варианты перебирались по списку. Для правила с И это одна из
             # обязательных частей, для ИЛИ — сработавшая.
             нашлось = min(найдено.hits, key=lambda h: h.start).text if найдено.hits else "—"
         итог.append({"id": пункт.get("id"), "label": пункт.get("label"),
-                     "where": где, "within_s": окно or None,
+                     "where": где, "within_s": окно or None, "weight": вес,
                      "passed": найдено.matched, "matched": нашлось,
                      **({"error": ошибка} if ошибка else {})})
     return {
-        "score": round(выполнено / len(пункты), 3) if пункты else None,
+        "score": round(вес_выполнено / вес_всего, 3) if вес_всего else None,
         "checked": len(пункты), "passed": выполнено,
+        "weight": вес_всего, "weight_passed": вес_выполнено,
         "items": итог, "speaker": кто,
     }

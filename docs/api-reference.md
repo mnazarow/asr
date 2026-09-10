@@ -273,33 +273,33 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 {
   "items": [
     {
-      "id": "job000006",
+      "id": "stp021",
       "status": "completed",
       "model": "v2_rnnt",
       "engine": "gigaam",
       "language": "ru",
-      "owner": "grigoriy",
-      "source": "phone",
+      "owner": "анна",
+      "source": "web",
       "priority": 50,
-      "filename": "6.wav",
+      "filename": "поддержка-021.wav",
       "deadline": null,
-      "created_at": 1788969961.7053154,
-      "queued_at": 1788973115.6931176,
+      "created_at": 1788997281.9473639,
+      "queued_at": 1789030274.5480072,
       "started_at": null,
-      "finished_at": 1788969991.7053154,
-      "media_duration_s": 31.9,
-      "processing_time_s": null,
+      "finished_at": 1788997321.9473639,
+      "media_duration_s": 85.0,
+      "processing_time_s": 6.0,
       "queue_time_s": null,
       "audio_prep_s": null,
       "model_load_s": null,
       "inference_s": null,
       "postprocess_s": null,
-      "rtf": null,
-      "words_count": 0,
+      "rtf": 0.1,
+      "words_count": 51,
       "chars_count": 0,
-      "segments_count": 8,
-      "speakers_count": 0,
-      "avg_confidence": null,
+      "segments_count": 7,
+      "speakers_count": 2,
+      "avg_confidence": 0.9,
       "wer": null,
       "cer": null,
       "error_code": null,
@@ -311,18 +311,20 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "file_size": 0,
       "progress": 0.0,
       "stage": "",
-      "tags": "продажи",
+      "tags": "поддержка",
       "peak_memory_mb": null,
       "peak_memory_jobs": null,
       "file_hash": null,
       "cancelled_by": null,
       "webhook_status": null,
-      "suspect_segments": 2,
-      "suspect_share": 0.25,
-      "quality_flags": "compression,phrase,repeat,silence,temperature,tempo"
+      "suspect_segments": 0,
+      "suspect_share": 0.0,
+      "quality_flags": ""
     },
     {
-      "id": "job000888",
+      "id": "job000006",
+      "status": "completed",
+      "model": "v2_rnnt",
 …
 ```
 
@@ -653,7 +655,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:5545",
+  "instance": "vm:20560",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -662,7 +664,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 2048,
+    "completed": 2084,
     "failed": 0,
     "cancelled": 0
   },
@@ -1231,10 +1233,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789028456.6340363,
+    "generated_at": 1789030605.9754937,
     "jobs": {
-      "total": 230,
-      "completed": 230,
+      "total": 240,
+      "completed": 240,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1242,18 +1244,18 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 7657.7,
-      "audio_hours": 2.13,
-      "processing_seconds": 126.0,
-      "words": 732,
+      "audio_seconds": 8505.2,
+      "audio_hours": 2.36,
+      "processing_seconds": 192.0,
+      "words": 1223,
       "characters": 0,
-      "segments": 1392,
-      "files_per_hour": 1.37,
+      "segments": 1451,
+      "files_per_hour": 1.43,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 21,
+        "count": 32,
         "avg": 0.1,
         "min": 0.1,
         "max": 0.1,
@@ -1264,7 +1266,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
         "stdev": 0.0
       },
       "processing_time_s": {
-        "count": 21,
+        "count": 32,
         "avg": 6.0,
         "min": 6.0,
         "max": 6.0,
@@ -1353,7 +1355,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 204.9,
+  "uptime_s": 329.4,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1432,7 +1434,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 204.9,
+  "uptime_s": 329.4,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1441,7 +1443,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.7,
+    "ram_available_gb": 6.6,
     "disk_free_gb": 12.1,
     "gpus": [],
     "accelerator": "cpu",
