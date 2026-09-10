@@ -205,6 +205,7 @@ label { font-size: 13px; color: var(--text-dim); }
 }
 .chip.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .chip.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+span.warn { color: var(--warn); }
 
 /* Заметное предупреждение внутри карточки: пароль по умолчанию, устаревшая
    настройка. Отличается от chip тем, что занимает строку целиком — такое

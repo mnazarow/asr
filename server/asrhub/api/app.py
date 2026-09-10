@@ -223,6 +223,27 @@ class EventHub:
 _ASSET_VERSIONS: dict[str, tuple[float, int, str]] = {}
 
 
+def _record_stream(state: Any, settings: dict[str, Any], event: Any) -> None:
+    """Запоминает задержку потока: секунды до первого текста и длину сессии.
+
+    Файловое задание оставляет после себя строку в jobs, а поток — ничего:
+    его задержка нигде не была видна. Теперь она уходит в таблицу метрик по
+    модели, и раздел «Латентность» показывает её рядом с временем обработки.
+    """
+    try:
+        первый = event.extra.get("first_text_s")
+        модель = str(settings.get("model") or "")
+        движок = str(settings.get("engine") or "")
+        if первый is not None:
+            state.db.add_metric("stream_first_text_s", float(первый),
+                                model=модель, engine=движок)
+        state.db.add_metric("stream_session_s", float(event.extra.get("session_s") or 0.0),
+                            model=модель, engine=движок,
+                            labels={"audio_s": event.extra.get("duration_s")})
+    except Exception as exc:                            # noqa: BLE001
+        log.debug("Метрики потока не записаны: %s", exc)
+
+
 def _asset_version(path: Path) -> str:
     """Короткий отпечаток содержимого файла — для ссылки на него.
 
@@ -574,6 +595,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                         for event in await _asyncio.to_thread(session.finish):
                             await websocket.send_text(
                                 json.dumps(event.to_dict(), ensure_ascii=False))
+                            if event.type == "done":
+                                _record_stream(state, merged, event)
                         break
                     if kind == "ping":
                         await websocket.send_text('{"type":"pong"}')

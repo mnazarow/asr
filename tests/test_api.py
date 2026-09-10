@@ -123,6 +123,56 @@ def test_reference_text_computes_wer(client, sample_wav: Path):
     assert result["wer"] >= 0.0
     assert result["words"]["insertions"] >= 0
     assert "diff" in result
+    # MER лежит в [0, 1], WIL — тоже; счётчики и калибровка легли в задание.
+    assert 0.0 <= result["mer"] <= 1.0 and 0.0 <= result["wil"] <= 1.0
+    сохранено = client.get(f"/api/jobs/{job['id']}").json()
+    assert сохранено["ref_words"] == 4 and сохранено["mer"] == result["mer"]
+    assert сохранено["ins_words"] == result["words"]["insertions"]
+    assert isinstance(сохранено["calibration"], dict) and len(сохранено["calibration"]["bins"]) == 10
+
+    # Эталон, заданный после распознавания, сравнивается с текстом без
+    # меток говорящих — как и эталон, переданный вместе с заданием: иначе
+    # каждая реплика «Говорящий 1: …» приносила две лишние вставки, и один
+    # и тот же эталон давал два разных WER.
+    # Эталон — слова первой записи без меток говорящих; у заданий ниже
+    # разметка включена, и в тексте задания каждая реплика начинается с
+    # «Говорящий N:». Совпасть WER двух путей может, только если оба
+    # сравнивают по сегментам.
+    сегменты = client.get(f"/api/jobs/{job['id']}?with_segments=true").json()["segments"]
+    эталон = " ".join(с["text"] for с in сегменты)
+
+    def с_эталоном(имя: str, **настройки) -> dict:
+        with sample_wav.open("rb") as handle:
+            job = client.post(
+                "/api/jobs", files={"file": (имя, handle, "audio/wav")},
+                data={"settings": json.dumps({"model": "demo-simulator", "engine": "demo",
+                                              "vad_backend": "energy",
+                                              "diarization_enabled": True, **настройки}),
+                      "reference_text": эталон}).json()
+        for _ in range(80):
+            job = client.get(f"/api/jobs/{job['id']}").json()
+            if job["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.25)
+        assert job["status"] == "completed", job
+        return job
+
+    # Разметка включена — настройки отличаются от первого задания, и кеш
+    # не срабатывает: точность считает конвейер.
+    посчитано = с_эталоном("эталон2.wav")
+    assert not посчитано["cached_from"] and "Говорящий" in посчитано["text"], посчитано
+    заново = client.post(f"/api/jobs/{посчитано['id']}/reference",
+                         json={"text": эталон}).json()
+    assert заново["wer"] == посчитано["wer"], (заново["words"], посчитано["wer"])
+    assert посчитано["ref_words"] and посчитано["calibration"]["words"] > 0
+    # Задание с эталоном, взятое из кеша, тоже получает точность: раньше у
+    # такого клона WER оставался пустым, и в срезах точности его не было.
+    из_кеша = с_эталоном("эталон3.wav")
+    assert из_кеша["cached_from"] == посчитано["id"], из_кеша
+    assert из_кеша["wer"] == посчитано["wer"] and из_кеша["ref_words"] == посчитано["ref_words"]
+    assert из_кеша["calibration"] == посчитано["calibration"]
+    assert client.post(f"/api/jobs/{из_кеша['id']}/reference",
+                       json={"text": эталон}).json()["wer"] == посчитано["wer"]
 
 
 def test_cancel_job(client, sample_wav: Path):

@@ -154,7 +154,7 @@ def test_prometheus_rules_reference_existing_metrics():
     parsed = yaml.safe_load(exporters.prometheus_rules())
     known = set(METRICS_BY_NAME)
     for rule in parsed["groups"][0]["rules"]:
-        mentioned = set(re.findall(r"asrhub_[a-z_]+", rule["expr"]))
+        mentioned = set(re.findall(r"asrhub_[a-z0-9_]+", rule["expr"]))
         assert mentioned <= known, f"{rule['alert']}: неизвестная метрика {mentioned - known}"
 
 
@@ -468,7 +468,7 @@ def test_generated_rules_reference_known_metrics():
     known = set(METRICS_BY_NAME)
     unknown = {(rule["alert"], name)
                for rule in parsed["groups"][0]["rules"]
-               for name in re.findall(r"asrhub_[a-z_]+", rule["expr"])
+               for name in re.findall(r"asrhub_[a-z0-9_]+", rule["expr"])
                if name not in known}
     assert not unknown, f"правила поверх неизвестных метрик: {sorted(unknown)}"
 

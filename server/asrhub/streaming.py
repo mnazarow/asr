@@ -211,6 +211,10 @@ class StreamSession:
         self._native: Any = None         # состояние движка, если он умеет поток
         self._final_text = ""
         self._last_partial = ""
+        #: Когда клиент впервые увидел текст — от старта сессии. Это и есть
+        #: задержка потока, какой её чувствует человек: не RTF, а секунды до
+        #: первого слова на экране.
+        self._first_text_at: float | None = None
 
         self.window_s = max(1.0, float(settings.get("stream_window_s") or DEFAULT_WINDOW_S))
 
@@ -275,9 +279,21 @@ class StreamSession:
 
         if text and text != self._last_partial:
             self._last_partial = text
+            self._note_first_text()
             return [StreamEvent("partial", text=text,
                                 start=self._committed_s, end=self.duration_s)]
         return []
+
+    def _note_first_text(self) -> None:
+        if self._first_text_at is None:
+            self._first_text_at = time.time()
+
+    @property
+    def first_text_s(self) -> float | None:
+        """Секунды от старта сессии до первого текста; None — текста не было."""
+        if self._first_text_at is None:
+            return None
+        return round(max(0.0, self._first_text_at - self._started), 3)
 
     def _commit(self, text: str) -> list[StreamEvent]:
         """Закрепляет распознанный хвост и освобождает под ним звук.
@@ -293,6 +309,7 @@ class StreamSession:
         self._last_partial = ""
         if not text:
             return []
+        self._note_first_text()
         self._final_text = (self._final_text + " " + text).strip()
         return [StreamEvent("final", text=text, start=start, end=end)]
 
@@ -312,12 +329,15 @@ class StreamSession:
             text = self._recognize(bytes(self._pcm))
             start = self._committed_s
             if text:
+                self._note_first_text()
                 self._final_text = (self._final_text + " " + text).strip()
             events.append(StreamEvent("final", text=text, start=start,
                                       end=self.duration_s))
         events.append(StreamEvent("done", extra={
             "duration_s": round(self.duration_s, 3),
             "text": self._final_text,
+            "first_text_s": self.first_text_s,
+            "session_s": round(time.time() - self._started, 3),
         }))
         return events
 
@@ -356,6 +376,7 @@ class StreamSession:
         kind, text = result
         if not text or (kind == "partial" and text == self._last_partial):
             return []
+        self._note_first_text()
         if kind == "final":
             self._final_text = (self._final_text + " " + text).strip()
             self._last_partial = ""
@@ -370,6 +391,7 @@ class StreamSession:
             log.warning("Завершение потока движка дало сбой: %s", exc)
             text = ""
         if text:
+            self._note_first_text()
             self._final_text = (self._final_text + " " + text).strip()
         return [StreamEvent("final", text=self._final_text, start=0.0, end=self.duration_s)]
 

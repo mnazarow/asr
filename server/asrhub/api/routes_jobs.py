@@ -867,12 +867,21 @@ def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
 def set_reference(request: Request, job_id: str,
                   text: str = Body(embed=True),
                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    from ..pipeline import calibration
     from ..pipeline import metrics as M
 
     state = get_state(request)
     _owned_job(request, job_id, principal)
     require_write(principal)
     job = state.queue.get(job_id)
-    detail = M.detailed(text, job.get("text") or "")
-    state.db.update_job(job_id, reference_text=text, wer=detail["wer"], cer=detail["cer"])
+    # Метки говорящих в эталоне не пишут, а в тексте задания они есть у
+    # каждой реплики: сравнение по сегментам, как в конвейере, иначе
+    # каждая реплика приносила бы две лишние вставки.
+    сегменты = state.db.get_segments(job_id)
+    гипотеза = " ".join(str(с.get("text") or "") for с in сегменты) if сегменты \
+        else (job.get("text") or "")
+    detail = M.detailed(text, гипотеза)
+    state.db.update_job(job_id, reference_text=text,
+                        calibration=calibration.per_job(сегменты, text) if сегменты else None,
+                        **M.job_fields(detail))
     return {"job_id": job_id, **detail}

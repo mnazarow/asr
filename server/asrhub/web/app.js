@@ -2809,6 +2809,8 @@ function showJobModal(job, opts) {
         <button data-tab="params">Параметры (${changed.length} изменено)</button>
         ${job.status === 'completed' && job.text
           ? '<button data-tab="analysis">Разбор</button>' : ''}
+        ${job.status === 'completed' && job.text
+          ? `<button data-tab="reference">Эталон${job.wer !== null && job.wer !== undefined ? ` (WER ${pct(job.wer, 1)})` : ''}</button>` : ''}
         <button data-tab="events">События</button>
       </div>
       <div id="job-tab-body"></div>
@@ -2862,6 +2864,7 @@ function showJobModal(job, opts) {
       }).join('')}</tbody></table></div>
       ${changed.length === 0 ? '<div class="empty small">Использованы значения по умолчанию</div>' : ''}`,
     analysis: () => `<div id="job-analysis"><div class="empty">Разбираем запись…</div></div>`,
+    reference: () => referenceTab(job, segments),
     events: () => `<div class="table-wrap"><table>
       <thead><tr><th>Время</th><th>Событие</th><th>Сообщение</th></tr></thead><tbody>
       ${(job.events || []).map((e) => `<tr>
@@ -2879,6 +2882,7 @@ function showJobModal(job, opts) {
     // чаще всего ради текста, и лишний запрос на каждое открытие оплачивал
     // бы вкладку, в которую не заходят.
     if (name === 'analysis') loadJobAnalysis(backdrop, job);
+    if (name === 'reference') bindReferenceTab(backdrop, job, () => show('reference'));
   };
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
@@ -2890,6 +2894,73 @@ function showJobModal(job, opts) {
   // Проигрыватель продолжал бы играть из закрытого окна: узел удалён, звук
   // идёт. Поэтому останавливаем его вместе с окном.
   backdrop.addEventListener('asrhub:closed', () => { if (player) player.destroy(); });
+}
+
+/* Вкладка «Эталон» в карточке задания.
+ *
+ * Эталон — расшифровка, сделанная человеком; по ней считаются WER, MER, WIL
+ * и калибровка уверенности. Задать его можно было только через API, и
+ * раздел «Точность по эталону» у большинства установок оставался пустым.
+ * Здесь текст задания уже подставлен: править — быстрее, чем набирать.
+ */
+function referenceTab(job, segments) {
+  const есть = job.wer !== null && job.wer !== undefined;
+  const проц = (v, d) => (v === null || v === undefined ? '—' : pct(v, d === undefined ? 1 : d));
+  const текст = job.reference_text || (segments.length
+    ? segments.map((s) => s.text).join('\n') : (job.text || ''));
+  const к = job.calibration || null;
+  return `<div id="job-reference">
+    ${есть ? `<div class="grid cols-4" style="margin-bottom:12px">
+      ${kpi('WER', проц(job.wer), `${num(job.ref_words)} слов эталона`)}
+      ${kpi('MER', проц(job.mer), 'ограничен единицей')}
+      ${kpi('WIL', проц(job.wil), 'потерянная информация')}
+      ${kpi('Ошибок', `${num(job.sub_words)} / ${num(job.del_words)} / ${num(job.ins_words)}`, 'замен / пропусков / вставок')}
+    </div>
+    ${к && к.words ? `<div class="small faint" style="margin-bottom:10px">Калибровка: ${num(к.words)} слов с уверенностью${
+      к.source === 'word' ? ' по словам' : ' по сегментам'} — учтены в диаграмме надёжности раздела «Аналитика».</div>` : ''}` : `<div class="small dim" style="margin-bottom:10px">
+      Эталона у записи нет. Поправьте текст ниже так, как было сказано на самом деле, и сохраните —
+      сервер посчитает WER, MER, WIL и калибровку уверенности, а запись попадёт в срезы точности.</div>`}
+    <textarea id="job-reference-text" rows="10" style="width:100%;font-family:inherit;line-height:1.5"
+      placeholder="Эталонная расшифровка">${esc(текст)}</textarea>
+    <div class="row" style="gap:8px;margin-top:8px">
+      <button class="primary" id="job-reference-save">${есть ? 'Пересчитать по эталону' : 'Сохранить эталон и посчитать точность'}</button>
+      <span class="small faint">Метки говорящих в эталоне не нужны — сравнение идёт по словам.</span>
+    </div>
+    <div id="job-reference-result" style="margin-top:10px"></div>
+  </div>`;
+}
+
+function bindReferenceTab(backdrop, job, redraw) {
+  const кнопка = qs('#job-reference-save', backdrop);
+  if (!кнопка) return;
+  кнопка.onclick = async () => {
+    const текст = (qs('#job-reference-text', backdrop) || {}).value || '';
+    if (!текст.trim()) { toast('Эталон пуст', 'warn'); return; }
+    кнопка.disabled = true;
+    try {
+      const итог = await API.post(`/api/jobs/${job.id}/reference`, { text: текст });
+      Object.assign(job, { reference_text: текст, wer: итог.wer, mer: итог.mer, wil: итог.wil,
+        ref_words: итог.reference_words, sub_words: итог.words.substitutions,
+        del_words: итог.words.deletions, ins_words: итог.words.insertions });
+      redraw();
+      const хост = qs('#job-reference-result', backdrop);
+      const цвет = { ok: '', sub: 'var(--warn)', del: 'var(--err)', ins: 'var(--accent)' };
+      const подпись = { sub: 'замена', del: 'пропуск', ins: 'вставка' };
+      if (хост && (итог.diff || []).length) {
+        хост.innerHTML = `<div class="small dim" style="margin-bottom:6px">Расхождения: <span style="color:var(--warn)">замена</span>,
+          <span style="color:var(--err)">пропуск</span> (есть в эталоне, нет в расшифровке),
+          <span style="color:var(--accent)">вставка</span> (есть в расшифровке, нет в эталоне)</div>
+          <div class="transcript" style="line-height:1.9">${итог.diff.map((ш) => ш.op === 'ok'
+            ? esc(ш.hyp)
+            : `<span style="color:${цвет[ш.op]};border-bottom:1px dotted" title="${подпись[ш.op]}">${
+                ш.op === 'sub' ? `${esc(ш.hyp)}→${esc(ш.ref)}` : ш.op === 'del' ? `[${esc(ш.ref)}]` : `+${esc(ш.hyp)}`}</span>`).join(' ')}</div>`;
+      }
+      toast(`Эталон сохранён: WER ${pct(итог.wer, 1)}`, 'ok');
+      // Пересчитанный балл в заголовке вкладки — без перезагрузки карточки.
+      const вкладка = qs('#job-tabs button[data-tab="reference"]', backdrop);
+      if (вкладка) вкладка.textContent = `Эталон (WER ${pct(итог.wer, 1)})`;
+    } catch (err) { fail(err); } finally { кнопка.disabled = false; }
+  };
 }
 
 /* Разбор одной записи в карточке задания.
@@ -3523,6 +3594,19 @@ RENDERERS.analytics = {
                '<div id="control-body"></div>')}
       </div>
 
+      ${card('Точность по эталону',
+             'записи с эталонной расшифровкой: WER, MER и WIL по моделям и длительности — сложением слов, а не усреднением записей',
+             '<div id="accuracy-body"></div>')}
+
+      <div class="grid cols-2">
+        ${card('Калибровка уверенности',
+               'верны ли слова, которым модель дала такую уверенность: диаграмма надёжности, ECE и AUC по записям с эталоном',
+               '<div id="calibration-body"></div>')}
+        ${card('Латентность',
+               'p50 / p95 / p99 времени обработки и RTF по моделям и по длительности; для потока — секунды до первого текста',
+               '<div id="latency-body"></div>')}
+      </div>
+
       <div class="grid cols-2">
         ${card('Надёжность', 'что происходит между приёмом и выдачей результата',
                '<div id="reliability-body"></div>')}
@@ -3892,6 +3976,115 @@ function drawExtraAnalytics(data) {
           emptyText: 'нет данных',
         });
       });
+    }
+  }
+
+  const т = data.accuracy || {};
+  if (qs('#accuracy-body')) {
+    const тело = qs('#accuracy-body');
+    const общий = т.overall || {};
+    const проц = (v, d) => (v === null || v === undefined ? '—' : num(v * 100, d === undefined ? 1 : d) + '%');
+    const строка = (р) => `<tr><td>${esc(String(р.key))}</td>
+      <td class="num">${num(р.jobs)}</td><td class="num${р.enough ? '' : ' faint'}" title="${р.enough ? 'слов эталона достаточно' : 'меньше десяти тысяч слов эталона — около часа речи; число показано, но значит мало'}">${num(р.words)}${р.enough ? '' : ' <span class="faint">†</span>'}</td>
+      <td class="num mono">${проц(р.wer)}</td><td class="num mono">${проц(р.mer)}</td>
+      <td class="num mono">${проц(р.wil)}</td>
+      <td class="num mono">${р.gap === null || р.gap === undefined ? '—' : (р.gap > 0.02 ? '<span class="warn">' : '') + проц(р.gap) + (р.gap > 0.02 ? '</span>' : '')}</td>
+      <td class="num mono">${проц(р.insertion_share)}</td></tr>`;
+    const таблица = (заголовок, строки) => (строки || []).length ? `<div class="table-wrap"><table>
+      <thead><tr><th>${заголовок}</th><th class="num">Записей</th><th class="num" title="слов эталона">Слов</th>
+        <th class="num" title="доля ошибок по словам эталона; не ограничена единицей">WER</th>
+        <th class="num" title="доля ошибок среди пар выравнивания; в пределах 0–1">MER</th>
+        <th class="num" title="потерянная информация: 1 − H²/(N·M)">WIL</th>
+        <th class="num" title="разрыв WER − MER: избыток вставок, то есть галлюцинации">WER − MER</th>
+        <th class="num" title="вставок на слово эталона">Вставок</th></tr></thead>
+      <tbody>${строки.map(строка).join('')}</tbody></table></div>` : '';
+    if (!общий.jobs) {
+      тело.innerHTML = `<div class="empty small">За период нет записей с эталоном.
+        Эталон приходит полем reference_text при постановке задания или задаётся в карточке записи —
+        по нему считаются WER, MER, WIL и калибровка уверенности.</div>`;
+    } else {
+      тело.innerHTML = `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('WER', проц(общий.wer), `${num(общий.jobs)} записей · ${num(общий.words)} слов${общий.enough ? '' : ' · мало слов'}`)}
+        ${kpi('MER', проц(общий.mer), 'ограничен единицей')}
+        ${kpi('WIL', проц(общий.wil), 'потерянная информация')}
+        ${kpi('Вставок', проц(общий.insertion_share), общий.gap > 0.02 ? 'разрыв WER − MER заметен' : 'разрыв WER − MER мал')}
+      </div>
+      <div class="grid cols-2">
+        <div>${таблица('Модель', т.by_model)}${(т.by_language || []).length > 1 ? `<div style="margin-top:8px">${таблица('Язык', т.by_language)}</div>` : ''}</div>
+        <div>${таблица('Длительность', т.by_duration)}${(т.by_source || []).length > 1 ? `<div style="margin-top:8px">${таблица('Источник', т.by_source)}</div>` : ''}</div>
+      </div>
+      ${(т.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Хуже всего</b>: ${т.worst.slice(0, 5).map((з) =>
+        `<a href="#" class="link" onclick="window.__asrhub.openJob('${esc(з.id)}');return false">${esc(з.filename || з.id)}</a> — ${проц(з.wer)}`).join('; ')}</div>` : ''}
+      <p class="small faint" style="margin-top:8px">${esc(т.note || '')}${
+        [...(т.by_model || []), ...(т.by_duration || [])].some((р) => !р.enough) ? ' † — срезу не хватает слов.' : ''}</p>`;
+    }
+  }
+
+  const кл = data.calibration || {};
+  if (qs('#calibration-body')) {
+    const тело = qs('#calibration-body');
+    if (!кл.words) {
+      тело.innerHTML = '<div class="empty small">Нет записей с эталоном и уверенностью — калибровку считать не по чему</div>';
+    } else {
+      const корзины = (кл.bins || []).filter((к) => к.words);
+      const пункты = (v) => (v === null || v === undefined ? '—'
+        : Math.abs(v) < 0.0005 ? '0 п.' : (v > 0 ? '+' : '−') + num(Math.abs(v) * 100, 1) + ' п.');
+      тело.innerHTML = `<div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('ECE', num(кл.ece, 3), кл.ece < 0.05 ? 'уверенности можно верить' : кл.ece < 0.1 ? 'небольшое расхождение' : 'уверенность врёт')}
+        ${kpi('Переоценка', пункты(кл.overconfidence), Math.abs(кл.overconfidence) < 0.0005 ? 'обещает ровно столько, сколько даёт' : кл.overconfidence > 0 ? 'обещает больше, чем даёт' : 'скромнее, чем есть')}
+        ${kpi('AUC', кл.auc === null || кл.auc === undefined ? '—' : num(кл.auc, 3), 'верные от неверных')}
+      </div>
+      <div id="chart-calibration"></div>
+      ${(кл.by_model || []).length > 1 ? `<table style="margin-top:8px"><thead><tr><th>Модель</th><th class="num">Слов</th>
+        <th class="num">ECE</th><th class="num">Переоценка</th><th class="num">AUC</th></tr></thead><tbody>
+        ${кл.by_model.map((м) => `<tr><td>${esc(м.key)}</td><td class="num">${num(м.words)}</td>
+          <td class="num mono">${num(м.ece, 3)}</td><td class="num mono">${пункты(м.overconfidence)}</td>
+          <td class="num mono">${м.auc === null ? '—' : num(м.auc, 3)}</td></tr>`).join('')}</tbody></table>` : ''}
+      <p class="small faint" style="margin-top:8px">${esc(кл.note || '')} Слов: ${num(кл.words)}, записей: ${num(кл.jobs)}${
+        (кл.sources || {}).word && (кл.sources || {}).segment ? `; уверенность по словам у ${num(кл.sources.word)} записей, по сегментам у ${num(кл.sources.segment)}`
+        : (кл.sources || {}).word ? '; уверенность по словам' : '; уверенность по сегментам'}.</p>`;
+      Charts.line(qs('#chart-calibration'), {
+        height: 170, labels: корзины.map((к) => `${num(к.from, 1)}–${num(к.to, 1)}`),
+        series: [
+          { name: 'доля верных слов', values: корзины.map((к) => к.accuracy) },
+          { name: 'средняя уверенность', values: корзины.map((к) => к.confidence) },
+        ],
+        emptyText: 'нет данных',
+      });
+    }
+  }
+
+  const лт = data.latency || {};
+  if (qs('#latency-body')) {
+    const тело = qs('#latency-body');
+    const общий = лт.overall || {};
+    const строка = (р) => `<tr><td>${esc(String(р.key))}</td><td class="num">${num(р.jobs)}</td>
+      <td class="num mono">${num(р.processing_p50, 1)} / ${num(р.processing_p95, 1)} / ${num(р.processing_p99, 1)}</td>
+      <td class="num mono">${р.rtf_p50 === null ? '—' : num(р.rtf_p50, 3)} / ${р.rtf_p95 === null ? '—' : num(р.rtf_p95, 3)}</td>
+      <td class="num mono">${р.queue_p95 === null || р.queue_p95 === undefined ? '—' : num(р.queue_p95, 1)}</td></tr>`;
+    const таблица = (заголовок, строки) => (строки || []).length ? `<table>
+      <thead><tr><th>${заголовок}</th><th class="num">Заданий</th>
+        <th class="num" title="время обработки: p50 / p95 / p99, с">Обработка, с</th>
+        <th class="num" title="RTF: p50 / p95">RTF</th>
+        <th class="num" title="ожидание в очереди, p95, с">Очередь p95</th></tr></thead>
+      <tbody>${строки.map(строка).join('')}</tbody></table>` : '';
+    const поток = лт.stream || {};
+    if (!общий.jobs && !поток.sessions) {
+      тело.innerHTML = '<div class="empty small">За период нет заданий, посчитанных сервером самим</div>';
+    } else {
+      тело.innerHTML = `<div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Обработка p95', общий.processing_p95 === null || общий.processing_p95 === undefined ? '—' : fmtDur(общий.processing_p95), `p50 ${fmtDur(общий.processing_p50 || 0)} · p99 ${fmtDur(общий.processing_p99 || 0)}`)}
+        ${kpi('RTF p95', общий.rtf_p95 === null || общий.rtf_p95 === undefined ? '—' : num(общий.rtf_p95, 3), `p50 ${общий.rtf_p50 === null || общий.rtf_p50 === undefined ? '—' : num(общий.rtf_p50, 3)}`)}
+        ${kpi('Поток: первый текст', поток.first_text_p95 === null || поток.first_text_p95 === undefined ? '—' : `${num(поток.first_text_p95, 1)} с`,
+              поток.sessions ? `p95 · p50 ${num(поток.first_text_p50, 1)} с · сессий ${num(поток.sessions)}` : 'сессий не было')}
+      </div>
+      ${таблица('Модель', лт.by_model)}
+      <div style="margin-top:8px">${таблица('Длительность', лт.by_duration)}</div>
+      ${(поток.by_model || []).length ? `<table style="margin-top:8px"><thead><tr><th>Поток: модель</th><th class="num">Сессий</th>
+        <th class="num" title="секунды до первого текста: p50 / p95">До первого текста, с</th></tr></thead><tbody>
+        ${поток.by_model.map((м) => `<tr><td>${esc(м.key)}</td><td class="num">${num(м.sessions)}</td>
+          <td class="num mono">${num(м.first_text_p50, 1)} / ${num(м.first_text_p95, 1)}</td></tr>`).join('')}</tbody></table>` : ''}
+      <p class="small faint" style="margin-top:8px">${esc(лт.note || '')}</p>`;
     }
   }
 

@@ -941,6 +941,193 @@ class Analytics:
         return {"period": period, "baseline_days": self.БАЗА_ДНЕЙ, "step_s": round(шаг, 1),
                 "charts": карты}
 
+    # --- точность по эталону ---------------------------------------------------
+
+    #: Корзины длительности записи для срезов: граница в секундах и подпись.
+    ДЛИТЕЛЬНОСТИ: tuple[tuple[float | None, str], ...] = (
+        (60, "до 1 мин"), (300, "1–5 мин"), (1200, "5–20 мин"),
+        (3600, "20–60 мин"), (None, "более часа"))
+
+    #: Сколько слов эталона нужно срезу, чтобы его WER что-то значил —
+    #: около часа речи (Speechmatics). Меньше — число показывается, но
+    #: помечается как «мало слов».
+    ЗНАЧИМО_СЛОВ = 10000
+
+    @classmethod
+    def _корзина_длительности(cls, секунд: float) -> str:
+        for граница, подпись in cls.ДЛИТЕЛЬНОСТИ:
+            if граница is None or секунд < граница:
+                return подпись
+        return cls.ДЛИТЕЛЬНОСТИ[-1][1]
+
+    @classmethod
+    def _свод_точности(cls, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """WER, MER и WIL по срезу — сложением слов, а не усреднением долей.
+
+        Средний WER по записям — не WER среза: десятисекундная реплика с
+        одной ошибкой (WER 50 %) весила бы столько же, сколько часовая
+        встреча. Счётчики ошибок складываются, и деление идёт один раз.
+        Записи, посчитанные до появления счётчиков, входят только в
+        среднее по записям — оно показывается рядом как справочное.
+        """
+        со_счётчиками = [j for j in items if j.get("ref_words")]
+        n = sum(int(j["ref_words"]) for j in со_счётчиками)
+        s = sum(int(j.get("sub_words") or 0) for j in со_счётчиками)
+        d = sum(int(j.get("del_words") or 0) for j in со_счётчиками)
+        i = sum(int(j.get("ins_words") or 0) for j in со_счётчиками)
+        h = max(0, n - s - d)
+        m = h + s + i
+        ошибок = s + d + i
+        wer_по_записям = [float(j["wer"]) for j in items if j.get("wer") is not None]
+        return {
+            "jobs": len(items), "words": n, "enough": n >= cls.ЗНАЧИМО_СЛОВ,
+            "wer": round(ошибок / n, 4) if n else None,
+            "mer": round(ошибок / (ошибок + h), 4) if (ошибок + h) else None,
+            "wil": round(1.0 - (h / n) * (h / m), 4) if n and m else None,
+            "gap": round(ошибок / n - ошибок / (ошибок + h), 4) if n and (ошибок + h) else None,
+            "substitutions": s, "deletions": d, "insertions": i,
+            "insertion_share": round(i / n, 4) if n else None,
+            "wer_avg": round(sum(wer_по_записям) / len(wer_по_записям), 4)
+            if wer_по_записям else None,
+        }
+
+    def accuracy(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+        """Точность по записям с эталоном — срезами: модель, длительность,
+        источник, язык. С MER и WIL: WER не ограничен единицей, и разрыв
+        WER − MER показывает избыток вставок, то есть галлюцинации.
+        """
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000, owner=owner)
+                if j["status"] == "completed" and j.get("wer") is not None]
+
+        def срез(ключ: Any) -> list[dict[str, Any]]:
+            группы: dict[str, list[dict[str, Any]]] = {}
+            for j in jobs:
+                группы.setdefault(ключ(j), []).append(j)
+            строки = [{"key": имя, **self._свод_точности(items)}
+                      for имя, items in группы.items()]
+            строки.sort(key=lambda r: (-r["words"], -r["jobs"]))
+            return строки
+
+        худшие = sorted(jobs, key=lambda j: -float(j["wer"]))[:10]
+        return {
+            "period": period, "enough_words": self.ЗНАЧИМО_СЛОВ,
+            "overall": self._свод_точности(jobs),
+            "by_model": срез(lambda j: str(j.get("model") or "—")),
+            "by_duration": sorted(
+                срез(lambda j: self._корзина_длительности(
+                    float(j.get("media_duration_s") or 0))),
+                key=lambda r: [п for _, п in self.ДЛИТЕЛЬНОСТИ].index(r["key"])),
+            "by_source": срез(lambda j: str(j.get("source") or "api")),
+            "by_language": срез(lambda j: str(j.get("language") or "—")),
+            "worst": [{"id": j["id"], "filename": j.get("filename"), "model": j.get("model"),
+                       "wer": j.get("wer"), "mer": j.get("mer"), "words": j.get("ref_words"),
+                       "insertions": j.get("ins_words")} for j in худшие],
+            "note": ("Точность считается только по записям с эталоном: он приходит "
+                     "полем reference_text при постановке задания или задаётся потом "
+                     "в карточке. WER складывается по словам всех записей среза, а не "
+                     "усредняется по записям; срез значим от десяти тысяч слов "
+                     "эталона — это около часа речи."),
+        }
+
+    def calibration(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+        """Калибровка уверенности по записям с эталоном: ECE, AUC и диаграмма
+        надёжности — по всем и по моделям."""
+        from .pipeline import calibration as C  # noqa: PLC0415
+
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000, owner=owner)
+                if j["status"] == "completed" and j.get("calibration")]
+        по_моделям: dict[str, list[Any]] = {}
+        for j in jobs:
+            по_моделям.setdefault(str(j.get("model") or "—"), []).append(j["calibration"])
+        модели = []
+        for имя, записи in по_моделям.items():
+            свод = C.aggregate(записи)
+            модели.append({"key": имя, "jobs": свод["jobs"], "words": свод["words"],
+                           "ece": свод["ece"], "auc": свод["auc"],
+                           "confidence": свод["confidence"], "accuracy": свод["accuracy"],
+                           "overconfidence": свод["overconfidence"]})
+        модели.sort(key=lambda м: -м["words"])
+        return {
+            "period": period, **C.aggregate([j["calibration"] for j in jobs]),
+            "by_model": модели,
+            "note": ("ECE — среднее расхождение между уверенностью модели и долей "
+                     "верных слов по десяти корзинам: ноль — уверенности можно верить "
+                     "буквально. Переоценка со знаком плюс — модель обещает больше, "
+                     "чем даёт. AUC — насколько уверенность вообще отделяет верные "
+                     "слова от неверных: 0,5 — никак, 1 — безошибочно."),
+        }
+
+    # --- латентность -----------------------------------------------------------
+
+    def latency(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+        """Задержка по моделям и по длительности: p50/p95/p99 времени
+        обработки и RTF, ожидание в очереди; для потока — секунды до первого
+        текста.
+
+        Среднее время обработки скрывает хвост, а жалуются на хвост: p95 —
+        то, что видит каждый двадцатый.
+        """
+        since = self._since(period)
+        jobs = [j for j in self._jobs(status="completed", since=since or None,
+                                      limit=100000, owner=owner)
+                if not j.get("cached_from") and j.get("processing_time_s") is not None]
+
+        def свод(items: list[dict[str, Any]]) -> dict[str, Any]:
+            время = [float(j["processing_time_s"]) for j in items]
+            rtf = [float(j["rtf"]) for j in items if j.get("rtf")]
+            очередь = [float(j["queue_time_s"]) for j in items
+                       if j.get("queue_time_s") is not None]
+            звук = sum(float(j.get("media_duration_s") or 0) for j in items)
+            return {
+                "jobs": len(items), "audio_hours": round(звук / 3600, 3),
+                "processing_p50": round(M.percentile(время, 0.5), 2) if время else None,
+                "processing_p95": round(M.percentile(время, 0.95), 2) if время else None,
+                "processing_p99": round(M.percentile(время, 0.99), 2) if время else None,
+                "rtf_p50": round(M.percentile(rtf, 0.5), 4) if rtf else None,
+                "rtf_p95": round(M.percentile(rtf, 0.95), 4) if rtf else None,
+                "rtf_p99": round(M.percentile(rtf, 0.99), 4) if rtf else None,
+                "queue_p50": round(M.percentile(очередь, 0.5), 2) if очередь else None,
+                "queue_p95": round(M.percentile(очередь, 0.95), 2) if очередь else None,
+            }
+
+        def срез(ключ: Any) -> list[dict[str, Any]]:
+            группы: dict[str, list[dict[str, Any]]] = {}
+            for j in jobs:
+                группы.setdefault(ключ(j), []).append(j)
+            return [{"key": имя, **свод(items)} for имя, items in
+                    sorted(группы.items(), key=lambda kv: -len(kv[1]))]
+
+        # Поток: сессии не оставляют заданий, их задержка живёт в метриках.
+        поток: dict[str, list[float]] = {}
+        for строка in self.db.metric_values("stream_first_text_s", since):
+            поток.setdefault(str(строка.get("model") or "—"), []).append(float(строка["value"]))
+        сессии = self.db.metric_values("stream_session_s", since)
+        все_первые = [x for v in поток.values() for x in v]
+        return {
+            "period": period,
+            "overall": свод(jobs),
+            "by_model": срез(lambda j: str(j.get("model") or "—")),
+            "by_duration": sorted(
+                срез(lambda j: self._корзина_длительности(
+                    float(j.get("media_duration_s") or 0))),
+                key=lambda r: [п for _, п in self.ДЛИТЕЛЬНОСТИ].index(r["key"])),
+            "stream": {
+                "sessions": len(сессии),
+                "first_text_p50": round(M.percentile(все_первые, 0.5), 2) if все_первые else None,
+                "first_text_p95": round(M.percentile(все_первые, 0.95), 2) if все_первые else None,
+                "by_model": [{"key": имя, "sessions": len(v),
+                              "first_text_p50": round(M.percentile(v, 0.5), 2),
+                              "first_text_p95": round(M.percentile(v, 0.95), 2)}
+                             for имя, v in sorted(поток.items(),
+                                                  key=lambda kv: (-len(kv[1]), kv[0]))],
+            },
+            "note": ("Только задания, которые сервер считал сам: у взятых из кеша "
+                     "времени обработки нет. Для потока — секунды от начала сессии "
+                     "до первого текста на экране, по модели."),
+        }
+
     def suspicious(self, period: str = "month", owner: str | None = None,
                    limit: int = 15) -> dict[str, Any]:
         """Подозрительные расшифровки: галлюцинации, повторы, разметка.
@@ -1134,6 +1321,9 @@ class Analytics:
             "suspicious": self.suspicious(period, owner),
             "drift": self.drift(period, owner),
             "control": self.control(period, owner),
+            "accuracy": self.accuracy(period, owner),
+            "calibration": self.calibration(period, owner),
+            "latency": self.latency(period, owner),
             "tags": self.by_tag(period, owner),
             "queue": self.queue_latency(period, owner),
         }

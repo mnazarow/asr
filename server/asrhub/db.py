@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -308,7 +308,17 @@ _SCHEMA = [
         suspect_segments  INTEGER,
         suspect_share     REAL,
         quality_flags     TEXT,
-        quality_detail    TEXT
+        quality_detail    TEXT,
+        -- Версия 14: точность по эталону подробнее одного WER. Счётчики
+        -- ошибок нужны, чтобы складывать срезы по словам, а не усреднять
+        -- доли; калибровка — корзины уверенности против верности слов.
+        mer               REAL,
+        wil               REAL,
+        ref_words         INTEGER,
+        sub_words         INTEGER,
+        del_words         INTEGER,
+        ins_words         INTEGER,
+        calibration       TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
@@ -597,6 +607,13 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "reference_text": "TEXT",
         "wer": "REAL",
         "cer": "REAL",
+        "mer": "REAL",
+        "wil": "REAL",
+        "ref_words": "INTEGER",
+        "sub_words": "INTEGER",
+        "del_words": "INTEGER",
+        "ins_words": "INTEGER",
+        "calibration": "TEXT",
         "cached_from": "TEXT",
         "webhook_url": "TEXT",
         "webhook_status": "TEXT",
@@ -1056,10 +1073,7 @@ class Database:
         if not fields:
             return
         fields["updated_at"] = now()
-        if isinstance(fields.get("params"), dict):
-            fields["params"] = json.dumps(fields["params"], ensure_ascii=False)
-        if isinstance(fields.get("waveform"), (list, dict)):
-            fields["waveform"] = json.dumps(fields["waveform"], ensure_ascii=False)
+        _serialize_json_fields(fields)
         assignments = ", ".join(f"{k}=?" for k in fields)
         self.execute(f"UPDATE jobs SET {assignments} WHERE id=?",
                      [*fields.values(), job_id])
@@ -1098,7 +1112,11 @@ class Database:
         # Здоровье распознавания: число и доля подозрительных сегментов и
         # перечень признаков. Подробности (примеры с временем) — нет: они
         # нужны только карточке.
-        "suspect_segments, suspect_share, quality_flags"
+        "suspect_segments, suspect_share, quality_flags, "
+        # Точность по эталону: счётчики ошибок для срезов, складываемых по
+        # словам, и корзины калибровки. Есть только у заданий с эталоном —
+        # у остальных это NULL, и список они не утяжеляют.
+        "mer, wil, ref_words, sub_words, del_words, ins_words, calibration"
     )
 
     #: Отборы по содержанию разговора для списка заданий. Ключ приходит из
@@ -2194,10 +2212,7 @@ class Database:
         if not fields:
             return False
         fields["updated_at"] = now()
-        if isinstance(fields.get("params"), dict):
-            fields["params"] = json.dumps(fields["params"], ensure_ascii=False)
-        if isinstance(fields.get("waveform"), (list, dict)):
-            fields["waveform"] = json.dumps(fields["waveform"], ensure_ascii=False)
+        _serialize_json_fields(fields)
         columns = ", ".join(f"{name}=?" for name in fields)
         placeholders = ",".join("?" for _ in expected)
         where = f"id=? AND status IN ({placeholders})"
@@ -2291,6 +2306,18 @@ class Database:
                  json.dumps(labels, ensure_ascii=False) if labels else None))
         except (StorageError, TypeError, ValueError):
             pass
+
+    def metric_values(self, name: str, since: float, *, limit: int = 100000
+                      ) -> list[dict[str, Any]]:
+        """Все значения одной метрики за окно — с моделью, без корзин.
+
+        Для перцентилей нужны сами значения, а не ряд по корзинам: p95
+        задержки из средних по корзинам — это не p95.
+        """
+        rows = self.query(
+            "SELECT ts, value, model, engine, labels FROM metrics WHERE name=? AND ts>=? "
+            "ORDER BY ts DESC LIMIT ?", (name, since, limit))
+        return [dict(r) for r in rows]
 
     def metric_series(self, name: str, since: float, *, model: str | None = None,
                       buckets: int = 60) -> list[dict[str, Any]]:
@@ -2619,9 +2646,17 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
     return freed
 
 
+def _serialize_json_fields(fields: dict[str, Any]) -> None:
+    """Словари и списки в колонках JSON — строкой; остальное как есть."""
+    for column in ("params", "waveform", "calibration", "quality_detail"):
+        if isinstance(fields.get(column), (list, dict)):
+            fields[column] = json.dumps(fields[column], ensure_ascii=False)
+
+
 def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
     job = dict(row)
-    for column, empty in (("params", {}), ("waveform", []), ("quality_detail", None)):
+    for column, empty in (("params", {}), ("waveform", []), ("quality_detail", None),
+                          ("calibration", None)):
         raw = job.get(column)
         if isinstance(raw, str):
             try:

@@ -282,8 +282,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
     {
       "id": "stp021",
       "status": "completed",
-      "model": "v2_rnnt",
-      "engine": "gigaam",
+      "model": "whisper-large-v3",
+      "engine": "faster-whisper",
       "language": "ru",
       "owner": "анна",
       "source": "web",
@@ -295,18 +295,18 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "started_at": null,
       "finished_at": 1788997321.9473639,
       "media_duration_s": 85.0,
-      "processing_time_s": 6.0,
-      "queue_time_s": null,
-      "audio_prep_s": null,
-      "model_load_s": null,
-      "inference_s": null,
-      "postprocess_s": null,
-      "rtf": 0.1,
+      "processing_time_s": 12.49,
+      "queue_time_s": 0.57,
+      "audio_prep_s": 0.57,
+      "model_load_s": 0.0,
+      "inference_s": 10.61,
+      "postprocess_s": 0.39,
+      "rtf": 0.1469,
       "words_count": 51,
       "chars_count": 0,
       "segments_count": 7,
       "speakers_count": 2,
-      "avg_confidence": 0.9,
+      "avg_confidence": 0.798,
       "wer": null,
       "cer": null,
       "error_code": null,
@@ -326,12 +326,11 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "webhook_status": null,
       "suspect_segments": 0,
       "suspect_share": 0.0,
-      "quality_flags": ""
-    },
-    {
-      "id": "job000006",
-      "status": "completed",
-      "model": "v2_rnnt",
+      "quality_flags": "",
+      "mer": null,
+      "wil": null,
+      "ref_words": null,
+      "sub_words": null,
 …
 ```
 
@@ -662,7 +661,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:26365",
+  "instance": "vm:30492",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1240,10 +1239,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789036764.667948,
+    "generated_at": 1789039842.198269,
     "jobs": {
-      "total": 237,
-      "completed": 237,
+      "total": 235,
+      "completed": 235,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1251,45 +1250,42 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 8368.2,
-      "audio_hours": 2.32,
-      "processing_seconds": 186.0,
-      "words": 1185,
+      "audio_seconds": 8321.9,
+      "audio_hours": 2.31,
+      "processing_seconds": 1720.8,
+      "words": 9770,
       "characters": 0,
-      "segments": 1434,
-      "files_per_hour": 1.41,
+      "segments": 1422,
+      "files_per_hour": 1.4,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 31,
-        "avg": 0.1,
-        "min": 0.1,
-        "max": 0.1,
-        "p50": 0.1,
-        "p90": 0.1,
-        "p95": 0.1,
-        "p99": 0.1,
-        "stdev": 0.0
+        "count": 235,
+        "avg": 0.218543,
+        "min": 0.01,
+        "max": 5.7511,
+        "p50": 0.1097,
+        "p90": 0.38224,
+        "p95": 0.49231,
+        "p99": 2.11018,
+        "stdev": 0.501917
       },
       "processing_time_s": {
-        "count": 31,
-        "avg": 6.0,
-        "min": 6.0,
-        "max": 6.0,
-        "p50": 6.0,
-        "p90": 6.0,
-        "p95": 6.0,
-        "p99": 6.0,
-        "stdev": 0.0
+        "count": 235,
+        "avg": 7.322553,
+        "min": 0.28,
+        "max": 175.41,
+        "p50": 3.77,
+        "p90": 13.456,
+        "p95": 16.802,
+        "p99": 61.1638,
+        "stdev": 15.525606
       },
       "queue_time_s": {
-        "count": 0,
-        "avg": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "p50": 0.0,
-        "p90": 0.0,
+        "count": 235,
+        "avg": 6.508085,
+        "min": 0.02,
 …
 ```
 
@@ -1318,6 +1314,14 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 
 Отдельный раздел аналитики.
 
+Один разрез сводного отчёта — когда весь отчёт не нужен.
+
+Разделы: overview, timeseries, models, languages, owners, engines,
+sources, errors, durations, slowest, profile, efficiency, weekly, cache,
+reliability, audio, resources, quality, suspicious, drift, control,
+accuracy, calibration, latency, tags, queue. Неизвестный раздел
+отвечает 400 с перечнем доступных.
+
 **Доступ:** любой ключ; выборка сужается до его заданий.
 
 
@@ -1325,6 +1329,81 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 |---|---|---|---|---|
 | `section` | в пути | string | обязателен | — |
 | `period` | в адресе | string | `week` | — |
+
+**Пример**
+
+```bash
+curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?period=week'
+```
+
+**Ответ**
+
+```json
+{
+  "period": "week",
+  "overall": {
+    "jobs": 235,
+    "audio_hours": 2.312,
+    "processing_p50": 3.77,
+    "processing_p95": 16.8,
+    "processing_p99": 61.16,
+    "rtf_p50": 0.1097,
+    "rtf_p95": 0.4923,
+    "rtf_p99": 2.1102,
+    "queue_p50": 4.44,
+    "queue_p95": 19.21
+  },
+  "by_model": [
+    {
+      "key": "whisper-large-v3",
+      "jobs": 63,
+      "audio_hours": 0.672,
+      "processing_p50": 5.38,
+      "processing_p95": 18.06,
+      "processing_p99": 28.53,
+      "rtf_p50": 0.1699,
+      "rtf_p95": 0.2865,
+      "rtf_p99": 0.7221,
+      "queue_p50": 6.24,
+      "queue_p95": 19.49
+    },
+    {
+      "key": "t-one",
+      "jobs": 58,
+      "audio_hours": 0.541,
+      "processing_p50": 2.62,
+      "processing_p95": 7.75,
+      "processing_p99": 14.79,
+      "rtf_p50": 0.0847,
+      "rtf_p95": 0.1668,
+      "rtf_p99": 0.6098,
+      "queue_p50": 4.94,
+      "queue_p95": 21.6
+    },
+    {
+      "key": "vosk-ru",
+      "jobs": 57,
+      "audio_hours": 0.529,
+      "processing_p50": 10.17,
+      "processing_p95": 43.63,
+      "processing_p99": 152.35,
+      "rtf_p50": 0.3429,
+      "rtf_p95": 0.9818,
+      "rtf_p99": 4.9758,
+      "queue_p50": 3.8,
+      "queue_p95": 20.19
+    },
+    {
+      "key": "gigaam-v3-e2e-rnnt",
+      "jobs": 57,
+      "audio_hours": 0.57,
+      "processing_p50": 1.55,
+      "processing_p95": 5.34,
+      "processing_p99": 6.27,
+…
+```
+
+Разделы `accuracy`, `calibration` и `latency` — здоровье распознавания по записям с эталоном и по хвостам задержки; `drift` и `control` — дрейф уверенности и контрольные карты.
 
 ### `GET /api/events`
 
@@ -1362,7 +1441,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 69.9,
+  "uptime_s": 70.6,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1441,7 +1520,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 69.9,
+  "uptime_s": 70.6,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1451,7 +1530,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 6.9,
-    "disk_free_gb": 12.3,
+    "disk_free_gb": 12.1,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1462,7 +1541,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 12.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 12.1 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {

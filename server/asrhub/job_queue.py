@@ -44,6 +44,7 @@ from .monitoring.collector import (
     MEDIA_DURATION_BUCKETS,
     RUNTIME,
 )
+from .pipeline import metrics as metrics_mod
 from .processor import cleanup_workdir, process_job, safe_workdir, settings_digest
 
 log = get_logger("queue")
@@ -293,7 +294,8 @@ class JobQueue:
             cached = self._find_cached(digest, params_digest)
             if cached is not None:
                 job_id = self._clone_cached(cached, filename, str(path), owner,
-                                            group_id, settings, webhook_url)
+                                            group_id, settings, webhook_url,
+                                            reference_text=reference_text)
                 RUNTIME.inc("asrhub_cached_jobs_total")
                 self._emit("job.cached", {"id": job_id, "source": cached["id"]})
                 # Задание завершено мгновенно, но для отправителя оно
@@ -353,7 +355,8 @@ class JobQueue:
 
     def _clone_cached(self, cached: dict[str, Any], filename: str, path: str,
                       owner: str, group_id: str | None,
-                      settings: dict[str, Any], webhook_url: str = "") -> str:
+                      settings: dict[str, Any], webhook_url: str = "",
+                      reference_text: str = "") -> str:
         job_id = self.db.create_job({
             "id": new_id(),
             "group_id": group_id,
@@ -397,10 +400,35 @@ class JobQueue:
             speakers_count=cached.get("speakers_count"),
             avg_confidence=cached.get("avg_confidence"),
             rtf=cached.get("rtf"), processing_time_s=0.0, queue_time_s=0.0,
+            # Признаки здоровья распознавания — те же, что у оригинала: это
+            # свойство расшифровки, а она скопирована целиком.
+            suspect_segments=cached.get("suspect_segments"),
+            suspect_share=cached.get("suspect_share"),
+            quality_flags=",".join(cached.get("quality_flags") or [])
+            if isinstance(cached.get("quality_flags"), list) else cached.get("quality_flags"),
+            quality_detail=cached.get("quality_detail"),
             progress=1.0, stage="из кеша")
         segments = self.db.get_segments(cached["id"])
         if segments:
             self.db.save_segments(job_id, segments)
+        # Эталон приходит с заданием, а не с записью: у клона он свой, и
+        # точность считается здесь же — иначе задание с эталоном, попавшее
+        # в кеш, оставалось без WER, и в срезах точности его не было.
+        эталон = str(reference_text or "").strip()
+        if эталон:
+            from .pipeline import calibration  # noqa: PLC0415
+
+            гипотеза = (" ".join(str(с.get("text") or "") for с in segments)
+                        if segments else str(cached.get("text") or ""))
+            try:
+                разбор = metrics_mod.detailed(эталон, гипотеза)
+                self.db.update_job(
+                    job_id, reference_text=эталон,
+                    calibration=calibration.per_job(segments, эталон) if segments else None,
+                    **metrics_mod.job_fields(разбор))
+            except Exception as exc:                          # noqa: BLE001
+                log.warning("Точность для %s из кеша не рассчитана: %s", job_id, exc,
+                            extra={"job_id": job_id})
         self.db.add_event(job_id, "cached",
                           f"Результат взят из кеша задания {cached['id']}")
         log.info("Задание %s: результат взят из кеша (%s)", job_id, cached["id"])
@@ -886,8 +914,9 @@ class JobQueue:
             device=str(outcome.stats.get("device") or merged.get("device") or ""),
             peak_memory_mb=outcome.peak_memory_mb or None,
             peak_memory_jobs=max(1, self._concurrency.get(job_id, 1)),
-            wer=accuracy.get("wer"), cer=accuracy.get("cer"),
             waveform=outcome.waveform,
+            calibration=outcome.stats.get("calibration") or None,
+            **metrics_mod.job_fields(accuracy),
         )
         if not finished:
             # Задание успели отменить или удалить, пока оно считалось.

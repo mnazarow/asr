@@ -451,3 +451,40 @@ def test_the_analytics_section_still_works(страница):
     assert "undefined" not in тело.lower(), тело[:400]
     assert "Не удалось" not in тело, тело[:400]
     _чисто(страница)
+
+
+def test_the_record_card_saves_a_reference_and_shows_accuracy(страница):
+    """Эталон задаётся в карточке, а не только через API; после сохранения
+    в карточке — WER, MER, WIL и подсветка расхождений, а в «Аналитике» —
+    раздел «Точность по эталону» с записью."""
+    _открыть(страница, "results")
+    страница.wait_for_selector("#results-table button", timeout=15000)
+    страница.click('#results-table button:has-text("Открыть")')
+    страница.wait_for_selector("#job-tabs", timeout=10000)
+    страница.click('#job-tabs button[data-tab="reference"]')
+    страница.wait_for_selector("#job-reference-text", timeout=10000)
+    # Текст подставлен из записи: править быстрее, чем набирать. Портим
+    # одно слово — и WER обязан стать ненулевым, а расхождение — подсвеченным.
+    текст = страница.input_value("#job-reference-text")
+    assert len(текст.split()) > 5, текст
+    слова = текст.split()
+    слова[2] = "подмена"
+    страница.fill("#job-reference-text", " ".join(слова))
+    страница.click("#job-reference-save")
+    страница.wait_for_selector("#job-reference-result .transcript", timeout=10000)
+    страница.wait_for_timeout(300)
+    карточка = страница.inner_text("#job-reference")
+    assert "WER" in карточка and "MER" in карточка and "WIL" in карточка, карточка[:400]
+    assert "подмена" in карточка, карточка[:400]
+    вкладка = страница.inner_text('#job-tabs button[data-tab="reference"]')
+    assert "WER" in вкладка and "0.0%" not in вкладка, вкладка
+    _чисто(страница)
+
+    _открыть(страница, "analytics")
+    страница.wait_for_selector("#accuracy-body table", timeout=20000)
+    тело = страница.inner_text("#accuracy-body")
+    assert "demo-simulator" in тело and "WER" in тело, тело[:400]
+    assert "undefined" not in тело.lower() and "NaN" not in тело, тело[:400]
+    # Калибровка и латентность отрисованы: у записей есть уверенность и время.
+    assert страница.inner_text("#latency-body").count("demo-simulator") >= 1
+    _чисто(страница)

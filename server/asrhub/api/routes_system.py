@@ -367,6 +367,14 @@ def analytics_export(request: Request, period: str = Query(default="month"),
 @router.get("/analytics/{section}", summary="Отдельный раздел аналитики")
 def analytics_section(request: Request, section: str, period: str = "week",
                       principal: Principal = Depends(authenticate)) -> Any:
+    """Один разрез сводного отчёта — когда весь отчёт не нужен.
+
+    Разделы: overview, timeseries, models, languages, owners, engines,
+    sources, errors, durations, slowest, profile, efficiency, weekly, cache,
+    reliability, audio, resources, quality, suspicious, drift, control,
+    accuracy, calibration, latency, tags, queue. Неизвестный раздел
+    отвечает 400 с перечнем доступных.
+    """
     state = get_state(request)
     handlers = {
         "overview": state.analytics.overview,
@@ -390,6 +398,9 @@ def analytics_section(request: Request, section: str, period: str = "week",
         "suspicious": state.analytics.suspicious,
         "drift": state.analytics.drift,
         "control": state.analytics.control,
+        "accuracy": state.analytics.accuracy,
+        "calibration": state.analytics.calibration,
+        "latency": state.analytics.latency,
         "tags": state.analytics.by_tag,
         "queue": state.analytics.queue_latency,
     }

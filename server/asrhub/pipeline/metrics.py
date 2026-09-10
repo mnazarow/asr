@@ -48,11 +48,42 @@ class ErrorCounts:
         return self.hits + self.substitutions + self.deletions
 
     @property
+    def total_hypothesis(self) -> int:
+        return self.hits + self.substitutions + self.insertions
+
+    @property
     def error_rate(self) -> float:
         total = self.total_reference
         if total == 0:
             return 0.0 if self.insertions == 0 else 1.0
         return (self.substitutions + self.deletions + self.insertions) / total
+
+    @property
+    def match_error_rate(self) -> float:
+        """MER — доля ошибок среди всех выровненных пар (Morris, 2004).
+
+        WER не ограничен единицей: расшифровка, где к каждому слову
+        эталона дописано ещё три, даёт 300 %. MER делит ошибки не на длину
+        эталона, а на число пар выравнивания, поэтому лежит в [0, 1] —
+        и разрыв WER − MER показывает именно избыток вставок, то есть
+        галлюцинации.
+        """
+        всего = self.hits + self.substitutions + self.deletions + self.insertions
+        if всего == 0:
+            return 0.0
+        return (self.substitutions + self.deletions + self.insertions) / всего
+
+    @property
+    def information_lost(self) -> float:
+        """WIL — доля потерянной информации: 1 − H²/(N·M) (Morris, 2004).
+
+        Ловит и пропуски, и вставки одновременно: H/N — какая часть эталона
+        узнана, H/M — какая часть гипотезы верна.
+        """
+        n, m = self.total_reference, self.total_hypothesis
+        if n == 0 or m == 0:
+            return 0.0 if n == m else 1.0
+        return 1.0 - (self.hits / n) * (self.hits / m)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -218,11 +249,33 @@ def detailed(reference: str, hypothesis: str, **norm: Any) -> dict[str, Any]:
     return {
         "wer": round(counts.error_rate, 6),
         "cer": round(char_counts.error_rate, 6),
+        "mer": round(counts.match_error_rate, 6),
+        "wil": round(counts.information_lost, 6),
         "words": counts.to_dict(),
         "chars": char_counts.to_dict(),
         "reference_words": len(ref_words),
         "hypothesis_words": len(hyp_words),
         "diff": diff_words(ref_words, hyp_words)[:500],
+    }
+
+
+def job_fields(detail: dict[str, Any]) -> dict[str, Any]:
+    """Колонки задания из разбора `detailed`: доли и счётчики по словам.
+
+    Счётчики хранятся ради срезов: WER по модели складывается из ошибок и
+    слов эталона всех записей, а не усредняется по записям — иначе
+    десятисекундная реплика весит столько же, сколько часовая встреча.
+    """
+    if not detail:
+        return {}
+    слова = detail.get("words") or {}
+    return {
+        "wer": detail.get("wer"), "cer": detail.get("cer"),
+        "mer": detail.get("mer"), "wil": detail.get("wil"),
+        "ref_words": int(detail.get("reference_words") or 0),
+        "sub_words": int(слова.get("substitutions") or 0),
+        "del_words": int(слова.get("deletions") or 0),
+        "ins_words": int(слова.get("insertions") or 0),
     }
 
 
@@ -256,6 +309,32 @@ def diff_words(ref: Sequence[str], hyp: Sequence[str]) -> list[dict[str, Any]]:
             out.append({"op": "ins", "ref": "", "hyp": hyp[j - 1]})
             j -= 1
     out.reverse()
+    return out
+
+
+def align_hits(ref: Sequence[str], hyp: Sequence[str]) -> list[bool]:
+    """По каждому слову гипотезы — верно оно или нет.
+
+    Нужно калибровке уверенности: у слова есть уверенность модели, и надо
+    знать, оказалось ли оно на месте. Верным считается слово из
+    совпадающего участка по `difflib`; всё, что попало в промежутки между
+    участками, — неверно. Точнее выравнивать промежутки незачем: без
+    отсева «мусора» (autojunk=False) промежуток по построению не содержит
+    ни одного общего слова, и любое выравнивание внутри него даёт только
+    замены, пропуски и вставки. Пропуски эталона к словам гипотезы не
+    привязаны, и здесь их нет: калибровка отвечает за произнесённое
+    моделью, а не за пропущенное ею.
+    """
+    import difflib
+
+    out: list[bool] = [False] * len(hyp)
+    if not hyp:
+        return out
+    matcher = difflib.SequenceMatcher(a=list(ref), b=list(hyp), autojunk=False)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for j in range(j1, j2):
+                out[j] = True
     return out
 
 

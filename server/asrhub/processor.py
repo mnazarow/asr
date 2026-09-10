@@ -464,6 +464,14 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             outcome.warnings.append(f"Точность не рассчитана: {exc}")
             detail = {}
         outcome.stats["accuracy"] = detail
+        # Калибровка — по тем же сегментам и тому же эталону: верно ли
+        # слово, которому модель дала такую-то уверенность.
+        try:
+            from .pipeline import calibration  # noqa: PLC0415
+
+            outcome.stats["calibration"] = calibration.per_job(processed, reference)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Калибровка не рассчитана: %s", exc)
 
     # ---- 7. Выгрузка ------------------------------------------------------
     check_cancel()

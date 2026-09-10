@@ -339,6 +339,29 @@ class Collector:
         audio_hours = float(efficiency.get("audio_hours") or 0)
         out.append(Sample("asrhub_throughput_audio_hours", round(audio_hours / 24, 3)))
 
+        # Хвост задержки по моделям: p95 времени обработки и RTF — то, что
+        # видит каждый двадцатый, а не среднее. Поток — отдельно: секунды до
+        # первого текста, которые файловые задания не измеряют вовсе.
+        try:
+            латентность = self.state.analytics.latency("day")
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Латентность для метрик не посчитана: %s", exc)
+            return
+        for row in (латентность.get("by_model") or [])[:40]:
+            метки = {"model": str(row.get("key") or "")}
+            if row.get("processing_p95") is not None:
+                out.append(Sample("asrhub_processing_p95_seconds",
+                                  float(row["processing_p95"]), метки))
+            if row.get("rtf_p95") is not None:
+                out.append(Sample("asrhub_rtf_p95_by_model", float(row["rtf_p95"]), метки))
+        for row in ((латентность.get("stream") or {}).get("by_model") or [])[:40]:
+            метки = {"model": str(row.get("key") or "")}
+            for stat in ("p50", "p95"):
+                if row.get(f"first_text_{stat}") is not None:
+                    out.append(Sample("asrhub_stream_first_text_seconds",
+                                      float(row[f"first_text_{stat}"]),
+                                      {**метки, "stat": stat}))
+
     # -- качество ------------------------------------------------------------
 
     def _quality(self, out: list[Sample]) -> None:
@@ -357,6 +380,28 @@ class Collector:
                 "GROUP BY model", (since,)):
             out.append(Sample("asrhub_wer", round(float(row["w"]), 4),
                               {"model": str(row["model"] or "")}))
+        # MER — по счётчикам слов, сложением по записям: доля ошибок среди
+        # пар выравнивания, ограничена единицей. Разрыв с WER — вставки.
+        for row in self.state.db.query(
+                "SELECT model, SUM(ref_words) n, SUM(sub_words) s, SUM(del_words) d, "
+                "       SUM(ins_words) i FROM jobs WHERE ref_words IS NOT NULL "
+                "  AND ref_words > 0 AND finished_at>=? GROUP BY model", (since,)):
+            n, s_, d, i = (int(row[k] or 0) for k in ("n", "s", "d", "i"))
+            h = max(0, n - s_ - d)
+            if s_ + d + i + h:
+                out.append(Sample("asrhub_mer", round((s_ + d + i) / (s_ + d + i + h), 4),
+                                  {"model": str(row["model"] or "")}))
+        # Калибровка — за неделю: за сутки эталонных записей обычно единицы,
+        # и ECE по ним — совпадение, а не мера.
+        try:
+            калибровка = self.state.analytics.calibration("week")
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Калибровка для метрик не посчитана: %s", exc)
+            калибровка = {}
+        for м in (калибровка.get("by_model") or [])[:40]:
+            if м.get("ece") is not None and int(м.get("words") or 0) >= 500:
+                out.append(Sample("asrhub_calibration_ece", float(м["ece"]),
+                                  {"model": str(м.get("key") or "")}))
 
         # Подозрительные расшифровки — по сегментам и по записям, за сутки и
         # по моделям: у какой модели расшифровки начинают выдумывать, видно

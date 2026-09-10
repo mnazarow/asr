@@ -420,6 +420,13 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/analytics?period=week'",
         "show": "/api/analytics?period=week", "limit": 1100,
     },
+    ("/api/analytics/{section}", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/analytics/latency?period=week'",
+        "show": "/api/analytics/latency?period=week", "limit": 1400,
+        "note": "Разделы `accuracy`, `calibration` и `latency` — здоровье "
+                "распознавания по записям с эталоном и по хвостам задержки; "
+                "`drift` и `control` — дрейф уверенности и контрольные карты.",
+    },
     ("/api/logs", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/logs?level=ERROR&limit=20'",
         "show": "/api/logs?level=ERROR&limit=3", "limit": 800,
