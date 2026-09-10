@@ -60,8 +60,16 @@ _ДАТА_РОЖДЕНИЯ = re.compile(
     + _ДАТА, re.IGNORECASE)
 
 #: Ключи ответов, где живёт текст, и ключи со списками найденных сущностей.
+#:
+#: Сюда же входят поля смыслового слоя: модель пересказывает разговор
+#: своими словами, и номер карты из разговора попадает в пересказ ровно
+#: так же, как в расшифровку. Раньше `quote` маскировалась, а `summary` в
+#: том же объекте — нет, и ключ, заведённый специально «без персональных
+#: данных», получал их из пересказа.
 TEXT_KEYS = frozenset({"text", "word", "reference_text", "filename", "message",
-                       "ref", "hyp", "raw", "excerpt", "snippet", "quote", "title"})
+                       "ref", "hyp", "raw", "excerpt", "snippet", "quote", "title",
+                       "summary", "reason_quote", "outcome_quote", "what", "answer",
+                       "note", "question"})
 LIST_KEYS = frozenset({"phones", "emails"})
 
 

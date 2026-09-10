@@ -375,11 +375,28 @@ class Collector:
             low = sum(1 for value in confidences if value < 0.7) / len(confidences)
             out.append(Sample("asrhub_low_confidence_share", round(low, 4)))
 
+        # WER складывается по словам, а не усредняется по записям: три
+        # десятисекундные реплики с WER 0,5 и часовая встреча с WER 0,03
+        # давали «средний» 0,38 и пробивали порог тревоги, тогда как по
+        # словам это 0,03. Записи без счётчиков слов (эталон задан до
+        # появления колонок) идут запасным путём — средним по записям.
+        посчитаны: set[str] = set()
         for row in self.state.db.query(
-                "SELECT model, AVG(wer) w FROM jobs WHERE wer IS NOT NULL AND finished_at>=? "
+                "SELECT model, SUM(ref_words) n, SUM(sub_words) s, SUM(del_words) d, "
+                "       SUM(ins_words) i FROM jobs WHERE ref_words IS NOT NULL "
+                "  AND ref_words > 0 AND finished_at>=? GROUP BY model", (since,)):
+            n, s_, d, i = (int(row[k] or 0) for k in ("n", "s", "d", "i"))
+            if n:
+                out.append(Sample("asrhub_wer", round((s_ + d + i) / n, 4),
+                                  {"model": str(row["model"] or "")}))
+                посчитаны.add(str(row["model"] or ""))
+        for row in self.state.db.query(
+                "SELECT model, AVG(wer) w FROM jobs WHERE wer IS NOT NULL "
+                "  AND (ref_words IS NULL OR ref_words = 0) AND finished_at>=? "
                 "GROUP BY model", (since,)):
-            out.append(Sample("asrhub_wer", round(float(row["w"]), 4),
-                              {"model": str(row["model"] or "")}))
+            if str(row["model"] or "") not in посчитаны:
+                out.append(Sample("asrhub_wer", round(float(row["w"]), 4),
+                                  {"model": str(row["model"] or "")}))
         # MER — по счётчикам слов, сложением по записям: доля ошибок среди
         # пар выравнивания, ограничена единицей. Разрыв с WER — вставки.
         for row in self.state.db.query(
@@ -411,8 +428,14 @@ class Collector:
             согласие = self.state.analytics.agreement("week")
             for пара in согласие.get("by_pair") or []:
                 if пара.get("wer_avg") is not None:
+                    # Метка на обе модели пары: разрез считается по паре, и
+                    # с одной меткой модель, которую сверяли с двумя
+                    # разными контрольными, давала два ряда с одинаковыми
+                    # метками. Prometheus отвергает такой снимок целиком —
+                    # пропадали ВСЕ метрики сервера, включая asrhub_up.
                     out.append(Sample("asrhub_model_disagreement", float(пара["wer_avg"]),
-                                      {"model": str(пара.get("model") or "")}))
+                                      {"model": str(пара.get("model") or ""),
+                                       "control_model": str(пара.get("control_model") or "")}))
         except Exception as exc:                             # noqa: BLE001
             log.debug("Метрики проверки не посчитаны: %s", exc)
         # Смысловой слой — только когда включён.

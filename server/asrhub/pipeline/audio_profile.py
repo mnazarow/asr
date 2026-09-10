@@ -231,11 +231,21 @@ def profile(samples: Any, rate: int, *,
     # перцентилям: верхние 30 % кадров считаются речью, нижние 20 % — шумом.
     речь: list[float] = []
     шум: list[float] = []
+    способ = "percentile"
     if speech_spans:
         for i, уровень in enumerate(уровни):
             t = (i + 0.5) * КАДР_С
             (речь if any(a <= t < b for a, b in speech_spans) else шум).append(уровень)
+        способ = "vad"
     if not речь or not шум:
+        # Разметка не оставила ни одного кадра под шум (VAD решил, что речь
+        # идёт всю запись) — считаем по перцентилям. И честно называем это
+        # перцентилями: «шумом» здесь становятся провалы между слогами, то
+        # есть меряется уже не отношение сигнал/шум, а динамический диапазон
+        # речи. С пометкой «vad» один и тот же чистый звук давал 2,8 дБ у
+        # ровного диктора и 25 дБ у эмоционального — и первый попадал в
+        # «плохой звук».
+        способ = "percentile"
         ряд = sorted(уровни)
         k = len(ряд)
         шум = ряд[:max(1, int(k * 0.2))]
@@ -263,7 +273,7 @@ def profile(samples: Any, rate: int, *,
         "measured_s": round(n / rate, 1),
         "noise_dbfs": round(10.0 * math.log10(max(p_шум, 1e-12)), 1),
         "speech_dbfs": round(10.0 * math.log10(max(p_речь, 1e-12)), 1),
-        "method": "vad" if speech_spans else "percentile",
+        "method": способ,
     }
 
 

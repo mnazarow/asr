@@ -127,7 +127,12 @@ class LLMWorker:
         except Exception as exc:                             # noqa: BLE001
             log.debug("Прежний разбор %s не прочитан: %s", job_id, exc)
             прежнее = None
-        if прежнее and (прежнее.get("summary") or прежнее.get("outcome")):
+        # Полезным считается любой разобранный ответ, а не только резюме с
+        # исходом: сервер, настроенный на одни трекеры и скоркарту
+        # (`llm_tasks`), терял их при первом же сбое модели.
+        if прежнее and any(прежнее.get(п) for п in
+                           ("summary", "outcome", "reason", "actions",
+                            "trackers", "scorecard")):
             return
         self.db.llm_save(job_id, tasks.VERSION, model=self.client.model,
                          error=текст, calls=0, latency_ms=None)

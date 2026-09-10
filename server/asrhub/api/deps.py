@@ -87,17 +87,24 @@ class AppState:
     #: работают как раньше: они для программ, учётные записи — для людей.
     accounts: Accounts | None = None
     _rate: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
+    #: Замок к окнам частоты. Проверка ключа — обычная (не async)
+    #: зависимость, а такие FastAPI выполняет в пуле потоков: два запроса
+    #: с одним ключом входили сюда одновременно, оба видели просроченную
+    #: запись, и второй `popleft()` падал `IndexError` на пустой очереди —
+    #: пятисоткой на совершенно исправном запросе.
+    _rate_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def check_rate(self, key: str, limit: int) -> None:
         if limit <= 0:
             return
-        window = self._rate[key]
         now = time.time()
-        while window and now - window[0] > 60:
-            window.popleft()
-        if len(window) >= limit:
-            raise RateLimited(limit, retry_after_s=int(60 - (now - window[0])) + 1)
-        window.append(now)
+        with self._rate_lock:
+            window = self._rate[key]
+            while window and now - window[0] > 60:
+                window.popleft()
+            if len(window) >= limit:
+                raise RateLimited(limit, retry_after_s=int(60 - (now - window[0])) + 1)
+            window.append(now)
 
 
 def get_state(request: Request) -> AppState:

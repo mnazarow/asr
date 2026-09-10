@@ -821,8 +821,33 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "count": "INTEGER DEFAULT 1",
         "first_s": "REAL",
     },
+    "content_terms": {
+        "job_id": "TEXT",
+        "stem": "TEXT",
+        "n": "INTEGER NOT NULL DEFAULT 1",
+    },
+    "content_vocab": {
+        "stem": "TEXT",
+        "word": "TEXT",
+        "n": "INTEGER NOT NULL DEFAULT 1",
+    },
+    "gpu_samples": {
+        "ts": "REAL",
+        "gpu": "INTEGER",
+        "name": "TEXT",
+        "util_percent": "REAL",
+        "mem_used_mb": "REAL",
+        "mem_total_mb": "REAL",
+        "temperature_c": "REAL",
+        "power_w": "REAL",
+        "power_limit_w": "REAL",
+    },
     "events": {
-        "id": "INTEGER  AUTOINCREMENT",
+        # Ключевые колонки объявлены как в CREATE TABLE. Прежнее
+        # «INTEGER  AUTOINCREMENT» — не синтаксис ALTER TABLE, и если бы
+        # догонялка когда-нибудь до него дошла, миграция упала бы целиком.
+        # Не доходила только потому, что колонка есть с первой версии.
+        "id": "INTEGER",
         "job_id": "TEXT",
         "ts": "REAL",
         "kind": "TEXT",
@@ -830,7 +855,7 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "data": "TEXT",
     },
     "metrics": {
-        "id": "INTEGER  AUTOINCREMENT",
+        "id": "INTEGER",
         "ts": "REAL",
         "name": "TEXT",
         "value": "REAL",
@@ -1116,7 +1141,14 @@ class Database:
         ожидаются = {}
         for statement in _SCHEMA:
             подготовка = statement.strip()
-            if not подготовка.upper().startswith("CREATE INDEX"):
+            # «CREATE UNIQUE INDEX» тоже указатель — и как раз тот, что
+            # хоть что-то гарантирует. Из двадцати шести указателей схемы
+            # защитная сетка ловила двадцать пять и пропускала ровно
+            # уникальный указатель по имени пользователя, без которого две
+            # учётные записи «Admin» и «admin» заводятся разом.
+            верх = подготовка.upper()
+            if not (верх.startswith("CREATE INDEX")
+                    or верх.startswith("CREATE UNIQUE INDEX")):
                 continue
             имя = подготовка.split(" ON ")[0].split()[-1]
             ожидаются[имя] = подготовка
@@ -1384,17 +1416,24 @@ class Database:
             # расшифровки подряд, и редкое слово (то есть ровно тот запрос,
             # ради которого поиском и пользуются) читало таблицу насквозь.
             найденные = self.jobs_matching(search) if self.fts_ready else None
-            needle = f"%{search}%"
+            # Проценты и подчёркивания экранируем: «скидка 50%» и «part_1»
+            # — это то, что люди ищут, а не образцы LIKE. Без экранирования
+            # запрос «%» находил вообще всё, и то же самое находило
+            # удаление по требованию субъекта (там минимум четыре знака —
+            # «%%%%» проходило).
+            needle = f"%{_экранировать_like(search)}%"
             if найденные is None:
-                where.append("(filename LIKE ? OR text LIKE ? OR id LIKE ?)")
+                where.append("(filename LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\' "
+                             "OR id LIKE ? ESCAPE '\\')")
                 args.extend([needle, needle, needle])
             elif найденные:
                 места = ",".join("?" for _ in найденные)
                 where.append(
-                    f"(id IN ({места}) OR filename LIKE ? OR id LIKE ?)")
+                    f"(id IN ({места}) OR filename LIKE ? ESCAPE '\\' "
+                    f"OR id LIKE ? ESCAPE '\\')")
                 args.extend([*найденные, needle, needle])
             else:
-                where.append("(filename LIKE ? OR id LIKE ?)")
+                where.append("(filename LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')")
                 args.extend([needle, needle])
         return соединение, where, args
 
@@ -1481,10 +1520,18 @@ class Database:
         if not запрос or not self.fts_ready:
             return []
         try:
+            # Порядок обязателен: без него FTS отдаёт совпадения по
+            # возрастанию номера строки, то есть от самых старых реплик, а
+            # предел отрезает всё остальное. Человек, который ищет вчерашний
+            # разговор в архиве на тысячу совпадений, не находил его вовсе:
+            # список сортирован «сначала новые», но в него попадали только
+            # самые древние четыреста.
             rows = self.query(
-                "SELECT DISTINCT s.job_id FROM segments_fts f "
+                "SELECT s.job_id, MAX(j.created_at) AS свежесть FROM segments_fts f "
                 "JOIN segments s ON s.rowid = f.rowid "
-                "WHERE f.text MATCH ? LIMIT ?",
+                "JOIN jobs j ON j.id = s.job_id "
+                "WHERE f.text MATCH ? GROUP BY s.job_id "
+                "ORDER BY свежесть DESC LIMIT ?",
                 (запрос, limit or self.SEARCH_LIMIT))
         except StorageError as exc:
             log.warning("Поиск по указателю не удался (%s) — идём перебором", exc)
@@ -1667,13 +1714,19 @@ class Database:
         «разобрано всё» на архиве, разобранном наполовину. Предупреждение
         «показатели посчитаны по разобранной части» при этом гасло.
         """
+        # Контрольные прогоны мимо: `content_pending` их не выдаёт (это та
+        # же запись второй раз), и в «всего» им тоже не место — иначе
+        # «ожидают разбора» растёт на пять записей в сутки и не приходит к
+        # нулю никогда, а метрика покрытия показывает вечный недоразбор.
         всего = int(self.query_one(
             "SELECT COUNT(*) n FROM jobs WHERE status='completed' "
-            "AND text IS NOT NULL AND text != ''")["n"])
+            "AND text IS NOT NULL AND text != '' "
+            "AND COALESCE(source,'') <> 'control'")["n"])
         разобрано = int(self.query_one(
             "SELECT COUNT(*) n FROM content c JOIN jobs j ON j.id = c.job_id "
             "WHERE c.version >= ? AND j.status='completed' "
-            "AND j.text IS NOT NULL AND j.text != ''", (version,))["n"])
+            "AND j.text IS NOT NULL AND j.text != '' "
+            "AND COALESCE(j.source,'') <> 'control'", (version,))["n"])
         return {"total": всего, "analyzed": разобрано,
                 "pending": max(0, всего - разобрано)}
 
@@ -1849,6 +1902,24 @@ class Database:
         "speaker": "COALESCE(NULLIF(c.agent_speaker,''),'—') = ?",
         "owner": "COALESCE(NULLIF(j.owner,''),'—') = ?",
     }
+
+    @staticmethod
+    def _owner_clause(owner: str | list[str] | None,
+                      alias: str = "j") -> tuple[str, list[Any]]:
+        """Условие «свои записи» и его параметры — одним местом на всех.
+
+        Разрез по владельцу пишется в базе полудюжиной методов, и каждый
+        раз одинаково. Разъезжаться ему нельзя: пропущенное условие — это
+        чужие разговоры в чужом отчёте, а такое находится не проверкой, а
+        жалобой.
+        """
+        if not owner:
+            return "", []
+        владельцы = [owner] if isinstance(owner, str) else list(owner)
+        if not владельцы:
+            return "", []
+        места = ",".join("?" for _ in владельцы)
+        return f"{alias}.owner IN ({места})", list(владельцы)
 
     def _content_where(self, since: float | None, until: float | None,
                        owner: str | list[str] | None,
@@ -2143,6 +2214,10 @@ class Database:
         row = self.query_one("SELECT response FROM llm_cache WHERE key=?", (key,))
         return str(row["response"]) if row else None
 
+    def llm_cache_forget(self, key: str) -> None:
+        """Убирает запись кеша: ответ оказался неразбираемым."""
+        self.execute("DELETE FROM llm_cache WHERE key=?", (key,))
+
     def llm_cache_put(self, key: str, kind: str, model: str, response: str,
                       latency_ms: float) -> None:
         self.execute(
@@ -2230,9 +2305,15 @@ class Database:
             общие + f"WHERE {условие} AND c.agent_score IS NOT NULL "
             "AND COALESCE(c.violations,0) = 0 AND c.sentiment IS NOT NULL "
             "ORDER BY c.agent_score DESC, c.sentiment DESC LIMIT ?", [*args, limit])
+        # Разрез по владельцу нужен обоим запросам, а не только первому:
+        # отметка «эталон» ставится вручную, и без этого условия ключ
+        # подразделения видел чужие разговоры целиком — с именем файла,
+        # владельцем и всем разбором.
+        отбор_владельца, args_владельца = self._owner_clause(owner, "j")
         отмеченные = self.query(
             общие + "WHERE j.status='completed' AND m.status = 'yes' "
-            "ORDER BY m.updated_at DESC LIMIT ?", [limit])
+            + (f"AND {отбор_владельца} " if отбор_владельца else "")
+            + "ORDER BY m.updated_at DESC LIMIT ?", [*args_владельца, limit])
         out: list[dict[str, Any]] = []
         видели: set[str] = set()
         for r in [*отмеченные, *лучшие]:
@@ -2243,27 +2324,39 @@ class Database:
         return out
 
     def tracker_hits(self, *, since: float | None = None,
-                     until: float | None = None) -> list[dict[str, Any]]:
+                     until: float | None = None,
+                     owner: str | list[str] | None = None) -> list[dict[str, Any]]:
         """Срабатывания трекеров за окно — по журналу событий.
 
         Категория лежит в данных события; группируем по ней прямо в базе.
         На сборке SQLite без JSON (редкость, но бывает) — пустой список,
         а не ошибка: сводка от этого не должна пропадать.
+
+        Разрез по владельцу такой же, как у соседей по разделу: без него
+        ключ подразделения видел строку «трекер сработал 340 раз» по всему
+        серверу — и чужие числа, и сам факт чужих срабатываний.
         """
-        where = ["kind='tracker'"]
+        where = ["e.kind='tracker'"]
         args: list[Any] = []
         if since:
-            where.append("ts>=?")
+            where.append("e.ts>=?")
             args.append(since)
         if until:
-            where.append("ts<?")
+            where.append("e.ts<?")
             args.append(until)
+        соединение = "FROM events e "
+        if owner:
+            соединение += "JOIN jobs j ON j.id = e.job_id "
+            отбор, свои = self._owner_clause(owner, "j")
+            if отбор:
+                where.append(отбор)
+                args.extend(свои)
         try:
             rows = self.query(
-                "SELECT json_extract(data, '$.category') AS category, "
-                "       json_extract(data, '$.label') AS label, COUNT(*) AS hits, "
-                "       COUNT(DISTINCT job_id) AS records "
-                f"FROM events WHERE {' AND '.join(where)} "
+                "SELECT json_extract(e.data, '$.category') AS category, "
+                "       json_extract(e.data, '$.label') AS label, COUNT(*) AS hits, "
+                "       COUNT(DISTINCT e.job_id) AS records "
+                f"{соединение}WHERE {' AND '.join(where)} "
                 "GROUP BY category ORDER BY hits DESC", args)
         except StorageError:
             return []
@@ -2878,7 +2971,7 @@ class Database:
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
                 events_days: int = 90) -> dict[str, int]:
         removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0,
-                   "gpu_samples": 0, "bytes": 0}
+                   "gpu_samples": 0, "llm_cache": 0, "bytes": 0}
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
@@ -2922,13 +3015,33 @@ class Database:
         if events_days > 0:
             removed["events"] = self.execute(
                 "DELETE FROM events WHERE ts<?", (ts - events_days * 86400,))
+        # Кеш ответов языковой модели живёт по сроку хранения результатов, а
+        # не вечно. Дело не только в размере (несколько килобайт на вызов,
+        # до четырёх вызовов на запись — это гигабайты в год): ключ кеша —
+        # отпечаток подсказки, а в подсказке лежит расшифровка разговора.
+        # Без этой уборки пересказ переживал удаление самой записи по сроку
+        # хранения, то есть данные, которые считались удалёнными, оставались
+        # в базе.
+        if results_days > 0:
+            removed["llm_cache"] = self.execute(
+                "DELETE FROM llm_cache WHERE created_at<?",
+                (ts - results_days * 86400,))
         return removed
 
     def vacuum(self) -> None:
-        try:
-            self.conn.execute("VACUUM")
-        except sqlite3.Error as exc:
-            log.warning("VACUUM не выполнен: %s", exc)
+        """Сжатие файла базы — под общим замком записи.
+
+        VACUUM перестраивает базу целиком и держит исключительную
+        блокировку SQLite минутами на большом архиве. Без общего замка
+        пишущий поток входил в `BEGIN IMMEDIATE`, упирался в неё, ждал
+        `busy_timeout` и получал «database is locked» — а это воркер,
+        записывающий готовую расшифровку: текст был, и текст пропадал.
+        """
+        with self._write_lock:
+            try:
+                self.conn.execute("VACUUM")
+            except sqlite3.Error as exc:
+                log.warning("VACUUM не выполнен: %s", exc)
 
     def stats(self) -> dict[str, Any]:
         size = self.path.stat().st_size if self.path.exists() else 0
@@ -2998,6 +3111,12 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
         except OSError as exc:
             log.warning("Не удалось удалить исходник %s: %s", path, exc)
     return freed
+
+
+def _экранировать_like(значение: str) -> str:
+    """Обезвреживает образцы LIKE: обратная косая, процент, подчёркивание."""
+    return (str(значение or "").replace("\\", "\\\\")
+            .replace("%", "\\%").replace("_", "\\_"))
 
 
 def _row_to_llm(row: sqlite3.Row) -> dict[str, Any]:

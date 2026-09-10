@@ -387,7 +387,7 @@ POST /api/queue/concurrency        {"workers": 3}
 
 ```
 GET /api/catalog                     всё сразу: модели, движки, параметры, пресеты
-GET /api/models?language=ru&engine=gigaam&license=MIT
+GET /api/models?language=ru&engine=gigaam&license=MIT   (нужен ключ; путь к весам в /api/models/{id}/status отдаётся только администратору)
 GET /api/models?installed=true       только те, чьи веса уже на диске
 GET /api/models/recommended?limit=8
 GET /api/models/{id}
@@ -421,7 +421,7 @@ GET  /api/system                   железо, движки, диск, вре�
 GET  /api/analytics?period=week
 GET  /api/analytics/{раздел}?period=month
 GET  /api/logs?level=error&search=cuda&limit=200
-GET  /api/events?limit=100
+GET  /api/events?limit=100            предел 1…1000
 GET  /api/metrics                  формат Prometheus
 GET  /api/keys
 POST /api/keys                     {"name": "…", "role": "user"}

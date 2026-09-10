@@ -513,7 +513,16 @@ def export(request: Request,
     from ..content_export import to_csv_zip, to_xlsx
     from .routes_jobs import content_disposition
 
+    state = get_state(request)
     отчёт = _insights(request).report(period, owner=scope_owner(principal))
+    # Выгрузка идёт мимо прослойки маскирования: та смотрит только на
+    # ответы JSON, а здесь книга Excel. Значит, маскируем сами — иначе
+    # ключ, заведённый «без персональных данных», получал их именем файла
+    # записи, а в колл-центре имя файла — это номер клиента.
+    if bool(state.settings.get("export_mask_pii")) or principal.mask_pii:
+        from ..content import masking  # noqa: PLC0415
+
+        отчёт = masking.mask_payload(отчёт)
     метка = time.strftime("%Y-%m-%d")
     if fmt == "csv":
         тело = to_csv_zip(отчёт, period)

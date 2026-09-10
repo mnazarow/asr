@@ -1222,7 +1222,14 @@ def test_content_metrics_reach_prometheus_and_can_carry_an_alert(tmp_path):
 
     # Без свода выгрузка метрик не ломается и не пустеет.
     без = Analytics(db).prometheus(None)
-    assert "asrhub_jobs_total" in без and "asrhub_content_" not in без
+    assert "asrhub_jobs_current" in без and "asrhub_content_" not in без
+    # Запасной путь не занимает имена накопительных счётчиков подсистемы
+    # мониторинга: там `asrhub_jobs_total` растёт с запуска, а здесь это
+    # «сколько заданий сейчас в статусе» — под одним именем Prometheus
+    # видел то счётчик, то убывающую величину, и rate() считал каждое
+    # снижение сбросом.
+    for имя in ("asrhub_jobs_total", "asrhub_audio_seconds_total", "asrhub_words_total"):
+        assert имя not in без, имя
 
 
 def test_the_job_list_can_be_filtered_by_what_was_said(tmp_path, monkeypatch,

@@ -569,3 +569,21 @@ def restore(path: Path, target: Path) -> None:
             спутник.rename(Path(str(спутник) + f".before-restore-{метка}"))
     shutil.copy2(path, target)
     log.info("База восстановлена из %s", path)
+
+
+#: Срок хранения результатов из настроек.
+#:
+#: Ноль — «хранить бессрочно», и это документированное значение параметра
+#: (`result_retention_days`, минимум 0). Прежнее `int(settings.get(...) or 30)`
+#: превращало ноль в месяц, потому что ноль ложен: администратор просил
+#: ничего не удалять, а часовая уборка сносила всё старше тридцати дней —
+#: вместе с исходными файлами. Пустое значение и None — это «не задано»,
+#: там месяц по умолчанию уместен.
+def retention_days(settings: Any, default: int = 30) -> int:
+    значение = settings.get("result_retention_days")
+    if значение is None or значение == "":
+        return default
+    try:
+        return max(0, int(значение))
+    except (TypeError, ValueError):
+        return default

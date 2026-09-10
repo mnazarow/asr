@@ -19,6 +19,7 @@ from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
 from ..logging_setup import get_logger
 from ..logging_setup import recent as log_recent
+from ..maintenance import retention_days
 from ..monitoring.collector import RUNTIME
 from .deps import (
     Principal,
@@ -344,6 +345,14 @@ def analytics_export(request: Request, period: str = Query(default="month"),
 
     state = get_state(request)
     отчёт = state.analytics.full_report(period, owner=scope_owner(principal))
+    # Выгрузка идёт мимо прослойки маскирования: та смотрит только на
+    # ответы JSON, а здесь книга Excel. Значит, маскируем сами — иначе
+    # ключ, заведённый «без персональных данных», получал их именем файла
+    # записи, а в колл-центре имя файла — это номер клиента.
+    if bool(state.settings.get("export_mask_pii")) or principal.mask_pii:
+        from ..content import masking  # noqa: PLC0415
+
+        отчёт = masking.mask_payload(отчёт)
     метка = time.strftime("%Y-%m-%d")
     if fmt == "csv":
         тело = to_csv_zip(отчёт, period)
@@ -428,7 +437,12 @@ def logs(request: Request, limit: int = 200, level: str = "", search: str = "",
 
 
 @router.get("/events", summary="Лента событий")
-def events(request: Request, limit: int = 100,
+def events(request: Request,
+           # Предел обязателен и снизу, и сверху: голым `int` сюда проходил
+           # ноль и отрицательное, а «LIMIT -1» в SQLite снимает предел
+           # вовсе — любой ключ поднимал в память всю таблицу событий за
+           # девяносто дней, да ещё с разбором JSON в каждой строке.
+           limit: int = Query(default=100, ge=1, le=1000),
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Лента событий сервера.
 
@@ -709,8 +723,7 @@ a{{color:#4c8dff}}
 def cleanup(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    removed = state.db.cleanup(
-        results_days=int(state.settings.get("result_retention_days") or 30))
+    removed = state.db.cleanup(results_days=retention_days(state.settings))
     state.db.vacuum()
     return {"removed": removed}
 

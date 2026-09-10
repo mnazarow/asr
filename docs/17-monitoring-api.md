@@ -123,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 106.1
+asrhub_uptime_seconds 114
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1789058565.480848,
-  "collected_at": "2026-09-10T16:42:45+0000",
+  "timestamp": 1789067008.2638958,
+  "collected_at": "2026-09-10T19:03:28+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -291,7 +291,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 20.1 ГБ",
+      "detail": "свободно 19.6 ГБ",
       "hint": ""
     },
     {
@@ -458,7 +458,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
   "summary": {
     "rules": 65,
     "firing": 0,
-    "pending": 9,
+    "pending": 10,
     "critical": 0,
     "warning": 0,
     "worst": "ok"
@@ -685,6 +685,11 @@ curl http://сервер:8080/api/monitoring/config/prometheus \
 
 Сколько было опросов, сколько метрик, какие источники не отвечают.
 
+Адреса приёмников прячутся от неадминистратора ровно как в соседнем
+`/targets`: этот ответ несёт тот же список, и без такой же обрезки
+ключ «только чтение» получал строку подключения к InfluxDB вместе с
+учётными данными и входящий адрес чата вместе с токеном.
+
 **Доступ:** любой действующий ключ.
 
 
@@ -698,14 +703,14 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 3,
+  "scrapes": 2,
   "samples": 648,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {
     "rules": 65,
     "firing": 0,
-    "pending": 9,
+    "pending": 10,
     "critical": 0,
     "warning": 0,
     "worst": "ok"

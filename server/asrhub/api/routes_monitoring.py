@@ -480,5 +480,15 @@ def zabbix(request: Request) -> Response:
 
 @router.get("/info", summary="Состояние самой подсистемы мониторинга")
 def info(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    """Сколько было опросов, сколько метрик, какие источники не отвечают."""
-    return _monitoring(request).info()
+    """Сколько было опросов, сколько метрик, какие источники не отвечают.
+
+    Адреса приёмников прячутся от неадминистратора ровно как в соседнем
+    `/targets`: этот ответ несёт тот же список, и без такой же обрезки
+    ключ «только чтение» получал строку подключения к InfluxDB вместе с
+    учётными данными и входящий адрес чата вместе с токеном.
+    """
+    свод = _monitoring(request).info()
+    if not principal.is_admin and isinstance(свод.get("targets"), list):
+        свод = {**свод, "targets": [{**t, "url": _hide_url(str(t.get("url") or ""))}
+                                    for t in свод["targets"]]}
+    return свод

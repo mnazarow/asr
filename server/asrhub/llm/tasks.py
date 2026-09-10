@@ -207,7 +207,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
         for n, кусок in enumerate(куски, 1):
             ответ = client.chat(МЕТКА.format(kind="chunk") + _СИСТЕМА,
                                 _ПЕРЕСКАЗ.format(n=n, total=len(куски), chunk=кусок),
-                                kind="chunk")
+                                kind="chunk", validate=parse_json)
             итог["calls"] += 1
             пересказы.append(f"Часть {n}: {_строка(parse_json(ответ).get('summary'), 2000)}")
         разговор = "\n".join(пересказы)
@@ -242,7 +242,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
             _ОСНОВНОЙ.format(transcript=разговор,
                              lists=("\n".join(списки) + "\n") if списки else "",
                              fields="\n".join(поля)),
-            kind="main")
+            kind="main", validate=parse_json)
         итог["calls"] += 1
         данные = parse_json(ответ)
         if "summary" in задачи:
@@ -276,7 +276,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
             for т in трекеры if т.get("id"))
         ответ = client.chat(МЕТКА.format(kind="trackers") + _СИСТЕМА,
                             _ТРЕКЕРЫ.format(transcript=разговор, trackers=описания),
-                            kind="trackers")
+                            kind="trackers", validate=parse_json)
         итог["calls"] += 1
         данные = parse_json(ответ)
         ответы = {str(o.get("id")): o for o in (данные.get("trackers") or [])
@@ -292,7 +292,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
                            if в.get("id") and в.get("question"))
         ответ = client.chat(МЕТКА.format(kind="scorecard") + _СИСТЕМА,
                             _СКОРКАРТА.format(transcript=разговор, questions=список),
-                            kind="scorecard")
+                            kind="scorecard", validate=parse_json)
         итог["calls"] += 1
         данные = parse_json(ответ)
         ответы = {str(o.get("id")): o for o in (данные.get("answers") or [])
@@ -302,10 +302,18 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
             if not (в.get("id") and в.get("question")):
                 continue
             о = ответы.get(str(в.get("id"))) or {}
-            ответ_модели = _строка(о.get("answer"), 10).lower()
+            ответ_модели = _строка(о.get("answer"), 16).lower().replace("/", "")
+            # «Неприменимо» проверяется ПЕРЕД «нет»: подсказка сама
+            # предлагает модели это слово, а начинается оно с «не» — и
+            # ответ «ситуации в разговоре не было» шёл в «нет», штрафуя
+            # оператора за то, чего он не мог сделать.
+            неприменимо = (ответ_модели.startswith(("нп", "н п", "неприменим",
+                                                    "не применим"))
+                           or "не было" in ответ_модели)
             итог["scorecard"].append({
                 "id": str(в.get("id")), "question": str(в.get("question")),
-                "answer": ("да" if ответ_модели.startswith("да") else
+                "answer": ("н/п" if неприменимо else
+                           "да" if ответ_модели.startswith("да") else
                            "нет" if ответ_модели.startswith("не") else "н/п"),
                 "quote": _строка(о.get("quote"))})
 

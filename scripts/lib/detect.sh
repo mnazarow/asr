@@ -230,17 +230,24 @@ detect_gpu() {
 
 detect_cuda_version() {
   have nvidia-smi || { printf ''; return 0; }
-  nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1
+  # Код возврата гасим намеренно. nvidia-smi отвечает ошибкой в живой
+  # ситуации: драйвер поставлен, но NVML ещё не отвечает (нужна
+  # перезагрузка — ровно после того, как этот же установщик драйвер и
+  # поставил). Под `pipefail` этот код становился кодом функции, а под
+  # `errexit` обрывал установку на шаге «окружение» — без единого слова
+  # про видеокарту.
+  nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1 || true
 }
 
 detect_gpu_memory_mb() {
   have nvidia-smi || { printf '0'; return 0; }
-  nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+  nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+    | head -1 | tr -d ' ' || true
 }
 
 detect_gpu_name() {
   have nvidia-smi || { printf ''; return 0; }
-  nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1
+  nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true
 }
 
 detect_cpu_cores() {

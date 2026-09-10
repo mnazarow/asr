@@ -45,7 +45,21 @@
     return node;
   }
 
-  function fmtNum(value, digits) {
+  /* Экранирование подписи для разметки.
+ *
+ * Единственное место в этом файле, где подпись попадает в innerHTML, а не
+ * текстовым узлом (соседняя легенда делает createTextNode нарочно).
+ * Подписи приходят с сервера, а часть из них — это значения настроек,
+ * которые пишет администратор: «исходы разговора» задаются строками, и
+ * строка с разметкой исполнялась бы у каждого, кто открыл раздел.
+ */
+function escText(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function fmtNum(value, digits) {
     if (value === null || value === undefined || Number.isNaN(value)) return '—';
     const abs = Math.abs(value);
     if (abs >= 1e9) return (value / 1e9).toFixed(1) + ' млрд';
@@ -486,7 +500,7 @@
       row.style.gap = '7px';
       row.innerHTML = `<i style="width:10px;height:10px;border-radius:2px;background:${
         part.color || colors[index % colors.length]};display:inline-block"></i>` +
-        `<span class="dim">${part.label}</span><span class="spacer"></span>` +
+        `<span class="dim">${escText(part.label)}</span><span class="spacer"></span>` +
         `<b class="mono">${fmtNum(part.value)}</b>` +
         `<span class="faint mono">${((part.value / total) * 100).toFixed(0)} %</span>`;
       list.appendChild(row);

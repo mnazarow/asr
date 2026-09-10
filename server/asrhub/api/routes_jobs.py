@@ -1,6 +1,8 @@
 """Маршруты работы с заданиями: загрузка, очередь, результаты, управление."""
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import mimetypes
 import shutil
@@ -242,17 +244,23 @@ async def create_job(
     # копию загруженной записи.
     try:
         # Объём и длительность известны только теперь, когда файл на диске.
+        #
+        # ffprobe — внешний процесс с тайм-аутом в минуту, и обработчик
+        # здесь `async`: прямой вызов останавливал бы весь сервер на время
+        # разбора. В поток уходит и постановка в очередь — она делает тот
+        # же разбор второй раз и пишет в базу.
         check_quota(request, principal, incoming_bytes=size,
-                    incoming_audio_s=_probe_duration(target))
+                    incoming_audio_s=await asyncio.to_thread(_probe_duration, target))
         # Значения из settings перекрывают одноимённые поля формы: явный JSON
         # выражает намерение точнее, чем разрозненные поля.
         overrides = {**await _form_overrides(request), **_parse_settings(settings)}
         merged = state.settings.merged(overrides)
-        job = state.queue.submit(
+        job = await asyncio.to_thread(functools.partial(
+            state.queue.submit,
             file_path=target, filename=filename, settings=merged,
             owner=principal.name, api_key_name=principal.name,
             priority=priority, group_id=group_id, source="web",
-            tags=tags, reference_text=reference_text, webhook_url=webhook_url)
+            tags=tags, reference_text=reference_text, webhook_url=webhook_url))
     except Exception:
         # Ловим всё: ASRHubError, HTTPException от разбора полей и любую
         # неожиданную ошибку — файл не должен пережить неудачный запрос.
@@ -309,11 +317,12 @@ async def create_batch(
             # Квота проверяется на каждый файл пакета: иначе один запрос из
             # двухсот файлов обходил бы её целиком.
             check_quota(request, principal, incoming_bytes=size,
-                        incoming_audio_s=_probe_duration(target))
-            job = state.queue.submit(
+                        incoming_audio_s=await asyncio.to_thread(_probe_duration, target))
+            job = await asyncio.to_thread(functools.partial(
+                state.queue.submit,
                 file_path=target, filename=filename, settings=merged,
                 owner=principal.name, api_key_name=principal.name,
-                priority=priority, group_id=group, source="web-batch")
+                priority=priority, group_id=group, source="web-batch"))
             created.append(job)
         except ASRHubError as exc:
             target.unlink(missing_ok=True)
@@ -826,9 +835,13 @@ def bulk(request: Request,
         except ASRHubError as exc:
             отказы.append({"id": job_id, "error": exc.message})
         except Exception as exc:               # noqa: BLE001
+            # Наружу — только род ошибки, как в общем обработчике сервера:
+            # текст неожиданного исключения несёт то абсолютный путь к
+            # файлу на сервере, то кусок SQL. Подробности — в журнал.
             log.warning("Пакетное действие %s не удалось на %s: %s",
                         action, job_id, exc, extra={"job_id": job_id})
-            отказы.append({"id": job_id, "error": str(exc)})
+            отказы.append({"id": job_id,
+                           "error": f"Внутренняя ошибка сервера: {type(exc).__name__}"})
 
     log.info("Пакетное действие «%s»: получилось %d, отказов %d",
              action, len(сделано), len(отказы))

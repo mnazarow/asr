@@ -63,26 +63,42 @@ def sample_review(db: Any, settings: Any, *, now: float | None = None,
     # Записи с эталоном проверять незачем — эталон уже есть.
     кандидаты = [j for j in _кандидаты(db, since=сейчас - ОКНО_С)
                  if j["id"] not in в_очереди and not j.get("ref_words")]
+    # Дневной предел делится между двумя причинами, а не достаётся той,
+    # что набралась первой. Случайные отбирались раньше и на потоке в две
+    # тысячи записей занимали предел целиком: нижняя четверть по
+    # уверенности — вторая половина замысла — не попадала в очередь
+    # никогда, а настройка `review_daily_low` ни на что не влияла.
+    место_неуверенным = min(неуверенных, предел) if неуверенных > 0 else 0
+    место_случайным = max(0, предел - место_неуверенным)
+
     выбрано: dict[str, str] = {}
-    if кандидаты and доля > 0:
-        сколько = min(len(кандидаты), max(1, math.ceil(len(кандидаты) * доля / 100.0)))
-        for j in rng.sample(кандидаты, сколько):
-            выбрано[j["id"]] = "random"
-    if неуверенных > 0:
-        с_уверенностью = sorted((j for j in кандидаты if j.get("avg_confidence") is not None
-                                 and j["id"] not in выбрано),
-                                key=lambda j: float(j["avg_confidence"]))
-        # Нижняя четверть: порог — квартиль по всем кандидатам с уверенностью.
-        всего = [float(j["avg_confidence"]) for j in кандидаты
-                 if j.get("avg_confidence") is not None]
+    неуверенные: dict[str, str] = {}
+    if неуверенных > 0 and место_неуверенным:
+        всего = sorted(float(j["avg_confidence"]) for j in кандидаты
+                       if j.get("avg_confidence") is not None)
         if всего:
-            всего.sort()
-            квартиль = всего[max(0, int(len(всего) * 0.25) - 1)] if len(всего) >= 4 else всего[-1]
-            for j in с_уверенностью:
-                if len([r for r in выбрано.values() if r == "low_confidence"]) >= неуверенных:
-                    break
-                if float(j["avg_confidence"]) <= квартиль:
-                    выбрано[j["id"]] = "low_confidence"
+            # Порог — нижняя четверть. На выборке меньше четырёх записей
+            # четверти нет: брать максимум значило объявить неуверенными
+            # все записи подряд, включая ту, где уверенность 0,98.
+            квартиль = (всего[max(0, int(len(всего) * 0.25) - 1)]
+                        if len(всего) >= 4 else None)
+            if квартиль is not None:
+                с_уверенностью = sorted(
+                    (j for j in кандидаты if j.get("avg_confidence") is not None),
+                    key=lambda j: float(j["avg_confidence"]))
+                for j in с_уверенностью:
+                    if len(неуверенные) >= место_неуверенным:
+                        break
+                    if float(j["avg_confidence"]) <= квартиль:
+                        неуверенные[j["id"]] = "low_confidence"
+    if кандидаты and доля > 0 and место_случайным:
+        свободные = [j for j in кандидаты if j["id"] not in неуверенные]
+        сколько = min(len(свободные), место_случайным,
+                      max(1, math.ceil(len(кандидаты) * доля / 100.0)))
+        for j in rng.sample(свободные, сколько) if сколько else []:
+            выбрано[j["id"]] = "random"
+    выбрано.update(неуверенные)
+
     добавлено = 0
     for job_id, причина in list(выбрано.items())[:предел]:
         if db.review_add(job_id, причина, picked_at=сейчас):

@@ -1874,6 +1874,12 @@ write_file() {
   mkdir -p "${dir}"
   [[ -e "${path}" ]] && backup_file "${path}" >/dev/null
   local tmp="${path}.tmp.$$"
+  # Права ставим ДО записи, а не после: `cat >` создаёт временный файл под
+  # текущей umask (обычно 0644), и до chmod содержимое лежало доступным на
+  # чтение всем. Для config.yaml это ключи доступа и токен Hugging Face —
+  # «даже мгновение» здесь и есть окно. Пустой файл создаём отдельно.
+  : > "${tmp}"
+  [[ -n "${mode}" ]] && chmod "${mode}" "${tmp}"
   cat > "${tmp}"
   [[ -n "${mode}" ]] && chmod "${mode}" "${tmp}"
   mv -f "${tmp}" "${path}"

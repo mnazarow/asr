@@ -684,7 +684,11 @@ def test_control_runs_are_low_priority_jobs_whose_disagreement_is_recorded(
     assert отчёт["worst"][0]["job_id"] == job["id"] and len(отчёт["by_day"]) == 1
     assert client.get("/api/analytics/agreement?period=day").json()["checks"] == 1
     метрики = client.get("/api/monitoring/metrics").text
-    assert 'asrhub_model_disagreement{model="demo-simulator"}' in метрики
+    # Метки — обе модели пары: с одной меткой модель, которую сверяли с
+    # двумя контрольными, давала два одинаково помеченных ряда, а такой
+    # снимок Prometheus отвергает целиком.
+    assert 'asrhub_model_disagreement{control_model="' in метрики
+    assert 'model="demo-simulator"' in метрики
     # Неизвестная контрольная модель — пропуск с причиной, а не сбой.
     состояние.settings.values["control_model"] = "нет-такой"
     assert "неизвестна" in review.sample_control(состояние.db, состояние.settings,

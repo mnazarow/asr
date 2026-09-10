@@ -678,7 +678,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:17974",
+  "instance": "vm:9536",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1256,10 +1256,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789058565.1131916,
+    "generated_at": 1789067007.8439865,
     "jobs": {
-      "total": 221,
-      "completed": 221,
+      "total": 219,
+      "completed": 219,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1267,42 +1267,42 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 7917.2,
-      "audio_hours": 2.2,
-      "processing_seconds": 1538.1,
-      "words": 9176,
+      "audio_seconds": 7863.1,
+      "audio_hours": 2.18,
+      "processing_seconds": 1518.3,
+      "words": 9102,
       "characters": 0,
-      "segments": 1338,
-      "files_per_hour": 1.32,
+      "segments": 1326,
+      "files_per_hour": 1.3,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 221,
-        "avg": 0.204825,
+        "count": 219,
+        "avg": 0.20327,
         "min": 0.01,
         "max": 5.7511,
-        "p10": 0.0437,
+        "p10": 0.04354,
         "p50": 0.1097,
-        "p90": 0.3826,
-        "p95": 0.4906,
-        "p99": 1.23282,
-        "stdev": 0.434752
+        "p90": 0.38188,
+        "p95": 0.48952,
+        "p99": 1.247098,
+        "stdev": 0.436026
       },
       "processing_time_s": {
-        "count": 221,
-        "avg": 6.95991,
+        "count": 219,
+        "avg": 6.932785,
         "min": 0.28,
         "max": 175.41,
         "p10": 1.15,
-        "p50": 3.77,
-        "p90": 13.52,
-        "p95": 16.25,
-        "p99": 40.74,
-        "stdev": 13.500616
+        "p50": 3.72,
+        "p90": 13.392,
+        "p95": 16.434,
+        "p99": 40.84,
+        "stdev": 13.551168
       },
       "queue_time_s": {
-        "count": 221,
+        "count": 219,
 …
 ```
 
@@ -1359,43 +1359,43 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
 {
   "period": "week",
   "overall": {
-    "jobs": 221,
-    "audio_hours": 2.199,
-    "processing_p50": 3.77,
-    "processing_p95": 16.25,
-    "processing_p99": 40.74,
+    "jobs": 219,
+    "audio_hours": 2.184,
+    "processing_p50": 3.72,
+    "processing_p95": 16.43,
+    "processing_p99": 40.84,
     "rtf_p50": 0.1097,
-    "rtf_p95": 0.4906,
-    "rtf_p99": 1.2328,
-    "queue_p50": 4.68,
-    "queue_p95": 19.57
+    "rtf_p95": 0.4895,
+    "rtf_p99": 1.2471,
+    "queue_p50": 4.71,
+    "queue_p95": 19.75
   },
   "by_model": [
     {
       "key": "whisper-large-v3",
-      "jobs": 59,
-      "audio_hours": 0.642,
-      "processing_p50": 5.38,
-      "processing_p95": 18.42,
-      "processing_p99": 29.38,
-      "rtf_p50": 0.162,
-      "rtf_p95": 0.2885,
-      "rtf_p99": 0.7643,
-      "queue_p50": 5.89,
-      "queue_p95": 20.22
+      "jobs": 58,
+      "audio_hours": 0.634,
+      "processing_p50": 5.46,
+      "processing_p95": 18.49,
+      "processing_p99": 29.59,
+      "rtf_p50": 0.1613,
+      "rtf_p95": 0.2892,
+      "rtf_p99": 0.7748,
+      "queue_p50": 6.06,
+      "queue_p95": 20.54
     },
     {
       "key": "t-one",
-      "jobs": 56,
-      "audio_hours": 0.522,
-      "processing_p50": 2.62,
-      "processing_p95": 7.85,
-      "processing_p99": 14.79,
-      "rtf_p50": 0.0857,
-      "rtf_p95": 0.1712,
-      "rtf_p99": 0.6116,
-      "queue_p50": 5.24,
-      "queue_p95": 21.65
+      "jobs": 55,
+      "audio_hours": 0.515,
+      "processing_p50": 2.61,
+      "processing_p95": 7.38,
+      "processing_p99": 11.46,
+      "rtf_p50": 0.0856,
+      "rtf_p95": 0.1481,
+      "rtf_p99": 0.4147,
+      "queue_p50": 5.32,
+      "queue_p95": 21.67
     },
     {
       "key": "vosk-ru",
@@ -1458,7 +1458,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 106.0,
+  "uptime_s": 113.8,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1537,7 +1537,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 106.0,
+  "uptime_s": 113.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1546,8 +1546,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.8,
-    "disk_free_gb": 20.1,
+    "ram_available_gb": 7.0,
+    "disk_free_gb": 19.6,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1557,7 +1557,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "ffmpeg_version": "6.1.1-3ubuntu5",
     "python_version": "3.11.15",
     "warnings": [
-      "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8."
+      "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
+      "На диске свободно 19.6 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -1568,11 +1569,6 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "model_cache_size": 1,
     "max_concurrent_jobs": 1,
     "cpu_threads": 1,
-    "_reason": "Видеокарта не обнаружена. Выбран режим int8 на 2 физических ядрах — единственный практичный вариант на процессоре."
-  },
-  "log_counts": {
-    "INFO": 6
-  },
 …
 ```
 
@@ -2074,45 +2070,45 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "period": "week",
   "enabled": true,
   "model": "qwen3:14b",
-  "records": 221,
-  "analyzed": 221,
+  "records": 219,
+  "analyzed": 219,
   "errors": 0,
   "stale": 0,
   "coverage": 1.0,
-  "avg_latency_ms": 7425.3,
+  "avg_latency_ms": 7398.1,
   "off_list": 0,
   "outcomes": [
     {
       "key": "вопрос решён",
-      "records": 106,
-      "share": 48.0
+      "records": 105,
+      "share": 47.9
     },
     {
       "key": "перезвонят или передано",
-      "records": 64,
-      "share": 29.0
+      "records": 63,
+      "share": 28.8
     },
     {
       "key": "отказ клиента",
       "records": 43,
-      "share": 19.5
+      "share": 19.6
     },
     {
       "key": "неясно",
       "records": 8,
-      "share": 3.6
+      "share": 3.7
     }
   ],
   "reasons": [
     {
       "key": "статус заказа или доставки",
-      "records": 159,
-      "share": 71.9
+      "records": 157,
+      "share": 71.7
     },
     {
       "key": "другое",
       "records": 59,
-      "share": 26.7
+      "share": 26.9
     },
     {
       "key": "возврат или отмена",
@@ -2120,26 +2116,26 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
       "share": 1.4
     }
   ],
-  "resolved_share": 74.0,
-  "actions": 240,
-  "records_with_actions": 216,
+  "resolved_share": 73.8,
+  "actions": 238,
+  "records_with_actions": 214,
   "trackers": [
     {
       "id": "discount",
       "label": "Запрос скидки",
-      "checked": 221,
-      "fired": 110
+      "checked": 219,
+      "fired": 109
     },
     {
       "id": "competitor",
       "label": "Упоминание конкурента",
-      "checked": 221,
+      "checked": 219,
       "fired": 60
     },
     {
       "id": "escalation",
       "label": "Угроза жалобой",
-      "checked": 221,
+      "checked": 219,
       "fired": 46
     }
   ],
@@ -2147,15 +2143,15 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
     {
       "id": "greet",
       "question": "Сотрудник представился и назвал компанию?",
-      "да": 127,
-      "нет": 94,
+      "да": 126,
+      "нет": 93,
       "н/п": 0
     },
     {
       "id": "term",
       "question": "Сотрудник назвал конкретный срок или дату?",
       "да": 0,
-      "нет": 221,
+      "нет": 219,
       "н/п": 0
     }
   ],
@@ -2387,9 +2383,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "total_gb": 7.8,
-    "free_gb": 6.8,
+    "free_gb": 7.0,
     "reserve_gb": 4.0,
-    "budget_gb": 2.8,
+    "budget_gb": 2.9,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -3218,6 +3214,11 @@ curl http://сервер:8080/api/monitoring/health
 Состояние самой подсистемы мониторинга.
 
 Сколько было опросов, сколько метрик, какие источники не отвечают.
+
+Адреса приёмников прячутся от неадминистратора ровно как в соседнем
+`/targets`: этот ответ несёт тот же список, и без такой же обрезки
+ключ «только чтение» получал строку подключения к InfluxDB вместе с
+учётными данными и входящий адрес чата вместе с токеном.
 
 **Доступ:** любой действующий ключ.
 

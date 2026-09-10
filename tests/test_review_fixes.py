@@ -651,10 +651,20 @@ def test_powershell_rollback_captures_each_directory(repo_root: Path):
 
 
 def test_docker_uid_is_not_root_under_sudo(repo_root: Path):
-    """Под sudo id -u давал ноль, и контейнер работал от root, минуя gosu."""
+    """Контейнер не запускается от root — ни под sudo, ни от root напрямую.
+
+    Под sudo `id -u` даёт ноль, и это чинилось через SUDO_UID. Но
+    запасной путь `id -u` тоже даёт ноль, когда установщик работает от
+    root БЕЗ sudo — из root-шелла, из Ansible, из образа сборки, — и
+    контейнер снова шёл от root с примонтированным каталогом хоста.
+    """
     text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
-    assert "ASRHUB_UID=${SUDO_UID:-$(id -u)}" in text
-    assert "ASRHUB_GID=${SUDO_GID:-$(id -g)}" in text
+    assert 'docker_uid="${SUDO_UID:-$(id -u)}"' in text
+    assert 'docker_gid="${SUDO_GID:-$(id -g)}"' in text
+    # Ноль не должен доехать до .env ни одним путём.
+    assert '[[ "${docker_uid}" == "0" ]] && docker_uid=1000' in text
+    assert '[[ "${docker_gid}" == "0" ]] && docker_gid=1000' in text
+    assert 'echo "ASRHUB_UID=${docker_uid}"' in text
 
 
 def test_service_user_is_created(repo_root: Path):

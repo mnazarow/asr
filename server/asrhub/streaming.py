@@ -204,6 +204,9 @@ class StreamSession:
         self.workdir.mkdir(parents=True, exist_ok=True)
 
         self._pcm = bytearray()          # хвост, который распознаётся заново
+        #: Сколько звука прошло через движок в режиме потока: там хвост не
+        #: копится, а длительность сессии знать надо.
+        self._native_bytes = 0
         self._since_flush = 0            # байт с прошлой гипотезы
         self._committed_s = 0.0          # длительность закреплённого звука
         self._started = time.time()
@@ -260,11 +263,18 @@ class StreamSession:
         pcm = self.decoder.feed(chunk)
         if not pcm:
             return []
-        self._pcm.extend(pcm)
-        self._since_flush += len(pcm)
 
         if self._native is not None:
+            # Движок ведёт поток сам, и хвост ему не нужен: держать копию
+            # звука здесь значило бы 110 МБ на предельной сессии — ровно
+            # ту утечку, о которой предупреждает шапка модуля. Секунды
+            # считаем счётчиком, а не длиной буфера.
+            self._native_bytes += len(pcm)
+            self._since_flush += len(pcm)
             return self._feed_native(pcm)
+
+        self._pcm.extend(pcm)
+        self._since_flush += len(pcm)
 
         need = int(self.window_s * SAMPLE_RATE * 2)
         if self._since_flush < need:
@@ -275,7 +285,7 @@ class StreamSession:
         # Хвост перерос предел — закрепляем распознанное и выбрасываем звук.
         # Иначе каждое следующее окно считало бы всё сказанное с начала.
         if len(self._pcm) >= int(MAX_TAIL_S * SAMPLE_RATE * 2):
-            return self._commit(text)
+            return self._commit()
 
         if text and text != self._last_partial:
             self._last_partial = text
@@ -295,14 +305,22 @@ class StreamSession:
             return None
         return round(max(0.0, self._first_text_at - self._started), 3)
 
-    def _commit(self, text: str) -> list[StreamEvent]:
+    def _commit(self) -> list[StreamEvent]:
         """Закрепляет распознанный хвост и освобождает под ним звук.
 
         Режем не по счётчику байт, а по самому тихому месту в конце хвоста:
         разрыв посреди слова стоил бы обеих его половин. Закреплённый текст
         уходит клиенту как final — он уже не изменится.
+
+        Распознаём заново ровно ту часть, которую закрепляем. Раньше сюда
+        передавался текст всего хвоста, а звук выбрасывался только до
+        тихого места, — и остаток в одну-две секунды, чей текст уже ушёл
+        как final, распознавался следующим окном ещё раз. В итоговой
+        расшифровке это выглядело как повтор последних слов каждые
+        полминуты.
         """
         cut = _quiet_split(self._pcm)
+        text = self._recognize(bytes(self._pcm[:cut])) if cut else ""
         start, end = self._committed_s, self._committed_s + cut / (SAMPLE_RATE * 2)
         del self._pcm[:cut]
         self._committed_s = end
@@ -320,7 +338,10 @@ class StreamSession:
         self._closed = True
         tail = self.decoder.close()
         if tail:
-            self._pcm.extend(tail)
+            if self._native is not None:
+                self._native_bytes += len(tail)
+            else:
+                self._pcm.extend(tail)
 
         events: list[StreamEvent] = []
         if self._native is not None:
@@ -362,7 +383,8 @@ class StreamSession:
     @property
     def duration_s(self) -> float:
         """Весь звук сессии: закреплённый плюс хвост в работе."""
-        return self._committed_s + len(self._pcm) / (SAMPLE_RATE * 2)
+        байт = self._native_bytes if self._native is not None else len(self._pcm)
+        return self._committed_s + байт / (SAMPLE_RATE * 2)
 
     def _feed_native(self, pcm: bytes) -> list[StreamEvent]:
         try:

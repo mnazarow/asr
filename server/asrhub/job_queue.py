@@ -37,6 +37,7 @@ from .errors import (
     StorageError,
     classify_exception,
 )
+from .instance import HOSTNAME, process_alive
 from .instance import INSTANCE_ID as _INSTANCE_ID
 from .logging_setup import get_logger
 from .monitoring.collector import (
@@ -160,7 +161,18 @@ class JobQueue:
         self._stop = threading.Event()
         self._paused = False
         self._workers: list[threading.Thread] = []
-        self._states: list[WorkerState] = []
+        #: Состояния воркеров по их номеру. Именно словарь, а не список:
+        #: уходящий воркер обрезал список от своего номера до конца
+        #: (`del self._states[index:]`) и уносил с собой состояния живых
+        #: соседей. После этого длина списка врала о числе воркеров, смена
+        #: их числа снимала пометку на выход с тех, кто ещё её не увидел, и
+        #: поднимала для тех же номеров вторые потоки — два потока на один
+        #: `WorkerState`, затирающие друг другу задание и прогресс.
+        self._states: dict[int, WorkerState] = {}
+        #: Сколько воркеров заявлено. Не длина словаря: помеченный на выход
+        #: воркер уходит не сразу, и до его ухода заявленное и живое
+        #: расходятся.
+        self._worker_count = 0
         self._cancelled: set[str] = set()
         #: Владельцы заданий для адресной рассылки событий по WebSocket.
         self._owners: dict[str, str] = {}
@@ -188,7 +200,8 @@ class JobQueue:
             return
         count = int(workers or self.settings.get("max_concurrent_jobs") or 2)
         self.recover()
-        self._states = [WorkerState(index=i) for i in range(count)]
+        self._states = {i: WorkerState(index=i) for i in range(count)}
+        self._worker_count = count
         for index in range(count):
             thread = threading.Thread(target=self._worker_loop, args=(index,),
                                       name=f"asrhub-worker-{index}", daemon=True)
@@ -228,11 +241,23 @@ class JobQueue:
         while True:
             # Спрашиваем базу напрямую: облегчённый список не отдаёт
             # instance_id, и фильтр по нему молча пропускал бы всё подряд.
-            stuck = self.db.query(
-                "SELECT id FROM jobs WHERE status=? "
-                "  AND (instance_id IS NULL OR instance_id='' OR instance_id=?) "
+            #
+            # «Свои» — это не только текущий процесс. В отметке стоит номер
+            # процесса, и после перезапуска он другой, поэтому по точному
+            # совпадению не находилось ничего: задания висели «выполняется»
+            # пять минут, пока их не подберёт возврат брошенных, а тот
+            # тратит попытку и пишет «экземпляр перестал отвечать». Берём
+            # ещё и задания процессов этой же машины, которых больше нет.
+            кандидаты = self.db.query(
+                "SELECT id, instance_id FROM jobs WHERE status=? "
+                "  AND (instance_id IS NULL OR instance_id='' OR instance_id=? "
+                "       OR instance_id LIKE ?) "
                 "LIMIT 1000",
-                (STATUS_RUNNING, INSTANCE_ID))
+                (STATUS_RUNNING, INSTANCE_ID, f"{HOSTNAME}:%"))
+            stuck = [з for з in кандидаты
+                     if not str(з["instance_id"] or "")
+                     or str(з["instance_id"]) == INSTANCE_ID
+                     or not process_alive(str(з["instance_id"]))]
             if not stuck:
                 break
             for job in stuck:
@@ -242,7 +267,7 @@ class JobQueue:
                 self.db.add_event(job["id"], "recovered",
                                   "Задание возвращено в очередь после перезапуска сервера")
             total += len(stuck)
-            if len(stuck) < 1000:
+            if len(кандидаты) < 1000:
                 break
         if total:
             log.warning("Возвращено в очередь после перезапуска: %d заданий", total)
@@ -597,7 +622,10 @@ class JobQueue:
         """
         workers = max(1, min(64, int(workers)))
         with self._lock:
-            current = len(self._states)
+            # Считаем по заявленному числу, а не по длине словаря: ушедший
+            # воркер уже убрал своё состояние, и по длине выходило, что
+            # воркеров меньше, чем есть на самом деле.
+            current = self._worker_count
             # Снятие пометки — до ветвления, а не внутри «стало больше».
             # Помеченный воркер уходит не сразу: он замечает пометку, только
             # когда проснётся. Уменьшить и тут же вернуть обратно означало,
@@ -608,14 +636,14 @@ class JobQueue:
             self._retiring -= set(range(workers))
             if workers > current:
                 for index in range(current, workers):
-                    state = WorkerState(index=index)
-                    self._states.append(state)
+                    self._states[index] = WorkerState(index=index)
                     thread = threading.Thread(target=self._worker_loop, args=(index,),
                                               name=f"asrhub-worker-{index}", daemon=True)
                     thread.start()
                     self._workers.append(thread)
             elif workers < current:
                 self._retiring.update(range(workers, current))
+            self._worker_count = workers
             # Ушедшие потоки из перечня убираем: по его длине делится общий
             # таймаут остановки, и с каждым изменением числа воркеров доля
             # на поток становилась меньше — на давно живущем сервере
@@ -785,8 +813,8 @@ class JobQueue:
             with self._lock:
                 if index in self._retiring:
                     self._retiring.discard(index)
-                    if index < len(self._states):
-                        del self._states[index:]
+                    # Убираем только себя: соседи по номерам живы.
+                    self._states.pop(index, None)
                     log.info("Воркер %d завершён: число воркеров уменьшено", index)
                     return
             job = None
@@ -798,7 +826,14 @@ class JobQueue:
                 self._wake.wait(timeout=1.0)
                 self._wake.clear()
                 continue
-            state = self._states[index] if index < len(self._states) else WorkerState(index)
+            # Состояние берём под замком: соседний воркер может уйти и
+            # убрать своё в тот же момент. Раньше здесь была проверка длины
+            # списка и обращение по индексу без замка — между ними успевал
+            # вклиниться `del`, и поток умирал с IndexError уже ПОСЛЕ
+            # захвата задания: слот в `_running` не освобождался никогда, а
+            # очередь теряла воркера навсегда.
+            with self._lock:
+                state = self._states.get(index) or WorkerState(index)
             state.busy = True
             state.job_id = job["id"]
             state.model = job.get("model") or ""
@@ -808,6 +843,13 @@ class JobQueue:
                 self._execute(job, state)
             except Exception as exc:
                 log.exception("Непредвиденная ошибка воркера: %s", exc)
+                # Задание уже захвачено и стоит в базе как «выполняется».
+                # Сбой до конвейера (кончилось место под рабочий каталог,
+                # неверные настройки задания, отказ базы на событии
+                # «старт») сюда и приходит — и без этой строки задание
+                # висело бы «выполняется, 0 %» вечно: подхват зависших
+                # берёт только чужие экземпляры, а свои — лишь при старте.
+                self._fail_unexpected(job, exc)
             finally:
                 # Освобождение — одной функцией, а не второй копией здесь.
                 # Копия и разошлась: она снимала слот и счётчик модели, но не
@@ -938,7 +980,7 @@ class JobQueue:
             # Записывать результат некуда — убираем и файлы выгрузки.
             log.info("Задание %s завершилось, но его состояние уже изменено — "
                      "результат отброшен", job_id, extra={"job_id": job_id})
-            self._discard_results(outdir)
+            self._discard_unless_taken(outdir, job_id)
             with self._lock:
                 self._cancelled.discard(job_id)
             return
@@ -1053,6 +1095,30 @@ class JobQueue:
                      job_id, extra={"job_id": job_id})
         return записалось
 
+    def _fail_unexpected(self, job: dict[str, Any], exc: Exception) -> None:
+        """Отметить задание неудавшимся после сбоя вне конвейера.
+
+        Пишется тем же защищённым способом, что и обычная неудача: если
+        задание за это время перехватил другой экземпляр, наша запись не
+        проходит и его работа не портится.
+        """
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            return
+        try:
+            ошибка = classify_exception(exc, engine=str(job.get("engine") or ""),
+                                        model=str(job.get("model") or ""))
+            merged = self.settings.merged(dict(job.get("params") or {}))
+        except Exception:                                    # noqa: BLE001
+            # Код у базовой ошибки уже «internal_error» — этого хватает.
+            ошибка = ASRHubError(f"Внутренняя ошибка сервера: {type(exc).__name__}")
+            merged = dict(self.settings.values)
+        try:
+            self._handle_failure(job, ошибка, merged)
+        except Exception as повторный:                       # noqa: BLE001
+            log.error("Задание %s не удалось отметить неудавшимся: %s",
+                      job_id, повторный, extra={"job_id": job_id})
+
     def _handle_failure(self, job: dict[str, Any], error: ASRHubError,
                         merged: dict[str, Any], outdir: Path | None = None) -> None:
         job_id = job["id"]
@@ -1063,7 +1129,7 @@ class JobQueue:
             if not self._write_own(job_id, status=STATUS_CANCELLED, finished_at=now(),
                                    stage="отменено", instance_id=None,
                                    heartbeat_at=None):
-                self._discard_results(outdir)
+                self._discard_unless_taken(outdir, job_id)
                 return
             RUNTIME.inc("asrhub_jobs_total", {"status": "cancelled"})
             self._discard_results(outdir)
@@ -1091,7 +1157,7 @@ class JobQueue:
                     stage=f"повтор через {int(delay)} с", progress=0.0,
                     instance_id=None, heartbeat_at=None,
                     queued_at=now() + delay, params=params):
-                self._discard_results(outdir)
+                self._discard_unless_taken(outdir, job_id)
                 return
             self.db.add_event(job_id, "retry_scheduled",
                               f"Повтор {retries + 1} из {max_retries} через {int(delay)} с: "
@@ -1107,7 +1173,7 @@ class JobQueue:
                 job_id, status=STATUS_FAILED, finished_at=now(), progress=0.0,
                 stage="ошибка", error_code=error.code, error_message=error.message,
                 error_hint=error.hint, instance_id=None, heartbeat_at=None):
-            self._discard_results(outdir)
+            self._discard_unless_taken(outdir, job_id)
             return
         self.db.bump_model_stats(str(job.get("model") or ""), str(job.get("engine") or ""),
                                  ok=False)
@@ -1129,6 +1195,30 @@ class JobQueue:
         self._emit("job.failed", {"id": job_id, "error": error.to_dict()})
         self._discard_results(outdir)
         self._send_webhook(job_id)
+
+    def _discard_unless_taken(self, outdir: Path | None, job_id: str) -> None:
+        """Убрать свою неудавшуюся выгрузку — но не чужую работу.
+
+        Все места, откуда сюда приходят, — это провал защищённой записи:
+        задание за это время либо отменили, либо удалили, либо его
+        перехватил другой экземпляр по устаревшей отметке жизни. В первых
+        двух случаях каталог наш и его надо убрать. В третьем каталог
+        `results/<id>` уже принадлежит перехватившему — путь-то общий, — и
+        `rmtree` сносил бы готовую работу соседа, оставляя его задание
+        завершённым со ссылкой на пустоту.
+        """
+        try:
+            строка = self.db.get_job(job_id) or {}
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Владелец задания %s не выяснен (%s) — каталог не трогаем",
+                      job_id, exc)
+            return
+        чей = str(строка.get("instance_id") or "")
+        if чей and чей != INSTANCE_ID and строка.get("status") == STATUS_RUNNING:
+            log.info("Каталог результатов %s оставлен: заданием занят экземпляр «%s»",
+                     job_id, чей, extra={"job_id": job_id})
+            return
+        self._discard_results(outdir)
 
     @staticmethod
     def _discard_results(outdir: Path | None) -> None:
@@ -1437,7 +1527,9 @@ class JobQueue:
                         log.warning("Обслуживание по расписанию дало сбой "
                                     "(%d-й раз): %s", failures, exc)
                 if time.time() - last_cleanup > 3600:
-                    retention = int(self.settings.get("result_retention_days") or 30)
+                    from .maintenance import retention_days  # noqa: PLC0415
+
+                    retention = retention_days(self.settings)
                     removed = self.db.cleanup(results_days=retention)
                     if any(removed.values()):
                         log.info("Очистка хранилища: %s", removed)
@@ -1629,7 +1721,7 @@ class JobQueue:
             "paused": self._paused,
             "instance": INSTANCE_ID,
             "instances": instances,
-            "workers": [s.to_dict() for s in self._states],
+            "workers": [s.to_dict() for _, s in sorted(self._states.items())],
             "worker_count": workers,
             "counts": counts,
             "queue_depth": counts[STATUS_QUEUED] + counts[STATUS_RETRY],

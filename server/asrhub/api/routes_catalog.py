@@ -39,6 +39,12 @@ def list_models(
     #: --installed` печатал весь каталог из семидесяти с лишним моделей.
     installed: bool | None = None,
     search: str | None = None,
+    # Ключ нужен не ради самого каталога — он открытый и в документации, —
+    # а ради `installed`: этот разрез обходит каталог моделей на диске
+    # (для части моделей рекурсивно) и отвечает, что у сервера скачано.
+    # Без аутентификации сюда же не доходил и учёт частоты запросов, то
+    # есть каждый анонимный запрос занимал поток из общего пула.
+    principal: Principal = Depends(authenticate),
 ) -> dict[str, Any]:
     items = catalog.MODELS
     if language:
@@ -109,7 +115,11 @@ def model_status(request: Request, model_id: str,
     return {
         "model": model_id,
         "downloaded": bool(found),
-        "path": str(found) if found else None,
+        # Путь к весам — это раскладка файловой системы сервера, а рядом с
+        # каталогом моделей лежат база и config.yaml с ключами доступа.
+        # Соседний GET /api/system прячет `paths` от неадминистратора по
+        # той же причине.
+        "path": (str(found) if found else None) if principal.is_admin else None,
         "size_mb": round(model_files.directory_size(found) / 1024 / 1024, 1) if found else None,
         "engine_available": available,
         "engine_reason": reason,

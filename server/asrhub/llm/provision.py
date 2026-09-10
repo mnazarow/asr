@@ -492,11 +492,16 @@ class Установщик:
         if activate and activate not in имена:
             raise ConfigError("Включать можно только ту модель, которую ставим.")
         адрес = (url or str(self.settings.get("llm_url") or АДРЕС)).rstrip("/")
-        self._stop.clear()
         with self._lock:
             if self._состояние["running"]:
                 raise ConfigError("Установка уже идёт.",
                                   hint="Дождитесь окончания или отмените её.")
+            # Флаг отмены снимаем ЗДЕСЬ, а не до замка: иначе вторая
+            # вкладка, нажавшая «Поставить» сразу после «Отменить», сначала
+            # снимала отмену и лишь потом получала «уже идёт» — установка
+            # продолжалась как ни в чём не бывало и в конце переписывала
+            # настройки.
+            self._stop.clear()
             self._состояние = self._пусто()
             self._состояние.update({"running": True, "models": имена,
                                     "activate": activate or имена[0],

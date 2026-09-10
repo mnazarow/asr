@@ -902,8 +902,25 @@ ENVEOF
     {
       # Под sudo id -u даёт ноль, и контейнер запускался от root, минуя
       # понижение прав через gosu. Берём того, кто вызвал sudo.
-      echo "ASRHUB_UID=${SUDO_UID:-$(id -u)}"
-      echo "ASRHUB_GID=${SUDO_GID:-$(id -g)}"
+      #
+      # Запасной путь `id -u` тоже даёт ноль, если установщик работает от
+      # root БЕЗ sudo — из root-шелла, из Ansible, из образа сборки. Ноль
+      # здесь означает «контейнер побежит от root с примонтированным
+      # каталогом хоста», то есть ровно то, от чего понижение и защищает.
+      # Тогда берём владельца каталога данных, а если и он root — 1000,
+      # обычный первый пользователь.
+      docker_uid="${SUDO_UID:-$(id -u)}"
+      docker_gid="${SUDO_GID:-$(id -g)}"
+      if [[ "${docker_uid}" == "0" ]]; then
+        docker_uid="$(stat -c '%u' "${DATA_DIR}" 2>/dev/null \
+                      || stat -f '%u' "${DATA_DIR}" 2>/dev/null || echo 0)"
+        docker_gid="$(stat -c '%g' "${DATA_DIR}" 2>/dev/null \
+                      || stat -f '%g' "${DATA_DIR}" 2>/dev/null || echo 0)"
+      fi
+      [[ "${docker_uid}" == "0" ]] && docker_uid=1000
+      [[ "${docker_gid}" == "0" ]] && docker_gid=1000
+      echo "ASRHUB_UID=${docker_uid}"
+      echo "ASRHUB_GID=${docker_gid}"
     } >> "${ENV_FILE}"
   fi
 
@@ -1182,6 +1199,10 @@ if [[ -n "${HF_TOKEN_VALUE}" && "${MODE}" == "native" ]]; then
     info "[пробный запуск] hf_token записан бы в ${CONFIG_FILE}"
   elif [[ -f "${CONFIG_FILE}" ]]; then
     HF_TMP="${CONFIG_FILE}.hf.$$"
+    # Права — до того, как в файл попадёт токен: иначе он лежит рядом с
+    # конфигурацией доступным всем на чтение до самого mv.
+    : > "${HF_TMP}"
+    chmod 0640 "${HF_TMP}" 2>/dev/null || true
     grep -v '^hf_token:' "${CONFIG_FILE}" > "${HF_TMP}" 2>/dev/null || true
     # Файл мог остаться без перевода строки в конце — тогда ключ приклеился бы
     # к последней строке и YAML перестал бы читаться целиком.
@@ -1284,31 +1305,37 @@ if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
     else
       warn "Команда useradd недоступна — служба будет работать от root."
     fi
-    if [[ -n "${SERVICE_USER}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
-      # Каталог данных может быть общим: сервер умеет работать в нескольких
-      # экземплярах над одной базой. `useradd --system` даёт на каждой машине
-      # свой свободный uid, поэтому безусловный chown -R отбирал общий
-      # каталог у соседей — они переставали читать собственную базу.
-      # Если каталог уже принадлежит кому-то другому, спрашиваем.
-      DATA_OWNER="$(stat -c '%U' "${DATA_DIR}" 2>/dev/null \
-                    || stat -f '%Su' "${DATA_DIR}" 2>/dev/null || echo '')"
-      if [[ -n "${DATA_OWNER}" && "${DATA_OWNER}" != "root" \
-            && "${DATA_OWNER}" != "${SERVICE_USER}" ]]; then
-        warn "Каталог данных «${DATA_DIR}» принадлежит пользователю ${DATA_OWNER}."
-        hint "Похоже, над ним уже работает другая установка ASR Hub."
-        hint "Смена владельца отберёт у неё доступ к собственной базе."
-        if confirm "Всё равно передать каталог пользователю ${SERVICE_USER}?" "n"; then
-          run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
-            warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
-        else
-          info "Владелец каталога данных не меняется."
-          hint "Для общего каталога заведите одну группу и дайте её обоим"
-          hint "пользователям: chgrp -R asrhub '${DATA_DIR}' && chmod -R g+rwX '${DATA_DIR}'"
-        fi
-      else
+  fi
+
+  # Смена владельца каталога данных — отдельным блоком, а не внутри «завели
+  # пользователя сами». Ключ `--user ИМЯ` задаёт пользователя мимо того
+  # блока, и каталог оставался root:root 0750: служба под своим именем не
+  # могла войти в собственный каталог данных, сервер падал при старте, а
+  # шаг проверки сообщал только «сервер не отвечает».
+  if [[ -n "${SERVICE_USER}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+    # Каталог данных может быть общим: сервер умеет работать в нескольких
+    # экземплярах над одной базой. `useradd --system` даёт на каждой машине
+    # свой свободный uid, поэтому безусловный chown -R отбирал общий
+    # каталог у соседей — они переставали читать собственную базу.
+    # Если каталог уже принадлежит кому-то другому, спрашиваем.
+    DATA_OWNER="$(stat -c '%U' "${DATA_DIR}" 2>/dev/null \
+                  || stat -f '%Su' "${DATA_DIR}" 2>/dev/null || echo '')"
+    if [[ -n "${DATA_OWNER}" && "${DATA_OWNER}" != "root" \
+          && "${DATA_OWNER}" != "${SERVICE_USER}" ]]; then
+      warn "Каталог данных «${DATA_DIR}» принадлежит пользователю ${DATA_OWNER}."
+      hint "Похоже, над ним уже работает другая установка ASR Hub."
+      hint "Смена владельца отберёт у неё доступ к собственной базе."
+      if confirm "Всё равно передать каталог пользователю ${SERVICE_USER}?" "n"; then
         run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
           warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
+      else
+        info "Владелец каталога данных не меняется."
+        hint "Для общего каталога заведите одну группу и дайте её обоим"
+        hint "пользователям: chgrp -R asrhub '${DATA_DIR}' && chmod -R g+rwX '${DATA_DIR}'"
       fi
+    else
+      run chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" || \
+        warn "Не удалось передать каталог данных пользователю ${SERVICE_USER}."
     fi
   fi
 

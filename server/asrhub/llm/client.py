@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import threading
 import time
@@ -42,6 +43,17 @@ MAX_TOKENS = 1200
 
 #: Сколько живёт результат пробы доступности сервера модели.
 СРОК_ПРОБЫ = 60.0
+
+
+def _годится(ответ: str, validate: Any) -> bool:
+    """Разбирается ли ответ так, как его собирается читать вызывающий."""
+    if validate is None:
+        return True
+    try:
+        validate(ответ)
+    except Exception:                                        # noqa: BLE001
+        return False
+    return True
 
 
 class LLMError(Exception):
@@ -164,7 +176,7 @@ class LLMClient:
 
     def chat(self, system: str, user: str, *, kind: str = "chat",
              json_mode: bool = True, max_tokens: int = MAX_TOKENS,
-             use_cache: bool = True) -> str:
+             use_cache: bool = True, validate: Any = None) -> str:
         """Один вызов модели; возвращает текст ответа.
 
         Порядок: кеш → проверка памяти → семафор → сеть. Ошибка любого
@@ -175,10 +187,18 @@ class LLMClient:
         ключ = self.cache_key(kind, system, user)
         if use_cache and self.db is not None:
             готовое = self.db.llm_cache_get(ключ)
-            if готовое is not None:
+            if готовое is not None and _годится(готовое, validate):
                 with self._lock:
                     self.cache_hits += 1
                 return готовое
+            if готовое is not None:
+                # В кеше лежит ответ, который не разбирается. Так бывает:
+                # рассуждающая модель на первый вызов ответила размышлением
+                # без JSON. Раньше он оседал в кеше навсегда, и «Разобрать
+                # заново» вечно возвращало ту же ошибку, не спрашивая
+                # сервер модели. Забываем и спрашиваем заново.
+                log.info("Ответ модели из кеша не разобрался — спрашиваем заново")
+                self._забыть(ключ)
         self._check_vram()
         начало = time.perf_counter()
         with self._семафор():
@@ -205,12 +225,20 @@ class LLMClient:
             self.last_ms = round(прошло, 1)
             self.last_error = None
             self.last_call_at = time.time()
-        if use_cache and self.db is not None:
+        # В кеш — только то, что разбирается: иначе один сбойный ответ
+        # закрывает запись от повторных попыток навсегда.
+        if use_cache and self.db is not None and _годится(ответ, validate):
             try:
                 self.db.llm_cache_put(ключ, kind, self.model, ответ, round(прошло, 1))
             except Exception as exc:                         # noqa: BLE001
                 log.debug("Кеш ответа модели не записан: %s", exc)
         return ответ
+
+    def _забыть(self, ключ: str) -> None:
+        try:
+            self.db.llm_cache_forget(ключ)
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Запись кеша не убрана: %s", exc)
 
     def cache_key(self, kind: str, system: str, user: str) -> str:
         отпечаток = hashlib.sha256()
@@ -316,6 +344,14 @@ class LLMClient:
             raise LLMError(f"Сервер модели не ответил за {timeout:g} с.") from exc
         except OSError as exc:
             raise LLMError(f"Сервер модели недоступен: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # IncompleteRead и родня не наследуют ни URLError, ни OSError,
+            # и уходили из клиента сырым исключением: состояние слоя
+            # отвечало 500 вместо «сервер не отвечает», а счётчик ошибок
+            # оставался нулём. Обрыв за обратным прокси с коротким
+            # тайм-аутом чтения — обычное дело.
+            raise LLMError(f"Ответ сервера модели оборвался: "
+                           f"{type(exc).__name__}") from exc
         try:
             разобрано = json.loads(сырое.decode("utf-8"))
         except (TypeError, ValueError) as exc:

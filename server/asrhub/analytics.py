@@ -153,7 +153,13 @@ class Analytics:
         proc_s = sum(float(j.get("processing_time_s") or 0) for j in done)
         words = sum(int(j.get("words_count") or 0) for j in done)
         rtf_values = [float(j["rtf"]) for j in done if j.get("rtf")]
-        queue_values = [float(j["queue_time_s"]) for j in done if j.get("queue_time_s")]
+        # `is not None`, а не «истинно»: ноль — это законное ожидание
+        # (задание из кеша отвечает мгновенно), и выбрасывание нулей
+        # завышало перцентиль в разы. Соседний раздел «Ожидание в очереди»
+        # всегда считал по этому правилу, и одно и то же число в одной
+        # выгрузке отличалось впятеро.
+        queue_values = [float(j["queue_time_s"]) for j in done
+                        if j.get("queue_time_s") is not None]
         conf_values = [float(j["avg_confidence"]) for j in done if j.get("avg_confidence")]
         wer_values = [float(j["wer"]) for j in done if j.get("wer") is not None]
 
@@ -951,6 +957,12 @@ class Analytics:
         все = [j for j in self._jobs(since=база_от, limit=200000, owner=owner)
                if j["status"] == "completed"]
         дней = max(1, int(round((конец - начало) / 86400)))
+        # Период короче суток сравнивать с суточными пределами нельзя:
+        # база собрана по дням, и одна часовая точка на восьми разговорах
+        # прыгает по биномиальному шуму далеко за 3σ — «критично» на ровном
+        # месте при каждом открытии раздела за час. В таком случае карту
+        # рисуем, а вердикты не выносим.
+        короткий_период = (конец - начало) < 0.75 * 86400
 
         def по_дням(от: float, до: float, n: int) -> list[dict[str, list[float]]]:
             шаг = max(1.0, (до - от) / n)
@@ -985,7 +997,7 @@ class Analytics:
             ряд_базы = [(среднее(k[поле]) * множитель if k[поле] else None) for k in база]
             пределы = stats.control_limits([x for x in ряд_базы if x is not None])
             точки = [(среднее(k[поле]) * множитель if k[поле] else None) for k in текущие]
-            отметки = stats.spc_flags(точки, пределы)
+            отметки = [] if короткий_период else stats.spc_flags(точки, пределы)
             карты.append({
                 "key": ключ, "title": подпись, "good": лучше, "limits": пределы,
                 "baseline": [{"ts": round(база_от + i * (начало - база_от) / self.БАЗА_ДНЕЙ, 1),
@@ -1001,6 +1013,10 @@ class Analytics:
                              default=None),
             })
         return {"period": period, "baseline_days": self.БАЗА_ДНЕЙ, "step_s": round(шаг, 1),
+                "verdicts": not короткий_период,
+                "note_short": ("Период короче суток: карта показана, вердикты не выносятся — "
+                               "пределы посчитаны по суточным точкам."
+                               if короткий_период else None),
                 "charts": карты}
 
     # --- точность по эталону ---------------------------------------------------
@@ -1489,18 +1505,25 @@ class Analytics:
             suffix = "{" + labels + "}" if labels else ""
             lines.append(f"asrhub_{name}{suffix} {value}")
 
+        # Имена здесь не должны совпадать с накопительными счётчиками
+        # подсистемы мониторинга: `asrhub_jobs_total`, `asrhub_audio_seconds_total`
+        # и `asrhub_words_total` там растут с запуска, а тут это «сколько
+        # сейчас» и «сколько за сутки». Под одним именем Prometheus видел
+        # то счётчик, то скользящее окно, и `rate()` считал каждое снижение
+        # сбросом счётчика — поток завышался в разы. Поэтому запасной путь
+        # отдаёт свои показания под своими именами.
         counts = {status: self.db.count_jobs(status=status)
                   for status in ("queued", "running", "completed", "failed",
                                  "cancelled", "retry")}
         for status, value in counts.items():
-            add("jobs_total", value, f'status="{status}"',
-                "Число заданий по статусам" if status == "queued" else "", "gauge")
+            add("jobs_current", value, f'status="{status}"',
+                "Число заданий по статусам сейчас" if status == "queued" else "", "gauge")
 
         overview = self.overview("day")
-        add("audio_seconds_total", overview["volume"]["audio_seconds"], "",
-            "Обработано аудио за сутки, секунд", "counter")
-        add("words_total", overview["volume"]["words"], "",
-            "Распознано слов за сутки", "counter")
+        add("audio_seconds_day", overview["volume"]["audio_seconds"], "",
+            "Обработано аудио за сутки, секунд", "gauge")
+        add("words_day", overview["volume"]["words"], "",
+            "Распознано слов за сутки", "gauge")
         add("rtf_avg", overview["performance"]["rtf"]["avg"], "",
             "Средний коэффициент реального времени")
         add("rtf_p95", overview["performance"]["rtf"]["p95"])

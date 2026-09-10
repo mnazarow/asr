@@ -158,10 +158,18 @@ function h(html) {
   tpl.innerHTML = html.trim();
   return tpl.content.firstElementChild;
 }
+/* Экранирование для разметки.
+ *
+ * Апостроф — не украшение: половина обработчиков в этом файле написана как
+ * onclick="…('${esc(id)}')", то есть значение попадает внутрь строки JS,
+ * ограниченной апострофом. Кавычка там не спасает — разбор ломает именно
+ * апостроф, и сегодня от этого держит только проверка имени пользователя
+ * в питоне. Безопасность разметки не должна зависеть от чужой регулярки.
+ */
 function esc(value) {
   return String(value === null || value === undefined ? '' : value)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function qs(sel, root) { return (root || document).querySelector(sel); }
 function qsa(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
@@ -213,13 +221,6 @@ function fmtAgo(ts) {
   if (diff < 3600) return `${Math.floor(diff / 60)} мин назад`;
   if (diff < 86400) return `${Math.floor(diff / 3600)} ч назад`;
   return `${Math.floor(diff / 86400)} дн назад`;
-}
-function fmtBytes(bytes) {
-  if (!bytes) return '—';
-  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
-  let value = bytes, i = 0;
-  while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
-  return `${value.toFixed(value < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }
 function num(value, digits) { return window.Charts.fmtNum(value, digits); }
 /**
@@ -1449,7 +1450,16 @@ RENDERERS.transcribe = {
           <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(job.id)}')">
             Открыть</button></td></tr>`).join('')}
         </tbody></table></div>` : '<div class="empty small">Пока нет завершённых заданий</div>';
-    }).catch(() => {});
+    }).catch((err) => {
+      // Пустая карточка без объяснения неотличима от «заданий ещё не было»,
+      // а обновляется она каждые четыре секунды — то есть молчала бы вечно.
+      if (err && err.silent) return;
+      const host = qs('#recent-jobs');
+      if (host && !host.children.length) {
+        host.innerHTML = `<div class="empty small">Список не получен: ${
+          esc((err && err.message) || 'ошибка запроса')}</div>`;
+      }
+    });
   },
 };
 
@@ -1667,6 +1677,12 @@ RENDERERS.dictation = {
         </div>
       </div>`;
 
+    // Раздел мог перерисоваться поверх идущей записи (кнопка «Обновить»,
+    // смена темы): `leave()` вызывается только при СМЕНЕ раздела, поэтому
+    // без этой строки ссылка на сессию терялась, а микрофон, MediaRecorder
+    // и веб-сокет продолжали работать без всякой возможности их остановить
+    // — и следующее нажатие открывало вторую запись поверх первой.
+    if (this.session) { try { this.stop(true); } catch (err) { /* уже закрыта */ } }
     this.session = null;
     qs('#dict-toggle').onclick = () => (this.session ? this.stop() : this.start());
     qs('#dict-copy').onclick = () => {
@@ -2423,10 +2439,17 @@ RENDERERS.results = {
 
   /** Дописывает в отбор по содержанию действующие категории обращений. */
   async loadCategoryOptions(выбрать) {
+    // Запрос идёт через API.background, то есть переживает уход из раздела:
+    // ответ прошлого захода дописывал категории в НОВЫЙ список, и каждый
+    // заход-уход добавлял ещё одну копию каждой категории. Метка на самом
+    // элементе списка отвечает на вопрос «это тот список или уже другой»
+    // надёжнее любого счётчика поколений.
     let перечни;
     try { перечни = await API.background('/api/content/kinds'); } catch (e) { return; }
     const select = qs('#r-content');
     if (!select || !(перечни.categories || []).length) return;
+    if (select.dataset.categories === 'да') return;
+    select.dataset.categories = 'да';
     const группа = document.createElement('optgroup');
     группа.label = 'Категории обращений';
     (перечни.categories || []).forEach((к) => {
@@ -2444,8 +2467,15 @@ RENDERERS.results = {
 
   async load() {
     const host = qs('#results-table');
-    const search = qs('#r-search').value.trim();
-    const order = qs('#r-order').value;
+    // Поиск запускается по таймеру в 300 мс, и таймер не привязан к
+    // разделу: уйти сразу после набора — и обработчик срабатывает уже без
+    // разметки, а `qs('#r-search').value` падает TypeError мимо всех
+    // ловушек (метод async, вызывают без await).
+    const поле = qs('#r-search');
+    const порядок = qs('#r-order');
+    if (!host || !поле || !порядок) return;
+    const search = поле.value.trim();
+    const order = порядок.value;
     try {
       const params = new URLSearchParams({ status: 'completed', limit: '150', order });
       if (search) params.set('search', search);
@@ -5166,9 +5196,22 @@ RENDERERS.content = {
   async loadRecords() {
     const host = qs('#content-records');
     if (!host) return;
-    const данные = await API.latest('content-records',
-      `/api/content/records?kind=${encodeURIComponent(state.contentKind)}` +
-      `&period=${state.contentPeriod}&limit=50`);
+    // Метод зовут и по щелчку по кнопке отбора — без await и без catch.
+    // Отказ запроса оставлял на экране таблицу ПРЕЖНЕГО отбора под новой
+    // подписью: человек читает чужие данные как результат своего выбора.
+    let данные;
+    try {
+      данные = await API.latest('content-records',
+        `/api/content/records?kind=${encodeURIComponent(state.contentKind)}` +
+        `&period=${state.contentPeriod}&limit=50`);
+    } catch (err) {
+      if (err && err.silent) return;
+      if (host.isConnected) {
+        host.innerHTML = `<div class="empty small">Записи не получены: ${
+          esc((err && err.message) || 'ошибка запроса')}</div>`;
+      }
+      return;
+    }
     const items = данные.items || [];
     // Отбор показывает верхние пятьдесят, а «Результаты» — весь список с
     // поиском и листалкой. Ключи отборов там те же, поэтому переход
@@ -6863,6 +6906,7 @@ RENDERERS.settings = {
 
   list() {
     const host = qs('#params-body');
+    if (!host) return;            // раздел успели сменить, пока шёл таймер
     const search = (state.paramSearch || '').toLowerCase();
     const groups = state.catalog.groups;
 
@@ -7383,7 +7427,17 @@ RENDERERS.monitoring = {
     let data;
     try {
       data = await API.latest('mon-catalog', '/api/monitoring/catalog');
-    } catch (err) { return; }
+    } catch (err) {
+      // Молчаливый выход оставлял карточку на строке «Загрузка справочника…»
+      // навсегда: ни всплывашки, ни следа в консоли. Соседний загрузчик
+      // рядов в такой же ситуации честно пишет, что не вышло.
+      const box = qs('#mon-catalog');
+      if (box) {
+        box.innerHTML = `<div class="empty small">Не удалось получить справочник метрик: ${
+          esc((err && err.message) || 'ошибка запроса')}</div>`;
+      }
+      return;
+    }
     state.metricCatalog = data;
     const box = qs('#mon-catalog');
     const search = qs('#mon-search');

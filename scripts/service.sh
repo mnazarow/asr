@@ -369,7 +369,7 @@ case "${ACTION}" in
     # Копия снимается командой SQLite «.backup», а не копированием файла:
     # база работает в режиме WAL, рядом лежат -wal и -shm, и обычная копия
     # получается несогласованной — выглядит как копия и ею не является.
-    py="$(asrhub_python)" || { err "Не найден интерпретатор ASR Hub."; exit 1; }
+    py="$(asrhub_python)" || { error "Не найден интерпретатор ASR Hub."; exit 1; }
     ASRHUB_DATA_DIR="${DATA_DIR}" "${py}" - <<'PYCODE' || exit 1
 from pathlib import Path
 
@@ -389,14 +389,14 @@ PYCODE
     ok "Резервная копия готова" ;;
 
   restore)
-    [[ -n "${RESTORE_FROM}" ]] || { err "Укажите файл копии: --from ПУТЬ"; exit 2; }
-    [[ -f "${RESTORE_FROM}" ]] || { err "Файл не найден: ${RESTORE_FROM}"; exit 1; }
+    [[ -n "${RESTORE_FROM}" ]] || { error "Укажите файл копии: --from ПУТЬ"; exit 2; }
+    [[ -f "${RESTORE_FROM}" ]] || { error "Файл не найден: ${RESTORE_FROM}"; exit 1; }
     # Восстановление на работающем сервере затрёт базу под ним, и он
     # продолжит писать в файл, которого больше нет. Останавливаем сами: это
     # не тот случай, где предупреждения достаточно.
     warn "Служба будет остановлена на время восстановления."
     bash "${BASH_SOURCE[0]}" stop --data "${DATA_DIR}" >/dev/null 2>&1 || true
-    py="$(asrhub_python)" || { err "Не найден интерпретатор ASR Hub."; exit 1; }
+    py="$(asrhub_python)" || { error "Не найден интерпретатор ASR Hub."; exit 1; }
     ASRHUB_DATA_DIR="${DATA_DIR}" ASRHUB_RESTORE_FROM="${RESTORE_FROM}"       "${py}" - <<'PYCODE' || exit 1
 import os
 from pathlib import Path
