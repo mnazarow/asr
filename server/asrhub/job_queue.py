@@ -44,6 +44,7 @@ from .monitoring.collector import (
     MEDIA_DURATION_BUCKETS,
     RUNTIME,
 )
+from .pipeline import audio_profile
 from .pipeline import metrics as metrics_mod
 from .processor import cleanup_workdir, process_job, safe_workdir, settings_digest
 
@@ -407,6 +408,8 @@ class JobQueue:
             quality_flags=",".join(cached.get("quality_flags") or [])
             if isinstance(cached.get("quality_flags"), list) else cached.get("quality_flags"),
             quality_detail=cached.get("quality_detail"),
+            # Профиль звука — свойство записи, а запись та же.
+            **audio_profile.for_job(cached),
             progress=1.0, stage="из кеша")
         segments = self.db.get_segments(cached["id"])
         if segments:
@@ -917,6 +920,7 @@ class JobQueue:
             waveform=outcome.waveform,
             calibration=outcome.stats.get("calibration") or None,
             **metrics_mod.job_fields(accuracy),
+            **audio_profile.for_job(outcome.stats.get("audio_profile") or {}),
         )
         if not finished:
             # Задание успели отменить или удалить, пока оно считалось.

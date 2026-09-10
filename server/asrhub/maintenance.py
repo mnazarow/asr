@@ -202,6 +202,17 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
                                "median_before": (м.get("baseline") or {}).get("p50"),
                                "median_now": (м.get("current") or {}).get("p50")}
                             for м in сдвинулись]
+    # Плохой звук — тоже только когда он есть: доля шумных и срезанных
+    # записей и худшие источники. Это про вход, а не про модель, и
+    # лечится на стороне телефонии, а не сервера.
+    звук = отчёт.get("audio") or {}
+    if звук.get("bad_audio_jobs"):
+        готовое["bad_audio"] = {
+            "jobs": звук.get("bad_audio_jobs"), "measured": звук.get("measured_jobs"),
+            "share": звук.get("bad_audio_share"), "noisy": звук.get("noisy_jobs"),
+            "clipped": звук.get("clipped_jobs"),
+            "sources": [и for и in (звук.get("bad_audio_by_source") or []) if и.get("bad")][:3],
+        }
     метка = str(settings.get("consent_tag") or "").strip()
     if метка and getattr(analytics, "db", None) is not None:
         срок_дней = int(settings.get("consent_days") or 30)
@@ -211,7 +222,8 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
     готовое["text"] = digest_text(сводка, ошибки, очередь, содержание,
                                   suspicious=готовое.get("suspicious"),
                                   consent_missing=готовое.get("consent_missing"),
-                                  drift=готовое.get("drift"))
+                                  drift=готовое.get("drift"),
+                                  bad_audio=готовое.get("bad_audio"))
     return готовое
 
 
@@ -269,7 +281,8 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                 содержание: dict[str, Any] | None = None, *,
                 suspicious: dict[str, Any] | None = None,
                 consent_missing: int | None = None,
-                drift: list[dict[str, Any]] | None = None) -> str:
+                drift: list[dict[str, Any]] | None = None,
+                bad_audio: dict[str, Any] | None = None) -> str:
     """Та же сводка словами.
 
     Приёмник входящих сообщений в мессенджере показывает поле `text` и
@@ -316,6 +329,14 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                       f"{suspicious['assessed']} ({число(suspicious.get('flagged_share'))} %)")
     if consent_missing:
         строки.append(f"Записей без метки согласия старше срока: {consent_missing}")
+    if bad_audio and bad_audio.get("jobs"):
+        источники = ", ".join(f"{и.get('key')} — {число((и.get('share') or 0) * 100, 0)} %"
+                              for и in bad_audio.get("sources") or [])
+        строки.append(
+            f"Плохой звук на входе: {bad_audio['jobs']} из {bad_audio.get('measured') or 0} "
+            f"записей ({число((bad_audio.get('share') or 0) * 100, 0)} %): "
+            f"шумных {bad_audio.get('noisy') or 0}, с клиппингом {bad_audio.get('clipped') or 0}"
+            + (f"; хуже всего {источники}" if источники else ""))
     for д in drift or []:
         уровень = "критично" if д.get("verdict") == "critical" else "предупреждение"
         кто = "по всем моделям" if д.get("key") == "all" else f"у модели {д.get('key')}"

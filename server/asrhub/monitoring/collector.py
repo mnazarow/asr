@@ -391,6 +391,18 @@ class Collector:
             if s_ + d + i + h:
                 out.append(Sample("asrhub_mer", round((s_ + d + i) / (s_ + d + i + h), 4),
                                   {"model": str(row["model"] or "")}))
+        # Звук на входе за сутки: доля плохих записей и перцентили SNR.
+        try:
+            звук = self.state.analytics.audio_profile("day")
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Профиль звука для метрик не посчитан: %s", exc)
+            звук = {}
+        if звук.get("bad_audio_share") is not None:
+            out.append(Sample("asrhub_bad_audio_share", float(звук["bad_audio_share"])))
+        snr = звук.get("snr_db") or {}
+        if snr.get("count"):
+            for stat in ("p10", "p50", "p90"):
+                out.append(Sample("asrhub_audio_snr_db", float(snr[stat]), {"stat": stat}))
         # Калибровка — за неделю: за сутки эталонных записей обычно единицы,
         # и ECE по ним — совпадение, а не мера.
         try:

@@ -265,7 +265,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `limit` | в адресе | integer | `50` | — |
 | `offset` | в адресе | integer | `0` | — |
 | `order` | в адресе | string | `created_at DESC` | — |
-| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent) или по здоровью распознавания (suspect, hallucination, speakers_mismatch) |
+| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent), по здоровью распознавания (suspect, hallucination, speakers_mismatch) или по звуку на входе (bad_audio, noisy, clipped) |
 | `light` | в адресе | boolean | `False` | Только поля для таблицы, без текста и сегментов |
 
 **Пример**
@@ -661,7 +661,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:30492",
+  "instance": "vm:15648",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1239,10 +1239,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789039842.198269,
+    "generated_at": 1789042931.996997,
     "jobs": {
-      "total": 235,
-      "completed": 235,
+      "total": 229,
+      "completed": 229,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1250,42 +1250,42 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 8321.9,
-      "audio_hours": 2.31,
-      "processing_seconds": 1720.8,
-      "words": 9770,
+      "audio_seconds": 8141.0,
+      "audio_hours": 2.26,
+      "processing_seconds": 1697.4,
+      "words": 9520,
       "characters": 0,
-      "segments": 1422,
-      "files_per_hour": 1.4,
+      "segments": 1386,
+      "files_per_hour": 1.36,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 235,
-        "avg": 0.218543,
+        "count": 229,
+        "avg": 0.220894,
         "min": 0.01,
         "max": 5.7511,
+        "p10": 0.04402,
         "p50": 0.1097,
-        "p90": 0.38224,
-        "p95": 0.49231,
-        "p99": 2.11018,
-        "stdev": 0.501917
+        "p90": 0.38338,
+        "p95": 0.49402,
+        "p99": 2.17696,
+        "stdev": 0.508108
       },
       "processing_time_s": {
-        "count": 235,
-        "avg": 7.322553,
+        "count": 229,
+        "avg": 7.41214,
         "min": 0.28,
         "max": 175.41,
+        "p10": 1.174,
         "p50": 3.77,
-        "p90": 13.456,
-        "p95": 16.802,
-        "p99": 61.1638,
-        "stdev": 15.525606
+        "p90": 13.616,
+        "p95": 17.354,
+        "p99": 62.9296,
+        "stdev": 15.713721
       },
       "queue_time_s": {
-        "count": 235,
-        "avg": 6.508085,
-        "min": 0.02,
+        "count": 229,
 …
 ```
 
@@ -1342,64 +1342,64 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
 {
   "period": "week",
   "overall": {
-    "jobs": 235,
-    "audio_hours": 2.312,
+    "jobs": 229,
+    "audio_hours": 2.261,
     "processing_p50": 3.77,
-    "processing_p95": 16.8,
-    "processing_p99": 61.16,
+    "processing_p95": 17.35,
+    "processing_p99": 62.93,
     "rtf_p50": 0.1097,
-    "rtf_p95": 0.4923,
-    "rtf_p99": 2.1102,
-    "queue_p50": 4.44,
-    "queue_p95": 19.21
+    "rtf_p95": 0.494,
+    "rtf_p99": 2.177,
+    "queue_p50": 4.71,
+    "queue_p95": 19.36
   },
   "by_model": [
     {
       "key": "whisper-large-v3",
-      "jobs": 63,
-      "audio_hours": 0.672,
+      "jobs": 61,
+      "audio_hours": 0.656,
       "processing_p50": 5.38,
-      "processing_p95": 18.06,
-      "processing_p99": 28.53,
-      "rtf_p50": 0.1699,
-      "rtf_p95": 0.2865,
-      "rtf_p99": 0.7221,
+      "processing_p95": 18.27,
+      "processing_p99": 28.95,
+      "rtf_p50": 0.162,
+      "rtf_p95": 0.2869,
+      "rtf_p99": 0.7432,
       "queue_p50": 6.24,
-      "queue_p95": 19.49
+      "queue_p95": 19.57
     },
     {
       "key": "t-one",
-      "jobs": 58,
-      "audio_hours": 0.541,
-      "processing_p50": 2.62,
-      "processing_p95": 7.75,
+      "jobs": 57,
+      "audio_hours": 0.531,
+      "processing_p50": 2.61,
+      "processing_p95": 7.8,
       "processing_p99": 14.79,
-      "rtf_p50": 0.0847,
-      "rtf_p95": 0.1668,
-      "rtf_p99": 0.6098,
-      "queue_p50": 4.94,
-      "queue_p95": 21.6
+      "rtf_p50": 0.0856,
+      "rtf_p95": 0.169,
+      "rtf_p99": 0.6107,
+      "queue_p50": 5.16,
+      "queue_p95": 21.62
     },
     {
       "key": "vosk-ru",
-      "jobs": 57,
-      "audio_hours": 0.529,
-      "processing_p50": 10.17,
-      "processing_p95": 43.63,
-      "processing_p99": 152.35,
-      "rtf_p50": 0.3429,
-      "rtf_p95": 0.9818,
-      "rtf_p99": 4.9758,
-      "queue_p50": 3.8,
-      "queue_p95": 20.19
+      "jobs": 56,
+      "audio_hours": 0.52,
+      "processing_p50": 10.22,
+      "processing_p95": 45.35,
+      "processing_p99": 152.76,
+      "rtf_p50": 0.3455,
+      "rtf_p95": 1.076,
+      "rtf_p99": 4.9896,
+      "queue_p50": 3.9,
+      "queue_p95": 20.47
     },
     {
       "key": "gigaam-v3-e2e-rnnt",
-      "jobs": 57,
-      "audio_hours": 0.57,
+      "jobs": 55,
+      "audio_hours": 0.554,
       "processing_p50": 1.55,
-      "processing_p95": 5.34,
-      "processing_p99": 6.27,
+      "processing_p95": 5.37,
+      "processing_p99": 6.28,
 …
 ```
 
@@ -1441,7 +1441,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 70.6,
+  "uptime_s": 895.9,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1485,7 +1485,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 2
+    "INFO": 2,
+    "WARNING": 2
   }
 }
 ```
@@ -1520,7 +1521,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 70.6,
+  "uptime_s": 895.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1530,7 +1531,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 6.9,
-    "disk_free_gb": 12.1,
+    "disk_free_gb": 12.3,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1541,7 +1542,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 12.1 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 12.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {

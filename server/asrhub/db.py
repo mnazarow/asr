@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -318,7 +318,14 @@ _SCHEMA = [
         sub_words         INTEGER,
         del_words         INTEGER,
         ins_words         INTEGER,
-        calibration       TEXT
+        calibration       TEXT,
+        -- Версия 15: профиль звука на входе. Объясняет ошибки лучше всего
+        -- остального: WER растёт с падением SNR предсказуемо.
+        snr_db            REAL,
+        peak_dbfs         REAL,
+        clipping_share    REAL,
+        loudness_lufs     REAL,
+        silence_share     REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
@@ -614,6 +621,11 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "del_words": "INTEGER",
         "ins_words": "INTEGER",
         "calibration": "TEXT",
+        "snr_db": "REAL",
+        "peak_dbfs": "REAL",
+        "clipping_share": "REAL",
+        "loudness_lufs": "REAL",
+        "silence_share": "REAL",
         "cached_from": "TEXT",
         "webhook_url": "TEXT",
         "webhook_status": "TEXT",
@@ -1116,7 +1128,10 @@ class Database:
         # Точность по эталону: счётчики ошибок для срезов, складываемых по
         # словам, и корзины калибровки. Есть только у заданий с эталоном —
         # у остальных это NULL, и список они не утяжеляют.
-        "mer, wil, ref_words, sub_words, del_words, ins_words, calibration"
+        "mer, wil, ref_words, sub_words, del_words, ins_words, calibration, "
+        # Профиль звука: пять чисел, по которым строится разрез «SNR →
+        # уверенность и WER» и отбор «плохой звук».
+        "snr_db, peak_dbfs, clipping_share, loudness_lufs, silence_share"
     )
 
     #: Отборы по содержанию разговора для списка заданий. Ключ приходит из
@@ -1161,6 +1176,11 @@ class Database:
         "hallucination": ("(jobs.quality_flags LIKE '%phrase%' "
                           "OR jobs.quality_flags LIKE '%repeat%' "
                           "OR jobs.quality_flags LIKE '%compression%')"),
+        # Плохой звук — по порогам Deepgram: SNR ниже 10 дБ или клиппинг от
+        # одного процента отсчётов. Пороги те же, что в audio_profile.
+        "bad_audio": "(jobs.snr_db < 10 OR jobs.clipping_share >= 0.01)",
+        "noisy": "jobs.snr_db < 10",
+        "clipped": "jobs.clipping_share >= 0.01",
     }
 
     #: Приставка отбора по категории обращения: `category:payment`. Имя

@@ -112,8 +112,15 @@ const API = {
       this._pending.add(own);
     }
     let response;
+    let text;
     try {
       response = await fetch(path, opts);
+      // Тело читается под тем же сигналом: отмена приходит и во время
+      // чтения — на большом ответе чаще, чем до него, — и без этого
+      // AbortError вылетал сырым исключением DOMException мимо разбора
+      // ниже: красная плашка «The user aborted a request» и ошибка в
+      // консоли при обычном переключении вкладок.
+      text = await response.text();
     } catch (err) {
       if (err && err.name === 'AbortError') {
         // Запрос отменён более свежим — это не сбой, а штатный ход.
@@ -124,7 +131,6 @@ const API = {
     } finally {
       if (own) this._pending.delete(own);
     }
-    const text = await response.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
     if (!response.ok) {
@@ -997,7 +1003,7 @@ function installHotkeys() {
 }
 
 const RENDERERS = {};
-window.__asrhub = { state, API, RENDERERS, go, toast, renderView, showHotkeys };
+window.__asrhub = { state, API, RENDERERS, go, toast, renderView, showHotkeys, fail };
 
 // ==========================================================================
 // Общие компоненты
@@ -2362,6 +2368,9 @@ RENDERERS.results = {
             <option value="suspect">подозрительная расшифровка</option>
             <option value="hallucination">похоже на галлюцинацию</option>
             <option value="speakers_mismatch">говорящих не столько, сколько ожидалось</option>
+            <option value="bad_audio">плохой звук: шум или клиппинг</option>
+            <option value="noisy">шумная запись (SNR ниже 10 дБ)</option>
+            <option value="clipped">клиппинг от 1 % отсчётов</option>
             <option value="objection_unhandled">возражение без отработки</option>
             <option value="objection">с возражениями клиента</option>
             <option value="violation">с нарушениями оператора</option>
@@ -2766,6 +2775,11 @@ function showJobModal(job, opts) {
         ${kpi('Уверенность', job.avg_confidence ? pct(job.avg_confidence, 1) : '—',
               job.wer !== null && job.wer !== undefined ? `WER ${pct(job.wer, 2)}` : '')}
       </div>
+      ${job.snr_db !== null && job.snr_db !== undefined ? `<div class="small dim" style="margin:-6px 0 12px">
+        <b class="small">Звук на входе</b>: речь к шуму ${num(job.snr_db, 0)} дБ${job.snr_db < 10 ? ' <span class="chip warn">шумно</span>' : ''}
+        · пик ${num(job.peak_dbfs, 1)} dBFS${job.clipping_share >= 0.01 ? ` · клиппинг ${pct(job.clipping_share, 1)} <span class="chip warn">срезано</span>` : job.clipping_share > 0 ? ` · клиппинг ${pct(job.clipping_share, 2)}` : ''}
+        ${job.loudness_lufs !== null && job.loudness_lufs !== undefined ? ` · громкость ${num(job.loudness_lufs, 0)} LUFS` : ''}
+        ${job.silence_share !== null && job.silence_share !== undefined ? ` · тишины ${pct(job.silence_share, 0)}` : ''}</div>` : ''}
 
       ${job.error_message ? `<div class="card tight" style="border-color:var(--err)">
         <b style="color:var(--err)">${esc(job.error_code || 'ошибка')}</b>
@@ -4148,7 +4162,30 @@ function drawExtraAnalytics(data) {
         <td class="num">${f.jobs}</td><td class="num">${num(f.audio_hours, 2)}</td>
         <td class="num">${num(f.avg_mb, 1)} МБ</td></tr>`).join('')}</tbody></table>` : ''}
       ${(a.speakers || []).length ? `<div class="small faint" style="margin-top:8px">
-        Говорящих в записи: ${a.speakers.map((x) => `${x.speakers} — ${x.jobs}`).join(', ')}</div>` : ''}`;
+        Говорящих в записи: ${a.speakers.map((x) => `${x.speakers} — ${x.jobs}`).join(', ')}</div>` : ''}
+      ${a.measured_jobs ? `<div style="margin-top:12px">
+        <div class="grid cols-4" style="margin-bottom:10px">
+          ${kpi('Речь к шуму', `${num((a.snr_db || {}).p50, 0)} дБ`, `p10 ${num((a.snr_db || {}).p10, 0)} · p90 ${num((a.snr_db || {}).p90, 0)} дБ`)}
+          ${kpi('Плохой звук', a.bad_audio_share === null ? '—' : pct(a.bad_audio_share, 0),
+                `шумных ${num(a.noisy_jobs)}, с клиппингом ${num(a.clipped_jobs)} из ${num(a.measured_jobs)}`)}
+          ${kpi('Громкость', (a.loudness_lufs || {}).count ? `${num(a.loudness_lufs.p50, 0)} LUFS` : '—',
+                (a.loudness_lufs || {}).count ? `p10 ${num(a.loudness_lufs.p10, 0)} · p90 ${num(a.loudness_lufs.p90, 0)}` : '')}
+          ${kpi('Тишины', (a.silence_share || {}).count ? pct(a.silence_share.avg, 0) : '—', 'в среднем по записи')}
+        </div>
+        <table><thead><tr><th title="отношение речи к шуму, оценка по кадрам">Речь к шуму</th><th class="num">Записей</th>
+          <th class="num" title="средняя уверенность модели">Уверенность</th>
+          <th class="num" title="доля записей с уверенностью ниже 0,75">Низкой</th>
+          <th class="num" title="WER по записям с эталоном">WER</th>
+          <th class="num" title="средняя доля подозрительных сегментов">Подозр.</th></tr></thead><tbody>
+          ${(a.snr_bands || []).map((б) => `<tr><td>${esc(б.key)}</td><td class="num">${num(б.jobs)}</td>
+            <td class="num mono">${б.confidence_avg === null ? '—' : pct(б.confidence_avg, 1)}</td>
+            <td class="num mono">${б.low_confidence_share === null ? '—' : pct(б.low_confidence_share, 0)}</td>
+            <td class="num mono">${б.wer_avg === null ? '—' : pct(б.wer_avg, 1) + `<span class="faint"> (${num(б.wer_jobs)})</span>`}</td>
+            <td class="num mono">${б.suspect_share_avg === null ? '—' : pct(б.suspect_share_avg, 1)}</td></tr>`).join('')}</tbody></table>
+        ${(a.bad_audio_by_source || []).some((и) => и.bad) ? `<div class="small faint" style="margin-top:8px">Плохой звук по источникам: ${
+          a.bad_audio_by_source.filter((и) => и.bad).map((и) => `${esc(и.key)} — ${pct(и.share, 0)} (${num(и.bad)} из ${num(и.jobs)})`).join(', ')}</div>` : ''}
+        <div class="small faint" style="margin-top:6px">SNR — оценка по кадрам без эталона: громкие кадры считаются речью, тихие — шумом; плохой звук — ниже 10 дБ или клиппинг от 1 % отсчётов (пороги Deepgram). WER при 20 дБ обычно около 3–4 %, при 10 дБ — 15 %, при 5 дБ — за 30 %.</div>
+      </div>` : ''}`;
   }
 
   const res = data.resources || {};

@@ -26,7 +26,7 @@ from .engines import EngineRegistry, Segment
 from .errors import ASRHubError, JobCancelled, NoSpeechDetected
 from .logging_setup import get_logger
 from .pipeline import audio as audio_mod
-from .pipeline import export, metrics, postprocess, vad
+from .pipeline import audio_profile, export, metrics, postprocess, vad
 
 log = get_logger("processor")
 
@@ -243,12 +243,14 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     engine_meta: dict[str, Any] = {}
     languages: list[str] = []
     silent_channels: list[str] = []
+    профили: list[dict[str, Any]] = []
 
     for channel_index, (label, prepared) in enumerate(channels):
         check_cancel()
 
         # ---- 2. Поиск речи ---------------------------------------------
         speech_stats: dict[str, Any] = {}
+        spans: list[Any] = []
         if settings.get("vad_enabled", True):
             timer.start("vad")
             report(0.14, "поиск речи")
@@ -257,6 +259,19 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             timer.stop()
             outcome.stats.setdefault("speech", {})[label or "моно"] = speech_stats
             outcome.stats["speech_ratio"] = speech_stats.get("speech_ratio")
+        # Профиль звука — по подготовленному каналу и участкам речи: SNR,
+        # пик, клиппинг, громкость, тишина. Считается и для молчащего
+        # канала: тишина — тоже факт о записи. Сбой замера результат не
+        # трогает: профиль — сведения о входе, а не о расшифровке.
+        timer.start("audio_prep")
+        try:
+            профили.append(audio_profile.profile_file(
+                prepared, speech_spans=[(float(s.start), float(s.end)) for s in spans]
+                if spans else None))
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Профиль звука не измерен: %s", exc)
+        timer.stop()
+        if settings.get("vad_enabled", True):
             if not spans and info.duration_s > 1.0:
                 # Раньше здесь стоял raise, и на стереозаписи молчащий канал
                 # уносил с собой уже распознанный первый: в записи звонка,
@@ -377,6 +392,18 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
                         word[key] = round(prepared_audio.to_source_time(float(word[key])), 3)
         log.debug("Таймкоды возвращены в координаты исходной записи: "
                   "сдвиг %.3f с, темп %.3f", prepared_audio.offset_s, prepared_audio.speed)
+
+    if профили:
+        профиль = audio_profile.merge(профили)
+        outcome.stats["audio_profile"] = профиль
+        if audio_profile.is_bad(профиль):
+            части = []
+            if профиль.get("snr_db") is not None and профиль["snr_db"] < audio_profile.SNR_ПЛОХОЙ:
+                части.append(f"отношение речи к шуму {профиль['snr_db']:.0f} дБ")
+            if (профиль.get("clipping_share") or 0) >= audio_profile.КЛИППИНГ_ПЛОХОЙ:
+                части.append(f"клиппинг {100 * профиль['clipping_share']:.1f} % отсчётов")
+            outcome.warnings.append(
+                "Плохой звук: " + ", ".join(части) + " — ошибки распознавания ожидаемы.")
 
     # ---- 6. Постобработка -------------------------------------------------
     check_cancel()

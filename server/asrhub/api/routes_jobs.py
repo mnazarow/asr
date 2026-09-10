@@ -345,8 +345,9 @@ def list_jobs(
                     "downturn, recovered, alerts, open_commitments, "
                     "interruptions, silence, script_failed, money, monologue, "
                     "mixed, dead_air, frustrated, repeat, profanity, "
-                    "profanity_agent) или по здоровью распознавания (suspect, "
-                    "hallucination, speakers_mismatch)"),
+                    "profanity_agent), по здоровью распознавания (suspect, "
+                    "hallucination, speakers_mismatch) или по звуку на входе "
+                    "(bad_audio, noisy, clipped)"),
     light: bool = Query(default=False,
                         description="Только поля для таблицы, без текста и сегментов"),
     principal: Principal = Depends(authenticate),

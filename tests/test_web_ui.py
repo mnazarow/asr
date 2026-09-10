@@ -488,3 +488,41 @@ def test_the_record_card_saves_a_reference_and_shows_accuracy(страница):
     # Калибровка и латентность отрисованы: у записей есть уверенность и время.
     assert страница.inner_text("#latency-body").count("demo-simulator") >= 1
     _чисто(страница)
+
+
+def test_a_request_aborted_while_its_body_is_read_stays_silent(страница):
+    """Отмена приходит и во время чтения тела ответа — на большом ответе
+    чаще, чем до него. Раньше такой AbortError вылетал сырым исключением
+    мимо разбора: красная плашка и ошибка в консоли при обычном
+    переключении вкладок. Проверка воспроизводит это на месте."""
+    _открыть(страница, "analytics")
+    страница.wait_for_selector("#chart-flow svg", timeout=20000)
+    # Тело ответа читается 800 мс и роняет AbortError при отмене — ровно
+    # так ведёт себя настоящий fetch, только медленнее.
+    страница.evaluate("""() => {
+      const родной = window.fetch;
+      window.fetch = async function (вход, настройки) {
+        const ответ = await родной(вход, настройки);
+        const сигнал = настройки && настройки.signal;
+        const тело = await ответ.text();
+        return {
+          ok: ответ.ok, status: ответ.status, headers: ответ.headers,
+          text: () => new Promise((готово, отказ) => {
+            const т = setTimeout(() => готово(тело), 800);
+            if (сигнал) сигнал.addEventListener('abort', () => {
+              clearTimeout(т);
+              отказ(new DOMException('The user aborted a request.', 'AbortError'));
+            });
+          }),
+        };
+      };
+    }""")
+    # Ошибка запроса идёт туда же, куда её отправляют разделы, — в fail().
+    страница.evaluate("() => { window.__asrhub.API.latest('т', '/api/health').catch(window.__asrhub.fail); }")
+    страница.wait_for_timeout(150)
+    # Второй запрос с тем же ключом отменяет первый посреди чтения тела.
+    страница.evaluate("() => { window.__asrhub.API.latest('т', '/api/health'); }")
+    страница.wait_for_timeout(1500)
+    плашки = страница.inner_text("#toasts")
+    assert "aborted" not in плашки and "Запрос отменён" not in плашки, плашки
+    _чисто(страница)

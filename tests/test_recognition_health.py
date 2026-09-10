@@ -347,3 +347,143 @@ def test_the_sections_reach_the_api_the_export_and_prometheus(client, sample_wav
     assert 'asrhub_rtf_p95_by_model{model="demo-simulator"}' in метрики
     # Калибровка — от пятисот слов: одна короткая запись её не даёт.
     assert 'asrhub_calibration_ece{' not in метрики
+
+
+# ---------------------------------------------------------------------------
+# Профиль звука на входе
+# ---------------------------------------------------------------------------
+
+
+def test_k_weighting_reproduces_bs1770_and_lufs_matches_the_reference_tone():
+    """Коэффициенты фильтров на 48 кГц совпадают с таблицей BS.1770-4;
+    синус 997 Гц на −20 dBFS даёт −23 LUFS на любой частоте; тишина —
+    ничего; тихий хвост отсекается гейтом."""
+    import numpy as np
+    from asrhub.pipeline import audio_profile as AP
+
+    b, a = AP._biquad(*AP._ШЕЛФ, 48000.0)
+    assert b == pytest.approx([1.53512485958697, -2.69169618940638, 1.19839281085285], abs=2e-4)
+    assert a == pytest.approx([1.0, -1.69065929318241, 0.73248077421585], abs=2e-4)
+    b, a = AP._biquad(*AP._ВЫСОКИЕ, 48000.0)
+    assert b == [1.0, -2.0, 1.0]
+    assert a == pytest.approx([1.0, -1.99004745483398, 0.99007225036621], abs=1e-4)
+
+    for rate in (48000, 16000):
+        t = np.arange(rate * 4) / rate
+        синус = (0.1 * np.sin(2 * np.pi * 997 * t)).astype(np.float32)
+        assert AP.loudness_lufs(синус, rate) == pytest.approx(-23.0, abs=0.15), rate
+        # Хвост в −60 dBFS шума: относительный гейт (−10 LU) его выбрасывает.
+        хвост = (np.random.default_rng(1).standard_normal(rate * 4) * 0.001).astype(np.float32)
+        с_хвостом = np.concatenate([синус, хвост])
+        assert AP.loudness_lufs(с_хвостом, rate) == pytest.approx(-23.0, abs=0.2), rate
+    assert AP.loudness_lufs(np.zeros(16000, dtype=np.float32), 16000) is None
+    assert AP.loudness_lufs(np.zeros(100, dtype=np.float32), 16000) is None
+
+
+def test_audio_profile_estimates_snr_peak_clipping_and_silence():
+    import numpy as np
+    from asrhub.pipeline import audio_profile as AP
+
+    rate = 16000
+    rng = np.random.default_rng(5)
+    t = np.arange(rate * 20) / rate
+    # Речь-подобный сигнал: тон −20 dBFS секунду через секунду; шум −40 dBFS
+    # всё время. Истинное отношение — 20 дБ.
+    речь = (0.1 * np.sqrt(2) * np.sin(2 * np.pi * 180 * t)) * (np.floor(t) % 2 == 0)
+    шум = rng.standard_normal(len(t)) * 0.01
+    x = (речь + шум).astype(np.float32)
+    п = AP.profile(x, rate)
+    assert п["method"] == "percentile" and 16.0 <= п["snr_db"] <= 24.0, п
+    assert п["clipping_share"] == 0.0 and -22.0 <= п["peak_dbfs"] <= -14.0
+    assert п["silence_share"] == 0.0            # шум −40 dBFS громче порога −45
+    assert п["measured_s"] == 20.0
+    # С разметкой речи оценка точнее и доля тишины — по VAD.
+    участки = [(float(s), float(s) + 1.0) for s in range(0, 20, 2)]
+    в = AP.profile(x, rate, speech_spans=участки)
+    assert в["method"] == "vad" and 18.0 <= в["snr_db"] <= 22.0, в
+    assert в["silence_share"] == pytest.approx(0.5, abs=0.01)
+    assert isinstance(в["silence_share"], float)
+
+    # Уровень речи — средняя мощность, а не средний децибел: одна секунда
+    # на −20 dBFS среди девяти на −40 даёт среднюю мощность −29,6 dBFS,
+    # а средний децибел — −38; при шуме −50 dBFS это 20 дБ против 12.
+    неровная = np.zeros(len(t))
+    for s in range(0, 20, 2):
+        уровень = 0.1 * np.sqrt(2) if s == 0 else 0.01 * np.sqrt(2)
+        неровная[(t >= s) & (t < s + 1)] = уровень * np.sin(2 * np.pi * 180 * t[(t >= s) & (t < s + 1)])
+    шумок = rng.standard_normal(len(t)) * 0.00316          # −50 dBFS
+    н = AP.profile((неровная + шумок).astype(np.float32), rate, speech_spans=участки)
+    assert 18.5 <= н["snr_db"] <= 22.5, н
+
+    # Срезанные вершины: пик на нуле, доля клиппинга заметна.
+    срез = np.clip(речь * 30, -1, 1).astype(np.float32)
+    к = AP.profile(срез, rate)
+    assert к["peak_dbfs"] == 0.0 and к["clipping_share"] > 0.1
+    assert AP.is_bad(к) and AP.is_bad({"snr_db": 9.9}) and not AP.is_bad({"snr_db": 10.0})
+    # Цифровая тишина между словами: оценка упирается в предел, а не в бесконечность.
+    assert AP.profile(np.clip(речь, -1, 1).astype(np.float32), rate)["snr_db"] == AP.ПРЕДЕЛ_SNR
+    # Тишина целиком: половина кадров тише порога.
+    половина = np.concatenate([x[:rate * 10], np.zeros(rate * 10, dtype=np.float32)])
+    assert AP.profile(половина, rate)["silence_share"] == pytest.approx(0.5, abs=0.02)
+    assert AP.profile(np.zeros(0, dtype=np.float32), rate) == {}
+
+    assert [AP.snr_band(v) for v in (-3, 4.9, 5, 9.9, 10, 19.9, 20, 60, None)] == [
+        "ниже 5 дБ", "ниже 5 дБ", "5–10 дБ", "5–10 дБ", "10–20 дБ", "10–20 дБ",
+        "20 дБ и выше", "20 дБ и выше", None]
+    слитый = AP.merge([{"snr_db": 20, "clipping_share": 0.0, "loudness_lufs": -30,
+                        "silence_share": 0.5, "peak_dbfs": -6},
+                       {"snr_db": 8, "clipping_share": 0.02, "loudness_lufs": -20,
+                        "silence_share": 0.7, "peak_dbfs": -1}])
+    assert слитый == {"snr_db": 8, "clipping_share": 0.02, "loudness_lufs": -20,
+                      "silence_share": 0.6, "peak_dbfs": -1}
+    assert AP.merge([{}, {"snr_db": 3}]) == {"snr_db": 3} and AP.merge([]) == {}
+    assert AP.for_job({}) == {} and set(AP.for_job(слитый)) == {
+        "snr_db", "peak_dbfs", "clipping_share", "loudness_lufs", "silence_share"}
+
+
+def test_the_pipeline_stores_the_audio_profile_and_the_archive_slices_it(
+        client, sample_wav: Path):
+    """Профиль считается при подготовке и ложится в задание; по нему есть
+    отбор, разрез в аналитике, строка в сводке и метрика."""
+    from asrhub.maintenance import build_digest
+
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("звук.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    for _ in range(80):
+        job = client.get(f"/api/jobs/{job['id']}").json()
+        if job["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.25)
+    assert job["status"] == "completed", job
+    for поле in ("snr_db", "peak_dbfs", "clipping_share", "loudness_lufs", "silence_share"):
+        assert job[поле] is not None, поле
+    # Запись — тон, тишина, тон: тишины заметно, клиппинга нет.
+    assert job["silence_share"] > 0.1 and job["clipping_share"] == 0.0
+
+    состояние = client.app.state.hub
+    состояние.db.update_job(job["id"], snr_db=6.0)
+    плохие = client.get("/api/jobs?content=bad_audio&light=true").json()
+    assert [j["id"] for j in плохие["items"]] == [job["id"]]
+    assert client.get("/api/jobs?content=clipped&light=true").json()["items"] == []
+    assert client.get("/api/jobs?content=noisy&light=true").json()["total"] == 1
+
+    звук = client.get("/api/analytics/audio?period=day").json()
+    assert звук["measured_jobs"] >= 1 and звук["noisy_jobs"] == 1 and звук["bad_audio_jobs"] == 1
+    assert звук["bad_audio_share"] > 0 and звук["snr_db"]["p10"] <= 6.0
+    корзины = {к["key"]: к for к in звук["snr_bands"]}
+    assert корзины["5–10 дБ"]["jobs"] == 1 and корзины["5–10 дБ"]["confidence_avg"] > 0
+    assert звук["bad_audio_by_source"][0]["bad"] == 1
+
+    сводка = build_digest(состояние.analytics, состояние.settings, period="day")
+    assert сводка["bad_audio"]["jobs"] == 1 and сводка["bad_audio"]["noisy"] == 1
+    assert "Плохой звук на входе: 1 из" in сводка["text"], сводка["text"]
+    метрики = client.get("/api/monitoring/metrics").text
+    assert "asrhub_bad_audio_share " in метрики and 'asrhub_audio_snr_db{stat="p50"}' in метрики
+    import io
+    import zipfile
+
+    архив = zipfile.ZipFile(io.BytesIO(client.get("/api/analytics/export?period=day&fmt=csv").content))
+    assert any("Звук на входе" in имя for имя in архив.namelist()), архив.namelist()

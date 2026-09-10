@@ -697,6 +697,68 @@ class Analytics:
             "bitrate_kbps": M.summarize(битрейты),
             "segments_per_minute": M.summarize(плотность),
             "speakers": [{"speakers": k, "jobs": v} for k, v in sorted(говорящие.items())],
+            **self._звук_на_входе(jobs),
+        }
+
+    @staticmethod
+    def _звук_на_входе(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Профиль звука по записям: корзины SNR против уверенности, WER и
+        подозрительных сегментов, доля плохого звука, громкость, клиппинг.
+
+        Это ответ на «почему у этого источника ошибок вдвое больше»:
+        WER растёт с падением SNR предсказуемо (Deepgram: 3,5 % при 20 дБ,
+        15 % при 10, 35 % при 5), и разрез по корзинам показывает, где
+        именно в этой зависимости живут свои записи.
+        """
+        from .pipeline import audio_profile as AP  # noqa: PLC0415
+
+        измеренные = [j for j in jobs if j.get("snr_db") is not None]
+        корзины: dict[str, list[dict[str, Any]]] = {}
+        for j in измеренные:
+            корзины.setdefault(AP.snr_band(float(j["snr_db"])), []).append(j)
+
+        def свод(items: list[dict[str, Any]]) -> dict[str, Any]:
+            conf = [float(j["avg_confidence"]) for j in items if j.get("avg_confidence")]
+            wer = [float(j["wer"]) for j in items if j.get("wer") is not None]
+            подозр = [float(j["suspect_share"]) for j in items
+                      if j.get("suspect_share") is not None]
+            return {
+                "jobs": len(items),
+                "audio_hours": round(sum(float(j.get("media_duration_s") or 0)
+                                         for j in items) / 3600, 2),
+                "confidence_avg": round(sum(conf) / len(conf), 4) if conf else None,
+                "low_confidence_share": round(sum(1 for c in conf if c < 0.75) / len(conf), 4)
+                if conf else None,
+                "wer_avg": round(sum(wer) / len(wer), 4) if wer else None,
+                "wer_jobs": len(wer),
+                "suspect_share_avg": round(sum(подозр) / len(подозр), 4) if подозр else None,
+            }
+
+        плохие = [j for j in измеренные if AP.is_bad(j)]
+        return {
+            "measured_jobs": len(измеренные),
+            "snr_db": M.summarize([float(j["snr_db"]) for j in измеренные]),
+            "loudness_lufs": M.summarize([float(j["loudness_lufs"]) for j in измеренные
+                                          if j.get("loudness_lufs") is not None]),
+            "peak_dbfs": M.summarize([float(j["peak_dbfs"]) for j in измеренные
+                                      if j.get("peak_dbfs") is not None]),
+            "silence_share": M.summarize([float(j["silence_share"]) for j in измеренные
+                                          if j.get("silence_share") is not None]),
+            "clipped_jobs": sum(1 for j in измеренные
+                                if (j.get("clipping_share") or 0) >= AP.КЛИППИНГ_ПЛОХОЙ),
+            "noisy_jobs": sum(1 for j in измеренные if float(j["snr_db"]) < AP.SNR_ПЛОХОЙ),
+            "bad_audio_jobs": len(плохие),
+            "bad_audio_share": round(len(плохие) / len(измеренные), 4) if измеренные else None,
+            "snr_bands": [{"key": подпись, **свод(корзины.get(подпись, []))}
+                          for _, подпись in AP.КОРЗИНЫ_SNR],
+            "bad_audio_by_source": sorted(
+                ({"key": имя, "jobs": n, "bad": b, "share": round(b / n, 4)}
+                 for имя, (n, b) in (
+                     (src, (sum(1 for j in измеренные if str(j.get("source") or "api") == src),
+                            sum(1 for j in плохие if str(j.get("source") or "api") == src)))
+                     for src in {str(j.get("source") or "api") for j in измеренные})
+                 if n),
+                key=lambda r: -r["share"]),
         }
 
     # --- расход ресурсов ----------------------------------------------------

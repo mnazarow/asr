@@ -355,7 +355,7 @@ def percentile(values: Sequence[float], q: float) -> float:
 def summarize(values: Sequence[float]) -> dict[str, float]:
     """Сводка распределения: среднее, медиана, перцентили, разброс."""
     if not values:
-        return {"count": 0, "avg": 0.0, "min": 0.0, "max": 0.0,
+        return {"count": 0, "avg": 0.0, "min": 0.0, "max": 0.0, "p10": 0.0,
                 "p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0, "stdev": 0.0}
     data = [float(v) for v in values]
     avg = sum(data) / len(data)
@@ -365,6 +365,8 @@ def summarize(values: Sequence[float]) -> dict[str, float]:
         "avg": round(avg, 6),
         "min": round(min(data), 6),
         "max": round(max(data), 6),
+        # Нижний перцентиль нужен там, где плох именно низ: SNR, громкость.
+        "p10": round(percentile(data, 0.10), 6),
         "p50": round(percentile(data, 0.50), 6),
         "p90": round(percentile(data, 0.90), 6),
         "p95": round(percentile(data, 0.95), 6),
