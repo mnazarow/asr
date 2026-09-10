@@ -526,3 +526,31 @@ def test_a_request_aborted_while_its_body_is_read_stays_silent(страница)
     плашки = страница.inner_text("#toasts")
     assert "aborted" not in плашки and "Запрос отменён" not in плашки, плашки
     _чисто(страница)
+
+
+def test_the_review_queue_card_fills_opens_the_reference_tab_and_skips(страница):
+    """Очередь проверки: пополняется кнопкой, «Открыть» ведёт сразу на
+    вкладку «Эталон», «Пропустить» убирает строку без перезагрузки."""
+    _открыть(страница, "analytics")
+    страница.wait_for_selector("#review-body table, #review-body .empty", timeout=20000)
+    страница.wait_for_timeout(500)
+    assert "Согласие моделей" in страница.inner_text("#analytics-body")
+    страница.click("#review-sample-now")
+    страница.wait_for_selector("#review-body table", timeout=15000)
+    страница.wait_for_timeout(500)
+    строк = страница.evaluate("() => document.querySelectorAll('#review-body tbody tr').length")
+    assert строк >= 1, страница.inner_text("#review-body")[:400]
+    тело = страница.inner_text("#review-body")
+    assert "случайная" in тело or "неуверенная" in тело, тело[:400]
+
+    страница.click("#review-body [data-review-open]")
+    страница.wait_for_selector("#job-reference-text", timeout=10000)
+    assert страница.is_visible("#job-reference-save")
+    страница.click("#modal-close")
+    страница.wait_for_timeout(300)
+
+    страница.click("#review-body [data-review-skip]")
+    страница.wait_for_timeout(1200)
+    осталось = страница.evaluate("() => document.querySelectorAll('#review-body tbody tr').length")
+    assert осталось == строк - 1, (строк, осталось)
+    _чисто(страница)

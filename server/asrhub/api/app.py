@@ -36,6 +36,7 @@ from .routes_content import router as content_router
 from .routes_jobs import router as jobs_router
 from .routes_monitoring import router as monitoring_router
 from .routes_phone import router as phone_router
+from .routes_review import router as review_router
 from .routes_system import health_router
 from .routes_system import router as system_router
 
@@ -487,6 +488,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(health_router)
     app.include_router(monitoring_router)
     app.include_router(content_router)
+    app.include_router(review_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.
     app.include_router(phone_router)

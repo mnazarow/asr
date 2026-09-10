@@ -487,3 +487,256 @@ def test_the_pipeline_stores_the_audio_profile_and_the_archive_slices_it(
 
     архив = zipfile.ZipFile(io.BytesIO(client.get("/api/analytics/export?period=day&fmt=csv").content))
     assert any("Звук на входе" in имя for имя in архив.namelist()), архив.namelist()
+
+
+# ---------------------------------------------------------------------------
+# Очередь ручной проверки и контрольные прогоны
+# ---------------------------------------------------------------------------
+
+
+class _Параметры:
+    def __init__(self, **значения):
+        self.значения = {"review_enabled": True, "review_daily_share": 10.0,
+                         "review_daily_low": 3, "review_daily_max": 20, **значения}
+
+    def get(self, ключ, по_умолчанию=None):
+        return self.значения.get(ключ, по_умолчанию)
+
+
+def _архив_за_сутки(tmp_path, n: int = 40):
+    from asrhub.db import Database
+
+    db = Database(tmp_path / "asrhub.db")
+    сейчас = time.time()
+    for i in range(n):
+        когда = сейчас - 600 - i * 60
+        job_id = db.create_job({"id": f"r{i:03d}", "filename": f"{i}.wav", "owner": "анна",
+                                "model": "m", "engine": "e", "media_duration_s": 30.0})
+        db.execute("UPDATE jobs SET created_at=? WHERE id=?", (когда, job_id))
+        db.update_job(job_id, status="completed", finished_at=когда + 10, text="т",
+                      avg_confidence=round(0.5 + i * 0.01, 3))
+    # Не кандидаты: из кеша, контрольный прогон, с эталоном, старая.
+    for job_id, поля in (("cached", {"cached_from": "r000"}),
+                         ("ctrl", {}), ("withref", {"ref_words": 10, "wer": 0.1})):
+        db.create_job({"id": job_id, "filename": job_id, "owner": "анна", "model": "m",
+                       "source": "control" if job_id == "ctrl" else "api"})
+        db.update_job(job_id, status="completed", finished_at=сейчас, text="т",
+                      avg_confidence=0.1, **поля)
+    старая = db.create_job({"id": "old", "filename": "old", "owner": "анна", "model": "m"})
+    db.execute("UPDATE jobs SET created_at=? WHERE id=?", (сейчас - 3 * 86400, старая))
+    db.update_job(старая, status="completed", finished_at=сейчас - 3 * 86400, text="т",
+                  avg_confidence=0.05)
+    return db
+
+
+def test_review_sampling_takes_a_random_share_and_the_lowest_quartile(tmp_path):
+    """10 % случайных от сорока — четыре; три самых неуверенных из нижней
+    четверти; кешированные, контрольные, с эталоном и старые — мимо; второй
+    отбор за те же сутки ничего не дублирует; предел режет."""
+    from asrhub import review
+
+    db = _архив_за_сутки(tmp_path)
+    итог = review.sample_review(db, _Параметры(), rng=random.Random(1))
+    assert итог == {"candidates": 40, "added": 7, "random": 4, "low_confidence": 3}
+    строки = db.review_list(status="pending", limit=100)
+    assert len(строки) == 7
+    неуверенные = [с for с in строки if с["reason"] == "low_confidence"]
+    # Нижняя четверть — уверенность до 0,59; самые низкие первыми.
+    assert all(с["avg_confidence"] <= 0.59 for с in неуверенные), неуверенные
+    assert {с["job_id"] for с in строки}.isdisjoint({"cached", "ctrl", "withref", "old"})
+    # Порядок выдачи — сначала ожидающие, самые неуверенные первыми.
+    assert строки[0]["avg_confidence"] == min(с["avg_confidence"] for с in строки)
+
+    # Повторный отбор в те же сутки: кандидаты те же, но уже в очереди.
+    снова = review.sample_review(db, _Параметры(), rng=random.Random(2))
+    assert снова["added"] == 0 or len(db.review_list(limit=100)) == 7 + снова["added"]
+    # Предел: не больше двух за заход.
+    db2 = _архив_за_сутки(tmp_path / "b")
+    assert review.sample_review(db2, _Параметры(review_daily_max=2),
+                                rng=random.Random(1))["added"] == 2
+    # Ноль везде — пусто, а не падение.
+    db3 = _архив_за_сутки(tmp_path / "c")
+    assert review.sample_review(db3, _Параметры(review_daily_share=0, review_daily_low=0))[
+        "added"] == 0
+    # Только неуверенные: ровно три, все из нижней четверти.
+    только = review.sample_review(db3, _Параметры(review_daily_share=0))
+    assert только == {"candidates": 40, "added": 3, "random": 0, "low_confidence": 3}
+    # Четверть — это граница, а не пожелание: просят пятнадцать, а в нижней
+    # четверти сорока записей только десять, и три уже взяты.
+    db4 = _архив_за_сутки(tmp_path / "d")
+    assert review.sample_review(db4, _Параметры(review_daily_share=0, review_daily_low=15))[
+        "low_confidence"] == 10
+    # Доля округляется вверх: 11 % от сорока — пять, а не четыре.
+    db5 = _архив_за_сутки(tmp_path / "e")
+    assert review.sample_review(db5, _Параметры(review_daily_share=11, review_daily_low=0),
+                                rng=random.Random(3))["random"] == 5
+
+
+def test_the_review_queue_is_served_by_the_api_and_closed_by_a_reference(client, sample_wav: Path):
+    """Ручки: список с счётчиками, добавить вручную, пропустить, пополнить;
+    эталон закрывает строку сам, с именем проверяющего."""
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("п.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    for _ in range(80):
+        job = client.get(f"/api/jobs/{job['id']}").json()
+        if job["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.25)
+    assert job["status"] == "completed"
+
+    пусто = client.get("/api/review").json()
+    assert пусто["items"] == [] and пусто["enabled"] is True
+    # Пополнить сейчас: одна запись за сутки — 1 % от одной это одна.
+    итог = client.post("/api/review/sample").json()
+    assert итог["added"] == 1 and итог["random"] == 1
+    очередь = client.get("/api/review").json()
+    assert [з["job_id"] for з in очередь["items"]] == [job["id"]]
+    assert очередь["items"][0]["reason"] == "random" and очередь["counts"]["pending"] == 1
+    assert очередь["last_sampled_at"] is not None
+    # Повторное добавление вручную ничего не дублирует.
+    assert client.post(f"/api/review/{job['id']}").json()["added"] is False
+    # Эталон закрывает строку: done, с именем того, кто задал.
+    client.post(f"/api/jobs/{job['id']}/reference", json={"text": "другой текст"})
+    сделано = client.get("/api/review?status=done").json()
+    assert сделано["items"][0]["job_id"] == job["id"]
+    assert сделано["items"][0]["reviewer"] and сделано["counts"]["done"] == 1
+    assert client.get("/api/review").json()["items"] == []
+    # Вернуть и пропустить.
+    assert client.put(f"/api/review/{job['id']}", json={"status": "pending"}).json()["status"] == "pending"
+    assert client.put(f"/api/review/{job['id']}", json={"status": "skipped",
+                                                        "note": "служебная"}).status_code == 200
+    assert client.get("/api/review?status=skipped").json()["items"][0]["note"] == "служебная"
+    assert client.put(f"/api/review/{job['id']}", json={"status": "странно"}).status_code == 400
+    assert client.put("/api/review/нет-такой", json={"status": "done"}).status_code == 404
+    метрики = client.get("/api/monitoring/metrics").text
+    assert "asrhub_review_pending 0" in метрики
+    from asrhub.maintenance import build_digest
+
+    состояние = client.app.state.hub
+    сводка = build_digest(состояние.analytics, состояние.settings, period="day")
+    assert сводка["review"]["skipped"] == 1 and "Очередь ручной проверки" in сводка["text"]
+
+
+def test_control_runs_are_low_priority_jobs_whose_disagreement_is_recorded(
+        client, sample_wav: Path, monkeypatch):
+    """Контрольный прогон: задание второй моделью с источником control и
+    меткой «контроль», расхождение — в таблицу и в события, в разбор
+    содержания не идёт; ручки и метрика на месте."""
+    import dataclasses
+
+    from asrhub import review
+    from asrhub.catalog import models as каталог
+
+    состояние = client.app.state.hub
+    # Вторая «модель» — копия демонстрационной под другим именем.
+    демо = каталог.get_model("demo-simulator")
+    monkeypatch.setitem(каталог.MODELS_BY_ID, "demo-control",
+                        dataclasses.replace(демо, id="demo-control", name="Контрольный симулятор"))
+    with sample_wav.open("rb") as handle:
+        job = client.post("/api/jobs", files={"file": ("к.wav", handle, "audio/wav")},
+                          data={"settings": json.dumps({"model": "demo-simulator",
+                                                        "engine": "demo",
+                                                        "vad_backend": "energy"})}).json()
+    for _ in range(80):
+        job = client.get(f"/api/jobs/{job['id']}").json()
+        if job["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.25)
+    assert job["status"] == "completed"
+
+    # Без контрольной модели — отказ с подсказкой.
+    assert client.post("/api/control/run").status_code == 400
+    состояние.settings.set("control_model", "demo-control")
+    итог = client.post("/api/control/run").json()
+    assert итог["submitted"] == 1 and итог["candidates"] == 1, итог
+    контрольное = итог["jobs"][0]
+    for _ in range(80):
+        проверка = client.get(f"/api/jobs/{контрольное}").json()
+        if проверка["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.25)
+    assert проверка["status"] == "completed", проверка
+    assert проверка["source"] == "control" and "контроль" in проверка["tags"]
+    assert проверка["priority"] == review.ПРИОРИТЕТ_КОНТРОЛЯ
+    assert проверка["params"]["control_of"] == job["id"] and проверка["model"] == "demo-control"
+
+    строки = состояние.db.model_checks(0)
+    assert len(строки) == 1 and строки[0]["job_id"] == job["id"]
+    assert строки[0]["check_job_id"] == контрольное and строки[0]["wer"] is not None
+    assert строки[0]["control_model"] == "demo-control" and строки[0]["words"] > 0
+    события = client.get(f"/api/jobs/{job['id']}").json()["events"]
+    assert any(с["kind"] == "control_done" for с in события), события
+    # Разбор содержания контрольного задания не делается.
+    assert состояние.db.query_one("SELECT COUNT(*) n FROM content WHERE job_id=?",
+                                  (контрольное,))["n"] == 0
+    assert all(з["id"] != контрольное for з in состояние.db.content_pending(999, 100))
+    # Повторный запуск в те же сутки: та же запись второй раз не берётся.
+    assert client.post("/api/control/run").json()["submitted"] == 0
+
+    отчёт = client.get("/api/control?period=day").json()
+    assert отчёт["checks"] == 1 and отчёт["verdict"] == "unknown"
+    assert отчёт["by_pair"] == [{"model": "demo-simulator", "control_model": "demo-control",
+                                 "checks": 1, "wer_avg": round(строки[0]["wer"], 4),
+                                 "mer_avg": round(строки[0]["mer"], 4)}]
+    assert отчёт["worst"][0]["job_id"] == job["id"] and len(отчёт["by_day"]) == 1
+    assert client.get("/api/analytics/agreement?period=day").json()["checks"] == 1
+    метрики = client.get("/api/monitoring/metrics").text
+    assert 'asrhub_model_disagreement{model="demo-simulator"}' in метрики
+    # Неизвестная контрольная модель — пропуск с причиной, а не сбой.
+    состояние.settings.values["control_model"] = "нет-такой"
+    assert "неизвестна" in review.sample_control(состояние.db, состояние.settings,
+                                                 состояние.queue)["reason"]
+
+
+def test_the_scheduler_samples_once_a_day_and_the_agreement_verdict_follows_growth(tmp_path):
+    from asrhub import maintenance, review
+    from asrhub.analytics import Analytics
+
+    db = _архив_за_сутки(tmp_path)
+    параметры = _Параметры(backup_interval_hours=0, digest_url="", control_model="")
+    # Первый заход только ставит отметку: отбор — через сутки после запуска.
+    assert "review" not in maintenance.run_scheduled(db, параметры, None)
+    db.set_kv(maintenance.KV_REVIEW, time.time() - 25 * 3600)
+    сделано = maintenance.run_scheduled(db, параметры, None)
+    assert сделано["review"]["added"] == 7
+    # Раз в сутки, а не чаще: через два часа заход не повторяется.
+    db.set_kv(maintenance.KV_REVIEW, time.time() - 2 * 3600)
+    assert "review" not in maintenance.run_scheduled(db, параметры, None)
+    # Выключенная очередь — заход не идёт.
+    db.set_kv(maintenance.KV_REVIEW, time.time() - 25 * 3600)
+    assert "review" not in maintenance.run_scheduled(db, _Параметры(review_enabled=False), None)
+    # Контроль без очереди заданий и без модели — не идёт.
+    assert "control" not in maintenance.run_scheduled(db, параметры, None, queue=None)
+
+    # Вердикт согласия: прошлый период 10 %, этот — 16 % (+60 %) → критично.
+    сейчас = time.time()
+    for i in range(6):
+        db.execute("INSERT INTO model_checks (job_id, check_job_id, model, control_model, wer, "
+                   "mer, words, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                   (f"r{i:03d}", f"c{i}", "m", "k", 0.10, 0.09, 100, сейчас - 10 * 86400))
+        db.execute("INSERT INTO model_checks (job_id, check_job_id, model, control_model, wer, "
+                   "mer, words, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                   (f"r{i + 6:03d}", f"d{i}", "m", "k", 0.16, 0.15, 100, сейчас - 2 * 86400))
+    свод = Analytics(db).agreement("week")
+    assert свод["checks"] == 6 and свод["previous_checks"] == 6
+    assert свод["wer_avg"] == 0.16 and свод["previous_wer_avg"] == 0.1
+    assert свод["growth"] == pytest.approx(0.6) and свод["verdict"] == "critical"
+    assert свод["by_pair"][0]["checks"] == 6 and len(свод["worst"]) == 6
+    # Рост на треть — предупреждение; без прошлого периода — ok; мало — unknown.
+    db.execute("UPDATE model_checks SET wer=0.13 WHERE created_at > ?", (сейчас - 5 * 86400,))
+    assert Analytics(db).agreement("week")["verdict"] == "warning"
+    assert Analytics(db).agreement("month")["verdict"] == "ok"
+    db.execute("DELETE FROM model_checks WHERE created_at > ? AND job_id <> 'r006'",
+               (сейчас - 5 * 86400,))
+    assert Analytics(db).agreement("week")["verdict"] == "unknown"
+    assert review.record_check(db, {"id": "x", "params": {}}, []) is None
+    # Сводка называет рост согласия только при вердикте.
+    from asrhub.maintenance import digest_text
+
+    текст = digest_text({}, {}, {}, agreement={"verdict": "critical", "checks": 6,
+                                              "wer_avg": 0.16, "previous_wer_avg": 0.1})
+    assert "Согласие моделей: критично — расхождение 10 % → 16 % по 6" in текст, текст
+    assert review.record_check(db, {"id": "x", "params": {"control_of": "нет"}}, []) is None

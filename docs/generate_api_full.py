@@ -66,6 +66,12 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      "разбор одной записи. Выборка сужается до записей самого ключа; "
      "пересчёт всего архива — только администратору.",
      ("/api/content",)),
+    ("Здоровье распознавания",
+     "Очередь ручной проверки и контрольные прогоны второй моделью: то, из "
+     "чего появляются эталоны и согласие моделей. Список сужается до "
+     "записей самого ключа; пополнить очередь и поставить прогоны может "
+     "только администратор.",
+     ("/api/review", "/api/control")),
     ("Обслуживание",
      "Освобождение места и памяти. Обе операции необратимы, поэтому требуют "
      "ключа администратора.",
@@ -92,7 +98,7 @@ ROOT_PATHS = {"/health", "/process-call", "/statuses"}
 OPEN_ROUTES = {"/api/health", "/health"}
 #: Маршруты, выборка которых сужается до заданий самого ключа.
 SCOPED_ROUTES = {"/api/jobs", "/api/analytics", "/api/analytics/{section}",
-                 "/api/events", "/api/content"}
+                 "/api/events", "/api/content", "/api/review", "/api/control"}
 #: Маршруты, требующие ключа администратора.
 ADMIN_ROUTES = {
     ("/api/keys", "get"), ("/api/keys", "post"), ("/api/keys/{preview}", "delete"),
@@ -112,6 +118,9 @@ ADMIN_ROUTES = {
     # обещал бы доступ, которого сервер не даёт.
     ("/api/users", "get"), ("/api/users", "post"),
     ("/api/users/{user_id}", "patch"), ("/api/users/{user_id}", "delete"),
+    # Пополнить очередь проверки и поставить контрольные прогоны — работа
+    # для всего сервера, а не для своих заданий: только администратор.
+    ("/api/review/sample", "post"), ("/api/control/run", "post"),
 }
 #: Вход и выход ключа не требуют вовсе: это и есть способ его получить.
 OPEN_AUTH_ROUTES = {"/api/auth/login", "/api/auth/logout"}
@@ -419,6 +428,16 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     ("/api/analytics", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/analytics?period=week'",
         "show": "/api/analytics?period=week", "limit": 1100,
+    },
+    ("/api/review", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/review?status=pending&limit=20'",
+        "show": "/api/review?status=pending&limit=3", "limit": 1200,
+        "note": "Строка закрывается сама, когда по записи задан эталон "
+                "(`POST /api/jobs/{id}/reference`).",
+    },
+    ("/api/control", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/control?period=week'",
+        "show": "/api/control?period=week", "limit": 1400,
     },
     ("/api/analytics/{section}", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/analytics/latency?period=week'",

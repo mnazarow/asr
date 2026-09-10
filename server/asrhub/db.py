@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -117,6 +117,39 @@ _CONTENT_MARKS_SCHEMA = """
         updated_at REAL NOT NULL,
         PRIMARY KEY (job_id, kind)
     ) WITHOUT ROWID
+"""
+
+#: Очередь ручной проверки: какие записи послушать человеку и чем это
+#: кончилось. По строке на запись; причина — почему попала (случайная
+#: выборка, нижний квартиль по уверенности, вручную). Правка текста
+#: становится эталоном, и строка закрывается сама.
+_REVIEW_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS review_queue (
+        job_id     TEXT PRIMARY KEY,
+        reason     TEXT NOT NULL,
+        status     TEXT NOT NULL DEFAULT 'pending',
+        picked_at  REAL NOT NULL,
+        done_at    REAL,
+        reviewer   TEXT,
+        note       TEXT
+    ) WITHOUT ROWID
+"""
+
+#: Контрольные прогоны второй моделью: расхождение двух расшифровок одной
+#: записи. Точность без эталона это не меряет; меряет согласие — и его
+#: ход по дням.
+_MODEL_CHECKS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS model_checks (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id        TEXT NOT NULL,
+        check_job_id  TEXT NOT NULL,
+        model         TEXT,
+        control_model TEXT,
+        wer           REAL,
+        mer           REAL,
+        words         INTEGER,
+        created_at    REAL NOT NULL
+    )
 """
 
 #: Основы слов записи — знаменатель TF-IDF. Отдельная таблица, а не разбор
@@ -242,6 +275,12 @@ _SCHEMA = [
     _CONTENT_HITS_SCHEMA,
     # --- версия 13: отметки коучинга и эталонов -------------------------
     _CONTENT_MARKS_SCHEMA,
+    # --- версия 16: очередь ручной проверки и контрольные прогоны --------
+    _REVIEW_SCHEMA,
+    _MODEL_CHECKS_SCHEMA,
+    "CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, picked_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_model_checks_created ON model_checks(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_model_checks_job ON model_checks(job_id)",
     *_CONTENT_INDEXES,
     # --- версия 1: основные таблицы ---------------------------------------
     """
@@ -696,6 +735,26 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "status": "TEXT",
         "note": "TEXT",
         "updated_at": "REAL",
+    },
+    "review_queue": {
+        "job_id": "TEXT",
+        "reason": "TEXT",
+        "status": "TEXT DEFAULT 'pending'",
+        "picked_at": "REAL",
+        "done_at": "REAL",
+        "reviewer": "TEXT",
+        "note": "TEXT",
+    },
+    "model_checks": {
+        "id": "INTEGER",
+        "job_id": "TEXT",
+        "check_job_id": "TEXT",
+        "model": "TEXT",
+        "control_model": "TEXT",
+        "wer": "REAL",
+        "mer": "REAL",
+        "words": "INTEGER",
+        "created_at": "REAL",
     },
     "content_hits": {
         "job_id": "TEXT",
@@ -1514,6 +1573,9 @@ class Database:
             "SELECT j.id, j.text, j.media_duration_s, j.quality_flags FROM jobs j "
             "LEFT JOIN content c ON c.job_id = j.id "
             "WHERE j.status='completed' AND j.text IS NOT NULL AND j.text != '' "
+            # Контрольные прогоны второй моделью — та же запись второй раз:
+            # в разборе содержания ей не место.
+            "  AND COALESCE(j.source,'') <> 'control' "
             "  AND (c.job_id IS NULL OR c.version < ?) "
             "ORDER BY j.created_at DESC LIMIT ?",
             (version, limit))
@@ -1844,6 +1906,119 @@ class Database:
                 out.setdefault(str(r["job_id"]), {})[str(r["kind"])] = {
                     "status": r["status"], "note": r["note"], "updated_at": r["updated_at"]}
         return out
+
+    # --- очередь ручной проверки ------------------------------------------
+
+    REVIEW_STATUSES = ("pending", "done", "skipped")
+    REVIEW_REASONS = ("random", "low_confidence", "manual", "bad_audio")
+
+    def review_add(self, job_id: str, reason: str, *, picked_at: float | None = None) -> bool:
+        """Ставит запись в очередь; уже стоящую — не трогает. True — добавлена."""
+        if reason not in self.REVIEW_REASONS:
+            raise ValueError(f"неизвестная причина проверки: {reason}")
+        with self.write() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO review_queue (job_id, reason, status, picked_at) "
+                "VALUES (?,?,'pending',?)", (job_id, reason, picked_at or now()))
+            return cur.rowcount > 0
+
+    def review_update(self, job_id: str, status: str, *, reviewer: str = "",
+                      note: str = "") -> bool:
+        """Меняет исход проверки: done, skipped или обратно pending."""
+        if status not in self.REVIEW_STATUSES:
+            raise ValueError(f"неизвестный исход проверки: {status}")
+        with self.write() as conn:
+            cur = conn.execute(
+                "UPDATE review_queue SET status=?, done_at=?, reviewer=?, note=? WHERE job_id=?",
+                (status, now() if status != "pending" else None, reviewer or None,
+                 note or None, job_id))
+            return cur.rowcount > 0
+
+    def review_queued_ids(self) -> set[str]:
+        return {str(r["job_id"]) for r in self.query("SELECT job_id FROM review_queue")}
+
+    def review_list(self, *, status: str | None = "pending",
+                    owner: str | list[str] | None = None,
+                    limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        """Очередь вместе с полями задания, нужными таблице."""
+        where = []
+        args: list[Any] = []
+        if status:
+            where.append("r.status=?")
+            args.append(status)
+        if isinstance(owner, (list, tuple)):
+            where.append(f"j.owner IN ({','.join('?' for _ in owner)})")
+            args.extend(owner)
+        elif owner:
+            where.append("j.owner=?")
+            args.append(owner)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        rows = self.query(
+            "SELECT r.job_id, r.reason, r.status, r.picked_at, r.done_at, r.reviewer, r.note, "
+            "       j.filename, j.model, j.owner, j.source, j.media_duration_s, "
+            "       j.avg_confidence, j.snr_db, j.wer, j.ref_words, j.created_at "
+            f"FROM review_queue r JOIN jobs j ON j.id = r.job_id {clause} "
+            "ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, "
+            "         j.avg_confidence ASC, r.picked_at DESC LIMIT ? OFFSET ?",
+            [*args, limit, offset])
+        return [dict(r) for r in rows]
+
+    def review_counts(self, since: float | None = None) -> dict[str, int]:
+        """Сколько ожидает, сколько разобрано и пропущено за окно."""
+        out = {"pending": 0, "done": 0, "skipped": 0}
+        for r in self.query(
+                "SELECT status, COUNT(*) n FROM review_queue "
+                "WHERE status='pending' OR done_at >= ? GROUP BY status", (since or 0.0,)):
+            out[str(r["status"])] = int(r["n"])
+        return out
+
+    # --- контрольные прогоны второй моделью ----------------------------------
+
+    def add_model_check(self, job_id: str, check_job_id: str, *, model: str,
+                        control_model: str, wer: float | None, mer: float | None,
+                        words: int) -> None:
+        self.execute(
+            "INSERT INTO model_checks (job_id, check_job_id, model, control_model, wer, mer, "
+            "words, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (job_id, check_job_id, model, control_model, wer, mer, words, now()))
+
+    def model_checks(self, since: float, *, owner: str | list[str] | None = None,
+                     limit: int = 100000) -> list[dict[str, Any]]:
+        where = ["m.created_at >= ?"]
+        args: list[Any] = [since]
+        if isinstance(owner, (list, tuple)):
+            where.append(f"j.owner IN ({','.join('?' for _ in owner)})")
+            args.extend(owner)
+        elif owner:
+            where.append("j.owner=?")
+            args.append(owner)
+        rows = self.query(
+            "SELECT m.id, m.job_id, m.check_job_id, m.model, m.control_model, m.wer, m.mer, "
+            "       m.words, m.created_at, j.filename, j.source, j.snr_db, j.avg_confidence "
+            f"FROM model_checks m JOIN jobs j ON j.id = m.job_id WHERE {' AND '.join(where)} "
+            "ORDER BY m.created_at DESC LIMIT ?", [*args, limit])
+        return [dict(r) for r in rows]
+
+    def file_paths(self, job_ids: list[str]) -> dict[str, str]:
+        """Пути исходных файлов по номерам заданий.
+
+        Отдельным запросом, а не колонкой облегчённого списка: путь на
+        диске сервера — не то, что должно уезжать в таблицу результатов
+        каждому ключу. Нужен только контрольному прогону — он ставит
+        задание на тот же файл.
+        """
+        out: dict[str, str] = {}
+        for i in range(0, len(job_ids), 500):
+            кусок = job_ids[i:i + 500]
+            места = ",".join("?" for _ in кусок)
+            for r in self.query(f"SELECT id, file_path FROM jobs WHERE id IN ({места})", кусок):
+                if r["file_path"]:
+                    out[str(r["id"])] = str(r["file_path"])
+        return out
+
+    def checked_job_ids(self, since: float) -> set[str]:
+        return {str(r["job_id"]) for r in self.query(
+            "SELECT job_id FROM model_checks WHERE created_at >= ?", (since,))}
 
     #: Что зовёт запись в очередь коучинга. Выражения постоянные; причина
     #: подписывается в коде по тем же полям.
@@ -2204,6 +2379,9 @@ class Database:
             conn.execute("DELETE FROM content_terms WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_marks WHERE job_id=?", (job_id,))
+            conn.execute("DELETE FROM review_queue WHERE job_id=?", (job_id,))
+            conn.execute("DELETE FROM model_checks WHERE job_id=? OR check_job_id=?",
+                         (job_id, job_id))
             # content_vocab не трогаем: это словарь форм на весь сервер, а не
             # данные задания. Строка «поставк → поставки» после удаления
             # записи остаётся верной, а перебирать ради неё все прочие записи

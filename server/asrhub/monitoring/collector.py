@@ -403,6 +403,18 @@ class Collector:
         if snr.get("count"):
             for stat in ("p10", "p50", "p90"):
                 out.append(Sample("asrhub_audio_snr_db", float(snr[stat]), {"stat": stat}))
+        # Очередь ручной проверки и согласие моделей: первое — сколько ждёт,
+        # второе — за неделю по основным моделям.
+        try:
+            out.append(Sample("asrhub_review_pending",
+                              float(self.state.db.review_counts()["pending"])))
+            согласие = self.state.analytics.agreement("week")
+            for пара in согласие.get("by_pair") or []:
+                if пара.get("wer_avg") is not None:
+                    out.append(Sample("asrhub_model_disagreement", float(пара["wer_avg"]),
+                                      {"model": str(пара.get("model") or "")}))
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Метрики проверки не посчитаны: %s", exc)
         # Калибровка — за неделю: за сутки эталонных записей обычно единицы,
         # и ECE по ним — совпадение, а не мера.
         try:

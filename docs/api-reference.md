@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **110**, операций: **120**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **115**, операций: **126**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -156,6 +156,8 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/content/summary` | Свод по корпусу | любой действующий ключ |
 | `GET` | `/api/content/timeline` | Показатели по времени | любой действующий ключ |
 | `GET` | `/api/content/topics` | Темы корпуса | любой действующий ключ |
+| `GET` | `/api/control` | Согласие моделей по контрольным прогонам | любой ключ; выборка сужается до его заданий |
+| `POST` | `/api/control/run` | Поставить контрольные прогоны сейчас | ключ с ролью **admin** |
 | `GET` | `/api/engines` | Состояние движков | любой действующий ключ |
 | `GET` | `/api/events` | Лента событий | любой ключ; выборка сужается до его заданий |
 | `GET` | `/api/health` | Проверка доступности | без ключа |
@@ -226,6 +228,10 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/queue/resume` | Возобновить очередь | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/queue/retry-failed` | Повторить все неудавшиеся задания | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/reference` | Автономный справочник API (без интернета) | любой действующий ключ |
+| `GET` | `/api/review` | Очередь ручной проверки | любой ключ; выборка сужается до его заданий |
+| `POST` | `/api/review/sample` | Пополнить очередь проверки сейчас | ключ с ролью **admin** |
+| `POST` | `/api/review/{job_id}` | Добавить запись в очередь проверки | ключ с правом записи (**admin** или **user**) |
+| `PUT` | `/api/review/{job_id}` | Исход проверки записи | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/settings` | Текущие настройки сервера | любой действующий ключ |
 | `PUT` | `/api/settings` | Изменить настройки сервера | ключ с ролью **admin** |
 | `GET` | `/api/settings/hf-token` | Задан ли токен Hugging Face | любой действующий ключ |
@@ -661,7 +667,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:15648",
+  "instance": "vm:20603",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1239,10 +1245,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789042931.996997,
+    "generated_at": 1789045559.4821851,
     "jobs": {
-      "total": 229,
-      "completed": 229,
+      "total": 226,
+      "completed": 226,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1250,42 +1256,42 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 8141.0,
-      "audio_hours": 2.26,
-      "processing_seconds": 1697.4,
-      "words": 9520,
+      "audio_seconds": 8060.5,
+      "audio_hours": 2.24,
+      "processing_seconds": 1685.7,
+      "words": 9398,
       "characters": 0,
-      "segments": 1386,
-      "files_per_hour": 1.36,
+      "segments": 1368,
+      "files_per_hour": 1.35,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 229,
-        "avg": 0.220894,
+        "count": 226,
+        "avg": 0.221803,
         "min": 0.01,
         "max": 5.7511,
-        "p10": 0.04402,
+        "p10": 0.0439,
         "p50": 0.1097,
-        "p90": 0.38338,
-        "p95": 0.49402,
-        "p99": 2.17696,
-        "stdev": 0.508108
+        "p90": 0.38455,
+        "p95": 0.494875,
+        "p99": 2.21035,
+        "stdev": 0.511345
       },
       "processing_time_s": {
-        "count": 229,
-        "avg": 7.41214,
+        "count": 226,
+        "avg": 7.459071,
         "min": 0.28,
         "max": 175.41,
-        "p10": 1.174,
-        "p50": 3.77,
-        "p90": 13.616,
-        "p95": 17.354,
-        "p99": 62.9296,
-        "stdev": 15.713721
+        "p10": 1.165,
+        "p50": 3.745,
+        "p90": 13.76,
+        "p95": 17.63,
+        "p99": 63.8125,
+        "stdev": 15.811433
       },
       "queue_time_s": {
-        "count": 229,
+        "count": 226,
 …
 ```
 
@@ -1319,7 +1325,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 Разделы: overview, timeseries, models, languages, owners, engines,
 sources, errors, durations, slowest, profile, efficiency, weekly, cache,
 reliability, audio, resources, quality, suspicious, drift, control,
-accuracy, calibration, latency, tags, queue. Неизвестный раздел
+accuracy, calibration, latency, agreement, tags, queue. Неизвестный раздел
 отвечает 400 с перечнем доступных.
 
 **Доступ:** любой ключ; выборка сужается до его заданий.
@@ -1342,43 +1348,43 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
 {
   "period": "week",
   "overall": {
-    "jobs": 229,
-    "audio_hours": 2.261,
-    "processing_p50": 3.77,
-    "processing_p95": 17.35,
-    "processing_p99": 62.93,
+    "jobs": 226,
+    "audio_hours": 2.239,
+    "processing_p50": 3.75,
+    "processing_p95": 17.63,
+    "processing_p99": 63.81,
     "rtf_p50": 0.1097,
-    "rtf_p95": 0.494,
-    "rtf_p99": 2.177,
-    "queue_p50": 4.71,
-    "queue_p95": 19.36
+    "rtf_p95": 0.4949,
+    "rtf_p99": 2.2104,
+    "queue_p50": 4.7,
+    "queue_p95": 19.44
   },
   "by_model": [
     {
       "key": "whisper-large-v3",
-      "jobs": 61,
-      "audio_hours": 0.656,
+      "jobs": 59,
+      "audio_hours": 0.642,
       "processing_p50": 5.38,
-      "processing_p95": 18.27,
-      "processing_p99": 28.95,
+      "processing_p95": 18.42,
+      "processing_p99": 29.38,
       "rtf_p50": 0.162,
-      "rtf_p95": 0.2869,
-      "rtf_p99": 0.7432,
-      "queue_p50": 6.24,
-      "queue_p95": 19.57
+      "rtf_p95": 0.2885,
+      "rtf_p99": 0.7643,
+      "queue_p50": 5.89,
+      "queue_p95": 20.22
     },
     {
       "key": "t-one",
-      "jobs": 57,
-      "audio_hours": 0.531,
-      "processing_p50": 2.61,
-      "processing_p95": 7.8,
+      "jobs": 56,
+      "audio_hours": 0.522,
+      "processing_p50": 2.62,
+      "processing_p95": 7.85,
       "processing_p99": 14.79,
-      "rtf_p50": 0.0856,
-      "rtf_p95": 0.169,
-      "rtf_p99": 0.6107,
-      "queue_p50": 5.16,
-      "queue_p95": 21.62
+      "rtf_p50": 0.0857,
+      "rtf_p95": 0.1712,
+      "rtf_p99": 0.6116,
+      "queue_p50": 5.24,
+      "queue_p95": 21.65
     },
     {
       "key": "vosk-ru",
@@ -1441,7 +1447,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 895.9,
+  "uptime_s": 1242.5,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1521,7 +1527,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 895.9,
+  "uptime_s": 1242.5,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1531,7 +1537,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 6.9,
-    "disk_free_gb": 12.3,
+    "disk_free_gb": 12.4,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1542,7 +1548,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 12.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 12.4 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -2169,6 +2175,229 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
 |---|---|---|---|---|
 | `period` | в адресе | string | `all` | — |
 | `limit` | в адресе | integer | `40` | — |
+
+## Здоровье распознавания
+
+Очередь ручной проверки и контрольные прогоны второй моделью: то, из чего появляются эталоны и согласие моделей. Список сужается до записей самого ключа; пополнить очередь и поставить прогоны может только администратор.
+
+### `GET /api/control`
+
+Согласие моделей по контрольным прогонам.
+
+**Доступ:** любой ключ; выборка сужается до его заданий.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+
+**Пример**
+
+```bash
+curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/control?period=week'
+```
+
+**Ответ**
+
+```json
+{
+  "period": "week",
+  "checks": 34,
+  "previous_checks": 35,
+  "wer_avg": 0.1712,
+  "previous_wer_avg": 0.1286,
+  "growth": 0.3313,
+  "wer_p50": 0.1735,
+  "wer_p90": 0.2508,
+  "verdict": "warning",
+  "by_day": [
+    {
+      "ts": 1788393600.0,
+      "checks": 4,
+      "wer_avg": 0.1237
+    },
+    {
+      "ts": 1788480000.0,
+      "checks": 5,
+      "wer_avg": 0.1223
+    },
+    {
+      "ts": 1788566400.0,
+      "checks": 5,
+      "wer_avg": 0.1055
+    },
+    {
+      "ts": 1788652800.0,
+      "checks": 5,
+      "wer_avg": 0.1712
+    },
+    {
+      "ts": 1788739200.0,
+      "checks": 5,
+      "wer_avg": 0.208
+    },
+    {
+      "ts": 1788825600.0,
+      "checks": 5,
+      "wer_avg": 0.2221
+    },
+    {
+      "ts": 1788912000.0,
+      "checks": 5,
+      "wer_avg": 0.2363
+    }
+  ],
+  "by_pair": [
+    {
+      "model": "gigaam-v3-e2e-rnnt",
+      "control_model": "whisper-large-v3",
+      "checks": 34,
+      "wer_avg": 0.1712,
+      "mer_avg": 0.1592
+    }
+  ],
+  "worst": [
+    {
+      "job_id": "job001406",
+      "check_job_id": "ctrl-1-3",
+      "filename": "1406.wav",
+      "model": "gigaam-v3-e2e-rnnt",
+      "control_model": "whisper-large-v3",
+      "wer": 0.2885,
+      "snr_db": 26.5,
+      "confidence": 0.8576
+    },
+    {
+      "job_id": "job000833",
+      "check_job_id": "ctrl-2-0",
+      "filename": "833.wav",
+      "model": "gigaam-v3-e2e-rnnt",
+…
+```
+
+### `POST /api/control/run`
+
+Поставить контрольные прогоны сейчас.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+### `GET /api/review`
+
+Очередь ручной проверки.
+
+Записи, отобранные на прослушивание, с исходом; счётчики — за неделю.
+
+Строка закрывается сама, когда по записи задан эталон (вкладка «Эталон»
+карточки или POST /api/jobs/{id}/reference); пропустить можно вручную.
+
+**Доступ:** любой ключ; выборка сужается до его заданий.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `status` | в адресе | string | `pending` | — |
+| `limit` | в адресе | integer | `100` | — |
+| `offset` | в адресе | integer | `0` | — |
+
+**Пример**
+
+```bash
+curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/review?status=pending&limit=20'
+```
+
+**Ответ**
+
+```json
+{
+  "items": [
+    {
+      "job_id": "job000698",
+      "reason": "low_confidence",
+      "status": "pending",
+      "picked_at": 1789004167.760042,
+      "done_at": null,
+      "reviewer": null,
+      "note": null,
+      "filename": "698.wav",
+      "model": "whisper-large-v3",
+      "owner": "anna",
+      "source": "api",
+      "media_duration_s": 31.22,
+      "avg_confidence": 0.6469,
+      "snr_db": 7.3,
+      "wer": null,
+      "ref_words": null,
+      "created_at": 1788923822.5004246
+    },
+    {
+      "job_id": "job000010",
+      "reason": "low_confidence",
+      "status": "pending",
+      "picked_at": 1789004167.760042,
+      "done_at": null,
+      "reviewer": null,
+      "note": null,
+      "filename": "10.wav",
+      "model": "vosk-ru",
+      "owner": "vera",
+      "source": "phone",
+      "media_duration_s": 26.14,
+      "avg_confidence": 0.6545,
+      "snr_db": 1.4,
+      "wer": null,
+      "ref_words": null,
+      "created_at": 1788783853.331917
+    },
+    {
+      "job_id": "job001656",
+      "reason": "low_confidence",
+      "status": "pending",
+      "picked_at": 1789004167.760042,
+      "done_at": null,
+      "reviewer": null,
+      "note": null,
+…
+```
+
+Строка закрывается сама, когда по записи задан эталон (`POST /api/jobs/{id}/reference`).
+
+### `POST /api/review/sample`
+
+Пополнить очередь проверки сейчас.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+### `POST /api/review/{job_id}`
+
+Добавить запись в очередь проверки.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `job_id` | в пути | string | обязателен | — |
+
+### `PUT /api/review/{job_id}`
+
+Исход проверки записи.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `job_id` | в пути | string | обязателен | — |
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "$ref": "#/components/schemas/Body_review_update_api_review__job_id__put"
+}
+```
 
 ## Обслуживание
 

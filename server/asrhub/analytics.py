@@ -1190,6 +1190,80 @@ class Analytics:
                      "до первого текста на экране, по модели."),
         }
 
+    # --- согласие моделей ------------------------------------------------------
+
+    #: От скольких прогонов среднее расхождение что-то значит.
+    МИН_ПРОГОНОВ = 5
+
+    def agreement(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+        """Согласие моделей по контрольным прогонам: расхождение двух
+        расшифровок одной записи — по дням, по парам моделей и против
+        предыдущего такого же периода.
+
+        Точность без эталона это не меряет; рост расхождения — сигнал, что
+        изменился вход или сломалась одна из моделей. Порог — относительный
+        рост среднего к прошлому периоду: четверть — предупреждение, половина
+        — критично; на выборке меньше пяти прогонов вердикта нет.
+        """
+        since = self._since(period)
+        сейчас = time.time()
+        проверки = self.db.model_checks(since or 0.0, owner=owner)
+        прошлые: list[dict[str, Any]] = []
+        if since:
+            длина = сейчас - since
+            прошлые = [п for п in self.db.model_checks(since - длина, owner=owner)
+                       if float(п["created_at"]) < since]
+
+        def среднее(items: list[dict[str, Any]]) -> float | None:
+            значения = [float(п["wer"]) for п in items if п.get("wer") is not None]
+            return round(sum(значения) / len(значения), 4) if значения else None
+
+        по_дням: dict[int, list[dict[str, Any]]] = {}
+        for п in проверки:
+            по_дням.setdefault(int(float(п["created_at"]) // 86400), []).append(п)
+        пары: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for п in проверки:
+            пары.setdefault((str(п.get("model") or "—"), str(п.get("control_model") or "—")),
+                            []).append(п)
+        текущее, прошлое = среднее(проверки), среднее(прошлые)
+        вердикт = "unknown"
+        рост = None
+        if текущее is not None and len(проверки) >= self.МИН_ПРОГОНОВ:
+            вердикт = "ok"
+            if прошлое and len(прошлые) >= self.МИН_ПРОГОНОВ:
+                рост = round((текущее - прошлое) / прошлое, 4)
+                if рост >= 0.5:
+                    вердикт = "critical"
+                elif рост >= 0.25:
+                    вердикт = "warning"
+        значения = sorted(float(п["wer"]) for п in проверки if п.get("wer") is not None)
+        return {
+            "period": period, "checks": len(проверки), "previous_checks": len(прошлые),
+            "wer_avg": текущее, "previous_wer_avg": прошлое, "growth": рост,
+            "wer_p50": round(M.percentile(значения, 0.5), 4) if значения else None,
+            "wer_p90": round(M.percentile(значения, 0.9), 4) if значения else None,
+            "verdict": вердикт,
+            "by_day": [{"ts": день * 86400.0, "checks": len(items), "wer_avg": среднее(items)}
+                       for день, items in sorted(по_дням.items())],
+            "by_pair": sorted(({"model": м, "control_model": к, "checks": len(items),
+                                "wer_avg": среднее(items),
+                                "mer_avg": round(sum(float(п["mer"]) for п in items
+                                                     if п.get("mer") is not None)
+                                                 / max(1, sum(1 for п in items
+                                                              if п.get("mer") is not None)), 4)}
+                               for (м, к), items in пары.items()),
+                              key=lambda r: -r["checks"]),
+            "worst": [{"job_id": п["job_id"], "check_job_id": п["check_job_id"],
+                       "filename": п.get("filename"), "model": п.get("model"),
+                       "control_model": п.get("control_model"), "wer": п.get("wer"),
+                       "snr_db": п.get("snr_db"), "confidence": п.get("avg_confidence")}
+                      for п in sorted(проверки, key=lambda x: -float(x.get("wer") or 0))[:10]],
+            "note": ("Расхождение — WER расшифровки контрольной модели относительно "
+                     "исходной; какая из двух права, без эталона неизвестно. Смотрите "
+                     "ход: рост среднего на четверть к прошлому периоду — "
+                     "предупреждение, на половину — критично."),
+        }
+
     def suspicious(self, period: str = "month", owner: str | None = None,
                    limit: int = 15) -> dict[str, Any]:
         """Подозрительные расшифровки: галлюцинации, повторы, разметка.
@@ -1386,6 +1460,7 @@ class Analytics:
             "accuracy": self.accuracy(period, owner),
             "calibration": self.calibration(period, owner),
             "latency": self.latency(period, owner),
+            "agreement": self.agreement(period, owner),
             "tags": self.by_tag(period, owner),
             "queue": self.queue_latency(period, owner),
         }

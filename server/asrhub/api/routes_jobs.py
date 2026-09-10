@@ -885,4 +885,7 @@ def set_reference(request: Request, job_id: str,
     state.db.update_job(job_id, reference_text=text,
                         calibration=calibration.per_job(сегменты, text) if сегменты else None,
                         **M.job_fields(detail))
+    # Эталон и есть итог ручной проверки: строка очереди закрывается сама,
+    # с именем того, кто проверял.
+    state.db.review_update(job_id, "done", reviewer=principal.name)
     return {"job_id": job_id, **detail}

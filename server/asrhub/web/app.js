@@ -2900,7 +2900,7 @@ function showJobModal(job, opts) {
   };
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
-  show('text');
+  show(options.tab && tabs[options.tab] ? options.tab : 'text');
 
   const player = setupJobPlayer(backdrop, job, segments, show, options);
   drawJobWaveform(backdrop, job, segments, show, player);
@@ -2908,6 +2908,74 @@ function showJobModal(job, opts) {
   // Проигрыватель продолжал бы играть из закрытого окна: узел удалён, звук
   // идёт. Поэтому останавливаем его вместе с окном.
   backdrop.addEventListener('asrhub:closed', () => { if (player) player.destroy(); });
+}
+
+/* Очередь ручной проверки — карточка в «Аналитике».
+ *
+ * Очередь пополняется сервером раз в сутки, а закрывается человеком:
+ * «Открыть» ведёт в карточку записи сразу на вкладку «Эталон», и
+ * сохранённый эталон закрывает строку сам. «Пропустить» — для записей,
+ * которые слушать незачем (пустые, чужие, служебные).
+ */
+async function drawReviewQueue() {
+  const тело = qs('#review-body');
+  if (!тело) return;
+  let данные;
+  try {
+    данные = await API.latest('review-queue', '/api/review?status=pending&limit=50');
+  } catch (err) {
+    if (err && err.silent) return;
+    тело.innerHTML = `<div class="empty small">Очередь недоступна: ${esc(err.message || '')}</div>`;
+    return;
+  }
+  if (!тело.isConnected) return;
+  const счёт = данные.counts || {};
+  const причины = данные.reasons || {};
+  const строки = данные.items || [];
+  const админ = (state.me || {}).role === 'admin' || !(state.me || {}).role;
+  тело.innerHTML = `<div class="grid cols-3" style="margin-bottom:10px">
+      ${kpi('Ожидают', num(счёт.pending || 0), данные.enabled ? 'пополняется раз в сутки' : 'очередь выключена (review_enabled)')}
+      ${kpi('Проверено за неделю', num(счёт.done || 0), 'эталон задан')}
+      ${kpi('Пропущено за неделю', num(счёт.skipped || 0), '')}
+    </div>
+    ${строки.length ? `<div class="table-wrap"><table><thead><tr><th>Запись</th><th>Модель</th>
+      <th class="num" title="уверенность модели">Увер.</th><th class="num" title="речь к шуму, дБ">SNR</th><th>Почему</th><th></th></tr></thead><tbody>
+      ${строки.map((з) => `<tr data-review="${esc(з.job_id)}">
+        <td class="truncate" style="max-width:180px" title="${esc(з.filename || '')}">${esc(з.filename || з.job_id)}<div class="small faint">${fmtDur(з.media_duration_s)} · ${fmtTime(з.created_at).slice(0, 5)}</div></td>
+        <td class="small">${esc(з.model || '—')}</td>
+        <td class="num mono">${з.avg_confidence === null || з.avg_confidence === undefined ? '—' : pct(з.avg_confidence, 0)}</td>
+        <td class="num mono">${з.snr_db === null || з.snr_db === undefined ? '—' : num(з.snr_db, 0)}</td>
+        <td class="small" title="${esc(причины[з.reason] || з.reason)}">${esc({ random: 'случайная', low_confidence: 'неуверенная', manual: 'вручную', bad_audio: 'плохой звук' }[з.reason] || з.reason)}</td>
+        <td class="nowrap"><button class="btn sm" data-review-open="${esc(з.job_id)}">Открыть</button>
+          <button class="ghost sm" data-review-skip="${esc(з.job_id)}" title="Убрать из очереди без эталона">Пропустить</button></td></tr>`).join('')}
+      </tbody></table></div>` : `<div class="empty small">Очередь пуста${данные.last_sampled_at ? `: последний отбор ${fmtTime(данные.last_sampled_at)}` : ' — первый отбор будет через сутки после запуска'}.</div>`}
+    <div class="row" style="gap:8px;margin-top:8px">
+      ${админ ? '<button class="ghost sm" id="review-sample-now" title="Отобрать записи за последние сутки, не дожидаясь суточного захода">Пополнить сейчас</button>' : ''}
+      <span class="small faint">Случайные записи дают честный WER; неуверенные — больше исправлений на час прослушивания.</span>
+    </div>`;
+  qsa('[data-review-open]', тело).forEach((кнопка) => {
+    кнопка.onclick = () => window.__asrhub.openJob(кнопка.dataset.reviewOpen, { tab: 'reference' });
+  });
+  qsa('[data-review-skip]', тело).forEach((кнопка) => {
+    кнопка.onclick = async () => {
+      кнопка.disabled = true;
+      try {
+        await API.call(`/api/review/${кнопка.dataset.reviewSkip}`, { method: 'PUT', json: { status: 'skipped' } });
+        drawReviewQueue();
+      } catch (err) { fail(err); кнопка.disabled = false; }
+    };
+  });
+  const пополнить = qs('#review-sample-now', тело);
+  if (пополнить) {
+    пополнить.onclick = async () => {
+      пополнить.disabled = true;
+      try {
+        const итог = await API.post('/api/review/sample');
+        toast(`Отобрано записей: ${итог.added} из ${итог.candidates} за сутки`, 'ok');
+        drawReviewQueue();
+      } catch (err) { fail(err); пополнить.disabled = false; }
+    };
+  }
 }
 
 /* Вкладка «Эталон» в карточке задания.
@@ -3613,6 +3681,15 @@ RENDERERS.analytics = {
              '<div id="accuracy-body"></div>')}
 
       <div class="grid cols-2">
+        ${card('Очередь ручной проверки',
+               'раз в сутки: случайная доля плюс нижняя четверть по уверенности; правка текста во вкладке «Эталон» и есть проверка',
+               '<div id="review-body"><div class="empty small">Загрузка…</div></div>')}
+        ${card('Согласие моделей',
+               'контрольный прогон второй моделью: расхождение двух расшифровок одной записи — по дням и по парам моделей',
+               '<div id="agreement-body"></div>')}
+      </div>
+
+      <div class="grid cols-2">
         ${card('Калибровка уверенности',
                'верны ли слова, которым модель дала такую уверенность: диаграмма надёжности, ECE и AUC по записям с эталоном',
                '<div id="calibration-body"></div>')}
@@ -4033,6 +4110,45 @@ function drawExtraAnalytics(data) {
         [...(т.by_model || []), ...(т.by_duration || [])].some((р) => !р.enough) ? ' † — срезу не хватает слов.' : ''}</p>`;
     }
   }
+
+  const сг = data.agreement || {};
+  if (qs('#agreement-body')) {
+    const тело = qs('#agreement-body');
+    const проц = (v, d) => (v === null || v === undefined ? '—' : num(v * 100, d === undefined ? 1 : d) + '%');
+    const вердикт = { critical: '<span class="chip err">расхождение выросло вдвое</span>',
+      warning: '<span class="chip warn">расхождение растёт</span>',
+      ok: '<span class="chip ok">ровно</span>' }[сг.verdict] || '<span class="chip">мало прогонов</span>';
+    if (!сг.checks) {
+      тело.innerHTML = `<div class="empty small">За период контрольных прогонов не было.
+        Задайте контрольную модель в настройках (control_model) — модель другого семейства, —
+        и сервер раз в сутки будет заново распознавать несколько случайных записей.</div>`;
+    } else {
+      тело.innerHTML = `<div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Расхождение', проц(сг.wer_avg), `p50 ${проц(сг.wer_p50)} · p90 ${проц(сг.wer_p90)}`)}
+        ${kpi('Прогонов', num(сг.checks), сг.previous_checks ? `в прошлом периоде ${num(сг.previous_checks)}` : 'первый период')}
+        ${kpi('К прошлому периоду', сг.growth === null || сг.growth === undefined ? '—' : (сг.growth > 0 ? '+' : '') + num(сг.growth * 100, 0) + '%',
+              сг.previous_wer_avg === null || сг.previous_wer_avg === undefined ? 'сравнивать не с чем' : `было ${проц(сг.previous_wer_avg)}`)}
+      </div>
+      <div class="row" style="gap:8px;margin-bottom:6px">${вердикт}</div>
+      <div id="chart-agreement"></div>
+      ${(сг.by_pair || []).length ? `<table style="margin-top:8px"><thead><tr><th>Модель</th><th>Контрольная</th>
+        <th class="num">Прогонов</th><th class="num">Расхождение</th><th class="num">MER</th></tr></thead><tbody>
+        ${сг.by_pair.map((п) => `<tr><td>${esc(п.model)}</td><td>${esc(п.control_model)}</td>
+          <td class="num">${num(п.checks)}</td><td class="num mono">${проц(п.wer_avg)}</td>
+          <td class="num mono">${проц(п.mer_avg)}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${(сг.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Сильнее всего разошлись</b>: ${сг.worst.slice(0, 5).map((з) =>
+        `<a href="#" onclick="window.__asrhub.openJob('${esc(з.job_id)}');return false">${esc(з.filename || з.job_id)}</a> — ${проц(з.wer)}${
+          з.snr_db !== null && з.snr_db !== undefined && з.snr_db < 10 ? ' <span class="chip warn" title="шумная запись">шум</span>' : ''}`).join('; ')}</div>` : ''}
+      <p class="small faint" style="margin-top:8px">${esc(сг.note || '')}</p>`;
+      const дни = сг.by_day || [];
+      Charts.line(qs('#chart-agreement'), {
+        height: 150, labels: дни.map((д) => fmtTime(д.ts).slice(0, 5)),
+        series: [{ name: 'расхождение, %', values: дни.map((д) => (д.wer_avg === null ? null : д.wer_avg * 100)) }],
+        emptyText: 'нет прогонов',
+      });
+    }
+  }
+  drawReviewQueue();
 
   const кл = data.calibration || {};
   if (qs('#calibration-body')) {

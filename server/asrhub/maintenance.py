@@ -213,6 +213,18 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
             "clipped": звук.get("clipped_jobs"),
             "sources": [и for и in (звук.get("bad_audio_by_source") or []) if и.get("bad")][:3],
         }
+    # Очередь проверки и согласие моделей — когда есть о чём сказать.
+    if getattr(analytics, "db", None) is not None and settings.get("review_enabled", True):
+        from .analytics import PERIODS  # noqa: PLC0415
+
+        счёт = analytics.db.review_counts(
+            since=time.time() - (PERIODS.get(срок) or 7 * 86400))
+        if any(счёт.get(к) for к in ("pending", "done", "skipped")):
+            готовое["review"] = счёт
+    согласие = отчёт.get("agreement") or {}
+    if согласие.get("verdict") in ("warning", "critical"):
+        готовое["agreement"] = {k: согласие.get(k) for k in
+                                ("verdict", "checks", "wer_avg", "previous_wer_avg", "growth")}
     метка = str(settings.get("consent_tag") or "").strip()
     if метка and getattr(analytics, "db", None) is not None:
         срок_дней = int(settings.get("consent_days") or 30)
@@ -223,7 +235,9 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
                                   suspicious=готовое.get("suspicious"),
                                   consent_missing=готовое.get("consent_missing"),
                                   drift=готовое.get("drift"),
-                                  bad_audio=готовое.get("bad_audio"))
+                                  bad_audio=готовое.get("bad_audio"),
+                                  review=готовое.get("review"),
+                                  agreement=готовое.get("agreement"))
     return готовое
 
 
@@ -282,7 +296,9 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                 suspicious: dict[str, Any] | None = None,
                 consent_missing: int | None = None,
                 drift: list[dict[str, Any]] | None = None,
-                bad_audio: dict[str, Any] | None = None) -> str:
+                bad_audio: dict[str, Any] | None = None,
+                review: dict[str, Any] | None = None,
+                agreement: dict[str, Any] | None = None) -> str:
     """Та же сводка словами.
 
     Приёмник входящих сообщений в мессенджере показывает поле `text` и
@@ -337,6 +353,16 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
             f"записей ({число((bad_audio.get('share') or 0) * 100, 0)} %): "
             f"шумных {bad_audio.get('noisy') or 0}, с клиппингом {bad_audio.get('clipped') or 0}"
             + (f"; хуже всего {источники}" if источники else ""))
+    if review:
+        строки.append(f"Очередь ручной проверки: ожидают {review.get('pending') or 0}, "
+                      f"проверено {review.get('done') or 0}, пропущено {review.get('skipped') or 0}")
+    if agreement:
+        уровень = "критично" if agreement.get("verdict") == "critical" else "предупреждение"
+        строки.append(
+            f"Согласие моделей: {уровень} — расхождение "
+            f"{число((agreement.get('previous_wer_avg') or 0) * 100, 1)} % → "
+            f"{число((agreement.get('wer_avg') or 0) * 100, 1)} % "
+            f"по {agreement.get('checks') or 0} контрольным прогонам")
     for д in drift or []:
         уровень = "критично" if д.get("verdict") == "critical" else "предупреждение"
         кто = "по всем моделям" if д.get("key") == "all" else f"у модели {д.get('key')}"
@@ -435,14 +461,36 @@ def send_digest(digest: dict[str, Any], url: str) -> bool:
     return send_json(digest, url, what="сводка")
 
 
+#: Отметки суточных заходов здоровья распознавания.
+KV_REVIEW = "review_sampled_at"
+KV_CONTROL = "control_sampled_at"
+
+
 def run_scheduled(db: Any, settings: Any, analytics: Any,
-                  insights: Any = None) -> dict[str, Any]:
+                  insights: Any = None, queue: Any = None) -> dict[str, Any]:
     """Один заход обслуживания. Вызывается служебным циклом.
 
     Возвращает, что было сделано, — чтобы вызывающий мог это записать, а
     тест проверить, не подглядывая в журнал.
     """
+    from . import review  # noqa: PLC0415
+
     сделано: dict[str, Any] = {}
+    # Здоровье распознавания — раз в сутки: очередь ручной проверки и
+    # контрольные прогоны. Сбой одного не мешает другому и не мешает копии.
+    if settings.get("review_enabled", True) and _пора(db, KV_REVIEW, 24.0):
+        db.set_kv(KV_REVIEW, time.time())
+        try:
+            сделано["review"] = review.sample_review(db, settings)
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Очередь проверки не пополнена: %s", exc)
+    if str(settings.get("control_model") or "").strip() and queue is not None \
+            and _пора(db, KV_CONTROL, 24.0):
+        db.set_kv(KV_CONTROL, time.time())
+        try:
+            сделано["control"] = review.sample_control(db, settings, queue)
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Контрольные прогоны не поставлены: %s", exc)
     if _пора(db, KV_BACKUP, float(settings.get("backup_interval_hours") or 0)):
         db.set_kv(KV_BACKUP, time.time())
         копия = make_backup(db, settings)

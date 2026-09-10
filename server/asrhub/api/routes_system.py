@@ -372,7 +372,7 @@ def analytics_section(request: Request, section: str, period: str = "week",
     Разделы: overview, timeseries, models, languages, owners, engines,
     sources, errors, durations, slowest, profile, efficiency, weekly, cache,
     reliability, audio, resources, quality, suspicious, drift, control,
-    accuracy, calibration, latency, tags, queue. Неизвестный раздел
+    accuracy, calibration, latency, agreement, tags, queue. Неизвестный раздел
     отвечает 400 с перечнем доступных.
     """
     state = get_state(request)
@@ -401,6 +401,7 @@ def analytics_section(request: Request, section: str, period: str = "week",
         "accuracy": state.analytics.accuracy,
         "calibration": state.analytics.calibration,
         "latency": state.analytics.latency,
+        "agreement": state.analytics.agreement,
         "tags": state.analytics.by_tag,
         "queue": state.analytics.queue_latency,
     }

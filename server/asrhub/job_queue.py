@@ -953,10 +953,23 @@ class JobQueue:
             log.warning("Признаки качества для %s не посчитаны: %s", job_id, exc,
                         extra={"job_id": job_id})
 
+        # Контрольный прогон второй моделью: расхождение с исходной
+        # расшифровкой — в таблицу согласия моделей. Само задание — обычное,
+        # но в разбор содержания оно не идёт: разговор уже разобран по
+        # исходной записи.
+        if (job.get("params") or {}).get("control_of"):
+            try:
+                from . import review  # noqa: PLC0415
+
+                review.record_check(self.db, {**job, "model": job.get("model")},
+                                    outcome.segments)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Расхождение контрольного прогона %s не записано: %s",
+                            job_id, exc, extra={"job_id": job_id})
         # Разбор содержания — здесь, а не в фоновом потоке: признаки нужны
         # сразу, вместе с результатом. Стоит он десятки миллисекунд против
         # минут распознавания, а ошибки внутри не выходят наружу.
-        if self.content_index is not None:
+        if self.content_index is not None and str(job.get("source") or "") != "control":
             self.content_index.on_job_completed(
                 job_id, {**job, "text": outcome.text,
                          "media_duration_s": job.get("media_duration_s")},
@@ -1400,7 +1413,7 @@ class JobQueue:
                     from .maintenance import run_scheduled  # noqa: PLC0415
 
                     run_scheduled(self.db, self.settings, self._analytics(),
-                                  self._insights())
+                                  self._insights(), queue=self)
                 except Exception as exc:                # noqa: BLE001
                     failures += 1
                     if failures <= 3 or failures % 180 == 0:
