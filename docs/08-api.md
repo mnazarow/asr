@@ -339,6 +339,19 @@ DELETE /api/jobs/{id}
 
 `POST /api/jobs/{id}/reference` сравнивает эталон с расшифровкой по сегментам, без меток говорящих, и отвечает разбором: `wer`, `cer`, `mer`, `wil`, счётчики `words` (замены, пропуски, вставки, совпадения) и `diff` — пословное выравнивание для подсветки. То же самое считается само, если эталон передан полем `reference_text` при постановке задания, — в том числе для задания, отданного из кеша. В карточке задания после этого есть `wer`, `cer`, `mer`, `wil`, `ref_words`, `sub_words`, `del_words`, `ins_words` и `calibration` — десять корзин уверенности против верности слов, из которых складывается раздел `calibration` аналитики.
 
+### Смысловой слой (языковая модель)
+
+```
+GET  /api/llm/status                       как подключено, доступен ли сервер, учёт вызовов, покрытие
+POST /api/llm/test                         короткий вызов мимо кеша (администратор)
+GET  /api/content/jobs/{id}/llm            ответ модели по записи
+POST /api/content/jobs/{id}/llm?force=true разобрать запись сейчас, синхронно
+POST /api/llm/backfill    {"limit": 100}   поставить архив в очередь разбора (администратор)
+GET  /api/content/llm?period=week          свод: исходы, причины, действия, трекеры, скоркарта
+```
+
+Слой включается настройкой `llm_backend` (`ollama`, `openai`, `stub`, `off`); при `off` ручки отвечают 400 с подсказкой, а не молчат. Записи разбираются в фоне (`llm_auto`), архив — по `POST /api/llm/backfill`. Отборы списка заданий по ответу модели: `content=llm_unresolved`, `content=llm_actions`, `content=outcome:<исход>`, `content=reason:<причина>`.
+
 ### Очередь проверки и контрольные прогоны
 
 ```
@@ -480,7 +493,7 @@ POST /api/content/recompute              пересчитать архив (ну
 GET  /api/content/export?format=xlsx     выгрузка отчёта файлом
 ```
 
-Отборы списка заданий (`GET /api/jobs?content=…`) — по содержанию (`negative`, `positive`, `downturn`, `recovered`, `alerts`, `open_commitments`, `interruptions`, `silence`, `script_failed`, `money`, `monologue`, `mixed`, `dead_air`, `frustrated`, `repeat`, `profanity`, `profanity_agent`) и по здоровью распознавания (`suspect`, `hallucination`, `speakers_mismatch`); вторые работают и там, где разбор содержания выключен.
+Отборы списка заданий (`GET /api/jobs?content=…`) — по содержанию (`negative`, `positive`, `downturn`, `recovered`, `alerts`, `open_commitments`, `interruptions`, `silence`, `script_failed`, `money`, `monologue`, `mixed`, `dead_air`, `frustrated`, `repeat`, `profanity`, `profanity_agent`), по здоровью распознавания (`suspect`, `hallucination`, `speakers_mismatch`), по звуку на входе (`bad_audio`, `noisy`, `clipped`) и по ответу языковой модели (`llm_unresolved`, `llm_actions`, `outcome:<исход>`, `reason:<причина>`); всё, кроме первой группы, работает и там, где разбор содержания выключен.
 
 Персональные данные — ключом администратора:
 

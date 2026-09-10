@@ -134,6 +134,12 @@ def _наполнить(приложение) -> None:
              "speaker": f"SPEAKER_{i % 2:02d}"}
             for i, к in enumerate(куски)])
     ContentIndex(db, состояние.settings).backfill_once(limit=100)
+    # Смысловой слой на заглушке: интерфейс должен рисовать ответы модели
+    # там, где модели нет, — иначе проверять карточки нечем.
+    состояние.settings.set("llm_backend", "stub")
+    состояние.settings.set("llm_model", "stub")
+    for n in range(6):
+        состояние.llm_worker.analyze_job(f"ui{n:03d}", force=True)
 
 
 @pytest.fixture()
@@ -553,4 +559,33 @@ def test_the_review_queue_card_fills_opens_the_reference_tab_and_skips(стра�
     страница.wait_for_timeout(1200)
     осталось = страница.evaluate("() => document.querySelectorAll('#review-body tbody tr').length")
     assert осталось == строк - 1, (строк, осталось)
+    _чисто(страница)
+
+
+def test_the_meaning_layer_shows_up_in_the_summary_and_in_the_record_card(страница):
+    """Свод: карточка «По ответам языковой модели» с исходами и причинами;
+    карточка записи: смысл разговора с причиной, исходом и действиями."""
+    _открыть(страница, "content")
+    страница.wait_for_selector("#llm-summary .card", timeout=20000)
+    страница.wait_for_timeout(700)
+    тело = страница.inner_text("#llm-summary")
+    assert "По ответам языковой модели" in тело and "Исходы" in тело, тело[:400]
+    assert "undefined" not in тело.lower() and "NaN" not in тело, тело[:400]
+    assert страница.evaluate(
+        "() => document.querySelectorAll('#llm-outcomes svg').length") >= 1
+    _чисто(страница)
+
+    _открыть(страница, "results")
+    страница.wait_for_selector("#results-table button", timeout=15000)
+    страница.click('#results-table button:has-text("Открыть")')
+    страница.wait_for_selector("#job-tabs", timeout=10000)
+    страница.click('#job-tabs button[data-tab="analysis"]')
+    страница.wait_for_selector("#job-llm .card", timeout=15000)
+    страница.wait_for_timeout(400)
+    карточка = страница.inner_text("#job-llm")
+    assert "Смысл разговора" in карточка and "Сгенерировано моделью" in карточка, карточка[:400]
+    # Ответ можно пересчитать, не выходя из карточки.
+    страница.click("#job-llm-run")
+    страница.wait_for_timeout(1500)
+    assert "Смысл разговора" in страница.inner_text("#job-llm")
     _чисто(страница)

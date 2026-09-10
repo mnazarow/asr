@@ -706,6 +706,59 @@ _m(MetricSpec(
 ))
 
 _m(MetricSpec(
+    name="asrhub_llm_available", type="gauge", group="quality",
+    label="Сервер языковой модели доступен",
+    description=(
+        "1 — сервер модели отвечает и знает модель, 0 — нет. Появляется "
+        "только при включённом смысловом слое (llm_backend не off); проба "
+        "живёт минуту."
+    ),
+    recommendation=(
+        "Ноль дольше получаса — смысловой разбор копится; проверьте службу "
+        "Ollama или vLLM и что модель скачана (POST /api/llm/test)."
+    ),
+    normal="1",
+    threshold=Threshold("below", warning=1.0, critical=0.5, for_seconds=1800),
+    troubleshooting="GET /api/llm/status → reason; POST /api/llm/test",
+))
+
+_m(MetricSpec(
+    name="asrhub_llm_calls_total", type="counter", group="quality",
+    label="Вызовы языковой модели", labels=("status",),
+    description="Сколько вызовов модели сделано с запуска: ok, error, cache.",
+    recommendation=(
+        "Доля error выше десятой части — модель отвечает не JSON или не "
+        "успевает за llm_timeout_s; смотрите last_error в состоянии слоя."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_llm_latency_seconds", type="gauge", group="quality",
+    label="Время ответа модели", unit="с", labels=("stat",),
+    description=(
+        "Секунды на полный разбор одной записи за сутки — p50 и p95 — по "
+        "сохранённым ответам. Длинные записи — по вызову на кусок."
+    ),
+    recommendation=(
+        "p95 выше минуты при модели 14B на видеокарте — карта занята "
+        "распознаванием или модель выгружена; llm_yield_to_queue и "
+        "keep_alive Ollama на это и рассчитаны."
+    ),
+    normal="p50 3–15 с на видеокарте",
+))
+
+_m(MetricSpec(
+    name="asrhub_llm_coverage", type="gauge", group="quality",
+    label="Доля записей с ответом модели",
+    description=(
+        "Какая часть завершённых за сутки записей уже разобрана моделью. "
+        "Ниже единицы надолго — модель не успевает за потоком или лежит."
+    ),
+    recommendation="Смотрите вместе с asrhub_llm_available и очередью разбора в GET /api/llm/status.",
+    normal="близко к 1",
+))
+
+_m(MetricSpec(
     name="asrhub_suspect_segments_share", type="gauge", group="quality",
     label="Доля подозрительных сегментов", labels=("model",),
     description=(

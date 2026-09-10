@@ -2369,6 +2369,8 @@ RENDERERS.results = {
             <option value="hallucination">похоже на галлюцинацию</option>
             <option value="speakers_mismatch">говорящих не столько, сколько ожидалось</option>
             <option value="bad_audio">плохой звук: шум или клиппинг</option>
+            <option value="llm_unresolved">вопрос не решён (по оценке модели)</option>
+            <option value="llm_actions">есть действия к исполнению (модель)</option>
             <option value="noisy">шумная запись (SNR ниже 10 дБ)</option>
             <option value="clipped">клиппинг от 1 % отсчётов</option>
             <option value="objection_unhandled">возражение без отработки</option>
@@ -3045,6 +3047,62 @@ function bindReferenceTab(backdrop, job, redraw) {
   };
 }
 
+/* Смысл разговора в карточке: ответ языковой модели по записи.
+ *
+ * Отдельным запросом после разбора по правилам: слой необязательный, и
+ * карточка без него обязана открываться так же быстро. Когда ответа нет,
+ * а модель подключена, — кнопка «Разобрать моделью»: вызов синхронный,
+ * секунды, и ответ встаёт на место без перезагрузки.
+ */
+async function loadJobLlm(backdrop, job) {
+  const host = qs('#job-llm', backdrop);
+  if (!host) return;
+  let д;
+  try {
+    д = await API.get(`/api/content/jobs/${job.id}/llm`);
+  } catch (err) { return; }
+  if (!host.isConnected) return;
+  const рисовать = (р, stale) => {
+    if (!р) {
+      host.innerHTML = д.enabled ? `<div class="card tight" style="margin-bottom:12px">
+        <div class="row" style="gap:8px"><b class="small">Смысл разговора</b>
+          <span class="small faint">ответа языковой модели пока нет</span><span class="spacer"></span>
+          <button class="btn sm" id="job-llm-run">Разобрать моделью</button></div></div>` : '';
+      const кнопка = qs('#job-llm-run', host);
+      if (кнопка) кнопка.onclick = () => запустить(кнопка);
+      return;
+    }
+    const решено = р.resolved === true ? '<span class="chip ok">вопрос решён</span>'
+      : р.resolved === false ? '<span class="chip warn">не решён</span>' : '';
+    host.innerHTML = `<div class="card tight" style="margin-bottom:12px">
+      <div class="row wrap" style="gap:8px;margin-bottom:6px"><b class="small">Смысл разговора</b>
+        ${р.reason ? `<span class="chip info" title="причина обращения (из списка)">${esc(р.reason)}</span>` : ''}
+        ${р.outcome ? `<span class="chip accent" title="исход (из списка)">${esc(р.outcome)}</span>` : ''}
+        ${решено}
+        <span class="spacer"></span>
+        <button class="ghost sm" id="job-llm-run" title="Спросить модель заново">Заново</button></div>
+      ${р.error ? `<div class="small" style="color:var(--err)">Модель не ответила: ${esc(р.error)}</div>` : ''}
+      ${р.summary ? `<div style="line-height:1.6">${esc(р.summary)}</div>` : ''}
+      ${(р.actions || []).length ? `<div class="small dim" style="margin-top:8px"><b>Действия к исполнению</b></div>
+        <ul style="margin:4px 0 0 18px;padding:0">${р.actions.map((а) => `<li>${esc(а.what)} <span class="faint">— ${esc(а.who || '')}${а.when ? `, ${esc(а.when)}` : ''}</span></li>`).join('')}</ul>` : ''}
+      ${(р.trackers || []).some((т) => т.fired) ? `<div class="small" style="margin-top:8px"><b>Умные трекеры</b>: ${р.trackers.filter((т) => т.fired).map((т) => `<span class="chip warn" title="${esc(т.quote || '')}">${esc(т.label)}</span>`).join(' ')}</div>` : ''}
+      ${(р.scorecard || []).length ? `<div class="small" style="margin-top:8px"><b>Скоркарта</b>: ${р.scorecard.map((в) => `<span class="chip ${в.answer === 'да' ? 'ok' : в.answer === 'нет' ? 'err' : ''}" title="${esc(в.quote || '')}">${esc(в.question)} — ${esc(в.answer)}</span>`).join(' ')}</div>` : ''}
+      <div class="small faint" style="margin-top:8px">Сгенерировано моделью ${esc(р.model || '')}${р.latency_ms ? ` за ${num(р.latency_ms / 1000, 1)} с` : ''}${р.chunks > 1 ? ` по пересказам ${num(р.chunks)} частей` : ''}${stale ? ' · подсказки с тех пор менялись' : ''} — может ошибаться; причина и исход выбраны из закрытых списков.</div>
+    </div>`;
+    const кнопка = qs('#job-llm-run', host);
+    if (кнопка) кнопка.onclick = () => запустить(кнопка);
+  };
+  const запустить = async (кнопка) => {
+    кнопка.disabled = true; кнопка.textContent = 'Модель думает…';
+    try {
+      const ответ = await API.post(`/api/content/jobs/${job.id}/llm?force=true`);
+      д = { ...д, result: ответ.result, stale: false };
+      рисовать(ответ.result, false);
+    } catch (err) { fail(err); кнопка.disabled = false; кнопка.textContent = 'Разобрать моделью'; }
+  };
+  рисовать(д.result, д.stale);
+}
+
 /* Разбор одной записи в карточке задания.
  *
  * Отвечает на вопрос, ради которого запись и открывают повторно: что здесь
@@ -3087,7 +3145,7 @@ async function loadJobAnalysis(backdrop, job) {
     <span class="what">${esc(з.text || '')}${доп ? ` <span class="chip">${esc(доп)}</span>` : ''}</span>
   </div>`;
 
-  host.innerHTML = `
+  host.innerHTML = `<div id="job-llm"></div>
     <div class="grid cols-4" style="margin-bottom:14px">
       ${kpi('Тональность', num(тон.score, 2), esc(тон.label || ''))}
       ${kpi('Разворот', num((тон.turn || {}).shift, 2),
@@ -3327,6 +3385,10 @@ async function loadJobAnalysis(backdrop, job) {
       loadJobAnalysis(backdrop, job);
     } catch (err) { fail(err); кнопка.disabled = false; }
   });
+
+  // Смысл разговора — после разбора по правилам и своим запросом: место
+  // под него уже размечено, а ответ модели грузится отдельно.
+  loadJobLlm(backdrop, job);
 }
 
 /* Поиск по репликам открытого разговора.
@@ -4799,6 +4861,71 @@ RENDERERS.content = {
       height: 220, values: точки.map((т) => т.records), labels: метки,
       emptyText: 'нет данных за период',
     });
+    host.insertAdjacentHTML('beforeend', '<div id="llm-summary"></div>');
+    this.drawLlmSummary(qs('#llm-summary', host), период);
+  },
+
+  /* Смысловой слой в своде: причины и исходы по ответам языковой модели,
+   * доля решённых, действия к исполнению, умные трекеры и скоркарта.
+   * Отдельным запросом и после остального: модель — необязательный слой, и
+   * свод без неё обязан рисоваться так же быстро, как раньше. */
+  async drawLlmSummary(host, период) {
+    if (!host) return;
+    let д;
+    try {
+      д = await API.latest('content-llm', `/api/content/llm?period=${период}`);
+    } catch (err) {
+      if (err && err.silent) return;
+      return;
+    }
+    if (!host.isConnected) return;
+    if (!д.enabled && !д.analyzed) return;
+    const проц = (v) => (v === null || v === undefined ? '—' : `${num(v, 0)}%`);
+    if (!д.analyzed) {
+      host.innerHTML = card('По ответам языковой модели',
+        `модель ${esc(д.model || '')} подключена, но записей с ответом за период нет`,
+        `<div class="empty small">Новые записи разбираются в фоне${(д.worker || {}).queued ? ` — в очереди ${num(д.worker.queued)}` : ''}.
+         Разобрать архив: кнопка в «Настройках» → «Языковая модель» или POST /api/llm/backfill.</div>`);
+      return;
+    }
+    const исходы = д.outcomes || [];
+    const причины = д.reasons || [];
+    host.innerHTML = card('По ответам языковой модели',
+      `${esc(д.model || '')} · разобрано ${num(д.analyzed)} из ${num(д.records)} записей периода${д.stale ? ` · ${num(д.stale)} по прежним подсказкам` : ''}${д.errors ? ` · ошибок ${num(д.errors)}` : ''}`,
+      `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('Вопрос решён', проц(д.resolved_share), 'по оценке модели')}
+        ${kpi('Действий к исполнению', num(д.actions || 0), `в ${num(д.records_with_actions || 0)} записях`)}
+        ${kpi('Покрытие', д.coverage === null ? '—' : pct(д.coverage, 0), 'записей с ответом')}
+        ${kpi('Ответ модели', д.avg_latency_ms ? `${num(д.avg_latency_ms / 1000, 1)} с` : '—', 'на запись, в среднем')}
+      </div>
+      <div class="grid cols-2">
+        <div><div class="small dim" style="margin-bottom:6px"><b>Исходы</b></div><div id="llm-outcomes"></div></div>
+        <div><div class="small dim" style="margin-bottom:6px"><b>Причины обращений</b></div><div id="llm-reasons"></div></div>
+      </div>
+      ${(д.trackers || []).length ? `<table style="margin-top:10px"><thead><tr><th>Умный трекер</th><th class="num">Проверено</th><th class="num">Сработал</th><th class="num">Доля</th><th></th></tr></thead><tbody>
+        ${д.trackers.map((т) => `<tr><td>${esc(т.label || т.id)}</td><td class="num">${num(т.checked)}</td><td class="num">${num(т.fired)}</td>
+          <td class="num mono">${т.checked ? pct(т.fired / т.checked, 0) : '—'}</td><td></td></tr>`).join('')}</tbody></table>` : ''}
+      ${(д.scorecard || []).length ? `<table style="margin-top:10px"><thead><tr><th>Вопрос скоркарты</th><th class="num">Да</th><th class="num">Нет</th><th class="num">Н/п</th><th class="num">Доля «да»</th></tr></thead><tbody>
+        ${д.scorecard.map((в) => `<tr><td>${esc(в.question || в.id)}</td><td class="num">${num(в['да'])}</td><td class="num">${num(в['нет'])}</td><td class="num">${num(в['н/п'])}</td>
+          <td class="num mono">${(в['да'] + в['нет']) ? pct(в['да'] / (в['да'] + в['нет']), 0) : '—'}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${(д.action_items || []).length ? `<div class="small dim" style="margin-top:10px"><b>Действия к исполнению</b> — последние</div>
+        <div class="analysis-lines">${д.action_items.slice(0, 8).map((а) => `<div class="analysis-line">
+          <span class="ts mono">${fmtTime(а.created_at).slice(0, 5)}</span>
+          <span class="who">${esc(а.who || '')}</span>
+          <span class="what"><a href="#" onclick="window.__asrhub.openJob('${esc(а.job_id)}', {tab: 'analysis'});return false">${esc(а.what)}</a>${а.when ? ` <span class="chip">${esc(а.when)}</span>` : ''}</span></div>`).join('')}</div>` : ''}
+      <div class="small faint" style="margin-top:8px">Сгенерировано языковой моделью: причина и исход выбраны из закрытых списков, резюме и действия — пересказ модели, который может ошибаться. Отбор записей по исходу и причине — в «Результатах».</div>`);
+    if (исходы.length) {
+      Charts.donut(qs('#llm-outcomes', host), {
+        size: 150, centerLabel: 'записей', emptyText: 'исходы не спрашивались',
+        parts: исходы.map((и) => ({ label: и.key, value: и.records })),
+      });
+    } else { qs('#llm-outcomes', host).innerHTML = '<div class="empty small">исходы не спрашивались</div>'; }
+    if (причины.length) {
+      Charts.hbars(qs('#llm-reasons', host), {
+        items: причины.map((п) => ({ label: п.key, value: п.records })), labelWidth: 200,
+        emptyText: 'причины не спрашивались',
+      });
+    } else { qs('#llm-reasons', host).innerHTML = '<div class="empty small">причины не спрашивались</div>'; }
   },
 
   // --- разрезы -------------------------------------------------------------

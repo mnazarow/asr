@@ -415,6 +415,35 @@ class Collector:
                                       {"model": str(пара.get("model") or "")}))
         except Exception as exc:                             # noqa: BLE001
             log.debug("Метрики проверки не посчитаны: %s", exc)
+        # Смысловой слой — только когда включён.
+        клиент = getattr(self.state, "llm", None)
+        if клиент is not None and клиент.enabled:
+            try:
+                проба = клиент.probe()
+                out.append(Sample("asrhub_llm_available",
+                                  1.0 if проба.get("available") and
+                                  проба.get("model_known", True) else 0.0))
+                out.append(Sample("asrhub_llm_calls_total",
+                                  float(max(0, клиент.calls - клиент.errors)), {"status": "ok"}))
+                out.append(Sample("asrhub_llm_calls_total", float(клиент.errors),
+                                  {"status": "error"}))
+                out.append(Sample("asrhub_llm_calls_total", float(клиент.cache_hits),
+                                  {"status": "cache"}))
+                from ..llm import tasks as llm_tasks  # noqa: PLC0415
+
+                свод = self.state.db.llm_stats(llm_tasks.VERSION, since)
+                ответы = [р for р in свод["rows"] if not р.get("error")]
+                задержки = sorted(float(р["latency_ms"]) / 1000 for р in ответы
+                                  if р.get("latency_ms") is not None)
+                for stat, значение in self._quantiles(задержки).items():
+                    if stat in ("p50", "p95"):
+                        out.append(Sample("asrhub_llm_latency_seconds", round(значение, 3),
+                                          {"stat": stat}))
+                if свод["total"]:
+                    out.append(Sample("asrhub_llm_coverage",
+                                      round(len(ответы) / свод["total"], 4)))
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Метрики языковой модели не посчитаны: %s", exc)
         # Калибровка — за неделю: за сутки эталонных записей обычно единицы,
         # и ECE по ним — совпадение, а не мера.
         try:

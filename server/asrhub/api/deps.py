@@ -78,6 +78,9 @@ class AppState:
     monitoring: Any = None
     #: Разбор содержания записей: признаки, свод по корпусу, пересчёт архива.
     content: Any = None
+    #: Смысловой слой: клиент языковой модели и фоновый поток разбора.
+    llm: Any = None
+    llm_worker: Any = None
     version: str = "3.0.0"
     tickets: TicketStore = field(default_factory=TicketStore)
     #: Учётные записи и сессии веб-интерфейса. Ключи доступа живут отдельно и

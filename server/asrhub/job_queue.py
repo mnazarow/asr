@@ -141,6 +141,13 @@ class WorkerState:
 class JobQueue:
     """Менеджер очереди с пулом рабочих потоков."""
 
+    #: Необязательные соседи очереди — их ставит приложение после сборки.
+    #: Объявлены на классе, а не только в `__init__`: очередь собирают и
+    #: вручную (проверки строят её через `__new__` ради одного метода), и
+    #: обращение к недостающему полю роняло бы такой вызов на ровном месте.
+    content_index: Any = None
+    llm_worker: Any = None
+
     def __init__(self, db: Database, settings: Any, registry: EngineRegistry,
                  *, on_event: Callable[[str, dict[str, Any]], None] | None = None):
         self.db = db
@@ -160,11 +167,10 @@ class JobQueue:
         # Индексы воркеров, помеченных на выход при уменьшении их числа.
         self._retiring: set[int] = set()
         self._webhooks: Any = None
-        #: Разбор содержания записей. Ставится снаружи (create_app), потому
-        #: что тем же объектом пользуются ручки раздела: два разбора с двумя
-        #: снимками корпусных частот считали бы по-разному одну и ту же
-        #: запись — в зависимости от того, кто её посчитал.
-        self.content_index: Any = None
+        # content_index и llm_worker объявлены на классе: разбор содержания
+        # и смысловой слой ставит приложение (create_app), потому что теми
+        # же объектами пользуются ручки разделов — два разбора с двумя
+        # снимками корпусных частот считали бы по-разному одну и ту же запись.
         self._running: dict[str, float] = {}
         #: Сколько заданий шло разом, пока выполнялось это. Замер памяти —
         #: цифра на весь процесс, и без этого числа она не говорит ничего:
@@ -434,6 +440,11 @@ class JobQueue:
                             extra={"job_id": job_id})
         self.db.add_event(job_id, "cached",
                           f"Результат взят из кеша задания {cached['id']}")
+        if self.llm_worker is not None:
+            try:
+                self.llm_worker.enqueue(job_id)
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Клон %s не поставлен на смысловой разбор: %s", job_id, exc)
         log.info("Задание %s: результат взят из кеша (%s)", job_id, cached["id"])
         return job_id
 
@@ -974,6 +985,12 @@ class JobQueue:
                 job_id, {**job, "text": outcome.text,
                          "media_duration_s": job.get("media_duration_s")},
                 outcome.segments)
+        # Смысловой разбор — в свой поток: модель отвечает секунды.
+        if self.llm_worker is not None and str(job.get("source") or "") != "control":
+            try:
+                self.llm_worker.enqueue(job_id)
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Запись %s не поставлена на смысловой разбор: %s", job_id, exc)
 
         RUNTIME.inc("asrhub_jobs_total", {"status": "completed"})
         RUNTIME.inc("asrhub_audio_seconds_total",

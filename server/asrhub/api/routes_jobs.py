@@ -346,8 +346,9 @@ def list_jobs(
                     "interruptions, silence, script_failed, money, monologue, "
                     "mixed, dead_air, frustrated, repeat, profanity, "
                     "profanity_agent), по здоровью распознавания (suspect, "
-                    "hallucination, speakers_mismatch) или по звуку на входе "
-                    "(bad_audio, noisy, clipped)"),
+                    "hallucination, speakers_mismatch), по звуку на входе "
+                    "(bad_audio, noisy, clipped) или по ответу языковой модели "
+                    "(llm_unresolved, llm_actions, outcome:<исход>, reason:<причина>)"),
     light: bool = Query(default=False,
                         description="Только поля для таблицы, без текста и сегментов"),
     principal: Principal = Depends(authenticate),
@@ -368,11 +369,11 @@ def list_jobs(
     # интерфейсе ждала их только чтобы выбросить.
     отборы = {**state.db.CONTENT_FILTERS, **state.db.JOB_FILTERS}
     if (content and content not in отборы
-            and not content.startswith(state.db.CATEGORY_FILTER)):
+            and not content.startswith(state.db.PREFIX_FILTERS)):
         raise error_response(ConfigError(
             f"Неизвестный отбор по содержанию «{content}».",
-            hint="Доступные: " + ", ".join(sorted(отборы))
-                 + f", {state.db.CATEGORY_FILTER}<имя категории>"))
+            hint="Доступные: " + ", ".join(sorted(отборы)) + ", "
+                 + ", ".join(f"{п}<значение>" for п in state.db.PREFIX_FILTERS)))
     jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
                               order=order, light=light, content=content)

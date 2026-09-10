@@ -225,6 +225,18 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
     if согласие.get("verdict") in ("warning", "critical"):
         готовое["agreement"] = {k: согласие.get(k) for k in
                                 ("verdict", "checks", "wer_avg", "previous_wer_avg", "growth")}
+    # Смысловой слой: исходы и причины по ответам модели — когда они есть.
+    if getattr(analytics, "db", None) is not None and \
+            str(settings.get("llm_backend") or "off") != "off":
+        from .analytics import PERIODS  # noqa: PLC0415
+        from .llm import tasks as llm_tasks  # noqa: PLC0415
+
+        свод_модели = analytics.db.llm_stats(
+            llm_tasks.VERSION, time.time() - (PERIODS.get(срок) or 7 * 86400))
+        ответы = [р for р in свод_модели["rows"] if not р.get("error")]
+        if ответы:
+            готовое["llm"] = {"records": свод_модели["total"], "analyzed": len(ответы),
+                              **llm_tasks.summarize_for_digest(ответы)}
     метка = str(settings.get("consent_tag") or "").strip()
     if метка and getattr(analytics, "db", None) is not None:
         срок_дней = int(settings.get("consent_days") or 30)
@@ -237,7 +249,8 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
                                   drift=готовое.get("drift"),
                                   bad_audio=готовое.get("bad_audio"),
                                   review=готовое.get("review"),
-                                  agreement=готовое.get("agreement"))
+                                  agreement=готовое.get("agreement"),
+                                  llm=готовое.get("llm"))
     return готовое
 
 
@@ -298,7 +311,8 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                 drift: list[dict[str, Any]] | None = None,
                 bad_audio: dict[str, Any] | None = None,
                 review: dict[str, Any] | None = None,
-                agreement: dict[str, Any] | None = None) -> str:
+                agreement: dict[str, Any] | None = None,
+                llm: dict[str, Any] | None = None) -> str:
     """Та же сводка словами.
 
     Приёмник входящих сообщений в мессенджере показывает поле `text` и
@@ -432,6 +446,21 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         for вывод in ((содержание or {}).get("findings") or [])[:3]:
             метка = {"warning": "!", "good": "+"}.get(вывод.get("severity"), "·")
             строки.append(f"  {метка} {вывод.get('text')}")
+    if llm and llm.get("analyzed"):
+        строки.append("")
+        строки.append(f"По ответам языковой модели ({llm['analyzed']} из "
+                      f"{llm.get('records') or 0} записей)")
+        if llm.get("outcomes"):
+            строки.append("Исходы: " + ", ".join(
+                f"{и['key']} {число(и['share'], 0)} %" for и in llm["outcomes"][:5]))
+        if llm.get("reasons"):
+            строки.append("Причины обращений: " + ", ".join(
+                f"{п['key']} {число(п['share'], 0)} %" for п in llm["reasons"][:5]))
+        if llm.get("resolved_share") is not None:
+            строки.append(f"Вопрос решён в разговоре: {число(llm['resolved_share'], 0)} %")
+        if llm.get("actions"):
+            строки.append(f"Действий к исполнению: {llm['actions']} в "
+                          f"{llm.get('records_with_actions') or 0} записях")
     return "\n".join(строки)
 
 

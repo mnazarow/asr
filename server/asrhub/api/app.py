@@ -25,6 +25,7 @@ from ..db import Database
 from ..engines import EngineRegistry
 from ..errors import ASRHubError, FileTooLarge
 from ..job_queue import JobQueue
+from ..llm import LLMClient, LLMWorker
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
 from ..streaming import StreamSession
@@ -34,6 +35,7 @@ from .routes_auth import users_router
 from .routes_catalog import router as catalog_router
 from .routes_content import router as content_router
 from .routes_jobs import router as jobs_router
+from .routes_llm import router as llm_router
 from .routes_monitoring import router as monitoring_router
 from .routes_phone import router as phone_router
 from .routes_review import router as review_router
@@ -338,6 +340,14 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     state.monitoring = MonitoringService(state)
     state.content = ContentIndex(db, settings)
     queue.content_index = state.content
+    # Смысловой слой: клиент модели и фоновый поток разбора. Поток уступает
+    # распознаванию по глубине очереди — той же, что видит планировщик.
+    state.llm = LLMClient(settings, db)
+    state.llm_worker = LLMWorker(
+        db, settings, state.llm,
+        queue_state=lambda: db.count_jobs(status=["queued", "retry"]),
+        content_index=state.content)
+    queue.llm_worker = state.llm_worker
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -346,6 +356,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             queue.start()
         state.monitoring.start()
         state.content.start()
+        state.llm_worker.start()
         log.info("ASR Hub запущен: %s:%s, каталог данных %s",
                  settings.get("server_host"), settings.get("server_port"),
                  settings.paths.data)
@@ -354,6 +365,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         yield
         state.monitoring.stop()
         state.content.stop()
+        state.llm_worker.stop()
         queue.stop()
         registry.unload_all()
         db.close()
@@ -533,6 +545,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(monitoring_router)
     app.include_router(content_router)
     app.include_router(review_router)
+    app.include_router(llm_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.
     app.include_router(phone_router)

@@ -66,6 +66,12 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      "разбор одной записи. Выборка сужается до записей самого ключа; "
      "пересчёт всего архива — только администратору.",
      ("/api/content",)),
+    ("Языковая модель",
+     "Смысловой слой поверх расшифровок: резюме, причина обращения и исход "
+     "из закрытых списков, действия к исполнению, умные трекеры, ответы "
+     "скоркарты. Локальная модель через Ollama или OpenAI-совместимый "
+     "сервер; слой необязательный и включается настройкой llm_backend.",
+     ("/api/llm",)),
     ("Здоровье распознавания",
      "Очередь ручной проверки и контрольные прогоны второй моделью: то, из "
      "чего появляются эталоны и согласие моделей. Список сужается до "
@@ -121,6 +127,8 @@ ADMIN_ROUTES = {
     # Пополнить очередь проверки и поставить контрольные прогоны — работа
     # для всего сервера, а не для своих заданий: только администратор.
     ("/api/review/sample", "post"), ("/api/control/run", "post"),
+    # Проба модели и разбор архива — работа для всего сервера.
+    ("/api/llm/test", "post"), ("/api/llm/backfill", "post"),
 }
 #: Вход и выход ключа не требуют вовсе: это и есть способ его получить.
 OPEN_AUTH_ROUTES = {"/api/auth/login", "/api/auth/logout"}
@@ -428,6 +436,17 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     ("/api/analytics", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/analytics?period=week'",
         "show": "/api/analytics?period=week", "limit": 1100,
+    },
+    ("/api/llm/status", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/llm/status",
+        "show": "/api/llm/status", "limit": 1000,
+        "note": "`available` и `reason` отвечают, доступен ли сервер модели и "
+                "скачана ли она; `coverage` — какая часть записей за сутки уже "
+                "разобрана.",
+    },
+    ("/api/content/llm", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/content/llm?period=week'",
+        "show": "/api/content/llm?period=week", "limit": 1600,
     },
     ("/api/review", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/review?status=pending&limit=20'",

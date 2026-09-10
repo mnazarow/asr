@@ -248,7 +248,7 @@ class Settings:
     #: токен прямо в строке адреса, и знающий его пишет в чат от имени
     #: сервера. Раньше в перечне стоял один webhook_secret, и оба адреса
     #: уходили открытым текстом любому ключу, включая доступ «только чтение».
-    SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token")
+    SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token", "llm_api_key")
 
     def to_dict(self, for_admin: bool = False) -> dict[str, Any]:
         """Настройки для выдачи наружу.

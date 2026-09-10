@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -150,6 +150,44 @@ _MODEL_CHECKS_SCHEMA = """
         words         INTEGER,
         created_at    REAL NOT NULL
     )
+"""
+
+#: Смысловой слой: ответы языковой модели по записи. Отдельно от разбора
+#: содержания — тот считается правилами за миллисекунды и пересчитывается
+#: при каждой смене словаря, а ответ модели стоит секунды видеокарты и
+#: переживает пересчёты. Версия — версия подсказок: сменились подсказки,
+#: старые ответы помечаются устаревшими, но не стираются.
+_LLM_RESULTS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS llm_results (
+        job_id      TEXT PRIMARY KEY,
+        version     INTEGER NOT NULL,
+        model       TEXT,
+        summary     TEXT,
+        reason      TEXT,
+        outcome     TEXT,
+        resolved    INTEGER,
+        actions     TEXT,
+        trackers    TEXT,
+        scorecard   TEXT,
+        chunks      INTEGER DEFAULT 1,
+        calls       INTEGER DEFAULT 0,
+        latency_ms  REAL,
+        error       TEXT,
+        created_at  REAL NOT NULL
+    ) WITHOUT ROWID
+"""
+
+#: Кеш ответов модели по отпечатку подсказки: одна и та же запись с теми
+#: же подсказками второй раз модель не спрашивает.
+_LLM_CACHE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS llm_cache (
+        key         TEXT PRIMARY KEY,
+        kind        TEXT,
+        model       TEXT,
+        response    TEXT,
+        latency_ms  REAL,
+        created_at  REAL NOT NULL
+    ) WITHOUT ROWID
 """
 
 #: Основы слов записи — знаменатель TF-IDF. Отдельная таблица, а не разбор
@@ -278,6 +316,11 @@ _SCHEMA = [
     # --- версия 16: очередь ручной проверки и контрольные прогоны --------
     _REVIEW_SCHEMA,
     _MODEL_CHECKS_SCHEMA,
+    # --- версия 17: смысловой слой языковой модели ------------------------
+    _LLM_RESULTS_SCHEMA,
+    _LLM_CACHE_SCHEMA,
+    "CREATE INDEX IF NOT EXISTS idx_llm_results_created ON llm_results(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_results_outcome ON llm_results(outcome)",
     "CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, picked_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_model_checks_created ON model_checks(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_model_checks_job ON model_checks(job_id)",
@@ -744,6 +787,17 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "done_at": "REAL",
         "reviewer": "TEXT",
         "note": "TEXT",
+    },
+    "llm_results": {
+        "job_id": "TEXT", "version": "INTEGER", "model": "TEXT", "summary": "TEXT",
+        "reason": "TEXT", "outcome": "TEXT", "resolved": "INTEGER", "actions": "TEXT",
+        "trackers": "TEXT", "scorecard": "TEXT", "chunks": "INTEGER DEFAULT 1",
+        "calls": "INTEGER DEFAULT 0", "latency_ms": "REAL", "error": "TEXT",
+        "created_at": "REAL",
+    },
+    "llm_cache": {
+        "key": "TEXT", "kind": "TEXT", "model": "TEXT", "response": "TEXT",
+        "latency_ms": "REAL", "created_at": "REAL",
     },
     "model_checks": {
         "id": "INTEGER",
@@ -1240,12 +1294,22 @@ class Database:
         "bad_audio": "(jobs.snr_db < 10 OR jobs.clipping_share >= 0.01)",
         "noisy": "jobs.snr_db < 10",
         "clipped": "jobs.clipping_share >= 0.01",
+        # По ответу языковой модели: вопрос не решён, есть договорённости.
+        "llm_unresolved": "jobs.id IN (SELECT job_id FROM llm_results WHERE resolved = 0)",
+        "llm_actions": ("jobs.id IN (SELECT job_id FROM llm_results "
+                        "WHERE actions IS NOT NULL AND actions <> '[]')"),
     }
 
     #: Приставка отбора по категории обращения: `category:payment`. Имя
     #: категории — значение из настроек, а не выражение, и в запрос оно
     #: попадает только параметром.
     CATEGORY_FILTER = "category:"
+
+    #: Отборы с приставкой и значением: категория обращения, исход и
+    #: причина из ответа языковой модели. Перечень нужен и здесь, и в
+    #: обработчике списка заданий: он проверяет отбор до запроса, и без
+    #: общего перечня новый отбор работал бы в базе и отвергался ручкой.
+    PREFIX_FILTERS: tuple[str, ...] = ("category:", "outcome:", "reason:")
 
     def _jobs_where(self, *, status: str | list[str] | None = None,
                     owner: str | list[str] | None = None,
@@ -1273,6 +1337,13 @@ class Database:
             where.append("EXISTS (SELECT 1 FROM content_hits h "
                          "WHERE h.job_id = jobs.id AND h.category = ?)")
             args.append(content[len(self.CATEGORY_FILTER):])
+        elif content and content.startswith(("outcome:", "reason:")):
+            # Исход и причина из ответа языковой модели — значение из
+            # списка настроек, в запрос попадает только параметром.
+            вид, значение = content.split(":", 1)
+            условие, параметры = self.llm_outcome_filter(вид, значение)
+            where.append(условие)
+            args.extend(параметры)
         elif content:
             # Соединение с разбором добавляется, только когда отбор задан:
             # список заданий открывают чаще всего, и лишнее соединение
@@ -1999,6 +2070,86 @@ class Database:
             "ORDER BY m.created_at DESC LIMIT ?", [*args, limit])
         return [dict(r) for r in rows]
 
+    # --- смысловой слой языковой модели ----------------------------------------
+
+    def llm_save(self, job_id: str, version: int, **поля: Any) -> None:
+        """Кладёт ответ модели по записи; словари и списки — строкой JSON."""
+        строка = dict(поля)
+        for к in ("actions", "trackers", "scorecard"):
+            if isinstance(строка.get(к), (list, dict)):
+                строка[к] = json.dumps(строка[к], ensure_ascii=False)
+        if строка.get("resolved") is not None:
+            строка["resolved"] = 1 if строка["resolved"] else 0
+        колонки = ["job_id", "version", "created_at", *строка]
+        значения = [job_id, version, now(), *строка.values()]
+        self.execute(
+            f"INSERT OR REPLACE INTO llm_results ({', '.join(колонки)}) "
+            f"VALUES ({', '.join('?' for _ in колонки)})", значения)
+
+    def llm_get(self, job_id: str) -> dict[str, Any] | None:
+        row = self.query_one("SELECT * FROM llm_results WHERE job_id=?", (job_id,))
+        return _row_to_llm(row) if row else None
+
+    def llm_pending(self, version: int, limit: int = 50, *, since: float | None = None
+                    ) -> list[dict[str, Any]]:
+        """Завершённые записи без ответа модели текущей версии — новые первыми.
+
+        Контрольные прогоны мимо: это та же запись второй раз. Записи из
+        кеша остаются: у клона свой владелец и своя карточка, а модель по
+        ним всё равно не вызывается второй раз — тот же текст даёт тот же
+        отпечаток подсказки, и ответ берётся из кеша.
+        """
+        where = ["j.status='completed'", "j.text IS NOT NULL", "j.text != ''",
+                 "COALESCE(j.source,'') <> 'control'",
+                 "(l.job_id IS NULL OR l.version < ?)"]
+        args: list[Any] = [version]
+        if since is not None:
+            where.append("j.created_at >= ?")
+            args.append(since)
+        rows = self.query(
+            "SELECT j.id, j.text, j.media_duration_s, j.model, j.owner FROM jobs j "
+            "LEFT JOIN llm_results l ON l.job_id = j.id "
+            f"WHERE {' AND '.join(where)} ORDER BY j.created_at DESC LIMIT ?",
+            [*args, limit])
+        return [dict(r) for r in rows]
+
+    def llm_stats(self, version: int, since: float, *,
+                  owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Свод ответов модели за окно: покрытие, исходы, причины, действия,
+        трекеры, задержка, ошибки."""
+        where = ["j.status='completed'", "j.created_at >= ?",
+                 "COALESCE(j.source,'') <> 'control'"]
+        args: list[Any] = [since]
+        if isinstance(owner, (list, tuple)):
+            where.append(f"j.owner IN ({','.join('?' for _ in owner)})")
+            args.extend(owner)
+        elif owner:
+            where.append("j.owner=?")
+            args.append(owner)
+        условие = " AND ".join(where)
+        всего = int(self.query_one(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args)["n"])
+        rows = self.query(
+            "SELECT l.job_id, l.version, l.reason, l.outcome, l.resolved, l.actions, l.trackers, "
+            "       l.scorecard, l.latency_ms, l.error, l.calls, l.chunks, j.filename, "
+            "       j.created_at, j.owner "
+            f"FROM llm_results l JOIN jobs j ON j.id = l.job_id WHERE {условие}", args)
+        return {"total": всего, "rows": [_row_to_llm(r) for r in rows]}
+
+    def llm_cache_get(self, key: str) -> str | None:
+        row = self.query_one("SELECT response FROM llm_cache WHERE key=?", (key,))
+        return str(row["response"]) if row else None
+
+    def llm_cache_put(self, key: str, kind: str, model: str, response: str,
+                      latency_ms: float) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO llm_cache (key, kind, model, response, latency_ms, "
+            "created_at) VALUES (?,?,?,?,?,?)", (key, kind, model, response, latency_ms, now()))
+
+    def llm_outcome_filter(self, kind: str, value: str) -> tuple[str, list[Any]]:
+        """Условие отбора заданий по исходу или причине из ответа модели."""
+        колонка = {"outcome": "outcome", "reason": "reason"}[kind]
+        return (f"jobs.id IN (SELECT job_id FROM llm_results WHERE {колонка} = ?)", [value])
+
     def file_paths(self, job_ids: list[str]) -> dict[str, str]:
         """Пути исходных файлов по номерам заданий.
 
@@ -2380,6 +2531,7 @@ class Database:
             conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_marks WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM review_queue WHERE job_id=?", (job_id,))
+            conn.execute("DELETE FROM llm_results WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM model_checks WHERE job_id=? OR check_job_id=?",
                          (job_id, job_id))
             # content_vocab не трогаем: это словарь форм на весь сервер, а не
@@ -2842,6 +2994,20 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
         except OSError as exc:
             log.warning("Не удалось удалить исходник %s: %s", path, exc)
     return freed
+
+
+def _row_to_llm(row: sqlite3.Row) -> dict[str, Any]:
+    out = dict(row)
+    for к in ("actions", "trackers", "scorecard"):
+        raw = out.get(к)
+        if isinstance(raw, str):
+            try:
+                out[к] = json.loads(raw)
+            except (TypeError, ValueError):
+                out[к] = None
+    if out.get("resolved") is not None:
+        out["resolved"] = bool(out["resolved"])
+    return out
 
 
 def _serialize_json_fields(fields: dict[str, Any]) -> None:
