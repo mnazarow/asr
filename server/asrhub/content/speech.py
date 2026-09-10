@@ -19,6 +19,12 @@ from .stemmer import words
 #: Пауза внутри разговора, начиная с которой это уже молчание, а не дыхание.
 ПОРОГ_ПАУЗЫ = 2.0
 
+#: Пауза, начиная с которой молчание уже заметно собеседнику: три секунды —
+#: порог «заметной тишины» у NICE и Amazon Contact Lens, у Genesys две, у
+#: Google пять. Считается отдельно от пауз: пауза в две секунды — это
+#: обдумывание, а сумма пауз от трёх — время, которое клиент ждал.
+ПОРОГ_ЗАМЕТНОЙ_ТИШИНЫ = 3.0
+
 
 def _минуты(сегменты: list[dict[str, Any]]) -> float:
     звучало = sum(max(0.0, float(с.get("end") or с.get("end_s") or 0.0)
@@ -72,13 +78,19 @@ def analyze(segments: list[dict[str, Any]], duration_s: float) -> dict[str, Any]
     монолог = {"speaker": None, "seconds": 0.0, "start_s": 0.0}
     текущий = {"speaker": None, "seconds": 0.0, "start_s": 0.0}
     ответы: dict[str, list[float]] = {}
+    # Смены говорящего и наложение речи — то, что Gong называет
+    # интерактивностью, а Genesys считает в секундах: сколько раз речь
+    # переходила от стороны к стороне и сколько времени обе говорили сразу.
+    смен = 0
+    наложение = 0.0
+    заметная_тишина = 0.0
 
     предыдущий: dict[str, Any] | None = None
     for с in сегменты:
         кто = str(с.get("speaker") or "—")
         запись = по_говорящим.setdefault(кто, {
             "speaker": кто, "seconds": 0.0, "words": 0, "segments": 0,
-            "fillers": 0, "questions": 0})
+            "fillers": 0, "questions": 0, "monologue_s": 0.0})
         длина = max(0.0, с["end"] - с["start"])
         слова_реплики = words(str(с.get("text") or ""))
         запись["seconds"] += длина
@@ -93,7 +105,12 @@ def analyze(segments: list[dict[str, Any]], duration_s: float) -> dict[str, Any]
             тот_же = str(предыдущий.get("speaker") or "—") == кто
             if разрыв >= ПОРОГ_ПАУЗЫ:
                 паузы.append(разрыв)
+            if разрыв >= ПОРОГ_ЗАМЕТНОЙ_ТИШИНЫ:
+                заметная_тишина += разрыв
             if not тот_же:
+                смен += 1
+                if разрыв < 0:
+                    наложение += -разрыв
                 if разрыв <= ПОРОГ_ПЕРЕБИВАНИЯ:
                     перебивания.append({
                         "start_s": round(с["start"], 2), "speaker": кто,
@@ -109,6 +126,8 @@ def analyze(segments: list[dict[str, Any]], duration_s: float) -> dict[str, Any]
             текущий = {"speaker": кто, "seconds": длина, "start_s": с["start"]}
         if текущий["seconds"] > монолог["seconds"]:
             монолог = dict(текущий)
+        if текущий["seconds"] > запись["monologue_s"]:
+            запись["monologue_s"] = текущий["seconds"]
         предыдущий = с
 
     минут = звучало / 60.0
@@ -121,6 +140,7 @@ def analyze(segments: list[dict[str, Any]], duration_s: float) -> dict[str, Any]
         з["filler_rate"] = round(з["fillers"] / з["words"], 4) if з["words"] else 0.0
         задержки = ответы.get(з["speaker"]) or []
         з["reply_delay_s"] = round(sum(задержки) / len(задержки), 2) if задержки else None
+        з["monologue_s"] = round(з["monologue_s"], 1)
 
     молчание = max(0.0, длительность - звучало)
     всего_паразитов = sum(з["fillers"] for з in по_говорящим.values())
@@ -143,8 +163,55 @@ def analyze(segments: list[dict[str, Any]], duration_s: float) -> dict[str, Any]
         "longest_pause_s": round(max(паузы), 1) if паузы else 0.0,
         "interruptions": len(перебивания),
         "interruption_examples": перебивания[:10],
+        # Наложение — в секундах и долей длительности: число перебиваний
+        # говорит, сколько раз, а это — сколько времени говорили хором.
+        "overlap_s": round(наложение, 1),
+        "overlap_share": round(наложение / длительность, 4) if длительность else None,
+        "dead_air_s": round(заметная_тишина, 1),
+        "dead_air_share": (round(заметная_тишина / длительность, 4)
+                           if длительность else None),
+        # Смены говорящего: и всего, и на минуту разговора, потому что за
+        # час их естественно больше, чем за пять минут.
+        "switches": смен,
+        "switches_per_min": round(смен / минут, 2) if минут > 0.05 else None,
         "monologue": {"speaker": монолог["speaker"],
                       "seconds": round(монолог["seconds"], 1),
                       "start_s": round(монолог["start_s"], 1)},
         "speakers": sorted(по_говорящим.values(), key=lambda з: -(з["seconds"] or 0)),
+    }
+
+
+def sides(речь: dict[str, Any], agent: str | None) -> dict[str, Any]:
+    """Стороны разговора: оператор и клиент — и показатели между ними.
+
+    Половина показателей мировой практики существует только «между
+    сторонами»: доля речи оператора, его самый долгий монолог против самого
+    долгого рассказа клиента, пауза перед ответом, соотношение темпов.
+    Клиентом считается самый говорливый из тех, кто не оператор: в звонке
+    сторон две, а третий говорящий — обычно ошибка разделения.
+
+    Без оператора всё это None: считать «долю речи оператора», не зная,
+    кто оператор, значило бы выдать за неё долю случайного говорящего.
+    """
+    говорящие = {з["speaker"]: з for з in (речь.get("speakers") or [])}
+    пусто = {"agent": None, "customer": None, "talk_share": None,
+             "monologue_s": None, "customer_story_s": None,
+             "reply_delay_s": None, "customer_reply_delay_s": None,
+             "tempo_ratio": None}
+    if not agent or agent not in говорящие:
+        return пусто
+    оператор = говорящие[agent]
+    остальные = [з for к, з in говорящие.items() if к != agent]
+    клиент = max(остальные, key=lambda з: з["seconds"] or 0) if остальные else None
+    темп_оп, темп_кл = оператор.get("wpm"), (клиент or {}).get("wpm")
+    return {
+        "agent": agent,
+        "customer": клиент["speaker"] if клиент else None,
+        "talk_share": оператор.get("share"),
+        "monologue_s": оператор.get("monologue_s"),
+        "customer_story_s": (клиент or {}).get("monologue_s"),
+        "reply_delay_s": оператор.get("reply_delay_s"),
+        "customer_reply_delay_s": (клиент or {}).get("reply_delay_s"),
+        "tempo_ratio": (round(темп_оп / темп_кл, 2)
+                        if темп_оп and темп_кл else None),
     }

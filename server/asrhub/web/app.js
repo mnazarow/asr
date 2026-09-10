@@ -2352,6 +2352,16 @@ RENDERERS.results = {
             <option value="silence">много молчания</option>
             <option value="script_failed">скрипт не соблюдён</option>
             <option value="money">названы суммы</option>
+            <option value="monologue">монолог оператора дольше 2,5 мин</option>
+            <option value="mixed">противоречивые: и резко, и тепло</option>
+            <option value="dead_air">заметной тишины больше 30 с</option>
+            <option value="frustrated">клиент раздражён</option>
+            <option value="repeat">повторное обращение</option>
+            <option value="profanity_agent">нецензурная лексика у сотрудника</option>
+            <option value="profanity">нецензурная лексика в разговоре</option>
+            <option value="suspect">подозрительная расшифровка</option>
+            <option value="hallucination">похоже на галлюцинацию</option>
+            <option value="speakers_mismatch">говорящих не столько, сколько ожидалось</option>
           </select>
           <select id="r-order" style="width:190px">
             <option value="created_at DESC">Сначала новые</option>
@@ -2735,6 +2745,21 @@ function showJobModal(job, opts) {
         ${job.error_hint ? `<div class="small dim" style="margin-top:6px;white-space:pre-wrap">${
           esc(job.error_hint)}</div>` : ''}</div>` : ''}
 
+      ${(job.quality_flags || []).length ? `<div class="finding warning" style="margin-bottom:12px">
+        <b>Расшифровка выглядит подозрительно</b>: ${(job.quality_flags || []).map((ф) =>
+          esc(ПРИЗНАКИ_КАЧЕСТВА[ф] || ф)).join(', ')}${
+          job.suspect_segments ? ` — ${num(job.suspect_segments)} из ${num(job.segments_count)} сегментов` : ''}.
+        ${((job.quality_detail || {}).items || []).length ? `<div class="analysis-lines" style="margin-top:8px">${
+          (job.quality_detail.items || []).slice(0, 8).map((и) => `<div class="analysis-line" data-start="${и.start_s || 0}">
+            <span class="ts mono">${fmtDur(и.start_s || 0)}</span>
+            <span class="who">сегмент ${num((и.idx || 0) + 1)}</span>
+            <span class="what">${esc(и.text || '')} ${(и.reasons || []).map((r) =>
+              `<span class="chip">${esc(ПРИЗНАКИ_КАЧЕСТВА[r] || r)}</span>`).join(' ')}</span></div>`).join('')}</div>` : ''}
+        ${(job.quality_detail || {}).speakers_expected && job.quality_flags.includes('speakers')
+          ? `<div class="small" style="margin-top:6px">Говорящих найдено ${num(job.quality_detail.speakers)}, ожидалось ${num(job.quality_detail.speakers_expected)} — настройка quality_expected_speakers.</div>` : ''}
+        <div class="small faint" style="margin-top:6px">Признаки считаются по сегментам без эталона и ничего не доказывают — это повод послушать.</div>
+      </div>` : ''}
+
       ${job.status === 'completed' || job.status === 'failed'
         ? '<div class="player" id="job-player"></div>' : ''}
 
@@ -2867,6 +2892,9 @@ async function loadJobAnalysis(backdrop, job) {
   const обещания = a.commitments || {};
   const вопросы = a.questions || {};
   const тревога = a.alerts || {};
+  const раздражение = a.frustration || {};
+  const повторное = a.repeat_contact || {};
+  const мат = a.profanity || {};
 
   const реплика = (з, доп) => `<div class="analysis-line" data-start="${з.start_s || 0}">
     <span class="ts mono">${fmtDur(з.start_s || 0)}</span>
@@ -2895,17 +2923,25 @@ async function loadJobAnalysis(backdrop, job) {
       `<div class="table-wrap"><table>
         <thead><tr><th>Говорящий</th><th class="num">Тональность</th>
           <th class="num">Реплик</th><th class="num">Говорил</th>
-          <th class="num">Темп</th><th class="num">Паразитов</th></tr></thead>
+          <th class="num">Темп</th><th class="num">Паразитов</th>
+          <th class="num" title="самая долгая непрерывная речь">Монолог</th>
+          <th class="num" title="средняя пауза перед ответом собеседнику; паузы от 2 с считаются тишиной и сюда не входят">Пауза перед ответом</th></tr></thead>
         <tbody>${(тон.by_speaker || []).map((г) => {
           const р = (речь.speakers || []).find((s) => s.speaker === г.speaker) || {};
-          return `<tr><td>${esc(г.speaker)}</td>
+          const стороны = речь.sides || {};
+          const роль = г.speaker === стороны.agent ? ' <span class="faint small">оператор</span>'
+            : g_роль(г.speaker, стороны);
+          return `<tr><td>${esc(г.speaker)}${роль}</td>
             <td class="num">${toneChip(г.score, г.label)}</td>
             <td class="num mono">${num(г.segments)}</td>
             <td class="num mono">${р.share === null || р.share === undefined
               ? '—' : pct(р.share, 0)}</td>
             <td class="num mono">${num(р.wpm, 0)}</td>
             <td class="num mono">${р.filler_rate === null || р.filler_rate === undefined
-              ? '—' : pct(р.filler_rate, 1)}</td></tr>`;
+              ? '—' : pct(р.filler_rate, 1)}</td>
+            <td class="num mono">${р.monologue_s ? `${num(р.monologue_s, 0)} с` : '—'}</td>
+            <td class="num mono">${р.reply_delay_s === null || р.reply_delay_s === undefined
+              ? '—' : `${num(р.reply_delay_s, 2)} с`}</td></tr>`;
         }).join('')}</tbody></table></div>`) : ''}
 
     <div class="grid cols-2">
@@ -2942,6 +2978,23 @@ async function loadJobAnalysis(backdrop, job) {
       `<div class="analysis-lines">${(тревога.items || []).map(
          (т) => реплика(т, (т.words || []).join(', '))).join('')}</div>`) : ''}
 
+    ${(раздражение.items || []).length ? card('Клиент раздражён',
+      раздражение.speaker ? `по репликам говорящего «${раздражение.speaker}»: не «обсуждает плохое», а расстроен`
+                          : 'по всем репликам: оператор не определён',
+      `<div class="analysis-lines">${(раздражение.items || []).map(
+         (т) => реплика(т, (т.words || []).join(', '))).join('')}</div>`) : ''}
+
+    ${(повторное.items || []).length ? card('Признаки повторного обращения',
+      'клиент говорит, что уже обращался и вопрос не решён — обратная сторона решения с первого раза',
+      `<div class="analysis-lines">${(повторное.items || []).map(
+         (т) => реплика(т, (т.words || []).join(', '))).join('')}</div>`) : ''}
+
+    ${мат.enabled && (мат.items || []).length ? card(
+      `Нецензурная лексика${мат.agent ? ` — у сотрудника ${мат.agent} из ${мат.count}` : ''}`,
+      'по корням слов; созвучные слова возможны — проверьте по репликам',
+      `<div class="analysis-lines">${(мат.items || []).map(
+         (т) => реплика(т, (т.words || []).join(', '))).join('')}</div>`) : ''}
+
     ${(обещания.items || []).length ? card(
       `Обещания (${обещания.count}, со сроком ${обещания.with_deadline})`,
       'то, за что потом спросят: в записи это есть, а в системе учёта — нет',
@@ -2970,8 +3023,7 @@ async function loadJobAnalysis(backdrop, job) {
           <td>${п.passed ? '<span class="chip ok">есть</span>'
                          : '<span class="chip err">нет</span>'}</td>
           <td>${esc(п.label)}</td>
-          <td class="small dim">${esc({ start: 'в начале', end: 'в конце',
-                                        any: 'в любом месте' }[п.where] || п.where)}</td>
+          <td class="small dim">${esc(гдеИскали(п))}</td>
           <td class="small">${esc(п.matched || '—')}</td></tr>`).join('')}</tbody></table></div>`) : ''}
 
     <div class="grid cols-2">
@@ -2982,10 +3034,20 @@ async function loadJobAnalysis(backdrop, job) {
                : '<div class="empty small">Вопросов не найдено</div>')}
       ${card('Разговор', 'паузы, перебивания, вежливость',
              `<div class="table-wrap"><table><tbody>
-               <tr><td class="small dim">Перебиваний</td><td class="mono">${num(речь.interruptions)}</td></tr>
+               <tr><td class="small dim">Перебиваний</td><td class="mono">${num(речь.interruptions)}${
+                 речь.overlap_s ? ` <span class="faint">(говорили одновременно ${
+                   num(речь.overlap_s, 1)} с)</span>` : ''}</td></tr>
+               <tr><td class="small dim">Смен говорящего</td><td class="mono">${num(речь.switches)}${
+                 речь.switches_per_min ? ` <span class="faint">(${num(речь.switches_per_min, 1)} в минуту)</span>` : ''}</td></tr>
                <tr><td class="small dim">Долгих пауз</td><td class="mono">${num(речь.pauses)}${
                  речь.longest_pause_s ? ` <span class="faint">(дольше всего ${
                    num(речь.longest_pause_s, 1)} с)</span>` : ''}</td></tr>
+               <tr><td class="small dim" title="сумма пауз от трёх секунд">Заметная тишина</td><td class="mono">${
+                 речь.dead_air_s ? `${num(речь.dead_air_s, 0)} с${
+                   речь.dead_air_share ? ` <span class="faint">(${pct(речь.dead_air_share, 0)} записи)</span>` : ''}` : '—'}</td></tr>
+               ${(речь.sides || {}).agent ? `<tr><td class="small dim">Темп оператора к темпу клиента</td><td class="mono">${
+                 речь.sides.tempo_ratio === null || речь.sides.tempo_ratio === undefined
+                   ? '—' : num(речь.sides.tempo_ratio, 2)}</td></tr>` : ''}
                <tr><td class="small dim">Самый долгий монолог</td><td class="mono">${
                  (речь.monologue || {}).seconds
                    ? `${num(речь.monologue.seconds, 0)} с — ${esc(речь.monologue.speaker || '—')}`
@@ -3142,7 +3204,10 @@ function setupJobPlayer(backdrop, job, segments, show, options) {
   // Щелчок по сегменту — переход к нему. Слушаем на теле вкладок, а не на
   // самих сегментах: вкладка перерисовывается целиком, и обработчики,
   // навешанные на строки, пропали бы при первом же переключении.
-  const body = qs('#job-tab-body', backdrop);
+  // Слушаем всё тело окна, а не только вкладки: примеры подозрительных
+  // сегментов стоят над вкладками, и щелчок по ним тоже должен вести к
+  // этому месту записи.
+  const body = qs('.modal-body', backdrop);
   if (body) {
     body.addEventListener('click', (event) => {
       // И реплики, и строки разбора: у обеих есть секунда, и обе для того
@@ -3358,6 +3423,10 @@ RENDERERS.analytics = {
         ${card('Расход ресурсов', 'память моделей и разрез по устройствам',
                '<div id="resources-body"></div>')}
       </div>
+
+      ${card('Подозрительные расшифровки',
+             'галлюцинации Whisper, невозможный темп, повторы, известные фразы, разметка говорящих — по сегментам, без эталона',
+             '<div id="suspicious-body"></div>')}
 
       <div class="grid cols-2">
         ${card('Надёжность', 'что происходит между приёмом и выдачей результата',
@@ -3607,6 +3676,64 @@ function drawExtraAnalytics(data) {
     }
   }
 
+  const п = data.suspicious || {};
+  if (qs('#suspicious-body')) {
+    const тело = qs('#suspicious-body');
+    if (!п.assessed) {
+      тело.innerHTML = `<div class="empty small">${п.jobs
+        ? 'Признаки считаются с этой версии: у записей периода их ещё нет — они появятся по мере фонового разбора архива'
+        : 'За период нет завершённых заданий'}</div>`;
+    } else {
+      тело.innerHTML = `
+        <div class="grid cols-4" style="margin-bottom:12px">
+          ${kpi('Записей с признаками', num(п.flagged),
+                `${num(п.flagged_share, 1)}% из ${num(п.assessed)} проверенных`)}
+          ${kpi('Подозрительных сегментов', num(п.suspect_segments),
+                `${num(п.suspect_share, 2)}% из ${num(п.segments)}`)}
+          ${kpi('Проверено записей', num(п.assessed),
+                п.jobs > п.assessed ? `ещё ${num(п.jobs - п.assessed)} сделаны до появления признаков` : 'все записи периода')}
+          ${kpi('Худшая модель',
+                (п.by_model || []).length && п.by_model[0].suspect_share ? esc(п.by_model[0].key) : '—',
+                (п.by_model || []).length && п.by_model[0].suspect_share
+                  ? `${num(п.by_model[0].suspect_share, 2)}% подозрительных сегментов` : 'подозрительных сегментов нет')}
+        </div>
+        <div class="grid cols-2">
+          <div><div class="small dim" style="margin-bottom:6px">По признакам, записей</div>
+            <div id="chart-suspect-flags"></div></div>
+          <div><div class="small dim" style="margin-bottom:6px">По моделям и источникам</div>
+            <div class="table-wrap"><table>
+              <thead><tr><th>Модель / источник</th><th class="num">Записей</th><th class="num">С признаками</th><th class="num">Сегментов</th></tr></thead>
+              <tbody>${[...(п.by_model || []), ...(п.by_source || []).map((и) => ({ ...и, key: `источник: ${и.key}` }))].map((м) => `<tr><td>${esc(м.key)}</td>
+                <td class="num mono">${num(м.jobs)}</td>
+                <td class="num mono">${м.flagged_share === null ? '—' : num(м.flagged_share, 1) + '%'}</td>
+                <td class="num mono">${м.suspect_share === null ? '—' : num(м.suspect_share, 2) + '%'}</td></tr>`).join('')}</tbody>
+            </table></div></div>
+        </div>
+        <div class="small dim" style="margin:12px 0 6px">Самые подозрительные записи</div>
+        <div class="table-wrap full"><table>
+          <thead><tr><th>Файл</th><th>Модель</th><th class="num">Подозрительных сегментов</th><th>Признаки</th><th></th></tr></thead>
+          <tbody>${(п.worst || []).map((з) => `<tr>
+            <td class="truncate" style="max-width:260px">${esc(з.filename || з.id)}</td>
+            <td class="small dim">${esc(з.model || '—')}</td>
+            <td class="num mono">${num(з.suspect_segments)} / ${num(з.segments_count)}</td>
+            <td class="small dim">${esc((з.flags || []).map((ф) => ПРИЗНАКИ_КАЧЕСТВА[ф] || ф).join(', '))}</td>
+            <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(з.id)}')">Открыть</button></td></tr>`).join('')
+            || '<tr><td colspan="5" class="empty small">Подозрительных записей нет</td></tr>'}</tbody>
+        </table></div>
+        <p class="small faint" style="margin-top:10px">
+          Ни один признак не доказательство: это отбор «что послушать» и ход по моделям, а не приговор расшифровке.
+          В «Результатах» те же записи — отбор «подозрительная расшифровка».
+        </p>`;
+      // Одна величина — один цвет: разные цвета читались бы как разные
+      // виды признаков, а это одно и то же число записей.
+      const цвет = Charts.palette()[0];
+      Charts.hbars(qs('#chart-suspect-flags'), {
+        items: (п.by_flag || []).map((ф) => ({ label: ф.title, value: ф.jobs, color: цвет })),
+        labelWidth: 210, emptyText: 'признаков нет',
+      });
+    }
+  }
+
   const r = data.reliability || {};
   if (qs('#reliability-body') && r.total !== undefined) {
     qs('#reliability-body').innerHTML = `<table>
@@ -3751,6 +3878,9 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
   alerts: 'alerts', open_commitments: 'open_commitments',
   interruptions: 'interruptions', silence: 'silence',
   script: 'script_failed', money: 'money',
+  monologue: 'monologue', mixed: 'mixed', dead_air: 'dead_air',
+  frustrated: 'frustrated', repeat: 'repeat',
+  profanity_agent: 'profanity_agent', profanity: 'profanity',
 };
 
 const CONTENT_TABS = [
@@ -3767,6 +3897,23 @@ function toneChip(score, label) {
   if (score === null || score === undefined) return '<span class="chip">нет оценки</span>';
   const cls = score < -0.15 ? 'err' : score > 0.15 ? 'ok' : '';
   return `<span class="chip ${cls}">${esc(label || '')} ${num(score, 2)}</span>`;
+}
+
+/** Как называть признаки подозрительной расшифровки — тот же перечень, что в quality.py. */
+const ПРИЗНАКИ_КАЧЕСТВА = {
+  compression: 'сжимаемый текст',
+  silence: 'текст на тишине',
+  temperature: 'перебор температур',
+  tempo: 'невозможный темп',
+  repeat: 'повторы фраз',
+  phrase: 'известная фраза-галлюцинация',
+  fragments: 'осколки разметки говорящих',
+  speakers: 'говорящих не столько, сколько ожидалось',
+};
+
+/** Подпись роли говорящего в карточке: клиент — самый говорливый из не-операторов. */
+function g_роль(кто, стороны) {
+  return кто === (стороны || {}).customer ? ' <span class="faint small">клиент</span>' : '';
 }
 
 /** Полоска долей: отрицательные / нейтральные / положительные. */
@@ -3963,7 +4110,24 @@ RENDERERS.content = {
                 <span>отрицательных: <b>${num(c.negative)}</b></span>
                 <span>нейтральных: <b>${num(c.neutral)}</b></span>
                 <span>положительных: <b>${num(c.positive)}</b></span>
+                ${c.mixed ? `<span title="и резкие, и тёплые реплики — средняя по ним ничего не говорит">из нейтральных противоречивых: <b>${num(c.mixed)}</b></span>` : ''}
               </div>`)}
+
+      <div class="grid cols-4" style="margin-bottom:16px">
+        ${kpi('Клиент раздражён', num(c.frustrated),
+              c.frustrated_share === null ? 'по репликам клиента'
+                : `${num(c.frustrated_share, 1)}% записей — «сколько можно», «позовите руководителя»`)}
+        ${kpi('Повторные обращения', num(c.repeat),
+              c.repeat_share === null ? 'по репликам клиента'
+                : `${num(c.repeat_share, 1)}% записей — «уже звонил», «до сих пор не»`)}
+        ${kpi('Противоречивых', num(c.mixed),
+              'и резкие, и тёплые реплики в одном разговоре')}
+        ${kpi('Мат у сотрудника',
+              c.profanity_checked ? num(c.profanity_agent_records) : '—',
+              c.profanity_checked
+                ? `в разговоре вообще: ${num(c.profanity_records)} из ${num(c.profanity_checked)} проверенных`
+                : 'словарь выключен — настройка content_profanity')}
+      </div>
 
       ${(выводы.items || []).length ? card('Выводы',
         'правила с порогами, а не пересказ цифр — каждый вывод называет числа, из которых сделан',
@@ -3997,7 +4161,8 @@ RENDERERS.content = {
                  // Разница мельче показанной точности — это ноль, а не
                  // изменение: иначе столбец пестрит «−0» и «+0.000».
                  if (d !== null && Math.abs(d) < Math.pow(10, -f.digits) / 2) d = 0;
-                 return `<tr><td>${esc(f.title)}${f.unit ? ` <span class="faint small">${esc(f.unit)}</span>` : ''}</td>
+                 return `<tr><td${f.hint ? ` title="${esc(f.hint)}"` : ''}>${esc(f.title)}${f.unit ? ` <span class="faint small">${esc(f.unit)}</span>` : ''}${
+                   f.hint ? `<div class="faint small">${esc(f.hint)}</div>` : ''}</td>
                    <td class="num mono">${num(a, f.digits)}</td>
                    <td class="num mono faint">${b === null || b === undefined ? '—' : num(b, f.digits)}</td>
                    <td class="num mono ${d && f.good ? (Math.sign(d) * f.good > 0 ? 'ok-text' : 'err-text') : ''}">${
@@ -4046,7 +4211,9 @@ RENDERERS.content = {
           <th class="num">Тональность</th><th class="num">Отрицательных</th>
           <th class="num">Тревожных</th><th class="num">Скрипт</th>
           <th class="num">Темп</th><th class="num">Перебиваний</th>
-          <th class="num">Тишина</th><th class="num">Обещаний без срока</th></tr></thead>
+          <th class="num">Тишина</th><th class="num">Обещаний без срока</th>
+          <th class="num" title="доля времени речи оператора; ориентир 40–60 %">Речь опер.</th>
+          <th class="num" title="средний самый долгий монолог оператора, секунд">Монолог</th></tr></thead>
         <tbody>${items.map((г) => `<tr>
           <td>${esc(г.label)}</td>
           <td class="num mono">${num(г.records)}</td>
@@ -4058,7 +4225,9 @@ RENDERERS.content = {
           <td class="num mono">${num(г.wpm, 0)}</td>
           <td class="num mono">${num(г.interruptions, 1)}</td>
           <td class="num mono">${г.silence_share === null ? '—' : pct(г.silence_share, 0)}</td>
-          <td class="num mono">${num(г.commitments_open)}</td></tr>`).join('')}</tbody></table>
+          <td class="num mono">${num(г.commitments_open)}</td>
+          <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : pct(г.talk_share, 0)}</td>
+          <td class="num mono">${г.monologue_s === null || г.monologue_s === undefined ? '—' : num(г.monologue_s, 0) + ' с'}</td></tr>`).join('')}</tbody></table>
         ${данные.hidden ? `<p class="small faint" style="margin:8px 12px">
           Скрыто групп с числом записей меньше пяти: ${данные.hidden}. На двух
           разговорах группа всегда либо лучшая, либо худшая, и оба раза
@@ -4159,6 +4328,11 @@ RENDERERS.content = {
                  || '<tr><td colspan="4" class="small dim">Заметного спада нет</td></tr>'}
                  </tbody></table></div>`)}
       </div>
+      ${(данные.new || []).length ? card('Новые слова периода',
+             'в прошлом таком же периоде не звучали вовсе — новая акция, новый сбой, новая модель; сырьё для категорий',
+             `<div class="chips">${(данные.new || []).map((т) =>
+               `<span class="chip" title="в ${т.now} записях; найти в результатах" data-search="${esc(т.word)}"
+                      style="cursor:pointer">${esc(т.word)} <span class="faint">${num(т.now)}</span></span>`).join('')}</div>`) : ''}
       ${card('Все темы периода', 'вес — редкость темы: слово из девяти записей ' +
              'из десяти это фон, а не тема',
              `<div class="table-wrap full"><table>
@@ -4186,7 +4360,7 @@ RENDERERS.content = {
         note: `упоминаний: ${num(т.mentions)}` })),
       labelWidth: 150, emptyText: 'нет тем',
     });
-    qsa('#content-body button[data-search]').forEach((b) =>
+    qsa('#content-body [data-search]').forEach((b) =>
       b.addEventListener('click', () => {
         state.resultsSearch = b.dataset.search;
         go('results');
@@ -4310,6 +4484,13 @@ const ГДЕ_ИСКАТЬ = {
   any: 'в любом месте',
 };
 
+/** Подпись «где искали» с окном в секундах, если оно задано. */
+function гдеИскали(п) {
+  if (п.within_s && п.where === 'start') return `в первые ${п.within_s} с`;
+  if (п.within_s && п.where === 'end') return `в последние ${п.within_s} с`;
+  return ГДЕ_ИСКАТЬ[п.where] || п.where;
+}
+
 RENDERERS.content.tab_script = async function (host) {
   const [настройки, перечень, перечни] = await Promise.all([
     API.latest('content-settings', '/api/settings'),
@@ -4380,6 +4561,10 @@ RENDERERS.content.drawScript = function (host) {
               `<option value="${k}" ${(п.where || 'any') === k ? 'selected' : ''}>${v}</option>`
             ).join('')}
           </select>
+          <input type="number" class="script-within" min="0" step="5" style="width:92px"
+                 value="${п.within_s ? esc(String(п.within_s)) : ''}"
+                 placeholder="секунд" ${(п.where || 'any') === 'any' ? 'hidden' : ''}
+                 title="Окно в секундах от начала или до конца записи. Пусто — пятая часть реплик, как раньше. «Разговор записывается» обязано прозвучать в первые 30 секунд — это и есть такое окно">
           <button class="ghost icon script-del" title="Убрать пункт">✕</button>
         </div>
         <input type="text" class="script-any" style="margin-top:6px"
@@ -4393,6 +4578,11 @@ RENDERERS.content.drawScript = function (host) {
       const менять = () => {
         пункты[i].label = qs('.script-title', узел).value.trim();
         пункты[i].where = qs('.script-where', узел).value;
+        const окно = qs('.script-within', узел);
+        окно.hidden = пункты[i].where === 'any';
+        const секунд = Number(окно.value);
+        if (секунд > 0 && пункты[i].where !== 'any') пункты[i].within_s = секунд;
+        else delete пункты[i].within_s;
         пункты[i].any = qs('.script-any', узел).value
           .split(',').map((w) => w.trim()).filter(Boolean);
         qs('#script-save').disabled = false;
@@ -4461,7 +4651,7 @@ RENDERERS.content.checkScript = async function () {
         <td>${п.passed ? '<span class="chip ok">есть</span>'
                        : '<span class="chip err">нет</span>'}</td>
         <td>${esc(п.label || '—')}</td>
-        <td class="small dim">${esc(ГДЕ_ИСКАТЬ[п.where] || п.where)}</td>
+        <td class="small dim">${esc(гдеИскали(п))}</td>
         <td class="small">${п.matched
           ? `<b>${esc(п.matched)}</b>` : '—'}</td></tr>`).join('')}</tbody></table></div>
     ${(ответ.suspicious || []).length ? `<div class="finding warning" style="margin-top:12px">

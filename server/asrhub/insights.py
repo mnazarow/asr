@@ -42,6 +42,10 @@ log = get_logger("insights")
 #: это ничего не значит.
 МИН_ГРУППА = 5
 
+#: В скольких записях должно встретиться слово, которого раньше не было,
+#: чтобы назвать его новым: из одной — это ошибка распознавания.
+МИН_НОВОГО = 3
+
 #: Сколько записей должно быть в окне, чтобы делать выводы по корпусу.
 #: Отдельно от МИН_ГРУППА, потому что это другой вопрос: там «можно ли
 #: сравнивать группу с остальными», здесь «есть ли о чём говорить вообще».
@@ -96,6 +100,31 @@ log = get_logger("insights")
     {"key": "speakers", "title": "Говорящих", "unit": "", "good": 0, "digits": 1},
     {"key": "duration_s", "title": "Длительность", "unit": "с", "good": 0,
      "digits": 0},
+    # Стороны разговора. Ориентиры («hint») — из опубликованной практики
+    # Gong, Avoma, Genesys и Fireflies, и все они про английские продажи,
+    # а не про русскую поддержку. Поэтому это подсказка рядом с числом, а
+    # не порог: порогом должна стать своя обычная величина.
+    {"key": "talk_share", "title": "Доля речи оператора", "unit": "доля",
+     "good": 0, "digits": 2,
+     "hint": "ориентир 0,40–0,60 (Avoma); у Gong для продаж — 0,43"},
+    {"key": "monologue_s", "title": "Самый долгий монолог оператора", "unit": "с",
+     "good": -1, "digits": 0,
+     "hint": "ориентир до 150 с (Gong); Fireflies считает монологом от 90 с"},
+    {"key": "customer_story_s", "title": "Самый долгий рассказ клиента",
+     "unit": "с", "good": 1, "digits": 0,
+     "hint": "чем дольше, тем полнее клиент высказался (Gong)"},
+    {"key": "switches", "title": "Смен говорящего", "unit": "", "good": 1,
+     "digits": 1, "hint": "ориентир от 5 за разговор (Gong)"},
+    {"key": "reply_delay_s", "title": "Пауза оператора перед ответом",
+     "unit": "с", "good": 0, "digits": 2,
+     "hint": "ориентир 0,6–1,0 с (Gong); паузы от 2 с считаются тишиной"},
+    {"key": "overlap_s", "title": "Наложение речи", "unit": "с", "good": -1,
+     "digits": 1, "hint": "сколько секунд говорили одновременно"},
+    {"key": "dead_air_s", "title": "Заметная тишина", "unit": "с", "good": -1,
+     "digits": 1, "hint": "сумма пауз от 3 с (порог NICE и Amazon Contact Lens)"},
+    {"key": "tempo_ratio", "title": "Темп оператора к темпу клиента", "unit": "",
+     "good": 0, "digits": 2,
+     "hint": "около 1 — подстраивается под собеседника (UIS)"},
 ]
 ПРИЗНАКИ_ПО_КЛЮЧУ = {п["key"]: п for п in ПРИЗНАКИ}
 
@@ -115,6 +144,11 @@ log = get_logger("insights")
     ("compliance", "commitments", "Чем полнее скрипт, тем {} обещаний"),
     ("duration_s", "interruptions", "Чем длиннее разговор, тем {} перебиваний"),
     ("speakers", "interruptions", "Чем больше говорящих, тем {} перебиваний"),
+    ("talk_share", "sentiment", "Чем больше говорит оператор, тем {} оценка"),
+    ("monologue_s", "sentiment", "Чем длиннее монологи оператора, тем {} оценка"),
+    ("customer_story_s", "sentiment", "Чем дольше клиенту дают говорить, тем {} оценка"),
+    ("dead_air_s", "sentiment", "Чем больше заметной тишины, тем {} оценка"),
+    ("switches", "sentiment", "Чем живее разговор (смены говорящего), тем {} оценка"),
 ]
 
 #: Разрезы: ключ группировки в базе -> название и особенности показа.
@@ -187,6 +221,33 @@ _ДНИ = ("воскресенье", "понедельник", "вторник",
                "where": "COALESCE(c.longest_pause_s,0) > 0"},
     "fast": {"title": "Самая быстрая речь",
              "order": "c.wpm DESC", "where": "c.wpm IS NOT NULL"},
+    "monologue": {"title": "Самые долгие монологи оператора",
+                  "order": "c.monologue_s DESC",
+                  "where": "c.monologue_s IS NOT NULL"},
+    "customer_story": {"title": "Самый долгий рассказ клиента",
+                       "order": "c.customer_story_s DESC",
+                       "where": "c.customer_story_s IS NOT NULL"},
+    "mixed": {"title": "Противоречивые разговоры",
+              "order": "(c.negative_segments + c.positive_segments) DESC",
+              "where": "c.sentiment_label = 'смешанная'"},
+    "dead_air": {"title": "Больше всего заметной тишины",
+                 "order": "c.dead_air_s DESC",
+                 "where": "COALESCE(c.dead_air_s,0) > 0"},
+    "impatient": {"title": "Самые короткие паузы перед ответом",
+                  "order": "c.reply_delay_s ASC",
+                  "where": "c.reply_delay_s IS NOT NULL"},
+    "frustrated": {"title": "Клиент раздражён",
+                   "order": "c.frustration DESC, c.sentiment ASC",
+                   "where": "COALESCE(c.frustration,0) > 0"},
+    "repeat": {"title": "Повторные обращения",
+               "order": "c.repeat_contact DESC, c.sentiment ASC",
+               "where": "COALESCE(c.repeat_contact,0) > 0"},
+    "profanity_agent": {"title": "Нецензурная лексика у сотрудника",
+                        "order": "c.profanity_agent DESC",
+                        "where": "COALESCE(c.profanity_agent,0) > 0"},
+    "profanity": {"title": "Нецензурная лексика в разговоре",
+                  "order": "c.profanity DESC",
+                  "where": "COALESCE(c.profanity,0) > 0"},
 }
 
 
@@ -318,6 +379,16 @@ class Insights:
             # и знать их долю нужно раньше, чем читать эти показатели.
             "mono": int(строка.get("mono") or 0),
             "mono_share": _процент(строка.get("mono"), всего),
+            "mixed": int(строка.get("mixed") or 0),
+            "long_monologues": int(строка.get("long_monologues") or 0),
+            "long_monologue_share": _процент(строка.get("long_monologues"), всего),
+            "frustrated": int(строка.get("frustrated") or 0),
+            "frustrated_share": _процент(строка.get("frustrated"), всего),
+            "repeat": int(строка.get("repeat") or 0),
+            "repeat_share": _процент(строка.get("repeat"), всего),
+            "profanity_records": int(строка.get("profanity_records") or 0),
+            "profanity_agent_records": int(строка.get("profanity_agent_records") or 0),
+            "profanity_checked": int(строка.get("profanity_checked") or 0),
         }
         for признак in ПРИЗНАКИ:
             ключ = признак["key"]
@@ -518,6 +589,21 @@ class Insights:
         out.sort(key=lambda т: -abs(т["delta"]))
         return out[:limit]
 
+    def new_topics(self, period: str = "week",
+                   owner: str | list[str] | None = None,
+                   limit: int = 15) -> list[dict[str, Any]]:
+        """Слова, которых в прошлом окне не было вовсе.
+
+        Сырьё для новых категорий обращений — то, что у Genesys делает Topic
+        Miner: новая модель, новая акция, новый сбой называются словом,
+        которого раньше в разговорах не звучало. Порог в три записи
+        отсекает опечатки распознавания: слово из одной записи — шум.
+        """
+        строки = self.topic_trend(period, owner, limit=max(limit * 8, 80))
+        новые = [т for т in строки if т["before"] == 0 and т["now"] >= МИН_НОВОГО]
+        новые.sort(key=lambda т: -т["now"])
+        return новые[:limit]
+
     # --- связи ------------------------------------------------------------
 
     def correlations(self, period: str = "week",
@@ -667,17 +753,19 @@ class Insights:
                 своё = группа.get("sentiment")
                 if своё is None or группа["records"] < max(МИН_ГРУППА, 10):
                     continue
+                # Два знака: тональность в своде показана с двумя, и вывод с
+                # четырьмя выглядел бы посчитанным по другим числам.
                 if своё <= среднее - 0.25:
                     добавить("warning",
                              f"У {подпись} «{группа['label']}» тональность заметно "
-                             f"ниже средней: {своё} против {среднее} "
+                             f"ниже средней: {round(своё, 2)} против {round(среднее, 2)} "
                              f"({группа['records']} записей)",
                              metric="sentiment", value=своё, group=группа["label"],
                              dimension=разрез)
                 elif своё >= среднее + 0.25:
                     добавить("good",
                              f"У {подпись} «{группа['label']}» тональность заметно "
-                             f"выше средней: {своё} против {среднее} "
+                             f"выше средней: {round(своё, 2)} против {round(среднее, 2)} "
                              f"({группа['records']} записей)",
                              metric="sentiment", value=своё, group=группа["label"],
                              dimension=разрез)
@@ -701,6 +789,59 @@ class Insights:
                      f"всех слов: {_каждое(паразиты)} — «э-э», «как бы» или "
                      f"«короче»",
                      metric="filler_rate", value=паразиты)
+
+        # 6а. Стороны разговора. Пороги — из опубликованной практики
+        #     (Gong, Avoma), и это ориентиры для английских продаж, поэтому
+        #     уровень «info», а не «warning»: вывод показывает число, а
+        #     решать, норма ли это здесь, — человеку.
+        доля_речи = свод.get("talk_share")
+        if доля_речи is not None and доля_речи >= 0.65:
+            добавить("info",
+                     f"Оператор говорит больше клиента: {round(доля_речи * 100)}% "
+                     f"времени речи — ориентир 40–60%",
+                     metric="talk_share", value=доля_речи)
+        монологов = свод.get("long_monologue_share")
+        if монологов is not None and монологов >= 20 and свод.get("long_monologues"):
+            добавить("info",
+                     f"{_каждый(монологов)} разговор содержит монолог оператора "
+                     f"дольше двух с половиной минут: {монологов}% "
+                     f"({свод['long_monologues']} из {свод['records']})",
+                     metric="long_monologue_share", value=монологов)
+        тишина_с = свод.get("dead_air_s")
+        длительность = свод.get("duration_s")
+        if тишина_с and длительность and тишина_с / длительность >= 0.2:
+            добавить("info",
+                     f"Заметная тишина занимает {round(100 * тишина_с / длительность)}% "
+                     f"записи: в среднем {round(тишина_с)} с пауз от трёх секунд",
+                     metric="dead_air_s", value=тишина_с)
+        смешанных = свод.get("mixed")
+        if смешанных and свод.get("scored") and смешанных / свод["scored"] >= 0.15:
+            добавить("info",
+                     f"Противоречивых разговоров — и с резкими, и с тёплыми "
+                     f"репликами — {смешанных} ({_процент(смешанных, свод['scored'])}%): "
+                     f"средняя оценка по ним ничего не говорит, их стоит послушать",
+                     metric="mixed", value=смешанных)
+
+        # 6б. Фрустрация, повторные обращения, нецензурная лексика.
+        раздражённых = свод.get("frustrated_share")
+        if раздражённых is not None and раздражённых >= 10:
+            добавить("warning",
+                     f"{_каждый(раздражённых)} разговор — с признаками раздражения "
+                     f"клиента: {раздражённых}% ({свод['frustrated']} из {свод['records']})",
+                     metric="frustrated_share", value=раздражённых)
+        повторных = свод.get("repeat_share")
+        if повторных is not None and повторных >= 10:
+            добавить("warning",
+                     f"{_каждый(повторных)} разговор — повторное обращение "
+                     f"по нерешённому вопросу: {повторных}% ({свод['repeat']} из "
+                     f"{свод['records']}); это обратная сторона решения с первого раза",
+                     metric="repeat_share", value=повторных)
+        if свод.get("profanity_agent_records"):
+            добавить("warning",
+                     f"Нецензурная лексика у сотрудника — в "
+                     f"{свод['profanity_agent_records']} записях",
+                     metric="profanity_agent_records",
+                     value=свод["profanity_agent_records"])
 
         # 7. Часы, когда разговоры тяжелее.
         часы = (разрезы.get("hour") or {}).get("items") or []

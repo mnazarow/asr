@@ -120,9 +120,10 @@ def topics(request: Request, period: str = Query(default="all",
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     свод = _insights(request)
     владелец = scope_owner(principal)
+    окно = period if period != "all" else "month"
     return {**свод.topics(period, владелец, limit=limit),
-            "trend": свод.topic_trend(period if period != "all" else "month",
-                                      владелец)}
+            "trend": свод.topic_trend(окно, владелец),
+            "new": свод.new_topics(окно, владелец)}
 
 
 @router.get("/correlations", summary="Связи между признаками")

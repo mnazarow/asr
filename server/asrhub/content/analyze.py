@@ -20,17 +20,36 @@ from .lexicons import (
     ВЕЖЛИВОСТЬ,
     ВОПРОСИТЕЛЬНЫЕ,
     НЕ_ВОПРОСЫ,
+    НЕ_НЕЦЕНЗУРНЫЕ,
     НЕ_ТРЕВОЖНЫЕ,
+    НЕЦЕНЗУРНЫЕ_КОРНИ,
     ОБЯЗАТЕЛЬСТВА,
+    ПОВТОРНОЕ_ОБРАЩЕНИЕ_ФРАЗЫ,
     СООТНОСИТЕЛЬНЫЕ,
     СРОКИ,
     ТРЕВОЖНЫЕ,
+    ФРУСТРАЦИЯ_СЛОВА,
+    ФРУСТРАЦИЯ_ФРАЗЫ,
 )
 from .stemmer import sentences, stem, words
 
 #: Версия разбора. Меняется, когда меняются словари или правила: по ней
 #: видно, какие записи разобраны старым набором и требуют пересчёта.
-VERSION = 1
+#:
+#: 2 — стороны разговора (доля речи оператора, монолог против рассказа
+#: клиента, пауза перед ответом, соотношение темпов), смены говорящего,
+#: наложение в секундах, заметная тишина, смешанная тональность,
+#: фрустрация, признаки повторного обращения, нецензурная лексика, окно
+#: пункта скрипта в секундах.
+VERSION = 2
+
+_НЕЦЕНЗУРНЫЕ = re.compile("|".join(НЕЦЕНЗУРНЫЕ_КОРНИ))
+
+#: Сколько окрашенных реплик с каждой стороны нужно, чтобы назвать запись
+#: смешанной, и как сильно меньшая сторона может уступать большей. Ниже —
+#: «в целом нейтральный разговор с одной резкой репликой», а не смешанный.
+СМЕШАННАЯ_МИН = 2
+СМЕШАННАЯ_ДОЛЯ = 0.25
 
 _ЗНАК_ВОПРОСА = re.compile(r"\?")
 
@@ -103,6 +122,76 @@ def _вежливость(текст: str) -> dict[str, bool]:
             for назначение, варианты in ВЕЖЛИВОСТЬ.items()}
 
 
+def _обороты(слова_: list[str],
+             фразы: tuple[tuple[str, ...], ...]) -> list[str]:
+    """Какие из оборотов встретились в списке слов — по точным формам."""
+    найдено = []
+    for оборот in фразы:
+        n = len(оборот)
+        for i in range(len(слова_) - n + 1):
+            if tuple(слова_[i:i + n]) == оборот:
+                найдено.append(" ".join(оборот))
+                break
+    return найдено
+
+
+def _по_репликам(сегменты: list[dict[str, Any]], *, кого: str | None,
+                 искать: Any) -> list[dict[str, Any]]:
+    """Реплики, в которых `искать(слова)` что-то нашёл, с временем и текстом.
+
+    `кого` — чьи реплики смотреть; None — все. Фрустрацию и признаки
+    повторного обращения ищем у клиента: «сколько можно» из уст оператора
+    — другая история, и в отбор «клиент раздражён» ей не место.
+    """
+    найдено = []
+    for с in сегменты:
+        if кого is not None and str(с.get("speaker") or "") != кого:
+            continue
+        текст = str(с.get("text") or "")
+        сработали = искать(words(текст))
+        if сработали:
+            найдено.append({
+                "start_s": float(с.get("start") or с.get("start_s") or 0.0),
+                "speaker": с.get("speaker"),
+                "words": сработали,
+                "text": текст.strip()[:300],
+            })
+    return найдено
+
+
+def _фрустрация(слова_: list[str]) -> list[str]:
+    обороты = _обороты(слова_, ФРУСТРАЦИЯ_ФРАЗЫ)
+    # Слово, уже вошедшее в найденный оборот, второй раз не считаем:
+    # «это безобразие» — одна вспышка, а не две.
+    в_оборотах = {w for о in обороты for w in о.split()}
+    слова = [w for w in слова_ if w in ФРУСТРАЦИЯ_СЛОВА and w not in в_оборотах]
+    return sorted(set(обороты + слова))
+
+
+def _повторное(слова_: list[str]) -> list[str]:
+    return _обороты(слова_, ПОВТОРНОЕ_ОБРАЩЕНИЕ_ФРАЗЫ)
+
+
+def _мат(слова_: list[str]) -> list[str]:
+    return sorted({w for w in слова_
+                   if _НЕЦЕНЗУРНЫЕ.search(w)
+                   and not any(w.startswith(и) for и in НЕ_НЕЦЕНЗУРНЫЕ)})
+
+
+def _клиент(сегменты: list[dict[str, Any]], оператор: str | None) -> str | None:
+    """Клиент — самый говорливый из тех, кто не оператор; None без оператора."""
+    if not оператор:
+        return None
+    время: dict[str, float] = {}
+    for с in сегменты:
+        кто = str(с.get("speaker") or "")
+        if кто and кто != оператор:
+            время[кто] = время.get(кто, 0.0) + max(
+                0.0, float(с.get("end") or с.get("end_s") or 0.0)
+                - float(с.get("start") or с.get("start_s") or 0.0))
+    return max(время, key=время.get) if время else None
+
+
 def _тревожные(сегменты: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Упоминания суда, жалобы, огласки — повод послушать запись целиком."""
     найдено = []
@@ -126,12 +215,14 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             script: list[dict[str, Any]] | None = None,
             agent_speaker: str | None = None,
             document_frequency: dict[str, int] | None = None,
-            corpus_size: int = 0) -> dict[str, Any]:
+            corpus_size: int = 0,
+            profanity: bool = False) -> dict[str, Any]:
     """Разбор одной записи.
 
     `agent_speaker` — кто из говорящих оператор: по нему проверяется скрипт.
     `document_frequency` и `corpus_size` — сведения о корпусе для TF-IDF;
-    без них ключевые слова считаются по простой частоте.
+    без них ключевые слова считаются по простой частоте. `profanity` —
+    считать ли нецензурную лексику: по умолчанию нет, см. словарь.
     """
     сегменты = list(segments or [])
     if not сегменты and text:
@@ -147,16 +238,36 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
     вопросы = _вопросы(сегменты)
     обещания = _обязательства(сегменты)
     тревога = _тревожные(сегменты)
+    скрипт = compliance.check(сегменты, script=script, speaker=agent_speaker)
+    # Кто оператор, решает проверка скрипта — та же, что и раньше; стороны
+    # разговора считаются от него же, чтобы «доля речи оператора» и
+    # «скрипт оператора» говорили об одном человеке.
+    речь["sides"] = speech.sides(речь, скрипт.get("speaker"))
+    оператор = скрипт.get("speaker")
+    клиент = _клиент(сегменты, оператор)
+    фрустрация = _по_репликам(сегменты, кого=клиент, искать=_фрустрация)
+    повторное = _по_репликам(сегменты, кого=клиент, искать=_повторное)
+    мат = _по_репликам(сегменты, кого=None, искать=_мат) if profanity else []
 
     отрицательные = sorted((о for о in оценки if о["score"] < -sentiment.ПОРОГ),
                            key=lambda о: о["score"])
     положительные = sorted((о for о in оценки if о["score"] > sentiment.ПОРОГ),
                            key=lambda о: -о["score"])
 
+    итог = общая.to_dict()
+    # Смешанная запись: и резких, и тёплых реплик заметно, а средняя около
+    # нуля. Усреднение делало из такого разговора «нейтральный» — то есть
+    # неотличимый от ровного, хотя слушать нужно именно его. Класс есть у
+    # NICE ровно по этой причине.
+    меньшая, большая = sorted((len(отрицательные), len(положительные)))
+    if (итог["label"] == "нейтральная" and меньшая >= СМЕШАННАЯ_МИН
+            and меньшая >= СМЕШАННАЯ_ДОЛЯ * большая):
+        итог["label"] = "смешанная"
+
     return {
         "version": VERSION,
         "sentiment": {
-            **общая.to_dict(),
+            **итог,
             "trajectory": sentiment.trajectory(оценки),
             "turn": sentiment.turn(оценки),
             "negative_segments": len(отрицательные),
@@ -176,7 +287,20 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
                         "items": обещания[:30]},
         "politeness": _вежливость(целиком),
         "alerts": {"count": len(тревога), "items": тревога[:10]},
-        "compliance": compliance.check(сегменты, script=script, speaker=agent_speaker),
+        # Фрустрация и повторное обращение — по репликам клиента (когда
+        # оператор известен). Счёт — по репликам, а не по словам: три
+        # «сколько можно» в одной реплике — это одна вспышка.
+        "frustration": {"count": len(фрустрация), "items": фрустрация[:10],
+                        "speaker": клиент},
+        "repeat_contact": {"count": len(повторное), "items": повторное[:10],
+                           "speaker": клиент},
+        "profanity": {
+            "enabled": bool(profanity),
+            "count": len(мат),
+            "agent": sum(1 for м in мат if оператор and м["speaker"] == оператор),
+            "items": мат[:10],
+        },
+        "compliance": скрипт,
         # Основы записи для корпусного знаменателя. Считаются здесь, а не
         # отдельным проходом при сохранении: текст уже разобран на слова, и
         # второй проход по часовой расшифровке ради того же результата —
@@ -203,6 +327,7 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
     обещания = разбор.get("commitments") or {}
     тревога = разбор.get("alerts") or {}
     скрипт = разбор.get("compliance") or {}
+    стороны = речь.get("sides") or {}
     свод = {
         "version": int(разбор.get("version") or VERSION),
         "sentiment": тон.get("score"),
@@ -224,6 +349,22 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
         "money_max": сущности.get("money_max"),
         "speakers": len(речь.get("speakers") or []),
         "agent_speaker": скрипт.get("speaker"),
+        "overlap_s": речь.get("overlap_s"),
+        "dead_air_s": речь.get("dead_air_s"),
+        "switches": речь.get("switches"),
+        "talk_share": стороны.get("talk_share"),
+        "monologue_s": стороны.get("monologue_s"),
+        "customer_story_s": стороны.get("customer_story_s"),
+        "reply_delay_s": стороны.get("reply_delay_s"),
+        "tempo_ratio": стороны.get("tempo_ratio"),
+        "frustration": (разбор.get("frustration") or {}).get("count"),
+        "repeat_contact": (разбор.get("repeat_contact") or {}).get("count"),
+        # Нецензурная лексика: None, когда словарь выключен, — иначе ноль
+        # читался бы как «не ругались», хотя никто и не смотрел.
+        "profanity": ((разбор.get("profanity") or {}).get("count")
+                      if (разбор.get("profanity") or {}).get("enabled") else None),
+        "profanity_agent": ((разбор.get("profanity") or {}).get("agent")
+                            if (разбор.get("profanity") or {}).get("enabled") else None),
         "detail": разбор,
     }
     return свод, основы

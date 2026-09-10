@@ -341,9 +341,12 @@ def list_jobs(
     order: str = "created_at DESC",
     content: str | None = Query(
         default=None,
-        description="Отбор по содержанию разговора: negative, positive, "
+        description="Отбор по содержанию разговора (negative, positive, "
                     "downturn, recovered, alerts, open_commitments, "
-                    "interruptions, silence, script_failed, money"),
+                    "interruptions, silence, script_failed, money, monologue, "
+                    "mixed, dead_air, frustrated, repeat, profanity, "
+                    "profanity_agent) или по здоровью распознавания (suspect, "
+                    "hallucination, speakers_mismatch)"),
     light: bool = Query(default=False,
                         description="Только поля для таблицы, без текста и сегментов"),
     principal: Principal = Depends(authenticate),
@@ -362,10 +365,11 @@ def list_jobs(
     # Облегчённый список пропускает текст расшифровки и сегменты. На сотне
     # часовых записей ответ со всем текстом — единицы мегабайт, и таблица в
     # интерфейсе ждала их только чтобы выбросить.
-    if content and content not in state.db.CONTENT_FILTERS:
+    отборы = {**state.db.CONTENT_FILTERS, **state.db.JOB_FILTERS}
+    if content and content not in отборы:
         raise error_response(ConfigError(
             f"Неизвестный отбор по содержанию «{content}».",
-            hint="Доступные: " + ", ".join(sorted(state.db.CONTENT_FILTERS))))
+            hint="Доступные: " + ", ".join(sorted(отборы))))
     jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
                               order=order, light=light, content=content)

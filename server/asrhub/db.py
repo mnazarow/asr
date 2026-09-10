@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -67,6 +67,26 @@ _CONTENT_SCHEMA = """
         money_max         REAL,
         speakers          INTEGER,
         agent_speaker     TEXT,
+        -- Версия 11: стороны разговора и то, что между ними. Доля речи
+        -- оператора, его самый долгий монолог против самого долгого
+        -- рассказа клиента, пауза перед ответом, соотношение темпов —
+        -- показатели, которые считает каждая система речевой аналитики, а
+        -- у нас лежали в подробностях и в разрезы не попадали.
+        overlap_s         REAL,
+        dead_air_s        REAL,
+        switches          INTEGER,
+        talk_share        REAL,
+        monologue_s       REAL,
+        customer_story_s  REAL,
+        reply_delay_s     REAL,
+        tempo_ratio       REAL,
+        -- Фрустрация и признаки повторного обращения — по репликам клиента;
+        -- нецензурная лексика — NULL, пока словарь выключен: ноль читался
+        -- бы как «не ругались», хотя никто и не смотрел.
+        frustration       INTEGER,
+        repeat_contact    INTEGER,
+        profanity         INTEGER,
+        profanity_agent   INTEGER,
         -- Подробности: сам разбор целиком, как его показывает карточка.
         detail            TEXT
     )
@@ -232,7 +252,14 @@ _SCHEMA = [
         webhook_status    TEXT,
         waveform          TEXT,
         instance_id       TEXT,
-        heartbeat_at      REAL
+        heartbeat_at      REAL,
+        -- Версия 11: здоровье распознавания. Сколько сегментов выглядят
+        -- подозрительно (галлюцинации Whisper, невозможный темп, повторы,
+        -- известные фразы), какие признаки у записи и примеры для карточки.
+        suspect_segments  INTEGER,
+        suspect_share     REAL,
+        quality_flags     TEXT,
+        quality_detail    TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
@@ -486,6 +513,10 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # заданием, а не в файле результата, чтобы её можно было отдать в
         # карточке задания, не читая диск.
         "waveform": "TEXT",
+        "suspect_segments": "INTEGER",
+        "suspect_share": "REAL",
+        "quality_flags": "TEXT",
+        "quality_detail": "TEXT",
         # Какой экземпляр сервера взял задание и когда в последний раз
         # подтвердил, что жив. Нужно, чтобы два сервера на общей базе не
         # брали одно задание и чтобы задания умершего экземпляра вернулись
@@ -534,6 +565,46 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "temperature": "REAL",
         "language": "TEXT",
         "words": "TEXT",
+    },
+    # Таблица разбора появилась целиком в десятой версии, и дописывать ей
+    # колонки было незачем — до одиннадцатой. Перечень полный, а не только
+    # новые: так следующая колонка не потребует вспоминать, как это делается.
+    "content": {
+        "job_id": "TEXT",
+        "version": "INTEGER",
+        "computed_at": "REAL",
+        "sentiment": "REAL",
+        "sentiment_label": "TEXT",
+        "sentiment_shift": "REAL",
+        "negative_segments": "INTEGER",
+        "positive_segments": "INTEGER",
+        "wpm": "INTEGER",
+        "silence_share": "REAL",
+        "interruptions": "INTEGER",
+        "pauses": "INTEGER",
+        "longest_pause_s": "REAL",
+        "filler_rate": "REAL",
+        "questions": "INTEGER",
+        "commitments": "INTEGER",
+        "commitments_dated": "INTEGER",
+        "alerts": "INTEGER",
+        "compliance": "REAL",
+        "money_max": "REAL",
+        "speakers": "INTEGER",
+        "agent_speaker": "TEXT",
+        "overlap_s": "REAL",
+        "dead_air_s": "REAL",
+        "switches": "INTEGER",
+        "talk_share": "REAL",
+        "monologue_s": "REAL",
+        "customer_story_s": "REAL",
+        "reply_delay_s": "REAL",
+        "tempo_ratio": "REAL",
+        "frustration": "INTEGER",
+        "repeat_contact": "INTEGER",
+        "profanity": "INTEGER",
+        "profanity_agent": "INTEGER",
+        "detail": "TEXT",
     },
     "events": {
         "id": "INTEGER  AUTOINCREMENT",
@@ -954,7 +1025,11 @@ class Database:
         # молча приходило как None, и разделы показывали пустоту — тот самый
         # случай, о котором предупреждает абзац выше.
         "tags, peak_memory_mb, peak_memory_jobs, file_hash, cancelled_by, "
-        "webhook_status"
+        "webhook_status, "
+        # Здоровье распознавания: число и доля подозрительных сегментов и
+        # перечень признаков. Подробности (примеры с временем) — нет: они
+        # нужны только карточке.
+        "suspect_segments, suspect_share, quality_flags"
     )
 
     #: Отборы по содержанию разговора для списка заданий. Ключ приходит из
@@ -976,6 +1051,24 @@ class Database:
         "silence": "c.silence_share > 0.3",
         "script_failed": "c.compliance IS NOT NULL AND c.compliance < 0.5",
         "money": "c.money_max IS NOT NULL",
+        "monologue": "c.monologue_s >= 150",
+        "mixed": "c.sentiment_label = 'смешанная'",
+        "dead_air": "c.dead_air_s >= 30",
+        "frustrated": "COALESCE(c.frustration,0) > 0",
+        "repeat": "COALESCE(c.repeat_contact,0) > 0",
+        "profanity": "COALESCE(c.profanity,0) > 0",
+        "profanity_agent": "COALESCE(c.profanity_agent,0) > 0",
+    }
+
+    #: Отборы по самому заданию, без соединения с разбором содержания:
+    #: подозрительные расшифровки есть и там, где разбор выключен.
+    JOB_FILTERS: dict[str, str] = {
+        "suspect": ("(COALESCE(jobs.suspect_segments,0) > 0 "
+                    "OR COALESCE(jobs.quality_flags,'') <> '')"),
+        "speakers_mismatch": "jobs.quality_flags LIKE '%speakers%'",
+        "hallucination": ("(jobs.quality_flags LIKE '%phrase%' "
+                          "OR jobs.quality_flags LIKE '%repeat%' "
+                          "OR jobs.quality_flags LIKE '%compression%')"),
     }
 
     def _jobs_where(self, *, status: str | list[str] | None = None,
@@ -998,7 +1091,9 @@ class Database:
         where: list[str] = []
         args: list[Any] = []
         соединение = ""
-        if content:
+        if content in self.JOB_FILTERS:
+            where.append(self.JOB_FILTERS[content])
+        elif content:
             # Соединение с разбором добавляется, только когда отбор задан:
             # список заданий открывают чаще всего, и лишнее соединение
             # стоило бы времени каждому, кто им не пользуется.
@@ -1104,6 +1199,21 @@ class Database:
             job.pop("waveform", None)
         return jobs
 
+    def jobs_without_tag(self, tag: str, *, older_than: float,
+                         limit: int = 5000) -> list[str]:
+        """Завершённые задания старше указанного момента без данной метки.
+
+        Метки лежат строкой через запятую, поэтому сравнение — по
+        обрамлённой запятыми строке: иначе метка «согласие» находилась бы и
+        в «несогласие».
+        """
+        rows = self.query(
+            "SELECT id FROM jobs WHERE status='completed' AND created_at < ? "
+            "  AND (',' || COALESCE(tags,'') || ',') NOT LIKE ? "
+            "ORDER BY created_at LIMIT ?",
+            (older_than, f"%,{tag},%", limit))
+        return [str(r["id"]) for r in rows]
+
     #: Сколько разговоров максимум приносит один поиск. Список на экране
     #: всё равно листается страницами, а перечень номеров уезжает в SQL
     #: условием `id IN (...)`, у которого есть свой предел на число
@@ -1183,7 +1293,9 @@ class Database:
         "sentiment_shift, negative_segments, positive_segments, wpm, "
         "silence_share, interruptions, pauses, longest_pause_s, filler_rate, "
         "questions, commitments, commitments_dated, alerts, compliance, "
-        "money_max, speakers, agent_speaker"
+        "money_max, speakers, agent_speaker, overlap_s, dead_air_s, switches, "
+        "talk_share, monologue_s, customer_story_s, reply_delay_s, tempo_ratio, "
+        "frustration, repeat_contact, profanity, profanity_agent"
     )
 
     def save_content(self, job_id: str, features: dict[str, Any],
@@ -1264,7 +1376,7 @@ class Database:
         правила меняются — по версии видно, что пора считать заново.
         """
         rows = self.query(
-            "SELECT j.id, j.text, j.media_duration_s FROM jobs j "
+            "SELECT j.id, j.text, j.media_duration_s, j.quality_flags FROM jobs j "
             "LEFT JOIN content c ON c.job_id = j.id "
             "WHERE j.status='completed' AND j.text IS NOT NULL AND j.text != '' "
             "  AND (c.job_id IS NULL OR c.version < ?) "
@@ -1358,6 +1470,27 @@ class Database:
         # не «стало лучше», и раздел обязан отличать одно от другого.
         ("mono", "SUM(CASE WHEN COALESCE(c.speakers,0) < 2 THEN 1 ELSE 0 END)"),
         ("duration_s", "AVG(j.media_duration_s)"),
+        ("mixed", "SUM(CASE WHEN c.sentiment_label = 'смешанная' THEN 1 ELSE 0 END)"),
+        ("overlap_s", "AVG(c.overlap_s)"),
+        ("dead_air_s", "AVG(c.dead_air_s)"),
+        ("switches", "AVG(c.switches)"),
+        ("talk_share", "AVG(c.talk_share)"),
+        ("monologue_s", "AVG(c.monologue_s)"),
+        # Монолог дольше двух с половиной минут — порог Gong; доля таких
+        # записей говорит больше среднего: среднее по архиву коротких
+        # звонков не покажет пятиминутный монолог в каждом десятом.
+        ("long_monologues", "SUM(CASE WHEN c.monologue_s >= 150 THEN 1 ELSE 0 END)"),
+        ("customer_story_s", "AVG(c.customer_story_s)"),
+        ("reply_delay_s", "AVG(c.reply_delay_s)"),
+        ("tempo_ratio", "AVG(c.tempo_ratio)"),
+        ("frustrated", "SUM(CASE WHEN COALESCE(c.frustration,0) > 0 THEN 1 ELSE 0 END)"),
+        ("repeat", "SUM(CASE WHEN COALESCE(c.repeat_contact,0) > 0 THEN 1 ELSE 0 END)"),
+        # Нецензурная лексика: считаем и записи с ней, и записи, где словарь
+        # вообще смотрел, — без второго числа первое не прочитать.
+        ("profanity_records", "SUM(CASE WHEN COALESCE(c.profanity,0) > 0 THEN 1 ELSE 0 END)"),
+        ("profanity_agent_records",
+         "SUM(CASE WHEN COALESCE(c.profanity_agent,0) > 0 THEN 1 ELSE 0 END)"),
+        ("profanity_checked", "SUM(CASE WHEN c.profanity IS NOT NULL THEN 1 ELSE 0 END)"),
     )
 
     #: Как группировать свод. Значение — выражение SQL; None — без
@@ -1404,6 +1537,16 @@ class Database:
         "negative_segments": "c.negative_segments",
         "positive_segments": "c.positive_segments",
         "duration_s": "j.media_duration_s",
+        "overlap_s": "c.overlap_s",
+        "dead_air_s": "c.dead_air_s",
+        "switches": "c.switches",
+        "talk_share": "c.talk_share",
+        "monologue_s": "c.monologue_s",
+        "customer_story_s": "c.customer_story_s",
+        "reply_delay_s": "c.reply_delay_s",
+        "tempo_ratio": "c.tempo_ratio",
+        "frustration": "c.frustration",
+        "repeat_contact": "c.repeat_contact",
     }
 
     def _content_where(self, since: float | None, until: float | None,
@@ -2147,7 +2290,7 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
 
 def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
     job = dict(row)
-    for column, empty in (("params", {}), ("waveform", [])):
+    for column, empty in (("params", {}), ("waveform", []), ("quality_detail", None)):
         raw = job.get(column)
         if isinstance(raw, str):
             try:
@@ -2156,4 +2299,6 @@ def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
                 job[column] = empty
         elif raw is None and column == "waveform":
             job[column] = []
+    if isinstance(job.get("quality_flags"), str):
+        job["quality_flags"] = [ф for ф in job["quality_flags"].split(",") if ф]
     return job

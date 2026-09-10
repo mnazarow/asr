@@ -897,6 +897,24 @@ class JobQueue:
         with self._lock:
             self._cancelled.discard(job_id)
 
+        # Здоровье распознавания — тут же, по тем же сегментам: галлюцинации
+        # Whisper, невозможный темп, повторы, известные фразы, разметка
+        # говорящих. Считается всегда, а не только при включённом разборе
+        # содержания: это признак самого распознавания, и сбой внутри не
+        # должен трогать результат.
+        try:
+            from . import quality  # noqa: PLC0415
+
+            оценка = quality.assess(
+                outcome.segments,
+                expected_speakers=int(
+                    self.settings.get("quality_expected_speakers") or 0)
+                if self.settings is not None else 0)
+            self.db.update_job(job_id, **quality.for_job(оценка))
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Признаки качества для %s не посчитаны: %s", job_id, exc,
+                        extra={"job_id": job_id})
+
         # Разбор содержания — здесь, а не в фоновом потоке: признаки нужны
         # сразу, вместе с результатом. Стоит он десятки миллисекунд против
         # минут распознавания, а ошибки внутри не выходят наружу.

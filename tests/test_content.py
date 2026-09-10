@@ -1396,3 +1396,545 @@ def test_records_without_diarization_are_counted_and_named(tmp_path):
     выводы = [в for в in Insights(db).findings("all") if в.get("metric") == "mono_share"]
     assert выводы, "про неразделённых говорящих раздел молчит"
     assert "не считаются" in выводы[0]["text"], выводы[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Стороны разговора — то, что считает каждая система речевой аналитики
+# ---------------------------------------------------------------------------
+
+
+def test_the_sides_of_the_call_are_measured_from_the_operator():
+    """Доля речи, монолог против рассказа клиента, пауза перед ответом.
+
+    Числа проверяются по разметке РАЗГОВОР руками: оператор SPEAKER_00
+    говорит 4 + 4.3 + 5 + 1.8 = 15.1 с из 15.1 + 4.5 + 4.5 + 2.5 = 26.6 с
+    звучащей речи; его самый долгий монолог — одна реплика в пять секунд,
+    самый долгий рассказ клиента — 4.5 с. Из четырёх переходов слова к
+    оператору один — перебивание (начал на 0.3 с раньше), один — после
+    четырёхсекундной паузы (это тишина, не пауза перед ответом), и лишь
+    последний — ответ через 0.2 с; он и есть его пауза перед ответом.
+    """
+    р = _разбор()
+    речь = р["speech"]
+    стороны = речь["sides"]
+
+    assert стороны["agent"] == "SPEAKER_00" and стороны["customer"] == "SPEAKER_01"
+    assert стороны["talk_share"] == pytest.approx(15.1 / 26.6, abs=0.01), стороны
+    assert стороны["monologue_s"] == 5.0, стороны
+    assert стороны["customer_story_s"] == 4.5, стороны
+    # Пауза перед ответом: только ответы, не перебивания и не молчание.
+    assert стороны["reply_delay_s"] == pytest.approx(0.2, abs=0.01), стороны
+    # А у клиента — три ответа по полсекунды.
+    assert стороны["customer_reply_delay_s"] == pytest.approx(0.5, abs=0.01), стороны
+    assert стороны["tempo_ratio"] is not None and стороны["tempo_ratio"] > 0
+
+    # Смены говорящего: семь реплик по очереди — шесть смен.
+    assert речь["switches"] == 6, речь
+    # Наложение: третья реплика началась на 0.3 с раньше конца второй.
+    assert речь["overlap_s"] == pytest.approx(0.3, abs=0.01), речь
+    # Заметная тишина: одна пауза в четыре секунды.
+    assert речь["dead_air_s"] == 4.0, речь
+
+
+def test_without_an_operator_the_sides_are_unknown_and_not_invented():
+    """Не зная, кто оператор, «долю речи оператора» выдумывать нельзя."""
+    from asrhub.content import speech
+
+    речь = speech.analyze(РАЗГОВОР, 32.0)
+    стороны = speech.sides(речь, None)
+    assert стороны["talk_share"] is None and стороны["monologue_s"] is None
+    assert стороны["reply_delay_s"] is None and стороны["tempo_ratio"] is None
+    # Оператор назван, но его нет среди говорящих — то же самое.
+    assert speech.sides(речь, "SPEAKER_09")["talk_share"] is None
+
+
+def test_a_call_with_both_sharp_and_warm_lines_is_mixed_not_neutral():
+    """Средняя по такому разговору — около нуля, и «нейтральная» врала.
+
+    Разговор с четырьмя резкими и четырьмя тёплыми репликами неотличим по
+    средней от ровного, хотя слушать нужно именно его. Класс есть у NICE
+    ровно по этой причине.
+    """
+    from asrhub import content
+
+    сегменты = []
+    t = 0.0
+    for _ in range(4):
+        сегменты.append({"start": t, "end": t + 3, "speaker": "SPEAKER_01",
+                         "text": "Отвратительное качество, ужасно, я крайне недоволен."})
+        t += 3.5
+        сегменты.append({"start": t, "end": t + 3, "speaker": "SPEAKER_00",
+                         "text": "Спасибо, всё отлично, замечательно, вы очень помогли."})
+        t += 3.5
+    р = content.analyze(text=" ".join(с["text"] for с in сегменты),
+                        segments=сегменты, duration_s=t)
+    assert р["sentiment"]["label"] == "смешанная", р["sentiment"]
+    assert abs(р["sentiment"]["score"]) < 0.15, р["sentiment"]
+
+    # Одна резкая реплика на фоне ровного разговора — не смешанный.
+    ровный = [{"start": i * 4.0, "end": i * 4.0 + 3, "speaker": f"SPEAKER_0{i % 2}",
+               "text": "Хорошо, договорились, отправлю сегодня."} for i in range(6)]
+    ровный.append({"start": 24.0, "end": 27.0, "speaker": "SPEAKER_01",
+                   "text": "Отвратительное качество, ужасно."})
+    р = content.analyze(text=" ".join(с["text"] for с in ровный),
+                        segments=ровный, duration_s=27.0)
+    assert р["sentiment"]["label"] != "смешанная", р["sentiment"]
+
+
+def test_the_sides_reach_the_database_the_summary_and_the_selections(tmp_path):
+    """Показатель, которого нет в своде и отборах, всё равно что не посчитан.
+
+    Именно так и было: пауза перед ответом считалась с первой версии
+    разбора и не показывалась нигде.
+    """
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, 24)
+    ContentIndex(db, _Настройки()).backfill_once(limit=100)
+    свод = Insights(db).summary("all")
+    for ключ in ("talk_share", "monologue_s", "customer_story_s", "switches",
+                 "reply_delay_s", "overlap_s", "dead_air_s", "tempo_ratio",
+                 "mixed", "long_monologues"):
+        assert ключ in свод, ключ
+    # В корпусе оператор здоровается первым и говорит первую реплику:
+    # доля его речи — известное число, а не None.
+    assert свод["talk_share"] is not None and 0 < свод["talk_share"] < 1, свод
+    assert свод["switches"] == 1.0, свод
+
+    for отбор in ("monologue", "customer_story", "mixed", "dead_air", "impatient"):
+        ответ = Insights(db).records(отбор, "all")
+        assert "items" in ответ, отбор
+
+    # И в списке заданий — те же отборы.
+    for отбор in ("monologue", "mixed", "dead_air"):
+        assert db.count_jobs(status="completed", content=отбор) >= 0, отбор
+
+
+def test_findings_speak_about_the_sides_only_when_there_is_something_to_say(tmp_path):
+    """Правило про монологи и долю речи — с числами и только по порогу."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, 24)
+    ContentIndex(db, _Настройки()).backfill_once(limit=100)
+    # В корпусе оператор говорит 8 с из 19 — долю 65 % правило не назовёт.
+    тексты = [в["text"] for в in Insights(db).findings("all")]
+    assert not any("говорит больше клиента" in т for т in тексты), тексты
+
+    # Перепишем разбор так, будто оператор говорил три четверти времени и
+    # в каждой записи был монолог в три минуты, — оба вывода должны
+    # появиться и назвать свои числа.
+    db.execute("UPDATE content SET talk_share=0.75, monologue_s=180")
+    тексты = [в["text"] for в in Insights(db).findings("all")]
+    assert any("говорит больше клиента: 75%" in т for т in тексты), тексты
+    assert any("монолог оператора" in т and "100.0%" in т for т in тексты), тексты
+
+
+# ---------------------------------------------------------------------------
+# Раздражение, повторное обращение, нецензурная лексика, окна в секундах
+# ---------------------------------------------------------------------------
+
+
+def test_frustration_is_told_apart_from_merely_negative_content():
+    """«Доставка задерживается» и «сколько можно!» — обе отрицательные.
+
+    Но слушать нужно второе: клиент не обсуждает плохое, а расстроен. У NICE
+    это отдельный признак, и здесь тоже.
+    """
+    from asrhub import content
+
+    спокойно = [{"start": 0, "end": 3, "speaker": "SPEAKER_00",
+                 "text": "Здравствуйте, компания Ромашка."},
+                {"start": 3.5, "end": 9, "speaker": "SPEAKER_01",
+                 "text": "Доставка задерживается, качество плохое, я недоволен."}]
+    р = content.analyze(text=" ".join(с["text"] for с in спокойно),
+                        segments=спокойно, duration_s=9)
+    assert р["sentiment"]["score"] < 0
+    assert р["frustration"]["count"] == 0, р["frustration"]
+
+    резко = [спокойно[0], {"start": 3.5, "end": 9, "speaker": "SPEAKER_01",
+                           "text": "Сколько можно! Позовите руководителя, это безобразие."}]
+    р = content.analyze(text=" ".join(с["text"] for с in резко),
+                        segments=резко, duration_s=9)
+    assert р["frustration"]["count"] == 1, р["frustration"]
+    слова = р["frustration"]["items"][0]["words"]
+    assert "сколько можно" in слова and "позовите руководителя" in слова, слова
+    # «Безобразие» вошло в оборот «это безобразие» и второй раз не считается.
+    assert "безобразие" not in слова and "это безобразие" in слова, слова
+
+
+def test_frustration_is_looked_for_in_the_customers_lines_only():
+    """«Сколько можно» из уст оператора — другая история."""
+    from asrhub import content
+
+    сегменты = [{"start": 0, "end": 3, "speaker": "SPEAKER_00",
+                 "text": "Здравствуйте, компания Ромашка. Сколько можно вам объяснять."},
+                {"start": 3.5, "end": 6, "speaker": "SPEAKER_01",
+                 "text": "Добрый день, спасибо."}]
+    р = content.analyze(text=" ".join(с["text"] for с in сегменты),
+                        segments=сегменты, duration_s=6)
+    assert р["frustration"]["speaker"] == "SPEAKER_01"
+    assert р["frustration"]["count"] == 0, р["frustration"]
+
+
+def test_repeat_contact_is_seen_by_turns_of_phrase_not_single_words():
+    """«Снова здравствуйте» — не повторное обращение, «снова не работает» — да."""
+    from asrhub import content
+
+    def разбор(текст):
+        сег = [{"start": 0, "end": 3, "speaker": "SPEAKER_00", "text": "Здравствуйте."},
+               {"start": 3.5, "end": 9, "speaker": "SPEAKER_01", "text": текст}]
+        return content.analyze(text="Здравствуйте. " + текст, segments=сег, duration_s=9)
+
+    assert разбор("Снова здравствуйте, опять я.")["repeat_contact"]["count"] == 0
+    р = разбор("Я уже звонил вчера, и до сих пор не работает, в третий раз обращаюсь.")
+    assert р["repeat_contact"]["count"] == 1, р["repeat_contact"]
+    assert set(р["repeat_contact"]["items"][0]["words"]) >= {
+        "уже звонил", "до сих пор не", "в третий раз"}, р["repeat_contact"]
+
+
+def test_profanity_is_off_by_default_and_unknown_is_not_zero():
+    """Пока словарь выключен, в записи стоит «не считалось», а не ноль."""
+    from asrhub import content
+
+    сег = [{"start": 0, "end": 3, "speaker": "SPEAKER_00",
+            "text": "Что за хрень, идиоты, охренели совсем."},
+           {"start": 3.5, "end": 6, "speaker": "SPEAKER_01",
+            "text": "Срок сорван, из Херсона звоню, фигурку херувима и сучковатую "
+                    "доску не привезли, рубля не дали."}]
+    текст = " ".join(с["text"] for с in сег)
+
+    р = content.analyze(text=текст, segments=сег, duration_s=6)
+    свод, _ = content.features(р)
+    assert свод["profanity"] is None and свод["profanity_agent"] is None, свод
+    # Выключенный словарь не ищет вовсе: найденное им нигде не оседает.
+    assert р["profanity"]["items"] == [] and р["profanity"]["count"] == 0, р["profanity"]
+
+    р = content.analyze(text=текст, segments=сег, duration_s=6, profanity=True)
+    свод, _ = content.features(р)
+    assert свод["profanity"] == 1 and свод["profanity_agent"] == 1, свод
+    # Созвучные слова словарь не трогает: Херсон, рубля, срок — их корень
+    # не ловит; херувим и сучковатую корень ловит, и их спасает список
+    # исключений.
+    assert р["profanity"]["items"][0]["speaker"] == "SPEAKER_00"
+    assert {"хрень", "идиоты", "охренели"} == set(р["profanity"]["items"][0]["words"])
+    assert len(р["profanity"]["items"]) == 1, р["profanity"]
+
+
+def test_a_script_item_can_demand_its_marker_within_seconds():
+    """«Разговор записывается» обязано прозвучать в первые 30 секунд.
+
+    Пятая часть реплик в часовом разговоре — это двенадцать минут, и
+    предупреждение на десятой засчитывалось.
+    """
+    from asrhub.content import compliance
+
+    сег = [{"start": 0, "end": 3, "speaker": "A", "text": "Алло, слушаю вас."},
+           {"start": 3.5, "end": 8, "speaker": "B", "text": "Здравствуйте, по договору."},
+           {"start": 40, "end": 45, "speaker": "A", "text": "Разговор записывается."},
+           {"start": 46, "end": 50, "speaker": "A", "text": "Всего доброго."}]
+    пункт = {"id": "rec", "label": "Предупредил о записи",
+             "any": ["разговор записывается"], "where": "start"}
+
+    # По долям реплик начало — первая реплика оператора: не прошло.
+    assert not compliance.check(сег, script=[пункт], speaker="A")["items"][0]["passed"]
+    # Окно в 45 секунд накрывает реплику на сороковой; окно в 30 — нет.
+    assert compliance.check(сег, script=[{**пункт, "within_s": 45}],
+                            speaker="A")["items"][0]["passed"]
+    assert not compliance.check(сег, script=[{**пункт, "within_s": 30}],
+                                speaker="A")["items"][0]["passed"]
+    # Окно от конца: прощание в последние пять секунд.
+    прощание = {"id": "bye", "label": "Попрощался", "any": ["всего доброго"],
+                "where": "end", "within_s": 5}
+    assert compliance.check(сег, script=[прощание], speaker="A")["items"][0]["passed"]
+    # А в отчёте окно названо, чтобы «где искали» было понятно без кода.
+    assert compliance.check(сег, script=[прощание],
+                            speaker="A")["items"][0]["within_s"] == 5
+
+
+def test_the_new_signals_reach_the_summary_the_selections_and_the_digest(tmp_path):
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+    from asrhub.maintenance import digest_text
+
+    db = _корпус(tmp_path, 24)
+    ContentIndex(db, _Настройки()).backfill_once(limit=100)
+    свод = Insights(db).summary("all")
+    for ключ in ("frustrated", "frustrated_share", "repeat", "repeat_share",
+                 "profanity_records", "profanity_agent_records", "profanity_checked"):
+        assert ключ in свод, ключ
+    # Словарь мата выключен — проверенных записей ноль, и это видно.
+    assert свод["profanity_checked"] == 0, свод
+
+    for отбор in ("frustrated", "repeat", "profanity", "profanity_agent"):
+        assert "items" in Insights(db).records(отбор, "all"), отбор
+        assert db.count_jobs(status="completed", content=отбор) == 0, отбор
+
+    db.execute("UPDATE content SET frustration=2, repeat_contact=1")
+    свод = Insights(db).summary("all")
+    assert свод["frustrated"] == 24 and свод["repeat_share"] == 100.0, свод
+    текст = digest_text({}, {}, {}, содержание={"summary": свод})
+    assert "раздражения клиента: 24" in текст, текст
+    assert "Повторных обращений по нерешённому вопросу: 24" in текст, текст
+
+
+# ---------------------------------------------------------------------------
+# Здоровье распознавания: подозрительные расшифровки
+# ---------------------------------------------------------------------------
+
+
+def _подозрительные_сегменты():
+    return [
+        {"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00",
+         "text": "Здравствуйте, компания Ромашка, меня зовут Анна.",
+         "confidence": 0.92, "no_speech_prob": 0.01, "compression_ratio": 1.4,
+         "temperature": 0.0},
+        {"start": 4.5, "end": 5.0, "speaker": "SPEAKER_01",
+         "text": "да да да да да да да да да да да да да да да да да да да да",
+         "confidence": 0.41, "no_speech_prob": 0.2, "compression_ratio": 3.1,
+         "temperature": 0.4},
+        {"start": 5.0, "end": 9.0, "speaker": "SPEAKER_01",
+         "text": "Субтитры сделал DimaTorzok",
+         "confidence": 0.2, "no_speech_prob": 0.9, "compression_ratio": 1.2,
+         "temperature": 0.0},
+        {"start": 9.0, "end": 12.0, "speaker": "SPEAKER_00",
+         "text": "Хорошо, спасибо, всего доброго.",
+         "confidence": 0.8, "no_speech_prob": 0.05, "compression_ratio": 1.1,
+         "temperature": 0.0},
+    ]
+
+
+def test_hallucinations_are_seen_by_the_signs_whisper_itself_publishes():
+    """Средняя уверенность по такому заданию — 0,58, и она ничего не выдала.
+
+    Признаки считаются по сегментам: сжатие выше 2,4 и перебор температур
+    (пороги самого Whisper), текст на тишине (no_speech > 0,6 при
+    уверенности ниже e^-1), невозможный темп, повторы, известная фраза.
+    """
+    from asrhub import quality
+
+    оценка = quality.assess(_подозрительные_сегменты(), expected_speakers=2)
+    assert оценка["segments"] == 4 and оценка["suspect"] == 2, оценка
+    assert оценка["suspect_share"] == 0.5
+    причины = оценка["reasons"]
+    assert причины["compression"] == 1 and причины["temperature"] == 1
+    assert причины["tempo"] == 1 and причины["repeat"] == 1
+    assert причины["silence"] == 1 and причины["phrase"] == 1
+    # Говорящих двое, ожидалось двое — признака нет.
+    assert "speakers" not in оценка["flags"], оценка["flags"]
+    # Примеры — с временем и причиной, для карточки.
+    фраза = next(п for п in оценка["items"] if п["phrase"])
+    assert фраза["start_s"] == 5.0 and фраза["phrase"] == "субтитры сделал"
+
+    # Чистая запись чиста: ни одного признака на обычной речи.
+    чистая = [с for с in _подозрительные_сегменты() if с["compression_ratio"] < 2]
+    чистая = [с for с in чистая if "субтитры" not in с["text"].lower()]
+    assert quality.assess(чистая)["suspect"] == 0
+
+
+def test_the_expected_number_of_speakers_is_checked_only_when_asked():
+    from asrhub import quality
+
+    моно = [{"start": i * 3.0, "end": i * 3.0 + 2.5, "speaker": "SPEAKER_00",
+             "text": "Обычная реплика без всяких признаков."} for i in range(8)]
+    assert "speakers" not in quality.assess(моно)["flags"]
+    assert "speakers" in quality.assess(моно, expected_speakers=2)["flags"]
+    # Осколки разметки: когда треть реплик короче секунды.
+    осколки = [{"start": i * 1.0, "end": i * 1.0 + 0.4, "speaker": f"SPEAKER_0{i % 3}",
+                "text": "да"} for i in range(9)]
+    assert "fragments" in quality.assess(осколки)["flags"]
+
+
+def test_quality_flags_are_stored_with_the_job_and_reach_the_list_and_the_report(tmp_path):
+    """Задание получает признаки, отбор «подозрительная расшифровка» их видит."""
+    from asrhub import quality
+    from asrhub.analytics import Analytics
+    from asrhub.content_index import ContentIndex
+    from asrhub.db import Database
+
+    db = Database(tmp_path / "asrhub.db")
+    сейчас = time.time()
+    for n, сегменты in ((0, _подозрительные_сегменты()),
+                        (1, [с for с in _подозрительные_сегменты()
+                             if с["compression_ratio"] < 2 and "субтитры" not in с["text"].lower()])):
+        job_id = db.create_job({"id": f"q{n}", "filename": f"{n}.wav",
+                                "media_duration_s": 12.0, "owner": "anna",
+                                "engine": "whisper", "model": "large-v3",
+                                "language": "ru", "source": "api"})
+        db.update_job(job_id, status="completed", finished_at=сейчас,
+                      text=" ".join(с["text"] for с in сегменты),
+                      segments_count=len(сегменты))
+        db.save_segments(job_id, сегменты)
+        db.update_job(job_id, **quality.for_job(quality.assess(сегменты)))
+
+    плохое = db.get_job("q0")
+    assert плохое["suspect_segments"] == 2 and плохое["suspect_share"] == 0.5
+    assert "phrase" in плохое["quality_flags"], плохое["quality_flags"]
+    assert плохое["quality_detail"]["items"][0]["start_s"] == 4.5
+    assert db.get_job("q1")["quality_flags"] == []
+
+    assert db.count_jobs(status="completed", content="suspect") == 1
+    assert db.count_jobs(status="completed", content="hallucination") == 1
+    assert [j["id"] for j in db.list_jobs(status="completed", content="suspect")] == ["q0"]
+
+    отчёт = Analytics(db).suspicious("all")
+    assert отчёт["assessed"] == 2 and отчёт["flagged"] == 1
+    assert отчёт["suspect_share"] == pytest.approx(100.0 * 2 / 6, abs=0.1), отчёт   # 4 + 2 сегмента
+    assert {ф["key"] for ф in отчёт["by_flag"]} >= {"phrase", "repeat", "compression"}
+    assert отчёт["by_model"][0]["key"] == "large-v3"
+    assert отчёт["worst"][0]["id"] == "q0"
+
+    # Записи, сделанные до появления признаков, доразмечает фоновый разбор.
+    db.execute("UPDATE jobs SET quality_flags=NULL, suspect_segments=NULL")
+    assert Analytics(db).suspicious("all")["assessed"] == 0
+    индекс = ContentIndex(db, _Настройки())
+    индекс.backfill_once(limit=10)
+    assert db.get_job("q0")["suspect_segments"] == 2
+    assert Analytics(db).suspicious("all")["assessed"] == 2
+
+    # И пересчёт одной записи пересчитывает признаки: смена ожидаемого
+    # числа говорящих иначе ждала бы фонового разбора, который эту запись
+    # уже прошёл.
+    db.execute("UPDATE jobs SET quality_flags=NULL, suspect_segments=NULL WHERE id='q0'")
+    индекс.recompute(["q0"])
+    assert db.get_job("q0")["suspect_segments"] == 2
+
+
+def test_new_words_of_the_period_are_those_the_previous_period_never_heard(tmp_path):
+    """Слово из трёх свежих записей, которого раньше не было, — новое.
+
+    Из одной — ошибка распознавания, а не новость.
+    """
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, 40)
+    сейчас = time.time()
+    # Три свежие записи получают слово «мегаакция», две — «опечатка»: оно
+    # проходит порог тем (две записи), но не порог новизны (три).
+    for n, слово in ((0, "мегаакция"), (1, "мегаакция"), (2, "мегаакция"),
+                     (3, "опечатка"), (4, "опечатка")):
+        db.execute("UPDATE jobs SET text = text || ? , created_at=? WHERE id=?",
+                   (f" {слово} {слово}", сейчас - n * 60, f"job{n:04d}"))
+    # Остальные — в прошлую неделю, чтобы окна «неделя» и «прошлая неделя»
+    # были непустыми.
+    db.execute("UPDATE jobs SET created_at = ? - 8*86400 - (CAST(substr(id, 4) AS INTEGER) * 60) "
+               "WHERE id NOT IN ('job0000','job0001','job0002','job0003','job0004')", (сейчас,))
+    ContentIndex(db, _Настройки()).backfill_once(limit=100)
+
+    новые = {т["word"]: т["now"] for т in Insights(db).new_topics("week")}
+    assert "мегаакция" in новые and новые["мегаакция"] == 3, новые
+    assert "опечатка" not in новые, новые
+    # Слова прошлого периода новыми не считаются.
+    assert "ромашка" not in новые and "суд" not in новые, новые
+
+
+# ---------------------------------------------------------------------------
+# Персональные данные: удаление по требованию и отметка согласия
+# ---------------------------------------------------------------------------
+
+
+def test_erasure_by_request_finds_by_transcript_and_deletes_only_when_asked(
+        data_dir, monkeypatch):
+    """Отзыв согласия — и записи уничтожаются в срок до тридцати дней.
+
+    По умолчанию — пробный запуск: показывает, что нашлось, и не удаляет.
+    Удаляет только администратор и только с dry_run=false. В журнале
+    событий запрос усечён: номер телефона в журнале — ещё одно место,
+    откуда его придётся удалять.
+    """
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        for n, текст in enumerate(("Мой номер восемь девятьсот 5551234, перезвоните.",
+                                   "Обычный разговор без номера.")):
+            job_id = db.create_job({"id": f"pd{n}", "filename": f"{n}.wav",
+                                    "owner": "пользователь", "media_duration_s": 5.0})
+            db.update_job(job_id, status="completed", finished_at=1.0, text=текст)
+            db.save_segments(job_id, [{"start": 0, "end": 5, "text": текст}])
+
+        админ = {"X-API-Key": "ah_admin_k"}
+        # Обычному ключу нельзя даже смотреть.
+        assert c.post("/api/maintenance/erase", json={"query": "5551234"},
+                      headers={"X-API-Key": "ah_user_k"}).status_code == 403
+        # Короткий запрос отвергается: три символа нашли бы половину архива.
+        assert c.post("/api/maintenance/erase", json={"query": "555"},
+                      headers=админ).status_code == 400
+
+        пробный = c.post("/api/maintenance/erase", json={"query": "5551234"},
+                         headers=админ)
+        assert пробный.status_code == 200, пробный.text
+        assert пробный.json()["dry_run"] is True
+        assert пробный.json()["ids"] == ["pd0"], пробный.json()
+        assert db.get_job("pd0") is not None, "пробный запуск удалил запись"
+
+        боевой = c.post("/api/maintenance/erase",
+                        json={"query": "5551234", "dry_run": False}, headers=админ)
+        assert боевой.status_code == 200 and боевой.json()["deleted"] == 1
+        assert db.get_job("pd0") is None and db.get_job("pd1") is not None
+
+        события = [dict(r) for r in db.query(
+            "SELECT * FROM events WHERE kind='erase'")]
+        assert len(события) == 1, события
+        assert "5551234" not in события[0]["message"], события[0]["message"]
+        assert "555…" in события[0]["message"], события[0]["message"]
+
+
+def test_records_without_a_consent_tag_are_listed_when_the_tag_is_set(
+        data_dir, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        давно = time.time() - 40 * 86400
+        for n, метки in enumerate(("согласие", "", "несогласие,vip")):
+            job_id = db.create_job({"id": f"cs{n}", "filename": f"{n}.wav",
+                                    "owner": "пользователь", "tags": метки,
+                                    "media_duration_s": 5.0})
+            db.update_job(job_id, status="completed", finished_at=давно, text="текст")
+            db.execute("UPDATE jobs SET created_at=? WHERE id=?", (давно, job_id))
+        админ = {"X-API-Key": "ah_admin_k"}
+
+        # Метка не задана — проверка выключена и об этом сказано.
+        ответ = c.get("/api/maintenance/consent", headers=админ).json()
+        assert ответ["enabled"] is False and ответ["count"] == 0
+
+        app.state.hub.settings.set("consent_tag", "согласие")
+        ответ = c.get("/api/maintenance/consent", headers=админ).json()
+        assert ответ["enabled"] is True and ответ["days"] == 30
+        # «Несогласие» — не «согласие»: сравнение по целой метке.
+        assert sorted(ответ["ids"]) == ["cs1", "cs2"], ответ
+        # Свежие записи (моложе срока) в список не попадают.
+        assert c.get("/api/maintenance/consent?days=3650", headers=админ).json()["count"] == 0
+
+
+def test_the_job_list_accepts_the_quality_selections_too(data_dir, monkeypatch):
+    """Ручка проверяла ключ отбора только по перечню содержания.
+
+    Отбор «подозрительная расшифровка» есть и там, где разбор содержания
+    выключен, — и ручка отвергала его как неизвестный, хотя база его знала.
+    """
+    from asrhub import quality
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        сегменты = _подозрительные_сегменты()
+        job_id = db.create_job({"id": "qa0", "filename": "0.wav", "owner": "пользователь",
+                                "media_duration_s": 12.0})
+        db.update_job(job_id, status="completed", finished_at=1.0,
+                      text="текст", segments_count=len(сегменты),
+                      **quality.for_job(quality.assess(сегменты)))
+        заголовки = {"X-API-Key": "ah_user_k"}
+        for отбор in ("suspect", "hallucination"):
+            ответ = c.get(f"/api/jobs?status=completed&content={отбор}", headers=заголовки)
+            assert ответ.status_code == 200, ответ.text
+            assert [j["id"] for j in ответ.json()["items"]] == ["qa0"], ответ.json()
+        assert c.get("/api/jobs?content=speakers_mismatch",
+                     headers=заголовки).json()["items"] == []
+        assert c.get("/api/jobs?content=нет-такого", headers=заголовки).status_code == 400

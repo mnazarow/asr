@@ -183,7 +183,23 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
     содержание = _digest_content(insights, settings, срок)
     if содержание:
         готовое["content"] = содержание
-    готовое["text"] = digest_text(сводка, ошибки, очередь, содержание)
+    # Подозрительные расшифровки и записи без метки согласия — это про
+    # сервер и про порядок, а не про разговоры, поэтому они здесь, а не в
+    # разделе о содержании.
+    подозрительные = отчёт.get("suspicious") or {}
+    if подозрительные.get("assessed"):
+        готовое["suspicious"] = {k: подозрительные.get(k) for k in
+                                 ("assessed", "flagged", "flagged_share",
+                                  "suspect_share")}
+    метка = str(settings.get("consent_tag") or "").strip()
+    if метка and getattr(analytics, "db", None) is not None:
+        срок_дней = int(settings.get("consent_days") or 30)
+        без = analytics.db.jobs_without_tag(
+            метка, older_than=time.time() - срок_дней * 86400)
+        готовое["consent_missing"] = len(без)
+    готовое["text"] = digest_text(сводка, ошибки, очередь, содержание,
+                                  suspicious=готовое.get("suspicious"),
+                                  consent_missing=готовое.get("consent_missing"))
     return готовое
 
 
@@ -229,7 +245,9 @@ def _digest_content(insights: Any, settings: Any,
 
 def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                 очередь: dict[str, Any],
-                содержание: dict[str, Any] | None = None) -> str:
+                содержание: dict[str, Any] | None = None, *,
+                suspicious: dict[str, Any] | None = None,
+                consent_missing: int | None = None) -> str:
     """Та же сводка словами.
 
     Приёмник входящих сообщений в мессенджере показывает поле `text` и
@@ -271,6 +289,12 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         перечень = ", ".join(f"{o.get('code')} ×{o.get('count')}" for o in верхние)
         строки.append(f"Чаще всего падало: {перечень}")
 
+    if suspicious and suspicious.get("flagged"):
+        строки.append(f"Подозрительных расшифровок: {suspicious['flagged']} из "
+                      f"{suspicious['assessed']} ({число(suspicious.get('flagged_share'))} %)")
+    if consent_missing:
+        строки.append(f"Записей без метки согласия старше срока: {consent_missing}")
+
     # Про разговоры — отдельным блоком и после показателей сервера: читают
     # сводку сверху вниз, а «сервер жив» — это условие, при котором вторая
     # половина вообще имеет смысл.
@@ -292,6 +316,15 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         скрипт = свод.get("compliance")
         if скрипт is not None:
             строки.append(f"Скрипт разговора соблюдён на {число(скрипт * 100, 0)} %")
+        if свод.get("frustrated"):
+            строки.append(f"С признаками раздражения клиента: {свод['frustrated']} "
+                          f"({число(свод.get('frustrated_share'))} %)")
+        if свод.get("repeat"):
+            строки.append(f"Повторных обращений по нерешённому вопросу: {свод['repeat']} "
+                          f"({число(свод.get('repeat_share'))} %)")
+        if свод.get("profanity_agent_records"):
+            строки.append(f"Нецензурная лексика у сотрудника: "
+                          f"{свод['profanity_agent_records']} записей")
         for вывод in ((содержание or {}).get("findings") or [])[:3]:
             метка = {"warning": "!", "good": "+"}.get(вывод.get("severity"), "·")
             строки.append(f"  {метка} {вывод.get('text')}")

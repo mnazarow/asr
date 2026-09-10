@@ -815,6 +815,84 @@ class Analytics:
             "jobs": [len(k["conf"]) for k in корзины],
         }
 
+    # --- здоровье распознавания -----------------------------------------------
+
+    def suspicious(self, period: str = "month", owner: str | None = None,
+                   limit: int = 15) -> dict[str, Any]:
+        """Подозрительные расшифровки: галлюцинации, повторы, разметка.
+
+        Средняя уверенность по заданию оставалась приличной и тогда, когда
+        Whisper дописывал на тишине «Субтитры сделал DimaTorzok»: признаки
+        считаются по сегментам, и здесь они собраны по моделям, по
+        источникам и по признакам — чтобы видеть, у какой модели и на каком
+        входе расшифровки начинают выдумывать.
+        """
+        from . import quality  # noqa: PLC0415
+
+        since = self._since(period)
+        jobs = [j for j in self._jobs(since=since or None, limit=100000, owner=owner)
+                if j["status"] == "completed" and j.get("segments_count")]
+        # Задания, сделанные до появления признаков, не считаются ни
+        # подозрительными, ни чистыми — их просто не смотрели.
+        оценённые = [j for j in jobs if j.get("quality_flags") is not None]
+        сегментов = sum(int(j.get("segments_count") or 0) for j in оценённые)
+        подозрительных = sum(int(j.get("suspect_segments") or 0) for j in оценённые)
+        с_признаками = [j for j in оценённые if (j.get("quality_flags") or "")]
+
+        по_признакам: dict[str, int] = dict.fromkeys(quality.ПРИЗНАКИ, 0)
+        for j in с_признаками:
+            for признак in str(j.get("quality_flags") or "").split(","):
+                if признак in по_признакам:
+                    по_признакам[признак] += 1
+
+        def группы(поле: str) -> list[dict[str, Any]]:
+            корзины: dict[str, dict[str, float]] = {}
+            for j in оценённые:
+                ключ = str(j.get(поле) or "—")
+                к = корзины.setdefault(ключ, {"jobs": 0, "flagged": 0,
+                                              "segments": 0, "suspect": 0})
+                к["jobs"] += 1
+                к["flagged"] += 1 if j.get("quality_flags") else 0
+                к["segments"] += int(j.get("segments_count") or 0)
+                к["suspect"] += int(j.get("suspect_segments") or 0)
+            out = []
+            for ключ, к in корзины.items():
+                out.append({
+                    "key": ключ, "jobs": к["jobs"], "flagged": к["flagged"],
+                    "flagged_share": round(100.0 * к["flagged"] / к["jobs"], 1)
+                    if к["jobs"] else None,
+                    "suspect_share": round(100.0 * к["suspect"] / к["segments"], 2)
+                    if к["segments"] else None,
+                })
+            return sorted(out, key=lambda x: -(x["suspect_share"] or 0))
+
+        худшие = sorted(с_признаками, key=lambda j: -float(j.get("suspect_share") or 0))
+        return {
+            "period": period,
+            "jobs": len(jobs),
+            "assessed": len(оценённые),
+            "flagged": len(с_признаками),
+            "flagged_share": round(100.0 * len(с_признаками) / len(оценённые), 1)
+            if оценённые else None,
+            "segments": сегментов,
+            "suspect_segments": подозрительных,
+            "suspect_share": round(100.0 * подозрительных / сегментов, 2)
+            if сегментов else None,
+            "by_flag": [{"key": к, "title": quality.ПРИЗНАКИ[к], "jobs": n}
+                        for к, n in sorted(по_признакам.items(), key=lambda x: -x[1])
+                        if n],
+            "by_model": группы("model"),
+            "by_source": группы("source"),
+            "worst": [{
+                "id": j["id"], "filename": j.get("filename"), "model": j.get("model"),
+                "created_at": j.get("created_at"),
+                "suspect_segments": j.get("suspect_segments"),
+                "segments_count": j.get("segments_count"),
+                "suspect_share": j.get("suspect_share"),
+                "flags": [ф for ф in str(j.get("quality_flags") or "").split(",") if ф],
+            } for j in худшие[:limit]],
+        }
+
     # --- разрез по меткам ---------------------------------------------------
 
     def by_tag(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
@@ -929,6 +1007,7 @@ class Analytics:
             "audio": self.audio_profile(period, owner),
             "resources": self.resources(period, owner),
             "quality_trend": self.quality_trend(period, owner=owner),
+            "suspicious": self.suspicious(period, owner),
             "tags": self.by_tag(period, owner),
             "queue": self.queue_latency(period, owner),
         }
@@ -1017,6 +1096,14 @@ class Analytics:
         ("content_silence_share", "silence_share", "Доля тишины в записях"),
         ("content_filler_rate", "filler_rate", "Доля слов-паразитов"),
         ("content_wpm_avg", "wpm", "Средний темп речи, слов в минуту"),
+        ("content_talk_share_avg", "talk_share",
+         "Доля времени речи оператора"),
+        ("content_monologue_avg", "monologue_s",
+         "Самый долгий монолог оператора, секунд, в среднем по записям"),
+        ("content_reply_delay_avg", "reply_delay_s",
+         "Пауза оператора перед ответом, секунд"),
+        ("content_dead_air_avg", "dead_air_s",
+         "Заметная тишина (паузы от 3 с), секунд на запись"),
     )
 
     def _prometheus_content(self, insights: Any, add: Any) -> None:

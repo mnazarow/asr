@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **98**, операций: **108**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **100**, операций: **110**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -173,6 +173,8 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `DELETE` | `/api/keys/{preview}` | Отозвать ключ доступа | ключ с ролью **admin** |
 | `GET` | `/api/logs` | Журнал сервера | ключ с ролью **admin** |
 | `POST` | `/api/maintenance/cleanup` | Очистка старых данных | ключ с ролью **admin** |
+| `GET` | `/api/maintenance/consent` | Записи без отметки о согласии | любой действующий ключ |
+| `POST` | `/api/maintenance/erase` | Удалить записи по требованию | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/maintenance/unload-models` | Выгрузить модели из памяти | ключ с ролью **admin** |
 | `GET` | `/api/metrics` | Метрики Prometheus | любой действующий ключ |
 | `GET` | `/api/models` | Список моделей | любой действующий ключ |
@@ -253,7 +255,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `limit` | в адресе | integer | `50` | — |
 | `offset` | в адресе | integer | `0` | — |
 | `order` | в адресе | string | `created_at DESC` | — |
-| `content` | в адресе | string | — | Отбор по содержанию разговора: negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money |
+| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent) или по здоровью распознавания (suspect, hallucination, speakers_mismatch) |
 | `light` | в адресе | boolean | `False` | Только поля для таблицы, без текста и сегментов |
 
 **Пример**
@@ -292,7 +294,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "rtf": null,
       "words_count": 0,
       "chars_count": 0,
-      "segments_count": 0,
+      "segments_count": 8,
       "speakers_count": 0,
       "avg_confidence": null,
       "wer": null,
@@ -311,16 +313,13 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "peak_memory_jobs": null,
       "file_hash": null,
       "cancelled_by": null,
-      "webhook_status": null
+      "webhook_status": null,
+      "suspect_segments": 2,
+      "suspect_share": 0.25,
+      "quality_flags": "compression,phrase,repeat,silence,temperature,tempo"
     },
     {
       "id": "job000888",
-      "status": "completed",
-      "model": "v2_rnnt",
-      "engine": "gigaam",
-      "language": "ru",
-      "owner": "boris",
-      "source": "api",
 …
 ```
 
@@ -651,7 +650,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:9742",
+  "instance": "vm:19231",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1229,10 +1228,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1788981464.480122,
+    "generated_at": 1789022755.9131525,
     "jobs": {
-      "total": 227,
-      "completed": 227,
+      "total": 210,
+      "completed": 210,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1240,13 +1239,13 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 6524.8,
-      "audio_hours": 1.81,
+      "audio_seconds": 6027.6,
+      "audio_hours": 1.67,
       "processing_seconds": 0.0,
       "words": 0,
       "characters": 0,
-      "segments": 0,
-      "files_per_hour": 1.35,
+      "segments": 1298,
+      "files_per_hour": 1.25,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
@@ -1351,7 +1350,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 546.6,
+  "uptime_s": 494.4,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1395,8 +1394,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 3,
-    "WARNING": 2
+    "INFO": 2
   }
 }
 ```
@@ -1431,7 +1429,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 546.7,
+  "uptime_s": 494.4,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1440,8 +1438,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
-    "disk_free_gb": 12.3,
+    "ram_available_gb": 6.7,
+    "disk_free_gb": 12.2,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1452,7 +1450,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 12.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 12.2 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -1662,6 +1660,48 @@ curl -X POST -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/maintenance/
 ```
 
 Удаляет задания старше `result_retention_days` вместе с их файлами. То же делает уборщик по расписанию.
+
+### `GET /api/maintenance/consent`
+
+Записи без отметки о согласии.
+
+Завершённые записи старше N дней, у которых нет метки согласия.
+
+Метка задаётся настройкой `consent_tag`; пустая — проверка выключена.
+Это не юридическая гарантия, а список того, на что стоит посмотреть:
+сервер не знает, есть ли согласие, он знает лишь, поставили ли метку.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `days` | в адресе | integer | — | — |
+
+### `POST /api/maintenance/erase`
+
+Удалить записи по требованию.
+
+Находит и удаляет всё, где встречается запрос: по номеру телефона,
+имени файла, фамилии — тем же поиском, что в «Результатах».
+
+Нужно для 152-ФЗ: при отзыве согласия записи уничтожаются в срок до
+тридцати дней, и искать их по одной в архиве на сто тысяч записей —
+занятие на день. По умолчанию — пробный запуск: показывает, что нашлось,
+и ничего не удаляет; удаление — только с `dry_run: false` и только
+администратору. Сам запрос в журнал попадает усечённым: номер телефона
+в журнале событий — это ещё одно место, откуда его придётся удалять.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "$ref": "#/components/schemas/Body_erase_api_maintenance_erase_post"
+}
+```
 
 ### `POST /api/maintenance/unload-models`
 

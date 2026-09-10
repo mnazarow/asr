@@ -447,6 +447,16 @@ POST /api/content/recompute              пересчитать архив (ну
 GET  /api/content/export?format=xlsx     выгрузка отчёта файлом
 ```
 
+Отборы списка заданий (`GET /api/jobs?content=…`) — по содержанию (`negative`, `positive`, `downturn`, `recovered`, `alerts`, `open_commitments`, `interruptions`, `silence`, `script_failed`, `money`, `monologue`, `mixed`, `dead_air`, `frustrated`, `repeat`, `profanity`, `profanity_agent`) и по здоровью распознавания (`suspect`, `hallucination`, `speakers_mismatch`); вторые работают и там, где разбор содержания выключен.
+
+Персональные данные — ключом администратора:
+
+```
+POST /api/maintenance/erase   {"query": "+7 999 555-12-34"}                 что найдётся — ничего не удаляет
+POST /api/maintenance/erase   {"query": "+7 999 555-12-34", "dry_run": false}  удалить найденное
+GET  /api/maintenance/consent?days=30    записи без метки согласия старше срока (настройка consent_tag)
+```
+
 Разрез по владельцу тот же, что у аналитики сервера: обычный ключ видит только свои записи, ключ в группе — записи подразделения, администратор — всё.
 
 Полный отчёт на архиве в сто тысяч записей считается около восьми секунд — каждый разрез отдельный запрос к базе. Для страницы это много: интерфейс берёт разделы по отдельности, и так же стоит делать любому клиенту, которому нужна часть.

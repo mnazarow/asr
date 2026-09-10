@@ -9,7 +9,11 @@ LibreOffice, обновляет поля и индексы и сохраняет
 
 Нужен установленный LibreOffice и модуль uno (пакет python3-uno).
 """
-import os, subprocess, sys, time
+import os
+import subprocess
+import sys
+import time
+
 import uno
 from com.sun.star.beans import PropertyValue
 
@@ -34,14 +38,18 @@ for _ in range(60):
     except Exception:
         time.sleep(1)
 if ctx is None:
-    print("не удалось подключиться к LibreOffice"); sys.exit(1)
+    print("не удалось подключиться к LibreOffice")
+    sys.exit(1)
 
 desktop = ctx.ServiceManager.createInstanceWithContext(
     "com.sun.star.frame.Desktop", ctx)
 
 
 def prop(name, value):
-    p = PropertyValue(); p.Name = name; p.Value = value; return p
+    p = PropertyValue()
+    p.Name = name
+    p.Value = value
+    return p
 
 
 url = uno.systemPathToFileUrl(SRC)
@@ -54,7 +62,18 @@ for i in range(indexes.getCount()):
 doc.getTextFields().refresh()
 
 doc.store()
-doc.storeToURL(uno.systemPathToFileUrl(PDF), (prop("FilterName", "writer_pdf_Export"),))
+# Снимки экрана сняты в двойном разрешении, и без ограничения PDF рос на
+# полтора мегабайта с каждым новым — полная документация перевалила за
+# двадцать. Двести двадцать точек на дюйм и JPEG 85 % на печати и при
+# увеличении неотличимы от исходника, а файл вдвое с лишним меньше.
+экспорт = uno.Any("[]com.sun.star.beans.PropertyValue", (
+    prop("Quality", 85),
+    prop("ReduceImageResolution", True),
+    prop("MaxImageResolution", 220),
+    prop("UseLosslessCompression", False),
+))
+doc.storeToURL(uno.systemPathToFileUrl(PDF),
+               (prop("FilterName", "writer_pdf_Export"), prop("FilterData", экспорт)))
 doc.close(False)
 try:
     desktop.terminate()

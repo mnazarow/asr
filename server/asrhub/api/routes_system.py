@@ -387,6 +387,7 @@ def analytics_section(request: Request, section: str, period: str = "week",
         "audio": state.analytics.audio_profile,
         "resources": state.analytics.resources,
         "quality": state.analytics.quality_trend,
+        "suspicious": state.analytics.suspicious,
         "tags": state.analytics.by_tag,
         "queue": state.analytics.queue_latency,
     }
@@ -692,6 +693,72 @@ def cleanup(request: Request, principal: Principal = Depends(authenticate)) -> d
         results_days=int(state.settings.get("result_retention_days") or 30))
     state.db.vacuum()
     return {"removed": removed}
+
+
+#: Самый короткий запрос на удаление по требованию. Три буквы нашли бы
+#: половину архива, а удаление необратимо.
+ERASE_MIN = 4
+
+
+@router.post("/maintenance/erase", summary="Удалить записи по требованию")
+def erase(request: Request,
+          query: str = Body(embed=True),
+          dry_run: bool = Body(default=True, embed=True),
+          principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Находит и удаляет всё, где встречается запрос: по номеру телефона,
+    имени файла, фамилии — тем же поиском, что в «Результатах».
+
+    Нужно для 152-ФЗ: при отзыве согласия записи уничтожаются в срок до
+    тридцати дней, и искать их по одной в архиве на сто тысяч записей —
+    занятие на день. По умолчанию — пробный запуск: показывает, что нашлось,
+    и ничего не удаляет; удаление — только с `dry_run: false` и только
+    администратору. Сам запрос в журнал попадает усечённым: номер телефона
+    в журнале событий — это ещё одно место, откуда его придётся удалять.
+    """
+    from .routes_jobs import BULK_LIMIT, _delete_one  # noqa: PLC0415
+
+    state = get_state(request)
+    require_admin(principal)
+    запрос = (query or "").strip()
+    if len(запрос) < ERASE_MIN:
+        raise error_response(ConfigError(
+            f"Запрос короче {ERASE_MIN} символов найдёт слишком многое.",
+            hint="Укажите номер телефона, имя файла или фамилию целиком."))
+    найдено = state.db.list_jobs(search=запрос, limit=BULK_LIMIT)
+    номера = [str(j["id"]) for j in найдено]
+    if dry_run:
+        return {"dry_run": True, "matched": len(номера), "ids": номера,
+                "limit": BULK_LIMIT}
+    for job in найдено:
+        _delete_one(state, job, principal)
+    усечённый = запрос[:3] + "…" if len(запрос) > 3 else "…"
+    state.db.add_event(None, "erase",
+                       f"Удалено по требованию: {len(номера)} записей по запросу "
+                       f"«{усечённый}» ({principal.name})",
+                       {"count": len(номера), "by": principal.name})
+    return {"dry_run": False, "deleted": len(номера), "ids": номера,
+            "limit": BULK_LIMIT}
+
+
+@router.get("/maintenance/consent", summary="Записи без отметки о согласии")
+def consent(request: Request,
+            days: int | None = Query(default=None, ge=0, le=3650),
+            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Завершённые записи старше N дней, у которых нет метки согласия.
+
+    Метка задаётся настройкой `consent_tag`; пустая — проверка выключена.
+    Это не юридическая гарантия, а список того, на что стоит посмотреть:
+    сервер не знает, есть ли согласие, он знает лишь, поставили ли метку.
+    """
+    state = get_state(request)
+    require_admin(principal)
+    метка = str(state.settings.get("consent_tag") or "").strip()
+    срок = days if days is not None else int(state.settings.get("consent_days") or 30)
+    if not метка:
+        return {"enabled": False, "tag": "", "days": срок, "count": 0, "ids": []}
+    номера = state.db.jobs_without_tag(метка, older_than=time.time() - срок * 86400)
+    return {"enabled": True, "tag": метка, "days": срок,
+            "count": len(номера), "ids": номера[:200]}
 
 
 @router.post("/maintenance/unload-models", summary="Выгрузить модели из памяти")

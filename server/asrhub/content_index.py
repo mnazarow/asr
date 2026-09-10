@@ -95,6 +95,10 @@ class ContentIndex:
     def enabled(self) -> bool:
         return bool(self.settings.get("content_analysis", True)) if self.settings else True
 
+    def _мат(self) -> bool:
+        """Считать ли нецензурную лексику. По умолчанию — нет, см. словарь."""
+        return bool(self.settings.get("content_profanity", False)) if self.settings else False
+
     # --- разбор одной записи ----------------------------------------------
 
     def analyze_job(self, job_id: str, *, job: dict[str, Any] | None = None,
@@ -113,10 +117,19 @@ class ContentIndex:
             text=текст, segments=реплики,
             duration_s=float(задание.get("media_duration_s") or 0.0),
             script=self._скрипт(), agent_speaker=self._оператор(),
-            document_frequency=частоты, corpus_size=размер)
+            document_frequency=частоты, corpus_size=размер,
+            profanity=self._мат())
         свод, основы = content.features(разбор)
         if save:
             self.db.save_content(job_id, свод, основы)
+            # Пересчёт записи пересчитывает и здоровье распознавания: после
+            # смены ожидаемого числа говорящих иначе пришлось бы ждать
+            # фонового разбора, который эту запись уже прошёл.
+            try:
+                self._оценить_качество(job_id, реплики)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Признаки качества для %s не пересчитаны: %s",
+                            job_id, exc, extra={"job_id": job_id})
         # Возвращаем то же, что легло бы в базу: `features` убирает из
         # разбора служебные основы для знаменателя TF-IDF. Без этого
         # карточка свежей записи приходила с лишним полем, а карточка
@@ -143,6 +156,15 @@ class ContentIndex:
             log.warning("Разбор содержания задания %s не удался: %s", job_id, exc,
                         extra={"job_id": job_id})
 
+    def _оценить_качество(self, job_id: str, реплики: list[dict[str, Any]]) -> None:
+        """Признаки подозрительной расшифровки — по уже поднятым сегментам."""
+        from . import quality  # noqa: PLC0415
+
+        ожидается = int(self.settings.get("quality_expected_speakers") or 0) \
+            if self.settings else 0
+        оценка = quality.assess(реплики, expected_speakers=ожидается)
+        self.db.update_job(job_id, **quality.for_job(оценка))
+
     # --- пересчёт архива --------------------------------------------------
 
     def backfill_once(self, limit: int | None = None) -> int:
@@ -152,21 +174,28 @@ class ContentIndex:
         if not ожидают:
             return 0
         частоты, корпус = self.corpus_frequency()
-        скрипт, оператор = self._скрипт(), self._оператор()
+        скрипт, оператор, мат = self._скрипт(), self._оператор(), self._мат()
         сделано = 0
         for запись in ожидают:
             if self._stop.is_set():
                 break
             job_id = str(запись["id"])
             try:
+                реплики = self.db.get_segments(job_id)
                 разбор = content.analyze(
                     text=str(запись.get("text") or ""),
-                    segments=self.db.get_segments(job_id),
+                    segments=реплики,
                     duration_s=float(запись.get("media_duration_s") or 0.0),
                     script=скрипт, agent_speaker=оператор,
-                    document_frequency=частоты, corpus_size=корпус)
+                    document_frequency=частоты, corpus_size=корпус,
+                    profanity=мат)
                 свод, основы = content.features(разбор)
                 self.db.save_content(job_id, свод, основы)
+                # Здоровье распознавания у записей, сделанных до его
+                # появления: те же сегменты уже подняты, второй раз ходить
+                # за ними незачем.
+                if запись.get("quality_flags") is None:
+                    self._оценить_качество(job_id, реплики)
                 сделано += 1
             except Exception as exc:                         # noqa: BLE001
                 # Одна битая запись не должна останавливать разбор архива.

@@ -355,6 +355,23 @@ class Collector:
             out.append(Sample("asrhub_wer", round(float(row["w"]), 4),
                               {"model": str(row["model"] or "")}))
 
+        # Подозрительные расшифровки — по сегментам и по записям, за сутки и
+        # по моделям: у какой модели расшифровки начинают выдумывать, видно
+        # только в разрезе, средняя по серверу это прячет.
+        for row in self.state.db.query(
+                "SELECT model, SUM(COALESCE(segments_count,0)) s, "
+                "       SUM(COALESCE(suspect_segments,0)) p, COUNT(*) n, "
+                "       SUM(CASE WHEN COALESCE(quality_flags,'') <> '' THEN 1 ELSE 0 END) f "
+                "FROM jobs WHERE status='completed' AND quality_flags IS NOT NULL "
+                "  AND finished_at>=? GROUP BY model", (since,)):
+            метки = {"model": str(row["model"] or "")}
+            if int(row["s"] or 0):
+                out.append(Sample("asrhub_suspect_segments_share",
+                                  round(float(row["p"] or 0) / float(row["s"]), 4), метки))
+            if int(row["n"] or 0):
+                out.append(Sample("asrhub_suspect_jobs_share",
+                                  round(float(row["f"] or 0) / float(row["n"]), 4), метки))
+
     # -- модели и движки -----------------------------------------------------
 
     def _models(self, out: list[Sample]) -> None:
@@ -518,6 +535,10 @@ class Collector:
             ("asrhub_content_silence_share", "silence_share"),
             ("asrhub_content_filler_rate", "filler_rate"),
             ("asrhub_content_wpm_avg", "wpm"),
+            ("asrhub_content_talk_share_avg", "talk_share"),
+            ("asrhub_content_monologue_avg", "monologue_s"),
+            ("asrhub_content_reply_delay_avg", "reply_delay_s"),
+            ("asrhub_content_dead_air_avg", "dead_air_s"),
         ):
             значение = за_сутки.get(ключ)
             if значение is not None:
