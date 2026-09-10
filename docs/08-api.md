@@ -348,9 +348,14 @@ GET  /api/content/jobs/{id}/llm            ответ модели по запи
 POST /api/content/jobs/{id}/llm?force=true разобрать запись сейчас, синхронно
 POST /api/llm/backfill    {"limit": 100}   поставить архив в очередь разбора (администратор)
 GET  /api/content/llm?period=week          свод: исходы, причины, действия, трекеры, скоркарта
+GET  /api/llm/models[?refresh=true]        каталог моделей и подбор под оборудование (администратор)
+POST /api/llm/setup       {"models": […]}  поставить, скачать, прогреть и включить (администратор)
+GET  /api/llm/setup/status                 ход установки: шаги, проценты, журнал (администратор)
+POST /api/llm/setup/cancel                 остановить установку на ближайшем шаге (администратор)
+POST /api/llm/models/delete {"model": "…"} убрать скачанные веса с диска (администратор)
 ```
 
-Слой включается настройкой `llm_backend` (`ollama`, `openai`, `stub`, `off`); при `off` ручки отвечают 400 с подсказкой, а не молчат. Записи разбираются в фоне (`llm_auto`), архив — по `POST /api/llm/backfill`. Отборы списка заданий по ответу модели: `content=llm_unresolved`, `content=llm_actions`, `content=outcome:<исход>`, `content=reason:<причина>`.
+Слой включается настройкой `llm_backend` (`ollama`, `openai`, `stub`, `off`); при `off` ручки отвечают 400 с подсказкой, а не молчат. Поставить модель можно, не заходя на сервер: `GET /api/llm/models` показывает каталог с пометками под обнаруженное оборудование, `POST /api/llm/setup` (без тела — рекомендованная модель) ставит Ollama, скачивает веса, прогревает и записывает настройки, а `GET /api/llm/setup/status` отдаёт ход установки — шаги, проценты по каждой модели и журнал. Записи разбираются в фоне (`llm_auto`), архив — по `POST /api/llm/backfill`. Отборы списка заданий по ответу модели: `content=llm_unresolved`, `content=llm_actions`, `content=outcome:<исход>`, `content=reason:<причина>`.
 
 ### Очередь проверки и контрольные прогоны
 

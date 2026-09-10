@@ -25,7 +25,7 @@ from ..db import Database
 from ..engines import EngineRegistry
 from ..errors import ASRHubError, FileTooLarge
 from ..job_queue import JobQueue
-from ..llm import LLMClient, LLMWorker
+from ..llm import LLMClient, LLMSetup, LLMWorker
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
 from ..streaming import StreamSession
@@ -348,6 +348,10 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         queue_state=lambda: db.count_jobs(status=["queued", "retry"]),
         content_index=state.content)
     queue.llm_worker = state.llm_worker
+    # Установщик модели: та же кнопка, что у распознавания, — «поставь и
+    # настрой сам». Живёт рядом с клиентом, чтобы после установки сразу
+    # сбросить пробу доступности.
+    state.llm_setup = LLMSetup(settings, db, client=state.llm)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):

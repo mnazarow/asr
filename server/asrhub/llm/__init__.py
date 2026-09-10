@@ -8,15 +8,18 @@ AssemblyAI и российских вендоров делает языкова�
 сервер.
 
 Слой необязательный: выключен — и всё остальное работает как прежде.
-Внутри — четыре части: `client` (вызовы, кеш, ограничение одновременности,
+Внутри — пять частей: `client` (вызовы, кеш, ограничение одновременности,
 тайм-ауты), `stub` (заглушка без модели — для проверок и показа
-интерфейса), `tasks` (подсказки и разбор ответов) и `worker` (фоновый
-поток, который уступает распознаванию).
+интерфейса), `tasks` (подсказки и разбор ответов), `worker` (фоновый
+поток, который уступает распознаванию) и `provision` (каталог моделей,
+подбор под оборудование и установка одной кнопкой).
 """
 from __future__ import annotations
 
 from .client import LLMClient, LLMError
+from .provision import Установщик as LLMSetup
 from .tasks import VERSION, analyze
 from .worker import LLMWorker
 
-__all__ = ["VERSION", "LLMClient", "LLMError", "LLMWorker", "analyze"]
+__all__ = ["VERSION", "LLMClient", "LLMError", "LLMSetup", "LLMWorker", "analyze",
+           "provision"]

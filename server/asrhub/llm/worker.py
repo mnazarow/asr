@@ -30,6 +30,9 @@ log = get_logger("llm")
 #: Сколько записей архива брать за один заход.
 ПОРЦИЯ = 5
 
+#: Сколько не подходить к записи после сбоя разбора.
+ОСТЫТЬ = 1800.0
+
 
 class LLMWorker:
     def __init__(self, db: Any, settings: Any, client: LLMClient, *,
@@ -46,6 +49,10 @@ class LLMWorker:
         self.failed = 0
         self.last_error: str | None = None
         self.current: str | None = None
+        #: Когда по записи последний раз не вышло: {id: время}. Держит
+        #: фоновый разбор от бесконечного возврата к записи, у которой есть
+        #: прежний ответ (строку с ошибкой поверх него не пишем).
+        self._сбои: dict[str, float] = {}
 
     # --- снаружи ----------------------------------------------------------
 
@@ -53,6 +60,18 @@ class LLMWorker:
         """Свежая запись — в очередь разбора, если слой включён и разбор новых."""
         if self.client.enabled and self.settings.get("llm_auto", True):
             self._pending.put(job_id)
+
+    def enqueue_many(self, job_ids: Any) -> int:
+        """Ставит записи в очередь разбора по явной просьбе.
+
+        Мимо `llm_auto`: эта настройка про свежие записи, а разбор архива
+        запускает администратор — раз попросил, значит надо.
+        """
+        сколько = 0
+        for job_id in job_ids:
+            self._pending.put(str(job_id))
+            сколько += 1
+        return сколько
 
     def analyze_job(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
         """Разбор одной записи сейчас, в вызывающем потоке; ответ — в базу."""
@@ -71,19 +90,47 @@ class LLMWorker:
                                  segments=сегменты, settings=self.settings,
                                  agent_speaker=оператор, script=скрипт)
         except LLMError as exc:
-            self.db.llm_save(job_id, tasks.VERSION, model=self.client.model, error=str(exc),
-                             calls=0, latency_ms=None)
+            self._отметить_сбой(job_id, str(exc))
             raise
+        замечания = [str(з) for з in (итог.get("warnings") or []) if str(з).strip()]
+        пусто = not итог.get("summary") and not итог.get("outcome")
         self.db.llm_save(
             job_id, tasks.VERSION, model=self.client.model,
             summary=итог.get("summary"), reason=итог.get("reason"),
-            outcome=итог.get("outcome"), resolved=итог.get("resolved"),
+            reason_quote=итог.get("reason_quote"), outcome=итог.get("outcome"),
+            outcome_quote=итог.get("outcome_quote"), resolved=итог.get("resolved"),
             actions=итог.get("actions"), trackers=итог.get("trackers"),
             scorecard=итог.get("scorecard"), chunks=итог.get("chunks") or 1,
             calls=итог.get("calls") or 0, latency_ms=итог.get("latency_ms"),
-            error=("; ".join(итог.get("warnings") or []) or None)
-            if not итог.get("summary") and not итог.get("outcome") else None)
+            warnings=замечания or None,
+            error=("; ".join(замечания) or None) if пусто else None)
+        self._сбои.pop(job_id, None)
         return self.db.llm_get(job_id) or итог
+
+    def _отметить_сбой(self, job_id: str, текст: str) -> None:
+        """Отметка о сбое — но не поверх удачного разбора.
+
+        `llm_save` кладёт строку целиком, поэтому пустая строка с ошибкой
+        затирала бы прежний ответ модели: нажал «Заново» при лежащем
+        сервере — и разбора, который был, больше нет. Так что удачный ответ
+        остаётся; о сбое узнаёт тот, кто его вызвал, — маршрут возвращает
+        текст ошибки, а фоновый поток пишет её в журнал.
+
+        Строка с ошибкой нужна записям без ответа: по ней разбор архива
+        понимает, что к записи уже подходили, и не возвращается к ней
+        бесконечно. Для записей с ответом ту же роль играет `_сбои`:
+        полчаса после сбоя фоновый поток их не трогает.
+        """
+        self._сбои[job_id] = time.time()
+        try:
+            прежнее = self.db.llm_get(job_id)
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Прежний разбор %s не прочитан: %s", job_id, exc)
+            прежнее = None
+        if прежнее and (прежнее.get("summary") or прежнее.get("outcome")):
+            return
+        self.db.llm_save(job_id, tasks.VERSION, model=self.client.model,
+                         error=текст, calls=0, latency_ms=None)
 
     def status(self) -> dict[str, Any]:
         return {"running": bool(self._thread and self._thread.is_alive()),
@@ -96,6 +143,10 @@ class LLMWorker:
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
+            # Прошлый поток ещё жив: остановка застала его внутри вызова
+            # модели. Снимаем флаг — он продолжит работу; второй такой же
+            # разбирал бы ту же очередь параллельно.
+            self._stop.clear()
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="asrhub-llm", daemon=True)
@@ -103,9 +154,17 @@ class LLMWorker:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
-        поток, self._thread = self._thread, None
+        поток = self._thread
         if поток and поток.is_alive():
             поток.join(timeout=timeout)
+            if поток.is_alive():
+                # Вызов модели идёт минуты, ждать их на остановке нельзя.
+                # Ссылку не отпускаем: поток завершится сам, а `start()` по
+                # ней поймёт, что поднимать второй не нужно.
+                log.warning("Поток смыслового разбора занят вызовом модели; "
+                            "завершится сам после ответа.")
+                return
+        self._thread = None
 
     def _queue_busy(self) -> bool:
         """Ждут ли задания распознавания — тогда модель подождёт."""
@@ -123,8 +182,13 @@ class LLMWorker:
             pass
         if not self.settings.get("llm_backfill", False):
             return None
+        свежий = time.time() - ОСТЫТЬ
         ожидают = self.db.llm_pending(tasks.VERSION, limit=ПОРЦИЯ)
-        return str(ожидают[0]["id"]) if ожидают else None
+        for з in ожидают:
+            job_id = str(з["id"])
+            if self._сбои.get(job_id, 0.0) < свежий:
+                return job_id
+        return None
 
     def _loop(self) -> None:
         пауза = 1.0
@@ -152,8 +216,7 @@ class LLMWorker:
                 self.last_error = str(exc)
                 log.warning("Смысловой разбор %s дал сбой: %s", job_id, exc)
                 try:
-                    self.db.llm_save(job_id, tasks.VERSION, model=self.client.model,
-                                     error=str(exc), calls=0, latency_ms=None)
+                    self._отметить_сбой(job_id, str(exc))
                 except Exception:                            # noqa: BLE001
                     pass
                 пауза = 2.0

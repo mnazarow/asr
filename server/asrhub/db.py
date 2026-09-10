@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -164,7 +164,9 @@ _LLM_RESULTS_SCHEMA = """
         model       TEXT,
         summary     TEXT,
         reason      TEXT,
+        reason_quote  TEXT,
         outcome     TEXT,
+        outcome_quote TEXT,
         resolved    INTEGER,
         actions     TEXT,
         trackers    TEXT,
@@ -173,6 +175,7 @@ _LLM_RESULTS_SCHEMA = """
         calls       INTEGER DEFAULT 0,
         latency_ms  REAL,
         error       TEXT,
+        warnings    TEXT,
         created_at  REAL NOT NULL
     ) WITHOUT ROWID
 """
@@ -790,10 +793,11 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
     },
     "llm_results": {
         "job_id": "TEXT", "version": "INTEGER", "model": "TEXT", "summary": "TEXT",
-        "reason": "TEXT", "outcome": "TEXT", "resolved": "INTEGER", "actions": "TEXT",
+        "reason": "TEXT", "reason_quote": "TEXT", "outcome": "TEXT",
+        "outcome_quote": "TEXT", "resolved": "INTEGER", "actions": "TEXT",
         "trackers": "TEXT", "scorecard": "TEXT", "chunks": "INTEGER DEFAULT 1",
         "calls": "INTEGER DEFAULT 0", "latency_ms": "REAL", "error": "TEXT",
-        "created_at": "REAL",
+        "warnings": "TEXT", "created_at": "REAL",
     },
     "llm_cache": {
         "key": "TEXT", "kind": "TEXT", "model": "TEXT", "response": "TEXT",
@@ -2075,7 +2079,7 @@ class Database:
     def llm_save(self, job_id: str, version: int, **поля: Any) -> None:
         """Кладёт ответ модели по записи; словари и списки — строкой JSON."""
         строка = dict(поля)
-        for к in ("actions", "trackers", "scorecard"):
+        for к in ("actions", "trackers", "scorecard", "warnings"):
             if isinstance(строка.get(к), (list, dict)):
                 строка[к] = json.dumps(строка[к], ensure_ascii=False)
         if строка.get("resolved") is not None:
@@ -2130,7 +2134,7 @@ class Database:
         всего = int(self.query_one(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args)["n"])
         rows = self.query(
             "SELECT l.job_id, l.version, l.reason, l.outcome, l.resolved, l.actions, l.trackers, "
-            "       l.scorecard, l.latency_ms, l.error, l.calls, l.chunks, j.filename, "
+            "       l.scorecard, l.latency_ms, l.error, l.calls, l.chunks, l.warnings, j.filename, "
             "       j.created_at, j.owner "
             f"FROM llm_results l JOIN jobs j ON j.id = l.job_id WHERE {условие}", args)
         return {"total": всего, "rows": [_row_to_llm(r) for r in rows]}
@@ -2998,7 +3002,7 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
 
 def _row_to_llm(row: sqlite3.Row) -> dict[str, Any]:
     out = dict(row)
-    for к in ("actions", "trackers", "scorecard"):
+    for к in ("actions", "trackers", "scorecard", "warnings"):
         raw = out.get(к)
         if isinstance(raw, str):
             try:

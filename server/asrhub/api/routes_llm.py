@@ -16,7 +16,7 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 
 from ..analytics import PERIODS
 from ..errors import ASRHubError, ConfigError
-from ..llm import LLMError, tasks
+from ..llm import LLMError, provision, tasks
 from .deps import (
     Principal,
     authenticate,
@@ -31,6 +31,16 @@ from .deps import (
 router = APIRouter(prefix="/api", tags=["Языковая модель"])
 
 ПЕРИОД = Query(default="week", pattern="^(hour|day|week|month|quarter|year|all)$")
+
+
+def _установщик(request: Request) -> Any:
+    """Установщик модели из состояния приложения."""
+    state = get_state(request)
+    if getattr(state, "llm_setup", None) is None:
+        raise error_response(ASRHubError(
+            "Установщик модели не инициализирован.",
+            hint="Сервер запущен в урезанном режиме; перезапустите его обычным способом."))
+    return state.llm_setup
 
 
 def _slot(request: Request) -> tuple[Any, Any, Any]:
@@ -136,9 +146,8 @@ def llm_backfill(request: Request, limit: int = Body(default=100, embed=True),
     if not клиент.enabled:
         raise error_response(ConfigError("Языковая модель выключена."))
     ожидают = state.db.llm_pending(tasks.VERSION, limit=max(1, min(int(limit), 10000)))
-    for з in ожидают:
-        поток._pending.put(str(з["id"]))
-    return {"queued": len(ожидают), "worker": поток.status()}
+    поставлено = поток.enqueue_many(з["id"] for з in ожидают)
+    return {"queued": поставлено, "worker": поток.status()}
 
 
 @router.get("/content/llm", summary="Свод ответов модели за период")
@@ -185,9 +194,116 @@ def llm_report(request: Request, period: str = ПЕРИОД,
         "coverage": round(len(строки) / свод["total"], 4) if свод["total"] else None,
         "avg_latency_ms": round(sum(float(р.get("latency_ms") or 0) for р in строки)
                                 / len(строки), 1) if строки else None,
+        "off_list": sum(1 for р in строки
+                        if any("вне списка" in str(з) for з in (р.get("warnings") or []))),
         **распределения,
         "trackers": sorted(трекеры.values(), key=lambda т: -т["fired"]),
         "scorecard": list(скоркарта.values()),
         "action_items": действия,
         "worker": поток.status(),
     }
+
+
+# --- установка модели ---------------------------------------------------
+#
+# Смысловой слой без модели — это выключенный слой, а поставить модель
+# руками значит зайти на сервер по ssh и выполнить полдюжины команд.
+# Поэтому те же полдюжины команд собраны здесь: каталог с подбором под
+# железо, установка, скачивание с процентами и запись настроек.
+
+
+@router.get("/llm/models", summary="Каталог моделей и подбор под оборудование")
+def llm_models(request: Request, refresh: bool = Query(default=False),
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Что можно поставить, что уже стоит и что поместится в память.
+
+    Пометки считаются по свободной видеопамяти за вычетом запаса под
+    распознавание: смысловой слой делит карту с главной работой сервера.
+    При `refresh=true` размеры уточняются по реестру Ollama — это
+    несколько секунд, поэтому по умолчанию берутся из каталога.
+    """
+    state = get_state(request)
+    require_admin(principal)
+    адрес = str(state.settings.get("llm_url") or provision.АДРЕС)
+    скачанные = provision.установленные(адрес)
+    свод = provision.подобрать(settings=state.settings,
+                               installed=[м["name"] for м in скачанные])
+    if refresh:
+        for строка in свод["models"]:
+            размер, ошибка = provision.размер_в_реестре(str(строка["name"]))
+            строка["size_gb"] = размер if размер is not None else строка["size_gb"]
+            строка["registry"] = ошибка or "ok"
+    return {**свод, "installed": скачанные, "service": provision.служба(адрес),
+            "backend": str(state.settings.get("llm_backend") or "off"),
+            "active": str(state.settings.get("llm_model") or ""),
+            "setup": _установщик(request).status()}
+
+
+@router.post("/llm/setup", summary="Поставить и настроить модель")
+def llm_setup(request: Request,
+              models: list[str] = Body(default=[], embed=True),
+              activate: str = Body(default="", embed=True),
+              install_server: bool = Body(default=True, embed=True),
+              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Ставит Ollama (если её нет), скачивает модели, прогревает и
+    включает выбранную. Идёт в фоне: ход установки — GET
+    /api/llm/setup/status.
+
+    Шаги, которые уже сделаны, пропускаются, поэтому повторный запуск на
+    настроенном сервере просто докачивает ещё одну модель.
+    """
+    state = get_state(request)
+    require_admin(principal)
+    установщик = _установщик(request)
+    выбор = [str(м) for м in (models or []) if str(м).strip()]
+    if not выбор:
+        # Ничего не выбрали — ставим то, что сами и советуем.
+        свод = provision.подобрать(settings=state.settings)
+        if not свод.get("recommended"):
+            raise error_response(ConfigError(
+                "Ни одна модель каталога не помещается в память этого сервера.",
+                hint="Освободите видеопамять или выберите модель вручную."))
+        выбор = [str(свод["recommended"])]
+    try:
+        return установщик.start(выбор, activate=(activate or None) if activate else выбор[0],
+                                install_server=bool(install_server),
+                                url=str(state.settings.get("llm_url") or provision.АДРЕС))
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+
+
+@router.get("/llm/setup/status", summary="Ход установки модели")
+def llm_setup_status(request: Request,
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Шаги, проценты и журнал последней установки."""
+    require_admin(principal)
+    return _установщик(request).status()
+
+
+@router.post("/llm/setup/cancel", summary="Отменить установку модели")
+def llm_setup_cancel(request: Request,
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Останавливает установку на ближайшем шаге. Скачанное остаётся:
+    Ollama продолжит с места обрыва при следующем запуске."""
+    require_admin(principal)
+    return _установщик(request).cancel()
+
+
+@router.post("/llm/models/delete", summary="Удалить скачанную модель")
+def llm_model_delete(request: Request, model: str = Body(..., embed=True),
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Убирает веса с диска. Включённую модель удалить нельзя — сначала
+    выберите другую, иначе разбор останется без модели."""
+    state = get_state(request)
+    require_admin(principal)
+    имя = str(model or "").strip()
+    if имя and имя == str(state.settings.get("llm_model") or ""):
+        raise error_response(ConfigError(
+            f"Модель «{имя}» сейчас выбрана для разбора.",
+            hint="Сначала выберите другую модель в настройках."))
+    адрес = str(state.settings.get("llm_url") or provision.АДРЕС)
+    try:
+        provision.удалить(имя, адрес)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    return {"deleted": имя, "installed": provision.установленные(адрес)}

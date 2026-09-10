@@ -3076,17 +3076,19 @@ async function loadJobLlm(backdrop, job) {
       : р.resolved === false ? '<span class="chip warn">не решён</span>' : '';
     host.innerHTML = `<div class="card tight" style="margin-bottom:12px">
       <div class="row wrap" style="gap:8px;margin-bottom:6px"><b class="small">Смысл разговора</b>
-        ${р.reason ? `<span class="chip info" title="причина обращения (из списка)">${esc(р.reason)}</span>` : ''}
-        ${р.outcome ? `<span class="chip accent" title="исход (из списка)">${esc(р.outcome)}</span>` : ''}
+        ${р.reason ? `<span class="chip info" title="${esc(р.reason_quote ? `причина обращения, по цитате: «${р.reason_quote}»` : 'причина обращения (из списка)')}">${esc(р.reason)}</span>` : ''}
+        ${р.outcome ? `<span class="chip accent" title="${esc(р.outcome_quote ? `исход, по цитате: «${р.outcome_quote}»` : 'исход (из списка)')}">${esc(р.outcome)}</span>` : ''}
         ${решено}
         <span class="spacer"></span>
         <button class="ghost sm" id="job-llm-run" title="Спросить модель заново">Заново</button></div>
       ${р.error ? `<div class="small" style="color:var(--err)">Модель не ответила: ${esc(р.error)}</div>` : ''}
       ${р.summary ? `<div style="line-height:1.6">${esc(р.summary)}</div>` : ''}
+      ${(р.reason_quote || р.outcome_quote) ? `<div class="small dim" style="margin-top:6px">По цитатам: ${[р.reason_quote && `причина — «${esc(р.reason_quote)}»`, р.outcome_quote && `исход — «${esc(р.outcome_quote)}»`].filter(Boolean).join('; ')}</div>` : ''}
       ${(р.actions || []).length ? `<div class="small dim" style="margin-top:8px"><b>Действия к исполнению</b></div>
         <ul style="margin:4px 0 0 18px;padding:0">${р.actions.map((а) => `<li>${esc(а.what)} <span class="faint">— ${esc(а.who || '')}${а.when ? `, ${esc(а.when)}` : ''}</span></li>`).join('')}</ul>` : ''}
       ${(р.trackers || []).some((т) => т.fired) ? `<div class="small" style="margin-top:8px"><b>Умные трекеры</b>: ${р.trackers.filter((т) => т.fired).map((т) => `<span class="chip warn" title="${esc(т.quote || '')}">${esc(т.label)}</span>`).join(' ')}</div>` : ''}
       ${(р.scorecard || []).length ? `<div class="small" style="margin-top:8px"><b>Скоркарта</b>: ${р.scorecard.map((в) => `<span class="chip ${в.answer === 'да' ? 'ok' : в.answer === 'нет' ? 'err' : ''}" title="${esc(в.quote || '')}">${esc(в.question)} — ${esc(в.answer)}</span>`).join(' ')}</div>` : ''}
+      ${(р.warnings || []).length ? `<div class="small" style="margin-top:6px;color:var(--warn)">Замечания разбора: ${esc(р.warnings.join('; '))}</div>` : ''}
       <div class="small faint" style="margin-top:8px">Сгенерировано моделью ${esc(р.model || '')}${р.latency_ms ? ` за ${num(р.latency_ms / 1000, 1)} с` : ''}${р.chunks > 1 ? ` по пересказам ${num(р.chunks)} частей` : ''}${stale ? ' · подсказки с тех пор менялись' : ''} — может ошибаться; причина и исход выбраны из закрытых списков.</div>
     </div>`;
     const кнопка = qs('#job-llm-run', host);
@@ -4891,7 +4893,7 @@ RENDERERS.content = {
     const исходы = д.outcomes || [];
     const причины = д.reasons || [];
     host.innerHTML = card('По ответам языковой модели',
-      `${esc(д.model || '')} · разобрано ${num(д.analyzed)} из ${num(д.records)} записей периода${д.stale ? ` · ${num(д.stale)} по прежним подсказкам` : ''}${д.errors ? ` · ошибок ${num(д.errors)}` : ''}`,
+      `${esc(д.model || '')} · разобрано ${num(д.analyzed)} из ${num(д.records)} записей периода${д.stale ? ` · ${num(д.stale)} по прежним подсказкам` : ''}${д.errors ? ` · ошибок ${num(д.errors)}` : ''}${д.off_list ? ` · ${num(д.off_list)} ответов мимо списка` : ''}`,
       `<div class="grid cols-4" style="margin-bottom:10px">
         ${kpi('Вопрос решён', проц(д.resolved_share), 'по оценке модели')}
         ${kpi('Действий к исполнению', num(д.actions || 0), `в ${num(д.records_with_actions || 0)} записях`)}
@@ -6582,6 +6584,207 @@ async function loadHfToken(isAdmin) {
 // Вид: Настройки
 // ==========================================================================
 
+/* Установка языковой модели одной кнопкой.
+ *
+ * Раздел настроек «Языковая модель» — шестнадцать параметров о модели,
+ * которой на свежем сервере нет. Поставить её значит зайти по ssh,
+ * скачать Ollama, поднять службу, выбрать модель под видеокарту, дождаться
+ * двадцати гигабайт и вписать три настройки обратно. Здесь то же самое
+ * делается отсюда, и главное в этой врезке — не кнопка, а таблица: видно,
+ * что поместится в память этой карты, что не поместится и почему.
+ *
+ * Установка идёт минутами, поэтому её ход спрашивается у сервера, а не
+ * держится в странице: обновили вкладку — ход установки на месте.
+ */
+let llmSetupTimer = null;
+
+async function drawLlmSetup(host) {
+  if (!host) return;
+  clearTimeout(llmSetupTimer);
+  let д;
+  try {
+    д = await API.get('/api/llm/models');
+  } catch (err) {
+    // Каталог моделей — за правами администратора: обычному ключу вместо
+    // ошибки честнее показать, почему врезки нет.
+    host.innerHTML = `<div class="card-head"><h3>Модель на сервере</h3></div>
+      <div class="empty small">${esc((err && err.message) || 'нет доступа')}</div>`;
+    return;
+  }
+  if (!host.isConnected) return;
+  state.llmModels = д;
+
+  const выбраны = new Set(state.llmChoice || []);
+  if (!state.llmChoice) {
+    // По умолчанию отмечена рекомендованная — самая крупная из тех, что
+    // помещаются. Человек, который просто нажмёт кнопку, получит лучшее
+    // из возможного на его железе.
+    if (д.recommended) выбраны.add(д.recommended);
+    state.llmChoice = [...выбраны];
+  }
+
+  const рисовать = () => {
+    if (!host.isConnected) return;
+    const у = д.setup || {};
+    const служба = д.service || {};
+    const метка = (м) => (
+      м.state === 'да' ? '<span class="chip ok">поместится</span>'
+        : м.state === 'впритык' ? '<span class="chip warn">впритык</span>'
+        : м.state === 'после освобождения' ? '<span class="chip warn">нужна свободная память</span>'
+        : '<span class="chip err">не поместится</span>');
+    host.innerHTML = `
+      <div class="card-head"><h3>Модель на сервере</h3>
+        <span class="hint">каталог, подбор под это оборудование и установка</span>
+        <span class="spacer"></span>
+        ${служба.running ? `<span class="chip ok" title="${esc(служба.url || '')}">Ollama ${esc(служба.version || '')}</span>`
+          : '<span class="chip warn">служба модели не запущена</span>'}
+        ${д.active ? `<span class="chip accent">включена: ${esc(д.active)}</span>`
+          : '<span class="chip">модель не выбрана</span>'}</div>
+      <div class="small dim" style="margin-bottom:8px">${esc((д.hardware || {}).note || '')}
+        Свободно на диске ${num(д.disk_free_gb || 0)} ГБ.</div>
+      ${у.running || у.error || у.finished_at ? `<div id="llm-setup-run" style="margin-bottom:10px"></div>` : ''}
+      <!-- Каталог не растёт со временем: двенадцать строк, и прятать
+           половину за внутренней прокруткой значило бы спрятать ровно то,
+           ради чего в таблице есть столбец «помещается». -->
+      <div class="table-wrap full"><table><thead><tr>
+        <th style="width:34px"></th><th>Модель</th><th class="num">Скачать</th>
+        <th class="num">Видеопамять</th><th class="num">Контекст</th>
+        <th>Помещается</th><th>Зачем она</th><th></th></tr></thead><tbody>
+        ${(д.models || []).map((м) => `<tr class="${м.state === 'нет' ? 'faint' : ''}">
+          <td><input type="checkbox" data-model="${esc(м.name)}" style="width:auto"
+            ${выбраны.has(м.name) ? 'checked' : ''} ${у.running ? 'disabled' : ''}></td>
+          <td><b>${esc(м.title)}</b><div class="small faint mono">${esc(м.name)}</div>
+            ${м.recommended ? '<span class="chip ok">рекомендуется</span>' : ''}
+            ${м.fast_pick ? '<span class="chip info" title="меньше и быстрее рекомендованной">быстрая</span>' : ''}
+            ${м.installed ? '<span class="chip">скачана</span>' : ''}</td>
+          <td class="num mono">${num(м.size_gb, 1)} ГБ</td>
+          <td class="num mono">${num(м.vram_gb, 1)} ГБ</td>
+          <td class="num mono">${num(Math.round(м.context / 1000))}K</td>
+          <td>${метка(м)}${м.note ? `<div class="small faint">${esc(м.note)}</div>` : ''}</td>
+          <td class="small">${esc(м.why)}<div class="small faint">${esc(м.license)}</div></td>
+          <td>${м.installed && м.name !== д.active
+            ? `<button class="ghost sm" data-drop="${esc(м.name)}" ${у.running ? 'disabled' : ''}>Удалить</button>` : ''}</td>
+        </tr>`).join('')}
+      </tbody></table></div>
+      <div class="row wrap" style="gap:8px;margin-top:10px">
+        <button id="llm-go" class="primary" ${у.running ? 'disabled' : ''}>Установить и настроить</button>
+        <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" id="llm-install-server"
+          checked style="width:auto">поставить Ollama, если её нет</label>
+        <span class="spacer"></span>
+        <button id="llm-sizes" class="ghost sm" ${у.running ? 'disabled' : ''}>Уточнить размеры по реестру</button>
+        <button id="llm-check" class="ghost sm">Проверить ответ модели</button>
+      </div>
+      <div class="small faint" style="margin-top:8px">Модель скачивается с ollama.com на этот сервер и
+        работает на нём же: расшифровки никуда не уходят. Выбранная модель делит видеопамять с
+        распознаванием — поэтому в таблице считается свободная память, а не общая.</div>`;
+
+    qsa('input[data-model]', host).forEach((кн) => привязать_флажок(кн));
+    qsa('button[data-drop]', host).forEach((кн) => {
+      кн.onclick = async () => {
+        if (!confirm(`Удалить веса модели ${кн.dataset.drop} с диска сервера?`)) return;
+        кн.disabled = true;
+        try {
+          await API.post('/api/llm/models/delete', { model: кн.dataset.drop });
+          toast('Модель удалена', 'ok');
+          drawLlmSetup(host);
+        } catch (err) { fail(err); кн.disabled = false; }
+      };
+    });
+    qs('#llm-go', host).onclick = () => запустить();
+    qs('#llm-sizes', host).onclick = async () => {
+      toast('Спрашиваем размеры у реестра…');
+      try {
+        д = await API.get('/api/llm/models?refresh=true');
+        рисовать();
+      } catch (err) { fail(err); }
+    };
+    qs('#llm-check', host).onclick = async (e) => {
+      e.target.disabled = true;
+      try {
+        const о = await API.post('/api/llm/test');
+        toast(о.ok ? `Модель ответила за ${num(о.ms / 1000, 1)} с` : `Модель не ответила: ${о.error}`,
+              о.ok ? 'ok' : 'err');
+      } catch (err) { fail(err); } finally { e.target.disabled = false; }
+    };
+    if (у.running || у.error || у.finished_at) рисоватьХод(qs('#llm-setup-run', host), у);
+  };
+
+  const привязать_флажок = (кн) => {
+    кн.onchange = () => {
+      if (кн.checked) выбраны.add(кн.dataset.model); else выбраны.delete(кн.dataset.model);
+      state.llmChoice = [...выбраны];
+    };
+  };
+
+  const рисоватьХод = (место, у) => {
+    if (!место) return;
+    const шаги = у.steps || [];
+    const значок = { 'готово': '✓', 'идёт': '…', 'сбой': '✕', 'пропущен': '·', 'ждёт': '·' };
+    const цвет = { 'готово': 'ok', 'идёт': 'info', 'сбой': 'err', 'пропущен': '', 'ждёт': '' };
+    место.innerHTML = `<div class="card tight">
+      <div class="row wrap" style="gap:8px;margin-bottom:6px">
+        <b class="small">${у.running ? 'Идёт установка' : у.error ? 'Установка не удалась'
+          : у.cancelled ? 'Установка отменена' : 'Установка завершена'}</b>
+        ${(у.models || []).map((м) => `<span class="chip mono">${esc(м)}</span>`).join('')}
+        <span class="spacer"></span>
+        ${у.running ? '<button class="ghost sm" id="llm-cancel">Отменить</button>' : ''}</div>
+      <div class="progress ${у.error ? 'warn' : 'ok'}"><span style="width:${((у.progress || 0) * 100).toFixed(0)}%"></span></div>
+      <div class="small" style="margin-top:6px">${шаги.map((ш) => `<span class="chip ${цвет[ш.state] || ''}"
+        title="${esc(ш.note || '')}">${значок[ш.state] || '·'} ${esc(ш.title)}</span>`).join(' ')}</div>
+      ${Object.entries(у.model_progress || {}).filter(([, п]) => п.status !== 'ждёт').map(([имя, п]) => `
+        <div class="small dim" style="margin-top:6px">${esc(имя)} — ${esc(п.status)} ${num((п.share || 0) * 100, 0)}%
+          <div class="progress"><span style="width:${((п.share || 0) * 100).toFixed(0)}%"></span></div></div>`).join('')}
+      ${у.error ? `<div class="small" style="color:var(--err);margin-top:6px">${esc(у.error)}</div>` : ''}
+      <details style="margin-top:6px"><summary class="small faint">Журнал установки</summary>
+        <pre class="small mono" style="white-space:pre-wrap;margin:6px 0 0">${esc((у.log || []).slice(-14).join('\n'))}</pre></details>
+    </div>`;
+    const отмена = qs('#llm-cancel', место);
+    if (отмена) отмена.onclick = async () => {
+      отмена.disabled = true;
+      try { await API.post('/api/llm/setup/cancel'); } catch (err) { fail(err); }
+    };
+  };
+
+  const следить = () => {
+    clearTimeout(llmSetupTimer);
+    llmSetupTimer = setTimeout(async () => {
+      if (!host.isConnected) return;
+      let у;
+      try { у = await API.get('/api/llm/setup/status'); } catch (err) { return; }
+      д.setup = у;
+      рисоватьХод(qs('#llm-setup-run', host), у);
+      if (у.running) { следить(); return; }
+      // Установка кончилась: настройки на сервере изменились, и карточки
+      // параметров ниже показывают старые значения.
+      try {
+        const свежие = await API.get('/api/settings');
+        state.settings = свежие.values;
+      } catch (err) { /* не беда: значения обновятся при следующем открытии */ }
+      toast(у.error ? 'Установка не удалась' : у.cancelled ? 'Установка отменена'
+        : 'Модель установлена и включена', у.error ? 'err' : 'ok');
+      renderView(true);
+    }, 2000);
+  };
+
+  const запустить = async () => {
+    if (!выбраны.size) { toast('Отметьте хотя бы одну модель', 'warn'); return; }
+    const тяжёлые = (д.models || []).filter((м) => выбраны.has(м.name) && м.state === 'нет');
+    if (тяжёлые.length && !confirm(
+      `${тяжёлые.map((м) => м.title).join(', ')} не помещается в память этого сервера — ` +
+      'модель пойдёт частично на процессоре и будет отвечать минутами. Всё равно ставить?')) return;
+    try {
+      д.setup = await API.post('/api/llm/setup', {
+        models: [...выбраны], activate: [...выбраны][0],
+        install_server: qs('#llm-install-server', host).checked });
+      рисовать();
+      следить();
+    } catch (err) { fail(err); }
+  };
+
+  рисовать();
+  if ((д.setup || {}).running) следить();
+}
+
 RENDERERS.settings = {
   render(root) {
     const groups = state.catalog.groups;
@@ -6666,6 +6869,12 @@ RENDERERS.settings = {
     // Поиск идёт по параметрам каталога, поэтому раздел «Доступ» показываем
     // только когда он выбран явно и в поиске пусто.
     if (state.paramGroup === ACCESS_GROUP && !search) { renderAccessSection(host); return; }
+    // «Языковая модель» — единственная группа, где перед параметрами нужен
+    // не параметр, а действие: без установленной модели все шестнадцать
+    // настроек ниже описывают то, чего на сервере нет.
+    const врезка = (state.paramGroup === 'llm' && !search)
+      ? h('<section class="card" id="llm-setup"><div class="empty">Смотрим, что стоит на сервере…</div></section>')
+      : null;
 
     let items = state.params;
     if (search) {
@@ -6679,6 +6888,7 @@ RENDERERS.settings = {
     if (!items.length) {
       host.innerHTML = '<div class="card"><div class="empty">Параметров не найдено. ' +
         'Возможно, стоит включить показ параметров для опытных.</div></div>';
+      if (врезка) { host.prepend(врезка); drawLlmSetup(врезка); }
       return;
     }
 
@@ -6703,6 +6913,7 @@ RENDERERS.settings = {
       });
       host.appendChild(section);
     });
+    if (врезка) { host.prepend(врезка); drawLlmSetup(врезка); }
   },
 };
 

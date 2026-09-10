@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **120**, операций: **132**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **125**, операций: **137**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -187,6 +187,11 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/keys` | Создать ключ доступа | ключ с ролью **admin** |
 | `DELETE` | `/api/keys/{preview}` | Отозвать ключ доступа | ключ с ролью **admin** |
 | `POST` | `/api/llm/backfill` | Разобрать архив моделью | ключ с ролью **admin** |
+| `GET` | `/api/llm/models` | Каталог моделей и подбор под оборудование | ключ с ролью **admin** |
+| `POST` | `/api/llm/models/delete` | Удалить скачанную модель | ключ с ролью **admin** |
+| `POST` | `/api/llm/setup` | Поставить и настроить модель | ключ с ролью **admin** |
+| `POST` | `/api/llm/setup/cancel` | Отменить установку модели | ключ с ролью **admin** |
+| `GET` | `/api/llm/setup/status` | Ход установки модели | ключ с ролью **admin** |
 | `GET` | `/api/llm/status` | Состояние языковой модели | любой действующий ключ |
 | `POST` | `/api/llm/test` | Проверить сервер модели | ключ с ролью **admin** |
 | `GET` | `/api/logs` | Журнал сервера | ключ с ролью **admin** |
@@ -673,7 +678,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:17776",
+  "instance": "vm:19836",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1251,10 +1256,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789050000.3389885,
+    "generated_at": 1789055550.519812,
     "jobs": {
-      "total": 225,
-      "completed": 225,
+      "total": 222,
+      "completed": 222,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1262,42 +1267,42 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 8033.9,
-      "audio_hours": 2.23,
-      "processing_seconds": 1683.9,
-      "words": 9353,
+      "audio_seconds": 7943.2,
+      "audio_hours": 2.21,
+      "processing_seconds": 1545.8,
+      "words": 9221,
       "characters": 0,
-      "segments": 1362,
-      "files_per_hour": 1.34,
+      "segments": 1344,
+      "files_per_hour": 1.32,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 225,
-        "avg": 0.22248,
+        "count": 222,
+        "avg": 0.205238,
         "min": 0.01,
         "max": 5.7511,
-        "p10": 0.04386,
-        "p50": 0.1097,
-        "p90": 0.38494,
-        "p95": 0.49516,
-        "p99": 2.22148,
-        "stdev": 0.512379
+        "p10": 0.04374,
+        "p50": 0.11,
+        "p90": 0.38251,
+        "p95": 0.49054,
+        "p99": 1.225681,
+        "stdev": 0.433815
       },
       "processing_time_s": {
-        "count": 225,
-        "avg": 7.484,
+        "count": 222,
+        "avg": 6.963288,
         "min": 0.28,
         "max": 175.41,
-        "p10": 1.162,
-        "p50": 3.77,
-        "p90": 13.808,
-        "p95": 17.722,
-        "p99": 64.1068,
-        "stdev": 15.842099
+        "p10": 1.153,
+        "p50": 3.83,
+        "p90": 13.504,
+        "p95": 16.245,
+        "p99": 40.69,
+        "stdev": 13.470269
       },
       "queue_time_s": {
-        "count": 225,
+        "count": 222,
 …
 ```
 
@@ -1354,16 +1359,16 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
 {
   "period": "week",
   "overall": {
-    "jobs": 225,
-    "audio_hours": 2.232,
-    "processing_p50": 3.77,
-    "processing_p95": 17.72,
-    "processing_p99": 64.11,
-    "rtf_p50": 0.1097,
-    "rtf_p95": 0.4952,
-    "rtf_p99": 2.2215,
-    "queue_p50": 4.68,
-    "queue_p95": 19.47
+    "jobs": 222,
+    "audio_hours": 2.206,
+    "processing_p50": 3.83,
+    "processing_p95": 16.24,
+    "processing_p99": 40.69,
+    "rtf_p50": 0.11,
+    "rtf_p95": 0.4905,
+    "rtf_p99": 1.2257,
+    "queue_p50": 4.7,
+    "queue_p95": 19.54
   },
   "by_model": [
     {
@@ -1394,24 +1399,24 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
     },
     {
       "key": "vosk-ru",
-      "jobs": 56,
-      "audio_hours": 0.52,
-      "processing_p50": 10.22,
-      "processing_p95": 45.35,
-      "processing_p99": 152.76,
-      "rtf_p50": 0.3455,
-      "rtf_p95": 1.076,
-      "rtf_p99": 4.9896,
-      "queue_p50": 3.9,
-      "queue_p95": 20.47
+      "jobs": 55,
+      "audio_hours": 0.512,
+      "processing_p50": 10.17,
+      "processing_p95": 29.89,
+      "processing_p99": 119.12,
+      "rtf_p50": 0.3429,
+      "rtf_p95": 0.5688,
+      "rtf_p99": 3.9894,
+      "queue_p50": 4.0,
+      "queue_p95": 20.75
     },
     {
       "key": "gigaam-v3-e2e-rnnt",
-      "jobs": 54,
-      "audio_hours": 0.547,
+      "jobs": 52,
+      "audio_hours": 0.53,
       "processing_p50": 1.53,
-      "processing_p95": 5.38,
-      "processing_p99": 6.29,
+      "processing_p95": 5.4,
+      "processing_p99": 6.3,
 …
 ```
 
@@ -1453,7 +1458,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 96.4,
+  "uptime_s": 120.4,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1497,7 +1502,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 2
+    "INFO": 6
   }
 }
 ```
@@ -1532,17 +1537,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 96.4,
+  "uptime_s": 120.5,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
-    "disk_free_gb": 12.2,
+    "ram_available_gb": 7.0,
+    "disk_free_gb": 11.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1553,7 +1558,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 12.2 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 11.9 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -2065,27 +2070,28 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "period": "week",
   "enabled": true,
   "model": "qwen3:14b",
-  "records": 225,
-  "analyzed": 225,
+  "records": 222,
+  "analyzed": 222,
   "errors": 0,
   "stale": 0,
   "coverage": 1.0,
-  "avg_latency_ms": 7399.2,
+  "avg_latency_ms": 7440.0,
+  "off_list": 0,
   "outcomes": [
     {
       "key": "вопрос решён",
-      "records": 107,
-      "share": 47.6
+      "records": 106,
+      "share": 47.7
     },
     {
       "key": "перезвонят или передано",
       "records": 64,
-      "share": 28.4
+      "share": 28.8
     },
     {
       "key": "отказ клиента",
-      "records": 46,
-      "share": 20.4
+      "records": 44,
+      "share": 19.8
     },
     {
       "key": "неясно",
@@ -2096,61 +2102,59 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "reasons": [
     {
       "key": "статус заказа или доставки",
-      "records": 160,
-      "share": 71.1
+      "records": 159,
+      "share": 71.6
     },
     {
       "key": "другое",
-      "records": 62,
-      "share": 27.6
+      "records": 60,
+      "share": 27.0
     },
     {
       "key": "возврат или отмена",
       "records": 3,
-      "share": 1.3
+      "share": 1.4
     }
   ],
-  "resolved_share": 73.1,
-  "actions": 244,
-  "records_with_actions": 220,
+  "resolved_share": 73.7,
+  "actions": 241,
+  "records_with_actions": 217,
   "trackers": [
     {
       "id": "discount",
       "label": "Запрос скидки",
-      "checked": 225,
-      "fired": 111
+      "checked": 222,
+      "fired": 110
     },
     {
       "id": "competitor",
       "label": "Упоминание конкурента",
-      "checked": 225,
-      "fired": 63
+      "checked": 222,
+      "fired": 61
     },
     {
       "id": "escalation",
       "label": "Угроза жалобой",
-      "checked": 225,
-      "fired": 49
+      "checked": 222,
+      "fired": 47
     }
   ],
   "scorecard": [
     {
       "id": "greet",
       "question": "Сотрудник представился и назвал компанию?",
-      "да": 128,
-      "нет": 97,
+      "да": 127,
+      "нет": 95,
       "н/п": 0
     },
     {
       "id": "term",
       "question": "Сотрудник назвал конкретный срок или дату?",
       "да": 0,
-      "нет": 225,
+      "нет": 222,
       "н/п": 0
     }
   ],
-  "action_items": [
-    {
 …
 ```
 
@@ -2347,6 +2351,202 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
 }
 ```
 
+### `GET /api/llm/models`
+
+Каталог моделей и подбор под оборудование.
+
+Что можно поставить, что уже стоит и что поместится в память.
+
+Пометки считаются по свободной видеопамяти за вычетом запаса под
+распознавание: смысловой слой делит карту с главной работой сервера.
+При `refresh=true` размеры уточняются по реестру Ollama — это
+несколько секунд, поэтому по умолчанию берутся из каталога.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `refresh` | в адресе | boolean | `False` | — |
+
+**Пример**
+
+```bash
+curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
+```
+
+**Ответ**
+
+```json
+{
+  "hardware": {
+    "kind": "cpu",
+    "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "total_gb": 7.8,
+    "free_gb": 7.0,
+    "reserve_gb": 4.0,
+    "budget_gb": 2.9,
+    "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
+  },
+  "models": [
+    {
+      "name": "qwen3:4b",
+      "title": "Qwen3 4B",
+      "params_b": 4,
+      "size_gb": 2.5,
+      "vram_gb": 4.5,
+      "context": 256000,
+      "family": "qwen3",
+      "license": "Apache 2.0",
+      "why": "Самая маленькая из тех, что ещё связно отвечают по-русски. Для слабой видеокарты и для процессора — с оговоркой, что качество пересказа заметно ниже старших.",
+      "state": "нет",
+      "note": "Нужно около 4.5 ГБ, всего на устройстве 7.8 ГБ.",
+      "installed": false,
+      "recommended": false,
+      "fast_pick": false
+    },
+    {
+      "name": "qwen3:8b",
+      "title": "Qwen3 8B",
+      "params_b": 8,
+      "size_gb": 5.2,
+      "vram_gb": 7.5,
+      "context": 40000,
+      "family": "qwen3",
+      "license": "Apache 2.0",
+      "why": "Разумный минимум для разбора разговоров: помещается рядом с распознаванием на карте в 12 ГБ и отвечает за секунды.",
+      "state": "нет",
+      "note": "Нужно около 7.5 ГБ, всего на устройстве 7.8 ГБ.",
+      "installed": false,
+      "recommended": false,
+      "fast_pick": false
+    },
+    {
+      "name": "gemma4:12b",
+…
+```
+
+`hardware` считается на той машине, где отвечает сервер, — в примере это машина сборки документации, без видеокарты. `state` у каждой модели: «да», «впритык», «после освобождения» или «нет», и рядом причина. `refresh=true` уточняет размеры по реестру Ollama.
+
+### `POST /api/llm/models/delete`
+
+Удалить скачанную модель.
+
+Убирает веса с диска. Включённую модель удалить нельзя — сначала
+выберите другую, иначе разбор останется без модели.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "$ref": "#/components/schemas/Body_llm_model_delete_api_llm_models_delete_post"
+}
+```
+
+### `POST /api/llm/setup`
+
+Поставить и настроить модель.
+
+Ставит Ollama (если её нет), скачивает модели, прогревает и
+включает выбранную. Идёт в фоне: ход установки — GET
+/api/llm/setup/status.
+
+Шаги, которые уже сделаны, пропускаются, поэтому повторный запуск на
+настроенном сервере просто докачивает ещё одну модель.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "$ref": "#/components/schemas/Body_llm_setup_api_llm_setup_post"
+}
+```
+
+### `POST /api/llm/setup/cancel`
+
+Отменить установку модели.
+
+Останавливает установку на ближайшем шаге. Скачанное остаётся:
+Ollama продолжит с места обрыва при следующем запуске.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+### `GET /api/llm/setup/status`
+
+Ход установки модели.
+
+Шаги, проценты и журнал последней установки.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+**Пример**
+
+```bash
+curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/setup/status
+```
+
+**Ответ**
+
+```json
+{
+  "running": false,
+  "step": null,
+  "progress": 0.0,
+  "error": null,
+  "cancelled": false,
+  "log": [],
+  "models": [],
+  "activate": null,
+  "started_at": null,
+  "finished_at": null,
+  "model_progress": {},
+  "steps": [
+    {
+      "key": "проверка",
+      "title": "Проверка оборудования и места на диске",
+      "state": "ждёт",
+      "note": ""
+    },
+    {
+      "key": "установка",
+      "title": "Установка Ollama",
+      "state": "ждёт",
+      "note": ""
+    },
+    {
+      "key": "запуск",
+      "title": "Запуск службы модели",
+      "state": "ждёт",
+      "note": ""
+    },
+    {
+      "key": "скачивание",
+      "title": "Скачивание моделей",
+      "state": "ждёт",
+      "note": ""
+    },
+    {
+      "key": "прогрев",
+      "title": "Прогрев и проверка ответа",
+      "state": "ждёт",
+      "note": ""
+    },
+    {
+      "key": "настройка",
+      "title": "Запись настроек",
+…
+```
+
+Шаги идут по порядку; уже сделанное помечается «пропущен». `model_progress` — доля скачанного по каждой модели.
+
 ### `GET /api/llm/status`
 
 Состояние языковой модели.
@@ -2397,8 +2597,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/status
   },
   "version": 1,
   "coverage": {
-    "total": 8,
-    "analyzed": 8,
+    "total": 2,
+    "analyzed": 2,
     "errors": 0,
     "share": 1.0
   }
@@ -2443,19 +2643,19 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/control?period=week
 ```json
 {
   "period": "week",
-  "checks": 33,
+  "checks": 31,
   "previous_checks": 35,
-  "wer_avg": 0.1739,
-  "previous_wer_avg": 0.1283,
-  "growth": 0.3554,
-  "wer_p50": 0.1742,
-  "wer_p90": 0.2516,
+  "wer_avg": 0.1775,
+  "previous_wer_avg": 0.1272,
+  "growth": 0.3954,
+  "wer_p50": 0.1771,
+  "wer_p90": 0.2532,
   "verdict": "warning",
   "by_day": [
     {
       "ts": 1788393600.0,
-      "checks": 3,
-      "wer_avg": 0.1375
+      "checks": 1,
+      "wer_avg": 0.1771
     },
     {
       "ts": 1788480000.0,
@@ -2492,9 +2692,9 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/control?period=week
     {
       "model": "gigaam-v3-e2e-rnnt",
       "control_model": "whisper-large-v3",
-      "checks": 33,
-      "wer_avg": 0.1739,
-      "mer_avg": 0.1617
+      "checks": 31,
+      "wer_avg": 0.1775,
+      "mer_avg": 0.1651
     }
   ],
   "worst": [

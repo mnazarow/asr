@@ -129,6 +129,11 @@ ADMIN_ROUTES = {
     ("/api/review/sample", "post"), ("/api/control/run", "post"),
     # Проба модели и разбор архива — работа для всего сервера.
     ("/api/llm/test", "post"), ("/api/llm/backfill", "post"),
+    # Установка модели ставит службу в систему и качает гигабайты: право
+    # администратора и по существу, и по осторожности.
+    ("/api/llm/models", "get"), ("/api/llm/setup", "post"),
+    ("/api/llm/setup/status", "get"), ("/api/llm/setup/cancel", "post"),
+    ("/api/llm/models/delete", "post"),
 }
 #: Вход и выход ключа не требуют вовсе: это и есть способ его получить.
 OPEN_AUTH_ROUTES = {"/api/auth/login", "/api/auth/logout"}
@@ -447,6 +452,21 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     ("/api/content/llm", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/content/llm?period=week'",
         "show": "/api/content/llm?period=week", "limit": 1600,
+    },
+    ("/api/llm/models", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/llm/models",
+        "show": "/api/llm/models", "limit": 1400,
+        "note": "`hardware` считается на той машине, где отвечает сервер, — в "
+                "примере это машина сборки документации, без видеокарты. "
+                "`state` у каждой модели: «да», «впритык», «после "
+                "освобождения» или «нет», и рядом причина. `refresh=true` "
+                "уточняет размеры по реестру Ollama.",
+    },
+    ("/api/llm/setup/status", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/llm/setup/status",
+        "show": "/api/llm/setup/status", "limit": 900,
+        "note": "Шаги идут по порядку; уже сделанное помечается «пропущен». "
+                "`model_progress` — доля скачанного по каждой модели.",
     },
     ("/api/review", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/review?status=pending&limit=20'",

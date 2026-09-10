@@ -589,3 +589,31 @@ def test_the_meaning_layer_shows_up_in_the_summary_and_in_the_record_card(стр
     страница.wait_for_timeout(1500)
     assert "Смысл разговора" in страница.inner_text("#job-llm")
     _чисто(страница)
+
+
+def test_the_settings_offer_to_install_a_model_for_this_hardware(страница):
+    """Раздел «Языковая модель» начинается не с параметров, а с каталога:
+    что поместится в память этого сервера, что уже скачано и чего не
+    хватает. Без этой врезки шестнадцать настроек ниже описывают модель,
+    которой на свежем сервере нет.
+    """
+    _открыть(страница, "settings")
+    страница.click('#group-nav button[data-group="llm"]')
+    страница.wait_for_selector("#llm-setup table tbody tr", timeout=20000)
+    страница.wait_for_timeout(400)
+    врезка = страница.inner_text("#llm-setup")
+    # Заголовки таблицы CSS приводит к прописным — сравниваем без регистра.
+    assert "Модель на сервере" in врезка and "зачем она" in врезка.lower(), врезка[:400]
+    assert "undefined" not in врезка.lower() and "NaN" not in врезка, врезка[:400]
+    # Каталог показан целиком: и то, что поместится, и то, что нет.
+    строк = страница.evaluate(
+        "() => document.querySelectorAll('#llm-setup table tbody tr').length")
+    assert строк >= 10, строк
+    assert "не поместится" in врезка or "поместится" in врезка
+    # Кнопка установки на месте и не нажата: нажатие здесь качало бы
+    # гигабайты на машину, где идут проверки.
+    assert страница.evaluate("() => !!document.querySelector('#llm-go')")
+    # Параметры группы никуда не делись — врезка стоит перед ними.
+    assert страница.evaluate(
+        "() => document.querySelectorAll('#params-body .params').length") >= 1
+    _чисто(страница)

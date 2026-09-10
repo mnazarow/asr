@@ -53,8 +53,8 @@ class LLMClient:
         self.settings = settings
         self.db = db
         self._hardware = hardware
-        self._semaphore = threading.BoundedSemaphore(
-            max(1, int(settings.get("llm_max_concurrent") or 1)))
+        self._предел = max(1, int(settings.get("llm_max_concurrent") or 1))
+        self._semaphore = threading.BoundedSemaphore(self._предел)
         self._lock = threading.Lock()
         self.calls = 0
         self.errors = 0
@@ -63,7 +63,7 @@ class LLMClient:
         self.last_ms: float | None = None
         self.last_error: str | None = None
         self.last_call_at: float | None = None
-        self._probe: tuple[float, dict[str, Any]] | None = None
+        self._probe: tuple[float, tuple[str, str, str], dict[str, Any]] | None = None
 
     # --- настройки ------------------------------------------------------
 
@@ -87,6 +87,29 @@ class LLMClient:
     def timeout(self) -> float:
         return float(self.settings.get("llm_timeout_s") or 90)
 
+    def _семафор(self) -> threading.BoundedSemaphore:
+        """Ограничитель одновременности под текущую настройку.
+
+        `llm_max_concurrent` меняют на странице настроек, и менять её
+        имеет смысл на живом сервере: одновременных вызовов на одной
+        видеокарте с распознаванием больше двух не нужно, а меньше —
+        бывает нужно срочно. Семафор, собранный один раз при запуске,
+        делал такую правку бессмысленной до перезапуска.
+
+        Держатели старого семафора освободят старый объект — это
+        безопасно: он только считает, а считает уже никому не нужное.
+        """
+        предел = max(1, int(self.settings.get("llm_max_concurrent") or 1))
+        with self._lock:
+            if предел != self._предел:
+                self._semaphore = threading.BoundedSemaphore(предел)
+                self._предел = предел
+            return self._semaphore
+
+    def _подпись(self) -> tuple[str, str, str]:
+        """Чем задан сервер модели: сменилось — прошлая проба не о нём."""
+        return (self.backend, self.url, self.model)
+
     # --- состояние ------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
@@ -109,12 +132,14 @@ class LLMClient:
             return {"available": False, "reason": "выключено"}
         if self.backend == "stub":
             return {"available": True, "reason": "заглушка отвечает без модели"}
+        подпись = self._подпись()
         with self._lock:
-            if not fresh and self._probe and time.time() - self._probe[0] < СРОК_ПРОБЫ:
-                return self._probe[1]
+            if (not fresh and self._probe and self._probe[1] == подпись
+                    and time.time() - self._probe[0] < СРОК_ПРОБЫ):
+                return self._probe[2]
         итог = self._probe_now()
         with self._lock:
-            self._probe = (time.time(), итог)
+            self._probe = (time.time(), подпись, итог)
         return итог
 
     def _probe_now(self) -> dict[str, Any]:
@@ -156,7 +181,7 @@ class LLMClient:
                 return готовое
         self._check_vram()
         начало = time.perf_counter()
-        with self._semaphore:
+        with self._семафор():
             try:
                 if self.backend == "stub":
                     from . import stub  # noqa: PLC0415
