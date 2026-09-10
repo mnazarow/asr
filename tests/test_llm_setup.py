@@ -127,21 +127,26 @@ def test_the_catalogue_is_matched_against_free_memory_not_the_whole_card():
     assert б["budget_gb"] == 30.0 - provision.ЗАПАС_ГБ
     по_имени = {м["name"]: м for м in свод["models"]}
     assert len(по_имени) == len(provision.КАТАЛОГ), "модели пропали из списка"
-    assert по_имени["qwen3:30b"]["state"] == "да"
+    assert по_имени["qwen3.8:27b"]["state"] == "да"
     assert по_имени["gpt-oss:120b"]["state"] == "нет"
     assert "72" in по_имени["gpt-oss:120b"]["note"]
-    # Рекомендуется самая крупная из поместившихся, а рядом — быстрая.
-    assert свод["recommended"] == "qwen3:30b"
-    assert по_имени[свод["fast_pick"]]["vram_gb"] <= по_имени["qwen3:30b"]["vram_gb"] / 2
+    # Рекомендуется самая новая из поместившихся, а рядом — быстрая.
+    assert свод["recommended"] == "qwen3.8:27b"
+    assert по_имени[свод["fast_pick"]]["vram_gb"] <= по_имени["qwen3.8:27b"]["vram_gb"] / 2
+    # Поколение важнее гигабайтов: gemma4:26b тоже помещается и весит
+    # больше, но она поколением старше — советовать её значило бы
+    # советовать вчерашнее за то, что оно тяжелее.
+    assert по_имени["gemma4:26b"]["state"] == "да"
+    assert по_имени["gemma4:26b"]["vram_gb"] > по_имени["qwen3.8:27b"]["vram_gb"]
 
     # Занятая карта: крупная модель уже не помещается, но и не объявляется
     # невозможной — память есть, она занята.
-    занята = provision.подобрать(_железо(vram_gb=32, свободно_gb=14),
+    занята = provision.подобрать(_железо(vram_gb=32, свободно_gb=16),
                                  settings=_Настройки(Path("/tmp")))
     занята_по_имени = {м["name"]: м for м in занята["models"]}
-    assert занята_по_имени["qwen3:30b"]["state"] == "после освобождения"
-    assert "занята" in занята_по_имени["qwen3:30b"]["note"]
-    assert занята["recommended"] == "qwen3:8b"
+    assert занята_по_имени["qwen3.8:27b"]["state"] == "после освобождения"
+    assert "занята" in занята_по_имени["qwen3.8:27b"]["note"]
+    assert занята["recommended"] == "qwen3.5:9b"
 
     # Карта занята целиком: советовать нечего, и это говорится прямо, а не
     # подсовыванием модели, которая не запустится.
@@ -155,7 +160,7 @@ def test_the_catalogue_is_matched_against_free_memory_not_the_whole_card():
         _железо(vram_gb=32, свободно_gb=30),
         settings=_Настройки(Path("/tmp"), llm_min_free_vram_gb=20))
     assert свой_запас["hardware"]["budget_gb"] == 10.0
-    assert свой_запас["recommended"] == "qwen3:8b"
+    assert свой_запас["recommended"] == "qwen3.5:9b"
 
 
 def test_without_a_card_the_catalogue_says_so_plainly():
@@ -164,30 +169,30 @@ def test_without_a_card_the_catalogue_says_so_plainly():
     свод = provision.подобрать(_железо(карта=False), settings=None)
     assert свод["hardware"]["kind"] == "cpu"
     assert "процессоре" in свод["hardware"]["note"]
-    крупная = next(м for м in свод["models"] if м["name"] == "qwen3:14b")
+    крупная = next(м for м in свод["models"] if м["name"] == "qwen3.6:27b")
     assert "минутами" in крупная["note"]
 
 
 def test_installed_models_are_marked(monkeypatch):
     """Скачанная модель помечена — иначе её предложат скачать ещё раз."""
-    свод = provision.подобрать(_железо(), installed=["qwen3:14b:latest", "qwen3:8b"])
+    свод = provision.подобрать(_железо(), installed=["qwen3.8:27b:latest", "qwen3.5:9b"])
     по_имени = {м["name"]: м for м in свод["models"]}
-    assert по_имени["qwen3:8b"]["installed"] is True
-    assert по_имени["qwen3:14b"]["installed"] is True
-    assert по_имени["qwen3:32b"]["installed"] is False
+    assert по_имени["qwen3.5:9b"]["installed"] is True
+    assert по_имени["qwen3.8:27b"]["installed"] is True
+    assert по_имени["gemma4:26b"]["installed"] is False
 
 
 def test_the_registry_answers_how_much_the_tag_really_weighs(monkeypatch):
     """Размер берётся из реестра: каталог в коде стареет, реестр — нет."""
     _сеть(monkeypatch)
-    размер, ошибка = provision.размер_в_реестре("qwen3:8b")
+    размер, ошибка = provision.размер_в_реестре("qwen3.5:9b")
     assert ошибка == "" and размер == 5.0
 
     def нет_такого(*a, **k):
         raise provision.urllib.error.HTTPError("u", 404, "Not Found", {}, None)
 
     monkeypatch.setattr(provision, "_запрос", нет_такого)
-    размер, ошибка = provision.размер_в_реестре("qwen3:nosuch")
+    размер, ошибка = provision.размер_в_реестре("qwen3.5:nosuch")
     assert размер is None and "нет модели" in ошибка
     assert provision.размер_в_реестре("../../etc/passwd")[1] == "Недопустимое имя модели."
 
@@ -210,8 +215,8 @@ def test_the_installer_walks_the_steps_and_writes_the_settings(tmp_path, monkeyp
     monkeypatch.setattr(provision.shutil, "which",
                         lambda имя: "/usr/local/bin/ollama" if имя == "ollama" else None)
     установщик = provision.Установщик(настройки, hardware=lambda: _железо())
-    начало = установщик.start(["qwen3:8b"], activate="qwen3:8b")
-    assert начало["running"] is True and начало["models"] == ["qwen3:8b"]
+    начало = установщик.start(["qwen3.5:9b"], activate="qwen3.5:9b")
+    assert начало["running"] is True and начало["models"] == ["qwen3.5:9b"]
     assert установщик.wait(30), "установка не закончилась"
 
     с = установщик.status()
@@ -220,9 +225,9 @@ def test_the_installer_walks_the_steps_and_writes_the_settings(tmp_path, monkeyp
     assert состояния == {"проверка": "готово", "установка": "пропущен",
                          "запуск": "пропущен", "скачивание": "готово",
                          "прогрев": "готово", "настройка": "готово"}
-    assert с["model_progress"]["qwen3:8b"]["share"] == 1.0
+    assert с["model_progress"]["qwen3.5:9b"]["share"] == 1.0
     assert настройки.get("llm_backend") == "ollama"
-    assert настройки.get("llm_model") == "qwen3:8b"
+    assert настройки.get("llm_model") == "qwen3.5:9b"
     assert настройки.сохранено == 1, "настройки не записаны в файл"
     assert any("ГБ по реестру" in строка for строка in с["log"])
     assert any("Пробный ответ" in строка for строка in с["log"])
@@ -232,12 +237,12 @@ def test_an_already_downloaded_model_is_not_downloaded_again(tmp_path, monkeypat
     """Повторный запуск на настроенном сервере ничего не ломает."""
     настройки = _Настройки(tmp_path)
     тянули = []
-    _сеть(monkeypatch, скачано=["qwen3:8b"])
+    _сеть(monkeypatch, скачано=["qwen3.5:9b"])
     monkeypatch.setattr(provision.shutil, "which", lambda имя: "/usr/local/bin/ollama")
     установщик = provision.Установщик(настройки, hardware=lambda: _железо())
     monkeypatch.setattr(установщик, "_тянуть",
                         lambda имя, адрес: тянули.append(имя))
-    установщик.start(["qwen3:8b"])
+    установщик.start(["qwen3.5:9b"])
     assert установщик.wait(30)
     assert тянули == [], "уже скачанная модель качается заново"
     assert установщик.status()["error"] is None
@@ -256,7 +261,7 @@ def test_no_room_on_the_disk_stops_before_anything_is_downloaded(tmp_path, monke
     monkeypatch.setattr(provision, "свободно_под_веса",
                         lambda: (3.0, "/var/lib/ollama/models"))
     установщик = provision.Установщик(настройки, hardware=lambda: _железо(диск_gb=900))
-    установщик.start(["qwen3:32b"])
+    установщик.start(["qwen3.8:27b"])
     assert установщик.wait(30)
     с = установщик.status()
     assert с["error"] and "свободно 3 ГБ" in с["error"]
@@ -288,9 +293,9 @@ def test_the_download_can_be_cancelled(tmp_path, monkeypatch):
     установщик = provision.Установщик(настройки, hardware=lambda: _железо())
     установщик._stop.set()
     установщик._состояние = установщик._пусто()
-    установщик._состояние["model_progress"] = {"qwen3:8b": {"share": 0.0, "status": "ждёт"}}
-    установщик._тянуть("qwen3:8b", provision.АДРЕС)
-    assert установщик.status()["model_progress"]["qwen3:8b"]["status"] == "отменено"
+    установщик._состояние["model_progress"] = {"qwen3.5:9b": {"share": 0.0, "status": "ждёт"}}
+    установщик._тянуть("qwen3.5:9b", provision.АДРЕС)
+    assert установщик.status()["model_progress"]["qwen3.5:9b"]["status"] == "отменено"
     assert настройки.get("llm_backend") == "off"
 
 
@@ -304,10 +309,10 @@ def test_the_installer_refuses_nonsense_and_a_second_run(tmp_path, monkeypatch):
     with pytest.raises(ConfigError):
         установщик.start([])
     with pytest.raises(ConfigError):
-        установщик.start(["qwen3:8b"], activate="qwen3:32b")
+        установщик.start(["qwen3.5:9b"], activate="qwen3.8:27b")
     установщик._состояние["running"] = True
     with pytest.raises(ConfigError):
-        установщик.start(["qwen3:8b"])
+        установщик.start(["qwen3.5:9b"])
 
 
 def test_the_service_is_started_when_it_does_not_answer(tmp_path, monkeypatch):
@@ -361,11 +366,11 @@ def test_the_routes_show_the_catalogue_and_guard_the_active_model(client, monkey
     from asrhub.llm import provision as п
 
     monkeypatch.setattr(п, "установленные", lambda адрес, **k: [
-        {"name": "qwen3:8b", "size_gb": 5.2, "modified": ""}])
+        {"name": "qwen3.5:9b", "size_gb": 5.2, "modified": ""}])
     monkeypatch.setattr(п, "служба", lambda адрес, **k: {"running": True,
                                                          "version": "0.12.4", "url": адрес})
     свод = client.get("/api/llm/models").json()
-    assert свод["installed"][0]["name"] == "qwen3:8b"
+    assert свод["installed"][0]["name"] == "qwen3.5:9b"
     assert свод["service"]["running"] is True
     assert len(свод["models"]) == len(п.КАТАЛОГ)
     assert all("state" in м and "why" in м for м in свод["models"])
@@ -374,14 +379,14 @@ def test_the_routes_show_the_catalogue_and_guard_the_active_model(client, monkey
     состояние = client.get("/api/llm/setup/status").json()
     assert состояние["steps"][0]["key"] == "проверка"
 
-    client.app.state.hub.settings.set("llm_model", "qwen3:8b")
-    отказ = client.post("/api/llm/models/delete", json={"model": "qwen3:8b"})
+    client.app.state.hub.settings.set("llm_model", "qwen3.5:9b")
+    отказ = client.post("/api/llm/models/delete", json={"model": "qwen3.5:9b"})
     assert отказ.status_code == 400 and "выбрана" in отказ.json()["detail"]["message"]
 
     удалено = []
     monkeypatch.setattr(п, "удалить", lambda имя, адрес, **k: удалено.append(имя))
-    ответ = client.post("/api/llm/models/delete", json={"model": "qwen3:14b"})
-    assert ответ.status_code == 200 and удалено == ["qwen3:14b"]
+    ответ = client.post("/api/llm/models/delete", json={"model": "gemma4:12b"})
+    assert ответ.status_code == 200 and удалено == ["gemma4:12b"]
 
 
 def test_the_setup_route_starts_the_installer_and_reports_it(client, monkeypatch):
@@ -393,14 +398,14 @@ def test_the_setup_route_starts_the_installer_and_reports_it(client, monkeypatch
     monkeypatch.setattr(установщик, "start",
                         lambda модели, **kw: (запуски.append((модели, kw)),
                                               {"running": True, "models": модели})[1])
-    ответ = client.post("/api/llm/setup", json={"models": ["qwen3:8b"],
-                                                "activate": "qwen3:8b"}).json()
-    assert ответ["running"] is True and запуски[0][0] == ["qwen3:8b"]
+    ответ = client.post("/api/llm/setup", json={"models": ["qwen3.5:9b"],
+                                                "activate": "qwen3.5:9b"}).json()
+    assert ответ["running"] is True and запуски[0][0] == ["qwen3.5:9b"]
 
     # Без выбора ставится рекомендованная — та же, что показана в каталоге.
-    monkeypatch.setattr(п, "подобрать", lambda **k: {"recommended": "qwen3:14b"})
+    monkeypatch.setattr(п, "подобрать", lambda **k: {"recommended": "gemma4:12b"})
     client.post("/api/llm/setup", json={})
-    assert запуски[-1][0] == ["qwen3:14b"]
+    assert запуски[-1][0] == ["gemma4:12b"]
 
     monkeypatch.setattr(п, "подобрать", lambda **k: {"recommended": None})
     отказ = client.post("/api/llm/setup", json={})
@@ -425,7 +430,7 @@ def test_the_setup_needs_an_administrator(data_dir, monkeypatch):
     with TestClient(create_app(settings, start_queue=False)) as c:
         for путь in ("/api/llm/models", "/api/llm/setup/status"):
             assert c.get(путь, headers={"X-API-Key": "ah_read_key"}).status_code == 403
-        assert c.post("/api/llm/setup", json={"models": ["qwen3:8b"]},
+        assert c.post("/api/llm/setup", json={"models": ["qwen3.5:9b"]},
                       headers={"X-API-Key": "ah_read_key"}).status_code == 403
         assert c.get("/api/llm/models",
                      headers={"X-API-Key": "ah_admin_key"}).status_code == 200
@@ -437,9 +442,9 @@ def test_the_setup_state_survives_a_page_reload(tmp_path, monkeypatch):
     _сеть(monkeypatch)
     monkeypatch.setattr(provision.shutil, "which", lambda имя: "/usr/local/bin/ollama")
     установщик = provision.Установщик(настройки, hardware=lambda: _железо())
-    установщик.start(["qwen3:8b"])
+    установщик.start(["qwen3.5:9b"])
     видно = установщик.status()
-    assert видно["started_at"] and видно["models"] == ["qwen3:8b"]
+    assert видно["started_at"] and видно["models"] == ["qwen3.5:9b"]
     assert установщик.wait(30)
     после = установщик.status()
     assert после["finished_at"] and после["running"] is False
@@ -448,9 +453,9 @@ def test_the_setup_state_survives_a_page_reload(tmp_path, monkeypatch):
     # доходить до установщика.
     после["log"].append("подделка")
     после["steps"][0]["note"] = "подделка"
-    после["model_progress"]["qwen3:8b"]["status"] = "подделка"
+    после["model_progress"]["qwen3.5:9b"]["status"] = "подделка"
     свежий = установщик.status()
     assert "подделка" not in свежий["log"]
     assert свежий["steps"][0]["note"] != "подделка"
-    assert свежий["model_progress"]["qwen3:8b"]["status"] != "подделка"
+    assert свежий["model_progress"]["qwen3.5:9b"]["status"] != "подделка"
     assert time.time() - после["finished_at"] < 60
