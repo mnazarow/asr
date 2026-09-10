@@ -505,6 +505,7 @@ def list_keys(request: Request,
             "quota_jobs_per_day": info.get("quota_jobs_per_day", 0),
             "quota_audio_hours_per_day": info.get("quota_audio_hours_per_day", 0),
             "quota_storage_gb": info.get("quota_storage_gb", 0),
+            "mask_pii": bool(info.get("mask_pii")),
         })
     return {"items": items}
 
@@ -517,6 +518,7 @@ def create_key(request: Request, name: str = Body(embed=True),
                quota_jobs_per_day: int = Body(default=0, embed=True),
                quota_audio_hours_per_day: float = Body(default=0, embed=True),
                quota_storage_gb: float = Body(default=0, embed=True),
+               mask_pii: bool = Body(default=False, embed=True),
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     import secrets
 
@@ -536,12 +538,16 @@ def create_key(request: Request, name: str = Body(embed=True),
         "quota_jobs_per_day": max(0, quota_jobs_per_day),
         "quota_audio_hours_per_day": max(0.0, quota_audio_hours_per_day),
         "quota_storage_gb": max(0.0, quota_storage_gb),
+        # Ключ интеграции или аналитика, которому нужен текст, но не
+        # персональные данные: все его ответы и выгрузки обезличиваются.
+        "mask_pii": bool(mask_pii),
     }
     # Без записи на диск ключ жил бы только до перезапуска, тогда как
     # интерфейс обещает пользователю обратное.
     saved = state.settings.persist_api_keys()
     state.db.add_event(None, "key_created", f"Создан ключ «{name}» с ролью {role}")
     return {"key": key, "name": name, "role": role, "group": group,
+            "mask_pii": bool(mask_pii),
             "persisted": saved,
             "warning": "Ключ показывается один раз — сохраните его."
                        if saved else

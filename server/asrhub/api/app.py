@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -412,6 +412,50 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                     # иначе клиент не найдёт привычный code и hint.
                     return JSONResponse(status_code=413, content=error.to_dict())
         return await call_next(request)
+
+    @app.middleware("http")
+    async def mask_personal_data(request: Request, call_next):
+        """Обезличивает ответы API ключу с флагом mask_pii.
+
+        Ключ интеграции или аналитика, которому нужен текст разговора, но
+        не персональные данные в нём. Маскируется всё, что несёт текст:
+        расшифровка, сегменты, слова, эталон, имя файла, выдержки в отборах,
+        найденные телефоны и адреса в разборе. Ответ читается целиком —
+        для JSON это единицы килобайт на задание, — а потоки и файлы идут
+        мимо: выгрузки маскируются в своём обработчике до сборки файла.
+        """
+        response = await call_next(request)
+        if not settings.get("auth_enabled", True):
+            return response
+        token = (request.headers.get("x-api-key") or "").strip()
+        if not token:
+            header = request.headers.get("authorization", "")
+            parts = header.split(" ", 1)
+            token = (parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer"
+                     else "")
+        if not token:
+            token = request.query_params.get("api_key", "")
+        info = settings.api_keys.get(token) if token else None
+        if not info or not info.get("mask_pii"):
+            return response
+        if not response.headers.get("content-type", "").startswith("application/json"):
+            return response
+        from ..content import masking  # noqa: PLC0415
+
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        try:
+            data = json.loads(body) if body else None
+        except (TypeError, ValueError):
+            data = None
+        if data is None:
+            return Response(content=body, status_code=response.status_code,
+                            headers=dict(response.headers),
+                            media_type=response.media_type)
+        new_body = json.dumps(masking.mask_payload(data), ensure_ascii=False).encode("utf-8")
+        headers = {k: v for k, v in response.headers.items()
+                   if k.lower() not in ("content-length",)}
+        return Response(content=new_body, status_code=response.status_code,
+                        headers=headers, media_type="application/json")
 
     @app.middleware("http")
     async def add_timing(request: Request, call_next):

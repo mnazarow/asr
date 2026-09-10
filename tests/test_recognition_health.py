@@ -740,3 +740,134 @@ def test_the_scheduler_samples_once_a_day_and_the_agreement_verdict_follows_grow
                                               "wer_avg": 0.16, "previous_wer_avg": 0.1})
     assert "Согласие моделей: критично — расхождение 10 % → 16 % по 6" in текст, текст
     assert review.record_check(db, {"id": "x", "params": {"control_of": "нет"}}, []) is None
+
+
+# ---------------------------------------------------------------------------
+# Маскирование персональных данных
+# ---------------------------------------------------------------------------
+
+
+def test_masking_finds_each_kind_by_form_and_checksum_and_leaves_the_rest():
+    from asrhub.content import masking as M
+
+    текст = ("Мой телефон +7 912 345-67-89, второй 8 (495) 123-45-67, почта ivan@example.com. "
+             "Карта 4111 1111 1111 1111, СНИЛС 112-233-445 95, ИНН 7707083893, "
+             "ИНН физлица 500100732259. Паспорт 45 12 345678, серия 4512 номер 345678. "
+             "Дата рождения 12.05.1980, родился 5 марта 1980 года, д.р. 01.01.2000. "
+             "Договор номер 1234567890 от 12.05.2024 на сумму 10000 рублей, код 1234.")
+    assert M.count(текст) == {"phone": 2, "email": 1, "card": 1, "snils": 1, "inn": 2,
+                             "passport": 2, "birthdate": 3}
+    маска = M.mask_text(текст)
+    for пометка in M.ПОМЕТКИ.values():
+        assert пометка in маска, пометка
+    # Что не персональные данные — остаётся: договор, дата документа, сумма, код.
+    assert "1234567890" in маска and "12.05.2024" in маска and "10000" in маска and "1234" in маска
+    # Ни одной цифры искомого не просочилось.
+    for кусок in ("912", "345-67-89", "4111", "233-445", "7707083893", "500100732259",
+                  "45 12 345678", "4512 номер 345678", "12.05.1980", "01.01.2000",
+                  "example.com"):
+        assert кусок not in маска, кусок
+
+    # Контрольные суммы: неверная — не карта, не СНИЛС, не ИНН.
+    assert M.luhn("4111111111111111") and not M.luhn("4111111111111112")
+    assert M.snils_ok("11223344595") and not M.snils_ok("11223344596")
+    assert not M.snils_ok("00100199800")            # ниже 001-001-998 не проверяется
+    # Особые случаи суммы: ровно 100 и 101 дают 00, больше — остаток от 101.
+    assert M.snils_ok("05023431600") and M.snils_ok("01610339600") and M.snils_ok("82098123300")
+    assert not M.snils_ok("05023431601")
+    assert M.inn_ok("7707083893") and not M.inn_ok("7707083894")
+    assert M.inn_ok("500100732259") and not M.inn_ok("500100732250") and not M.inn_ok("123")
+    assert M.count("карта 4111 1111 1111 1112 и снилс 112-233-445 96 и инн 7707083894") == {}
+    # Паспорт и дата рождения — только рядом с называющим словом.
+    assert M.count("номер 4512 345678 и дата 12.05.1980") == {}
+    # Наложения: цифры, ставшие телефоном, за карту не сходят; пустой текст — пусто.
+    assert M.count("+7 912 345 67 89") == {"phone": 1}
+    assert M.mask_text("") == "" and M.find("") == []
+
+    ответ = {"id": "job_1", "text": "тел +7 912 345-67-89", "file_hash": "a1b2",
+             "phones": ["+79123456789"], "emails": ["a@b.ru"],
+             "numbers": [{"kind": "договор", "number": "12"}],
+             "segments": [{"text": "почта a@b.ru", "confidence": 0.9,
+                           "words": [{"word": "a@b.ru", "confidence": 0.9}]}],
+             "diff": [{"op": "sub", "ref": "ivan@example.com", "hyp": "иван"}]}
+    маскированный = M.mask_payload(ответ)
+    assert маскированный["text"] == "тел [телефон]" and маскированный["id"] == "job_1"
+    assert маскированный["phones"] == ["[телефон]"] and маскированный["emails"] == ["[почта]"]
+    assert маскированный["numbers"] == [{"kind": "договор", "number": "[номер]"}]
+    assert маскированный["segments"][0]["text"] == "почта [почта]"
+    assert маскированный["segments"][0]["words"][0] == {"word": "[почта]", "confidence": 0.9}
+    assert маскированный["diff"][0]["ref"] == "[почта]" and маскированный["diff"][0]["hyp"] == "иван"
+    assert ответ["text"] == "тел +7 912 345-67-89"      # исходное не тронуто
+
+
+def test_a_key_with_the_flag_and_the_export_setting_get_masked_texts(data_dir, monkeypatch):
+    """Ключ с mask_pii видит расшифровку с пометками во всех ответах и
+    выгрузках; настройка export_mask_pii обезличивает выгрузки всем; обычный
+    ключ и интерфейс получают полный текст."""
+    from asrhub.api import create_app
+    from asrhub.config import load
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
+    monkeypatch.setenv("ASRHUB_AUTH_ENABLED", "true")
+    настройки = load()
+    настройки.api_keys.update({
+        "ah_admin_k": {"name": "админ", "role": "admin", "enabled": True},
+        "ah_masked_k": {"name": "аналитик", "role": "user", "enabled": True,
+                        "mask_pii": True},
+    })
+    app = create_app(настройки, start_queue=False)
+    with TestClient(app) as c:
+        админ = {"X-API-Key": "ah_admin_k"}
+        маска = {"X-API-Key": "ah_masked_k"}
+        db = app.state.hub.db
+        текст = "Здравствуйте, мой телефон +7 912 345-67-89, почта ivan@example.com."
+        job_id = db.create_job({"id": "pii1", "filename": "+7 912 345-67-89.wav",
+                                "owner": "аналитик", "model": "demo-simulator",
+                                "engine": "demo", "media_duration_s": 10.0})
+        # Готовый файл результата с полным текстом лежит на диске: обычная
+        # выгрузка отдаёт его как есть, обезличенная обязана строить заново.
+        каталог = Path(app.state.hub.settings.paths.results) / job_id
+        каталог.mkdir(parents=True, exist_ok=True)
+        (каталог / "запись.txt").write_text(текст, encoding="utf-8")
+        db.update_job(job_id, status="completed", text=текст, words_count=8,
+                      result_path=str(каталог))
+        db.save_segments(job_id, [{"start": 0.0, "end": 5.0, "text": текст,
+                                   "words": [{"word": "+79123456789", "confidence": 0.9}]}])
+
+        полный = c.get(f"/api/jobs/{job_id}?with_segments=true", headers=админ).json()
+        assert "+7 912 345-67-89" in полный["text"]
+        скрытый = c.get(f"/api/jobs/{job_id}?with_segments=true", headers=маска).json()
+        assert скрытый["text"] == "Здравствуйте, мой телефон [телефон], почта [почта]."
+        assert скрытый["filename"] == "[телефон].wav"
+        assert скрытый["segments"][0]["text"].count("[телефон]") == 1
+        assert скрытый["segments"][0]["words"][0]["word"] == "[телефон]"
+        assert скрытый["id"] == job_id and скрытый["status"] == "completed"
+        # Список и поиск — тоже.
+        список = c.get("/api/jobs?light=true", headers=маска).json()
+        assert список["items"][0]["filename"] == "[телефон].wav"
+        # Выгрузка ключу с флагом — с пометками во всех форматах.
+        for fmt in ("txt", "srt", "json", "csv", "md"):
+            тело = c.get(f"/api/jobs/{job_id}/download?fmt={fmt}", headers=маска)
+            assert тело.status_code == 200, (fmt, тело.text)
+            assert "345-67-89" not in тело.text and "[телефон]" in тело.text, fmt
+        docx = c.get(f"/api/jobs/{job_id}/download?fmt=docx", headers=маска)
+        assert docx.status_code == 200 and b"345-67-89" not in docx.content
+        # Обычному ключу — полный текст.
+        assert "345-67-89" in c.get(f"/api/jobs/{job_id}/download?fmt=txt", headers=админ).text
+        # Настройка обезличивает выгрузки всем, но ответы API — нет.
+        app.state.hub.settings.set("export_mask_pii", True)
+        assert "[телефон]" in c.get(f"/api/jobs/{job_id}/download?fmt=txt", headers=админ).text
+        assert "345-67-89" in c.get(f"/api/jobs/{job_id}", headers=админ).json()["text"]
+        # Ошибки и не-JSON ответы ключу с флагом приходят как есть.
+        assert c.get("/api/jobs/нет-такого", headers=маска).status_code == 404
+        assert c.get("/api/health", headers=маска).status_code == 200
+        # Ключ с флагом виден в списке, флаг задаётся при создании.
+        ключи = c.get("/api/keys", headers=админ).json()["items"]
+        assert {к["name"]: к["mask_pii"] for к in ключи if к["name"] in ("админ", "аналитик")} \
+            == {"админ": False, "аналитик": True}
+        новый = c.post("/api/keys", json={"name": "интеграция", "role": "user",
+                                          "mask_pii": True}, headers=админ).json()
+        assert новый["mask_pii"] is True
+        assert c.get(f"/api/jobs/{job_id}", headers={"X-API-Key": новый["key"]}).status_code == 403

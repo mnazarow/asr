@@ -6687,7 +6687,9 @@ RENDERERS.system = {
             <select id="key-role" style="width:130px">
               <option value="user">user</option><option value="admin">admin</option>
               <option value="readonly">readonly</option></select>
-            <button class="primary sm" id="key-create">Создать</button></div>`)}
+            <button class="primary sm" id="key-create">Создать</button></div>
+          <label class="small dim" style="display:flex;gap:6px;align-items:center;margin-top:6px">
+            <input type="checkbox" id="key-mask"> обезличивать ответы: телефоны, почта, карты, паспорт, СНИЛС, ИНН, даты рождения — пометками</label>`)}
 
         ${card('Учётные записи', 'для людей: вход по логину и паролю',
           '<div id="users-body"></div>' +
@@ -6739,7 +6741,8 @@ RENDERERS.system = {
       if (!name) { toast('Укажите название ключа', 'warn'); return; }
       try {
         const r = await API.post('/api/keys',
-          { name, role: qs('#key-role').value, rate_limit: 0 });
+          { name, role: qs('#key-role').value, rate_limit: 0,
+            mask_pii: !!(qs('#key-mask') && qs('#key-mask').checked) });
         prompt('Сохраните ключ — он показывается один раз:', r.key);
         this.loadKeys();
       } catch (err) { fail(err); }
@@ -6784,7 +6787,8 @@ RENDERERS.system = {
         ${data.items.map((k) => `<tr>
           <td class="mono small">${esc(k.key_preview)}</td>
           <td>${esc(k.name || '')}</td>
-          <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span></td>
+          <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span>${
+            k.mask_pii ? ' <span class="chip" title="персональные данные в ответах заменяются пометками">обезличен</span>' : ''}</td>
           <td><button class="ghost sm danger"
             onclick="__asrhub.revokeKey('${esc(k.key_id || '')}')">отозвать</button>
           </td></tr>`).join('')}</tbody></table>`

@@ -667,7 +667,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:20603",
+  "instance": "vm:24077",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1245,7 +1245,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789045559.4821851,
+    "generated_at": 1789046109.0695496,
     "jobs": {
       "total": 226,
       "completed": 226,
@@ -1447,7 +1447,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 1242.5,
+  "uptime_s": 66.6,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1491,8 +1491,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 2,
-    "WARNING": 2
+    "INFO": 2
   }
 }
 ```
@@ -1527,7 +1526,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 1242.5,
+  "uptime_s": 66.6,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1536,7 +1535,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.9,
+    "ram_available_gb": 6.8,
     "disk_free_gb": 12.4,
     "gpus": [],
     "accelerator": "cpu",

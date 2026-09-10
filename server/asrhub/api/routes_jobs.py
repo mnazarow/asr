@@ -599,7 +599,12 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
             f"Неизвестный формат «{fmt}».",
             hint="Доступные форматы: " + ", ".join(export_mod.FORMATS)))
 
-    if result_dir is not None and result_dir.is_dir():
+    # Обезличенная выгрузка — настройкой для всех или флагом у ключа:
+    # готовые файлы результата содержат полный текст, поэтому такая
+    # выгрузка всегда строится заново из сегментов, с масками.
+    маскировать = bool(state.settings.get("export_mask_pii")) or principal.mask_pii
+
+    if result_dir is not None and result_dir.is_dir() and not маскировать:
         try:
             base = result_dir.resolve(strict=True)
         except OSError:
@@ -635,6 +640,10 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
                     "words": job.get("words_count"),
                     "avg_confidence": job.get("avg_confidence")},
     }
+    if маскировать:
+        from ..content import masking  # noqa: PLC0415
+
+        payload = masking.mask_payload(payload)
     merged = state.settings.merged(job.get("params") or {})
     name = Path(job.get("filename") or job_id).stem
     if fmt == "docx":

@@ -136,6 +136,9 @@ class Principal:
     user_id: str = ""
     #: Пароль требует смены — до неё разрешены только сама смена и выход.
     must_change_password: bool = False
+    #: Ключ получает тексты с замаскированными персональными данными:
+    #: телефоны, почта, карты, паспорт, СНИЛС, ИНН, даты рождения.
+    mask_pii: bool = False
 
     @property
     def is_admin(self) -> bool:
@@ -248,6 +251,7 @@ def authenticate(request: Request,
                      quota_audio_hours_per_day=float(
                          info.get("quota_audio_hours_per_day") or 0),
                      quota_storage_gb=float(info.get("quota_storage_gb") or 0),
+                     mask_pii=bool(info.get("mask_pii")),
                      role=str(info.get("role") or "user"))
 
 
