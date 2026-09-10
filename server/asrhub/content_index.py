@@ -177,11 +177,65 @@ class ContentIndex:
         if not self.enabled:
             return
         try:
-            self.analyze_job(job_id, job=job, segments=segments)
+            разбор = self.analyze_job(job_id, job=job, segments=segments)
         except Exception as exc:                             # noqa: BLE001
             self.last_error = str(exc)
             log.warning("Разбор содержания задания %s не удался: %s", job_id, exc,
                         extra={"job_id": job_id})
+            return
+        try:
+            self._трекеры(job_id, job, разбор or {})
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Трекеры по заданию %s не сработали: %s", job_id, exc,
+                        extra={"job_id": job_id})
+
+    def _трекеры(self, job_id: str, job: dict[str, Any], разбор: dict[str, Any]) -> None:
+        """Категории с флагом «сообщать»: событие в журнал и вызов наружу.
+
+        Только для свежих записей — при пересчёте архива не срабатывает:
+        трекер отвечает на «сейчас прозвучало», а не на «когда-то было».
+        Отправка наружу идёт отдельным потоком: это поток воркера, и ждать
+        в нём чужой сервер значило бы задерживать следующее задание.
+        """
+        сработали = [и for и in (разбор.get("categories") or {}).get("items") or []
+                     if и.get("count")]
+        уведомлять = {к.id: к for к in self.categories() if к.notify}
+        события = []
+        for и in сработали:
+            к = уведомлять.get(и["id"])
+            if к is None:
+                continue
+            данные = {
+                "job_id": job_id, "category": к.id, "label": к.label, "kind": к.kind,
+                "count": и.get("count"), "first_s": и.get("first_s"),
+                "hits": (и.get("hits") or [])[:3],
+                "filename": job.get("filename"), "owner": job.get("owner"),
+                "created_at": job.get("created_at"),
+            }
+            self.db.add_event(job_id, "tracker",
+                              f"Сработал трекер «{к.label}»: {и.get('count')} совп., "
+                              f"первое на {float(и.get('first_s') or 0):.0f} с", данные)
+            события.append(данные)
+        адрес = str(self.settings.get("tracker_url") or "").strip() if self.settings else ""
+        if события and адрес:
+            # Та же проверка, что у обратного вызова задания: адрес из
+            # настроек уходит в urlopen, и внутренняя сеть для него закрыта.
+            from .job_queue import check_outbound_url  # noqa: PLC0415
+
+            try:
+                check_outbound_url(адрес, bool(self.settings.get("webhook_allow_internal")))
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Адрес трекеров отвергнут: %s", exc)
+                return
+            threading.Thread(target=self._отправить, args=(адрес, события),
+                             name="asrhub-tracker", daemon=True).start()
+
+    @staticmethod
+    def _отправить(адрес: str, события: list[dict[str, Any]]) -> None:
+        from .maintenance import send_json  # noqa: PLC0415
+
+        for событие in события:
+            send_json({"event": "tracker", **событие}, адрес, what="трекер")
 
     def _оценить_качество(self, job_id: str, реплики: list[dict[str, Any]]) -> None:
         """Признаки подозрительной расшифровки — по уже поднятым сегментам."""

@@ -198,6 +198,19 @@ def categories_report(request: Request, period: str = ПЕРИОД,
     return _insights(request).categories(period, owner=scope_owner(principal))
 
 
+@router.get("/drivers", summary="Драйверы негатива")
+def drivers(request: Request, period: str = ПЕРИОД,
+            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Какие категории чаще среднего встречаются в отрицательных разговорах.
+
+    Подъём (lift) — частота категории среди отрицательных разговоров к её
+    частоте вообще; в список попадают категории с подъёмом от 1,25 на
+    десяти записях и больше. Связь, а не причина: тема может быть и
+    следствием плохого разговора.
+    """
+    return _insights(request).drivers(period, owner=scope_owner(principal))
+
+
 @router.post("/categories/check", summary="Проверить набор категорий на записи")
 def categories_check(request: Request, body: dict[str, Any] = Body(default={}),
                      principal: Principal = Depends(authenticate)) -> dict[str, Any]:

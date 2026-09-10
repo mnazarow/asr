@@ -51,6 +51,13 @@ log = get_logger("insights")
 #: сравнивать группу с остальными», здесь «есть ли о чём говорить вообще».
 МИН_КОРПУСА = 10
 
+#: Драйверы негатива: категория попадает в список, когда среди отрицательных
+#: разговоров она встречается заметно чаще, чем вообще, — подъём (lift) от
+#: 1,25, — и на достаточном числе записей. Десять — тот же порог, что у
+#: выводов по группам: на трёх записях подъём в два раза — это одна запись.
+МИН_ДРАЙВЕРА = 10
+ПОДЪЁМ = 1.25
+
 #: Сколько записей берётся на расчёт связей. Коэффициент по двадцати тысячам
 #: отличается от коэффициента по ста тысячам в третьем знаке — при пороге в
 #: две десятых это не имеет значения.
@@ -156,6 +163,9 @@ log = get_logger("insights")
     "owner": {"title": "Владелец"},
     "speaker": {"title": "Оператор"},
     "tag": {"title": "Метка", "multi": True},
+    # Запись про оплату и доставку входит в обе группы: суммы по разрезу
+    # больше числа записей, и это не ошибка — так же, как у меток.
+    "category": {"title": "Категория обращения"},
     "model": {"title": "Модель"},
     "engine": {"title": "Движок"},
     "language": {"title": "Язык"},
@@ -174,6 +184,7 @@ _ДНИ = ("воскресенье", "понедельник", "вторник",
 #: выгрузке были одни и те же.
 РАЗРЕЗЫ_ВЫВОДОВ: dict[str, str] = {
     "owner": "владельца", "speaker": "оператора", "tag": "метки",
+    "category": "категории",
 }
 
 #: Разрезы, которые выводам нужны целиком: три сравниваемых с общим средним
@@ -248,6 +259,9 @@ _ДНИ = ("воскресенье", "понедельник", "вторник",
     "profanity": {"title": "Нецензурная лексика в разговоре",
                   "order": "c.profanity DESC",
                   "where": "COALESCE(c.profanity,0) > 0"},
+    "objections": {"title": "Возражения без отработки",
+                   "order": "c.objections_unhandled DESC, c.objections DESC",
+                   "where": "COALESCE(c.objections_unhandled,0) > 0"},
 }
 
 
@@ -389,6 +403,14 @@ class Insights:
             "profanity_records": int(строка.get("profanity_records") or 0),
             "profanity_agent_records": int(строка.get("profanity_agent_records") or 0),
             "profanity_checked": int(строка.get("profanity_checked") or 0),
+            "objections": int(строка.get("objections") or 0),
+            "objections_unhandled": int(строка.get("objections_unhandled") or 0),
+            "objections_checked": int(строка.get("objections_checked") or 0),
+            # Доля возражений без отработки — от возражений в записях, где
+            # отработку было чем считать; None, когда таких записей нет.
+            "objections_unhandled_share": (
+                _процент(строка.get("objections_unhandled"), строка.get("objections"))
+                if int(строка.get("objections_checked") or 0) else None),
         }
         for признак in ПРИЗНАКИ:
             ключ = признак["key"]
@@ -426,12 +448,17 @@ class Insights:
             since=начало, owner=owner, group_by=dimension, limit=запас)
         группы = (self._развернуть_метки(строки) if описание.get("multi")
                   else [(str(с.get("group_key")), с) for с in строки])
+        подписи = self._подписи_категорий() if dimension == "category" else {}
         items = []
         for ключ, строка in группы:
             свод = self._свод(строка)
             if свод["records"] < МИН_ГРУППА and not описание.get("ordered"):
                 continue
-            items.append({"key": ключ, "label": self._подпись(dimension, ключ), **свод})
+            items.append({"key": ключ,
+                          "label": подписи.get(ключ, {}).get("label")
+                          or self._подпись(dimension, ключ),
+                          **({"kind": подписи[ключ]["kind"]} if ключ in подписи else {}),
+                          **свод})
         отсеяно = len(группы) - len(items)
         if описание.get("ordered"):
             items.sort(key=lambda з: self._ключ_порядка(dimension, з["key"]))
@@ -480,6 +507,14 @@ class Insights:
                 цель[имя] = (цель[имя] / вес) if вес and имя in цель else None
             out.append((метка, цель))
         return out
+
+    def _подписи_категорий(self) -> dict[str, dict[str, str]]:
+        """Имя категории -> подпись и вид, по действующему набору."""
+        from .content import categories as категории_модуль  # noqa: PLC0415
+
+        набор = (self.index.categories() if self.index
+                 else категории_модуль.compile(категории_модуль.ГОТОВЫЕ))
+        return {к.id: {"label": к.label, "kind": к.kind} for к in набор}
 
     @staticmethod
     def _подпись(dimension: str, ключ: str) -> str:
@@ -647,10 +682,17 @@ class Insights:
         угасают = sorted((з for з in items if (з["delta"] or 0) <= -5
                           and (з["previous"] or 0) >= МИН_ГРУППА),
                          key=lambda з: з["delta"])
+        # Срабатывания трекеров — по журналу событий; подпись берём из
+        # действующего набора, а у переименованной с тех пор — из события.
+        подписи_набора = {к.id: к.label for к in набор}
+        трекеры = self.db.tracker_hits(since=начало)
+        for т in трекеры:
+            т["label"] = подписи_набора.get(т["category"], т.get("label") or т["category"])
         return {"period": period, "corpus": n_сейчас, "corpus_previous": n_раньше,
                 "items": items, "rising": [з["id"] for з in растут],
                 "fading": [з["id"] for з in угасают],
                 "uncategorized": self._без_категории(начало, owner, n_сейчас),
+                "trackers": трекеры,
                 "own": bool(self.index and self.index.categories_own()),
                 "kinds": категории_модуль.ВИДЫ, "who": категории_модуль.КТО}
 
@@ -676,6 +718,63 @@ class Insights:
             "delta": (round(доля - доля_было, 1)
                       if доля is not None and доля_было is not None else None),
         }
+
+    def drivers(self, period: str = "week",
+                owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Драйверы негатива: какие категории тянут разговоры вниз.
+
+        Подъём (lift) — частота категории среди отрицательных разговоров,
+        делённая на её частоту вообще: 2,0 значит «в отрицательных эта тема
+        встречается вдвое чаще». Это то, что у Verint называется Cross
+        Correlation, и то, ради чего категории и заводят: «доставка» сама по
+        себе — тема, «доставка в каждом втором отрицательном разговоре» —
+        причина. Связь, не причина в строгом смысле: категория может быть
+        и следствием — «эскалация» чаще в отрицательных потому, что
+        разговор уже отрицательный.
+        """
+        from .content import categories as категории_модуль  # noqa: PLC0415
+
+        начало = self.window(period)[0]
+        свод = self.summary(period, owner)
+        оценено = int(свод.get("scored") or 0)
+        отрицательных = int(свод.get("negative") or 0)
+        подписи = self._подписи_категорий()
+        строки = self.db.category_counts(since=начало, owner=owner)
+        items = []
+        for с in строки:
+            n = int(с.get("scored") or 0)
+            neg = int(с.get("negative") or 0)
+            if n < МИН_ДРАЙВЕРА or not оценено or not отрицательных:
+                continue
+            доля_вообще = n / оценено
+            доля_в_отриц = neg / отрицательных
+            подъём = round(доля_в_отриц / доля_вообще, 2) if доля_вообще else None
+            описание = подписи.get(с["category"], {})
+            items.append({
+                "id": с["category"],
+                "label": описание.get("label") or с["category"],
+                "kind": описание.get("kind") or с.get("kind") or "topic",
+                "records": n, "negative": neg,
+                "negative_share": _процент(neg, n),
+                "share": _процент(n, оценено),
+                "share_in_negative": _процент(neg, отрицательных),
+                "lift": подъём,
+                "kind_title": категории_модуль.ВИДЫ.get(
+                    описание.get("kind") or с.get("kind") or "topic"),
+            })
+        вниз = sorted((з for з in items if (з["lift"] or 0) >= ПОДЪЁМ),
+                      key=lambda з: -з["lift"])
+        вверх = sorted((з for з in items if з["lift"] is not None
+                        and з["lift"] <= 1 / ПОДЪЁМ),
+                       key=lambda з: з["lift"])
+        return {"period": period, "scored": оценено, "negative": отрицательных,
+                "negative_share": свод.get("negative_share"),
+                "min_records": МИН_ДРАЙВЕРА, "lift_threshold": ПОДЪЁМ,
+                "items": sorted(items, key=lambda з: -(з["lift"] or 0)),
+                "down": вниз, "up": вверх,
+                "note": ("Подъём — во сколько раз категория чаще среди отрицательных "
+                         "разговоров, чем вообще. Связь, а не причина: тема может "
+                         "быть и следствием плохого разговора.")}
 
     def _без_категории(self, начало: float | None, owner: Any,
                        всего: int) -> dict[str, Any] | None:
@@ -749,7 +848,8 @@ class Insights:
                  *, свод: dict[str, Any] | None = None,
                  прошлый: dict[str, Any] | None = None,
                  разрезы: dict[str, Any] | None = None,
-                 категории: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                 категории: dict[str, Any] | None = None,
+                 драйверы: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Готовые выводы: правила с порогами, а не пересказ цифр.
 
         Каждый вывод несёт уровень внимания и числа, из которых сделан.
@@ -955,6 +1055,31 @@ class Insights:
                      f"({к['previous']} → {к['records']})",
                      metric="category", value=к["share"], previous=к["share_previous"],
                      group=к["label"], dimension="category")
+        # Возражения без отработки — когда отработку было чем считать.
+        доля_без_ответа = свод.get("objections_unhandled_share")
+        if (доля_без_ответа is not None and доля_без_ответа >= 30
+                and int(свод.get("objections") or 0) >= МИН_ГРУППА):
+            добавить("warning",
+                     f"Возражения клиентов остаются без отработки: "
+                     f"{свод['objections_unhandled']} из {свод['objections']} "
+                     f"({доля_без_ответа}%) — за «дорого» и «подумаю» в следующих "
+                     f"репликах не прозвучало ничего из «отработки»",
+                     metric="objections_unhandled_share", value=доля_без_ответа)
+        # Драйвер негатива — одна строка про самый сильный подъём.
+        if драйверы is None:
+            try:
+                драйверы = self.drivers(period, owner)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Драйверы для выводов не посчитаны: %s", exc)
+                драйверы = {}
+        for д in (драйверы.get("down") or [])[:1]:
+            добавить("warning",
+                     f"Разговоры про «{д['label']}» отрицательные чаще других: "
+                     f"{д['negative_share']}% против {драйверы.get('negative_share')}% "
+                     f"в среднем — в {д['lift']} раза чаще среди отрицательных "
+                     f"({д['negative']} из {д['records']})",
+                     metric="lift", value=д["lift"], group=д["label"],
+                     dimension="category")
         без = категории.get("uncategorized") or {}
         if без.get("share") is not None and без["share"] >= 50 and по_имени:
             добавить("info",
@@ -1007,8 +1132,9 @@ class Insights:
     # --- полный отчёт -----------------------------------------------------
 
     def report(self, period: str = "week", owner: str | list[str] | None = None,
-               *, dimensions: tuple[str, ...] = ("owner", "speaker", "tag", "model",
-                                                 "source", "label", "weekday", "hour"),
+               *, dimensions: tuple[str, ...] = ("owner", "speaker", "tag", "category",
+                                                 "model", "source", "label", "weekday",
+                                                 "hour"),
                ) -> dict[str, Any]:
         """Всё сразу: свод, разрезы, темы, связи, выводы и что послушать."""
         начало_счёта = time.time()
@@ -1018,6 +1144,7 @@ class Insights:
                    if начало is not None else None)
         разрезы = {d: self.breakdown(d, period, owner) for d in dimensions}
         категории = self.categories(period, owner)
+        драйверы = self.drivers(period, owner)
         return {
             "period": period,
             "generated_at": time.time(),
@@ -1031,8 +1158,10 @@ class Insights:
             "topic_trend": self.topic_trend(period, owner),
             "correlations": self.correlations(period, owner),
             "categories": категории,
+            "drivers": драйверы,
             "findings": self.findings(period, owner, свод=свод, прошлый=прошлый,
-                                      разрезы=разрезы, категории=категории),
+                                      разрезы=разрезы, категории=категории,
+                                      драйверы=драйверы),
             "highlights": {k: self.records(k, period, owner, limit=10)
                            for k in ("negative", "downturn", "alerts",
                                      "open_commitments", "script")},

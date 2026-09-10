@@ -23,8 +23,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..db import SCHEMA_VERSION
+from ..logging_setup import get_logger
 from ..pipeline import metrics as M
 from .catalog import METRICS_BY_NAME
+
+log = get_logger("monitoring.collector")
 
 # Границы гистограмм. Подобраны под реальные величины: задания от секунд до
 # часов, запросы к API — от миллисекунд до минуты загрузки файла.
@@ -539,10 +542,27 @@ class Collector:
             ("asrhub_content_monologue_avg", "monologue_s"),
             ("asrhub_content_reply_delay_avg", "reply_delay_s"),
             ("asrhub_content_dead_air_avg", "dead_air_s"),
+            ("asrhub_content_objections_unhandled_share", "objections_unhandled_share"),
         ):
             значение = за_сутки.get(ключ)
             if значение is not None:
                 out.append(Sample(имя, float(значение)))
+        # Категории обращений — по одной метке на категорию: доля записей за
+        # сутки и срабатывания трекеров. Только сработавшие: набор из двухсот
+        # категорий с нулями — это двести рядов, которые никто не смотрит.
+        try:
+            категории = Insights(self.state.db, свод).categories("day")
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Категории для метрик не посчитаны: %s", exc)
+            return
+        for к in категории.get("items") or []:
+            if к.get("records") and к.get("share") is not None:
+                out.append(Sample("asrhub_content_category_share",
+                                  round(float(к["share"]) / 100.0, 4),
+                                  {"category": str(к["id"]), "kind": str(к.get("kind"))}))
+        for т in категории.get("trackers") or []:
+            out.append(Sample("asrhub_content_tracker_hits", float(т.get("hits") or 0),
+                              {"category": str(т["category"])}))
 
     def _runtime_series(self, out: list[Sample]) -> None:
         """Переносит в снимок счётчики и гистограммы, накопленные в памяти."""

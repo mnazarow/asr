@@ -87,6 +87,10 @@ _CONTENT_SCHEMA = """
         repeat_contact    INTEGER,
         profanity         INTEGER,
         profanity_agent   INTEGER,
+        -- Версия 12: возражения клиента и сколько из них без отработки
+        -- (NULL, когда категорий отработки в наборе нет).
+        objections        INTEGER,
+        objections_unhandled INTEGER,
         -- Подробности: сам разбор целиком, как его показывает карточка.
         detail            TEXT
     )
@@ -624,6 +628,8 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "repeat_contact": "INTEGER",
         "profanity": "INTEGER",
         "profanity_agent": "INTEGER",
+        "objections": "INTEGER",
+        "objections_unhandled": "INTEGER",
         "detail": "TEXT",
     },
     "content_hits": {
@@ -1085,6 +1091,8 @@ class Database:
         "repeat": "COALESCE(c.repeat_contact,0) > 0",
         "profanity": "COALESCE(c.profanity,0) > 0",
         "profanity_agent": "COALESCE(c.profanity_agent,0) > 0",
+        "objection_unhandled": "COALESCE(c.objections_unhandled,0) > 0",
+        "objection": "COALESCE(c.objections,0) > 0",
     }
 
     #: Отборы по самому заданию, без соединения с разбором содержания:
@@ -1331,7 +1339,8 @@ class Database:
         "questions, commitments, commitments_dated, alerts, compliance, "
         "money_max, speakers, agent_speaker, overlap_s, dead_air_s, switches, "
         "talk_share, monologue_s, customer_story_s, reply_delay_s, tempo_ratio, "
-        "frustration, repeat_contact, profanity, profanity_agent"
+        "frustration, repeat_contact, profanity, profanity_agent, objections, "
+        "objections_unhandled"
     )
 
     def save_content(self, job_id: str, features: dict[str, Any],
@@ -1540,6 +1549,12 @@ class Database:
         ("profanity_agent_records",
          "SUM(CASE WHEN COALESCE(c.profanity_agent,0) > 0 THEN 1 ELSE 0 END)"),
         ("profanity_checked", "SUM(CASE WHEN c.profanity IS NOT NULL THEN 1 ELSE 0 END)"),
+        # Возражения: всего, без отработки и в скольких записях отработку
+        # вообще было чем считать — без третьего числа второе не прочитать.
+        ("objections", "SUM(COALESCE(c.objections,0))"),
+        ("objections_unhandled", "SUM(COALESCE(c.objections_unhandled,0))"),
+        ("objections_checked",
+         "SUM(CASE WHEN c.objections_unhandled IS NOT NULL THEN 1 ELSE 0 END)"),
     )
 
     #: Как группировать свод. Значение — выражение SQL; None — без
@@ -1596,6 +1611,8 @@ class Database:
         "tempo_ratio": "c.tempo_ratio",
         "frustration": "c.frustration",
         "repeat_contact": "c.repeat_contact",
+        "objections": "c.objections",
+        "objections_unhandled": "c.objections_unhandled",
     }
 
     def _content_where(self, since: float | None, until: float | None,
@@ -1628,17 +1645,25 @@ class Database:
         тоже даёт строку, с нулями и None: разделу нужно показать «записей
         нет», а не свалиться на отсутствующем ключе.
         """
-        выражение = self.CONTENT_GROUPS.get(group_by or "")
-        if group_by and выражение is None:
-            return []
+        # Категория — не колонка записи, а строки таблицы совпадений:
+        # запись про оплату и доставку входит в обе группы, и разрез по
+        # категориям считается через соединение с этой таблицей.
+        соединение = ""
+        if group_by == "category":
+            выражение = "h.category"
+            соединение = " JOIN content_hits h ON h.job_id = c.job_id"
+        else:
+            выражение = self.CONTENT_GROUPS.get(group_by or "")
+            if group_by and выражение is None:
+                return []
         показатели = ", ".join(f"{выр} AS {имя}" for имя, выр in self.CONTENT_METRICS)
         условие, args = self._content_where(since, until, owner)
         начало = f"SELECT {выражение} AS group_key, " if выражение else "SELECT "
         хвост = (f" GROUP BY group_key ORDER BY records DESC LIMIT {int(limit)}"
                  if выражение else "")
         rows = self.query(
-            f"{начало}{показатели} FROM content c JOIN jobs j ON j.id = c.job_id "
-            f"WHERE {условие}{хвост}", args)
+            f"{начало}{показатели} FROM content c JOIN jobs j ON j.id = c.job_id"
+            f"{соединение} WHERE {условие}{хвост}", args)
         return [dict(r) for r in rows]
 
     def category_counts(self, *, since: float | None = None,
@@ -1655,11 +1680,43 @@ class Database:
         условие, args = self._content_where(since, until, owner)
         rows = self.query(
             "SELECT h.category, h.kind, COUNT(*) AS records, "
-            "       SUM(h.count) AS mentions, AVG(h.first_s) AS first_s "
+            "       SUM(h.count) AS mentions, AVG(h.first_s) AS first_s, "
+            # Отрицательные и оценённые записи категории — числитель и
+            # знаменатель для драйверов негатива; порог тот же, что везде.
+            "       SUM(CASE WHEN c.sentiment < -0.15 THEN 1 ELSE 0 END) AS negative, "
+            "       SUM(CASE WHEN c.sentiment IS NOT NULL THEN 1 ELSE 0 END) AS scored "
             "FROM content_hits h JOIN jobs j ON j.id = h.job_id "
+            "LEFT JOIN content c ON c.job_id = h.job_id "
             f"WHERE {условие} GROUP BY h.category, h.kind "
             "ORDER BY records DESC", args)
         return [dict(r) for r in rows]
+
+    def tracker_hits(self, *, since: float | None = None,
+                     until: float | None = None) -> list[dict[str, Any]]:
+        """Срабатывания трекеров за окно — по журналу событий.
+
+        Категория лежит в данных события; группируем по ней прямо в базе.
+        На сборке SQLite без JSON (редкость, но бывает) — пустой список,
+        а не ошибка: сводка от этого не должна пропадать.
+        """
+        where = ["kind='tracker'"]
+        args: list[Any] = []
+        if since:
+            where.append("ts>=?")
+            args.append(since)
+        if until:
+            where.append("ts<?")
+            args.append(until)
+        try:
+            rows = self.query(
+                "SELECT json_extract(data, '$.category') AS category, "
+                "       json_extract(data, '$.label') AS label, COUNT(*) AS hits, "
+                "       COUNT(DISTINCT job_id) AS records "
+                f"FROM events WHERE {' AND '.join(where)} "
+                "GROUP BY category ORDER BY hits DESC", args)
+        except StorageError:
+            return []
+        return [dict(r) for r in rows if r["category"]]
 
     def uncategorized_count(self, *, since: float | None = None,
                             until: float | None = None,

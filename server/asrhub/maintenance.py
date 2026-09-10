@@ -241,6 +241,7 @@ def _digest_content(insights: Any, settings: Any,
                                    "previous", "share_previous", "delta")}
             for з in (категории.get("items") or []) if з.get("records")][:5],
         "uncategorized": категории.get("uncategorized"),
+        "trackers": категории.get("trackers") or [],
         "coverage": insights.index.status() if insights.index else {},
         "highlights": {вид: [
             {к: з.get(к) for к in ("job_id", "filename", "owner", "sentiment",
@@ -346,15 +347,24 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         if без.get("records"):
             строки.append(f"Без категории: {без['records']} записей "
                           f"({число(без.get('share'))} %)")
+        if свод.get("objections") and свод.get("objections_unhandled_share") is not None:
+            строки.append(f"Возражений без отработки: {свод.get('objections_unhandled') or 0} "
+                          f"из {свод['objections']} "
+                          f"({число(свод['objections_unhandled_share'])} %)")
+        трекеры = (содержание or {}).get("trackers") or []
+        if трекеры:
+            строки.append("Трекеры: " + ", ".join(
+                f"{т.get('label')} — {т.get('hits')} в {т.get('records')} записях"
+                for т in трекеры[:5]))
         for вывод in ((содержание or {}).get("findings") or [])[:3]:
             метка = {"warning": "!", "good": "+"}.get(вывод.get("severity"), "·")
             строки.append(f"  {метка} {вывод.get('text')}")
     return "\n".join(строки)
 
 
-def send_digest(digest: dict[str, Any], url: str) -> bool:
-    """Отправляет сводку на заданный адрес."""
-    тело = json.dumps(digest, ensure_ascii=False).encode("utf-8")
+def send_json(payload: dict[str, Any], url: str, *, what: str = "сводка") -> bool:
+    """Отправляет JSON на заданный адрес; сбой — в журнал, не наружу."""
+    тело = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
         # Сборка запроса — тоже внутри: негодный адрес в настройках
         # («без схемы», опечатка) роняет уже конструктор, и без этого
@@ -364,13 +374,18 @@ def send_digest(digest: dict[str, Any], url: str) -> bool:
             headers={"Content-Type": "application/json; charset=utf-8",
                      "User-Agent": "ASR Hub"})
         with urllib.request.urlopen(запрос, timeout=DIGEST_TIMEOUT) as ответ:  # noqa: S310
-            log.info("Сводка отправлена на %s: код %s", url, ответ.status)
+            log.info("%s: отправлено на %s, код %s", what.capitalize(), url, ответ.status)
             return True
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        # Сбой отправки никогда не влияет на работу сервера: сводка — это
-        # удобство, а не часть обработки заданий.
-        log.warning("Сводку отправить не удалось (%s): %s", url, exc)
+        # Сбой отправки никогда не влияет на работу сервера: сводка и
+        # трекеры — удобство, а не часть обработки заданий.
+        log.warning("%s: отправить не удалось (%s): %s", what.capitalize(), url, exc)
         return False
+
+
+def send_digest(digest: dict[str, Any], url: str) -> bool:
+    """Отправляет сводку на заданный адрес."""
+    return send_json(digest, url, what="сводка")
 
 
 def run_scheduled(db: Any, settings: Any, analytics: Any,

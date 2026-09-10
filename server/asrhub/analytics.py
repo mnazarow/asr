@@ -1104,6 +1104,8 @@ class Analytics:
          "Пауза оператора перед ответом, секунд"),
         ("content_dead_air_avg", "dead_air_s",
          "Заметная тишина (паузы от 3 с), секунд на запись"),
+        ("content_objections_unhandled_share", "objections_unhandled_share",
+         "Доля возражений клиента без отработки, процентов"),
     )
 
     def _prometheus_content(self, insights: Any, add: Any) -> None:
@@ -1133,3 +1135,25 @@ class Analytics:
             "Записей архива, для которых разбор посчитан")
         add("content_pending", состояние.get("pending"), "",
             "Записей архива, ожидающих разбора")
+        # Категории обращений — по метке на категорию с хотя бы одной записью
+        # за сутки, и срабатывания трекеров по журналу событий.
+        try:
+            категории = insights.categories("day")
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Метрики категорий не собраны: %s", exc)
+            return
+        # Пояснение — только у первой строки метрики: HELP и TYPE в формате
+        # Prometheus стоят один раз на имя, а не на каждую метку.
+        первая = True
+        for к in категории.get("items") or []:
+            if к.get("records") and к.get("share") is not None:
+                add("content_category_share", round(float(к["share"]) / 100.0, 4),
+                    f'category="{к["id"]}",kind="{к.get("kind")}"',
+                    "Доля разобранных записей за сутки в категории обращения"
+                    if первая else "")
+                первая = False
+        первая = True
+        for т in категории.get("trackers") or []:
+            add("content_tracker_hits", т.get("hits"), f'category="{т["category"]}"',
+                "Срабатываний трекера за сутки" if первая else "")
+            первая = False

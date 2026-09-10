@@ -46,7 +46,10 @@ from .stemmer import sentences, stem, words
 #: 3 — категории обращений по правилам (И / ИЛИ / НЕ / РЯДОМ, кто сказал,
 #: где в разговоре) с таблицей совпадений; скрипт разговора проверяется
 #: тем же движком правил.
-VERSION = 3
+#:
+#: 4 — возражения клиента и их отработка (пара категорий «возражение» —
+#: «отработка», окно в три реплики), в готовом наборе появилась эта пара.
+VERSION = 4
 
 _НЕЦЕНЗУРНЫЕ = re.compile("|".join(НЕЦЕНЗУРНЫЕ_КОРНИ))
 
@@ -383,6 +386,11 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
         "profanity_agent": ((разбор.get("profanity") or {}).get("agent")
                             if (разбор.get("profanity") or {}).get("enabled") else None),
         "hits": категории_модуль.for_db(разбор.get("categories") or {}),
+        # Возражения клиента и сколько из них остались без отработки; NULL,
+        # когда в наборе нет категорий отработки — считать было нечем.
+        "objections": ((разбор.get("categories") or {}).get("objections") or {}).get("count"),
+        "objections_unhandled": ((разбор.get("categories") or {}).get("objections")
+                                 or {}).get("unhandled"),
         "detail": разбор,
     }
     return свод, основы

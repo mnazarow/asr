@@ -2362,6 +2362,8 @@ RENDERERS.results = {
             <option value="suspect">подозрительная расшифровка</option>
             <option value="hallucination">похоже на галлюцинацию</option>
             <option value="speakers_mismatch">говорящих не столько, сколько ожидалось</option>
+            <option value="objection_unhandled">возражение без отработки</option>
+            <option value="objection">с возражениями клиента</option>
           </select>
           <select id="r-order" style="width:190px">
             <option value="created_at DESC">Сначала новые</option>
@@ -2919,6 +2921,7 @@ async function loadJobAnalysis(backdrop, job) {
   const повторное = a.repeat_contact || {};
   const мат = a.profanity || {};
   const категории = a.categories || { items: [], matched: [], checked: 0 };
+  const возражения = категории.objections || { items: [], count: 0, unhandled: null };
 
   const реплика = (з, доп) => `<div class="analysis-line" data-start="${з.start_s || 0}">
     <span class="ts mono">${fmtDur(з.start_s || 0)}</span>
@@ -3015,6 +3018,15 @@ async function loadJobAnalysis(backdrop, job) {
          return [...поРепликам.values()].slice(0, 2).map((h) =>
            реплика(h, `${к.label}: ${h.слова.join(', ')}`));
        }).join('')}</div>`) : ''}
+
+    ${(возражения.items || []).length ? card(
+      `Возражения клиента${возражения.unhandled === null || возражения.unhandled === undefined
+        ? '' : ` — без отработки ${возражения.unhandled} из ${возражения.count}`}`,
+      возражения.unhandled === null || возражения.unhandled === undefined
+        ? 'в наборе нет категорий «отработка возражения» — считать, было ли отвечено, нечем'
+        : 'отработкой считается реплика из категории «отработка» в следующих трёх репликах',
+      `<div class="analysis-lines">${(возражения.items || []).map((в) => реплика(в,
+        в.handled === false ? 'без отработки' : в.handled ? 'отработано' : в.matched)).join('')}</div>`) : ''}
 
     ${(тревога.items || []).length ? card('Тревожные упоминания',
       'суд, жалоба, огласка — повод послушать запись целиком',
@@ -3924,6 +3936,7 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
   monologue: 'monologue', mixed: 'mixed', dead_air: 'dead_air',
   frustrated: 'frustrated', repeat: 'repeat',
   profanity_agent: 'profanity_agent', profanity: 'profanity',
+  objections: 'objection_unhandled',
 };
 
 const CONTENT_TABS = [
@@ -4181,8 +4194,13 @@ RENDERERS.content = {
         ${kpi('Повторные обращения', num(c.repeat),
               c.repeat_share === null ? 'по репликам клиента'
                 : `${num(c.repeat_share, 1)}% записей — «уже звонил», «до сих пор не»`)}
-        ${kpi('Противоречивых', num(c.mixed),
-              'и резкие, и тёплые реплики в одном разговоре')}
+        ${kpi('Возражений без отработки',
+              c.objections_unhandled_share === null || c.objections_unhandled_share === undefined
+                ? '—' : num(c.objections_unhandled),
+              c.objections_unhandled_share === null || c.objections_unhandled_share === undefined
+                ? (c.objections ? `возражений ${num(c.objections)}; отработку считать нечем — в наборе нет категорий «отработка»`
+                                : 'возражений клиента за период нет')
+                : `${num(c.objections_unhandled_share, 1)}% из ${num(c.objections)} — за «дорого» и «подумаю» не последовало отработки`)}
         ${kpi('Мат у сотрудника',
               c.profanity_checked ? num(c.profanity_agent_records) : '—',
               c.profanity_checked
@@ -4258,7 +4276,7 @@ RENDERERS.content = {
 
   async tab_groups(host) {
     const период = state.contentPeriod;
-    const разрезы = ['owner', 'speaker', 'tag', 'model', 'source', 'weekday', 'hour'];
+    const разрезы = ['owner', 'speaker', 'tag', 'category', 'model', 'source', 'weekday', 'hour'];
     const данные = await Promise.all(разрезы.map((d) =>
       API.latest(`content-b-${d}`, `/api/content/breakdown/${d}?period=${период}`)
         .catch(() => ({ items: [] }))));
@@ -4276,7 +4294,8 @@ RENDERERS.content = {
           <th class="num" title="доля времени речи оператора; ориентир 40–60 %">Речь опер.</th>
           <th class="num" title="средний самый долгий монолог оператора, секунд">Монолог</th></tr></thead>
         <tbody>${items.map((г) => `<tr>
-          <td>${esc(г.label)}</td>
+          <td>${esc(г.label)}${г.kind && г.kind !== 'topic'
+            ? ` <span class="chip ${КАТЕГОРИЯ_ЦВЕТ[г.kind] || ''}">${esc(КАТЕГОРИЯ_ВИД[г.kind] || г.kind)}</span>` : ''}</td>
           <td class="num mono">${num(г.records)}</td>
           <td class="num">${toneChip(г.sentiment)}</td>
           <td class="num mono">${г.negative_share === null ? '—'
@@ -4313,6 +4332,9 @@ RENDERERS.content = {
              'кто из говорящих вёл разговор; записи без разделения по говорящим ' +
              'попадают в одну группу «—»', таблица(по_ключу.speaker))}
       ${card('По меткам', 'метка задания', таблица(по_ключу.tag))}
+      ${card('По категориям обращений',
+             'запись про оплату и доставку входит в обе группы; средние по категории — против средних по всем',
+             таблица(по_ключу.category))}
       <div class="grid cols-2">
         ${card('По моделям', 'разбор зависит от качества расшифровки', таблица(по_ключу.model))}
         ${card('По источникам', '', таблица(по_ключу.source))}
@@ -4537,11 +4559,13 @@ RENDERERS.content = {
 
 RENDERERS.content.tab_categories = async function (host) {
   const период = state.contentPeriod;
-  const [свод, перечни, перечень] = await Promise.all([
+  const [свод, перечни, перечень, драйверы] = await Promise.all([
     API.latest('content-categories', `/api/content/categories?period=${период}`),
     API.latest('content-kinds', '/api/content/kinds'),
     API.latest('content-script-jobs',
       '/api/jobs?status=completed&limit=25&light=true&order=created_at DESC'),
+    API.latest('content-drivers', `/api/content/drivers?period=${период}`)
+      .catch(() => ({ items: [], down: [], up: [] })),
   ]);
   state.contentCategoriesOwn = !!перечни.categories_own;
   state.contentCategoriesReady = перечни.default_categories || [];
@@ -4558,11 +4582,12 @@ RENDERERS.content.tab_categories = async function (host) {
   state.contentScriptJobs = (перечень.items || []);
   state.contentScriptJob = state.contentScriptJob ||
     (state.contentScriptJobs[0] || {}).id || '';
-  this.drawCategories(host, свод);
+  this.drawCategories(host, свод, драйверы);
   if (state.contentScriptJob) this.checkCategories();
 };
 
-RENDERERS.content.drawCategories = function (host, свод) {
+RENDERERS.content.drawCategories = function (host, свод, драйверы) {
+  драйверы = драйверы || { items: [], down: [], up: [] };
   const набор = state.contentCategories || [];
   const свой = state.contentCategoriesOwn;
   const items = свод.items || [];
@@ -4638,9 +4663,49 @@ RENDERERS.content.drawCategories = function (host, свод) {
         </tr>`).join('')}</tbody></table></div>`
            : '<div class="empty small">За период разобранных записей нет</div>')}
 
+    <div class="grid cols-2">
+      ${card('Что тянет вниз',
+             `подъём — во сколько раз категория чаще среди отрицательных разговоров, чем вообще; ` +
+             `в списке — от ${num(драйверы.lift_threshold || 1.25, 2)} на ${num(драйверы.min_records || 10)} записях и больше`,
+             (драйверы.down || []).length
+               ? `<div class="table-wrap"><table>
+                   <thead><tr><th>Категория</th><th class="num">Записей</th>
+                     <th class="num">Отрицательных</th><th class="num" title="доля отрицательных среди записей категории против средней по всем">Против средней</th>
+                     <th class="num" title="во сколько раз чаще среди отрицательных, чем вообще">Подъём</th></tr></thead>
+                   <tbody>${(драйверы.down || []).map((д) => `<tr>
+                     <td>${esc(д.label)}${д.kind !== 'topic'
+                       ? ` <span class="chip ${КАТЕГОРИЯ_ЦВЕТ[д.kind] || ''}">${esc(КАТЕГОРИЯ_ВИД[д.kind] || '')}</span>` : ''}</td>
+                     <td class="num mono">${num(д.records)}</td>
+                     <td class="num mono">${num(д.negative)}</td>
+                     <td class="num mono">${num(д.negative_share, 1)}% <span class="faint">/ ${num(драйверы.negative_share, 1)}%</span></td>
+                     <td class="num mono"><b>×${num(д.lift, 2)}</b></td></tr>`).join('')}</tbody></table></div>
+                  <p class="small faint" style="margin:8px 0 0">${esc(драйверы.note || '')}</p>`
+               : `<div class="empty small">${драйверы.scored
+                   ? 'Ни одна категория не встречается среди отрицательных разговоров заметно чаще, чем вообще'
+                   : 'За период нет оценённых записей'}</div>`)}
+      ${card('Что держит наверху',
+             'категории, которые среди отрицательных разговоров встречаются заметно реже',
+             (драйверы.up || []).length
+               ? `<div class="table-wrap"><table>
+                   <thead><tr><th>Категория</th><th class="num">Записей</th>
+                     <th class="num">Отрицательных</th><th class="num">Подъём</th></tr></thead>
+                   <tbody>${(драйверы.up || []).map((д) => `<tr>
+                     <td>${esc(д.label)}</td>
+                     <td class="num mono">${num(д.records)}</td>
+                     <td class="num mono">${num(д.negative_share, 1)}%</td>
+                     <td class="num mono">×${num(д.lift, 2)}</td></tr>`).join('')}</tbody></table></div>`
+               : '<div class="empty small">Таких категорий за период нет</div>')}
+    </div>
+
+    ${(свод.trackers || []).length ? card('Трекеры за период',
+      'категории с флагом «сообщать»: срабатывание — событие в журнале и, если задан tracker_url, вызов наружу',
+      `<div class="chips">${(свод.trackers || []).map((т) =>
+        `<span class="chip warn" title="записей: ${num(т.records)}">${esc(т.label)} <b>${num(т.hits)}</b></span>`).join('')}</div>`) : ''}
+
     ${card('Набор категорий',
            'правило: слова и фразы с И, ИЛИ, НЕ, РЯДОМ(N) и скобками; без кавычек — по основам ' +
-           '(«уточнить» найдёт «уточню»), в кавычках — точно. Операторы — заглавными',
+           '(«уточнить» найдёт «уточню»), в кавычках — точно. Операторы — заглавными. ' +
+           'Флаг «сообщать» делает категорию трекером',
            '<div class="script-list" id="cat-list"></div>')}
 
     ${card('Что нашлось в выбранной записи',
@@ -4676,6 +4741,8 @@ RENDERERS.content.drawCategories = function (host, свод) {
                  value="${к.within_s ? esc(String(к.within_s)) : ''}"
                  placeholder="секунд" ${(к.where || 'any') === 'any' ? 'hidden' : ''}
                  title="Окно в секундах от начала или до конца записи; пусто — пятая часть реплик">
+          <label class="small nowrap" title="Трекер: срабатывание — событие в журнале и вызов на tracker_url, сразу после распознавания">
+            <input type="checkbox" class="cat-notify" ${к.notify ? 'checked' : ''}> сообщать</label>
           <button class="ghost icon cat-del" title="Убрать категорию">✕</button>
         </div>
         <input type="text" class="cat-rule mono" style="margin-top:6px"
@@ -4697,6 +4764,7 @@ RENDERERS.content.drawCategories = function (host, свод) {
         if (секунд > 0 && набор[i].where !== 'any') набор[i].within_s = секунд;
         else delete набор[i].within_s;
         набор[i].rule = qs('.cat-rule', узел).value.trim();
+        набор[i].notify = qs('.cat-notify', узел).checked;
         тронуто();
       };
       qsa('input, select', узел).forEach((поле) => {

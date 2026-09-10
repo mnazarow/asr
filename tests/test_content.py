@@ -1203,11 +1203,17 @@ def test_content_metrics_reach_prometheus_and_can_carry_an_alert(tmp_path):
     assert метрики.get("asrhub_content_records") == 40, метрики
     assert "asrhub_content_negative_share" in метрики, метрики
     assert метрики.get("asrhub_content_pending") == 0, метрики
+    # Категории — по метке на категорию, с видом; доля — от нуля до единицы.
+    assert метрики.get('asrhub_content_category_share{category="deadline",kind="topic"}') \
+        == round(14 / 40, 4), метрики
 
     # Каждая выданная метрика описана в каталоге: иначе она не появится ни
-    # в справочнике, ни в списке, по которому пишут правила.
-    неописанные = [и for и in метрики if и not in METRICS_BY_NAME]
+    # в справочнике, ни в списке, по которому пишут правила. Метки — не
+    # часть имени.
+    неописанные = [и for и in метрики if и.split("{")[0] not in METRICS_BY_NAME]
     assert not неописанные, неописанные
+    # HELP и TYPE стоят один раз на имя, а не на каждую метку.
+    assert текст.count("# HELP asrhub_content_category_share") == 1
 
     # И на неё можно поставить порог — правила берутся из того же каталога.
     правила = {r.metric for r in default_rules()}
@@ -2102,14 +2108,15 @@ def test_the_ready_made_categories_parse_and_are_used_when_nothing_is_saved():
     from asrhub.content import categories
 
     assert categories.validate(categories.ГОТОВЫЕ) == []
-    assert len(categories.ГОТОВЫЕ) == 10
-    assert len({к["id"] for к in categories.ГОТОВЫЕ}) == 10
+    assert len(categories.ГОТОВЫЕ) == 12
+    assert len({к["id"] for к in categories.ГОТОВЫЕ}) == 12
+    assert {к["kind"] for к in categories.ГОТОВЫЕ} == {"topic", "objection", "handling"}
     разбор = content.analyze(text="", segments=[
         {"start": 0.0, "end": 4.0, "speaker": "A", "text": "Здравствуйте, компания Ромашка"},
         {"start": 4.0, "end": 9.0, "speaker": "B",
          "text": "Оплата не прошла, а курьер так и не приехал"}])
     assert set(разбор["categories"]["matched"]) == {"payment", "delivery"}
-    assert разбор["categories"]["checked"] == 10
+    assert разбор["categories"]["checked"] == 12
     # Пустой список — «не искать», а не «готовый набор»: так просят
     # выключить категории.
     пусто = content.analyze(text="оплата", categories=[])
@@ -2126,6 +2133,7 @@ def test_the_ready_made_categories_parse_and_are_used_when_nothing_is_saved():
 def test_category_hits_reach_the_database_the_counts_and_the_job_list(tmp_path):
     """Совпадения лежат своей таблицей: по ней считается счёт, динамика и
     отбор списка заданий; удаление задания забирает их с собой."""
+    from asrhub import content
     from asrhub.content_index import ContentIndex
     from asrhub.insights import Insights
 
@@ -2148,7 +2156,7 @@ def test_category_hits_reach_the_database_the_counts_and_the_job_list(tmp_path):
     assert строк == 20, строк
     # «Без категории» — про категории обращений: нарушение оператора в
     # записи не делает её «про что-то».
-    db.save_content("job0001", {"version": 3, "hits": [
+    db.save_content("job0001", {"version": content.VERSION, "hits": [
         {"category": "stop", "kind": "violation", "count": 1, "first_s": 0.0}]})
     assert Insights(db, индекс).categories("all")["uncategorized"]["records"] == 20
 
@@ -2241,7 +2249,7 @@ def test_the_categories_endpoints_check_a_draft_and_report_the_period(
         перечни = c.get("/api/content/kinds", headers=ключ).json()
         assert перечни["categories_own"] is True
         assert [к["id"] for к in перечни["categories"]] == ["pay"]
-        assert len(перечни["default_categories"]) == 10
+        assert len(перечни["default_categories"]) == 12
 
         # Разбор записи — по сохранённому набору; счёт за период видит его.
         c.post(f"/api/content/jobs/{job_id}/recompute", headers=ключ)
@@ -2297,3 +2305,257 @@ def test_categories_reach_the_digest_and_the_export(tmp_path):
     лист = next(и for и in имена if "Категории" in и)
     содержимое = архив.read(лист).decode("utf-8-sig")
     assert "Сроки" in содержимое and "Правило" in содержимое
+
+
+# ---------------------------------------------------------------------------
+# Категории, часть вторая: возражения, драйверы, разрез, трекеры
+# ---------------------------------------------------------------------------
+
+
+def test_an_objection_counts_as_unhandled_only_when_handling_could_be_seen():
+    """«Дорого» без ответа из «отработки» в следующих трёх репликах — без
+    отработки; без категорий отработки в наборе — не считается вовсе."""
+    from asrhub.content import categories
+
+    сегменты = [
+        {"start": 0.0, "end": 3.0, "speaker": "A", "text": "Здравствуйте, компания Ромашка"},
+        {"start": 3.0, "end": 6.0, "speaker": "B", "text": "Это дорого, я подумаю"},
+        {"start": 6.0, "end": 9.0, "speaker": "A", "text": "Понимаю, могу предложить рассрочку"},
+        {"start": 9.0, "end": 12.0, "speaker": "B", "text": "Нет, мне не нужно"},
+        {"start": 12.0, "end": 15.0, "speaker": "A", "text": "Хорошо, всего доброго"},
+        {"start": 15.0, "end": 18.0, "speaker": "B", "text": "До свидания"},
+        {"start": 18.0, "end": 21.0, "speaker": "A", "text": "Спасибо"},
+        {"start": 21.0, "end": 24.0, "speaker": "A", "text": "Понимаю вас"},
+    ]
+    набор = [
+        {"id": "obj", "label": "Возражение", "kind": "objection", "who": "customer",
+         "rule": "дорого ИЛИ подумаю ИЛИ не нужно"},
+        {"id": "hand", "label": "Отработка", "kind": "handling", "who": "agent",
+         "rule": "понимаю ИЛИ могу предложить"},
+    ]
+    итог = categories.apply(сегменты, набор, agent="A", customer="B")
+    в = итог["objections"]
+    # Две реплики с возражениями («дорого, подумаю» — одна), первая отработана
+    # следующей же репликой, вторая — нет: «понимаю вас» на четвёртой после
+    # неё уже не считается.
+    assert в["count"] == 2 and в["unhandled"] == 1, в
+    assert в["items"][0]["handled"] is True and в["items"][0]["matched"] == "дорого, подумаю"
+    assert в["items"][1]["handled"] is False and в["items"][1]["start_s"] == 9.0
+    # Категория отработки сработала сама по себе — это отдельная категория.
+    assert "hand" in итог["matched"]
+
+    # Без отработки в наборе неотработанность неизвестна, а не «все без ответа».
+    без = categories.apply(сегменты, набор[:1], agent="A", customer="B")["objections"]
+    assert без["count"] == 2 and без["unhandled"] is None
+    assert all(в["handled"] is None for в in без["items"])
+
+    # В свод записи уходит и число, и NULL вместо нуля, когда считать нечем.
+    from asrhub import content
+
+    свод, _ = content.features(content.analyze(text="", segments=сегменты, categories=набор))
+    assert свод["objections"] == 2 and свод["objections_unhandled"] == 1
+    свод, _ = content.features(content.analyze(text="", segments=сегменты,
+                                               categories=набор[:1]))
+    assert свод["objections"] == 2 and свод["objections_unhandled"] is None
+
+
+def test_drivers_of_negativity_are_lift_over_the_base_rate(tmp_path):
+    """Подъём — частота среди отрицательных к частоте вообще, на достаточном
+    числе записей; категория благополучных разговоров уходит в «держит наверху»."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, записей=30)
+    настройки = _Настройки(content_categories=[
+        {"id": "deadline", "label": "Сроки", "rule": "срок ИЛИ сорван"},
+        {"id": "contract", "label": "Договор", "rule": "договор"},
+        {"id": "rare", "label": "Редкая", "rule": "суд"},
+    ])
+    # «Суд» есть в каждой плохой записи, но подрежем: у редкой категории
+    # записей меньше порога — она не должна попасть в драйверы.
+    индекс = ContentIndex(db, настройки)
+    while индекс.backfill_once(limit=20):
+        pass
+    db.execute("DELETE FROM content_hits WHERE category='rare' AND job_id > 'job0015'")
+    свод = Insights(db, индекс).drivers("all")
+    по = {д["id"]: д for д in свод["items"]}
+    # 10 плохих записей из 30 — все отрицательные; «Сроки» только в них:
+    # доля вообще 1/3, среди отрицательных 1 → подъём 3.
+    assert свод["scored"] == 30 and свод["negative"] == 10
+    assert по["deadline"]["lift"] == 3.0 and по["deadline"]["negative_share"] == 100.0
+    assert по["contract"]["lift"] == 0.0 and по["contract"]["records"] == 20
+    assert "rare" not in по, по
+    assert [д["id"] for д in свод["down"]] == ["deadline"]
+    assert [д["id"] for д in свод["up"]] == ["contract"]
+    # Вывод называет категорию и оба числа.
+    выводы = Insights(db, индекс).findings("all")
+    строка = next(в for в in выводы if в.get("metric") == "lift")
+    assert "Сроки" in строка["text"] and "в 3.0 раза" in строка["text"], строка
+
+
+def test_the_category_breakdown_carries_labels_kinds_and_overlaps(tmp_path):
+    """Разрез по категориям: подписи из набора, вид, и запись входит во все
+    свои категории, поэтому суммы по разрезу больше числа записей."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import РАЗРЕЗЫ, Insights
+
+    assert "category" in РАЗРЕЗЫ
+    db = _корпус(tmp_path, записей=30)
+    настройки = _Настройки(content_categories=[
+        {"id": "deadline", "label": "Сроки", "rule": "срок ИЛИ сорван"},
+        {"id": "court", "label": "Суд", "rule": "суд", "kind": "violation"},
+        {"id": "contract", "label": "Договор", "rule": "договор"},
+    ])
+    индекс = ContentIndex(db, настройки)
+    while индекс.backfill_once(limit=20):
+        pass
+    разрез = Insights(db, индекс).breakdown("category", "all")
+    по = {г["key"]: г for г in разрез["items"]}
+    assert по["deadline"]["label"] == "Сроки" and по["deadline"]["records"] == 10
+    assert по["court"]["kind"] == "violation" and по["court"]["records"] == 10
+    assert по["contract"]["records"] == 20
+    assert sum(г["records"] for г in разрез["items"]) == 40 > 30
+    assert по["deadline"]["negative_share"] == 100.0 and по["contract"]["negative_share"] == 0.0
+    # Разрез участвует в выводах о группах против среднего.
+    выводы = Insights(db, индекс).findings("all")
+    assert any(в.get("dimension") == "category" and "категории «Сроки»" in в["text"]
+               for в in выводы), [в["text"] for в in выводы]
+
+
+def test_a_tracker_writes_an_event_and_calls_out_only_on_fresh_records(tmp_path):
+    """Категория с флагом «сообщать»: событие в журнале и POST наружу сразу
+    после распознавания; при пересчёте архива — тишина."""
+    import http.server
+    import json
+    import threading
+
+    from asrhub.content_index import ContentIndex
+    from asrhub.db import Database
+    from asrhub.insights import Insights
+
+    принято: list[dict] = []
+    готово = threading.Event()
+
+    class Приёмник(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):                                  # noqa: N802
+            тело = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            принято.append(json.loads(тело))
+            self.send_response(200)
+            self.end_headers()
+            готово.set()
+
+        def log_message(self, *args):
+            pass
+
+    сервер = http.server.HTTPServer(("127.0.0.1", 0), Приёмник)
+    threading.Thread(target=сервер.serve_forever, daemon=True).start()
+    адрес = f"http://127.0.0.1:{сервер.server_port}/hook"
+
+    db = Database(tmp_path / "asrhub.db")
+    job_id = db.create_job({"id": "т1", "filename": "звонок.wav", "owner": "анна",
+                            "media_duration_s": 20.0})
+    db.update_job(job_id, status="completed", finished_at=1.0,
+                  text="Здравствуйте. Позовите руководителя, я буду жаловаться в суд.")
+    сегменты = [{"start": 0.0, "end": 3.0, "speaker": "A", "text": "Здравствуйте."},
+                {"start": 3.0, "end": 9.0, "speaker": "B",
+                 "text": "Позовите руководителя, я буду жаловаться в суд."}]
+    db.save_segments(job_id, сегменты)
+    набор = [{"id": "escalation", "label": "Эскалация", "rule": "руководитель ИЛИ суд",
+              "who": "customer", "notify": True},
+             {"id": "hello", "label": "Приветствие", "rule": "здравствуйте", "notify": False}]
+    try:
+        # Внутренний адрес закрыт той же проверкой, что у обратного вызова:
+        # без разрешения — событие есть, вызова нет.
+        индекс = ContentIndex(db, _Настройки(content_categories=набор, tracker_url=адрес))
+        индекс.on_job_completed(job_id, db.get_job(job_id), сегменты)
+        время_ожидания = готово.wait(1.0)
+        assert not время_ожидания and not принято, принято
+        события = [с for с in db.get_events(job_id) if с["kind"] == "tracker"]
+        assert len(события) == 1 and "Эскалация" in события[0]["message"], события
+        assert события[0]["data"]["category"] == "escalation"
+        assert события[0]["data"]["count"] == 2 and события[0]["data"]["hits"]
+
+        # С разрешением на внутреннюю сеть вызов уходит — с записью и примерами.
+        индекс = ContentIndex(db, _Настройки(content_categories=набор, tracker_url=адрес,
+                                             webhook_allow_internal=True))
+        индекс.on_job_completed(job_id, db.get_job(job_id), сегменты)
+        assert готово.wait(5.0), "вызов наружу не пришёл"
+        assert принято[0]["event"] == "tracker" and принято[0]["category"] == "escalation"
+        assert принято[0]["job_id"] == job_id and принято[0]["filename"] == "звонок.wav"
+        assert принято[0]["hits"][0]["text"].startswith("Позовите")
+
+        # Пересчёт — не срабатывание: событий больше не становится.
+        принято.clear()
+        готово.clear()
+        индекс.analyze_job(job_id)
+        индекс.recompute([job_id])
+        assert not готово.wait(0.5) and not принято
+        assert len([с for с in db.get_events(job_id) if с["kind"] == "tracker"]) == 2
+
+        # Свод видит срабатывания по журналу — и подпись, и число.
+        трекеры = Insights(db, индекс).categories("all")["trackers"]
+        assert трекеры == [{"category": "escalation", "label": "Эскалация",
+                            "hits": 2, "records": 1}], трекеры
+    finally:
+        сервер.shutdown()
+
+
+def test_part_two_reaches_the_endpoints_the_digest_and_the_export(
+        tmp_path, monkeypatch, data_dir):
+    """Ручка драйверов, отбор «возражение без отработки», строки сводки и
+    листы выгрузки."""
+    import io
+    import zipfile
+
+    from asrhub import content
+    from asrhub.content_export import to_csv_zip
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+    from asrhub.maintenance import _digest_content, digest_text
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        ключ = {"X-API-Key": "ah_admin_k"}
+        job_id = db.create_job({"id": "воз", "filename": "x.wav", "owner": "админ",
+                                "media_duration_s": 20.0})
+        db.update_job(job_id, status="completed", finished_at=1.0,
+                      text="Здравствуйте. Это дорого. Всего доброго.")
+        db.save_segments(job_id, [
+            {"start": 0.0, "end": 3.0, "speaker": "A", "text": "Здравствуйте."},
+            {"start": 3.0, "end": 6.0, "speaker": "B", "text": "Это дорого."},
+            {"start": 6.0, "end": 9.0, "speaker": "A", "text": "Всего доброго."}])
+        c.post(f"/api/content/jobs/{job_id}/recompute", headers=ключ)
+        # Готовый набор содержит пару «возражение — отработка»: «дорого» без
+        # ответа — возражение без отработки.
+        список = c.get("/api/jobs?content=objection_unhandled", headers=ключ).json()
+        assert [j["id"] for j in список["items"]] == [job_id]
+        assert c.get("/api/jobs?content=objection", headers=ключ).json()["items"]
+        ответ = c.get("/api/content/drivers?period=all", headers=ключ)
+        assert ответ.status_code == 200 and "note" in ответ.json()
+        записи = c.get("/api/content/records?kind=objections&period=all", headers=ключ).json()
+        assert [з["job_id"] for з in записи["items"]] == [job_id]
+        карточка = c.get(f"/api/content/jobs/{job_id}", headers=ключ).json()
+        assert карточка["analysis"]["categories"]["objections"]["unhandled"] == 1
+
+    db = _корпус(tmp_path, записей=30)
+    индекс = ContentIndex(db, _Настройки())
+    while индекс.backfill_once(limit=20):
+        pass
+    for n in range(3):
+        db.add_event(f"job{n:04d}", "tracker", "Сработал трекер «Эскалация»",
+                     {"category": "escalation", "label": "Эскалация"})
+    db.save_content("job0001", {"version": content.VERSION, "objections": 4,
+                                "objections_unhandled": 3})
+    свод = Insights(db, индекс)
+    содержание = _digest_content(свод, _Настройки(), "all")
+    текст = digest_text({}, {}, {}, содержание=содержание)
+    assert "Возражений без отработки: 3 из 4 (75 %)" in текст, текст
+    assert "Трекеры: Эскалация — 3 в 3 записях" in текст, текст
+    отчёт = свод.report("all")
+    assert отчёт["drivers"]["down"] and отчёт["breakdowns"]["category"]["items"]
+    архив = zipfile.ZipFile(io.BytesIO(to_csv_zip(отчёт, "all")))
+    имена = архив.namelist()
+    assert any("Драйверы" in и for и in имена) and any("По категориям" in и for и in имена)
+    assert "Подъём" in архив.read(next(и for и in имена if "Драйверы" in и)).decode("utf-8-sig")

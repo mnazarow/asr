@@ -69,6 +69,49 @@ STATUS_RETRY = "retry"
 ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY, STATUS_PAUSED)
 
 
+def check_outbound_url(url: str, allow_internal: bool = False) -> str:
+    """Проверяет адрес, на который сервер пойдёт сам: обратный вызов, трекер.
+
+    Адрес приходит из запроса или настроек и уходит в urlopen, поэтому без
+    проверки сервер становится инструментом обращения к внутренней сети от
+    своего имени: file:// читает диск, а http://169.254.169.254 достаёт
+    учётные данные облака. Пропускаем только http и https и запрещаем
+    адреса, которые заведомо указывают внутрь.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ConfigError(
+            f"Адрес уведомления должен начинаться с http:// или https:// "
+            f"(получено «{parsed.scheme or url[:20]}»).",
+            hint="Другие схемы запрещены: через них сервер читал бы "
+                 "собственные файлы вместо отправки уведомления.")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise ConfigError("В адресе уведомления не указан узел.")
+
+    if allow_internal:
+        return url
+
+    lowered = host.lower()
+    if lowered in ("localhost", "localhost.localdomain") or lowered.endswith(".localhost"):
+        raise ConfigError(
+            "Адрес уведомления указывает на сам сервер.",
+            hint="Если это намеренно, включите webhook_allow_internal.")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return url                      # доменное имя — проверять некому
+    if (address.is_loopback or address.is_private or address.is_link_local
+            or address.is_reserved or address.is_multicast):
+        raise ConfigError(
+            f"Адрес уведомления {host} находится во внутренней сети.",
+            hint="Если это намеренно, включите webhook_allow_internal.")
+    return url
+
+
 @dataclass
 class WorkerState:
     index: int
@@ -638,46 +681,8 @@ class JobQueue:
                 self._model_counts[model] = max(0, self._model_counts[model] - 1)
 
     def _check_webhook_url(self, url: str) -> str:
-        """Проверяет адрес уведомления.
-
-        Адрес приходит из запроса и уходит в urlopen, поэтому без проверки
-        сервер становится инструментом обращения к внутренней сети от своего
-        имени: file:// читает диск, а http://169.254.169.254 достаёт учётные
-        данные облака. Пропускаем только http и https и запрещаем адреса,
-        которые заведомо указывают внутрь.
-        """
-        import ipaddress
-        from urllib.parse import urlparse
-
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            raise ConfigError(
-                f"Адрес уведомления должен начинаться с http:// или https:// "
-                f"(получено «{parsed.scheme or url[:20]}»).",
-                hint="Другие схемы запрещены: через них сервер читал бы "
-                     "собственные файлы вместо отправки уведомления.")
-        host = (parsed.hostname or "").strip()
-        if not host:
-            raise ConfigError("В адресе уведомления не указан узел.")
-
-        if self.settings.get("webhook_allow_internal", False):
-            return url
-
-        lowered = host.lower()
-        if lowered in ("localhost", "localhost.localdomain") or lowered.endswith(".localhost"):
-            raise ConfigError(
-                "Адрес уведомления указывает на сам сервер.",
-                hint="Если это намеренно, включите webhook_allow_internal.")
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            return url                      # доменное имя — проверять некому
-        if (address.is_loopback or address.is_private or address.is_link_local
-                or address.is_reserved or address.is_multicast):
-            raise ConfigError(
-                f"Адрес уведомления {host} находится во внутренней сети.",
-                hint="Если это намеренно, включите webhook_allow_internal.")
-        return url
+        """Проверяет адрес уведомления — см. `check_outbound_url`."""
+        return check_outbound_url(url, bool(self.settings.get("webhook_allow_internal", False)))
 
     def _check_disk_space(self) -> None:
         """Отказывает в приёме, пока на диске меньше порога свободного места.

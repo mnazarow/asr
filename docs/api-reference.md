@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **102**, операций: **112**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **103**, операций: **113**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -136,6 +136,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/content/categories` | Категории обращений: счёт и динамика | любой действующий ключ |
 | `POST` | `/api/content/categories/check` | Проверить набор категорий на записи | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/content/correlations` | Связи между признаками | любой действующий ключ |
+| `GET` | `/api/content/drivers` | Драйверы негатива | любой действующий ключ |
 | `GET` | `/api/content/export` | Выгрузка отчёта в таблицу | любой действующий ключ |
 | `GET` | `/api/content/findings` | Готовые выводы | любой действующий ключ |
 | `GET` | `/api/content/jobs/{job_id}` | Разбор одной записи | любой действующий ключ |
@@ -652,7 +653,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:7066",
+  "instance": "vm:5545",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -661,7 +662,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 2000,
+    "completed": 2048,
     "failed": 0,
     "cancelled": 0
   },
@@ -1230,10 +1231,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789026306.9679801,
+    "generated_at": 1789028456.6340363,
     "jobs": {
-      "total": 209,
-      "completed": 209,
+      "total": 230,
+      "completed": 230,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1241,36 +1242,36 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 5997.7,
-      "audio_hours": 1.67,
-      "processing_seconds": 0.0,
-      "words": 0,
+      "audio_seconds": 7657.7,
+      "audio_hours": 2.13,
+      "processing_seconds": 126.0,
+      "words": 732,
       "characters": 0,
-      "segments": 1292,
-      "files_per_hour": 1.24,
+      "segments": 1392,
+      "files_per_hour": 1.37,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 0,
-        "avg": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "p50": 0.0,
-        "p90": 0.0,
-        "p95": 0.0,
-        "p99": 0.0,
+        "count": 21,
+        "avg": 0.1,
+        "min": 0.1,
+        "max": 0.1,
+        "p50": 0.1,
+        "p90": 0.1,
+        "p95": 0.1,
+        "p99": 0.1,
         "stdev": 0.0
       },
       "processing_time_s": {
-        "count": 0,
-        "avg": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "p50": 0.0,
-        "p90": 0.0,
-        "p95": 0.0,
-        "p99": 0.0,
+        "count": 21,
+        "avg": 6.0,
+        "min": 6.0,
+        "max": 6.0,
+        "p50": 6.0,
+        "p90": 6.0,
+        "p95": 6.0,
+        "p99": 6.0,
         "stdev": 0.0
       },
       "queue_time_s": {
@@ -1352,7 +1353,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 1261.3,
+  "uptime_s": 204.9,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1396,8 +1397,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 2,
-    "WARNING": 2
+    "INFO": 2
   }
 }
 ```
@@ -1432,7 +1432,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 1261.3,
+  "uptime_s": 204.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1441,8 +1441,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.8,
-    "disk_free_gb": 12.5,
+    "ram_available_gb": 6.7,
+    "disk_free_gb": 12.1,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1453,7 +1453,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 12.5 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 12.1 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -1744,6 +1744,24 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
 ### `GET /api/content/correlations`
 
 Связи между признаками.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+
+### `GET /api/content/drivers`
+
+Драйверы негатива.
+
+Какие категории чаще среднего встречаются в отрицательных разговорах.
+
+Подъём (lift) — частота категории среди отрицательных разговоров к её
+частоте вообще; в список попадают категории с подъёмом от 1,25 на
+десяти записях и больше. Связь, а не причина: тема может быть и
+следствием плохого разговора.
 
 **Доступ:** любой действующий ключ.
 

@@ -1202,6 +1202,58 @@ _m(MetricSpec(
 ))
 
 _m(MetricSpec(
+    name="asrhub_content_objections_unhandled_share", type="gauge", group="content",
+    label="Доля возражений без отработки", unit="%",
+    description=(
+        "Какая часть возражений клиента («дорого», «подумаю», «не нужно») за "
+        "сутки осталась без реплики оператора из категории «отработка "
+        "возражения» в следующих трёх репликах. Считается только по записям, "
+        "где в наборе есть категории отработки."
+    ),
+    recommendation=(
+        "Отчёт Т-Банка «где менеджер не отработал возражение» — это ровно "
+        "эта метрика по операторам. Порог — своя обычная величина; правило "
+        "разумно писать с условием на число записей: "
+        "asrhub_content_objections_unhandled_share > 50 and asrhub_content_records > 30."
+    ),
+    normal="зависит от скрипта продаж; рост за неделю — повод посмотреть разрез по операторам",
+))
+
+_m(MetricSpec(
+    name="asrhub_content_category_share", type="gauge", group="content",
+    label="Доля записей категории обращения", labels=("category", "kind"),
+    description=(
+        "Какая часть разобранных записей за сутки попала в категорию — по "
+        "одной метке на категорию с хотя бы одной записью; kind — вид "
+        "категории (topic, violation, objection, handling). Считается по "
+        "правилам набора content_categories."
+    ),
+    recommendation=(
+        "Ряд по категории — это ход темы во времени: всплеск «доставка» в "
+        "понедельник виден раньше, чем отчёт за неделю. Правило на рост: "
+        "asrhub_content_category_share{category=\"delivery\"} > 2 * "
+        "avg_over_time(asrhub_content_category_share{category=\"delivery\"}[7d])."
+    ),
+    normal="своя обычная величина у каждой категории",
+))
+
+_m(MetricSpec(
+    name="asrhub_content_tracker_hits", type="gauge", group="content",
+    label="Срабатываний трекера за сутки", labels=("category",),
+    description=(
+        "Сколько раз за сутки сработала категория с флагом «сообщать» — по "
+        "журналу событий; каждое срабатывание — одна запись, в которой "
+        "категория нашлась сразу после распознавания."
+    ),
+    recommendation=(
+        "Трекер — это «узнать сегодня»: «просит руководителя», «упомянул суд». "
+        "Отправка наружу задаётся адресом tracker_url; метрика — для тех, кто "
+        "смотрит в Prometheus, а не в чат."
+    ),
+    normal="ноль в спокойный день",
+))
+
+_m(MetricSpec(
     name="asrhub_content_dead_air_avg", type="gauge", group="content",
     label="Заметная тишина", unit="с",
     description=(
