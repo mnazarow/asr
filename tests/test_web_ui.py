@@ -184,6 +184,7 @@ def _чисто(страница) -> None:
 @pytest.mark.parametrize("вкладка,что_ждём", [
     ("summary", "#tone-bar svg"),
     ("categories", "#cat-table"),
+    ("agents", "#agents-table"),
     ("groups", "#chart-by-owner svg"),
     ("topics", "#chart-topics svg"),
     ("links", ".card"),
@@ -321,6 +322,17 @@ def test_the_script_editor_checks_a_marker_on_a_real_record(страница):
     поле = страница.query_selector(".script-item .script-any")
     поле.fill("здравствуйте, добрый день")
     страница.wait_for_timeout(1500)
+    # «Добавить пункт» действительно добавляет: раньше вкладка перерисовывалась
+    # и заново читала скрипт из настроек, теряя новый пункт.
+    было = страница.evaluate("() => document.querySelectorAll('#script-list .script-item').length")
+    страница.click("#script-add")
+    страница.wait_for_timeout(800)
+    assert страница.evaluate(
+        "() => document.querySelectorAll('#script-list .script-item').length") == было + 1
+    страница.click("#script-add-name")
+    страница.wait_for_timeout(1500)
+    assert "Проверяется по факту" in страница.inner_text("#script-list")
+    assert "Обратился по имени" in страница.inner_text("#script-check")
     _чисто(страница)
 
 
@@ -368,6 +380,37 @@ def test_the_categories_tab_counts_edits_and_checks_a_rule(страница):
     строк = страница.evaluate(
         "() => document.querySelectorAll('#results-table tbody tr').length")
     assert строк == 10, строк
+    _чисто(страница)
+
+
+def test_the_operators_tab_opens_a_card_and_marks_a_record_reviewed(страница):
+    """Операторы: строка ведёт в карточку против команды и обратно; кнопка
+    «Разобрано» убирает запись из очереди коучинга без перезагрузки."""
+    _открыть(страница, "content")
+    страница.click('#content-tabs button[data-tab="agents"]')
+    страница.wait_for_selector("#agents-table", timeout=15000)
+    таблица = страница.inner_text("#agents-table")
+    assert "SPEAKER_00" in таблица, таблица[:300]
+    было = страница.evaluate(
+        "() => [...document.querySelectorAll('#content-body .card h3, #content-body .card .card-title, #content-body .card')]"
+        ".map((c) => c.textContent).find((t) => t.includes('Очередь коучинга'))")
+    assert было and "Очередь коучинга (" in было, было
+    страница.click('#agents-table tr.clickable[data-agent="SPEAKER_00"]')
+    страница.wait_for_selector("#agent-score-chart", timeout=15000)
+    страница.wait_for_timeout(800)
+    карточка = страница.inner_text("#content-body")
+    assert "Против команды" in карточка and "Балл по неделям" in карточка, карточка[:500]
+    страница.click("#agent-back")
+    страница.wait_for_selector("#agents-table", timeout=15000)
+    # Отметка «разобрано»: очередь становится короче на одну запись.
+    до = страница.evaluate(
+        "() => document.querySelectorAll('button[data-mark=\"coaching\"][data-status=\"done\"]').length")
+    assert до > 0
+    страница.click('button[data-mark="coaching"][data-status="done"]')
+    страница.wait_for_timeout(1500)
+    после = страница.evaluate(
+        "() => document.querySelectorAll('button[data-mark=\"coaching\"][data-status=\"done\"]').length")
+    assert после == до - 1, (до, после)
     _чисто(страница)
 
 

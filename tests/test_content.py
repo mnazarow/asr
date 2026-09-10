@@ -2751,3 +2751,220 @@ def test_score_empathy_and_violations_reach_the_summary_selections_and_the_repor
         assert c.get("/api/jobs?content=impolite", headers=ключ).json()["items"] == []
         карточка = c.get(f"/api/content/jobs/{job_id}", headers=ключ).json()["analysis"]
         assert карточка["scorecard"]["penalty"] == 10.0 and карточка["empathy"]["index"] == 20.0
+
+
+# ---------------------------------------------------------------------------
+# Этап 3: обращение по имени, карточка оператора, коучинг, эталоны
+# ---------------------------------------------------------------------------
+
+
+def test_addressing_by_name_uses_declined_forms_and_ignores_the_operators_own_name():
+    """«Иван», «Ивану», «Вань» — одно имя; «меня зовут Анна» — не обращение;
+    «вера в лучшее» и «ИНН» именами не считаются."""
+    from asrhub import content
+    from asrhub.content.names import is_name
+
+    for форма in ("Иван", "Ивану", "Вань", "Наташ", "Марии", "Павла", "Игорю", "Оль"):
+        assert is_name(форма), форма
+    for слово in ("вера", "роман", "ИНН", "марка", "лиды", "тема", "семена", "стол"):
+        assert not is_name(слово), слово
+
+    сегменты = [
+        {"start": 0.0, "end": 3.0, "speaker": "A",
+         "text": "Здравствуйте, меня зовут Анна, компания Ромашка"},
+        {"start": 3.0, "end": 8.0, "speaker": "B", "text": "Добрый день, это Иван"},
+        {"start": 8.0, "end": 12.0, "speaker": "A",
+         "text": "Иван, сейчас уточню. Анна на связи. Спасибо, Вань, всего доброго"},
+    ]
+    разбор = content.analyze(text="", segments=сегменты, categories=[], script=[
+        {"id": "name", "label": "Обратился по имени", "check": "customer_name"},
+        {"id": "hi", "label": "Поздоровался", "any": ["здравствуйте"], "where": "start"}])
+    по_имени = разбор["by_name"]
+    assert по_имени["count"] == 2 and по_имени["names"] == {"иван": 1, "вань": 1}
+    assert по_имени["own"] == ["анна"] and по_имени["speaker"] == "A"
+    пункты = {п["id"]: п for п in разбор["compliance"]["items"]}
+    assert пункты["name"]["passed"] and пункты["name"]["matched"] == "обратился к клиенту по имени"
+    assert разбор["compliance"]["score"] == 1.0
+    свод, _ = content.features(разбор)
+    assert свод["name_uses"] == 2
+
+    # Без обращения пункт не выполнен; без оператора — счёта нет (NULL).
+    без = content.analyze(text="", segments=сегменты[:2], categories=[], script=[
+        {"id": "name", "label": "Обратился по имени", "check": "customer_name"}])
+    assert not без["compliance"]["items"][0]["passed"] and без["by_name"]["count"] == 0
+    моно = content.analyze(text="Иван, здравствуйте", categories=[])
+    assert моно["by_name"]["count"] is None
+    свод, _ = content.features(моно)
+    assert свод["name_uses"] is None
+    # Неизвестная проверка — ошибка пункта, а не падение разбора.
+    странный = content.analyze(text="", segments=сегменты, categories=[], script=[
+        {"id": "x", "label": "Чужая", "check": "moon_phase"}])
+    assert "неизвестная проверка" in странный["compliance"]["items"][0]["error"]
+
+
+def _корпус_операторов(tmp_path):
+    """Два оператора: SPEAKER_00 (Анна, хорошая) и SPEAKER_02 (Олег, со
+    стоп-словами) — по разным владельцам, чтобы карточка работала и по
+    говорящему, и по владельцу."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.db import Database
+
+    db = Database(tmp_path / "asrhub.db")
+    сейчас = time.time()
+    хороший = [
+        ("SPEAKER_00", "Здравствуйте, компания Ромашка, меня зовут Анна, чем могу помочь?"),
+        ("SPEAKER_01", "Добрый день, это Пётр, подскажите статус заказа."),
+        ("SPEAKER_00", "Пётр, сейчас уточню, пожалуйста, минуту. Правильно понимаю, заказ от пятого?"),
+        ("SPEAKER_01", "Да, верно. Спасибо."),
+        ("SPEAKER_00", "Отправлю сегодня. Спасибо, Пётр, всего доброго!"),
+    ]
+    плохой = [
+        ("SPEAKER_02", "Ромашка, слушаю."),
+        ("SPEAKER_01", "Добрый день, у меня заказ не пришёл, это дорого и долго."),
+        ("SPEAKER_02", "Не знаю, подождите, вы должны сами смотреть в кабинете."),
+        ("SPEAKER_01", "Позовите руководителя, я буду жаловаться в суд."),
+        ("SPEAKER_02", "Успокойтесь, это не ко мне."),
+    ]
+    for n in range(24):
+        реплики = хороший if n % 2 else плохой
+        владелец = "анна" if n % 2 else "олег"
+        когда = сейчас - n * 3 * 3600 - 600
+        job_id = db.create_job({"id": f"op{n:03d}", "filename": f"{n}.wav", "owner": владелец,
+                                "media_duration_s": 40.0, "engine": "gigaam", "model": "v2"})
+        db.execute("UPDATE jobs SET created_at=? WHERE id=?", (когда, job_id))
+        db.update_job(job_id, status="completed", finished_at=когда + 30,
+                      text=" ".join(т for _, т in реплики))
+        db.save_segments(job_id, [{"start": i * 8.0, "end": i * 8.0 + 7.0, "speaker": кто,
+                                   "text": т} for i, (кто, т) in enumerate(реплики)])
+    индекс = ContentIndex(db, _Настройки())
+    while индекс.backfill_once(limit=20):
+        pass
+    return db, индекс
+
+
+def test_the_agent_card_compares_with_the_team_by_speaker_and_by_owner(tmp_path):
+    """Карточка: показатели против команды, вердикт по направлению, ход по
+    неделям, нарушения, лучшие и худшие, очередь — и по говорящему, и по
+    владельцу."""
+    from asrhub.insights import Insights
+
+    db, индекс = _корпус_операторов(tmp_path)
+    свод = Insights(db, индекс)
+    список = свод.agents("speaker", "month")
+    по = {г["key"]: г for г in список["items"]}
+    assert set(по) == {"SPEAKER_00", "SPEAKER_02"}
+    assert по["SPEAKER_02"]["violation_records"] == 12 and по["SPEAKER_00"]["violation_records"] == 0
+    assert по["SPEAKER_00"]["named_share"] == 100.0 and по["SPEAKER_02"]["named_share"] == 0.0
+
+    карточка = свод.agent_card("SPEAKER_02", by="speaker", period="month")
+    assert карточка["summary"]["records"] == 12 and карточка["team"]["records"] == 24
+    сравнение = {п["key"]: п for п in карточка["compare"]}
+    assert сравнение["agent_score"]["verdict"] == "worse"
+    assert сравнение["violation_share"]["agent"] == 100.0 and сравнение["violation_share"]["team"] == 50.0
+    assert сравнение["violation_share"]["verdict"] == "worse"
+    assert сравнение["named_share"]["verdict"] == "worse"
+    assert сравнение["duration_s"]["verdict"] is None          # «никуда не лучше»
+    assert [н["label"] for н in карточка["violations"]] == ["Стоп-слова оператора"]
+    assert карточка["violations"][0]["records"] == 12
+    assert len(карточка["timeline"]) >= 4 and sum(т["records"] for т in карточка["timeline"]) == 12
+    assert карточка["worst"] and all(з["agent_speaker"] == "SPEAKER_02" for з in карточка["worst"])
+    assert карточка["coaching_total"] == 12
+    assert "нарушение оператора" in карточка["coaching"][0]["reasons"]
+
+    # По владельцу — та же карточка, другим ключом.
+    по_владельцу = свод.agent_card("анна", by="owner", period="month")
+    assert по_владельцу["summary"]["records"] == 12 and по_владельцу["summary"]["violation_records"] == 0
+    assert {п["key"]: п["verdict"] for п in по_владельцу["compare"]}["agent_score"] == "better"
+    with pytest.raises(ValueError):
+        свод.agent_card("x", by="model", period="month")
+
+
+def test_coaching_marks_take_records_out_of_the_queue_and_references_are_kept(tmp_path):
+    """«Разобрано» убирает запись из очереди; эталон живёт отдельно от
+    разбора и переживает пересчёт; удаление задания уносит отметки."""
+    from asrhub.insights import Insights
+
+    db, индекс = _корпус_операторов(tmp_path)
+    свод = Insights(db, индекс)
+    очередь = свод.coaching("month")
+    assert очередь["total"] == 12 and all("нарушение оператора" in з["reasons"]
+                                          for з in очередь["items"])
+    первая = очередь["items"][0]["job_id"]
+    db.set_mark(первая, "coaching", "done", "разобрали на планёрке")
+    после = свод.coaching("month")
+    assert после["total"] == 11 and первая not in {з["job_id"] for з in после["items"]}
+    с_разобранными = свод.coaching("month", include_done=True)
+    разобранная = next(з for з in с_разобранными["items"] if з["job_id"] == первая)
+    assert разобранная["mark"]["status"] == "done" and разобранная["mark"]["note"] == "разобрали на планёрке"
+    db.set_mark(первая, "coaching", "")                       # снять
+    assert свод.coaching("month")["total"] == 12
+
+    # Эталоны: лучшие без нарушений — только записи Анны; отметка руками
+    # ставит запись первой и переживает пересчёт.
+    эталоны = свод.references("month", limit=20)
+    # Двенадцать записей Анны — и ни одной Олега: у тех нарушения.
+    assert len(эталоны["items"]) == 12 and all(з["violations"] == 0 for з in эталоны["items"])
+    лучшая = эталоны["items"][-1]["job_id"]
+    db.set_mark(лучшая, "reference", "yes")
+    индекс.analyze_job(лучшая)
+    эталоны = свод.references("month", limit=20)
+    assert эталоны["items"][0]["job_id"] == лучшая and эталоны["items"][0]["marked"]
+    assert db.get_marks([лучшая])[лучшая]["reference"]["status"] == "yes"
+    with pytest.raises(ValueError):
+        db.set_mark(лучшая, "gold_star", "yes")
+    db.delete_job(лучшая)
+    assert db.get_marks([лучшая]) == {}
+
+
+def test_the_agent_endpoints_respect_ownership_and_validate_marks(
+        tmp_path, monkeypatch, data_dir):
+    """Ручки операторов, коучинга, эталонов и отметок — с разграничением."""
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        админ = {"X-API-Key": "ah_admin_k"}
+        пользователь = {"X-API-Key": "ah_user_k"}
+        реплики = [("SPEAKER_00", "Ромашка, слушаю."),
+                   ("SPEAKER_01", "Добрый день, заказ не пришёл."),
+                   ("SPEAKER_00", "Не знаю, подождите, вы должны сами смотреть.")]
+        for n in range(6):
+            job_id = db.create_job({"id": f"ag{n}", "filename": f"{n}.wav",
+                                    "owner": "админ", "media_duration_s": 30.0})
+            db.update_job(job_id, status="completed", finished_at=1.0,
+                          text=" ".join(т for _, т in реплики))
+            db.save_segments(job_id, [{"start": i * 8.0, "end": i * 8.0 + 7.0, "speaker": к,
+                                       "text": т} for i, (к, т) in enumerate(реплики)])
+            c.post(f"/api/content/jobs/{job_id}/recompute", headers=админ)
+        операторы = c.get("/api/content/agents?period=all", headers=админ).json()
+        assert [г["key"] for г in операторы["items"]] == ["SPEAKER_00"]
+        карточка = c.get("/api/content/agents/SPEAKER_00?period=all", headers=админ)
+        assert карточка.status_code == 200 and карточка.json()["summary"]["records"] == 6
+        assert c.get("/api/content/agents/SPEAKER_00?by=model", headers=админ).status_code == 422
+        по_владельцу = c.get("/api/content/agents/админ?period=all&by=owner", headers=админ).json()
+        assert по_владельцу["summary"]["records"] == 6
+        очередь = c.get("/api/content/coaching?period=all", headers=админ).json()
+        assert очередь["total"] == 6 and очередь["reasons"]
+        # Чужой ключ чужих записей не видит — ни в очереди, ни в отметках.
+        assert c.get("/api/content/coaching?period=all", headers=пользователь).json()["total"] == 0
+        assert c.put("/api/content/marks/ag0", json={"kind": "coaching", "status": "done"},
+                     headers=пользователь).status_code in (403, 404)
+        # Отметка: годная ставится, негодная отвергается, пустая снимает.
+        ответ = c.put("/api/content/marks/ag0", json={"kind": "coaching", "status": "done",
+                                                      "note": "разобрано"}, headers=админ)
+        assert ответ.status_code == 200 and ответ.json()["marks"]["coaching"]["note"] == "разобрано"
+        assert c.get("/api/content/coaching?period=all", headers=админ).json()["total"] == 5
+        assert c.put("/api/content/marks/ag0", json={"kind": "reference", "status": "maybe"},
+                     headers=админ).status_code == 400
+        assert c.put("/api/content/marks/нет", json={"kind": "coaching", "status": "done"},
+                     headers=админ).status_code == 404
+        assert c.put("/api/content/marks/ag0", json={"kind": "coaching", "status": ""},
+                     headers=админ).json()["status"] is None
+        assert c.get("/api/content/coaching?period=all", headers=админ).json()["total"] == 6
+        c.put("/api/content/marks/ag1", json={"kind": "reference", "status": "yes"}, headers=админ)
+        эталоны = c.get("/api/content/references?period=all", headers=админ).json()
+        assert эталоны["items"][0]["job_id"] == "ag1" and эталоны["items"][0]["marked"]
+        # Отметка — событие в журнале задания.
+        события = [с for с in db.get_events("ag1") if с["kind"] == "mark"]
+        assert события and события[0]["data"]["status"] == "yes"

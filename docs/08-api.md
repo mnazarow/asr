@@ -443,6 +443,11 @@ GET  /api/content/kinds                  перечень отборов, раз
 GET  /api/content/categories             категории обращений: счёт, доли, динамика, без категории
 POST /api/content/categories/check       прогнать набор категорий по записи, ничего не сохраняя
 GET  /api/content/drivers                драйверы негатива: подъём категорий среди отрицательных
+GET  /api/content/agents?by=owner        операторы: балл, эмпатия, нарушения, по имени
+GET  /api/content/agents/{ключ}          карточка оператора против команды, по неделям, очередь
+GET  /api/content/coaching               очередь коучинга с причинами
+GET  /api/content/references             эталонные разговоры
+PUT  /api/content/marks/{id}             отметка: coaching done/open, reference yes
 GET  /api/content/jobs/{id}              разбор одной записи
 POST /api/content/jobs/{id}/recompute    пересчитать одну запись
 POST /api/content/script/check           прогнать скрипт по записи, ничего не сохраняя

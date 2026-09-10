@@ -184,13 +184,28 @@ def _оператор(сегменты: list[dict[str, Any]]) -> str | None:
     return метки[0] if len(set(метки)) > 1 else None
 
 
+#: Пункты, проверяемые не по словам, а по факту о разговоре.
+ПРОВЕРКИ: dict[str, str] = {
+    "customer_name": "обратился к клиенту по имени",
+}
+
+
+def _по_факту(проверка: str, facts: dict[str, Any]) -> rules.Result:
+    if проверка not in ПРОВЕРКИ:
+        raise rules.RuleError(f"неизвестная проверка «{проверка}»", 0)
+    значение = facts.get(проверка)
+    сработало = bool(значение) and (not isinstance(значение, (int, float)) or значение > 0)
+    return rules.Result(сработало, [rules.Hit(0, 0, ПРОВЕРКИ[проверка])] if сработало else [])
+
+
 def agent(segments: list[dict[str, Any]], speaker: str | None = None) -> str | None:
     """Кто оператор: заданный настройкой или определённый по записи."""
     return speaker if speaker is not None else _оператор(list(segments or []))
 
 
 def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None = None,
-          speaker: str | None = None) -> dict[str, Any]:
+          speaker: str | None = None,
+          facts: dict[str, Any] | None = None) -> dict[str, Any]:
     """Проверяет разговор по скрипту.
 
     `speaker` — чьи реплики проверять. Без него оператор определяется сам:
@@ -205,6 +220,10 @@ def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None
 
     Когда говорящий один или их нет вовсе, проверяем по всему тексту:
     лучше проверить не разделяя, чем не проверить.
+
+    `facts` — то, что известно о разговоре помимо слов: пункт с полем
+    `check` («customer_name» — обратился к клиенту по имени) проверяется
+    не по приметам, а по этому факту.
     """
     пункты = script if script is not None else ПО_УМОЛЧАНИЮ
     все = list(segments or [])
@@ -250,8 +269,12 @@ def check(segments: list[dict[str, Any]], *, script: list[dict[str, Any]] | None
             текст = тексты.get(где, тексты["any"])
         нашлось = None
         ошибка = None
+        проверка = str(пункт.get("check") or "")
         try:
-            найдено = rules.evaluate(_правило(пункт), текст)
+            if проверка:
+                найдено = _по_факту(проверка, facts or {})
+            else:
+                найдено = rules.evaluate(_правило(пункт), текст)
         except rules.RuleError as exc:
             # Пункт с негодным правилом не выполнен и говорит почему:
             # молча пропустить его значило бы завысить соблюдение скрипта.

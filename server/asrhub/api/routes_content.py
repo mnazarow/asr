@@ -211,6 +211,84 @@ def drivers(request: Request, period: str = ПЕРИОД,
     return _insights(request).drivers(period, owner=scope_owner(principal))
 
 
+#: Разрез оператора: метка говорящего или владелец задания.
+ПО_КОМУ = Query(default="speaker", pattern="^(speaker|owner)$")
+
+
+@router.get("/agents", summary="Операторы: балл, эмпатия, нарушения")
+def agents(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ,
+           limit: int = Query(default=100, ge=1, le=500),
+           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Список операторов с показателями — разрез по говорящему или по
+    владельцу задания (ключу доступа); строка ведёт в карточку."""
+    return _insights(request).agents(by, period, owner=scope_owner(principal), limit=limit)
+
+
+@router.get("/agents/{key}", summary="Карточка оператора")
+def agent_card(request: Request, key: str, period: str = ПЕРИОД, by: str = ПО_КОМУ,
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Все показатели оператора против команды, ход по неделям, нарушения по
+    категориям, лучшие и худшие записи, очередь коучинга.
+
+    `by=speaker` — оператор по метке говорящего в разборе («кто заговорил
+    первым»); `by=owner` — по владельцу задания, точнее там, где у каждого
+    сотрудника свой ключ доступа.
+    """
+    return _insights(request).agent_card(key, by=by, period=period,
+                                         owner=scope_owner(principal))
+
+
+@router.get("/coaching", summary="Очередь коучинга")
+def coaching(request: Request, period: str = ПЕРИОД,
+             by: str = ПО_КОМУ, agent: str = Query(default=""),
+             limit: int = Query(default=50, ge=1, le=500),
+             done: bool = Query(default=False),
+             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Записи, которые стоит разобрать с оператором, с причиной: нарушение,
+    низкий балл, скрипт меньше половины, долгий монолог, невежливость,
+    возражение без отработки, раздражённый клиент. Разобранные скрыты,
+    пока не попросят `done=true`."""
+    return _insights(request).coaching(
+        period, owner=scope_owner(principal),
+        agent=(by, agent) if agent else None, limit=limit, include_done=done)
+
+
+@router.get("/references", summary="Эталонные разговоры")
+def references(request: Request, period: str = ПЕРИОД,
+               limit: int = Query(default=20, ge=1, le=200),
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Лучшие разговоры периода по баллу и тональности без нарушений — и всё,
+    что отмечено эталоном руками, независимо от периода."""
+    return _insights(request).references(period, owner=scope_owner(principal), limit=limit)
+
+
+@router.put("/marks/{job_id}", summary="Отметить запись: разобрано, эталон")
+def set_mark(request: Request, job_id: str, body: dict[str, Any] = Body(default={}),
+             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Отметка руководителя на записи: `kind` — `coaching` (статус `done`
+    или `open`) или `reference` (статус `yes`); пустой статус снимает
+    отметку. Отметки переживают пересчёт разбора: они лежат отдельно."""
+    require_write(principal)
+    state = get_state(request)
+    задание = state.db.get_job(job_id)
+    if not задание:
+        raise error_response(JobNotFound(job_id))
+    require_owner(principal, задание)
+    вид = str(body.get("kind") or "")
+    статус = str(body.get("status") or "")
+    допустимые = {"coaching": {"", "open", "done"}, "reference": {"", "yes"}}
+    if вид not in допустимые or статус not in допустимые[вид]:
+        raise error_response(ConfigError(
+            "Поле kind — coaching или reference; статус — done/open или yes; "
+            "пустой статус снимает отметку."))
+    state.db.set_mark(job_id, вид, статус, str(body.get("note") or "")[:500])
+    state.db.add_event(job_id, "mark",
+                       f"Отметка «{вид}»: {статус or 'снята'}",
+                       {"kind": вид, "status": статус, "by": principal.name})
+    return {"job_id": job_id, "kind": вид, "status": статус or None,
+            "marks": state.db.get_marks([job_id]).get(job_id, {})}
+
+
 @router.post("/categories/check", summary="Проверить набор категорий на записи")
 def categories_check(request: Request, body: dict[str, Any] = Body(default={}),
                      principal: Principal = Depends(authenticate)) -> dict[str, Any]:

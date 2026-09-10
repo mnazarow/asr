@@ -3974,6 +3974,7 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
 const CONTENT_TABS = [
   { key: 'summary',    title: 'Свод' },
   { key: 'categories', title: 'Категории' },
+  { key: 'agents',     title: 'Операторы' },
   { key: 'groups',     title: 'Разрезы' },
   { key: 'topics',   title: 'Темы' },
   { key: 'links',    title: 'Связи' },
@@ -4139,6 +4140,7 @@ RENDERERS.content = {
     state.contentCoverageTimer = null;
     state.contentCategories = null;
     state.contentCategoriesDirty = false;
+    state.contentAgent = '';
   },
 
   async recompute() {
@@ -4598,6 +4600,227 @@ RENDERERS.content = {
   },
 };
 
+/* Операторы: список с баллом, карточка против команды, очередь коучинга,
+ * эталонные разговоры.
+ *
+ * Оператор здесь — метка говорящего в разборе («кто заговорил первым») или
+ * владелец задания (ключ доступа). Второе точнее там, где у каждого
+ * сотрудника свой ключ; первое работает без всякой настройки. Переключатель
+ * — в панели вкладки, и выбор запоминается на время сеанса.
+ */
+
+const ПРИЧИНА_ЦВЕТ = {
+  'нарушение оператора': 'err', 'нецензурная лексика у сотрудника': 'err',
+  'невежливых оборотов больше вежливых': 'err', 'балл ниже 60': 'warn',
+  'скрипт меньше половины': 'warn', 'возражение без отработки': 'warn',
+  'клиент раздражён': 'warn',
+};
+
+RENDERERS.content.tab_agents = async function (host) {
+  state.contentAgentBy = state.contentAgentBy || 'speaker';
+  if (state.contentAgent) return this.drawAgentCard(host);
+  const период = state.contentPeriod;
+  const [операторы, очередь, эталоны] = await Promise.all([
+    API.latest('content-agents',
+      `/api/content/agents?period=${период}&by=${state.contentAgentBy}`),
+    API.latest('content-coaching', `/api/content/coaching?period=${период}&limit=30`),
+    API.latest('content-references', `/api/content/references?period=${период}&limit=10`),
+  ]);
+  const items = операторы.items || [];
+  host.innerHTML = `
+    <div class="settings-toolbar">
+      <span class="small dim">Оператор — это:</span>
+      <div class="group-nav" id="agent-by">
+        <button data-by="speaker" class="${state.contentAgentBy === 'speaker' ? 'active' : ''}"
+          title="метка говорящего в разборе: кто заговорил первым">говорящий</button>
+        <button data-by="owner" class="${state.contentAgentBy === 'owner' ? 'active' : ''}"
+          title="владелец задания — ключ доступа, под которым записи загружены">владелец</button>
+      </div>
+    </div>
+    ${card('Операторы за период',
+           'щелчок по строке открывает карточку: показатели против команды, ход по неделям, что послушать',
+           items.length ? `<div class="table-wrap full"><table id="agents-table">
+        <thead><tr><th>Оператор</th><th class="num">Записей</th>
+          <th class="num" title="средний балл из 100">Балл</th>
+          <th class="num">Тональность</th><th class="num">Отрицательных</th>
+          <th class="num" title="индекс эмпатии от −100 до +100">Эмпатия</th>
+          <th class="num" title="записей с нарушениями">Наруш.</th>
+          <th class="num" title="доля записей, где оператор назвал клиента по имени">По имени</th>
+          <th class="num">Скрипт</th><th class="num" title="доля речи оператора">Речь</th><th></th></tr></thead>
+        <tbody>${items.map((г) => `<tr class="clickable" data-agent="${esc(г.key)}">
+          <td><b>${esc(г.label)}</b></td>
+          <td class="num mono">${num(г.records)}</td>
+          <td class="num mono">${г.agent_score === null || г.agent_score === undefined ? '—' : num(г.agent_score, 0)}</td>
+          <td class="num">${toneChip(г.sentiment)}</td>
+          <td class="num mono">${г.negative_share === null ? '—' : num(г.negative_share, 1) + '%'}</td>
+          <td class="num mono">${г.empathy === null || г.empathy === undefined ? '—' : num(г.empathy, 0)}</td>
+          <td class="num mono">${num(г.violation_records)}</td>
+          <td class="num mono">${г.named_share === null || г.named_share === undefined ? '—' : num(г.named_share, 0) + '%'}</td>
+          <td class="num mono">${г.compliance === null ? '—' : pct(г.compliance, 0)}</td>
+          <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : pct(г.talk_share, 0)}</td>
+          <td><button class="ghost sm" data-agent="${esc(г.key)}">Карточка</button></td></tr>`).join('')}
+        </tbody></table></div>${операторы.hidden ? `<p class="small faint" style="margin:8px 12px">
+          Скрыто операторов с числом записей меньше пяти: ${операторы.hidden}.</p>` : ''}`
+           : '<div class="empty small">За период нет операторов с пятью и более записями</div>')}
+    <div class="grid cols-2">
+      ${card(`Очередь коучинга (${num(очередь.total)})`,
+             'записи, которые стоит разобрать с оператором, — худшие первыми; «разобрано» убирает из очереди',
+             this.coachingTable(очередь.items || []))}
+      ${card('Эталонные разговоры',
+             'лучшие по баллу и тональности без нарушений — и отмеченные руками «показывать новичкам»',
+             this.referencesTable(эталоны.items || []))}
+    </div>`;
+  qsa('#agent-by button').forEach((b) => b.addEventListener('click', () => {
+    state.contentAgentBy = b.dataset.by;
+    state.contentData = {};
+    this.showTab();
+  }));
+  qsa('[data-agent]', host).forEach((el) => el.addEventListener('click', () => {
+    state.contentAgent = el.dataset.agent;
+    this.showTab();
+  }));
+  this.bindMarks(host);
+};
+
+/** Таблица очереди коучинга — общая для вкладки и карточки оператора. */
+RENDERERS.content.coachingTable = function (items) {
+  if (!items.length) return '<div class="empty small">Очередь пуста — разбирать нечего</div>';
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Запись</th><th>Когда</th><th>Почему</th>
+      <th class="num">Балл</th><th class="num">Тон.</th><th></th></tr></thead>
+    <tbody>${items.map((з) => `<tr>
+      <td class="truncate" style="max-width:200px"><a href="#" data-open="${esc(з.job_id)}">${esc(з.filename || з.job_id)}</a>
+        ${з.mark && з.mark.status === 'done' ? '<span class="chip ok">разобрано</span>' : ''}</td>
+      <td class="small faint nowrap">${fmtTime(з.created_at)}</td>
+      <td><div class="chips">${(з.reasons || []).map((п) =>
+        `<span class="chip ${ПРИЧИНА_ЦВЕТ[п] || ''}">${esc(п)}</span>`).join('')}</div></td>
+      <td class="num mono">${з.agent_score === null || з.agent_score === undefined ? '—' : num(з.agent_score, 0)}</td>
+      <td class="num">${toneChip(з.sentiment)}</td>
+      <td class="nowrap">${з.mark && з.mark.status === 'done'
+        ? `<button class="ghost sm" data-mark="coaching" data-status="open" data-job="${esc(з.job_id)}">Вернуть</button>`
+        : `<button class="btn sm" data-mark="coaching" data-status="done" data-job="${esc(з.job_id)}"
+             title="Отметить разобранным: запись уйдёт из очереди">Разобрано</button>`}</td></tr>`).join('')}
+    </tbody></table></div>`;
+};
+
+RENDERERS.content.referencesTable = function (items) {
+  if (!items.length) return '<div class="empty small">За период нет записей с баллом и без нарушений</div>';
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Запись</th><th>Когда</th><th class="num">Балл</th>
+      <th class="num">Тон.</th><th></th></tr></thead>
+    <tbody>${items.map((з) => `<tr>
+      <td class="truncate" style="max-width:200px"><a href="#" data-open="${esc(з.job_id)}">${esc(з.filename || з.job_id)}</a>
+        ${з.marked ? '<span class="chip ok" title="показывать новичкам">эталон</span>' : ''}</td>
+      <td class="small faint nowrap">${fmtTime(з.created_at)}</td>
+      <td class="num mono">${з.agent_score === null || з.agent_score === undefined ? '—' : num(з.agent_score, 0)}</td>
+      <td class="num">${toneChip(з.sentiment)}</td>
+      <td class="nowrap">${з.marked
+        ? `<button class="ghost sm" data-mark="reference" data-status="" data-job="${esc(з.job_id)}">Снять</button>`
+        : `<button class="ghost sm" data-mark="reference" data-status="yes" data-job="${esc(з.job_id)}"
+             title="Отметить эталоном — показывать новичкам">Эталон</button>`}</td></tr>`).join('')}
+    </tbody></table></div>`;
+};
+
+/** Кнопки отметок и ссылки на записи — в любой таблице вкладки. */
+RENDERERS.content.bindMarks = function (host) {
+  qsa('[data-mark]', host).forEach((b) => b.addEventListener('click', async () => {
+    try {
+      await API.put(`/api/content/marks/${encodeURIComponent(b.dataset.job)}`,
+        { kind: b.dataset.mark, status: b.dataset.status });
+      toast(b.dataset.status ? 'Отметка поставлена' : 'Отметка снята', 'ok');
+    } catch (err) { fail(err); return; }
+    state.contentData = {};
+    this.showTab();
+  }));
+  qsa('[data-open]', host).forEach((a) => a.addEventListener('click', (e) => {
+    e.preventDefault();
+    __asrhub.openJob(a.dataset.open);
+  }));
+};
+
+RENDERERS.content.drawAgentCard = async function (host) {
+  const период = state.contentPeriod;
+  const к = await API.latest('content-agent',
+    `/api/content/agents/${encodeURIComponent(state.contentAgent)}?period=${период}&by=${state.contentAgentBy}`);
+  const с = к.summary || {};
+  const т = к.team || {};
+  const строка = (з, доп) => `<tr>
+    <td class="truncate" style="max-width:220px"><a href="#" data-open="${esc(з.job_id)}">${esc(з.filename || з.job_id)}</a></td>
+    <td class="small faint nowrap">${fmtTime(з.created_at)}</td>
+    <td class="num mono">${з.agent_score === null || з.agent_score === undefined ? '—' : num(з.agent_score, 0)}</td>
+    <td class="num">${toneChip(з.sentiment)}</td>
+    <td class="num mono">${num(з.violations)}</td></tr>`;
+  const список = (items) => items.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>Запись</th><th>Когда</th><th class="num">Балл</th>
+      <th class="num">Тон.</th><th class="num">Наруш.</th></tr></thead>
+    <tbody>${items.map(строка).join('')}</tbody></table></div>`
+    : '<div class="empty small">Записей нет</div>';
+  host.innerHTML = `
+    <div class="settings-toolbar">
+      <button class="ghost sm" id="agent-back">← все операторы</button>
+      <span class="small dim">${state.contentAgentBy === 'owner' ? 'владелец' : 'говорящий'}:</span>
+      <b>${esc(state.contentAgent)}</b>
+      <span class="spacer"></span>
+      <span class="small dim">записей за период: ${num(с.records)} из ${num(т.records)} у команды</span>
+    </div>
+    <div class="grid cols-4" style="margin-bottom:16px">
+      ${kpi('Балл оператора', с.agent_score === null || с.agent_score === undefined ? '—' : num(с.agent_score, 0),
+            т.agent_score === null || т.agent_score === undefined ? 'у команды — нет' : `у команды ${num(т.agent_score, 0)}`,
+            delta(с.agent_score, (к.previous || {}).agent_score, { good: 1, digits: 0 }))}
+      ${kpi('Тональность', num(с.sentiment, 2), `у команды ${num(т.sentiment, 2)}`,
+            delta(с.sentiment, (к.previous || {}).sentiment, { good: 1, digits: 2 }))}
+      ${kpi('Индекс эмпатии', с.empathy === null || с.empathy === undefined ? '—' : num(с.empathy, 0),
+            т.empathy === null || т.empathy === undefined ? '' : `у команды ${num(т.empathy, 0)}`,
+            delta(с.empathy, (к.previous || {}).empathy, { good: 1, digits: 0 }))}
+      ${kpi('С нарушениями', num(с.violation_records),
+            с.violation_share === null || с.violation_share === undefined ? ''
+              : `${num(с.violation_share, 1)}% записей, у команды ${num(т.violation_share, 1)}%`)}
+    </div>
+    ${card('Против команды', 'разница — оператор минус команда; зелёное — лучше, красное — хуже; прошлый период — тот же оператор',
+      `<div class="table-wrap"><table>
+        <thead><tr><th>Показатель</th><th class="num">Оператор</th><th class="num">Команда</th>
+          <th class="num">Разница</th><th class="num">Прошлый период</th></tr></thead>
+        <tbody>${(к.compare || []).map((п) => `<tr>
+          <td>${esc(п.title)}</td>
+          <td class="num mono">${п.agent === null || п.agent === undefined ? '—' : num(п.agent, п.digits)}</td>
+          <td class="num mono">${п.team === null || п.team === undefined ? '—' : num(п.team, п.digits)}</td>
+          <td class="num mono ${п.verdict === 'better' ? 'ok' : п.verdict === 'worse' ? 'err' : ''}">${
+            п.delta === null || п.delta === undefined ? '—' : (п.delta > 0 ? '+' : '') + num(п.delta, п.digits)}</td>
+          <td class="num mono faint">${п.previous === null || п.previous === undefined ? '—' : num(п.previous, п.digits)}</td></tr>`).join('')}
+        </tbody></table></div>`)}
+    <div class="grid cols-2">
+      ${card('Балл по неделям', '', '<div id="agent-score-chart"></div>')}
+      ${card('Тональность по неделям', '', '<div id="agent-tone-chart"></div>')}
+    </div>
+    ${(к.violations || []).length ? card('Нарушения по категориям', 'записей с категорией и совпадений всего',
+      `<div class="chips">${(к.violations || []).map((н) =>
+        `<span class="chip err">${esc(н.label)} <b>${num(н.records)}</b> <span class="faint">/ ${num(н.mentions)}</span></span>`).join('')}</div>`) : ''}
+    <div class="grid cols-2">
+      ${card('Лучшие записи', 'по баллу и тональности', список(к.best || []))}
+      ${card('Худшие записи', 'по баллу и тональности', список(к.worst || []))}
+    </div>
+    ${card(`Очередь коучинга оператора (${num(к.coaching_total)})`, 'разобрать с оператором',
+           this.coachingTable(к.coaching || []))}`;
+  qs('#agent-back').addEventListener('click', () => {
+    state.contentAgent = '';
+    this.showTab();
+  });
+  this.bindMarks(host);
+  const точки = к.timeline || [];
+  const метки = точки.map((т) => new Date(т.ts * 1000).toLocaleDateString('ru-RU',
+    { day: 'numeric', month: 'short' }));
+  window.Charts.line(qs('#agent-score-chart'), {
+    height: 200, labels: метки, yMin: 0, yMax: 100,
+    series: [{ name: 'балл', values: точки.map((т) => т.agent_score) }],
+    emptyText: 'нет данных за период',
+  });
+  window.Charts.line(qs('#agent-tone-chart'), {
+    height: 200, labels: метки, yMin: -1, yMax: 1,
+    series: [{ name: 'тональность', values: точки.map((т) => т.sentiment) }],
+    emptyText: 'нет данных за период',
+  });
+};
+
 /* Категории обращений: счёт за период и редактор правил.
  *
  * Вкладка отвечает на вопрос «о чём звонят» — по правилам, которые тут же
@@ -5013,6 +5236,8 @@ RENDERERS.content.drawScript = function (host) {
       ${свой ? `<button class="ghost sm" id="script-default"
         title="Вернуться к набору по умолчанию">Вернуть набор по умолчанию</button>` : ''}
       <button class="btn sm" id="script-add">Добавить пункт</button>
+      <button class="ghost sm" id="script-add-name"
+        title="Пункт проверяется не по словам, а по факту: назвал ли оператор клиента по имени (словарь имён с формами склонения)">Пункт «Обратился по имени»</button>
       <button class="primary sm" id="script-save" disabled>Сохранить</button>
     </div>
 
@@ -5055,9 +5280,12 @@ RENDERERS.content.drawScript = function (host) {
                  title="Вес пункта в балле оператора: балл = сумма весов выполненных ÷ сумма всех × 100 минус штрафы. Пусто — единица">
           <button class="ghost icon script-del" title="Убрать пункт">✕</button>
         </div>
-        <input type="text" class="script-any" style="margin-top:6px"
+        ${п.check ? `<div class="small dim" style="margin-top:6px">Проверяется по факту:
+            <span class="chip info">${esc(п.check === 'customer_name' ? 'обратился к клиенту по имени' : п.check)}</span>
+            — по словарю имён с формами склонения; собственное имя оператора после «меня зовут» не считается</div>`
+          : `<input type="text" class="script-any" style="margin-top:6px"
                value="${esc((п.any || []).join(', '))}"
-               placeholder="слова-приметы через запятую: здравствуйте, добрый день">
+               placeholder="слова-приметы через запятую: здравствуйте, добрый день">`}
         <div class="script-hit small" data-hit="${esc(п.id || '')}"></div>
       </div>`).join('') ||
       '<div class="empty small">Пунктов нет: сервер проверять не будет ничего</div>';
@@ -5074,8 +5302,10 @@ RENDERERS.content.drawScript = function (host) {
         const вес = Number(qs('.script-weight', узел).value);
         if (вес > 0 && вес !== 1) пункты[i].weight = вес;
         else delete пункты[i].weight;
-        пункты[i].any = qs('.script-any', узел).value
-          .split(',').map((w) => w.trim()).filter(Boolean);
+        const приметы = qs('.script-any', узел);
+        if (приметы) {
+          пункты[i].any = приметы.value.split(',').map((w) => w.trim()).filter(Boolean);
+        }
         qs('#script-save').disabled = false;
         clearTimeout(state.contentScriptTimer);
         state.contentScriptTimer = setTimeout(() => RENDERERS.content.checkScript(), 500);
@@ -5100,12 +5330,27 @@ RENDERERS.content.drawScript = function (host) {
     state.contentScriptJob = e.target.value;
     this.checkScript();
   });
-  qs('#script-add').addEventListener('click', () => {
-    state.contentScript = state.contentScript || [];
-    state.contentScript.push({ id: `п${Date.now().toString(36)}`,
-                               label: '', any: [], where: 'any' });
+  // Новый пункт дорисовывается на месте, а не через перерисовку вкладки:
+  // вкладка заново читает скрипт из настроек и черновик с новым пунктом
+  // терялся — «Добавить пункт» не добавлял ничего, и снимок экрана это
+  // показал только на третьем заходе.
+  const добавить = (пункт) => {
+    пункты.push(пункт);
     qs('#script-save').disabled = false;
-    this.showTab();
+    рисовать();
+    const последний = qs('.script-item:last-child .script-title', список);
+    if (последний) последний.focus();
+    RENDERERS.content.checkScript();
+  };
+  qs('#script-add').addEventListener('click', () => добавить({
+    id: `п${Date.now().toString(36)}`, label: '', any: [], where: 'any' }));
+  qs('#script-add-name').addEventListener('click', () => {
+    if (пункты.some((п) => п.check === 'customer_name')) {
+      toast('Такой пункт уже есть', 'warn');
+      return;
+    }
+    добавить({ id: 'customer_name', label: 'Обратился по имени',
+               check: 'customer_name', where: 'any' });
   });
   const вернуть = qs('#script-default');
   if (вернуть) вернуть.addEventListener('click', () => this.saveScript([]));
@@ -5156,7 +5401,7 @@ RENDERERS.content.checkScript = async function () {
 
 /** Сохраняет скрипт и пересчитывает разбор: старые числа считаны другим. */
 RENDERERS.content.saveScript = async function (пункты) {
-  const плохие = пункты.filter((п) => !п.label || !(п.any || []).length);
+  const плохие = пункты.filter((п) => !п.label || (!п.check && !п.rule && !(п.any || []).length));
   if (плохие.length) {
     toast('У каждого пункта должно быть название и хотя бы одна примета', 'err');
     return;

@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -96,9 +96,27 @@ _CONTENT_SCHEMA = """
         violations        INTEGER,
         agent_score       REAL,
         empathy           REAL,
+        -- Сколько раз оператор обратился к клиенту по имени; NULL без
+        -- определённого оператора.
+        name_uses         INTEGER,
         -- Подробности: сам разбор целиком, как его показывает карточка.
         detail            TEXT
     )
+"""
+
+#: Отметки на записях, которые ставит человек: «разобрано» в очереди
+#: коучинга, «эталон — показывать новичкам». Отдельно от разбора: разбор
+#: пересчитывается и перезаписывается, а отметка руководителя должна
+#: пережить любой пересчёт.
+_CONTENT_MARKS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS content_marks (
+        job_id     TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        status     TEXT NOT NULL,
+        note       TEXT,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (job_id, kind)
+    ) WITHOUT ROWID
 """
 
 #: Основы слов записи — знаменатель TF-IDF. Отдельная таблица, а не разбор
@@ -222,6 +240,8 @@ _SCHEMA = [
     _CONTENT_VOCAB_SCHEMA,
     # --- версия 12: совпадения категорий обращений ----------------------
     _CONTENT_HITS_SCHEMA,
+    # --- версия 13: отметки коучинга и эталонов -------------------------
+    _CONTENT_MARKS_SCHEMA,
     *_CONTENT_INDEXES,
     # --- версия 1: основные таблицы ---------------------------------------
     """
@@ -638,7 +658,15 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "violations": "INTEGER",
         "agent_score": "REAL",
         "empathy": "REAL",
+        "name_uses": "INTEGER",
         "detail": "TEXT",
+    },
+    "content_marks": {
+        "job_id": "TEXT",
+        "kind": "TEXT",
+        "status": "TEXT",
+        "note": "TEXT",
+        "updated_at": "REAL",
     },
     "content_hits": {
         "job_id": "TEXT",
@@ -1351,7 +1379,7 @@ class Database:
         "money_max, speakers, agent_speaker, overlap_s, dead_air_s, switches, "
         "talk_share, monologue_s, customer_story_s, reply_delay_s, tempo_ratio, "
         "frustration, repeat_contact, profanity, profanity_agent, objections, "
-        "objections_unhandled, violations, agent_score, empathy"
+        "objections_unhandled, violations, agent_score, empathy, name_uses"
     )
 
     def save_content(self, job_id: str, features: dict[str, Any],
@@ -1571,6 +1599,10 @@ class Database:
         ("agent_score", "AVG(c.agent_score)"),
         ("scored_agents", "SUM(CASE WHEN c.agent_score IS NOT NULL THEN 1 ELSE 0 END)"),
         ("empathy", "AVG(c.empathy)"),
+        # Обращение по имени: доля записей, где оператор назвал клиента по
+        # имени, среди тех, где оператор был определён.
+        ("named", "SUM(CASE WHEN COALESCE(c.name_uses,0) > 0 THEN 1 ELSE 0 END)"),
+        ("name_checked", "SUM(CASE WHEN c.name_uses IS NOT NULL THEN 1 ELSE 0 END)"),
     )
 
     #: Как группировать свод. Значение — выражение SQL; None — без
@@ -1632,13 +1664,29 @@ class Database:
         "violations": "c.violations",
         "agent_score": "c.agent_score",
         "empathy": "c.empathy",
+        "name_uses": "c.name_uses",
+    }
+
+    #: Разрезы, по которым бывает карточка оператора: метка говорящего в
+    #: разборе или владелец задания (ключ доступа). Выражение берётся
+    #: отсюда, ключ группы уходит параметром.
+    AGENT_DIMENSIONS: dict[str, str] = {
+        "speaker": "COALESCE(NULLIF(c.agent_speaker,''),'—') = ?",
+        "owner": "COALESCE(NULLIF(j.owner,''),'—') = ?",
     }
 
     def _content_where(self, since: float | None, until: float | None,
                        owner: str | list[str] | None,
-                       extra: str = "") -> tuple[str, list[Any]]:
+                       extra: str = "",
+                       agent: tuple[str, str] | None = None) -> tuple[str, list[Any]]:
         where = ["j.status='completed'"]
         args: list[Any] = []
+        if agent:
+            выражение = self.AGENT_DIMENSIONS.get(agent[0])
+            if выражение is None:
+                raise ValueError(f"неизвестный разрез оператора: {agent[0]}")
+            where.append(выражение)
+            args.append(agent[1])
         if since:
             where.append("j.created_at>=?")
             args.append(since)
@@ -1657,7 +1705,8 @@ class Database:
                           until: float | None = None,
                           owner: str | list[str] | None = None,
                           group_by: str | None = None,
-                          limit: int = 200) -> list[dict[str, Any]]:
+                          limit: int = 200,
+                          agent: tuple[str, str] | None = None) -> list[dict[str, Any]]:
         """Свод по разобранным записям — целиком или по группам.
 
         Возвращает список строк; без группировки — ровно одну. Пустой корпус
@@ -1676,7 +1725,7 @@ class Database:
             if group_by and выражение is None:
                 return []
         показатели = ", ".join(f"{выр} AS {имя}" for имя, выр in self.CONTENT_METRICS)
-        условие, args = self._content_where(since, until, owner)
+        условие, args = self._content_where(since, until, owner, agent=agent)
         начало = f"SELECT {выражение} AS group_key, " if выражение else "SELECT "
         хвост = (f" GROUP BY group_key ORDER BY records DESC LIMIT {int(limit)}"
                  if выражение else "")
@@ -1709,6 +1758,121 @@ class Database:
             f"WHERE {условие} GROUP BY h.category, h.kind "
             "ORDER BY records DESC", args)
         return [dict(r) for r in rows]
+
+    def agent_violations(self, *, since: float | None = None,
+                         until: float | None = None,
+                         owner: str | list[str] | None = None,
+                         agent: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+        """Сработавшие нарушения по категориям — для карточки оператора."""
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        rows = self.query(
+            "SELECT h.category, COUNT(*) AS records, SUM(h.count) AS mentions "
+            "FROM content_hits h JOIN content c ON c.job_id = h.job_id "
+            "JOIN jobs j ON j.id = h.job_id "
+            f"WHERE {условие} AND h.kind = 'violation' "
+            "GROUP BY h.category ORDER BY records DESC", args)
+        return [dict(r) for r in rows]
+
+    # --- отметки коучинга и эталонов -------------------------------------
+
+    MARK_KINDS = ("coaching", "reference")
+
+    def set_mark(self, job_id: str, kind: str, status: str, note: str = "") -> None:
+        """Ставит или снимает отметку; пустой статус — снять."""
+        if kind not in self.MARK_KINDS:
+            raise ValueError(f"неизвестный вид отметки: {kind}")
+        with self.write() as conn:
+            if not status:
+                conn.execute("DELETE FROM content_marks WHERE job_id=? AND kind=?",
+                             (job_id, kind))
+                return
+            conn.execute(
+                "INSERT INTO content_marks (job_id, kind, status, note, updated_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(job_id, kind) DO UPDATE SET "
+                "status=excluded.status, note=excluded.note, updated_at=excluded.updated_at",
+                (job_id, kind, status, note or "", now()))
+
+    def get_marks(self, job_ids: list[str]) -> dict[str, dict[str, dict[str, Any]]]:
+        """Отметки по заданиям: {job_id: {kind: {status, note, updated_at}}}."""
+        if not job_ids:
+            return {}
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for i in range(0, len(job_ids), 500):
+            кусок = job_ids[i:i + 500]
+            места = ",".join("?" for _ in кусок)
+            for r in self.query(
+                    f"SELECT job_id, kind, status, note, updated_at FROM content_marks "
+                    f"WHERE job_id IN ({места})", кусок):
+                out.setdefault(str(r["job_id"]), {})[str(r["kind"])] = {
+                    "status": r["status"], "note": r["note"], "updated_at": r["updated_at"]}
+        return out
+
+    #: Что зовёт запись в очередь коучинга. Выражения постоянные; причина
+    #: подписывается в коде по тем же полям.
+    COACHING_REASONS: tuple[tuple[str, str], ...] = (
+        ("violations", "COALESCE(c.violations,0) > 0"),
+        ("low_score", "c.agent_score IS NOT NULL AND c.agent_score < 60"),
+        ("script", "c.compliance IS NOT NULL AND c.compliance < 0.5"),
+        ("monologue", "c.monologue_s >= 150"),
+        ("impolite", "c.empathy IS NOT NULL AND c.empathy < 0"),
+        ("objections", "COALESCE(c.objections_unhandled,0) > 0"),
+        ("frustrated", "COALESCE(c.frustration,0) > 0"),
+        ("profanity", "COALESCE(c.profanity_agent,0) > 0"),
+    )
+
+    def coaching_queue(self, *, since: float | None = None,
+                       until: float | None = None,
+                       owner: str | list[str] | None = None,
+                       agent: tuple[str, str] | None = None,
+                       limit: int = 50, include_done: bool = False) -> list[dict[str, Any]]:
+        """Записи, которые стоит разобрать с оператором, — худшие первыми.
+
+        Разобранные (отметка coaching=done) не показываются, пока не
+        попросят: очередь — это то, что осталось, а не всё, что было.
+        """
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        причины = " OR ".join(f"({выр})" for _, выр in self.COACHING_REASONS)
+        колонки = ", ".join(f"c.{к.strip()}" for к in self.CONTENT_COLUMNS.split(","))
+        готово = "" if include_done else " AND COALESCE(m.status,'') <> 'done'"
+        rows = self.query(
+            f"SELECT {колонки}, j.owner, j.model, j.tags, j.created_at, "
+            f"       j.media_duration_s, j.filename, m.status AS mark_status, "
+            f"       m.note AS mark_note, m.updated_at AS mark_at "
+            f"FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"LEFT JOIN content_marks m ON m.job_id = c.job_id AND m.kind = 'coaching' "
+            f"WHERE {условие} AND ({причины}){готово} "
+            f"ORDER BY c.agent_score IS NULL, c.agent_score ASC, c.sentiment ASC LIMIT ?",
+            [*args, limit])
+        return [dict(r) for r in rows]
+
+    def reference_records(self, *, since: float | None = None,
+                          until: float | None = None,
+                          owner: str | list[str] | None = None,
+                          limit: int = 20) -> list[dict[str, Any]]:
+        """Лучшие разговоры периода — по баллу и тональности, без нарушений —
+        и всё, что отмечено эталоном руками, независимо от периода."""
+        условие, args = self._content_where(since, until, owner)
+        колонки = ", ".join(f"c.{к.strip()}" for к in self.CONTENT_COLUMNS.split(","))
+        общие = (f"SELECT {колонки}, j.owner, j.model, j.tags, j.created_at, "
+                 f"       j.media_duration_s, j.filename, m.status AS mark_status, "
+                 f"       m.note AS mark_note "
+                 f"FROM content c JOIN jobs j ON j.id = c.job_id "
+                 f"LEFT JOIN content_marks m ON m.job_id = c.job_id AND m.kind = 'reference' ")
+        лучшие = self.query(
+            общие + f"WHERE {условие} AND c.agent_score IS NOT NULL "
+            "AND COALESCE(c.violations,0) = 0 AND c.sentiment IS NOT NULL "
+            "ORDER BY c.agent_score DESC, c.sentiment DESC LIMIT ?", [*args, limit])
+        отмеченные = self.query(
+            общие + "WHERE j.status='completed' AND m.status = 'yes' "
+            "ORDER BY m.updated_at DESC LIMIT ?", [limit])
+        out: list[dict[str, Any]] = []
+        видели: set[str] = set()
+        for r in [*отмеченные, *лучшие]:
+            if r["job_id"] in видели:
+                continue
+            видели.add(r["job_id"])
+            out.append(dict(r))
+        return out
 
     def tracker_hits(self, *, since: float | None = None,
                      until: float | None = None) -> list[dict[str, Any]]:
@@ -1754,6 +1918,7 @@ class Database:
 
     def content_series(self, *, since: float, until: float, buckets: int = 24,
                        owner: str | list[str] | None = None,
+                       agent: tuple[str, str] | None = None,
                        ) -> tuple[int, float, list[dict[str, Any]]]:
         """Ряд показателей содержания по времени — свёртка в SQL.
 
@@ -1764,14 +1929,16 @@ class Database:
         который читается как «разговоров не было».
         """
         buckets, шаг = self._bucket_step(since, until, buckets)
-        условие, args = self._content_where(since, until, owner)
+        условие, args = self._content_where(since, until, owner, agent=agent)
         rows = self.query(
             "SELECT CAST((j.created_at-?)/? AS INTEGER) AS bucket, "
             "       COUNT(*) AS records, AVG(c.sentiment) AS sentiment, "
             "       SUM(CASE WHEN c.sentiment < -0.15 THEN 1 ELSE 0 END) AS negative, "
             "       SUM(CASE WHEN c.sentiment IS NOT NULL THEN 1 ELSE 0 END) AS scored, "
             "       SUM(COALESCE(c.alerts,0)) AS alerts, "
-            "       AVG(c.compliance) AS compliance, AVG(c.wpm) AS wpm "
+            "       AVG(c.compliance) AS compliance, AVG(c.wpm) AS wpm, "
+            "       AVG(c.agent_score) AS agent_score, AVG(c.empathy) AS empathy, "
+            "       SUM(CASE WHEN COALESCE(c.violations,0) > 0 THEN 1 ELSE 0 END) AS violation_records "
             "FROM content c JOIN jobs j ON j.id = c.job_id "
             f"WHERE {условие} GROUP BY bucket ORDER BY bucket",
             [since, шаг, *args])
@@ -1780,14 +1947,15 @@ class Database:
     def content_top(self, order: str, *, since: float | None = None,
                     until: float | None = None,
                     owner: str | list[str] | None = None,
-                    where: str = "", limit: int = 20) -> list[dict[str, Any]]:
+                    where: str = "", limit: int = 20,
+                    agent: tuple[str, str] | None = None) -> list[dict[str, Any]]:
         """Записи окна по заданному порядку — для списков «что послушать».
 
         `order` и `where` приходят не от пользователя, а из перечня отборов
         в `insights`: подставлять сюда строку из запроса нельзя, и вызывающая
         сторона обязана это гарантировать.
         """
-        условие, args = self._content_where(since, until, owner, where)
+        условие, args = self._content_where(since, until, owner, where, agent=agent)
         колонки = ", ".join(f"c.{к.strip()}" for к in self.CONTENT_COLUMNS.split(","))
         rows = self.query(
             f"SELECT {колонки}, j.owner, j.model, j.tags, j.created_at, "
@@ -1996,6 +2164,7 @@ class Database:
             conn.execute("DELETE FROM content WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_terms WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
+            conn.execute("DELETE FROM content_marks WHERE job_id=?", (job_id,))
             # content_vocab не трогаем: это словарь форм на весь сервер, а не
             # данные задания. Строка «поставк → поставки» после удаления
             # записи остаётся верной, а перебирать ради неё все прочие записи

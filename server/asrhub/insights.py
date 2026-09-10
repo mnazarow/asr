@@ -141,6 +141,9 @@ log = get_logger("insights")
     {"key": "empathy", "title": "Индекс эмпатии", "unit": "от −100 до +100",
      "good": 1, "digits": 0,
      "hint": "(вежливых − невежливых) ÷ сумму по репликам оператора (Genesys)"},
+    {"key": "named_share", "title": "Обратился по имени", "unit": "% записей",
+     "good": 1, "digits": 1,
+     "hint": "доля записей, где оператор назвал клиента по имени; по словарю имён"},
 ]
 ПРИЗНАКИ_ПО_КЛЮЧУ = {п["key"]: п for п in ПРИЗНАКИ}
 
@@ -435,6 +438,11 @@ class Insights:
             "violation_records": int(строка.get("violation_records") or 0),
             "violation_share": _процент(строка.get("violation_records"), всего),
             "scored_agents": int(строка.get("scored_agents") or 0),
+            # Обращение по имени — доля среди записей с определённым оператором.
+            "named": int(строка.get("named") or 0),
+            "name_checked": int(строка.get("name_checked") or 0),
+            "named_share": (_процент(строка.get("named"), строка.get("name_checked"))
+                            if int(строка.get("name_checked") or 0) else None),
         }
         for признак in ПРИЗНАКИ:
             ключ = признак["key"]
@@ -811,6 +819,157 @@ class Insights:
             return None
         без = self.db.uncategorized_count(since=начало, owner=owner)
         return {"records": без, "share": _процент(без, всего)}
+
+    # --- оператор ---------------------------------------------------------
+
+    #: Что сравнивать в карточке оператора с командой: ключ свода, подпись,
+    #: куда лучше (1 — больше, −1 — меньше, 0 — никуда), знаков.
+    СРАВНЕНИЕ: tuple[tuple[str, str, int, int], ...] = (
+        ("agent_score", "Балл оператора", 1, 0),
+        ("sentiment", "Тональность", 1, 2),
+        ("negative_share", "Отрицательных, %", -1, 1),
+        ("compliance", "Скрипт", 1, 2),
+        ("empathy", "Индекс эмпатии", 1, 0),
+        ("violation_share", "С нарушениями, %", -1, 1),
+        ("named_share", "Обратился по имени, %", 1, 1),
+        ("talk_share", "Доля речи оператора", 0, 2),
+        ("monologue_s", "Самый долгий монолог, с", -1, 0),
+        ("reply_delay_s", "Пауза перед ответом, с", 0, 2),
+        ("interruptions", "Перебиваний", -1, 1),
+        ("objections_unhandled_share", "Возражений без отработки, %", -1, 1),
+        ("frustrated_share", "Клиент раздражён, %", -1, 1),
+        ("duration_s", "Длительность, с", 0, 0),
+    )
+
+    #: Причины попадания в очередь коучинга — по полям записи.
+    ПРИЧИНЫ_КОУЧИНГА: tuple[tuple[str, Any, str], ...] = (
+        ("violations", lambda з: (з.get("violations") or 0) > 0,
+         "нарушение оператора"),
+        ("low_score", lambda з: з.get("agent_score") is not None and з["agent_score"] < 60,
+         "балл ниже 60"),
+        ("script", lambda з: з.get("compliance") is not None and з["compliance"] < 0.5,
+         "скрипт меньше половины"),
+        ("monologue", lambda з: (з.get("monologue_s") or 0) >= 150,
+         "монолог дольше 2,5 мин"),
+        ("impolite", lambda з: з.get("empathy") is not None and з["empathy"] < 0,
+         "невежливых оборотов больше вежливых"),
+        ("objections", lambda з: (з.get("objections_unhandled") or 0) > 0,
+         "возражение без отработки"),
+        ("frustrated", lambda з: (з.get("frustration") or 0) > 0,
+         "клиент раздражён"),
+        ("profanity", lambda з: (з.get("profanity_agent") or 0) > 0,
+         "нецензурная лексика у сотрудника"),
+    )
+
+    def _причины(self, запись: dict[str, Any]) -> list[str]:
+        out = []
+        for _, правило, подпись in self.ПРИЧИНЫ_КОУЧИНГА:
+            try:
+                if правило(запись):
+                    out.append(подпись)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def agents(self, by: str = "speaker", period: str = "week",
+               owner: str | list[str] | None = None,
+               limit: int = 100) -> dict[str, Any]:
+        """Список операторов — разрез с баллом, эмпатией и нарушениями."""
+        if by not in Database.AGENT_DIMENSIONS:
+            raise ValueError(f"неизвестный разрез оператора: {by}")
+        разрез = self.breakdown(by, period, owner, limit=limit)
+        return {"by": by, "period": period, "items": разрез["items"],
+                "hidden": разрез.get("hidden", 0)}
+
+    def agent_card(self, key: str, *, by: str = "speaker", period: str = "week",
+                   owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Карточка оператора: показатели против команды, ход по неделям,
+        нарушения, лучшие и худшие записи, очередь коучинга.
+
+        Оператор здесь — либо метка говорящего в разборе (по умолчанию),
+        либо владелец задания: ключ доступа, под которым записи загружены.
+        Второе точнее там, где у каждого сотрудника свой ключ: метка
+        «SPEAKER_00» — это «кто заговорил первым», а не человек.
+        """
+        if by not in Database.AGENT_DIMENSIONS:
+            raise ValueError(f"неизвестный разрез оператора: {by}")
+        оператор = (by, key)
+        начало, прошлое = self.window(period)
+        строки = self.db.content_aggregate(since=начало, owner=owner, agent=оператор)
+        свой = self._свод(строки[0] if строки else {})
+        команда = self.summary(period, owner)
+        прошлый_свой = (self._свод((self.db.content_aggregate(
+            since=прошлое, until=начало, owner=owner, agent=оператор) or [{}])[0])
+                        if начало is not None else None)
+        сравнение = []
+        for ключ, подпись, лучше, знаков in self.СРАВНЕНИЕ:
+            своё, общее = свой.get(ключ), команда.get(ключ)
+            разница = (round(float(своё) - float(общее), знаков + 1)
+                       if своё is not None and общее is not None else None)
+            сравнение.append({
+                "key": ключ, "title": подпись, "digits": знаков,
+                "agent": _округлить(своё, знаков + 1), "team": _округлить(общее, знаков + 1),
+                "previous": _округлить((прошлый_свой or {}).get(ключ), знаков + 1),
+                "delta": разница,
+                "verdict": (None if разница is None or not лучше or abs(разница) < 1e-9
+                            else ("better" if разница * лучше > 0 else "worse")),
+            })
+        # Ход по неделям: недельные корзины за период, но не меньше четырёх.
+        конец = time.time()
+        от = начало if начало is not None else конец - 90 * 86400
+        корзин = max(4, min(53, int(round((конец - от) / (7 * 86400)))))
+        n, шаг, ряд = self.db.content_series(since=от, until=конец, buckets=корзин,
+                                             owner=owner, agent=оператор)
+        по_корзинам = {int(с["bucket"]): с for с in ряд}
+        ход = []
+        for k in range(n):
+            с = по_корзинам.get(k) or {}
+            ход.append({"ts": round(от + k * шаг, 1), "records": int(с.get("records") or 0),
+                        "agent_score": _округлить(с.get("agent_score"), 1),
+                        "sentiment": _округлить(с.get("sentiment"), 3),
+                        "empathy": _округлить(с.get("empathy"), 1),
+                        "violation_records": int(с.get("violation_records") or 0)})
+        подписи = self._подписи_категорий()
+        нарушения = [{**н, "label": подписи.get(н["category"], {}).get("label", н["category"])}
+                     for н in self.db.agent_violations(since=начало, owner=owner,
+                                                       agent=оператор)]
+        худшие = self.db.content_top("c.agent_score IS NULL, c.agent_score ASC, c.sentiment ASC",
+                                     since=начало, owner=owner, agent=оператор, limit=5)
+        лучшие = self.db.content_top("c.agent_score DESC, c.sentiment DESC",
+                                     since=начало, owner=owner, agent=оператор,
+                                     where="c.agent_score IS NOT NULL", limit=5)
+        очередь = self.coaching(period, owner, agent=оператор, limit=20)
+        return {
+            "by": by, "key": key, "period": period,
+            "summary": свой, "team": команда, "previous": прошлый_свой,
+            "compare": сравнение, "timeline": ход, "step_s": round(шаг, 1),
+            "violations": нарушения, "worst": худшие, "best": лучшие,
+            "coaching": очередь["items"], "coaching_total": очередь["total"],
+        }
+
+    def coaching(self, period: str = "week", owner: str | list[str] | None = None,
+                 *, agent: tuple[str, str] | None = None, limit: int = 50,
+                 include_done: bool = False) -> dict[str, Any]:
+        """Очередь коучинга: записи с причиной и отметкой «разобрано»."""
+        начало = self.window(period)[0]
+        строки = self.db.coaching_queue(since=начало, owner=owner, agent=agent,
+                                        limit=limit, include_done=include_done)
+        items = []
+        for з in строки:
+            items.append({**з, "reasons": self._причины(з),
+                          "mark": ({"status": з.get("mark_status"), "note": з.get("mark_note"),
+                                    "updated_at": з.get("mark_at")}
+                                   if з.get("mark_status") else None)})
+        return {"period": period, "items": items, "total": len(items),
+                "reasons": [{"key": к, "title": п} for к, _, п in self.ПРИЧИНЫ_КОУЧИНГА]}
+
+    def references(self, period: str = "week", owner: str | list[str] | None = None,
+                   limit: int = 20) -> dict[str, Any]:
+        """Эталонные разговоры: отмеченные руками и лучшие за период."""
+        начало = self.window(period)[0]
+        строки = self.db.reference_records(since=начало, owner=owner, limit=limit)
+        return {"period": period, "items": [
+            {**з, "marked": з.get("mark_status") == "yes"} for з in строки]}
 
     # --- связи ------------------------------------------------------------
 
