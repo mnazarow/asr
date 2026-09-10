@@ -425,6 +425,34 @@ curl -H "X-API-Key: ah_xxx" "https://asr.example.com/api/analytics/queue?period=
 curl -H "X-API-Key: ah_xxx" "https://asr.example.com/api/analytics/weekly?period=month"
 ```
 
+### Аналитика записей
+
+Разбор содержания расшифровок живёт под своим корнем и устроен так же: всё сразу или по разделам.
+
+```
+GET  /api/content?period=month           весь отчёт: для выгрузки и сводки
+GET  /api/content/status                 состояние разбора: посчитано, ждёт
+GET  /api/content/summary?period=month   свод и предыдущий такой же период
+GET  /api/content/timeline?period=month  показатели по времени
+GET  /api/content/breakdown/{разрез}     owner, speaker, tag, model, source, weekday, hour
+GET  /api/content/topics?period=month    темы корпуса и что изменилось
+GET  /api/content/correlations           связи между признаками
+GET  /api/content/findings               готовые выводы словами
+GET  /api/content/records?kind=negative  записи по отбору
+GET  /api/content/kinds                  перечень отборов, разрезов и скрипт по умолчанию
+GET  /api/content/jobs/{id}              разбор одной записи
+POST /api/content/jobs/{id}/recompute    пересчитать одну запись
+POST /api/content/script/check           прогнать скрипт по записи, ничего не сохраняя
+POST /api/content/recompute              пересчитать архив (нужен ключ администратора)
+GET  /api/content/export?format=xlsx     выгрузка отчёта файлом
+```
+
+Разрез по владельцу тот же, что у аналитики сервера: обычный ключ видит только свои записи, ключ в группе — записи подразделения, администратор — всё.
+
+Полный отчёт на архиве в сто тысяч записей считается около восьми секунд — каждый разрез отдельный запрос к базе. Для страницы это много: интерфейс берёт разделы по отдельности, и так же стоит делать любому клиенту, которому нужна часть.
+
+Подробное описание каждого показателя, границы применимости и формат скрипта разговора — в главе «Аналитика записей».
+
 ## События по WebSocket
 
 Браузерный WebSocket не умеет отправлять заголовки, поэтому ключ пришлось бы писать в адрес — а он попадает в историю браузера, в журнал обратного прокси и в заголовок `Referer`. Вместо ключа берётся одноразовый билет: он живёт минуту, гасится при первом подключении и не открывает доступ к HTTP-маршрутам.

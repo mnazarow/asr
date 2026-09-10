@@ -957,16 +957,56 @@ class Database:
         "webhook_status"
     )
 
-    def list_jobs(self, *, status: str | list[str] | None = None,
-                  owner: str | list[str] | None = None,
-                  model: str | None = None, search: str | None = None,
-                  group_id: str | None = None, since: float | None = None,
-                  limit: int = 100, offset: int = 0,
-                  order: str = "created_at DESC",
-                  light: bool = False,
-                  ready_before: float | None = None) -> list[dict[str, Any]]:
+    #: Отборы по содержанию разговора для списка заданий. Ключ приходит из
+    #: строки запроса, выражение берётся отсюда и никогда из неё: перечень
+    #: закрытый, неизвестный ключ отдаёт пустой список.
+    #:
+    #: Те же вопросы, что в разделе «Аналитика записей», но здесь они
+    #: сочетаются с поиском по словам и с отбором по владельцу — то есть
+    #: отвечают на «покажи отрицательные разговоры про возврат за неделю»,
+    #: чего раздел сам по себе не умеет.
+    CONTENT_FILTERS: dict[str, str] = {
+        "negative": "c.sentiment < -0.15",
+        "positive": "c.sentiment > 0.15",
+        "downturn": "c.sentiment_shift < -0.2",
+        "recovered": "c.sentiment_shift > 0.2",
+        "alerts": "COALESCE(c.alerts,0) > 0",
+        "open_commitments": "c.commitments > COALESCE(c.commitments_dated,0)",
+        "interruptions": "COALESCE(c.interruptions,0) > 2",
+        "silence": "c.silence_share > 0.3",
+        "script_failed": "c.compliance IS NOT NULL AND c.compliance < 0.5",
+        "money": "c.money_max IS NOT NULL",
+    }
+
+    def _jobs_where(self, *, status: str | list[str] | None = None,
+                    owner: str | list[str] | None = None,
+                    model: str | None = None, search: str | None = None,
+                    group_id: str | None = None, since: float | None = None,
+                    content: str | None = None,
+                    ) -> tuple[str, list[str], list[Any]] | None:
+        """Условия отбора заданий — общие для списка и для счётчика.
+
+        Раньше их было две копии, и они разошлись: список учитывал поиск,
+        модель и группу, а счётчик — только статус и владельца. На экране
+        это выглядело как «показано 30, всего 4000», и листалка уводила на
+        пустые страницы. Одна сборка на двоих — единственный способ, при
+        котором это не разойдётся снова.
+
+        Возвращает None, когда отбор заведомо пуст (неизвестный ключ
+        содержания): вызывающий отдаёт пустой ответ, не ходя в базу.
+        """
         where: list[str] = []
         args: list[Any] = []
+        соединение = ""
+        if content:
+            # Соединение с разбором добавляется, только когда отбор задан:
+            # список заданий открывают чаще всего, и лишнее соединение
+            # стоило бы времени каждому, кто им не пользуется.
+            условие = self.CONTENT_FILTERS.get(content)
+            if условие is None:
+                return None
+            соединение = " JOIN content c ON c.job_id = jobs.id"
+            where.append(условие)
         if status:
             statuses = [status] if isinstance(status, str) else list(status)
             where.append("status IN (" + ",".join("?" for _ in statuses) + ")")
@@ -1006,6 +1046,23 @@ class Database:
             else:
                 where.append("(filename LIKE ? OR id LIKE ?)")
                 args.extend([needle, needle])
+        return соединение, where, args
+
+    def list_jobs(self, *, status: str | list[str] | None = None,
+                  owner: str | list[str] | None = None,
+                  model: str | None = None, search: str | None = None,
+                  group_id: str | None = None, since: float | None = None,
+                  limit: int = 100, offset: int = 0,
+                  order: str = "created_at DESC",
+                  light: bool = False,
+                  content: str | None = None,
+                  ready_before: float | None = None) -> list[dict[str, Any]]:
+        собрано = self._jobs_where(status=status, owner=owner, model=model,
+                                   search=search, group_id=group_id, since=since,
+                                   content=content)
+        if собрано is None:
+            return []
+        соединение, where, args = собрано
         if ready_before is not None:
             # Отбор «время повтора уже наступило» обязан идти в SQL, а не
             # после LIMIT. Планировщик выбирает окно из 500 заданий; если в
@@ -1022,9 +1079,20 @@ class Database:
         if order not in allowed_order:
             order = "created_at DESC"
         clause = ("WHERE " + " AND ".join(where)) if where else ""
-        columns = self.LIGHT_COLUMNS if light else "*"
+        # Колонки с явным именем таблицы: при соединении с разбором голая
+        # звёздочка притащила бы и его колонки, а `_row_to_job` разобрал бы
+        # их как поля задания.
+        if light:
+            columns = (", ".join(f"jobs.{к.strip()}"
+                                 for к in self.LIGHT_COLUMNS.split(","))
+                       if соединение else self.LIGHT_COLUMNS)
+        else:
+            columns = "jobs.*" if соединение else "*"
+        порядок = (f"jobs.{order}" if соединение and not order.startswith("jobs.")
+                   else order)
         rows = self.query(
-            f"SELECT {columns} FROM jobs {clause} ORDER BY {order} LIMIT ? OFFSET ?",
+            f"SELECT {columns} FROM jobs{соединение} {clause} "
+            f"ORDER BY {порядок} LIMIT ? OFFSET ?",
             [*args, limit, offset])
         if light:
             return [dict(r) for r in rows]
@@ -1284,6 +1352,11 @@ class Database:
         ("compliance", "AVG(c.compliance)"),
         ("money_max", "MAX(c.money_max)"),
         ("speakers", "AVG(c.speakers)"),
+        # Записи, где говорящий один: на них перебивания, монологи, разрез
+        # по операторам и ход тональности считать не по чему, и половина
+        # показателей группы получается нулями. Ноль, полученный так, — это
+        # не «стало лучше», и раздел обязан отличать одно от другого.
+        ("mono", "SUM(CASE WHEN COALESCE(c.speakers,0) < 2 THEN 1 ELSE 0 END)"),
         ("duration_s", "AVG(j.media_duration_s)"),
     )
 
@@ -1587,22 +1660,26 @@ class Database:
 
     def count_jobs(self, *, status: str | list[str] | None = None,
                    owner: str | list[str] | None = None,
+                   model: str | None = None, search: str | None = None,
+                   group_id: str | None = None,
+                   content: str | None = None,
                    since: float | None = None) -> int:
-        where: list[str] = []
-        args: list[Any] = []
-        if status:
-            statuses = [status] if isinstance(status, str) else list(status)
-            where.append("status IN (" + ",".join("?" for _ in statuses) + ")")
-            args.extend(statuses)
-        if owner:
-            owners = [owner] if isinstance(owner, str) else list(owner)
-            where.append("owner IN (" + ",".join("?" for _ in owners) + ")")
-            args.extend(owners)
-        if since:
-            where.append("created_at>=?")
-            args.append(since)
+        """Сколько заданий подходит под отбор.
+
+        Тот же набор условий, что у `list_jobs`, и собирает их та же
+        функция. Раньше счётчик знал только про статус и владельца: список
+        с поиском показывал тридцать строк и «всего 4000», а листалка вела
+        на пустые страницы.
+        """
+        собрано = self._jobs_where(status=status, owner=owner, model=model,
+                                   search=search, group_id=group_id, since=since,
+                                   content=content)
+        if собрано is None:
+            return 0
+        соединение, where, args = собрано
         clause = ("WHERE " + " AND ".join(where)) if where else ""
-        row = self.query_one(f"SELECT COUNT(*) AS n FROM jobs {clause}", args)
+        row = self.query_one(
+            f"SELECT COUNT(*) AS n FROM jobs{соединение} {clause}", args)
         return int(row["n"]) if row else 0
 
     def delete_job(self, job_id: str) -> None:

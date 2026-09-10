@@ -23,6 +23,8 @@ services:
       dockerfile: docker/Dockerfile
       args:
         PROFILE: ${ASRHUB_PROFILE:-standard}
+        # Явный список движков из .env. Пустой — берётся набор профиля.
+        ENGINES: ${ASRHUB_ENGINES:-}
         ACCEL: cpu
         TORCH_INDEX: https://download.pytorch.org/whl/cpu
     image: asrhub:${ASRHUB_TAG:-latest}
@@ -31,7 +33,11 @@ services:
     # Профиля у сервера нет намеренно: сервис с профилем не поднимается без
     # явного --profile, и «docker compose up -d» не запускал бы ничего.
     ports:
-      - "${ASRHUB_PORT:-8080}:8080"
+      # Адрес публикации, а не только порт. Установщик писал в .env
+      # ASRHUB_HOST=127.0.0.1, если человек просил закрыть сервер снаружи, —
+      # а Compose знал только про порт и открывал его на всех интерфейсах.
+      # То есть установка «только для себя» выставляла сервер в сеть.
+      - "${ASRHUB_HOST:-0.0.0.0}:${ASRHUB_PORT:-8080}:8080"
     volumes:
       - "${ASRHUB_DATA:-./data}:/data"
     environment:

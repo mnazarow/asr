@@ -144,11 +144,18 @@ def _подчистить(каталог: Path, держать: int, *,
             log.warning("Старую копию %s удалить не удалось: %s", лишняя.name, exc)
 
 
-def build_digest(analytics: Any, settings: Any, *, period: str = "") -> dict[str, Any]:
+def build_digest(analytics: Any, settings: Any, *, period: str = "",
+                 insights: Any = None) -> dict[str, Any]:
     """Сводка о работе сервера — то же, что в разделе «Аналитика».
 
     Собирается по всем заданиям, без разреза по владельцу: сводка уходит
     тому, кто отвечает за сервер целиком.
+
+    `insights` — свод по содержанию записей. Если он передан и разбор
+    включён, к сводке добавляется раздел о самих разговорах: тональность,
+    доля отрицательных, тревожные упоминания, обещания без срока и готовые
+    выводы. Именно эти строки и читают: «сервер обработал 4000 записей» —
+    это про сервер, а «каждый третий разговор отрицательный» — про дело.
     """
     срок = period or str(settings.get("digest_period") or "week")
     отчёт = analytics.full_report(срок, owner=None)
@@ -156,7 +163,7 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "") -> dict[str
     ошибки = отчёт.get("errors") or {}
     очередь = (отчёт.get("queue") or {}).get("overall") or {}
     надёжность = отчёт.get("reliability") or {}
-    return {
+    готовое: dict[str, Any] = {
         "kind": "asrhub.digest",
         "period": срок,
         "generated_at": time.time(),
@@ -172,12 +179,57 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "") -> dict[str
         "queue_wait": {k: очередь.get(k) for k in ("count", "p50", "p95", "max")},
         "first_attempt_rate": надёжность.get("first_attempt_rate"),
         "models": (отчёт.get("models") or [])[:10],
-        "text": digest_text(сводка, ошибки, очередь),
+    }
+    содержание = _digest_content(insights, settings, срок)
+    if содержание:
+        готовое["content"] = содержание
+    готовое["text"] = digest_text(сводка, ошибки, очередь, содержание)
+    return готовое
+
+
+def _digest_content(insights: Any, settings: Any,
+                    срок: str) -> dict[str, Any] | None:
+    """Раздел сводки о содержании разговоров.
+
+    Берём разделы по отдельности, а не полный отчёт: тому нужны все восемь
+    разрезов, все темы и все связи — восемь секунд на архиве в сто тысяч
+    записей ради четырёх строк в чате. Здесь хватает свода, выводов и трёх
+    списков «что послушать».
+
+    Сбой этого раздела не должен уносить всю сводку: показатели сервера
+    полезны и без него, а разбор содержания — надстройка. Раньше сводки
+    вообще не было — весь блок целиком в обёртке по этой же причине.
+    """
+    if insights is None or not bool(settings.get("content_analysis", True)):
+        return None
+    if not bool(settings.get("digest_content", True)):
+        return None
+    try:
+        свод = insights.summary(срок)
+        if not свод.get("records"):
+            return None
+        выводы = insights.findings(срок)
+        послушать = {вид: insights.records(вид, срок, limit=3)
+                     for вид in ("negative", "alerts", "open_commitments")}
+    except Exception as exc:                                 # noqa: BLE001
+        log.warning("Раздел содержания в сводку не попал: %s", exc)
+        return None
+    return {
+        "summary": свод,
+        "findings": выводы,
+        "coverage": insights.index.status() if insights.index else {},
+        "highlights": {вид: [
+            {к: з.get(к) for к in ("job_id", "filename", "owner", "sentiment",
+                                   "sentiment_label", "alerts", "commitments",
+                                   "commitments_dated", "created_at")}
+            for з in (данные.get("items") or [])]
+            for вид, данные in послушать.items()},
     }
 
 
 def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
-                очередь: dict[str, Any]) -> str:
+                очередь: dict[str, Any],
+                содержание: dict[str, Any] | None = None) -> str:
     """Та же сводка словами.
 
     Приёмник входящих сообщений в мессенджере показывает поле `text` и
@@ -218,6 +270,31 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
     if верхние:
         перечень = ", ".join(f"{o.get('code')} ×{o.get('count')}" for o in верхние)
         строки.append(f"Чаще всего падало: {перечень}")
+
+    # Про разговоры — отдельным блоком и после показателей сервера: читают
+    # сводку сверху вниз, а «сервер жив» — это условие, при котором вторая
+    # половина вообще имеет смысл.
+    свод = (содержание or {}).get("summary") or {}
+    if свод.get("records"):
+        строки.append("")
+        строки.append(f"О чём говорили ({свод['records']} разобранных записей)")
+        доля = свод.get("negative_share")
+        if доля is not None:
+            строки.append(f"Отрицательных разговоров: {число(доля)} % "
+                          f"({свод.get('negative') or 0} из {свод.get('scored') or 0})")
+        if свод.get("alert_records"):
+            строки.append(f"С упоминанием суда, жалоб и огласки: "
+                          f"{свод['alert_records']}")
+        if свод.get("commitments_open"):
+            строки.append(f"Обещаний без названного срока: "
+                          f"{свод['commitments_open']} из "
+                          f"{свод.get('commitments') or 0}")
+        скрипт = свод.get("compliance")
+        if скрипт is not None:
+            строки.append(f"Скрипт разговора соблюдён на {число(скрипт * 100, 0)} %")
+        for вывод in ((содержание or {}).get("findings") or [])[:3]:
+            метка = {"warning": "!", "good": "+"}.get(вывод.get("severity"), "·")
+            строки.append(f"  {метка} {вывод.get('text')}")
     return "\n".join(строки)
 
 
@@ -242,7 +319,8 @@ def send_digest(digest: dict[str, Any], url: str) -> bool:
         return False
 
 
-def run_scheduled(db: Any, settings: Any, analytics: Any) -> dict[str, Any]:
+def run_scheduled(db: Any, settings: Any, analytics: Any,
+                  insights: Any = None) -> dict[str, Any]:
     """Один заход обслуживания. Вызывается служебным циклом.
 
     Возвращает, что было сделано, — чтобы вызывающий мог это записать, а
@@ -258,7 +336,7 @@ def run_scheduled(db: Any, settings: Any, analytics: Any) -> dict[str, Any]:
     if адрес and _пора(db, KV_DIGEST, float(settings.get("digest_interval_hours") or 0)):
         db.set_kv(KV_DIGEST, time.time())
         try:
-            сводка = build_digest(analytics, settings)
+            сводка = build_digest(analytics, settings, insights=insights)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Сводку собрать не удалось: %s", exc)
         else:

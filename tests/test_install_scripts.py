@@ -3060,3 +3060,102 @@ def test_model_commands_see_both_layouts(repo_root: Path, tmp_path: Path):
     вывод = запуск("remove", "gigaam-v3-e2e-rnnt", "--yes")
     assert "Удалено" in вывод, вывод
     assert not веса.exists(), "файл весов остался на диске"
+
+
+# ---------------------------------------------------------------------------
+# Установка в контейнере
+#
+# Демона Docker на стенде нет, но он и не нужен: подменяем сам `docker`
+# заглушкой, которая записывает вызовы. Проверяется то, что раньше молча
+# терялось по дороге от ключей командной строки до файла docker/.env.
+# ---------------------------------------------------------------------------
+
+
+def _заглушка_docker(каталог: Path, журнал: Path) -> Path:
+    корзина = каталог / "bin"
+    корзина.mkdir(parents=True, exist_ok=True)
+    (корзина / "docker").write_text(
+        f'#!/bin/sh\necho "docker $*" >> "{журнал}"\nexit 0\n')
+    (корзина / "docker").chmod(0o755)
+    return корзина
+
+
+def _установка_в_контейнере(repo_root: Path, tmp_path: Path, *ключи: str):
+    журнал = tmp_path / "docker.log"
+    корзина = _заглушка_docker(tmp_path, журнал)
+    итог = subprocess.run(
+        [BASH, str(repo_root / "scripts" / "install.sh"),
+         "--no-interactive", "--yes", "--mode", "docker", "--profile", "light",
+         "--skip-models", "--no-service", "--offline",
+         "--prefix", str(tmp_path / "app"), "--data", str(tmp_path / "data"),
+         *ключи],
+        env={**os.environ, "PATH": f"{корзина}:{os.environ['PATH']}",
+             "ASRHUB_NO_COLOR": "1"},
+        capture_output=True, text=True, timeout=600, cwd=str(repo_root))
+    env_file = tmp_path / "app" / "docker" / ".env"
+    return итог, (env_file.read_text(encoding="utf-8") if env_file.exists() else ""),\
+        (журнал.read_text(encoding="utf-8") if журнал.exists() else "")
+
+
+def _значение(env: str, ключ: str) -> str | None:
+    for строка in env.splitlines():
+        if строка.startswith(f"{ключ}="):
+            return строка.split("=", 1)[1]
+    return None
+
+
+def test_docker_install_writes_env_and_calls_compose(repo_root: Path, tmp_path: Path):
+    """Опорная проверка: режим docker доходит до сборки и запуска."""
+    итог, env, вызовы = _установка_в_контейнере(repo_root, tmp_path)
+    assert итог.returncode == 0, итог.stdout[-2000:]
+    assert env, "файл docker/.env не создан"
+    assert "compose --env-file .env -f docker-compose.yml build" in вызовы, вызовы
+    assert "up -d" in вызовы, вызовы
+
+
+def test_docker_env_keeps_the_engine_list_empty_unless_asked(repo_root: Path,
+                                                            tmp_path: Path):
+    """Набор профиля не должен просачиваться в аргументы сборки образа.
+
+    Списки профилей у установщика и у образа разные: «full» при обычной
+    установке тянет nemo и whisperx, которых в образе нет намеренно. Пустое
+    значение означает «образ берёт набор своего профиля».
+    """
+    _, env, _ = _установка_в_контейнере(repo_root, tmp_path)
+    assert _значение(env, "ASRHUB_ENGINES") == "", env
+
+
+def test_docker_env_carries_an_explicit_engine_list(repo_root: Path, tmp_path: Path):
+    """Ключ --engines доезжал до .env и там умирал: образ его не читал."""
+    _, env, _ = _установка_в_контейнере(repo_root, tmp_path,
+                                        "--engines", "gigaam,vosk")
+    assert _значение(env, "ASRHUB_ENGINES") == "gigaam,vosk", env
+
+
+def test_docker_env_carries_the_host_to_publish_on(repo_root: Path, tmp_path: Path):
+    """«--host 127.0.0.1» в режиме docker открывал порт на всех интерфейсах."""
+    _, env, _ = _установка_в_контейнере(repo_root, tmp_path,
+                                        "--host", "127.0.0.1", "--port", "9099")
+    assert _значение(env, "ASRHUB_HOST") == "127.0.0.1", env
+    assert _значение(env, "ASRHUB_PORT") == "9099", env
+
+
+def test_docker_dry_run_writes_nothing_and_succeeds(repo_root: Path, tmp_path: Path):
+    """«--dry-run --mode docker» падал с «cd: No such file or directory».
+
+    Два места шли мимо пробного запуска: дописывание ASRHUB_UID в .env и
+    переход в каталог перед вызовом compose. Первое при переустановке
+    поверх существующей меняло настоящий файл — пробный запуск не имеет
+    права менять ничего.
+    """
+    итог, env, вызовы = _установка_в_контейнере(repo_root, tmp_path, "--dry-run")
+    assert итог.returncode == 0, итог.stdout[-2000:]
+    assert env == "", "пробный запуск создал docker/.env"
+    assert not (tmp_path / "app").exists(), "пробный запуск создал каталог программы"
+    # Опрос обстановки пробному запуску разрешён: «docker info» и «compose
+    # version» ничего не меняют. Запрещено собирать и запускать.
+    for опасное in ("build", "up -d"):
+        assert опасное not in вызовы, (
+            f"пробный запуск дошёл до «{опасное}»: {вызовы}")
+    assert "docker-compose.yml build" in итог.stdout, (
+        "не показано, что было бы собрано:\n" + итог.stdout[-2000:])

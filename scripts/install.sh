@@ -846,13 +846,22 @@ if [[ "${MODE}" == "docker" ]]; then
   have "${COMPOSE%% *}" || { error "Не найден docker compose."; exit 127; }
 
   ENV_FILE="${PREFIX}/docker/.env"
+
+  # Список движков передаём образу только тогда, когда его задал человек
+  # ключом --engines. Иначе там оказался бы набор профиля, посчитанный для
+  # обычной установки, — а он шире образного: «full» тянет nemo и whisperx,
+  # то есть несколько лишних гигабайт и сборку на час. Пустое значение
+  # означает «бери набор своего профиля», и это ровно то, что нужно.
+  DOCKER_ENGINES=""
+  [[ -n "${ENGINES_EXPLICIT}" ]] && DOCKER_ENGINES="${ENGINES}"
+
   write_file "${ENV_FILE}" 0640 <<ENVEOF
 # Создано установщиком ASR Hub $(date '+%Y-%m-%d %H:%M')
 ASRHUB_PORT=${PORT}
 ASRHUB_HOST=${HOST}
 ASRHUB_DATA=${DATA_DIR}
 ASRHUB_PROFILE=${PROFILE}
-ASRHUB_ENGINES=${ENGINES}
+ASRHUB_ENGINES=${DOCKER_ENGINES}
 ASRHUB_ACCEL=${ACCEL}
 ENVEOF
 
@@ -880,18 +889,39 @@ ENVEOF
   fi
 
   # Владелец каталога данных: контейнер приведёт права к нему при запуске.
-  {
-    # Под sudo id -u даёт ноль, и контейнер запускался от root, минуя
-    # понижение прав через gosu. Берём того, кто вызвал sudo.
-    echo "ASRHUB_UID=${SUDO_UID:-$(id -u)}"
-    echo "ASRHUB_GID=${SUDO_GID:-$(id -g)}"
-  } >> "${ENV_FILE}"
+  #
+  # Дописывание идёт мимо write_file, поэтому пробный запуск проверяется
+  # здесь отдельно. Без этого «--dry-run --mode docker» падал с «No such
+  # file or directory» на несозданном .env, а при переустановке поверх
+  # существующей — молча дописывал строки в настоящий файл. Пробный запуск
+  # не имеет права менять ничего.
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '%s[пробный запуск]%s ASRHUB_UID/ASRHUB_GID дописаны в %s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${ENV_FILE}"
+  else
+    {
+      # Под sudo id -u даёт ноль, и контейнер запускался от root, минуя
+      # понижение прав через gosu. Берём того, кто вызвал sudo.
+      echo "ASRHUB_UID=${SUDO_UID:-$(id -u)}"
+      echo "ASRHUB_GID=${SUDO_GID:-$(id -g)}"
+    } >> "${ENV_FILE}"
+  fi
 
   info "Сборка образа (первый раз занимает 10–25 минут)…"
-  ( cd "${PREFIX}/docker" \
-      && retry 2 run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" build )
-  ( cd "${PREFIX}/docker" \
-      && run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" up -d )
+  # Переход в каталог стоит вне run и потому исполняется по-настоящему даже
+  # в пробном запуске, где каталога ещё нет: «--dry-run --mode docker»
+  # заканчивался ошибкой «cd: No such file or directory» вместо описания
+  # того, что было бы сделано. Печатаем команды, никуда не переходя.
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    info "Каталог запуска: ${PREFIX}/docker"
+    run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" build
+    run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" up -d
+  else
+    ( cd "${PREFIX}/docker" \
+        && retry 2 run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" build )
+    ( cd "${PREFIX}/docker" \
+        && run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" up -d )
+  fi
   add_rollback "cd '${PREFIX}/docker' && ${COMPOSE} ${COMPOSE_FILES[*]} down"
   ok "Контейнер запущен"
 

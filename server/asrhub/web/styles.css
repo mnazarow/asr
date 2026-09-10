@@ -746,3 +746,14 @@ td.pick input, th.pick input { width: auto; margin: 0; cursor: pointer; }
   .analysis-line { grid-template-columns: 62px 1fr; }
   .analysis-line .what { grid-column: 1 / -1; }
 }
+
+/* Редактор скрипта разговора: пункт — карточка со строкой названия, местом
+   поиска и приметами. Приметы отдельной строкой во всю ширину: их длинный
+   перечень в узком поле не читается, а читать его надо именно целиком. */
+.script-list { display: flex; flex-direction: column; gap: 10px; }
+.script-item {
+  padding: 12px; border: 1px solid var(--border-soft); border-radius: 8px;
+  background: var(--bg-elev-2);
+}
+.script-item .script-hit { margin-top: 6px; color: var(--text-faint); }
+.script-item .script-hit:empty { display: none; }

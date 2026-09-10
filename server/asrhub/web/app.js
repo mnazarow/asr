@@ -29,8 +29,15 @@ const state = {
   contentTab: 'summary',
   contentData: {},
   contentKind: 'negative',
+  contentScript: null,
+  contentScriptOwn: false,
+  contentScriptJobs: [],
+  contentScriptJob: '',
+  contentScriptTimer: null,
+  contentScriptRedraw: null,
   contentCoverageTimer: null,
   resultsSearch: '',
+  resultsContent: '',
   period: 'week',
   jobSettings: {},
   selectedJob: null,
@@ -2328,8 +2335,25 @@ RENDERERS.results = {
         <div class="card-head"><h3>Завершённые задания</h3>
           <span class="spacer"></span>
           <input type="search" id="r-search" placeholder="поиск по файлу или тексту"
-            style="width:260px">
-          <select id="r-order" style="width:200px">
+            style="width:240px">
+          <!-- Ширина по содержимому, а не 210 пикселей: при жёсткой ширине
+               самый длинный отбор обрезался посреди слова («с упоминанием
+               суда и жало»), и человек не понимал, что именно выбрано. -->
+          <select id="r-content" style="max-width:280px"
+            title="Отбор по содержанию разговора — считается разбором записей">
+            <option value="">любое содержание</option>
+            <option value="negative">отрицательные</option>
+            <option value="positive">положительные</option>
+            <option value="downturn">кончились хуже, чем начались</option>
+            <option value="recovered">кончились лучше, чем начались</option>
+            <option value="alerts">с упоминанием суда и жалоб</option>
+            <option value="open_commitments">обещания без срока</option>
+            <option value="interruptions">много перебиваний</option>
+            <option value="silence">много молчания</option>
+            <option value="script_failed">скрипт не соблюдён</option>
+            <option value="money">названы суммы</option>
+          </select>
+          <select id="r-order" style="width:190px">
             <option value="created_at DESC">Сначала новые</option>
             <option value="created_at ASC">Сначала старые</option>
             <option value="media_duration_s DESC">Самые длинные</option>
@@ -2358,6 +2382,13 @@ RENDERERS.results = {
     }
     qs('#r-search').oninput = () => { clearTimeout(timer); timer = setTimeout(() => this.load(), 300); };
     qs('#r-order').onchange = () => this.load();
+    // Отбор по содержанию приходит и снаружи — из «Аналитики записей»,
+    // где щелчок по отбору «что послушать» ведёт сюда за самим списком.
+    if (state.resultsContent) {
+      qs('#r-content').value = state.resultsContent;
+      state.resultsContent = '';
+    }
+    qs('#r-content').onchange = () => this.load();
     Bulk.attach(qs('#r-bulk'), () => this.load());
     this.load();
   },
@@ -2369,6 +2400,8 @@ RENDERERS.results = {
     try {
       const params = new URLSearchParams({ status: 'completed', limit: '150', order });
       if (search) params.set('search', search);
+      const содержание = (qs('#r-content') || {}).value;
+      if (содержание) params.set('content', содержание);
       const data = await API.latest('results-table', `/api/jobs?${params}`);
       host.innerHTML = data.items.length ? `<table>
         <thead><tr><th class="pick"><input type="checkbox" id="r-pick-all"
@@ -3708,12 +3741,25 @@ function drawExtraAnalytics(data) {
  * секунды, и, пока человек читает свод, остальные разделы ему не нужны.
  */
 
+/* Какой отбор «что послушать» каким фильтром открывается в «Результатах».
+ * Перечни близки, но не совпадают: в разделе есть отборы, которых в списке
+ * заданий нет (самые долгие паузы, самая быстрая речь) — для них перехода
+ * не будет, и кнопка не показывается вовсе. Молча уводить на «все записи»
+ * хуже, чем не уводить никуда. */
+const ОТБОР_В_РЕЗУЛЬТАТЫ = {
+  negative: 'negative', downturn: 'downturn', recovered: 'recovered',
+  alerts: 'alerts', open_commitments: 'open_commitments',
+  interruptions: 'interruptions', silence: 'silence',
+  script: 'script_failed', money: 'money',
+};
+
 const CONTENT_TABS = [
   { key: 'summary',  title: 'Свод' },
   { key: 'groups',   title: 'Разрезы' },
   { key: 'topics',   title: 'Темы' },
   { key: 'links',    title: 'Связи' },
   { key: 'records',  title: 'Что послушать' },
+  { key: 'script',   title: 'Скрипт разговора' },
 ];
 
 /** Подпись тональности с цветом: одно число читается плохо, слово — сразу. */
@@ -3933,6 +3979,13 @@ RENDERERS.content = {
                '<div id="chart-vol-time"></div>')}
       </div>
 
+      ${c.mono ? `<div class="finding info" style="margin-bottom:14px">
+        В ${num(c.mono_share, 1)} % записей периода (${num(c.mono)} из ${num(c.records)})
+        говорящий не разделён. Перебивания, монологи, разрез по операторам и ход
+        тональности по ним не считаются — ноль в этих строках означает «нечем
+        считать», а не «этого не было». Включается настройкой диаризации.
+      </div>` : ''}
+
       ${card('Речь и разговор', 'усреднённые характеристики записей периода',
              `<div class="table-wrap full"><table>
                <thead><tr><th>Показатель</th><th class="num">За период</th>
@@ -4026,7 +4079,9 @@ RENDERERS.content = {
                '<div id="chart-by-weekday"></div>')}
       </div>
       ${card('По владельцам', 'все показатели рядом', таблица(по_ключу.owner))}
-      ${card('По операторам', 'кто из говорящих вёл разговор', таблица(по_ключу.speaker))}
+      ${card('По операторам',
+             'кто из говорящих вёл разговор; записи без разделения по говорящим ' +
+             'попадают в одну группу «—»', таблица(по_ключу.speaker))}
       ${card('По меткам', 'метка задания', таблица(по_ключу.tag))}
       <div class="grid cols-2">
         ${card('По моделям', 'разбор зависит от качества расшифровки', таблица(по_ключу.model))}
@@ -4195,6 +4250,14 @@ RENDERERS.content = {
       `/api/content/records?kind=${encodeURIComponent(state.contentKind)}` +
       `&period=${state.contentPeriod}&limit=50`);
     const items = данные.items || [];
+    // Отбор показывает верхние пятьдесят, а «Результаты» — весь список с
+    // поиском и листалкой. Ключи отборов там те же, поэтому переход
+    // сохраняет выбор, а не сбрасывает его на «все записи».
+    const весь = ОТБОР_В_РЕЗУЛЬТАТЫ[state.contentKind];
+    const действия = весь
+      ? `<button class="ghost sm" id="content-all"
+           title="Открыть тот же отбор в разделе «Результаты» — с поиском и листалкой"
+           >Все такие записи</button>` : '';
     host.innerHTML = card(данные.title, `${items.length} записей`,
       items.length ? `<div class="table-wrap full"><table>
         <thead><tr><th>Запись</th><th>Когда</th><th>Владелец</th>
@@ -4217,8 +4280,218 @@ RENDERERS.content = {
           <td class="num mono nowrap">${fmtDur(з.media_duration_s)}</td>
           <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(з.job_id)}')"
                 >Открыть</button></td></tr>`).join('')}</tbody></table></div>`
-      : '<div class="empty">По этому отбору записей за период нет</div>');
+      : '<div class="empty">По этому отбору записей за период нет</div>', действия);
+    const кнопка = qs('#content-all');
+    if (кнопка) кнопка.addEventListener('click', () => {
+      state.resultsContent = весь;
+      go('results');
+    });
   },
+};
+
+/* Редактор скрипта разговора.
+ *
+ * Скрипт — единственная настройка раздела, которую правят руками и не по
+ * одному разу: у каждого он свой, и подбирается он итерациями. В общем
+ * списке настроек он лежит как поле `json`, куда надо вписать массив
+ * объектов, — то есть ровно та настройка, которую меняют чаще всего,
+ * сделана хуже всех остальных.
+ *
+ * Главное здесь не форма, а проверка: примета «это» или «то есть»
+ * совпадает с одним из самых частых слов языка и делает пункт выполненным
+ * всегда. Понять это по списку слов нельзя — только увидев, на чём пункт
+ * сработал в настоящей записи. Поэтому рядом с каждым пунктом стоит
+ * результат проверки на выбранном разговоре.
+ */
+
+const ГДЕ_ИСКАТЬ = {
+  start: 'в начале разговора',
+  end: 'в конце разговора',
+  any: 'в любом месте',
+};
+
+RENDERERS.content.tab_script = async function (host) {
+  const [настройки, перечень, перечни] = await Promise.all([
+    API.latest('content-settings', '/api/settings'),
+    API.latest('content-script-jobs',
+      '/api/jobs?status=completed&limit=25&light=true&order=created_at DESC'),
+    API.latest('content-kinds', '/api/content/kinds'),
+  ]);
+  const свои = (настройки.values || {}).content_script;
+  state.contentScriptOwn = Array.isArray(свои) && свои.length;
+  // Показываем набор по умолчанию, когда своего нет: с пустым списком
+  // человек не видит, что же сервер проверяет сейчас, и начинать правку
+  // ему приходится с чистого листа. Своим набор становится в тот момент,
+  // когда его сохранили, — до этого правки живут только на экране.
+  state.contentScript = JSON.parse(JSON.stringify(
+    state.contentScriptOwn ? свои : (перечни.default_script || [])));
+  state.contentScriptJobs = (перечень.items || []);
+  state.contentScriptJob = state.contentScriptJob ||
+    (state.contentScriptJobs[0] || {}).id || '';
+  this.drawScript(host);
+  if (state.contentScriptJob) this.checkScript();
+};
+
+RENDERERS.content.drawScript = function (host) {
+  const пункты = state.contentScript || [];
+  const свой = state.contentScriptOwn;
+  host.innerHTML = `
+    <div class="settings-toolbar">
+      <span class="small dim">Проверить на записи:</span>
+      <select id="script-job" style="width:320px">
+        ${state.contentScriptJobs.map((j) => `<option value="${esc(j.id)}"
+          ${j.id === state.contentScriptJob ? 'selected' : ''}>${
+          esc(j.filename || j.id)}</option>`).join('') ||
+          '<option value="">завершённых записей пока нет</option>'}
+      </select>
+      <span class="spacer"></span>
+      ${свой ? `<button class="ghost sm" id="script-default"
+        title="Вернуться к набору по умолчанию">Вернуть набор по умолчанию</button>` : ''}
+      <button class="btn sm" id="script-add">Добавить пункт</button>
+      <button class="primary sm" id="script-save" disabled>Сохранить</button>
+    </div>
+
+    ${свой ? '' : `<div class="finding info" style="margin-bottom:14px">
+      Сейчас действует набор по умолчанию — ${пункты.length} пунктов, которые
+      спрашивают почти в любой службе поддержки. Он показан ниже целиком.
+      Сохранение делает скрипт вашим: с этого момента сервер проверяет только
+      то, что здесь написано, и обновления сервера этот список больше не трогают.
+    </div>`}
+
+    ${card('Пункты скрипта',
+           'слова-приметы задавайте в начальной форме: сравнение идёт по основам, ' +
+           'и «уточнить» найдёт «уточню» и «уточнили»',
+           `<div class="script-list" id="script-list"></div>`)}
+
+    ${card('Что нашлось в выбранной записи',
+           'примета, совпадающая с частым словом, делает пункт выполненным всегда — ' +
+           'здесь это видно сразу',
+           '<div id="script-check"><div class="empty small">Выберите запись</div></div>')}`;
+
+  const список = qs('#script-list', host);
+  const рисовать = () => {
+    список.innerHTML = пункты.map((п, i) => `
+      <div class="script-item" data-index="${i}">
+        <div class="row" style="gap:8px">
+          <input type="text" class="script-title" value="${esc(п.label || '')}"
+                 placeholder="Как называть пункт в отчёте" style="flex:1">
+          <select class="script-where" style="width:190px">
+            ${Object.entries(ГДЕ_ИСКАТЬ).map(([k, v]) =>
+              `<option value="${k}" ${(п.where || 'any') === k ? 'selected' : ''}>${v}</option>`
+            ).join('')}
+          </select>
+          <button class="ghost icon script-del" title="Убрать пункт">✕</button>
+        </div>
+        <input type="text" class="script-any" style="margin-top:6px"
+               value="${esc((п.any || []).join(', '))}"
+               placeholder="слова-приметы через запятую: здравствуйте, добрый день">
+        <div class="script-hit small" data-hit="${esc(п.id || '')}"></div>
+      </div>`).join('') ||
+      '<div class="empty small">Пунктов нет: сервер проверять не будет ничего</div>';
+    qsa('.script-item', список).forEach((узел) => {
+      const i = Number(узел.dataset.index);
+      const менять = () => {
+        пункты[i].label = qs('.script-title', узел).value.trim();
+        пункты[i].where = qs('.script-where', узел).value;
+        пункты[i].any = qs('.script-any', узел).value
+          .split(',').map((w) => w.trim()).filter(Boolean);
+        qs('#script-save').disabled = false;
+        clearTimeout(state.contentScriptTimer);
+        state.contentScriptTimer = setTimeout(() => RENDERERS.content.checkScript(), 500);
+      };
+      qsa('input, select', узел).forEach((поле) => poleOn(поле, менять));
+      qs('.script-del', узел).addEventListener('click', () => {
+        пункты.splice(i, 1);
+        qs('#script-save').disabled = false;
+        рисовать();
+        RENDERERS.content.checkScript();
+      });
+    });
+  };
+  const poleOn = (поле, fn) => {
+    поле.addEventListener('change', fn);
+    if (поле.tagName === 'INPUT') поле.addEventListener('input', fn);
+  };
+  state.contentScriptRedraw = рисовать;
+  рисовать();
+
+  qs('#script-job').addEventListener('change', (e) => {
+    state.contentScriptJob = e.target.value;
+    this.checkScript();
+  });
+  qs('#script-add').addEventListener('click', () => {
+    state.contentScript = state.contentScript || [];
+    state.contentScript.push({ id: `п${Date.now().toString(36)}`,
+                               label: '', any: [], where: 'any' });
+    qs('#script-save').disabled = false;
+    this.showTab();
+  });
+  const вернуть = qs('#script-default');
+  if (вернуть) вернуть.addEventListener('click', () => this.saveScript([]));
+  qs('#script-save').addEventListener('click', () =>
+    this.saveScript(state.contentScript || []));
+};
+
+/** Прогоняет скрипт по выбранной записи и показывает, что нашлось. */
+RENDERERS.content.checkScript = async function () {
+  const host = qs('#script-check');
+  if (!host || !state.contentScriptJob) return;
+  let ответ;
+  try {
+    ответ = await API.post('/api/content/script/check', {
+      job_id: state.contentScriptJob,
+      script: state.contentScript || undefined,
+    });
+  } catch (err) {
+    host.innerHTML = `<div class="empty small">Проверить не удалось: ${esc(err.message)}</div>`;
+    return;
+  }
+  const итог = ответ.compliance || {};
+  const пункты = итог.items || [];
+  host.innerHTML = `
+    <div class="row small dim" style="margin-bottom:10px">
+      <span>Выполнено пунктов: <b>${итог.passed || 0}</b> из ${итог.checked || 0}</span>
+      <span class="spacer"></span>
+      <span>${итог.speaker ? `проверено по говорящему «${esc(итог.speaker)}»`
+        : 'говорящий не определён — проверено по всей записи'}</span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Пункт</th><th>Где искали</th><th>Что нашли</th></tr></thead>
+      <tbody>${пункты.map((п) => `<tr>
+        <td>${п.passed ? '<span class="chip ok">есть</span>'
+                       : '<span class="chip err">нет</span>'}</td>
+        <td>${esc(п.label || '—')}</td>
+        <td class="small dim">${esc(ГДЕ_ИСКАТЬ[п.where] || п.where)}</td>
+        <td class="small">${п.matched
+          ? `<b>${esc(п.matched)}</b>` : '—'}</td></tr>`).join('')}</tbody></table></div>
+    ${(ответ.suspicious || []).length ? `<div class="finding warning" style="margin-top:12px">
+      Приметы, совпадающие с частыми словами языка:
+      ${(ответ.suspicious || []).map((с) =>
+        `<b>${esc(с.word)}</b> (в пункте «${esc(с.label)}»)`).join(', ')}.
+      Такая примета делает пункт выполненным почти всегда — на ней и попался
+      пункт «Представился», искавший голое «это».
+    </div>` : ''}`;
+};
+
+/** Сохраняет скрипт и пересчитывает разбор: старые числа считаны другим. */
+RENDERERS.content.saveScript = async function (пункты) {
+  const плохие = пункты.filter((п) => !п.label || !(п.any || []).length);
+  if (плохие.length) {
+    toast('У каждого пункта должно быть название и хотя бы одна примета', 'err');
+    return;
+  }
+  try {
+    await API.put('/api/settings', { content_script: пункты });
+  } catch (err) { fail(err); return; }
+  toast(пункты.length ? 'Скрипт сохранён' : 'Возвращён набор по умолчанию', 'ok');
+  if (confirm('Скрипт изменился — пересчитать разбор архива?\n\n' +
+              'Без пересчёта соблюдение скрипта в отчётах останется посчитанным ' +
+              'по прежним пунктам, и сравнивать эти числа с новыми нельзя.')) {
+    try { await API.post('/api/content/recompute', {}); } catch (err) { fail(err); }
+  }
+  state.contentData = {};
+  state.contentScriptOwn = пункты.length > 0;
+  this.showTab();
 };
 
 RENDERERS.models = {

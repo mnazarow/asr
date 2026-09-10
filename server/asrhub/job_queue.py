@@ -1343,7 +1343,8 @@ class JobQueue:
                 try:
                     from .maintenance import run_scheduled  # noqa: PLC0415
 
-                    run_scheduled(self.db, self.settings, self._analytics())
+                    run_scheduled(self.db, self.settings, self._analytics(),
+                                  self._insights())
                 except Exception as exc:                # noqa: BLE001
                     failures += 1
                     if failures <= 3 or failures % 180 == 0:
@@ -1371,6 +1372,25 @@ class JobQueue:
                 if failures and not сбой_на_обороте:
                     log.info("Служебный цикл восстановился после %d сбоев", failures)
                     failures = 0
+
+    def _insights(self) -> Any:
+        """Свод по содержанию для сводки по расписанию.
+
+        Заводится по требованию и на том же объекте разбора, что и раздел:
+        второй объект означал бы второй снимок корпусных частот, и одна и
+        та же запись считалась бы по-разному в зависимости от того, кто её
+        посчитал. Без разбора (сервер поднят в урезанном режиме) сводка
+        просто выходит без раздела о разговорах.
+        """
+        if self.content_index is None:
+            return None
+        готовый = getattr(self, "_insights_obj", None)
+        if готовый is None:
+            from .insights import Insights  # noqa: PLC0415
+
+            готовый = Insights(self.db, self.content_index)
+            self._insights_obj = готовый
+        return готовый
 
     def _analytics(self) -> Any:
         """Аналитика для сводки. Заводится по требованию и один раз.

@@ -935,7 +935,16 @@ class Analytics:
 
     # --- экспорт метрик Prometheus --------------------------------------------
 
-    def prometheus(self) -> str:
+    def prometheus(self, insights: Any = None) -> str:
+        """Метрики для Prometheus.
+
+        `insights` — свод по содержанию записей. Если он передан, к метрикам
+        сервера добавляются метрики разговоров: без них система мониторинга
+        видит, что сервер жив и быстр, и не видит, что каждый третий
+        разговор кончается руганью. Тревога на это ставится тем же
+        правилом, что и на нехватку памяти, — и это единственный способ
+        узнать о таком не через неделю.
+        """
         lines: list[str] = []
 
         def add(name: str, value: Any, labels: str = "", help_text: str = "",
@@ -986,4 +995,54 @@ class Analytics:
             add("gpu_percent", sample.get("gpu_percent"))
             add("gpu_memory_mb", sample.get("gpu_mem_mb"))
             add("disk_free_gb", sample.get("disk_free_gb"))
+
+        self._prometheus_content(insights, add)
         return "\n".join(lines) + "\n"
+
+    #: Метрики содержания: имя, откуда брать, пояснение. Одним перечнем —
+    #: чтобы выгрузка и каталог мониторинга не разошлись: там они описаны
+    #: теми же именами, и правило тревоги ссылается на имя.
+    CONTENT_METRICS: tuple[tuple[str, str, str], ...] = (
+        ("content_records", "records", "Разобранных записей за сутки"),
+        ("content_sentiment_avg", "sentiment", "Средняя тональность разговоров"),
+        ("content_negative_share", "negative_share",
+         "Доля отрицательных разговоров, процентов"),
+        ("content_alert_records", "alert_records",
+         "Записей с упоминанием суда, жалоб и огласки"),
+        ("content_commitments_open", "commitments_open",
+         "Обещаний без названного срока"),
+        ("content_compliance_avg", "compliance",
+         "Средняя доля выполненных пунктов скрипта разговора"),
+        ("content_interruptions_avg", "interruptions", "Перебиваний на запись"),
+        ("content_silence_share", "silence_share", "Доля тишины в записях"),
+        ("content_filler_rate", "filler_rate", "Доля слов-паразитов"),
+        ("content_wpm_avg", "wpm", "Средний темп речи, слов в минуту"),
+    )
+
+    def _prometheus_content(self, insights: Any, add: Any) -> None:
+        """Метрики содержания за сутки плюс состояние разбора.
+
+        Сутки, а не «за всё время»: система мониторинга строит ряд сама, и
+        значение, посчитанное по всему архиву, менялось бы на третьем знаке
+        в год — то есть ни одно правило по нему никогда не сработает.
+
+        Сбой этой части не должен ронять выгрузку метрик целиком: Prometheus
+        считает пустой ответ падением цели, и тогда из-за разбора содержания
+        сервер выглядел бы недоступным.
+        """
+        if insights is None:
+            return
+        try:
+            свод = insights.summary("day")
+            состояние = insights.index.status() if insights.index else {}
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Метрики содержания не собраны: %s", exc)
+            return
+        if not свод.get("records"):
+            return
+        for имя, ключ, пояснение in self.CONTENT_METRICS:
+            add(имя, свод.get(ключ), "", пояснение)
+        add("content_analyzed", состояние.get("analyzed"), "",
+            "Записей архива, для которых разбор посчитан")
+        add("content_pending", состояние.get("pending"), "",
+            "Записей архива, ожидающих разбора")

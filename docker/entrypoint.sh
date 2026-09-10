@@ -15,6 +15,11 @@ echo "ASR Hub $(cat /app/VERSION 2>/dev/null || echo '?') — запуск ко�
 if [[ -n "${ASRHUB_BUILD_PROFILE:-}" ]]; then
   echo "Сборка: профиль ${ASRHUB_BUILD_PROFILE}, ускоритель ${ASRHUB_BUILD_ACCEL:-cpu}"
 fi
+# Что именно попало в образ. По имени профиля этого не понять: набор движков
+# задаётся ещё и ключом ENGINES, а часть движков в образ не входит вовсе.
+if [[ -s /opt/venv/.asrhub-engines ]]; then
+  echo "Движки в образе: $(tr ' ' ',' < /opt/venv/.asrhub-engines)"
+fi
 
 SUBDIRS=(uploads results models logs tmp)
 

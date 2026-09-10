@@ -1137,3 +1137,262 @@ def test_turning_the_analysis_off_actually_turns_it_off(data_dir, monkeypatch):
         assert ответ.status_code == 200 and ответ.json()["analysis"], ответ.text
         assert db.get_content(job_id) is None, "разбор попал в базу при выключенной настройке"
         assert db.query("SELECT 1 FROM content_terms") == []
+
+
+# ---------------------------------------------------------------------------
+# Связь с остальным сервером
+# ---------------------------------------------------------------------------
+
+
+def test_the_scheduled_digest_talks_about_the_conversations(tmp_path):
+    """Ради этих строк сводку и читают, а их в ней не было вовсе."""
+    from asrhub.analytics import Analytics
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+    from asrhub.maintenance import build_digest
+
+    db = _корпус(tmp_path, 60)
+    индекс = ContentIndex(db, _Настройки())
+    индекс.backfill_once(limit=100)
+    настройки = _Настройки(digest_period="month", digest_content=True)
+
+    сводка = build_digest(Analytics(db), настройки, insights=Insights(db, индекс))
+    assert "content" in сводка, sorted(сводка)
+    свод = сводка["content"]["summary"]
+    assert свод["records"] == 60
+    assert сводка["content"]["findings"], "выводов в сводке нет"
+
+    # Приёмник входящих сообщений показывает только `text` — значит про
+    # разговоры должно быть и там, иначе в чат придёт сводка про сервер.
+    текст = сводка["text"]
+    assert "О чём говорили" in текст, текст
+    assert "Отрицательных разговоров" in текст, текст
+    assert any(строка.strip().startswith(("!", "+", "·"))
+               for строка in текст.splitlines()), текст
+
+    # Настройка выключает раздел, а не сводку целиком.
+    без = build_digest(Analytics(db), _Настройки(digest_content=False),
+                       insights=Insights(db, индекс))
+    assert "content" not in без and без["text"]
+    # И сводка собирается, когда разбора нет вовсе.
+    assert "content" not in build_digest(Analytics(db), настройки)
+
+
+def test_content_metrics_reach_prometheus_and_can_carry_an_alert(tmp_path):
+    """Мониторинг видел, что сервер быстр, и не видел, что клиенты недовольны."""
+    from asrhub.analytics import Analytics
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+    from asrhub.monitoring.alerts import default_rules
+    from asrhub.monitoring.catalog import METRICS_BY_NAME
+
+    db = _корпус(tmp_path, 40)
+    # Записи за последние сутки: метрики содержания считаются за сутки.
+    for n in range(40):
+        db.execute("UPDATE jobs SET created_at=? WHERE id=?",
+                   (time.time() - 600 - n, f"job{n:04d}"))
+    индекс = ContentIndex(db, _Настройки())
+    индекс.backfill_once(limit=100)
+
+    текст = Analytics(db).prometheus(Insights(db, индекс))
+    метрики = {строка.split()[0]: float(строка.split()[1])
+               for строка in текст.splitlines()
+               if строка.startswith("asrhub_content_")}
+    assert метрики.get("asrhub_content_records") == 40, метрики
+    assert "asrhub_content_negative_share" in метрики, метрики
+    assert метрики.get("asrhub_content_pending") == 0, метрики
+
+    # Каждая выданная метрика описана в каталоге: иначе она не появится ни
+    # в справочнике, ни в списке, по которому пишут правила.
+    неописанные = [и for и in метрики if и not in METRICS_BY_NAME]
+    assert not неописанные, неописанные
+
+    # И на неё можно поставить порог — правила берутся из того же каталога.
+    правила = {r.metric for r in default_rules()}
+    assert "asrhub_content_negative_share" in правила, sorted(правила)
+    assert "asrhub_content_alert_records" in правила
+
+    # Без свода выгрузка метрик не ломается и не пустеет.
+    без = Analytics(db).prometheus(None)
+    assert "asrhub_jobs_total" in без and "asrhub_content_" not in без
+
+
+def test_the_job_list_can_be_filtered_by_what_was_said(tmp_path, monkeypatch,
+                                                       data_dir):
+    """«Отрицательные разговоры про возврат за неделю» — раньше невозможно."""
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        for n, (текст, метка) in enumerate((
+            ("Срок сорван, я крайне недоволен, буду жаловаться в суд.", "плохо"),
+            ("Спасибо большое, всё отлично, вы очень помогли.", "хорошо"),
+            ("Срок сорван, отвратительно, верните деньги.", "плохо"),
+        )):
+            job_id = db.create_job({"id": f"f{n}", "filename": f"{n}.wav",
+                                    "owner": "админ", "media_duration_s": 30.0,
+                                    "tags": метка})
+            db.update_job(job_id, status="completed", finished_at=1.0, text=текст)
+            db.save_segments(job_id, [{"start": 0.0, "end": 20.0, "text": текст,
+                                       "speaker": "SPEAKER_00"}])
+            app.state.hub.content.analyze_job(job_id)
+
+        ключ = {"X-API-Key": "ah_admin_k"}
+        отриц = c.get("/api/jobs?status=completed&content=negative&light=true",
+                      headers=ключ).json()
+        assert {j["id"] for j in отриц["items"]} == {"f0", "f2"}, отриц["items"]
+        assert отриц["total"] == 2
+
+        тревога = c.get("/api/jobs?status=completed&content=alerts&light=true",
+                        headers=ключ).json()
+        assert {j["id"] for j in тревога["items"]} == {"f0"}, тревога["items"]
+
+        # Отбор складывается с поиском — ровно то, ради чего он и заведён.
+        вместе = c.get("/api/jobs?status=completed&content=negative&search=деньги"
+                       "&light=true", headers=ключ).json()
+        assert {j["id"] for j in вместе["items"]} == {"f2"}, вместе["items"]
+        assert вместе["total"] == 1
+
+        assert c.get("/api/jobs?content=чушь", headers=ключ).status_code == 400
+
+
+def test_the_total_matches_the_list_it_counts(tmp_path, monkeypatch, data_dir):
+    """«Показано 30, всего 4000» — листалка вела на пустые страницы."""
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        for n in range(12):
+            job_id = db.create_job({"id": f"t{n}", "filename": f"файл{n}.wav",
+                                    "owner": "админ", "model": "м1" if n < 4 else "м2",
+                                    "media_duration_s": 10.0})
+            db.update_job(job_id, status="completed", finished_at=1.0,
+                          text="Договор поставки" if n < 5 else "Просто разговор")
+        ключ = {"X-API-Key": "ah_admin_k"}
+        for запрос in ("search=договор", "model=м1", "search=договор&model=м1",
+                       "search=файл3"):
+            ответ = c.get(f"/api/jobs?status=completed&{запрос}&limit=500&light=true",
+                          headers=ключ).json()
+            assert ответ["total"] == len(ответ["items"]), (запрос, ответ["total"],
+                                                           len(ответ["items"]))
+
+
+def test_a_script_marker_that_matches_a_function_word_is_flagged():
+    """Примета из служебных слов делает пункт выполненным всегда."""
+    from asrhub.content.compliance import ПО_УМОЛЧАНИЮ, check, suspicious
+
+    плохой = [
+        {"id": "a", "label": "Представился", "any": ["это"], "where": "start"},
+        {"id": "b", "label": "Ответил", "any": ["так", "то"], "where": "any"},
+        {"id": "c", "label": "Поздоровался", "any": ["здравствуйте"],
+         "where": "start"},
+        {"id": "d", "label": "Помощь", "any": ["чем могу помочь"], "where": "start"},
+    ]
+    слова = {с["word"] for с in suspicious(плохой)}
+    assert слова == {"это", "так", "то"}, слова
+
+    # Набор по умолчанию чист — и это проверка на него самого: «передам»
+    # стеммится в «перед», и пункт засчитывался на «перед тем как».
+    assert suspicious(ПО_УМОЛЧАНИЮ) == [], suspicious(ПО_УМОЛЧАНИЮ)
+    итог = check([{"start": 0.0, "end": 5.0,
+                   "text": "Перед тем как оформить, я посмотрю документы."}])
+    assert not [п for п in итог["items"] if п["passed"]], итог["items"]
+
+
+def test_words_from_a_comment_did_not_become_stop_words():
+    """Пояснение стояло внутри строки, и его слова попали в словарь.
+
+    «Записи», «речь», «глаголы», «шума», «ключевых» переставали быть
+    темами разговора — вместе с «#», «—» и словами с запятыми из того же
+    пояснения.
+    """
+    from asrhub.content import keywords
+    from asrhub.content.lexicons import СЛУЖЕБНЫЕ, СТОП_СЛОВА
+
+    мусор = sorted(с for с in СТОП_СЛОВА if not с.isalpha())
+    assert not мусор, мусор
+
+    из_пояснения = ("записи", "речь", "глаголы", "шума", "ключевых", "списка",
+                    "обороты", "разговорные", "частые", "смысла")
+    попали = [с for с in из_пояснения if keywords.stem(с) in СТОП_СЛОВА]
+    assert not попали, попали
+
+    найдено = {к["word"] for к in keywords.keywords(
+        "Ключевые слова записи и смысл разговора. Речь оператора и списки.")}
+    assert {"записи", "речь", "смысл"} <= найдено, найдено
+
+    # Вежливость лежит среди разговорных, а не служебных: приметой скрипта
+    # «здравствуйте» быть можно, темой разговора — нет.
+    assert keywords.stem("здравствуйте") in СТОП_СЛОВА
+    assert keywords.stem("здравствуйте") not in СЛУЖЕБНЫЕ
+
+
+def test_the_script_check_endpoint_runs_a_draft_without_saving_it(
+        tmp_path, monkeypatch, data_dir):
+    """Понять по списку слов, годится ли примета, нельзя — только на записи."""
+    from fastapi.testclient import TestClient
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        db = app.state.hub.db
+        job_id = db.create_job({"id": "проверка", "filename": "x.wav",
+                                "owner": "админ", "media_duration_s": 20.0})
+        db.update_job(job_id, status="completed", finished_at=1.0,
+                      text="Здравствуйте, это компания Ромашка. Отправлю завтра.")
+        db.save_segments(job_id, [
+            {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00",
+             "text": "Здравствуйте, это компания Ромашка."},
+            {"start": 5.0, "end": 10.0, "speaker": "SPEAKER_00",
+             "text": "Отправлю завтра."}])
+        ключ = {"X-API-Key": "ah_admin_k"}
+
+        черновик = [{"id": "hi", "label": "Поздоровался",
+                     "any": ["здравствуйте"], "where": "start"},
+                    {"id": "bad", "label": "Плохая", "any": ["это"], "where": "any"}]
+        ответ = c.post("/api/content/script/check",
+                       json={"job_id": job_id, "script": черновик},
+                       headers=ключ)
+        assert ответ.status_code == 200, ответ.text
+        тело = ответ.json()
+        пункты = {п["id"]: п for п in тело["compliance"]["items"]}
+        assert пункты["hi"]["passed"] and пункты["hi"]["matched"] == "здравствуйте"
+        assert пункты["bad"]["passed"] and пункты["bad"]["matched"] == "это"
+        assert {с["word"] for с in тело["suspicious"]} == {"это"}, тело["suspicious"]
+        assert тело["default"] is False
+
+        # Черновик в настройки не попал: его ещё правят.
+        assert app.state.hub.settings.get("content_script") in (None, [], )
+
+        # Без скрипта проверяется набор по умолчанию.
+        свой = c.post("/api/content/script/check", json={"job_id": job_id},
+                      headers=ключ).json()
+        assert свой["default"] is True and свой["compliance"]["checked"] == 8
+
+        assert c.post("/api/content/script/check", json={"job_id": "нет"},
+                      headers=ключ).status_code == 404
+        assert c.post("/api/content/script/check",
+                      json={"job_id": job_id, "script": "строка"},
+                      headers=ключ).status_code == 400
+
+
+def test_records_without_diarization_are_counted_and_named(tmp_path):
+    """Ноль перебиваний на моно-записи — это «нечем считать», а не «не было»."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.insights import Insights
+
+    db = _корпус(tmp_path, 30)
+    for n in range(0, 30, 2):
+        задание = db.get_job(f"job{n:04d}")
+        db.save_segments(f"job{n:04d}",
+                         [{"start": 0.0, "end": 20.0, "text": задание["text"]}])
+    ContentIndex(db, _Настройки()).backfill_once(limit=100)
+
+    свод = Insights(db).summary("all")
+    assert свод["mono"] == 15, свод["mono"]
+    assert свод["mono_share"] == 50.0, свод["mono_share"]
+
+    выводы = [в for в in Insights(db).findings("all") if в.get("metric") == "mono_share"]
+    assert выводы, "про неразделённых говорящих раздел молчит"
+    assert "не считаются" in выводы[0]["text"], выводы[0]["text"]

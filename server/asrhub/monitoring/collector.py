@@ -196,6 +196,7 @@ class Collector:
             ("storage", self._storage),
             ("api", self._api),
             ("errors", self._errors),
+            ("content", self._content),
             ("runtime", self._runtime_series),
         ):
             self._safe(source, fn, out, errors)
@@ -475,6 +476,52 @@ class Collector:
     def _errors(self, out: list[Sample]) -> None:
         out.append(Sample("asrhub_last_error_timestamp_seconds",
                           float(self.runtime.last_error_ts)))
+
+    # -- содержание записей --------------------------------------------------
+
+    def _content(self, out: list[Sample]) -> None:
+        """Метрики разговоров: не «жив ли сервер», а «как идут дела».
+
+        За сутки, а не за всё время: система мониторинга строит ряд сама, и
+        величина по всему архиву меняется на третьем знаке в год — ни одно
+        правило по ней не сработает никогда.
+
+        Состояние разбора отдаём всегда, даже когда записей за сутки нет:
+        по нему видно, что фоновый разбор встал, а это как раз тот случай,
+        когда «за сутки ничего» — не «разговоров не было», а «считать
+        перестало».
+        """
+        свод = getattr(self.state, "content", None)
+        if свод is None:
+            return
+        состояние = свод.status()
+        for имя, ключ in (("asrhub_content_analyzed", "analyzed"),
+                          ("asrhub_content_pending", "pending")):
+            if состояние.get(ключ) is not None:
+                out.append(Sample(имя, float(состояние[ключ])))
+        if not состояние.get("enabled"):
+            return
+
+        from ..insights import Insights  # noqa: PLC0415
+
+        за_сутки = Insights(self.state.db, свод).summary("day")
+        if not за_сутки.get("records"):
+            return
+        for имя, ключ in (
+            ("asrhub_content_records", "records"),
+            ("asrhub_content_sentiment_avg", "sentiment"),
+            ("asrhub_content_negative_share", "negative_share"),
+            ("asrhub_content_alert_records", "alert_records"),
+            ("asrhub_content_commitments_open", "commitments_open"),
+            ("asrhub_content_compliance_avg", "compliance"),
+            ("asrhub_content_interruptions_avg", "interruptions"),
+            ("asrhub_content_silence_share", "silence_share"),
+            ("asrhub_content_filler_rate", "filler_rate"),
+            ("asrhub_content_wpm_avg", "wpm"),
+        ):
+            значение = за_сутки.get(ключ)
+            if значение is not None:
+                out.append(Sample(имя, float(значение)))
 
     def _runtime_series(self, out: list[Sample]) -> None:
         """Переносит в снимок счётчики и гистограммы, накопленные в памяти."""

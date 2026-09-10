@@ -608,8 +608,18 @@ def metrics(request: Request) -> PlainTextResponse:
     if service is None:
         # Подсистема мониторинга не поднялась — отдаём хотя бы прежний срез,
         # чтобы сбор метрик не остался совсем без данных.
-        return PlainTextResponse(state.analytics.prometheus(),
-                                 media_type="text/plain; version=0.0.4; charset=utf-8")
+        # Свод по содержанию передаём и сюда: этот путь работает, когда
+        # подсистема мониторинга не поднялась, и оставлять его без метрик
+        # разговоров значило бы, что при её сбое пропадает ровно та часть,
+        # ради которой на метрики и смотрят.
+        свод = None
+        if getattr(state, "content", None) is not None:
+            from ..insights import Insights  # noqa: PLC0415
+
+            свод = Insights(state.db, state.content)
+        return PlainTextResponse(
+            state.analytics.prometheus(свод),
+            media_type="text/plain; version=0.0.4; charset=utf-8")
     body, content_type = service.render("prometheus")
     return PlainTextResponse(body, media_type=content_type)
 

@@ -57,7 +57,7 @@ asr-hub/
 │   └── client/           asrctl — консольный клиент для Linux, macOS, Windows
 ├── docker/               Dockerfile, compose, nginx
 ├── docs/                 эта документация, схемы и снимки экрана
-└── tests/                418 тестов
+└── tests/                738 проверок, включая тринадцать в настоящем браузере
 ```
 
 ## Требования

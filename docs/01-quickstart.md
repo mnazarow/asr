@@ -48,9 +48,11 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Profile standard
 
 ```bash
 cd asr-hub/docker
-docker compose --profile gpu up -d      # с видеокартой NVIDIA
-docker compose --profile cpu up -d      # без видеокарты
+docker compose up -d                    # без видеокарты
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # NVIDIA
 ```
+
+Профилей `cpu` и `gpu` у Compose нет: обычный запуск и есть процессорный, а видеокарта включается файлом-надстройкой.
 
 ## Первая расшифровка
 

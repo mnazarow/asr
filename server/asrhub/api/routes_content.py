@@ -154,12 +154,22 @@ def records(request: Request, kind: str = Query(default="negative"),
 @router.get("/kinds", summary="Перечень отборов и разрезов")
 def kinds(request: Request,
           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    """Что раздел умеет показывать — чтобы интерфейс не держал копию списка."""
+    """Что раздел умеет показывать — чтобы интерфейс не держал копию списка.
+
+    Здесь же набор скрипта по умолчанию. Он нужен редактору: без него
+    человек, у которого своего скрипта ещё нет, видел пустой список и не
+    мог понять, что же сервер проверяет сейчас. Начинать правку с восьми
+    готовых пунктов правильнее, чем с чистого листа: скрипт у каждого свой,
+    но начинается он обычно не с нуля.
+    """
+    from ..content.compliance import ПО_УМОЛЧАНИЮ  # noqa: PLC0415
+
     return {
         "kinds": [{"key": к, "title": о["title"]} for к, о in ОТБОРЫ.items()],
         "dimensions": [{"key": к, "title": о["title"]}
                        for к, о in РАЗРЕЗЫ.items()],
         "features": ПРИЗНАКИ,
+        "default_script": ПО_УМОЛЧАНИЮ,
     }
 
 
@@ -212,6 +222,54 @@ def recompute_job(request: Request, job_id: str,
     require_owner(principal, задание)
     разбор = _index(request).analyze_job(job_id, job=задание)
     return {"recomputed": разбор is not None, "job_id": job_id}
+
+
+@router.post("/script/check", summary="Проверить скрипт на одной записи")
+def script_check(request: Request, body: dict[str, Any] = Body(default={}),
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Прогоняет скрипт по выбранной записи, ничего не сохраняя.
+
+    Ради этой ручки редактор скрипта и сделан отдельно от общего списка
+    настроек. Понять по списку слов, годится ли примета, нельзя: «это» и
+    «то есть» выглядят безобидно и делают пункт выполненным всегда. Видно
+    это только на настоящей записи — в столбце «что нашли».
+
+    Скрипт приходит в теле и в базу не попадает: это черновик, который
+    человек ещё правит. Сохранение — обычная запись настройки.
+    """
+    state = get_state(request)
+    job_id = str(body.get("job_id") or "")
+    задание = state.db.get_job(job_id) if job_id else None
+    if not задание:
+        raise error_response(JobNotFound(job_id))
+    require_owner(principal, задание)
+
+    скрипт = body.get("script")
+    if скрипт is not None and not isinstance(скрипт, list):
+        raise error_response(ConfigError(
+            "Поле script должно быть списком пунктов."))
+    if скрипт is None:
+        значение = state.settings.get("content_script")
+        скрипт = значение if isinstance(значение, list) and значение else None
+
+    from ..content import compliance  # noqa: PLC0415
+
+    сегменты = state.db.get_segments(job_id)
+    if not сегменты and задание.get("text"):
+        сегменты = [{"start": 0.0, "end": float(задание.get("media_duration_s") or 0.0),
+                     "text": задание["text"]}]
+    оператор = str(state.settings.get("content_agent_speaker") or "").strip() or None
+    итог = compliance.check(сегменты, script=скрипт, speaker=оператор)
+    частоты, корпус = _index(request).corpus_frequency()
+    return {
+        "job_id": job_id,
+        "filename": задание.get("filename"),
+        "compliance": итог,
+        "suspicious": compliance.suspicious(
+            скрипт if скрипт is not None else compliance.ПО_УМОЛЧАНИЮ,
+            частоты, корпус),
+        "default": скрипт is None,
+    }
 
 
 @router.post("/recompute", summary="Пересчитать разбор архива")
