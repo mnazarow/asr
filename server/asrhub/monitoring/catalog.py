@@ -566,6 +566,54 @@ _m(MetricSpec(
 ))
 
 _m(MetricSpec(
+    name="asrhub_confidence_drift_level", type="gauge", group="quality",
+    label="Дрейф уверенности: уровень", labels=("model",),
+    description=(
+        "0 — без дрейфа, 1 — предупреждение, 2 — критично. Распределение "
+        "средней уверенности по заданиям за сутки сравнивается с четырьмя "
+        "неделями до них критерием Колмогорова — Смирнова; метка model=all — "
+        "по всем моделям вместе. Пороги — по Deepgram: сдвиг на 10 % и "
+        "p < 0,05 вместе — критично, что-то одно — предупреждение. Считается "
+        "только там, где в обеих выборках от тридцати заданий."
+    ),
+    recommendation=(
+        "Уверенность модели — не точность: она падает и на честно трудном "
+        "звуке. Дрейф — повод посмотреть, что изменилось на входе: новый "
+        "источник записей, другой кодек, другая гарнитура у операторов."
+    ),
+    normal="0",
+    threshold=Threshold("above", warning=1.0, critical=2.0, for_seconds=3600,
+                        note="Уровень — уже вердикт; пороги повторяют его"),
+    troubleshooting="Раздел «Аналитика» → «Дрейф уверенности»",
+))
+
+_m(MetricSpec(
+    name="asrhub_confidence_drift_p", type="gauge", group="quality",
+    label="Дрейф уверенности: p-значение", labels=("model",),
+    description=(
+        "p-значение двухвыборочного критерия Колмогорова — Смирнова: "
+        "вероятность увидеть такое расхождение распределений случайно. "
+        "Ниже 0,05 — распределения различимы."
+    ),
+    recommendation=(
+        "Само по себе малое p не говорит, в какую сторону сдвиг, — смотрите "
+        "asrhub_confidence_drift_shift: дрейф вверх — новость, а не тревога."
+    ),
+    normal="выше 0,05",
+))
+
+_m(MetricSpec(
+    name="asrhub_confidence_drift_shift", type="gauge", group="quality",
+    label="Дрейф уверенности: сдвиг среднего", labels=("model",),
+    description=(
+        "Относительный сдвиг средней уверенности за сутки против четырёх "
+        "недель до них: −0,1 — упала на десять процентов."
+    ),
+    recommendation="Правило: asrhub_confidence_drift_shift < -0.1 — сдвиг на порог Deepgram.",
+    normal="около нуля",
+))
+
+_m(MetricSpec(
     name="asrhub_suspect_jobs_share", type="gauge", group="quality",
     label="Доля записей с признаками", labels=("model",),
     description=(

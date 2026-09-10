@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import time
+import types
 import wave
 import zipfile
 from pathlib import Path
@@ -1202,13 +1203,15 @@ def test_the_report_reads_the_archive_once_not_twenty_times(rich_db):
     assert len(set(запросы)) == len(запросы), "один и тот же запрос выполнен дважды"
 
 
-def test_all_sections_of_one_report_cover_the_same_window(rich_db):
+def test_all_sections_of_one_report_cover_the_same_window(rich_db, monkeypatch):
     """Иначе «месяц» у первого разреза начинался раньше, чем у последнего.
 
     Границу окна каждый разрез считал сам, от текущего времени. За секунды
     сборки отчёта она уезжала — разрезы расходились между собой, и общая
     выборка не попадала в кеш ни разу.
     """
+    import asrhub.analytics as модуль
+
     границы: list[float] = []
     исходный = rich_db.db.list_jobs
 
@@ -1217,6 +1220,15 @@ def test_all_sections_of_one_report_cover_the_same_window(rich_db):
             границы.append(float(kw["since"]))
         return исходный(**kw)
 
+    # Часы уходят на секунду вперёд при каждом обращении: разрез, который
+    # считает границу сам от «сейчас», гарантированно получит своё окно,
+    # а не совпадёт с общим по случайности одной и той же микросекунды.
+    настоящее = time.time()
+    тик = iter(range(1, 100_000))
+    часы = types.SimpleNamespace(**{имя: getattr(time, имя) for имя in dir(time)
+                                    if not имя.startswith("_")})
+    часы.time = lambda: настоящее + next(тик)
+    monkeypatch.setattr(модуль, "time", часы)
     rich_db.db.list_jobs = учёт
     try:
         rich_db.full_report("month")
@@ -1224,7 +1236,14 @@ def test_all_sections_of_one_report_cover_the_same_window(rich_db):
         rich_db.db.list_jobs = исходный
 
     assert границы, "ни один разрез не ограничил окно"
-    assert len(set(границы)) == 1, f"окна разъехались: {sorted(set(границы))}"
+    окна = sorted(set(границы))
+    # Разрезы здоровья распознавания — дрейф и контрольные карты — читают
+    # ещё четыре недели до периода: базу, с которой сравнивают. Это второе
+    # окно, но привязанное к той же замороженной границе, а не к «сейчас».
+    assert len(окна) <= 2, f"окна разъехались: {окна}"
+    if len(окна) == 2:
+        assert окна[1] - окна[0] == pytest.approx(rich_db.БАЗА_ДНЕЙ * 86400, abs=1e-3), (
+            f"базовое окно не привязано к границе периода: {окна}")
 
 
 def test_outside_a_report_each_section_still_reads_fresh(rich_db):

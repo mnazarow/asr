@@ -215,6 +215,28 @@ def drivers(request: Request, period: str = ПЕРИОД,
 ПО_КОМУ = Query(default="speaker", pattern="^(speaker|owner)$")
 
 
+@router.get("/norms", summary="Нормы от своего архива")
+def norms(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ,
+          agent: str = Query(default=""),
+          principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Обычная величина каждого показателя — медиана и межквартильный размах
+    по четырём неделям до периода — и где относительно неё медиана периода.
+    С `agent` — норма и период по одному оператору."""
+    return _insights(request).norms(period, owner=scope_owner(principal),
+                                    agent=(by, agent) if agent else None)
+
+
+@router.get("/control", summary="Контрольные карты по дням")
+def control(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ,
+            agent: str = Query(default=""),
+            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Доля отрицательных, балл оператора, тональность и скрипт по дням с
+    пределами 2σ и 3σ по четырём неделям до периода; отметки за пределами
+    и серии по одну сторону от среднего."""
+    return _insights(request).control(period, owner=scope_owner(principal),
+                                      agent=(by, agent) if agent else None)
+
+
 @router.get("/agents", summary="Операторы: балл, эмпатия, нарушения")
 def agents(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ,
            limit: int = Query(default=100, ge=1, le=500),

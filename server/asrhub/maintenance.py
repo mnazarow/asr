@@ -191,6 +191,17 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
         готовое["suspicious"] = {k: подозрительные.get(k) for k in
                                  ("assessed", "flagged", "flagged_share",
                                   "suspect_share")}
+    # Дрейф уверенности — только когда есть что сказать: «без дрейфа» в
+    # каждой сводке — это шум, который перестают читать.
+    дрейф = отчёт.get("drift") or {}
+    сдвинулись = [м for м in [дрейф.get("overall") or {}, *(дрейф.get("models") or [])]
+                  if м.get("verdict") in ("warning", "critical")]
+    if сдвинулись:
+        готовое["drift"] = [{k: м.get(k) for k in ("key", "verdict", "shift_relative")}
+                            | {"p": (м.get("ks") or {}).get("p"),
+                               "median_before": (м.get("baseline") or {}).get("p50"),
+                               "median_now": (м.get("current") or {}).get("p50")}
+                            for м in сдвинулись]
     метка = str(settings.get("consent_tag") or "").strip()
     if метка and getattr(analytics, "db", None) is not None:
         срок_дней = int(settings.get("consent_days") or 30)
@@ -199,7 +210,8 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
         готовое["consent_missing"] = len(без)
     готовое["text"] = digest_text(сводка, ошибки, очередь, содержание,
                                   suspicious=готовое.get("suspicious"),
-                                  consent_missing=готовое.get("consent_missing"))
+                                  consent_missing=готовое.get("consent_missing"),
+                                  drift=готовое.get("drift"))
     return готовое
 
 
@@ -256,7 +268,8 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                 очередь: dict[str, Any],
                 содержание: dict[str, Any] | None = None, *,
                 suspicious: dict[str, Any] | None = None,
-                consent_missing: int | None = None) -> str:
+                consent_missing: int | None = None,
+                drift: list[dict[str, Any]] | None = None) -> str:
     """Та же сводка словами.
 
     Приёмник входящих сообщений в мессенджере показывает поле `text` и
@@ -303,6 +316,13 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
                       f"{suspicious['assessed']} ({число(suspicious.get('flagged_share'))} %)")
     if consent_missing:
         строки.append(f"Записей без метки согласия старше срока: {consent_missing}")
+    for д in drift or []:
+        уровень = "критично" if д.get("verdict") == "critical" else "предупреждение"
+        кто = "по всем моделям" if д.get("key") == "all" else f"у модели {д.get('key')}"
+        строки.append(f"Дрейф уверенности {кто}: {уровень} — медиана "
+                      f"{число(д.get('median_before'), 3)} → {число(д.get('median_now'), 3)}, "
+                      f"сдвиг {число((д.get('shift_relative') or 0) * 100, 1)} %, "
+                      f"p = {число(д.get('p'), 3)}")
 
     # Про разговоры — отдельным блоком и после показателей сервера: читают
     # сводку сверху вниз, а «сервер жив» — это условие, при котором вторая

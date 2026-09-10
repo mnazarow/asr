@@ -1967,7 +1967,8 @@ class Database:
     def content_sample(self, columns: list[str], *, since: float | None = None,
                        until: float | None = None,
                        owner: str | list[str] | None = None,
-                       limit: int = 20000) -> list[tuple[float, ...]]:
+                       limit: int = 20000,
+                       agent: tuple[str, str] | None = None) -> list[tuple[float, ...]]:
         """Выборка числовых признаков для расчёта связей.
 
         Именно выборка, а не весь корпус: коэффициент корреляции по двадцати
@@ -1980,7 +1981,7 @@ class Database:
         if not безопасные:
             return []
         поля = ", ".join(self.CONTENT_NUMERIC[к] for к in безопасные)
-        условие, args = self._content_where(since, until, owner)
+        условие, args = self._content_where(since, until, owner, agent=agent)
         rows = self.query(
             f"SELECT {поля} FROM content c JOIN jobs j ON j.id = c.job_id "
             f"WHERE {условие} ORDER BY j.created_at DESC LIMIT ?", [*args, limit])

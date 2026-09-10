@@ -374,6 +374,25 @@ class Collector:
             if int(row["n"] or 0):
                 out.append(Sample("asrhub_suspect_jobs_share",
                                   round(float(row["f"] or 0) / float(row["n"]), 4), метки))
+        # Дрейф уверенности за сутки против четырёх недель — по моделям.
+        # Только те, где выборки хватило на вердикт: p по десяти заданиям
+        # — не число, а совпадение.
+        try:
+            дрейф = self.state.analytics.drift("day")
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Дрейф для метрик не посчитан: %s", exc)
+            return
+        уровни = {"ok": 0.0, "warning": 1.0, "critical": 2.0}
+        for м in [дрейф.get("overall") or {}, *(дрейф.get("models") or [])]:
+            if м.get("verdict") not in уровни or not м.get("key"):
+                continue
+            метки = {"model": str(м["key"])}
+            out.append(Sample("asrhub_confidence_drift_level", уровни[м["verdict"]], метки))
+            if (м.get("ks") or {}).get("p") is not None:
+                out.append(Sample("asrhub_confidence_drift_p", float(м["ks"]["p"]), метки))
+            if м.get("shift_relative") is not None:
+                out.append(Sample("asrhub_confidence_drift_shift",
+                                  float(м["shift_relative"]), метки))
 
     # -- модели и движки -----------------------------------------------------
 

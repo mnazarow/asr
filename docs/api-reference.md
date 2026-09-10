@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **108**, операций: **118**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **110**, операций: **120**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -138,6 +138,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/content/categories` | Категории обращений: счёт и динамика | любой действующий ключ |
 | `POST` | `/api/content/categories/check` | Проверить набор категорий на записи | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/content/coaching` | Очередь коучинга | любой действующий ключ |
+| `GET` | `/api/content/control` | Контрольные карты по дням | любой действующий ключ |
 | `GET` | `/api/content/correlations` | Связи между признаками | любой действующий ключ |
 | `GET` | `/api/content/drivers` | Драйверы негатива | любой действующий ключ |
 | `GET` | `/api/content/export` | Выгрузка отчёта в таблицу | любой действующий ключ |
@@ -146,6 +147,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/content/jobs/{job_id}/recompute` | Пересчитать разбор записи | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/content/kinds` | Перечень отборов и разрезов | любой действующий ключ |
 | `PUT` | `/api/content/marks/{job_id}` | Отметить запись: разобрано, эталон | ключ с правом записи (**admin** или **user**) |
+| `GET` | `/api/content/norms` | Нормы от своего архива | любой действующий ключ |
 | `POST` | `/api/content/recompute` | Пересчитать разбор архива | ключ с ролью **admin** |
 | `GET` | `/api/content/records` | Записи, которые стоит послушать | любой действующий ключ |
 | `GET` | `/api/content/references` | Эталонные разговоры | любой действующий ключ |
@@ -660,7 +662,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:24099",
+  "instance": "vm:26365",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1238,10 +1240,10 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789033163.028827,
+    "generated_at": 1789036764.667948,
     "jobs": {
-      "total": 239,
-      "completed": 239,
+      "total": 237,
+      "completed": 237,
       "failed": 0,
       "cancelled": 0,
       "in_progress": 0,
@@ -1249,18 +1251,18 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
       "success_rate": 1.0
     },
     "volume": {
-      "audio_seconds": 8476.4,
-      "audio_hours": 2.35,
-      "processing_seconds": 192.0,
-      "words": 1223,
+      "audio_seconds": 8368.2,
+      "audio_hours": 2.32,
+      "processing_seconds": 186.0,
+      "words": 1185,
       "characters": 0,
-      "segments": 1445,
-      "files_per_hour": 1.42,
+      "segments": 1434,
+      "files_per_hour": 1.41,
       "audio_hours_per_hour": 0.01
     },
     "performance": {
       "rtf": {
-        "count": 32,
+        "count": 31,
         "avg": 0.1,
         "min": 0.1,
         "max": 0.1,
@@ -1271,7 +1273,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
         "stdev": 0.0
       },
       "processing_time_s": {
-        "count": 32,
+        "count": 31,
         "avg": 6.0,
         "min": 6.0,
         "max": 6.0,
@@ -1360,7 +1362,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 624.0,
+  "uptime_s": 69.9,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1404,8 +1406,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 2,
-    "WARNING": 1
+    "INFO": 2
   }
 }
 ```
@@ -1440,7 +1441,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 624.0,
+  "uptime_s": 69.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1449,7 +1450,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.7,
+    "ram_available_gb": 6.9,
     "disk_free_gb": 12.3,
     "gpus": [],
     "accelerator": "cpu",
@@ -1805,6 +1806,23 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
 | `limit` | в адресе | integer | `50` | — |
 | `done` | в адресе | boolean | `False` | — |
 
+### `GET /api/content/control`
+
+Контрольные карты по дням.
+
+Доля отрицательных, балл оператора, тональность и скрипт по дням с
+пределами 2σ и 3σ по четырём неделям до периода; отметки за пределами
+и серии по одну сторону от среднего.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+| `by` | в адресе | string | `speaker` | — |
+| `agent` | в адресе | string | — | — |
+
 ### `GET /api/content/correlations`
 
 Связи между признаками.
@@ -1926,6 +1944,23 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
   "title": "Body"
 }
 ```
+
+### `GET /api/content/norms`
+
+Нормы от своего архива.
+
+Обычная величина каждого показателя — медиана и межквартильный размах
+по четырём неделям до периода — и где относительно неё медиана периода.
+С `agent` — норма и период по одному оператору.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+| `by` | в адресе | string | `speaker` | — |
+| `agent` | в адресе | string | — | — |
 
 ### `POST /api/content/recompute`
 

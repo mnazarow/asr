@@ -817,6 +817,130 @@ class Analytics:
 
     # --- здоровье распознавания -----------------------------------------------
 
+    #: Базовое окно дрейфа — четыре недели до периода, как у Deepgram.
+    БАЗА_ДНЕЙ = 28
+
+    def drift(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+        """Дрейф уверенности: распределение за период против четырёх недель
+        до него — по моделям и по всем вместе.
+
+        Средняя уверенность по всем моделям может не сдвинуться, когда одна
+        модель стала хуже, а другую стали реже использовать; поэтому по
+        моделям. И распределение, а не среднее: половина записей лучше,
+        половина хуже — среднее то же, а критерий Колмогорова — Смирнова
+        это видит. Пороги — по Deepgram: 10 % сдвига и p < 0,05 вместе —
+        критично, что-то одно — предупреждение.
+        """
+        from . import stats  # noqa: PLC0415
+
+        since = self._since(period)
+        # Граница периода — общая для всех разрезов отчёта (см. `_since`);
+        # база — четыре недели до неё. У «всего времени» границы нет, а
+        # значит, нет и «до»: сравнивать не с чем, вердикт — unknown.
+        конец_базы = since or time.time()
+        база_от = (конец_базы - self.БАЗА_ДНЕЙ * 86400) if since else None
+        все = [j for j in self._jobs(since=база_от, limit=200000, owner=owner)
+               if j["status"] == "completed" and j.get("avg_confidence") is not None]
+        сейчас = [j for j in все if float(j["created_at"]) >= конец_базы] if since else все
+        база = [j for j in все if float(j["created_at"]) < конец_базы] if since else []
+
+        def сравнить(имя: str, б: list[dict[str, Any]], т: list[dict[str, Any]]) -> dict[str, Any]:
+            итог = stats.drift_verdict([float(j["avg_confidence"]) for j in б],
+                                       [float(j["avg_confidence"]) for j in т])
+            низких = sum(1 for j in т if float(j["avg_confidence"]) < 0.75)
+            низких_базы = sum(1 for j in б if float(j["avg_confidence"]) < 0.75)
+            return {"key": имя, **итог,
+                    "low_share": round(100.0 * низких / len(т), 1) if т else None,
+                    "low_share_baseline": round(100.0 * низких_базы / len(б), 1) if б else None}
+
+        по_моделям: dict[str, tuple[list, list]] = {}
+        for j in база:
+            по_моделям.setdefault(str(j.get("model") or "—"), ([], []))[0].append(j)
+        for j in сейчас:
+            по_моделям.setdefault(str(j.get("model") or "—"), ([], []))[1].append(j)
+        модели = [сравнить(имя, б, т) for имя, (б, т) in sorted(по_моделям.items())
+                  if т]
+        порядок = {"critical": 0, "warning": 1, "ok": 2, "unknown": 3}
+        модели.sort(key=lambda м: (порядок.get(м["verdict"], 4), -м["current"]["n"]))
+        общий = сравнить("all", база, сейчас)
+        return {
+            "period": period, "baseline_days": self.БАЗА_ДНЕЙ,
+            "baseline_from": round(база_от, 1) if база_от is not None else None,
+            "baseline_to": round(конец_базы, 1) if since else None,
+            "overall": общий, "models": модели,
+            "worst": min((м["verdict"] for м in [общий, *модели]),
+                         key=lambda v: порядок.get(v, 4), default="unknown"),
+            "note": ("Сравнивается распределение средней уверенности по заданиям за "
+                     "период с четырьмя неделями до него. Уверенность модели — не "
+                     "точность: она падает и на честно трудном звуке. Дрейф — повод "
+                     "посмотреть, что изменилось на входе, а не вердикт модели."),
+        }
+
+    def control(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+        """Контрольные карты по дням: уверенность, доля заданий с низкой
+        уверенностью, доля подозрительных сегментов — пределы 2σ и 3σ по
+        четырём неделям до периода."""
+        from . import stats  # noqa: PLC0415
+
+        since = self._since(period)
+        конец = time.time()
+        начало = since or конец - 30 * 86400
+        база_от = начало - self.БАЗА_ДНЕЙ * 86400
+        все = [j for j in self._jobs(since=база_от, limit=200000, owner=owner)
+               if j["status"] == "completed"]
+        дней = max(1, int(round((конец - начало) / 86400)))
+
+        def по_дням(от: float, до: float, n: int) -> list[dict[str, list[float]]]:
+            шаг = max(1.0, (до - от) / n)
+            корзины: list[dict[str, list[float]]] = [
+                {"conf": [], "low": [], "suspect": [], "jobs": []} for _ in range(n)]
+            for j in все:
+                t = float(j["created_at"])
+                if not от <= t < до:
+                    continue
+                i = min(max(int((t - от) / шаг), 0), n - 1)
+                c = j.get("avg_confidence")
+                if c is not None:
+                    корзины[i]["conf"].append(float(c))
+                    корзины[i]["low"].append(1.0 if float(c) < 0.75 else 0.0)
+                if j.get("quality_flags") is not None and int(j.get("segments_count") or 0):
+                    корзины[i]["suspect"].append(
+                        100.0 * float(j.get("suspect_segments") or 0)
+                        / float(j["segments_count"]))
+                корзины[i]["jobs"].append(1.0)
+            return корзины
+
+        база = по_дням(база_от, начало, self.БАЗА_ДНЕЙ)
+        текущие = по_дням(начало, конец, дней)
+        шаг = max(1.0, (конец - начало) / дней)
+        среднее = lambda xs: (sum(xs) / len(xs)) if xs else None  # noqa: E731
+        карты = []
+        for ключ, поле, подпись, лучше, множитель in (
+                ("confidence", "conf", "Средняя уверенность", 1, 1.0),
+                ("low_confidence_share", "low", "Доля заданий с уверенностью ниже 0,75, %",
+                 -1, 100.0),
+                ("suspect_share", "suspect", "Доля подозрительных сегментов, %", -1, 1.0)):
+            ряд_базы = [(среднее(k[поле]) * множитель if k[поле] else None) for k in база]
+            пределы = stats.control_limits([x for x in ряд_базы if x is not None])
+            точки = [(среднее(k[поле]) * множитель if k[поле] else None) for k in текущие]
+            отметки = stats.spc_flags(точки, пределы)
+            карты.append({
+                "key": ключ, "title": подпись, "good": лучше, "limits": пределы,
+                "baseline": [{"ts": round(база_от + i * (начало - база_от) / self.БАЗА_ДНЕЙ, 1),
+                              "value": (round(v, 4) if v is not None else None)}
+                             for i, v in enumerate(ряд_базы)],
+                "points": [{"ts": round(начало + i * шаг, 1),
+                            "value": (round(v, 4) if v is not None else None),
+                            "jobs": len(текущие[i]["jobs"])}
+                           for i, v in enumerate(точки)],
+                "flags": отметки,
+                "worst": max((ф["level"] for ф in отметки),
+                             key=lambda у: {"critical": 2, "warning": 1}.get(у, 0),
+                             default=None),
+            })
+        return {"period": period, "baseline_days": self.БАЗА_ДНЕЙ, "step_s": round(шаг, 1),
+                "charts": карты}
+
     def suspicious(self, period: str = "month", owner: str | None = None,
                    limit: int = 15) -> dict[str, Any]:
         """Подозрительные расшифровки: галлюцинации, повторы, разметка.
@@ -1008,6 +1132,8 @@ class Analytics:
             "resources": self.resources(period, owner),
             "quality_trend": self.quality_trend(period, owner=owner),
             "suspicious": self.suspicious(period, owner),
+            "drift": self.drift(period, owner),
+            "control": self.control(period, owner),
             "tags": self.by_tag(period, owner),
             "queue": self.queue_latency(period, owner),
         }

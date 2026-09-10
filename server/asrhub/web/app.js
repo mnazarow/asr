@@ -3515,6 +3515,15 @@ RENDERERS.analytics = {
              '<div id="suspicious-body"></div>')}
 
       <div class="grid cols-2">
+        ${card('Дрейф уверенности',
+               'распределение уверенности за период против четырёх недель до него — по моделям; критерий Колмогорова — Смирнова',
+               '<div id="drift-body"></div>')}
+        ${card('Контрольные карты распознавания',
+               'по дням: уверенность, доля заданий с низкой уверенностью, доля подозрительных сегментов; пределы 2σ и 3σ по базе',
+               '<div id="control-body"></div>')}
+      </div>
+
+      <div class="grid cols-2">
         ${card('Надёжность', 'что происходит между приёмом и выдачей результата',
                '<div id="reliability-body"></div>')}
         ${card('Повторы и экономия', 'сколько работы сняло узнавание уже виденных файлов',
@@ -3820,6 +3829,72 @@ function drawExtraAnalytics(data) {
     }
   }
 
+  const д = data.drift || {};
+  if (qs('#drift-body')) {
+    const тело = qs('#drift-body');
+    const вердикт = (v) => ({ critical: '<span class="chip err">критично</span>',
+      warning: '<span class="chip warn">предупреждение</span>', ok: '<span class="chip ok">без дрейфа</span>' }[v]
+      || '<span class="chip">мало данных</span>');
+    const строка = (м) => `<tr><td>${м.key === 'all' ? '<b>все модели</b>' : esc(м.key)}</td>
+      <td>${вердикт(м.verdict)}</td>
+      <td class="num mono">${num((м.baseline || {}).n)} / ${num((м.current || {}).n)}</td>
+      <td class="num mono">${(м.baseline || {}).p50 === null || (м.baseline || {}).p50 === undefined ? '—' : num(м.baseline.p50, 3)}
+        → ${(м.current || {}).p50 === null || (м.current || {}).p50 === undefined ? '—' : num(м.current.p50, 3)}</td>
+      <td class="num mono">${м.shift_relative === null || м.shift_relative === undefined ? '—' : (м.shift_relative > 0 ? '+' : '') + num(м.shift_relative * 100, 1) + '%'}</td>
+      <td class="num mono">${(м.ks || {}).p === null || (м.ks || {}).p === undefined ? '—' : num(м.ks.p, 3)}</td>
+      <td class="num mono">${м.low_share === null || м.low_share === undefined ? '—' : num(м.low_share, 1) + '%'}${
+        м.low_share_baseline !== null && м.low_share_baseline !== undefined ? ` <span class="faint">/ ${num(м.low_share_baseline, 1)}%</span>` : ''}</td></tr>`;
+    const общий = д.overall || {};
+    if (!(общий.current || {}).n) {
+      тело.innerHTML = '<div class="empty small">За период нет заданий с уверенностью</div>';
+    } else {
+      тело.innerHTML = `<div class="table-wrap"><table>
+        <thead><tr><th>Модель</th><th>Вердикт</th><th class="num" title="заданий в базе / за период">База / период</th>
+          <th class="num" title="медиана уверенности: база → период">Медиана</th>
+          <th class="num" title="сдвиг среднего, относительный">Сдвиг</th>
+          <th class="num" title="p-значение критерия Колмогорова — Смирнова">p</th>
+          <th class="num" title="доля заданий с уверенностью ниже 0,75: период / база">Низких</th></tr></thead>
+        <tbody>${[общий, ...(д.models || [])].map(строка).join('')}</tbody></table></div>
+        <p class="small faint" style="margin-top:8px">${esc(д.note || '')}</p>`;
+    }
+  }
+  const кк = data.control || {};
+  if (qs('#control-body')) {
+    const тело = qs('#control-body');
+    const карты = кк.charts || [];
+    if (!карты.length || !карты.some((к) => (к.points || []).some((т) => т.value !== null))) {
+      тело.innerHTML = '<div class="empty small">За период нет данных по дням</div>';
+    } else {
+      тело.innerHTML = карты.map((к) => `<div style="margin-bottom:10px">
+        <div class="row" style="gap:8px;margin-bottom:4px"><span class="small"><b>${esc(к.title)}</b></span>
+          ${к.worst === 'critical' ? '<span class="chip err">за 3σ</span>'
+            : к.worst === 'warning' ? '<span class="chip warn">за 2σ или серия</span>'
+            : к.limits && к.limits.enough ? '<span class="chip ok">в пределах</span>'
+            : '<span class="chip">мало дней в базе</span>'}</div>
+        <div id="spc-a-${esc(к.key)}"></div>
+        ${(к.flags || []).length ? `<div class="small dim" style="margin-top:4px">${(к.flags || []).slice(0, 3).map((ф) =>
+          `${fmtTime((к.points[ф.index] || {}).ts).slice(0, 5)}: ${num(ф.value, 3)} — ${esc(ф.why)}`).join('; ')}</div>` : ''}
+      </div>`).join('');
+      карты.forEach((к) => {
+        const точки = к.points || [];
+        const пределы = к.limits || {};
+        const ряд = (v) => точки.map(() => v);
+        Charts.line(qs(`#spc-a-${к.key}`), {
+          height: 140, labels: точки.map((т) => fmtTime(т.ts).slice(0, 5)),
+          series: [
+            { name: к.title, values: точки.map((т) => т.value) },
+            ...(пределы.enough ? [
+              { name: 'среднее базы', values: ряд(пределы.mean) },
+              { name: '+2σ', values: ряд(пределы.warn_high) },
+              { name: '−2σ', values: ряд(пределы.warn_low) },
+            ] : []),
+          ],
+          emptyText: 'нет данных',
+        });
+      });
+    }
+  }
+
   const r = data.reliability || {};
   if (qs('#reliability-body') && r.total !== undefined) {
     qs('#reliability-body').innerHTML = `<table>
@@ -3992,6 +4067,17 @@ const КАТЕГОРИЯ_ВИД = {
 };
 const КАТЕГОРИЯ_ЦВЕТ = { violation: 'err', objection: 'warn', handling: 'ok' };
 const КАТЕГОРИЯ_КТО = { any: 'любой', agent: 'оператор', customer: 'клиент' };
+
+/** Фишка «относительно нормы»: по статусу и по тому, куда лучше. */
+function НОРМА_ФИШКА(status, good) {
+  if (!status) return '<span class="faint small">—</span>';
+  const выше = status === 'above' || status === 'outlier_high';
+  const выброс = status.startsWith('outlier');
+  if (status === 'inside') return '<span class="chip ok">в норме</span>';
+  const плохо = good ? (выше ? good < 0 : good > 0) : false;
+  const cls = выброс ? (плохо ? 'err' : good ? 'ok' : 'warn') : (плохо ? 'warn' : good ? 'ok' : '');
+  return `<span class="chip ${cls}">${выброс ? 'выброс: ' : ''}${выше ? 'выше нормы' : 'ниже нормы'}</span>`;
+}
 
 /** Подпись тональности с цветом: одно число читается плохо, слово — сразу. */
 function toneChip(score, label) {
@@ -4177,14 +4263,19 @@ RENDERERS.content = {
 
   async tab_summary(host) {
     const период = state.contentPeriod;
-    const [свод, лента, выводы] = await Promise.all([
+    const [свод, лента, выводы, нормы, карты] = await Promise.all([
       API.latest('content-summary', `/api/content/summary?period=${период}`),
       API.latest('content-timeline', `/api/content/timeline?period=${период}`),
       API.latest('content-findings', `/api/content/findings?period=${период}`),
+      API.latest('content-norms', `/api/content/norms?period=${период}`)
+        .catch(() => ({ items: [] })),
+      API.latest('content-control', `/api/content/control?period=${период}`)
+        .catch(() => ({ charts: [] })),
     ]);
     const c = свод.current || {};
     const p = свод.previous || {};
     const признак = (k) => (свод.features || []).find((f) => f.key === k) || {};
+    const норма = (k) => (нормы.items || []).find((n) => n.key === k) || {};
     if (!c.records) {
       host.innerHTML = '<div class="empty">За период разобранных записей нет</div>';
       return;
@@ -4278,10 +4369,14 @@ RENDERERS.content = {
         считать», а не «этого не было». Включается настройкой диаризации.
       </div>` : ''}
 
-      ${card('Речь и разговор', 'усреднённые характеристики записей периода',
+      ${card('Речь и разговор',
+             `усреднённые характеристики записей периода; норма — медиана и коридор половины записей за ${
+               num(нормы.baseline_days || 28)} дней до периода (${num(нормы.baseline_records || 0)} записей)`,
              `<div class="table-wrap full"><table>
                <thead><tr><th>Показатель</th><th class="num">За период</th>
-                 <th class="num">Прошлый период</th><th class="num">Изменение</th></tr></thead>
+                 <th class="num">Прошлый период</th><th class="num">Изменение</th>
+                 <th class="num" title="медиана и межквартильный размах по своему архиву за четыре недели до периода">Своя норма</th>
+                 <th title="медиана периода против коридора нормы">Относительно нормы</th></tr></thead>
                <tbody>${(свод.features || []).map((f) => {
                  const a = c[f.key], b = p[f.key];
                  if (a === null || a === undefined) return '';
@@ -4289,16 +4384,55 @@ RENDERERS.content = {
                  // Разница мельче показанной точности — это ноль, а не
                  // изменение: иначе столбец пестрит «−0» и «+0.000».
                  if (d !== null && Math.abs(d) < Math.pow(10, -f.digits) / 2) d = 0;
+                 const н = норма(f.key);
                  return `<tr><td${f.hint ? ` title="${esc(f.hint)}"` : ''}>${esc(f.title)}${f.unit ? ` <span class="faint small">${esc(f.unit)}</span>` : ''}${
                    f.hint ? `<div class="faint small">${esc(f.hint)}</div>` : ''}</td>
                    <td class="num mono">${num(a, f.digits)}</td>
                    <td class="num mono faint">${b === null || b === undefined ? '—' : num(b, f.digits)}</td>
                    <td class="num mono ${d && f.good ? (Math.sign(d) * f.good > 0 ? 'ok-text' : 'err-text') : ''}">${
                      d === null ? '—' : d === 0 ? 'без изменений'
-                       : (d > 0 ? '+' : '') + num(d, f.digits)}</td></tr>`;
-               }).join('')}</tbody></table></div>`)}`;
+                       : (d > 0 ? '+' : '') + num(d, f.digits)}</td>
+                   <td class="num mono small">${н.enough ? `${num(н.median, f.digits)} <span class="faint">[${num(н.q1, f.digits)}–${num(н.q3, f.digits)}]</span>`
+                     : н.n ? `<span class="faint" title="норма считается от ${num(н.min_sample || 30)} записей">мало данных (${num(н.n)})</span>` : '—'}</td>
+                   <td>${НОРМА_ФИШКА(н.status, f.good)}</td></tr>`;
+               }).join('')}</tbody></table></div>`)}
+
+      ${(карты.charts || []).length ? card('Контрольные карты',
+        `по дням; пределы 2σ и 3σ — по ${num(карты.baseline_days || 28)} дням до периода; серия из семи точек по одну сторону от среднего — сдвиг`,
+        `<div class="grid cols-2">${(карты.charts || []).map((к) => `
+          <div>
+            <div class="row" style="gap:8px;margin-bottom:6px"><b>${esc(к.title)}</b>
+              ${к.worst === 'critical' ? '<span class="chip err">за 3σ</span>'
+                : к.worst === 'warning' ? '<span class="chip warn">за 2σ или серия</span>'
+                : к.limits && к.limits.enough ? '<span class="chip ok">в пределах</span>'
+                : '<span class="chip">пределы не посчитаны — мало дней в базе</span>'}</div>
+            <div id="spc-${esc(к.key)}"></div>
+            ${(к.flags || []).length ? `<div class="small dim" style="margin-top:6px">${(к.flags || []).slice(0, 4).map((ф) =>
+              `${fmtTime((к.points[ф.index] || {}).ts).slice(0, 5)}: ${num(ф.value, 2)} — ${esc(ф.why)}`).join('; ')}</div>` : ''}
+          </div>`).join('')}</div>`) : ''}`;
 
     toneBar(qs('#tone-bar'), c);
+    // Контрольные карты: значение по дням и пределы 2σ/3σ плоскими линиями.
+    (карты.charts || []).forEach((к) => {
+      const узел = qs(`#spc-${к.key}`);
+      if (!узел) return;
+      const точки = к.points || [];
+      const метки = точки.map((т) => fmtTime(т.ts).slice(0, 5));
+      const пределы = к.limits || {};
+      const ряд = (v) => точки.map(() => (v === null || v === undefined ? null : v));
+      window.Charts.line(узел, {
+        height: 180, labels: метки,
+        series: [
+          { name: к.title, values: точки.map((т) => т.value) },
+          ...(пределы.enough ? [
+            { name: 'среднее базы', values: ряд(пределы.mean) },
+            { name: '+2σ', values: ряд(пределы.warn_high) },
+            { name: '−2σ', values: ряд(пределы.warn_low) },
+          ] : []),
+        ],
+        emptyText: 'нет данных за период',
+      });
+    });
     const точки = (лента.buckets || []).filter((т) => т.records);
     const метки = точки.map((т) => fmtTime(т.ts).slice(0, 5));
     window.Charts.line(qs('#chart-tone-time'), {

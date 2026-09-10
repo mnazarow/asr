@@ -123,7 +123,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 624
+asrhub_uptime_seconds 69.9
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -157,8 +157,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1789033163.139057,
-  "collected_at": "2026-09-10T09:39:23+0000",
+  "timestamp": 1789036764.852371,
+  "collected_at": "2026-09-10T10:39:24+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -456,34 +456,15 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
 ```json
 {
   "summary": {
-    "rules": 51,
-    "firing": 2,
-    "pending": 4,
+    "rules": 53,
+    "firing": 0,
+    "pending": 7,
     "critical": 0,
-    "warning": 2,
-    "worst": "warning"
+    "warning": 0,
+    "worst": "ok"
   },
-  "alerts": [
-    {
-      "id": "asrhub_content_alert_records|warning",
-      "state": "firing",
-      "severity": "warning",
-      "metric": "asrhub_content_alert_records",
-      "label": "Записей с тревожными упоминаниями",
-      "unit": "",
-      "value": 4.0,
-      "threshold": 1.0,
-      "direction": "above",
-      "since": 1789032545.7136793,
-      "active_seconds": 617.4,
-      "fired_at": 1789033163.0662367,
-      "resolved_at": null,
-      "breaches": 5,
-      "summary": "Записей с тревожными упоминаниями: выше 1",
-      "hint": "Раздел «Аналитика записей» → «Что послушать» → «С тревожными упоминаниями»"
-    },
-    {
-…
+  "alerts": []
+}
 ```
 
 ### `GET /api/monitoring/alerts/history`
@@ -717,17 +698,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 5,
-  "samples": 769,
+  "scrapes": 2,
+  "samples": 530,
   "collection_errors": [],
   "cache_ttl_s": 5.0,
   "alerts": {
-    "rules": 51,
-    "firing": 2,
-    "pending": 4,
+    "rules": 53,
+    "firing": 0,
+    "pending": 7,
     "critical": 0,
-    "warning": 2,
-    "worst": "warning"
+    "warning": 0,
+    "worst": "ok"
   },
   "targets": []
 }

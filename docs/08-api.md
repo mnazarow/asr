@@ -448,6 +448,8 @@ GET  /api/content/agents/{ключ}          карточка оператора
 GET  /api/content/coaching               очередь коучинга с причинами
 GET  /api/content/references             эталонные разговоры
 PUT  /api/content/marks/{id}             отметка: coaching done/open, reference yes
+GET  /api/content/norms                  своя норма показателей по четырём неделям до периода
+GET  /api/content/control                контрольные карты по дням (2σ/3σ, серия)
 GET  /api/content/jobs/{id}              разбор одной записи
 POST /api/content/jobs/{id}/recompute    пересчитать одну запись
 POST /api/content/script/check           прогнать скрипт по записи, ничего не сохраняя

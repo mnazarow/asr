@@ -2968,3 +2968,191 @@ def test_the_agent_endpoints_respect_ownership_and_validate_marks(
         # Отметка — событие в журнале задания.
         события = [с for с in db.get_events("ag1") if с["kind"] == "mark"]
         assert события and события[0]["data"]["status"] == "yes"
+
+
+# ---------------------------------------------------------------------------
+# Этап 3: нормы от архива, дрейф уверенности, контрольные карты
+# ---------------------------------------------------------------------------
+
+
+def test_the_statistics_match_the_textbook_and_the_reference_implementation():
+    """Процентили, KS, пределы и правило серии — против известных ответов
+    и, где есть, против scipy."""
+    import random
+
+    from asrhub import stats
+
+    assert stats.percentile([1, 2, 3, 4], 0.5) == 2.5
+    assert stats.percentiles([1, 2, 3, 4, 5]) == {"p10": 1.4, "p25": 2.0, "p50": 3.0,
+                                                  "p75": 4.0, "p90": 4.6}
+    норма = stats.norm_band([1, 2, 3, 4, 5, 6, 7, 8, 9, 100])
+    assert (норма["median"], норма["q1"], норма["q3"]) == (5.5, 3.25, 7.75)
+    assert норма["high"] == 14.5 and норма["low"] == -3.5 and not норма["enough"]
+    полная = stats.norm_band(list(range(1, 41)))
+    assert полная["enough"]
+    assert stats.against_norm(100, норма) is None            # выборки мало — статуса нет
+    assert stats.against_norm(20.5, полная) == "inside"
+    assert stats.against_norm(35, полная) == "above"
+    assert stats.against_norm(90, полная) == "outlier_high"
+    assert stats.against_norm(2, полная) == "below"
+    assert stats.against_norm(-30, полная) == "outlier_low"
+
+    random.seed(1)
+    a = [random.gauss(0.9, 0.05) for _ in range(400)]
+    b = [random.gauss(0.9, 0.05) for _ in range(200)]
+    c = [random.gauss(0.8, 0.05) for _ in range(200)]
+    d = [random.gauss(0.88, 0.05) for _ in range(200)]
+    e = [random.gauss(0.95, 0.05) for _ in range(200)]
+    одинаковые, разные = stats.ks_test(a, b), stats.ks_test(a, c)
+    assert одинаковые["p"] > 0.05 and разные["p"] < 0.001 and разные["d"] > 0.5
+    assert [stats.drift_verdict(a, x)["verdict"] for x in (b, c, d, e)] == \
+        ["ok", "critical", "warning", "ok"]
+    assert stats.drift_verdict(a[:10], c[:10])["verdict"] == "unknown"
+    try:
+        from scipy import stats as sp
+    except ImportError:
+        pass
+    else:
+        for x in (b, c, d):
+            эталон = sp.ks_2samp(a, x)
+            свой = stats.ks_test(a, x)
+            assert abs(свой["d"] - float(эталон.statistic)) < 1e-3
+            assert abs(свой["p"] - float(эталон.pvalue)) < 0.02
+
+    пределы = stats.control_limits([10, 11, 9, 10, 12, 8, 10, 11, 9, 10])
+    assert пределы["mean"] == 10.0 and пределы["enough"]
+    отметки = stats.spc_flags([10, 14, 20, 10.5, None, 10.5, 10.5, 10.5, 10.5, 10.5, 10.5, 10.5],
+                              пределы)
+    assert [(ф["index"], ф["level"]) for ф in отметки] == [(1, "critical"), (2, "critical"),
+                                                           (11, "warning")]
+    assert "7 точек" in отметки[-1]["why"]                   # None прервал серию
+    assert stats.spc_flags([1, 2, 3], {"enough": False}) == []
+
+
+def _корпус_с_историей(tmp_path, дней: int = 35, дрейф_с: int = 7):
+    """Пять недель записей: четыре недели ровных и последняя неделя, где
+    операторы говорят быстрее, а уверенность модели просела."""
+    from asrhub.content_index import ContentIndex
+    from asrhub.db import Database
+
+    db = Database(tmp_path / "asrhub.db")
+    сейчас = time.time()
+    ровный = "Здравствуйте, компания Ромашка, меня зовут Анна. Договор готов, отправлю сегодня. Спасибо, всего доброго."
+    быстрый = ровный + " " + " ".join(["уточню"] * 40)
+    n = 0
+    for день in range(дней, 0, -1):
+        for k in range(5):
+            когда = сейчас - день * 86400 + k * 3600 + 60
+            свежий = день <= дрейф_с
+            job_id = db.create_job({"id": f"h{n:04d}", "filename": f"{n}.wav", "owner": "анна",
+                                    "media_duration_s": 30.0, "model": "v2", "engine": "gigaam"})
+            db.execute("UPDATE jobs SET created_at=? WHERE id=?", (когда, job_id))
+            db.update_job(job_id, status="completed", finished_at=когда + 20,
+                          text=быстрый if свежий else ровный,
+                          avg_confidence=0.70 + 0.02 * (k % 3) if свежий else 0.9 + 0.02 * (k % 3))
+            db.save_segments(job_id, [
+                {"start": 0.0, "end": 10.0, "speaker": "SPEAKER_00",
+                 "text": (быстрый if свежий else ровный)},
+                {"start": 10.0, "end": 30.0, "speaker": "SPEAKER_01", "text": "Спасибо."}])
+            n += 1
+    индекс = ContentIndex(db, _Настройки())
+    while индекс.backfill_once(limit=50):
+        pass
+    return db, индекс
+
+
+def test_norms_come_from_the_archive_and_flag_the_period_outside_them(tmp_path):
+    """Своя норма — медиана и квартили по четырём неделям до периода; период
+    сравнивается медианой; вывод называет обе величины."""
+    from asrhub.insights import Insights
+
+    db, индекс = _корпус_с_историей(tmp_path)
+    свод = Insights(db, индекс)
+    нормы = свод.norms("week")
+    по = {н["key"]: н for н in нормы["items"]}
+    assert нормы["baseline_days"] == 28 and нормы["baseline_records"] == 140
+    assert нормы["current_records"] == 35
+    темп = по["wpm"]
+    assert темп["enough"] and темп["n"] == 140
+    # На базе темп ровный: коридор узкий, а неделя — сильно быстрее.
+    assert темп["q1"] == темп["q3"] == темп["median"]
+    assert темп["current"] > темп["high"] and темп["status"] == "outlier_high"
+    assert по["sentiment"]["status"] == "inside"
+    # Темп — показатель без направления: выброс даёт вывод «к сведению»
+    # с обеими величинами; тональность в норме — вывода нет.
+    выводы = свод.findings("week", нормы=нормы)
+    по_метрике = {в["metric"]: в for в in выводы if в.get("previous") is not None}
+    assert "wpm" in по_метрике and по_метрике["wpm"]["severity"] == "info", выводы
+    assert "выше своей нормы" in по_метрике["wpm"]["text"] and "за 28 дней" in по_метрике["wpm"]["text"]
+    assert "sentiment" not in по_метрике
+    # Без базы норма честно «мало данных», а не ноль.
+    пусто = свод.norms("year")
+    assert all(not н["enough"] for н in пусто["items"])
+
+
+def test_control_charts_use_the_baseline_limits_and_catch_the_shift(tmp_path):
+    """Контрольные карты: пределы 2σ/3σ по четырём неделям до периода, точки
+    периода за ними — и серия по одну сторону от среднего."""
+    from asrhub.analytics import Analytics
+    from asrhub.insights import Insights
+
+    db, индекс = _корпус_с_историей(tmp_path)
+    карты = {к["key"]: к for к in Insights(db, индекс).control("week")["charts"]}
+    # На базе доля отрицательных ровно ноль каждый день — σ нулевая, и
+    # любая точка выше — «за 3σ»; в тестовом корпусе так и есть у темпа,
+    # а тональность не менялась: пределы посчитаны, отметок нет.
+    assert карты["sentiment"]["limits"]["enough"] and карты["sentiment"]["flags"] == []
+    assert len(карты["sentiment"]["points"]) == 7 and len(карты["sentiment"]["baseline"]) == 28
+
+    # Уверенность модели: база 0,90–0,94, неделя 0,72–0,76 — каждая точка
+    # за 3σ, и дрейф критичен.
+    аналитика = Analytics(db)
+    контроль = {к["key"]: к for к in аналитика.control("week")["charts"]}
+    уверенность = контроль["confidence"]
+    assert уверенность["limits"]["enough"] and уверенность["worst"] == "critical"
+    assert len([ф for ф in уверенность["flags"] if ф["level"] == "critical"]) == 7
+    assert контроль["low_confidence_share"]["worst"] == "critical"
+
+    дрейф = аналитика.drift("week")
+    assert дрейф["overall"]["verdict"] == "critical"
+    assert дрейф["overall"]["ks"]["p"] < 0.001 and дрейф["overall"]["shift_relative"] < -0.15
+    assert дрейф["overall"]["baseline"]["n"] == 140 and дрейф["overall"]["current"]["n"] == 35
+    assert [м["key"] for м in дрейф["models"]] == ["v2"] and дрейф["worst"] == "critical"
+    assert дрейф["overall"]["low_share"] == 100.0 and дрейф["overall"]["low_share_baseline"] == 0.0
+    # За «всё время» базы нет — вердикта нет, а не ложная тревога; и период
+    # при этом весь архив, а не последние четыре недели под чужим именем.
+    всё = аналитика.drift("all")
+    assert всё["overall"]["verdict"] == "unknown" and всё["baseline_from"] is None
+    assert всё["overall"]["current"]["n"] == 175 and всё["overall"]["baseline"]["n"] == 0
+
+
+def test_drift_reaches_the_digest_the_metrics_and_the_endpoints(tmp_path, monkeypatch, data_dir):
+    """Сводка называет модель и числа; метрики несут уровень, p и сдвиг;
+    ручки отдают разделы."""
+    from asrhub.analytics import Analytics
+    from asrhub.maintenance import build_digest
+    from asrhub.monitoring.catalog import METRICS_BY_NAME
+    from fastapi.testclient import TestClient
+
+    db, индекс = _корпус_с_историей(tmp_path)
+    сводка = build_digest(Analytics(db), _Настройки(digest_period="week"))
+    assert сводка["drift"] and сводка["drift"][0]["key"] == "all"
+    assert "Дрейф уверенности по всем моделям: критично" in сводка["text"], сводка["text"]
+    assert "у модели v2: критично" in сводка["text"]
+    for имя in ("asrhub_confidence_drift_level", "asrhub_confidence_drift_p",
+                "asrhub_confidence_drift_shift"):
+        assert имя in METRICS_BY_NAME and "model" in METRICS_BY_NAME[имя].labels
+
+    app = _клиент_с_ключами(data_dir, monkeypatch)
+    with TestClient(app) as c:
+        ключ = {"X-API-Key": "ah_admin_k"}
+        for раздел in ("drift", "control"):
+            ответ = c.get(f"/api/analytics/{раздел}?period=week", headers=ключ)
+            assert ответ.status_code == 200, ответ.text
+        assert c.get("/api/analytics/drift?period=week", headers=ключ).json()["baseline_days"] == 28
+        нормы = c.get("/api/content/norms?period=week", headers=ключ)
+        assert нормы.status_code == 200 and нормы.json()["min_sample"] == 30
+        карты = c.get("/api/content/control?period=week", headers=ключ).json()
+        assert [к["key"] for к in карты["charts"]] == ["negative_share", "agent_score",
+                                                        "sentiment", "compliance"]
+        assert c.get("/api/content/norms?by=model", headers=ключ).status_code == 422

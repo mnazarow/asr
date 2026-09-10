@@ -388,6 +388,8 @@ def analytics_section(request: Request, section: str, period: str = "week",
         "resources": state.analytics.resources,
         "quality": state.analytics.quality_trend,
         "suspicious": state.analytics.suspicious,
+        "drift": state.analytics.drift,
+        "control": state.analytics.control,
         "tags": state.analytics.by_tag,
         "queue": state.analytics.queue_latency,
     }

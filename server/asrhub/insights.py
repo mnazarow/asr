@@ -25,7 +25,7 @@ import math
 import time
 from typing import Any
 
-from . import content
+from . import content, stats
 from .analytics import PERIODS
 from .db import Database
 from .logging_setup import get_logger
@@ -57,6 +57,29 @@ log = get_logger("insights")
 #: выводов по группам: на трёх записях подъём в два раза — это одна запись.
 МИН_ДРАЙВЕРА = 10
 ПОДЪЁМ = 1.25
+
+#: Базовое окно для норм и контрольных карт — четыре недели до периода,
+#: как у Deepgram (1500–2500 записей за четыре недели — обычная база).
+#: Пороги из чужих методик — ориентир; своя медиана за четыре недели —
+#: норма.
+БАЗА_ДНЕЙ = 28
+
+#: Признаки, по которым считается норма: числовые показатели записи, у
+#: которых есть значение в каждой записи (не суммы за период).
+ПРИЗНАКИ_НОРМЫ: tuple[str, ...] = (
+    "sentiment", "wpm", "silence_share", "interruptions", "pauses", "longest_pause_s",
+    "filler_rate", "compliance", "duration_s", "talk_share", "monologue_s",
+    "customer_story_s", "switches", "reply_delay_s", "overlap_s", "dead_air_s",
+    "tempo_ratio", "agent_score", "empathy",
+)
+
+#: Ряды для контрольных карт содержания: ключ корзины, подпись, куда лучше.
+КАРТЫ: tuple[tuple[str, str, int], ...] = (
+    ("negative_share", "Доля отрицательных, %", -1),
+    ("agent_score", "Балл оператора", 1),
+    ("sentiment", "Тональность", 1),
+    ("compliance", "Скрипт", 1),
+)
 
 #: Сколько записей берётся на расчёт связей. Коэффициент по двадцати тысячам
 #: отличается от коэффициента по ста тысячам в третьем знаке — при пороге в
@@ -820,6 +843,103 @@ class Insights:
         без = self.db.uncategorized_count(since=начало, owner=owner)
         return {"records": без, "share": _процент(без, всего)}
 
+    # --- нормы от своего архива и контрольные карты -----------------------
+
+    def norms(self, period: str = "week", owner: str | list[str] | None = None,
+              *, agent: tuple[str, str] | None = None) -> dict[str, Any]:
+        """Своя обычная величина каждого показателя — медиана и квартили по
+        четырём неделям до периода — и где относительно неё период.
+
+        Ориентиры из чужих методик («темп 140–160», «доля речи 40–60 %»)
+        сделаны для английских продаж; норма здесь — то, как обычно бывает
+        на этом сервере. Коридор — межквартильный размах: в нём лежит
+        половина записей; выброс — дальше полутора размахов от квартилей.
+        """
+        начало = self.window(period)[0]
+        конец = начало if начало is not None else time.time()
+        база_от = конец - БАЗА_ДНЕЙ * 86400
+        столбцы = list(ПРИЗНАКИ_НОРМЫ)
+        база = self.db.content_sample(столбцы, since=база_от, until=конец, owner=owner,
+                                      limit=ПРЕДЕЛ_СВЯЗЕЙ, agent=agent)
+        # Период сравнивается медианой, а не средним: среднее по многим
+        # записям почти всегда внутри коридора, даже когда распределение
+        # уехало; медиана периода против медианы базы — честнее.
+        текущее = self.db.content_sample(столбцы, since=начало, owner=owner,
+                                         limit=ПРЕДЕЛ_СВЯЗЕЙ, agent=agent)
+        items = []
+        for n, ключ in enumerate(столбцы):
+            значения = [float(р[n]) for р in база if р[n] is not None]
+            норма = stats.norm_band(значения, знаков=4)
+            описание = ПРИЗНАКИ_ПО_КЛЮЧУ.get(ключ, {})
+            свои = [float(р[n]) for р in текущее if р[n] is not None]
+            сейчас = stats.percentile(свои, 0.5)
+            items.append({
+                "key": ключ, "title": описание.get("title", ключ),
+                "unit": описание.get("unit", ""), "good": описание.get("good", 0),
+                "digits": описание.get("digits", 2), "hint": описание.get("hint"),
+                **норма, "current": _округлить(сейчас, описание.get("digits", 2) + 2),
+                "current_n": len(свои),
+                "status": stats.against_norm(сейчас, норма),
+            })
+        return {"period": period, "baseline_days": БАЗА_ДНЕЙ,
+                "baseline_from": round(база_от, 1), "baseline_to": round(конец, 1),
+                "baseline_records": len(база), "current_records": len(текущее),
+                "min_sample": stats.МИН_ВЫБОРКА, "items": items}
+
+    def control(self, period: str = "week", owner: str | list[str] | None = None,
+                *, agent: tuple[str, str] | None = None) -> dict[str, Any]:
+        """Контрольные карты по дням: пределы 2σ и 3σ по четырём неделям до
+        периода и точки периода за ними.
+
+        Правило серии — семь дней подряд по одну сторону от среднего —
+        ловит сдвиг, который ни один день по отдельности не выдаёт: доля
+        отрицательных выросла на треть, но каждый день по-прежнему внутри
+        2σ. Дни без записей серию прерывают.
+        """
+        начало = self.window(period)[0]
+        конец = time.time()
+        if начало is None:
+            начало = конец - 30 * 86400
+        база_от = начало - БАЗА_ДНЕЙ * 86400
+        дней_базы = БАЗА_ДНЕЙ
+        дней = max(1, int(round((конец - начало) / 86400)))
+        n_б, шаг_б, база = self.db.content_series(since=база_от, until=начало,
+                                                  buckets=дней_базы, owner=owner, agent=agent)
+        n_т, шаг_т, период_ряд = self.db.content_series(since=начало, until=конец,
+                                                        buckets=дней, owner=owner, agent=agent)
+        по_б = {int(с["bucket"]): с for с in база}
+        по_т = {int(с["bucket"]): с for с in период_ряд}
+
+        def значение(с: dict[str, Any] | None, ключ: str) -> float | None:
+            if not с or not int(с.get("records") or 0):
+                return None
+            if ключ == "negative_share":
+                return _процент(с.get("negative"), с.get("scored"))
+            v = с.get(ключ)
+            return float(v) if v is not None else None
+
+        карты = []
+        for ключ, подпись, лучше in КАРТЫ:
+            ряд_базы = [значение(по_б.get(k), ключ) for k in range(n_б)]
+            пределы = stats.control_limits([x for x in ряд_базы if x is not None])
+            точки = [значение(по_т.get(k), ключ) for k in range(n_т)]
+            отметки = stats.spc_flags(точки, пределы)
+            карты.append({
+                "key": ключ, "title": подпись, "good": лучше,
+                "limits": пределы,
+                "baseline": [{"ts": round(база_от + k * шаг_б, 1), "value": ряд_базы[k]}
+                             for k in range(n_б)],
+                "points": [{"ts": round(начало + k * шаг_т, 1), "value": точки[k],
+                            "records": int((по_т.get(k) or {}).get("records") or 0)}
+                           for k in range(n_т)],
+                "flags": отметки,
+                "worst": max((ф["level"] for ф in отметки),
+                             key=lambda у: {"critical": 2, "warning": 1}.get(у, 0),
+                             default=None),
+            })
+        return {"period": period, "baseline_days": БАЗА_ДНЕЙ, "step_s": round(шаг_т, 1),
+                "baseline_step_s": round(шаг_б, 1), "charts": карты}
+
     # --- оператор ---------------------------------------------------------
 
     #: Что сравнивать в карточке оператора с командой: ключ свода, подпись,
@@ -1032,7 +1152,8 @@ class Insights:
                  прошлый: dict[str, Any] | None = None,
                  разрезы: dict[str, Any] | None = None,
                  категории: dict[str, Any] | None = None,
-                 драйверы: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                 драйверы: dict[str, Any] | None = None,
+                 нормы: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Готовые выводы: правила с порогами, а не пересказ цифр.
 
         Каждый вывод несёт уровень внимания и числа, из которых сделан.
@@ -1293,6 +1414,39 @@ class Insights:
                      f"о чём звонят, — посмотрите новые слова периода на вкладке «Темы»",
                      metric="uncategorized", value=без["share"])
 
+        # 6г. Своя норма: показатель периода за коридором четырёх недель до
+        #     него — в плохую сторону. Чужие ориентиры выше говорят «ориентир»,
+        #     это говорит «у вас обычно не так».
+        if нормы is None:
+            try:
+                нормы = self.norms(period, owner)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Нормы для выводов не посчитаны: %s", exc)
+                нормы = {}
+        for н in (нормы.get("items") or []):
+            статус = н.get("status")
+            if not статус or not статус.startswith("outlier"):
+                continue
+            выше = статус == "outlier_high"
+            # Показатель с направлением: выброс в хорошую сторону — не
+            # вывод; без направления (темп, длительность) — «к сведению»:
+            # отклонение от своей нормы стоит знать, даже когда неясно,
+            # хорошо это или плохо.
+            if н.get("good"):
+                плохо = (н["good"] < 0) if выше else (н["good"] > 0)
+                if not плохо:
+                    continue
+                уровень = "warning"
+            else:
+                уровень = "info"
+            добавить(уровень,
+                     f"{н['title']} за период {'выше' if выше else 'ниже'} своей нормы: "
+                     f"медиана {round(н['current'], н['digits'])} при обычных "
+                     f"{round(н['q1'], н['digits'])}–{round(н['q3'], н['digits'])} "
+                     f"(медиана {round(н['median'], н['digits'])} по {н['n']} записям "
+                     f"за {нормы.get('baseline_days')} дней до периода)",
+                     metric=н["key"], value=н["current"], previous=н["median"])
+
         # 7. Часы, когда разговоры тяжелее.
         часы = (разрезы.get("hour") or {}).get("items") or []
         годные = [ч for ч in часы if ч["records"] >= max(МИН_ГРУППА, 10)
@@ -1349,6 +1503,7 @@ class Insights:
         разрезы = {d: self.breakdown(d, period, owner) for d in dimensions}
         категории = self.categories(period, owner)
         драйверы = self.drivers(period, owner)
+        нормы = self.norms(period, owner)
         return {
             "period": period,
             "generated_at": time.time(),
@@ -1363,9 +1518,11 @@ class Insights:
             "correlations": self.correlations(period, owner),
             "categories": категории,
             "drivers": драйверы,
+            "norms": нормы,
+            "control": self.control(period, owner),
             "findings": self.findings(period, owner, свод=свод, прошлый=прошлый,
                                       разрезы=разрезы, категории=категории,
-                                      драйверы=драйверы),
+                                      драйверы=драйверы, нормы=нормы),
             "highlights": {k: self.records(k, period, owner, limit=10)
                            for k in ("negative", "downturn", "alerts",
                                      "open_commitments", "script")},
