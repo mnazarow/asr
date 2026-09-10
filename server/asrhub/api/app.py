@@ -29,6 +29,8 @@ from ..llm import LLMClient, LLMSetup, LLMWorker
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
 from ..streaming import StreamSession
+from ..telephony import Импортёр
+from ..trends import Trends
 from .deps import SESSION_COOKIE, AppState
 from .routes_auth import router as auth_router
 from .routes_auth import users_router
@@ -41,6 +43,8 @@ from .routes_phone import router as phone_router
 from .routes_review import router as review_router
 from .routes_system import health_router
 from .routes_system import router as system_router
+from .routes_telephony import router as telephony_router
+from .routes_trends import router as trends_router
 
 log = get_logger("app")
 
@@ -339,6 +343,9 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                   "Задать пароль вручную: python -m asrhub --set-password admin")
     state.monitoring = MonitoringService(state)
     state.content = ContentIndex(db, settings)
+    # Тренды: ряды по времени для всех измеримых величин. Слой без
+    # состояния — только ссылка на базу, поэтому собирается сразу.
+    state.trends = Trends(db)
     queue.content_index = state.content
     # Смысловой слой: клиент модели и фоновый поток разбора. Поток уступает
     # распознаванию по глубине очереди — той же, что видит планировщик.
@@ -352,6 +359,11 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # настрой сам». Живёт рядом с клиентом, чтобы после установки сразу
     # сбросить пробу доступности.
     state.llm_setup = LLMSetup(settings, db, client=state.llm)
+    # Телефония: записи разговоров приезжают с АТС сами. Импортёр
+    # собирается всегда, а работает только при включённой настройке:
+    # раздел должен показывать журнал уже импортированного и тогда, когда
+    # забор выключен.
+    state.telephony = Импортёр(db, settings, queue)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -361,6 +373,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         state.monitoring.start()
         state.content.start()
         state.llm_worker.start()
+        state.telephony.start()
         log.info("ASR Hub запущен: %s:%s, каталог данных %s",
                  settings.get("server_host"), settings.get("server_port"),
                  settings.paths.data)
@@ -370,6 +383,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         state.monitoring.stop()
         state.content.stop()
         state.llm_worker.stop()
+        state.telephony.stop()
         queue.stop()
         registry.unload_all()
         db.close()
@@ -550,6 +564,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(content_router)
     app.include_router(review_router)
     app.include_router(llm_router)
+    app.include_router(trends_router)
+    app.include_router(telephony_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.
     app.include_router(phone_router)

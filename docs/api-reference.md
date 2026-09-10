@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **125**, операций: **137**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **135**, операций: **147**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -251,6 +251,16 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/settings/save` | Сохранить настройки в файл конфигурации | ключ с ролью **admin** |
 | `GET` | `/api/statuses` | Состояние принятых разговоров | любой действующий ключ |
 | `GET` | `/api/system` | Сведения о сервере и оборудовании | любой действующий ключ |
+| `GET` | `/api/telephony/calls` | Журнал импортированных звонков | любой ключ; выборка сужается до его заданий |
+| `GET` | `/api/telephony/dimensions` | Очереди и операторы для отбора | любой ключ; выборка сужается до его заданий |
+| `POST` | `/api/telephony/scan` | Заход за новыми звонками прямо сейчас | ключ с ролью **admin** |
+| `GET` | `/api/telephony/status` | Состояние забора записей с АТС | любой ключ; выборка сужается до его заданий |
+| `POST` | `/api/telephony/test` | Проверка связи с АТС | ключ с ролью **admin** |
+| `GET` | `/api/trends` | Ряды показателей по времени | любой ключ; выборка сужается до его заданий |
+| `GET` | `/api/trends/catalog` | Каталог показателей трендов | любой действующий ключ |
+| `GET` | `/api/trends/correlations` | Показатели, которые движутся вместе | любой действующий ключ |
+| `GET` | `/api/trends/export` | Выгрузка трендов в таблицу | любой действующий ключ |
+| `GET` | `/api/trends/heatmap` | Показатель по часам недели | любой действующий ключ |
 | `GET` | `/api/usage` | Расход и квоты ключа | любой действующий ключ |
 | `GET` | `/api/users` | Список учётных записей | ключ с ролью **admin** |
 | `POST` | `/api/users` | Завести учётную запись | ключ с ролью **admin** |
@@ -297,33 +307,33 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 {
   "items": [
     {
-      "id": "stp021",
+      "id": "job_d7fe59ed55244a82",
       "status": "completed",
-      "model": "whisper-large-v3",
-      "engine": "faster-whisper",
+      "model": "gigaam-v3-rnnt",
+      "engine": "gigaam",
       "language": "ru",
-      "owner": "анна",
-      "source": "web",
+      "owner": "admin",
+      "source": "api",
       "priority": 50,
-      "filename": "поддержка-021.wav",
+      "filename": "звонок-0.wav",
       "deadline": null,
-      "created_at": 1788997281.9473639,
-      "queued_at": 1789030274.5480072,
+      "created_at": 1788893287.5892565,
+      "queued_at": 1788893287.5892887,
       "started_at": null,
-      "finished_at": 1788997321.9473639,
-      "media_duration_s": 85.0,
-      "processing_time_s": 12.49,
-      "queue_time_s": 0.57,
-      "audio_prep_s": 0.57,
-      "model_load_s": 0.0,
-      "inference_s": 10.61,
-      "postprocess_s": 0.39,
-      "rtf": 0.1469,
-      "words_count": 51,
+      "finished_at": 1788893337.5892565,
+      "media_duration_s": 300.0,
+      "processing_time_s": 44.0,
+      "queue_time_s": 1.0,
+      "audio_prep_s": null,
+      "model_load_s": null,
+      "inference_s": null,
+      "postprocess_s": null,
+      "rtf": 0.15,
+      "words_count": 760,
       "chars_count": 0,
-      "segments_count": 7,
+      "segments_count": 48,
       "speakers_count": 2,
-      "avg_confidence": 0.798,
+      "avg_confidence": 0.93,
       "wer": null,
       "cer": null,
       "error_code": null,
@@ -331,23 +341,22 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
       "error_hint": null,
       "retries": 0,
       "cached_from": null,
-      "device": null,
-      "file_size": 0,
+      "device": "cuda",
+      "file_size": 9600000,
       "progress": 0.0,
       "stage": "",
-      "tags": "поддержка",
-      "peak_memory_mb": null,
+      "tags": "продажи",
+      "peak_memory_mb": 23400.0,
       "peak_memory_jobs": null,
       "file_hash": null,
       "cancelled_by": null,
       "webhook_status": null,
-      "suspect_segments": 0,
-      "suspect_share": 0.0,
-      "quality_flags": "",
+      "suspect_segments": null,
+      "suspect_share": null,
+      "quality_flags": null,
       "mer": null,
       "wil": null,
       "ref_words": null,
-      "sub_words": null,
 …
 ```
 
@@ -678,7 +687,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:9536",
+  "instance": "vm:13788",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -687,9 +696,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 2084,
-    "failed": 0,
-    "cancelled": 0
+    "completed": 321,
+    "failed": 12,
+    "cancelled": 5
   },
   "queue_depth": 0,
   "active": 0,
@@ -1256,53 +1265,52 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789067007.8439865,
+    "generated_at": 1789073438.220464,
     "jobs": {
-      "total": 219,
-      "completed": 219,
-      "failed": 0,
-      "cancelled": 0,
+      "total": 282,
+      "completed": 269,
+      "failed": 9,
+      "cancelled": 4,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 1.0
+      "success_rate": 0.9539
     },
     "volume": {
-      "audio_seconds": 7863.1,
-      "audio_hours": 2.18,
-      "processing_seconds": 1518.3,
-      "words": 9102,
-      "characters": 0,
-      "segments": 1326,
-      "files_per_hour": 1.3,
-      "audio_hours_per_hour": 0.01
+      "audio_seconds": 280062.1,
+      "audio_hours": 77.8,
+      "processing_seconds": 43964.0,
+      "words": 643092,
+      "characters": 3797022,
+      "segments": 29503,
+      "files_per_hour": 1.6,
+      "audio_hours_per_hour": 0.46
     },
     "performance": {
       "rtf": {
-        "count": 219,
-        "avg": 0.20327,
-        "min": 0.01,
-        "max": 5.7511,
-        "p10": 0.04354,
-        "p50": 0.1097,
-        "p90": 0.38188,
-        "p95": 0.48952,
-        "p99": 1.247098,
-        "stdev": 0.436026
+        "count": 269,
+        "avg": 0.14827,
+        "min": 0.0177,
+        "max": 0.5543,
+        "p10": 0.03844,
+        "p50": 0.1101,
+        "p90": 0.3343,
+        "p95": 0.42,
+        "p99": 0.516404,
+        "stdev": 0.118658
       },
       "processing_time_s": {
-        "count": 219,
-        "avg": 6.932785,
-        "min": 0.28,
-        "max": 175.41,
-        "p10": 1.15,
-        "p50": 3.72,
-        "p90": 13.392,
-        "p95": 16.434,
-        "p99": 40.84,
-        "stdev": 13.551168
+        "count": 269,
+        "avg": 163.434848,
+        "min": 0.72,
+        "max": 2411.75,
+        "p10": 3.722,
+        "p50": 46.0,
+        "p90": 387.198,
+        "p95": 746.896,
+        "p99": 1897.54,
+        "stdev": 341.491961
       },
       "queue_time_s": {
-        "count": 219,
 …
 ```
 
@@ -1359,64 +1367,63 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
 {
   "period": "week",
   "overall": {
-    "jobs": 219,
-    "audio_hours": 2.184,
-    "processing_p50": 3.72,
-    "processing_p95": 16.43,
-    "processing_p99": 40.84,
-    "rtf_p50": 0.1097,
-    "rtf_p95": 0.4895,
-    "rtf_p99": 1.2471,
-    "queue_p50": 4.71,
-    "queue_p95": 19.75
+    "jobs": 269,
+    "audio_hours": 77.795,
+    "processing_p50": 46.0,
+    "processing_p95": 746.9,
+    "processing_p99": 1897.54,
+    "rtf_p50": 0.1101,
+    "rtf_p95": 0.42,
+    "rtf_p99": 0.5164,
+    "queue_p50": 14.22,
+    "queue_p95": 66.03
   },
   "by_model": [
     {
-      "key": "whisper-large-v3",
-      "jobs": 58,
-      "audio_hours": 0.634,
-      "processing_p50": 5.46,
-      "processing_p95": 18.49,
-      "processing_p99": 29.59,
-      "rtf_p50": 0.1613,
-      "rtf_p95": 0.2892,
-      "rtf_p99": 0.7748,
-      "queue_p50": 6.06,
-      "queue_p95": 20.54
-    },
-    {
-      "key": "t-one",
-      "jobs": 55,
-      "audio_hours": 0.515,
-      "processing_p50": 2.61,
-      "processing_p95": 7.38,
-      "processing_p99": 11.46,
-      "rtf_p50": 0.0856,
-      "rtf_p95": 0.1481,
-      "rtf_p99": 0.4147,
-      "queue_p50": 5.32,
-      "queue_p95": 21.67
-    },
-    {
-      "key": "vosk-ru",
-      "jobs": 54,
-      "audio_hours": 0.505,
-      "processing_p50": 10.22,
-      "processing_p95": 30.38,
-      "processing_p99": 120.16,
-      "rtf_p50": 0.3455,
-      "rtf_p95": 0.5714,
-      "rtf_p99": 4.022,
-      "queue_p50": 3.9,
-      "queue_p95": 21.04
+      "key": "gigaam-v3-rnnt",
+      "jobs": 49,
+      "audio_hours": 10.749,
+      "processing_p50": 48.0,
+      "processing_p95": 494.87,
+      "processing_p99": 717.97,
+      "rtf_p50": 0.1392,
+      "rtf_p95": 0.1618,
+      "rtf_p99": 0.1852,
+      "queue_p50": 14.22,
+      "queue_p95": 74.66
     },
     {
       "key": "gigaam-v3-e2e-rnnt",
-      "jobs": 52,
-      "audio_hours": 0.53,
-      "processing_p50": 1.53,
-      "processing_p95": 5.4,
-      "processing_p99": 6.3,
+      "jobs": 42,
+      "audio_hours": 13.404,
+      "processing_p50": 34.53,
+      "processing_p95": 537.12,
+      "processing_p99": 642.99,
+      "rtf_p50": 0.1153,
+      "rtf_p95": 0.1631,
+      "rtf_p99": 0.1874,
+      "queue_p50": 14.29,
+      "queue_p95": 76.01
+    },
+    {
+      "key": "gigaam-v3-ctc",
+      "jobs": 41,
+      "audio_hours": 14.386,
+      "processing_p50": 31.92,
+      "processing_p95": 270.18,
+      "processing_p99": 299.65,
+      "rtf_p50": 0.0554,
+      "rtf_p95": 0.0798,
+      "rtf_p99": 0.0944,
+      "queue_p50": 18.56,
+      "queue_p95": 51.32
+    },
+    {
+      "key": "tone-ru",
+      "jobs": 39,
+      "audio_hours": 14.53,
+      "processing_p50": 191.72,
+      "processing_p95": 2089.7,
 …
 ```
 
@@ -1458,7 +1465,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 113.8,
+  "uptime_s": 989.7,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1502,7 +1509,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 6
+    "INFO": 2
   }
 }
 ```
@@ -1537,7 +1544,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 113.9,
+  "uptime_s": 989.8,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -2070,92 +2077,32 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "period": "week",
   "enabled": true,
   "model": "qwen3:14b",
-  "records": 219,
-  "analyzed": 219,
+  "records": 269,
+  "analyzed": 0,
   "errors": 0,
   "stale": 0,
-  "coverage": 1.0,
-  "avg_latency_ms": 7398.1,
+  "coverage": 0.0,
+  "avg_latency_ms": null,
   "off_list": 0,
-  "outcomes": [
-    {
-      "key": "вопрос решён",
-      "records": 105,
-      "share": 47.9
-    },
-    {
-      "key": "перезвонят или передано",
-      "records": 63,
-      "share": 28.8
-    },
-    {
-      "key": "отказ клиента",
-      "records": 43,
-      "share": 19.6
-    },
-    {
-      "key": "неясно",
-      "records": 8,
-      "share": 3.7
-    }
-  ],
-  "reasons": [
-    {
-      "key": "статус заказа или доставки",
-      "records": 157,
-      "share": 71.7
-    },
-    {
-      "key": "другое",
-      "records": 59,
-      "share": 26.9
-    },
-    {
-      "key": "возврат или отмена",
-      "records": 3,
-      "share": 1.4
-    }
-  ],
-  "resolved_share": 73.8,
-  "actions": 238,
-  "records_with_actions": 214,
-  "trackers": [
-    {
-      "id": "discount",
-      "label": "Запрос скидки",
-      "checked": 219,
-      "fired": 109
-    },
-    {
-      "id": "competitor",
-      "label": "Упоминание конкурента",
-      "checked": 219,
-      "fired": 60
-    },
-    {
-      "id": "escalation",
-      "label": "Угроза жалобой",
-      "checked": 219,
-      "fired": 46
-    }
-  ],
-  "scorecard": [
-    {
-      "id": "greet",
-      "question": "Сотрудник представился и назвал компанию?",
-      "да": 126,
-      "нет": 93,
-      "н/п": 0
-    },
-    {
-      "id": "term",
-      "question": "Сотрудник назвал конкретный срок или дату?",
-      "да": 0,
-      "нет": 219,
-      "н/п": 0
-    }
-  ],
-…
+  "outcomes": [],
+  "reasons": [],
+  "resolved_share": null,
+  "actions": 0,
+  "records_with_actions": 0,
+  "trackers": [],
+  "scorecard": [],
+  "action_items": [],
+  "worker": {
+    "running": true,
+    "queued": 0,
+    "current": null,
+    "done": 0,
+    "failed": 0,
+    "last_error": null,
+    "auto": false,
+    "backfill": false
+  }
+}
 ```
 
 ### `PUT /api/content/marks/{job_id}`
@@ -2595,10 +2542,10 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/status
   },
   "version": 1,
   "coverage": {
-    "total": 1,
-    "analyzed": 1,
+    "total": 0,
+    "analyzed": 0,
     "errors": 0,
-    "share": 1.0
+    "share": null
   }
 }
 ```
@@ -2611,6 +2558,170 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/status
 
 Короткий вызов мимо кеша: доступен ли сервер, знает ли модель,
 сколько ждать ответа. Для настройки — до включения разбора.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+## Тренды
+
+Как менялось со временем всё, что сервер измеряет: шестьдесят два показателя в девяти группах, ряды на общих корзинах времени, сравнение с прошлым периодом, разложение по часам недели, пары показателей с наибольшей связью и выгрузка таблицей. Разрез по владельцу тот же, что у аналитики; показатели железа — только администратору.
+
+### `GET /api/trends`
+
+Ряды показателей по времени.
+
+Ряды выбранных показателей с общими корзинами времени.
+
+Без `metrics` отдаются все — это и есть «как менялось всё сразу».
+`compare=true` добавляет к каждому ряду такой же ряд предыдущего
+периода: «выросло» без «по сравнению с чем» — не утверждение.
+
+**Доступ:** любой ключ; выборка сужается до его заданий.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `month` | — |
+| `bucket` | в адресе | string | `auto` | — |
+| `metrics` | в адресе | string | — | — |
+| `compare` | в адресе | boolean | `True` | — |
+
+### `GET /api/trends/catalog`
+
+Каталог показателей трендов.
+
+Что вообще можно построить: показатели по группам, шаги, периоды.
+
+**Доступ:** любой действующий ключ.
+
+
+### `GET /api/trends/correlations`
+
+Показатели, которые движутся вместе.
+
+Пары рядов с наибольшей связью — как повод посмотреть, а не как вывод.
+
+Связь не означает причину, и раздел этого не обещает. Пары считаются
+только там, где у обоих рядов есть хотя бы восемь общих непустых
+корзин: совпадение двух точек выглядит как закон природы, а им не
+является.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `month` | — |
+| `bucket` | в адресе | string | `auto` | — |
+| `metrics` | в адресе | string | — | — |
+| `limit` | в адресе | integer | `12` | — |
+
+### `GET /api/trends/export`
+
+Выгрузка трендов в таблицу.
+
+Те же ряды книгой Excel или архивом CSV: строка на корзину времени.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `month` | — |
+| `bucket` | в адресе | string | `auto` | — |
+| `metrics` | в адресе | string | — | — |
+| `fmt` | в адресе | string | `xlsx` | — |
+
+### `GET /api/trends/heatmap`
+
+Показатель по часам недели.
+
+Семь строк на двадцать четыре столбца: когда именно это происходит.
+
+Средние по периоду прячут то, что видно только здесь: очередь растёт
+не «вообще», а в понедельник с девяти до одиннадцати.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `metric` | в адресе | string | обязателен | — |
+| `period` | в адресе | string | `month` | — |
+
+## Телефония
+
+Забор записей разговоров с АТС Asterisk: состояние импорта, проверка связи с источником, заход по требованию и журнал звонков с отбором по направлению, очереди, оператору и номеру. Настройки станции и ручной заход — только администратору.
+
+### `GET /api/telephony/calls`
+
+Журнал импортированных звонков.
+
+Список звонков с отбором: направление, очередь, оператор, номер.
+
+**Доступ:** любой ключ; выборка сужается до его заданий.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+| `direction` | в адресе | string | — | — |
+| `queue` | в адресе | string | — | — |
+| `agent` | в адресе | string | — | — |
+| `search` | в адресе | string | — | — |
+| `only_queued` | в адресе | boolean | `False` | — |
+| `limit` | в адресе | integer | `50` | — |
+| `offset` | в адресе | integer | `0` | — |
+
+### `GET /api/telephony/dimensions`
+
+Очереди и операторы для отбора.
+
+Что вообще встречалось в звонках — чтобы отбор был выбором, а не набором.
+
+**Доступ:** любой ключ; выборка сужается до его заданий.
+
+
+### `POST /api/telephony/scan`
+
+Заход за новыми звонками прямо сейчас.
+
+Один заход по требованию — чтобы не ждать интервала опроса.
+
+Отвечает тем же, чем отчитывается фоновый поток: сколько звонков
+увидели, сколько поставили в очередь и по каким причинам пропустили
+остальные. Причины важнее счётчика: «нет записи ×48» и «короткий ×48» —
+это две разные поломки.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `limit` | в адресе | integer | `50` | — |
+
+### `GET /api/telephony/status`
+
+Состояние забора записей с АТС.
+
+Включено ли, что за источник, сколько импортировано и что мешает.
+
+Обычному ключу отдаются счётчики его звонков и признак «работает»;
+адреса, пути и имя учётной записи — только администратору: по ним
+строится вход в телефонию организации, а не понимание своей работы.
+
+**Доступ:** любой ключ; выборка сужается до его заданий.
+
+
+### `POST /api/telephony/test`
+
+Проверка связи с АТС.
+
+Достучаться до источника и сказать, что именно не так.
+
+«Не работает» — не диагноз. Проверка отвечает по-разному на «порт
+закрыт», «пароль не тот», «файла нет» и «файл есть, но в нём ноль
+строк»: каждое из этих состояний чинится по-своему.
 
 **Доступ:** ключ с ролью **admin**.
 
@@ -2641,75 +2752,19 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/control?period=week
 ```json
 {
   "period": "week",
-  "checks": 30,
-  "previous_checks": 35,
-  "wer_avg": 0.1775,
-  "previous_wer_avg": 0.1277,
-  "growth": 0.39,
-  "wer_p50": 0.1771,
-  "wer_p90": 0.2533,
-  "verdict": "warning",
-  "by_day": [
-    {
-      "ts": 1788480000.0,
-      "checks": 5,
-      "wer_avg": 0.1223
-    },
-    {
-      "ts": 1788566400.0,
-      "checks": 5,
-      "wer_avg": 0.1055
-    },
-    {
-      "ts": 1788652800.0,
-      "checks": 5,
-      "wer_avg": 0.1712
-    },
-    {
-      "ts": 1788739200.0,
-      "checks": 5,
-      "wer_avg": 0.208
-    },
-    {
-      "ts": 1788825600.0,
-      "checks": 5,
-      "wer_avg": 0.2221
-    },
-    {
-      "ts": 1788912000.0,
-      "checks": 5,
-      "wer_avg": 0.2363
-    }
-  ],
-  "by_pair": [
-    {
-      "model": "gigaam-v3-e2e-rnnt",
-      "control_model": "whisper-large-v3",
-      "checks": 30,
-      "wer_avg": 0.1775,
-      "mer_avg": 0.1651
-    }
-  ],
-  "worst": [
-    {
-      "job_id": "job001406",
-      "check_job_id": "ctrl-1-3",
-      "filename": "1406.wav",
-      "model": "gigaam-v3-e2e-rnnt",
-      "control_model": "whisper-large-v3",
-      "wer": 0.2885,
-      "snr_db": 26.5,
-      "confidence": 0.8576
-    },
-    {
-      "job_id": "job000833",
-      "check_job_id": "ctrl-2-0",
-      "filename": "833.wav",
-      "model": "gigaam-v3-e2e-rnnt",
-      "control_model": "whisper-large-v3",
-      "wer": 0.2558,
-      "snr_db": 21.9,
-…
+  "checks": 0,
+  "previous_checks": 0,
+  "wer_avg": null,
+  "previous_wer_avg": null,
+  "growth": null,
+  "wer_p50": null,
+  "wer_p90": null,
+  "verdict": "unknown",
+  "by_day": [],
+  "by_pair": [],
+  "worst": [],
+  "note": "Расхождение — WER расшифровки контрольной модели относительно исходной; какая из двух права, без эталона неизвестно. Смотрите ход: рост среднего на четверть к прошлому периоду — предупреждение, на половину — критично."
+}
 ```
 
 ### `POST /api/control/run`
@@ -2747,54 +2802,21 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/review?status=pendi
 
 ```json
 {
-  "items": [
-    {
-      "job_id": "job000698",
-      "reason": "low_confidence",
-      "status": "pending",
-      "picked_at": 1789004167.760042,
-      "done_at": null,
-      "reviewer": null,
-      "note": null,
-      "filename": "698.wav",
-      "model": "whisper-large-v3",
-      "owner": "anna",
-      "source": "api",
-      "media_duration_s": 31.22,
-      "avg_confidence": 0.6469,
-      "snr_db": 7.3,
-      "wer": null,
-      "ref_words": null,
-      "created_at": 1788923822.5004246
-    },
-    {
-      "job_id": "job000010",
-      "reason": "low_confidence",
-      "status": "pending",
-      "picked_at": 1789004167.760042,
-      "done_at": null,
-      "reviewer": null,
-      "note": null,
-      "filename": "10.wav",
-      "model": "vosk-ru",
-      "owner": "vera",
-      "source": "phone",
-      "media_duration_s": 26.14,
-      "avg_confidence": 0.6545,
-      "snr_db": 1.4,
-      "wer": null,
-      "ref_words": null,
-      "created_at": 1788783853.331917
-    },
-    {
-      "job_id": "job001656",
-      "reason": "low_confidence",
-      "status": "pending",
-      "picked_at": 1789004167.760042,
-      "done_at": null,
-      "reviewer": null,
-      "note": null,
-…
+  "items": [],
+  "counts": {
+    "pending": 0,
+    "done": 0,
+    "skipped": 0
+  },
+  "enabled": true,
+  "last_sampled_at": null,
+  "reasons": {
+    "random": "случайная выборка",
+    "low_confidence": "нижняя четверть по уверенности",
+    "manual": "добавлена вручную",
+    "bad_audio": "плохой звук"
+  }
+}
 ```
 
 Строка закрывается сама, когда по записи задан эталон (`POST /api/jobs/{id}/reference`).

@@ -58,9 +58,13 @@ python3 docs/assemble.py
 echo "5/8 Шаблон оформления Word"
 python3 docs/make_reference.py "${BUILD}/reference.docx"
 
+# tex_math_dollars отключён намеренно: формул в документации нет, зато
+# полно шаблонов вида ${UNIQUEID} и ${HOME}. Pandoc принимал два доллара
+# в одной строке за формулу и съедал всё между ними — вместе с половиной
+# строки таблицы.
 echo "6/8 Word"
 pandoc "${BUILD}/asr-hub-полная-документация.md" \
-  --from=markdown+pipe_tables+backtick_code_blocks+auto_identifiers \
+  --from=markdown+pipe_tables+backtick_code_blocks+auto_identifiers-tex_math_dollars \
   --metadata-file="${BUILD}/metadata.yaml" \
   --reference-doc="${BUILD}/reference.docx" \
   --toc --toc-depth=3 \

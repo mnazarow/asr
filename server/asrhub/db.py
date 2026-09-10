@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -593,6 +593,46 @@ _SCHEMA = [
         notes        TEXT
     )
     """,
+
+    # --- версия 19: звонки с АТС ------------------------------------------
+    #
+    # Запись разговора приезжает с Asterisk сама, и одну и ту же её нельзя
+    # завести дважды: `uniqueid` — первичный ключ, поэтому повторный проход
+    # по журналу ничего не добавит, даже если позиция чтения потерялась.
+    #
+    # Таблица хранит и пропущенные звонки (`skipped` непустой): без этого
+    # импортёр на каждом заходе заново искал бы файл записи для разговора,
+    # которого никто не писал, и заново решал бы, что он короткий.
+    """
+    CREATE TABLE IF NOT EXISTS calls (
+        uniqueid     TEXT PRIMARY KEY,
+        job_id       TEXT,
+        src          TEXT DEFAULT '',
+        dst          TEXT DEFAULT '',
+        clid         TEXT DEFAULT '',
+        channel      TEXT DEFAULT '',
+        dstchannel   TEXT DEFAULT '',
+        context      TEXT DEFAULT '',
+        disposition  TEXT DEFAULT '',
+        direction    TEXT DEFAULT '',
+        queue        TEXT DEFAULT '',
+        agent        TEXT DEFAULT '',
+        duration     INTEGER DEFAULT 0,
+        billsec      INTEGER DEFAULT 0,
+        answered     INTEGER DEFAULT 0,
+        started_at   REAL DEFAULT 0,
+        recording    TEXT DEFAULT '',
+        userfield    TEXT DEFAULT '',
+        accountcode  TEXT DEFAULT '',
+        owner        TEXT DEFAULT '',
+        skipped      TEXT DEFAULT '',
+        imported_at  REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_agent ON calls(agent, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_queue ON calls(queue, started_at DESC)",
 ]
 
 
@@ -917,6 +957,30 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "status": "TEXT DEFAULT 'running'",
         "results": "TEXT",
         "notes": "TEXT",
+    },
+    "calls": {
+        "uniqueid": "TEXT",
+        "job_id": "TEXT",
+        "src": "TEXT DEFAULT ''",
+        "dst": "TEXT DEFAULT ''",
+        "clid": "TEXT DEFAULT ''",
+        "channel": "TEXT DEFAULT ''",
+        "dstchannel": "TEXT DEFAULT ''",
+        "context": "TEXT DEFAULT ''",
+        "disposition": "TEXT DEFAULT ''",
+        "direction": "TEXT DEFAULT ''",
+        "queue": "TEXT DEFAULT ''",
+        "agent": "TEXT DEFAULT ''",
+        "duration": "INTEGER DEFAULT 0",
+        "billsec": "INTEGER DEFAULT 0",
+        "answered": "INTEGER DEFAULT 0",
+        "started_at": "REAL DEFAULT 0",
+        "recording": "TEXT DEFAULT ''",
+        "userfield": "TEXT DEFAULT ''",
+        "accountcode": "TEXT DEFAULT ''",
+        "owner": "TEXT DEFAULT ''",
+        "skipped": "TEXT DEFAULT ''",
+        "imported_at": "REAL",
     },
 }
 
@@ -2966,12 +3030,206 @@ class Database:
         except (TypeError, ValueError):
             return default
 
+    # --- звонки с АТС ----------------------------------------------------
+    #
+    # Разговор с телефонной станции — это задание распознавания плюс
+    # десяток полей, которых у обычного задания нет: кто кому звонил, через
+    # какую очередь, ответили ли. Держать их в `params` задания было
+    # заманчиво, но по JSON внутри колонки не построишь ни отбора «входящие
+    # за вторник», ни разреза по очереди — а ради них всё и затевалось.
+
+    #: Поля звонка, которые пишутся в таблицу. Перечень явный: словарь
+    #: приходит из разбора журнала АТС, и лишний ключ в нём (у разных сборок
+    #: Asterisk свой набор) не должен ломать вставку.
+    ПОЛЯ_ЗВОНКА = (
+        "src", "dst", "clid", "channel", "dstchannel", "context",
+        "disposition", "direction", "queue", "agent", "duration", "billsec",
+        "answered", "started_at", "recording", "userfield", "accountcode",
+    )
+
+    def save_call(self, uniqueid: str, *, job_id: str | None = None,
+                  owner: str | None = None, skipped: str = "",
+                  **поля: Any) -> None:
+        """Запоминает звонок. Повторный вызов обновляет запись, не задваивая.
+
+        `INSERT OR REPLACE` здесь неуместен: он стирает поля, которых нет в
+        текущем вызове, и звонок, сохранённый импортёром со всеми полями, а
+        потом дописанный одной пометкой, терял бы номера. Поэтому вставка с
+        `ON CONFLICT DO UPDATE` и явным списком того, что обновляется.
+
+        Пустое — не то же самое, что «не передали». `job_id` и `owner`
+        пустыми не затираются: пометка «нет записи», поставленная вторым
+        вызовом, иначе отвязывала бы звонок от распознавания и от отдела, а
+        разрез по владельцу — единственное, что отделяет чужие разговоры от
+        своих в отчётах.
+        """
+        if not uniqueid:
+            raise StorageError("Звонок без идентификатора не сохраняется.")
+        данные: dict[str, Any] = {"uniqueid": str(uniqueid),
+                                  "job_id": job_id or None,
+                                  "owner": str(owner) if owner else None,
+                                  "skipped": str(skipped or ""),
+                                  "imported_at": now()}
+        for имя in self.ПОЛЯ_ЗВОНКА:
+            if имя not in поля:
+                continue
+            значение = поля[имя]
+            if имя == "answered":
+                значение = 1 if значение else 0
+            elif имя in ("duration", "billsec"):
+                значение = int(значение or 0)
+            elif имя == "started_at":
+                значение = float(значение or 0.0)
+            else:
+                значение = str(значение or "")
+            данные[имя] = значение
+        колонки = list(данные)
+        места = ",".join("?" for _ in колонки)
+        УДЕРЖИВАТЬ = ("job_id", "owner")
+        обновить = ",".join(
+            f"{к}=excluded.{к}" for к in колонки
+            if к != "uniqueid" and к not in УДЕРЖИВАТЬ)
+        обновить += "".join(f",{к}=COALESCE(excluded.{к}, calls.{к})"
+                            for к in УДЕРЖИВАТЬ)
+        self.execute(
+            f"INSERT INTO calls ({','.join(колонки)}) VALUES ({места}) "
+            f"ON CONFLICT(uniqueid) DO UPDATE SET {обновить}",
+            [данные[к] for к in колонки])
+
+    def call_exists(self, uniqueid: str) -> bool:
+        """Был ли звонок уже разобран — главный предохранитель импортёра."""
+        if not uniqueid:
+            return False
+        return self.query_one("SELECT 1 FROM calls WHERE uniqueid=?",
+                              (str(uniqueid),)) is not None
+
+    def known_call_ids(self, limit: int = 100000) -> set[str]:
+        """Множество известных идентификаторов — для обхода папки записей.
+
+        Спрашивать базу по файлу на каждом заходе — это тысячи запросов на
+        каталог в десять тысяч записей. Одно множество дешевле и по времени,
+        и по блокировкам.
+        """
+        rows = self.query(
+            "SELECT uniqueid FROM calls ORDER BY imported_at DESC LIMIT ?",
+            (max(1, int(limit)),))
+        return {str(r["uniqueid"]) for r in rows}
+
+    def call_counts(self, *, owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Сводка по звонкам: всего, поставлено, пропущено и почему."""
+        условие, args = self._owner_clause(owner, "c")
+        где = f" WHERE {условие}" if условие else ""
+        строка = self.query_one(
+            "SELECT COUNT(*) AS total,"
+            "       SUM(CASE WHEN job_id IS NOT NULL THEN 1 ELSE 0 END) AS queued,"
+            "       SUM(CASE WHEN COALESCE(skipped,'')<>'' THEN 1 ELSE 0 END) AS skipped,"
+            "       SUM(CASE WHEN direction='входящий' THEN 1 ELSE 0 END) AS inbound,"
+            "       SUM(CASE WHEN direction='исходящий' THEN 1 ELSE 0 END) AS outbound,"
+            "       SUM(COALESCE(billsec,0)) AS talk_s,"
+            "       MAX(started_at) AS last_call,"
+            "       MAX(imported_at) AS last_import "
+            f"FROM calls c{где}", args)
+        свод = {к: (строка[к] if строка and строка[к] is not None else 0)
+                for к in ("total", "queued", "skipped", "inbound", "outbound",
+                          "talk_s", "last_call", "last_import")}
+        причины = self.query(
+            "SELECT skipped AS reason, COUNT(*) AS n FROM calls c "
+            f"WHERE COALESCE(skipped,'')<>''{(' AND ' + условие) if условие else ''} "
+            "GROUP BY skipped ORDER BY n DESC LIMIT 20", args)
+        свод["reasons"] = {str(r["reason"]): int(r["n"]) for r in причины}
+        return свод
+
+    def list_calls(self, *, owner: str | list[str] | None = None,
+                   direction: str = "", queue: str = "", agent: str = "",
+                   since: float | None = None, until: float | None = None,
+                   only_queued: bool = False, search: str = "",
+                   limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        """Журнал звонков с отбором — то, что показывает раздел «Телефония»."""
+        where: list[str] = []
+        args: list[Any] = []
+        условие, свои = self._owner_clause(owner, "c")
+        if условие:
+            where.append(условие)
+            args += свои
+        if direction:
+            where.append("c.direction=?")
+            args.append(direction)
+        if queue:
+            where.append("c.queue=?")
+            args.append(queue)
+        if agent:
+            where.append("c.agent=?")
+            args.append(agent)
+        if since is not None:
+            where.append("c.started_at>=?")
+            args.append(float(since))
+        if until is not None:
+            where.append("c.started_at<?")
+            args.append(float(until))
+        if only_queued:
+            where.append("c.job_id IS NOT NULL")
+        if search:
+            образец = f"%{_экранировать_like(search)}%"
+            where.append("(c.src LIKE ? ESCAPE '\\' OR c.dst LIKE ? ESCAPE '\\' "
+                         "OR c.clid LIKE ? ESCAPE '\\' OR c.uniqueid LIKE ? ESCAPE '\\')")
+            args += [образец] * 4
+        где = f" WHERE {' AND '.join(where)}" if where else ""
+        всего = self.query_one(f"SELECT COUNT(*) AS n FROM calls c{где}", args)
+        предел = max(1, min(int(limit), 500))
+        rows = self.query(
+            "SELECT c.*, j.status AS job_status, j.text AS job_text,"
+            "       j.media_duration_s AS job_duration "
+            f"FROM calls c LEFT JOIN jobs j ON j.id=c.job_id{где} "
+            "ORDER BY c.started_at DESC, c.imported_at DESC LIMIT ? OFFSET ?",
+            [*args, предел, max(0, int(offset))])
+        звонки = []
+        for r in rows:
+            звонок = dict(r)
+            звонок["answered"] = bool(звонок.get("answered"))
+            текст = звонок.pop("job_text", None) or ""
+            звонок["preview"] = текст[:200]
+            звонки.append(звонок)
+        return {"total": int(всего["n"]) if всего else 0, "calls": звонки,
+                "limit": предел, "offset": max(0, int(offset))}
+
+    def call_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Карточка задания спрашивает: а это вообще звонок и чей?"""
+        строка = self.query_one("SELECT * FROM calls WHERE job_id=?", (str(job_id),))
+        if строка is None:
+            return None
+        звонок = dict(строка)
+        звонок["answered"] = bool(звонок.get("answered"))
+        return звонок
+
+    def call_dimensions(self, *, owner: str | list[str] | None = None) -> dict[str, list[str]]:
+        """Очереди и операторы, которые вообще встречались, — для отбора."""
+        условие, args = self._owner_clause(owner, "c")
+        где = f" WHERE {условие}" if условие else ""
+        def значения(поле: str) -> list[str]:
+            rows = self.query(
+                f"SELECT {поле} AS v, COUNT(*) AS n FROM calls c{где} "
+                f"{'AND' if где else 'WHERE'} COALESCE({поле},'')<>'' "
+                f"GROUP BY {поле} ORDER BY n DESC LIMIT 200", args)
+            return [str(r["v"]) for r in rows]
+        return {"queues": значения("c.queue"), "agents": значения("c.agent"),
+                "directions": значения("c.direction")}
+
+    def forget_calls(self, *, before: float) -> int:
+        """Убирает старые записи журнала звонков вместе с их заданиями.
+
+        Сама запись занимает сотни байт, но за год их набегает миллион, и
+        обход папки записей начинает читать это множество целиком. Срок
+        хранения тот же, что у заданий: звонок без задания бесполезен.
+        """
+        return self.execute("DELETE FROM calls WHERE imported_at < ?",
+                            (float(before),))
+
     # --- обслуживание ---------------------------------------------------
 
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
                 events_days: int = 90) -> dict[str, int]:
         removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0,
-                   "gpu_samples": 0, "llm_cache": 0, "bytes": 0}
+                   "gpu_samples": 0, "llm_cache": 0, "calls": 0, "bytes": 0}
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
@@ -3026,6 +3284,14 @@ class Database:
             removed["llm_cache"] = self.execute(
                 "DELETE FROM llm_cache WHERE created_at<?",
                 (ts - results_days * 86400,))
+        # Журнал звонков — по тому же сроку и по той же причине. Запись
+        # звонка занимает сотни байт, но это номер клиента и номер
+        # оператора: пережить удаление самого разговора они не должны. К
+        # тому же за год их набегает миллион, и обход каталога записей
+        # начинает читать это множество целиком.
+        if results_days > 0:
+            removed["calls"] = self.forget_calls(
+                before=ts - results_days * 86400)
         return removed
 
     def vacuum(self) -> None:

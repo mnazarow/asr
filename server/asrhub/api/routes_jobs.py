@@ -459,6 +459,13 @@ def get_job(request: Request, job_id: str,
     else:
         job.pop("waveform", None)
     job["events"] = state.db.get_events(job_id, limit=100)
+    # Если задание приехало с телефонной станции — поля звонка. Без них
+    # карточка показывает «1757500001.1.wav» и больше ничего: ни кто
+    # звонил, ни куда попал, ни сколько ждал.
+    if str(job.get("source") or "") == "asterisk":
+        звонок = state.db.call_for_job(job_id)
+        if звонок:
+            job["call"] = звонок
     return job
 
 

@@ -89,9 +89,13 @@ for variant in "${VARIANTS[@]}"; do
   echo "  шаблон оформления Word"
   python3 docs/make_reference.py "${BUILD}/reference-${slug}.docx" "$(footer_of "${variant}")"
 
+  # tex_math_dollars отключён намеренно: формул в документации нет, зато
+  # полно шаблонов вида ${UNIQUEID} и ${HOME}. Pandoc принимал два доллара
+  # в одной строке за формулу и съедал всё между ними — вместе с половиной
+  # строки таблицы.
   echo "  Word"
   pandoc "${BUILD}/${slug}.md" \
-    --from=markdown+pipe_tables+backtick_code_blocks+auto_identifiers \
+    --from=markdown+pipe_tables+backtick_code_blocks+auto_identifiers-tex_math_dollars \
     --metadata-file="${BUILD}/metadata-${slug}.yaml" \
     --reference-doc="${BUILD}/reference-${slug}.docx" \
     --toc --toc-depth=4 \

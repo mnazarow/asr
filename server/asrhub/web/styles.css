@@ -738,6 +738,13 @@ td.pick input, th.pick input { width: auto; margin: 0; cursor: pointer; }
                       overflow: hidden; text-overflow: ellipsis; }
 .analysis-line .what { font-size: 13px; }
 
+/* Список связей в трендах: колонок две, а не три — говорящего у показателя
+   нет. Без этого правила пара показателей попадала в среднюю колонку
+   шириной 96 пикселей и рвалась на три строки посреди слова. */
+.analysis-lines.pairs .analysis-line { grid-template-columns: 62px 1fr; }
+.analysis-lines.pairs .what a { display: block; }
+.analysis-lines.pairs .what .faint { display: block; }
+
 /* Облако ключевых слов записи. */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 

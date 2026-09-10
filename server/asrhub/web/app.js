@@ -604,7 +604,9 @@ const VIEWS = {
   queue:      { title: 'Очередь', subtitle: 'Управление заданиями, приоритетами и воркерами' },
   results:    { title: 'Результаты', subtitle: 'Выполненные задания и выгрузка' },
   analytics:  { title: 'Аналитика', subtitle: 'Показатели производительности и качества' },
+  trends:     { title: 'Тренды', subtitle: 'Как менялось со временем всё, что сервер измеряет: объём, скорость, качество, звук, содержание, железо' },
   content:    { title: 'Аналитика записей', subtitle: 'О чём и как говорили: тональность, речь, темы, обязательства, скрипт' },
+  telephony:  { title: 'Телефония', subtitle: 'Разговоры с АТС Asterisk: забор записей, журнал звонков, направления, очереди и операторы' },
   models:     { title: 'Модели', subtitle: 'Каталог моделей, лицензии, требования, загрузка весов' },
   compare:    { title: 'Сравнение моделей', subtitle: 'Качество, скорость и лицензии рядом' },
   settings:   { title: 'Настройки', subtitle: 'Все параметры с описаниями, рекомендациями и примерами' },
@@ -825,8 +827,8 @@ document.addEventListener('DOMContentLoaded', () => {
 // Горячие клавиши
 // --------------------------------------------------------------------------
 
-const HOTKEY_VIEWS = ['transcribe', 'dictation', 'queue', 'results', 'analytics', 'models',
-                      'compare', 'settings', 'system', 'monitoring', 'logs'];
+const HOTKEY_VIEWS = ['transcribe', 'dictation', 'queue', 'results', 'analytics', 'trends',
+                      'telephony', 'models', 'compare', 'settings', 'system', 'monitoring'];
 
 const HOTKEY_HELP = [
   ['1 … 0', 'переход к разделу по номеру (в порядке меню; на «Журнал» цифры не хватило)'],
@@ -2813,6 +2815,23 @@ function showJobModal(job, opts) {
         ${job.loudness_lufs !== null && job.loudness_lufs !== undefined ? ` · громкость ${num(job.loudness_lufs, 0)} LUFS` : ''}
         ${job.silence_share !== null && job.silence_share !== undefined ? ` · тишины ${pct(job.silence_share, 0)}` : ''}</div>` : ''}
 
+      ${job.call ? `<div class="card tight" style="margin-bottom:12px">
+        <b class="small">Звонок с АТС</b>
+        <div class="small dim" style="margin-top:4px">
+          ${esc(job.call.direction || 'направление неизвестно')} ·
+          ${esc(job.call.src || '—')} → ${esc(job.call.dst || '—')}
+          ${job.call.clid ? ` · ${esc(job.call.clid)}` : ''}
+          ${job.call.queue ? ` · очередь ${esc(job.call.queue)}` : ''}
+          ${job.call.agent ? ` · оператор ${esc(job.call.agent)}` : ''}
+        </div>
+        <div class="small dim" style="margin-top:2px">
+          начало ${esc(fmtTime(job.call.started_at))} · разговор ${fmtDur(job.call.billsec || 0)}
+          из ${fmtDur(job.call.duration || 0)} ·
+          ${job.call.answered ? 'ответили' : esc((job.call.disposition || '').toLowerCase() || 'без ответа')}
+          · идентификатор <span class="mono">${esc(job.call.uniqueid || '')}</span>
+        </div>
+      </div>` : ''}
+
       ${job.error_message ? `<div class="card tight" style="border-color:var(--err)">
         <b style="color:var(--err)">${esc(job.error_code || 'ошибка')}</b>
         <div style="margin-top:4px">${esc(job.error_message)}</div>
@@ -4572,6 +4591,692 @@ function delta(сейчас, раньше, признак) {
   const знак = d > 0 ? '+' : '−';
   return `<div class="kpi-trend ${dir}">${знак}${num(Math.abs(d), знаков)} к прошлому периоду</div>`;
 }
+
+// ==========================================================================
+// Вид: Тренды
+// ==========================================================================
+
+/* Тренды: все измеримые величины сервера на одной оси времени.
+ *
+ * Остальные разделы отвечают «как дела сейчас» и сравнивают период с
+ * предыдущим одним числом. Здесь отвечают на вопрос «когда это началось»:
+ * полсотни рядов с общими корзинами, сравнение с прошлым периодом,
+ * разложение по часам недели и связи между рядами.
+ *
+ * Один запрос на всё: ряды для мелких графиков, свод для таблицы и данные
+ * главного графика приходят вместе — иначе полсотни показателей означали бы
+ * полсотни запросов.
+ */
+RENDERERS.trends = {
+  async render(root) {
+    if (!state.trendsPeriod) state.trendsPeriod = 'month';
+    if (!state.trendsBucket) state.trendsBucket = 'auto';
+    if (!state.trendsSelected) state.trendsSelected = ['jobs', 'rtf', 'confidence'];
+    if (!state.trendsSmooth) state.trendsSmooth = '0';
+    if (!state.trendsNorm) state.trendsNorm = 'auto';
+    if (state.trendsCompare === undefined) state.trendsCompare = true;
+    if (!state.trendsGroup) state.trendsGroup = '';
+
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <select id="tr-period" style="width:150px">
+          <option value="day">Сутки</option>
+          <option value="week">Неделя</option>
+          <option value="month">Месяц</option>
+          <option value="quarter">Квартал</option>
+          <option value="year">Год</option>
+        </select>
+        <select id="tr-bucket" style="width:140px">
+          <option value="auto">Шаг: авто</option>
+          <option value="hour">Шаг: час</option>
+          <option value="day">Шаг: сутки</option>
+          <option value="week">Шаг: неделя</option>
+          <option value="month">Шаг: месяц</option>
+        </select>
+        <select id="tr-norm" style="width:190px">
+          <option value="auto">Шкала: по единицам</option>
+          <option value="index">Шкала: индекс (среднее = 100)</option>
+          <option value="z">Шкала: отклонения</option>
+        </select>
+        <select id="tr-smooth" style="width:170px">
+          <option value="0">Без сглаживания</option>
+          <option value="3">Сглаживание по 3</option>
+          <option value="7">Сглаживание по 7</option>
+        </select>
+        <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" id="tr-compare"
+          ${state.trendsCompare ? 'checked' : ''} style="width:auto">сравнить с прошлым периодом</label>
+        <span class="spacer"></span>
+        <input type="search" id="tr-search" placeholder="поиск показателя" value="${esc(state.trendsSearch || '')}"
+          style="width:200px">
+        <button id="tr-xlsx" class="ghost sm">В Excel</button>
+        <button id="tr-csv" class="ghost sm">В CSV</button>
+      </div>
+      <div id="trends-body"><div class="empty">Считаем ряды…</div></div>`;
+
+    qs('#tr-period').value = state.trendsPeriod;
+    qs('#tr-bucket').value = state.trendsBucket;
+    qs('#tr-norm').value = state.trendsNorm;
+    qs('#tr-smooth').value = state.trendsSmooth;
+    qs('#tr-period').onchange = (e) => { state.trendsPeriod = e.target.value; this.load(); };
+    qs('#tr-bucket').onchange = (e) => { state.trendsBucket = e.target.value; this.load(); };
+    qs('#tr-norm').onchange = (e) => { state.trendsNorm = e.target.value; this.draw(); };
+    qs('#tr-smooth').onchange = (e) => { state.trendsSmooth = e.target.value; this.draw(); };
+    qs('#tr-compare').onchange = (e) => { state.trendsCompare = e.target.checked; this.load(); };
+    let таймер;
+    qs('#tr-search').addEventListener('input', (e) => {
+      clearTimeout(таймер);
+      state.trendsSearch = e.target.value;
+      таймер = setTimeout(() => this.draw(), 250);
+    });
+    const выгрузить = (fmt) => {
+      const params = new URLSearchParams({ period: state.trendsPeriod, bucket: state.trendsBucket, fmt });
+      if (state.trendsSelected.length) params.set('metrics', state.trendsSelected.join(','));
+      downloadReport(`/api/trends/export?${params}`, fmt, `asrhub-тренды-${state.trendsPeriod}`);
+    };
+    qs('#tr-xlsx').onclick = () => выгрузить('xlsx');
+    qs('#tr-csv').onclick = () => выгрузить('csv');
+    await this.load();
+  },
+
+  async load() {
+    const host = qs('#trends-body');
+    if (!host) return;
+    const params = new URLSearchParams({
+      period: state.trendsPeriod, bucket: state.trendsBucket,
+      compare: state.trendsCompare ? 'true' : 'false' });
+    try {
+      state.trendsData = await API.latest('trends', `/api/trends?${params}`);
+    } catch (err) {
+      if (err && err.silent) return;
+      if (host.isConnected) {
+        host.innerHTML = `<div class="card"><div class="empty">Ряды не получены: ${
+          esc((err && err.message) || 'ошибка запроса')}</div></div>`;
+      }
+      return;
+    }
+    if (!host.isConnected) return;
+    this.draw();
+    this.loadHeatmap();
+    this.loadCorrelations();
+  },
+
+  /* Сглаживание и приведение к общей шкале — в интерфейсе, а не на сервере:
+   * это способ смотреть, а не то, что измерено. Сервер отдаёт числа как
+   * есть, и выгрузка совпадает с тем, что посчитано. */
+  prepare(values) {
+    let ряд = (values || []).slice();
+    const окно = parseInt(state.trendsSmooth, 10) || 0;
+    if (окно > 1) {
+      const сглажено = ряд.map((_, i) => {
+        const кусок = ряд.slice(Math.max(0, i - окно + 1), i + 1).filter((v) => v !== null);
+        return кусок.length ? кусок.reduce((a, b) => a + b, 0) / кусок.length : null;
+      });
+      ряд = сглажено;
+    }
+    return ряд;
+  },
+
+  normalize(ряд, режим) {
+    const есть = ряд.filter((v) => v !== null);
+    if (!есть.length) return ряд;
+    if (режим === 'index') {
+      // Опора — среднее по периоду, а не первая точка. Первая точка была
+      // именно тем, что ломало график: корзина с одним заданием давала
+      // базу «1», и ряд заданий улетал к шести тысячам, прижимая RTF и
+      // уверенность к нулю — то есть ровно к той картинке, ради ухода от
+      // которой шкалу и переводят в индекс.
+      const среднее = есть.reduce((a, b) => a + b, 0) / есть.length;
+      const опора = Math.abs(среднее) > 1e-9 ? среднее : 1;
+      return ряд.map((v) => (v === null ? null : (v / опора) * 100));
+    }
+    if (режим === 'z') {
+      const среднее = есть.reduce((a, b) => a + b, 0) / есть.length;
+      const дисп = есть.reduce((a, b) => a + (b - среднее) ** 2, 0) / есть.length;
+      const сигма = Math.sqrt(дисп) || 1;
+      return ряд.map((v) => (v === null ? null : (v - среднее) / сигма));
+    }
+    return ряд;
+  },
+
+  draw() {
+    const host = qs('#trends-body');
+    const д = state.trendsData;
+    if (!host || !д) return;
+    const поиск = (state.trendsSearch || '').toLowerCase();
+    const все = д.summary || [];
+    const выбраны = state.trendsSelected.filter((и) => все.some((с) => с.id === и));
+    const ряды = new Map((д.series || []).map((р) => [р.id, р]));
+    const метки = (д.buckets || []).map((ts) => fmtBucket(ts, д.step_s));
+
+    // Разные единицы на одной оси врут о соотношении величин, поэтому при
+    // смешанном наборе шкала сама переходит в индекс — и об этом сказано.
+    const единицы = new Set(выбраны.map((и) => (ряды.get(и) || {}).unit || ''));
+    const режим = state.trendsNorm === 'auto'
+      ? (единицы.size > 1 ? 'index' : 'none') : state.trendsNorm;
+
+    host.innerHTML = `
+      <section class="card">
+        <div class="card-head"><h3>Выбранные показатели</h3>
+          <span class="hint">${esc(периодПодпись(д))}${режим === 'index' && state.trendsNorm === 'auto'
+            ? ' · единицы разные, поэтому шкала переведена в индекс (среднее за период = 100)' : ''}</span>
+          <span class="spacer"></span>
+          <span class="chip">${num(выбраны.length)} из ${num(все.length)}</span></div>
+        <div id="tr-main"></div>
+        <div id="tr-legend" class="row wrap" style="gap:10px"></div>
+        ${выбраны.length ? '' : '<div class="empty small">Отметьте показатели ниже — они появятся здесь.</div>'}
+      </section>
+
+      <div class="grid cols-2" style="margin-bottom:16px;align-items:start">
+        <section class="card">
+          <div class="card-head"><h3>По часам недели</h3>
+            <span class="hint">когда именно это происходит</span>
+            <span class="spacer"></span>
+            <select id="tr-heat-metric" style="width:220px">
+              ${все.map((с) => `<option value="${esc(с.id)}" ${с.id === (state.trendsHeat || выбраны[0]) ? 'selected' : ''}>${esc(с.label)}</option>`).join('')}
+            </select></div>
+          <div id="tr-heat"><div class="empty small">Считаем…</div></div>
+        </section>
+        <section class="card">
+          <div class="card-head"><h3>Движутся вместе</h3>
+            <span class="hint">связь, а не причина: повод посмотреть глазами</span></div>
+          <div id="tr-corr"><div class="empty small">Считаем…</div></div>
+        </section>
+      </div>
+
+      <div id="tr-groups"></div>
+
+      <section class="card">
+        <div class="card-head"><h3>Все показатели за период</h3>
+          <span class="hint">среднее по корзинам, крайние значения и изменение к прошлому периоду</span></div>
+        <div class="table-wrap full"><table><thead><tr>
+          <th></th><th>Показатель</th><th>Группа</th><th class="num">Среднее</th>
+          <th class="num">Минимум</th><th class="num">Максимум</th><th class="num">Последнее</th>
+          <th class="num">Изменение</th><th>Куда идёт</th></tr></thead><tbody id="tr-table"></tbody></table></div>
+      </section>`;
+
+    // Главный график.
+    const место = qs('#tr-main', host);
+    const серии = выбраны.map((и) => {
+      const р = ряды.get(и) || {};
+      return { name: р.label || и,
+               values: this.normalize(this.prepare(р.values), режим) };
+    });
+    if (серии.length) {
+      // Высота задаётся графику, а не коробке вокруг него: Charts.line
+      // рисует 220 пикселей по умолчанию и не растягивается под контейнер,
+      // поэтому «height:300px» на обёртке давал не большой график, а
+      // прежний график и восемьдесят пикселей пустоты под ним.
+      window.Charts.line(место, { series: серии, labels: метки, tip: true, height: 300 });
+      // Своей легенды здесь нет: Charts.line рисует её сам для двух рядов и
+      // больше. Вторая — та, что стояла тут раньше, — просто дублировала
+      // первую под графиком, и на снимке это выглядело как ошибка вёрстки.
+      // Один ряд легенды не требует: его называет заголовок карточки.
+      const легенда = qs('#tr-legend', host);
+      if (легенда && серии.length === 1) {
+        легенда.innerHTML = `<span class="small dim">${esc(серии[0].name)}</span>`;
+      }
+    } else {
+      window.Charts.empty(место, 'Показатели не выбраны');
+    }
+
+    // Мелкие графики по группам — то, ради чего раздел и заводится: полсотни
+    // рядов рядом, каждый со своим направлением «лучше».
+    const группы = {};
+    все.forEach((с) => {
+      if (поиск && !`${с.label} ${с.id} ${с.group}`.toLowerCase().includes(поиск)) return;
+      (группы[с.group] = группы[с.group] || []).push(с);
+    });
+    const коробка = qs('#tr-groups', host);
+    заполнитьГруппы(коробка, группы, ряды, выбраны, (id) => this.toggle(id), (р) => this.prepare(р));
+    if (!Object.keys(группы).length) {
+      коробка.innerHTML = '<div class="card"><div class="empty">Ничего не нашлось по этому запросу.</div></div>';
+    }
+
+    // Таблица.
+    const тело = qs('#tr-table', host);
+    тело.innerHTML = все.filter((с) => !поиск
+      || `${с.label} ${с.id} ${с.group}`.toLowerCase().includes(поиск)).map((с) => `<tr>
+        <td class="pick"><input type="checkbox" data-metric="${esc(с.id)}"
+          ${выбраны.includes(с.id) ? 'checked' : ''} style="width:auto"></td>
+        <td><b>${esc(с.label)}</b>${с.hint ? `<div class="small faint">${esc(с.hint)}</div>` : ''}</td>
+        <td class="small dim">${esc(с.group)}</td>
+        <td class="num mono">${значение(с, с.avg)}</td>
+        <td class="num mono">${значение(с, с.min)}</td>
+        <td class="num mono">${значение(с, с.max)}</td>
+        <td class="num mono">${значение(с, с.last)}</td>
+        <td class="num mono">${изменение(с)}</td>
+        <td>${вердикт(с)}</td></tr>`).join('');
+    qsa('input[data-metric]', host).forEach((кн) => {
+      кн.onchange = () => this.toggle(кн.dataset.metric);
+    });
+    const выбор = qs('#tr-heat-metric', host);
+    if (выбор) выбор.onchange = () => { state.trendsHeat = выбор.value; this.loadHeatmap(); };
+  },
+
+  toggle(id) {
+    const набор = new Set(state.trendsSelected);
+    if (набор.has(id)) набор.delete(id);
+    else if (набор.size >= 8) { toast('На одном графике больше восьми рядов не читаются', 'warn'); return; }
+    else набор.add(id);
+    state.trendsSelected = [...набор];
+    this.draw();
+  },
+
+  async loadHeatmap() {
+    const host = qs('#tr-heat');
+    if (!host) return;
+    const метрика = state.trendsHeat || state.trendsSelected[0] || 'jobs';
+    let д;
+    try {
+      д = await API.latest('trends-heat',
+        `/api/trends/heatmap?metric=${encodeURIComponent(метрика)}&period=${state.trendsPeriod}`);
+    } catch (err) {
+      if (err && err.silent) return;
+      if (host.isConnected) host.innerHTML = `<div class="empty small">Карта не получена: ${
+        esc((err && err.message) || 'ошибка запроса')}</div>`;
+      return;
+    }
+    if (!host.isConnected) return;
+    const значения = (д.grid || []).map((строка) => строка.map((v) => (v === null ? 0 : v)));
+    window.Charts.grid(host, {
+      rows: д.days || [], cols: Array.from({ length: 24 }, (_, i) => (i % 3 === 0 ? String(i) : '')),
+      values: значения, emptyText: 'За период нет данных' });
+    const подпись = document.createElement('div');
+    подпись.className = 'small faint';
+    подпись.style.marginTop = '6px';
+    подпись.textContent = `${д.label}: от ${fmtNumSafe(д.min)} до ${fmtNumSafe(д.max)}${
+      д.unit ? ` ${д.unit}` : ''}, среднее ${fmtNumSafe(д.avg)}`;
+    host.appendChild(подпись);
+  },
+
+  async loadCorrelations() {
+    const host = qs('#tr-corr');
+    if (!host) return;
+    let д;
+    try {
+      д = await API.latest('trends-corr',
+        `/api/trends/correlations?period=${state.trendsPeriod}&bucket=${state.trendsBucket}&limit=10`);
+    } catch (err) {
+      if (err && err.silent) return;
+      if (host.isConnected) host.innerHTML = `<div class="empty small">Связи не посчитаны: ${
+        esc((err && err.message) || 'ошибка запроса')}</div>`;
+      return;
+    }
+    if (!host.isConnected) return;
+    const пары = д.pairs || [];
+    // Список ограничен по высоте и прокручивается: карточка стоит рядом с
+    // сеткой часов недели, и без предела десять пар растягивали строку
+    // сетки вдвое, оставляя под ней пустое поле в пол-экрана.
+    host.innerHTML = пары.length ? `<div class="analysis-lines pairs"
+        style="max-height:330px;overflow:auto">${пары.map((п) => `
+      <div class="analysis-line">
+        <span class="ts mono" style="white-space:nowrap">${п.r > 0 ? '+' : ''}${num(п.r, 2)}</span>
+        <span class="what">
+          <a href="#" data-pair="${esc(п.a)},${esc(п.b)}"
+             title="Показать оба ряда на графике">${esc(п.a_label)} ↔ ${esc(п.b_label)}</a>
+          <span class="faint small" style="white-space:nowrap">по ${num(п.points)} ${
+            plural(п.points, 'общей точке', 'общим точкам', 'общим точкам')}</span>
+        </span>
+      </div>`).join('')}</div>`
+      : '<div class="empty small">Пар с устойчивой связью не нашлось: нужно хотя бы восемь общих точек.</div>';
+    qsa('a[data-pair]', host).forEach((ссылка) => {
+      ссылка.onclick = (e) => {
+        e.preventDefault();
+        state.trendsSelected = ссылка.dataset.pair.split(',');
+        this.draw();
+      };
+    });
+  },
+};
+
+/* Подписи и мелкая арифметика раздела трендов. */
+function fmtBucket(ts, step) {
+  const d = new Date(ts * 1000);
+  const дата = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+  if (step <= 3600) return `${дата} ${String(d.getHours()).padStart(2, '0')}:00`;
+  return дата;
+}
+
+function fmtNumSafe(value) {
+  return (value === null || value === undefined) ? '—' : num(value, 2);
+}
+
+function периодПодпись(д) {
+  const шаги = { hour: 'по часам', day: 'по суткам', week: 'по неделям', month: 'по месяцам' };
+  return `${(д.buckets || []).length} точек ${шаги[д.bucket] || ''}`;
+}
+
+function значение(с, v) {
+  if (v === null || v === undefined) return '—';
+  return `${num(v, с.digits)}${с.unit ? ` ${esc(с.unit)}` : ''}`;
+}
+
+function изменение(с) {
+  if (с.change_percent === null || с.change_percent === undefined) return '—';
+  const знак = с.change_percent > 0 ? '+' : '';
+  return `${знак}${num(с.change_percent, 1)} %`;
+}
+
+function вердикт(с) {
+  if (!с.verdict) return '';
+  const класс = с.verdict.includes('хуже') ? 'err' : с.verdict.includes('лучше') ? 'ok' : '';
+  return `<span class="chip ${класс}">${esc(с.verdict)}</span>`;
+}
+
+/* Мелкие графики по группам: строка на показатель, спарклайн, последнее
+ * значение и изменение. Клик добавляет ряд на главный график. */
+function заполнитьГруппы(коробка, группы, ряды, выбраны, переключить, готовить) {
+  if (!коробка) return;
+  коробка.innerHTML = '';
+  Object.entries(группы).forEach(([имя, элементы]) => {
+    const section = h(`<section class="card">
+      <div class="card-head"><h3>${esc(имя[0].toUpperCase() + имя.slice(1))}</h3>
+        <span class="spacer"></span><span class="chip">${элементы.length}</span></div>
+      <div class="grid cols-3" data-cells></div></section>`);
+    const сетка = qs('[data-cells]', section);
+    элементы.forEach((с) => {
+      const карточка = h(`<div class="kpi" style="cursor:pointer" title="${esc(с.hint || с.label)}">
+        <div class="row"><span class="kpi-label">${esc(с.label)}</span><span class="spacer"></span>
+          ${выбраны.includes(с.id) ? '<span class="chip ok">на графике</span>' : ''}</div>
+        <div class="row" style="align-items:baseline;gap:8px">
+          <span class="kpi-value">${значение(с, с.last === null ? с.avg : с.last)}</span>
+          <span class="kpi-trend ${с.change_percent > 0 ? 'up' : с.change_percent < 0 ? 'down' : ''}">${изменение(с)}</span>
+        </div>
+        <div data-spark style="height:34px"></div></div>`);
+      const ряд = ряды.get(с.id) || {};
+      window.Charts.spark(qs('[data-spark]', карточка), готовить(ряд.values || []).map((v) => (v === null ? 0 : v)));
+      карточка.onclick = () => переключить(с.id);
+      сетка.appendChild(карточка);
+    });
+    коробка.appendChild(section);
+  });
+}
+
+/* ===========================================================================
+ * Раздел «Телефония»: разговоры с АТС Asterisk
+ * =========================================================================*/
+
+const ТЕЛЕФОНИЯ_ПЕРИОДЫ = { day: 'Сутки', week: 'Неделя', month: 'Месяц',
+                            quarter: 'Квартал', year: 'Год', all: 'Всё время' };
+
+/* Итоги звонка, как их называет Asterisk. Английские слова в русском
+ * журнале — не строгость, а лень: «BUSY» и «занято» читаются по-разному. */
+const ИТОГ_ЗВОНКА = {
+  ANSWERED: 'ответили', 'NO ANSWER': 'не ответили', BUSY: 'занято',
+  FAILED: 'не дозвонились', CONGESTION: 'сеть занята',
+};
+
+RENDERERS.telephony = {
+  async render(root) {
+    if (!state.telPeriod) state.telPeriod = 'week';
+    if (!state.telDirection) state.telDirection = '';
+    if (!state.telQueue) state.telQueue = '';
+    if (!state.telAgent) state.telAgent = '';
+    if (state.telOnlyQueued === undefined) state.telOnlyQueued = false;
+    state.telOffset = 0;
+
+    root.innerHTML = `
+      <div id="tel-status"></div>
+      <div class="settings-toolbar">
+        <div class="group-nav" id="tel-period">
+          ${Object.entries(ТЕЛЕФОНИЯ_ПЕРИОДЫ).map(([k, v]) =>
+            `<button data-period="${k}" class="${state.telPeriod === k ? 'active' : ''}">${v}</button>`
+          ).join('')}
+        </div>
+        <select id="tel-direction" style="width:150px">
+          <option value="">Все направления</option>
+          <option value="входящий">Входящие</option>
+          <option value="исходящий">Исходящие</option>
+          <option value="внутренний">Внутренние</option>
+        </select>
+        <select id="tel-queue" style="width:170px"><option value="">Все очереди</option></select>
+        <select id="tel-agent" style="width:170px"><option value="">Все операторы</option></select>
+        <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" id="tel-queued"
+          ${state.telOnlyQueued ? 'checked' : ''} style="width:auto">только распознанные</label>
+        <span class="spacer"></span>
+        <input type="search" id="tel-search" placeholder="номер или идентификатор"
+          value="${esc(state.telSearch || '')}" style="width:220px">
+      </div>
+      <div id="tel-calls"><div class="empty">Загрузка…</div></div>`;
+
+    qsa('#tel-period button').forEach((b) => b.addEventListener('click', () => {
+      state.telPeriod = b.dataset.period;
+      state.telOffset = 0;
+      qsa('#tel-period button').forEach((x) => x.classList.toggle('active', x === b));
+      this.loadCalls();
+    }));
+    ['tel-direction', 'tel-queue', 'tel-agent'].forEach((ид) => {
+      const поле = qs(`#${ид}`);
+      if (поле) поле.addEventListener('change', () => {
+        state[{ 'tel-direction': 'telDirection', 'tel-queue': 'telQueue',
+                'tel-agent': 'telAgent' }[ид]] = поле.value;
+        state.telOffset = 0;
+        this.loadCalls();
+      });
+    });
+    const только = qs('#tel-queued');
+    if (только) только.addEventListener('change', () => {
+      state.telOnlyQueued = только.checked;
+      state.telOffset = 0;
+      this.loadCalls();
+    });
+    const поиск = qs('#tel-search');
+    let таймер = null;
+    if (поиск) поиск.addEventListener('input', () => {
+      clearTimeout(таймер);
+      таймер = setTimeout(() => {
+        state.telSearch = поиск.value.trim();
+        state.telOffset = 0;
+        this.loadCalls();
+      }, 300);
+    });
+
+    await this.loadStatus();
+    await this.loadDimensions();
+    await this.loadCalls();
+  },
+
+  /* Карточка состояния: включено ли, что за источник, что мешает.
+   * Ошибка источника показывается прямо здесь и первой строкой: молчащий
+   * импорт выглядит точно так же, как «звонков не было». */
+  async loadStatus() {
+    const коробка = qs('#tel-status');
+    if (!коробка) return;
+    let свод;
+    try {
+      свод = await API.get('/api/telephony/status');
+    } catch (err) {
+      коробка.innerHTML = `<div class="empty">Состояние телефонии недоступно: ${esc(err.message || '')}</div>`;
+      return;
+    }
+    state.telStatus = свод;
+    const звонки = свод.calls || {};
+    const админ = (state.me || {}).role === 'admin';
+    const источники = { cdr_csv: 'журнал CDR', ami: 'интерфейс AMI', folder: 'каталог записей' };
+    const работает = свод.enabled && свод.running;
+    const причины = Object.entries(звонки.reasons || {})
+      .map(([п, n]) => `<span class="chip" title="звонков пропущено по этой причине">${esc(п)}: ${n}</span>`)
+      .join(' ');
+    коробка.innerHTML = `
+      <section class="card" style="margin-bottom:14px">
+        <div class="card-head">
+          <h3>Забор записей с АТС</h3>
+          <span class="chip ${работает ? 'ok' : свод.enabled ? 'warn' : ''}">${
+            работает ? 'работает' : свод.enabled ? 'включено, но поток стоит' : 'выключено'}</span>
+          <span class="chip">источник: ${esc(источники[свод.source] || свод.source || '—')}</span>
+          <span class="spacer"></span>
+          ${админ ? `<button class="ghost sm" id="tel-test"
+            title="Достучаться до источника и сказать, что именно не так">Проверить связь</button>
+          <button class="btn sm" id="tel-scan"
+            title="Заход за новыми звонками прямо сейчас, не дожидаясь интервала">Забрать сейчас</button>` : ''}
+          <button class="ghost sm" onclick="go('settings')"
+            title="Все настройки телефонии с описаниями и примерами">Настройки</button>
+        </div>
+        <div class="grid cols-4" style="padding:14px 16px">
+          <div class="kpi"><span class="kpi-label">Всего звонков</span>
+            <span class="kpi-value">${num(звонки.total || 0, 0)}</span>
+            <span class="small dim">за всё время</span></div>
+          <div class="kpi"><span class="kpi-label">Распознано</span>
+            <span class="kpi-value">${num(звонки.queued || 0, 0)}</span>
+            <span class="small dim">поставлено в очередь</span></div>
+          <div class="kpi"><span class="kpi-label">Пропущено</span>
+            <span class="kpi-value">${num(звонки.skipped || 0, 0)}</span>
+            <span class="small dim">короткие, без ответа, без записи</span></div>
+          <div class="kpi"><span class="kpi-label">Наговорено</span>
+            <span class="kpi-value">${fmtDur(звонки.talk_s || 0)}</span>
+            <span class="small dim">${num(звонки.inbound || 0, 0)} вх · ${num(звонки.outbound || 0, 0)} исх</span></div>
+        </div>
+        ${причины ? `<div class="row wrap" style="padding:0 16px 12px;gap:6px">${причины}</div>` : ''}
+        ${свод.last_error ? `<div class="banner err" style="margin:0 16px 14px">
+          <b>Источник отвечает ошибкой.</b> ${esc(свод.last_error)}</div>` : ''}
+        ${свод.last_run ? `<p class="small dim" style="padding:0 16px 14px">
+          Последний заход: ${esc(fmtTime(свод.last_run))} · ввезено ${num(свод.imported || 0, 0)},
+          пропущено ${num(свод.skipped || 0, 0)}, сбоев ${num(свод.failed || 0, 0)}</p>` : ''}
+      </section>`;
+    const проверка = qs('#tel-test');
+    if (проверка) проверка.addEventListener('click', () => this.test());
+    const заход = qs('#tel-scan');
+    if (заход) заход.addEventListener('click', () => this.scan());
+  },
+
+  async test() {
+    const кнопка = qs('#tel-test');
+    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Проверяю…'; }
+    try {
+      const итог = await API.post('/api/telephony/test');
+      const хвост = итог.version ? `Asterisk ${итог.version}`
+        : итог.files !== undefined ? `файлов записей: ${итог.files}`
+        : `журнал ${num((итог.bytes || 0) / 1048576, 1)} МБ, прочитано до ${num((итог.offset || 0) / 1048576, 1)} МБ`;
+      const образцы = (итог.sample || []).length;
+      toast(`Связь есть: ${хвост}${образцы ? `, разобрано строк-образцов: ${образцы}` : ''}`, 'ok',
+            `Ответ за ${num(итог.ms || 0, 0)} мс`);
+    } catch (err) {
+      toast(err.message || 'Источник недоступен', 'err', err.hint || '');
+    } finally {
+      if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Проверить связь'; }
+    }
+  },
+
+  async scan() {
+    const кнопка = qs('#tel-scan');
+    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Забираю…'; }
+    try {
+      const итог = await API.post('/api/telephony/scan');
+      const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
+      toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
+            итог.imported ? 'ok' : '', причины);
+      await this.loadStatus();
+      await this.loadCalls();
+    } catch (err) {
+      toast(err.message || 'Заход не удался', 'err', err.hint || '');
+    } finally {
+      if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Забрать сейчас'; }
+    }
+  },
+
+  /* Очереди и операторы для отбора: список из того, что встречалось, а не
+   * из того, что настроено. Настроенного может не быть ни в одном звонке. */
+  async loadDimensions() {
+    let оси;
+    try {
+      оси = await API.get('/api/telephony/dimensions');
+    } catch (err) { return; }
+    const заполнить = (ид, значения, выбрано, пусто) => {
+      const поле = qs(`#${ид}`);
+      if (!поле) return;
+      поле.innerHTML = `<option value="">${пусто}</option>` + значения
+        .map((з) => `<option value="${esc(з)}"${з === выбрано ? ' selected' : ''}>${esc(з)}</option>`)
+        .join('');
+    };
+    заполнить('tel-queue', оси.queues || [], state.telQueue, 'Все очереди');
+    заполнить('tel-agent', оси.agents || [], state.telAgent, 'Все операторы');
+  },
+
+  async loadCalls() {
+    const коробка = qs('#tel-calls');
+    if (!коробка) return;
+    const пар = new URLSearchParams({
+      period: state.telPeriod, limit: '50', offset: String(state.telOffset || 0),
+    });
+    if (state.telDirection) пар.set('direction', state.telDirection);
+    if (state.telQueue) пар.set('queue', state.telQueue);
+    if (state.telAgent) пар.set('agent', state.telAgent);
+    if (state.telSearch) пар.set('search', state.telSearch);
+    if (state.telOnlyQueued) пар.set('only_queued', 'true');
+    let свод;
+    try {
+      свод = await API.get(`/api/telephony/calls?${пар}`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      коробка.innerHTML = `<div class="empty">Журнал недоступен: ${esc(err.message || '')}</div>`;
+      return;
+    }
+    this.drawCalls(коробка, свод);
+  },
+
+  drawCalls(коробка, свод) {
+    const звонки = свод.calls || [];
+    if (!звонки.length) {
+      коробка.innerHTML = `<div class="empty">
+        Звонков за выбранный период нет.
+        ${state.telStatus && !state.telStatus.enabled
+          ? 'Забор записей выключен — включите его в настройках, раздел «Телефония».'
+          : 'Проверьте период и отбор либо нажмите «Забрать сейчас».'}</div>`;
+      return;
+    }
+    const строки = звонки.map((з) => {
+      const статус = з.job_id
+        ? `<a href="#" onclick="__asrhub.openJob('${esc(з.job_id)}');return false"
+             title="Открыть карточку задания">${esc(STATUS_LABELS[з.job_status] || з.job_status || 'в очереди')}</a>`
+        : `<span class="dim" title="почему не распознан">${esc(з.skipped || '—')}</span>`;
+      const направление = з.direction
+        ? `<span class="chip ${з.direction === 'входящий' ? 'ok' : ''}">${esc(з.direction)}</span>`
+        : '<span class="dim">—</span>';
+      return `<tr>
+        <td class="small">${esc(fmtTime(з.started_at))}</td>
+        <td>${направление}</td>
+        <td class="mono small">${esc(з.src || '—')}</td>
+        <td class="mono small">${esc(з.dst || '—')}</td>
+        <td class="small">${esc(з.queue || '—')}</td>
+        <td class="small">${esc(з.agent || '—')}</td>
+        <td class="small" title="${з.duration ? `всего с гудками ${esc(fmtDur(з.duration))}` : ''}">${
+          з.billsec ? fmtDur(з.billsec) : '<span class="dim">—</span>'}</td>
+        <td class="small">${з.answered ? 'ответили'
+          : esc(ИТОГ_ЗВОНКА[з.disposition] || (з.disposition || '').toLowerCase() || '—')}</td>
+        <td class="small">${статус}</td>
+        <td class="small dim" title="${esc(з.preview || '')}">${esc((з.preview || '').slice(0, 80))}</td>
+      </tr>`;
+    }).join('');
+    const страниц = Math.ceil((свод.total || 0) / (свод.limit || 50));
+    const текущая = Math.floor((свод.offset || 0) / (свод.limit || 50)) + 1;
+    коробка.innerHTML = `
+      <section class="card">
+        <div class="card-head"><h3>Журнал звонков</h3>
+          <span class="chip">${num(свод.total || 0, 0)} ${plural(свод.total || 0, 'звонок', 'звонка', 'звонков')}</span>
+          <span class="spacer"></span>
+          ${страниц > 1 ? `<span class="small dim">страница ${текущая} из ${страниц}</span>
+            <button class="ghost sm" id="tel-prev" ${текущая <= 1 ? 'disabled' : ''}>←</button>
+            <button class="ghost sm" id="tel-next" ${текущая >= страниц ? 'disabled' : ''}>→</button>` : ''}
+        </div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Начало</th><th>Направление</th><th>Кто</th><th>Кому</th>
+            <th>Очередь</th><th>Оператор</th><th>Разговор</th><th>Итог</th>
+            <th>Распознавание</th><th>Начало расшифровки</th></tr></thead>
+          <tbody>${строки}</tbody>
+        </table></div>
+      </section>`;
+    const назад = qs('#tel-prev');
+    const вперёд = qs('#tel-next');
+    if (назад) назад.addEventListener('click', () => {
+      state.telOffset = Math.max(0, (свод.offset || 0) - (свод.limit || 50));
+      this.loadCalls();
+    });
+    if (вперёд) вперёд.addEventListener('click', () => {
+      state.telOffset = (свод.offset || 0) + (свод.limit || 50);
+      this.loadCalls();
+    });
+  },
+};
 
 RENDERERS.content = {
   async render(root) {
