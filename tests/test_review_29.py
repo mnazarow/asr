@@ -277,17 +277,37 @@ def test_соединение_с_атс_переоткрывается_при_с
     import asrhub.telephony.importer as M
     настоящий, M.AMIClient = M.AMIClient, Клиент
     try:
-        настройки = {"telephony_source": "ami", "telephony_host": "127.0.0.1",
-                     "telephony_port": 5038, "telephony_username": "asrhub",
-                     "telephony_secret": "старый"}
-        имп = Импортёр(Database(tmp_path / "asrhub.db"), настройки, None)
+        # Станций стало несколько, и пароль живёт в станции, а не в общих
+        # настройках. Утверждение то же: сменили пароль — сервер обязан
+        # переподключиться с новым, а старое соединение закрыть.
+        from asrhub.telephony import Телефония
+        from asrhub.telephony.stations import _станция_из
+
+        поля = {"name": "АТС", "source": "ami", "host": "127.0.0.1",
+                "port": 5038, "username": "asrhub", "secret": "старый"}
+        db = Database(tmp_path / "asrhub.db")
+        имп = Импортёр(db, _станция_из(dict(поля), 0), None, None)
         имп._из_ami(5)
         assert len(Клиент.живые) == 1 and Клиент.живые[0].секрет == "старый"
         имп._из_ami(5)
         assert len(Клиент.живые) == 1, "соединение держится между заходами"
 
-        настройки["telephony_secret"] = "новый"
-        имп._из_ami(5)
+        class Настройки(dict):
+            def get(self, ключ, по_умолчанию=None):          # noqa: A003
+                return dict.get(self, ключ, по_умолчанию)
+
+        настройки = Настройки({"telephony_enabled": True,
+                               "telephony_stations": [dict(поля)]})
+        телефония = Телефония(db, настройки, None)
+        телефония._свести()
+        # Подменяем импортёра тем, у которого уже открыто соединение: иначе
+        # проверять «закрылось ли старое» было бы не на чем.
+        ид = next(iter(телефония._станции))
+        телефония._станции[ид] = имп
+
+        настройки["telephony_stations"] = [{**поля, "id": ид, "secret": "новый"}]
+        телефония._свести()
+        телефония._станции[ид]._из_ami(5)
         assert len(Клиент.живые) == 2, "смена пароля не дошла до станции"
         assert Клиент.живые[0].закрыт, "старое соединение не закрыто"
         assert Клиент.живые[1].секрет == "новый"

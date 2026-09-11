@@ -29,11 +29,12 @@ from ..llm import LLMClient, LLMSetup, LLMWorker
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
 from ..streaming import StreamSession
-from ..telephony import Импортёр
+from ..telephony import Телефония
 from ..trends import Trends
 from .deps import SESSION_COOKIE, AppState, token_of
 from .routes_auth import router as auth_router
 from .routes_auth import users_router
+from .routes_backup import router as backup_router
 from .routes_catalog import router as catalog_router
 from .routes_content import router as content_router
 from .routes_jobs import router as jobs_router
@@ -359,11 +360,12 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # настрой сам». Живёт рядом с клиентом, чтобы после установки сразу
     # сбросить пробу доступности.
     state.llm_setup = LLMSetup(settings, db, client=state.llm)
-    # Телефония: записи разговоров приезжают с АТС сами. Импортёр
-    # собирается всегда, а работает только при включённой настройке:
-    # раздел должен показывать журнал уже импортированного и тогда, когда
-    # забор выключен.
-    state.telephony = Импортёр(db, settings, queue)
+    # Телефония: записи разговоров приезжают с АТС сами. Станций может
+    # быть несколько, и набор приводится к настройке на каждом заходе —
+    # добавили филиал, отключили архив, сменили пароль. Собирается всегда,
+    # а работает только при включённой настройке: раздел должен показывать
+    # журнал уже импортированного и тогда, когда забор выключен.
+    state.telephony = Телефония(db, settings, queue)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -563,6 +565,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(llm_router)
     app.include_router(trends_router)
     app.include_router(telephony_router)
+    app.include_router(backup_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.
     app.include_router(phone_router)

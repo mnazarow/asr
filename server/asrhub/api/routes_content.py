@@ -218,7 +218,10 @@ def drivers(request: Request, period: str = ПЕРИОД,
 
 
 #: Разрез оператора: метка говорящего или владелец задания.
-ПО_КОМУ = Query(default="speaker", pattern="^(speaker|owner)$")
+#: Чем считать «оператора». `agent` — имя из журнала АТС, и это самый
+#: полезный разрез: «говорящий 1» — техническая метка внутри записи, а
+#: владелец — это ключ доступа, то есть чаще отдел или интеграция.
+ПО_КОМУ = Query(default="speaker", pattern="^(speaker|owner|agent|queue|station)$")
 
 
 @router.get("/norms", summary="Нормы от своего архива")
@@ -264,6 +267,24 @@ def agent_card(request: Request, key: str, period: str = ПЕРИОД, by: str =
     """
     return _insights(request).agent_card(key, by=by, period=period,
                                          owner=scope_owner(principal))
+
+
+@router.get("/employees", summary="Аналитика по сотрудникам")
+def employees(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ,
+              limit: int = Query(default=200, ge=1, le=500),
+              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Все сотрудники со всеми показателями разом: разбор плюс телефония.
+
+    `by` выбирает, что считать сотрудником: `agent` — имя из журнала АТС
+    (самый полезный разрез), `speaker` — метка говорящего в записи,
+    `owner` — ключ доступа, `queue` и `station` — очередь и станция, когда
+    сравнивать нужно не людей, а участки.
+    """
+    try:
+        return _insights(request).employees(by, period, owner=scope_owner(principal),
+                                            limit=limit)
+    except ValueError as exc:
+        raise error_response(ConfigError(str(exc))) from exc
 
 
 @router.get("/coaching", summary="Очередь коучинга")

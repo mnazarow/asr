@@ -85,7 +85,12 @@ def make_backup(db: Any, settings: Any) -> Path | None:
     # `backup_keep` копий, очередная не помещалась, а старые не удалялись —
     # их удаляет строка после, до которой дело уже не доходило. С этого
     # момента свежих копий не появлялось вообще никогда, молча.
-    _подчистить(каталог, int(settings.get("backup_keep") or 7), место_под_ещё_одну=True)
+    # Ноль — «предела по числу нет», и это документированное значение
+    # параметра. `int(значение or 7)` превращал его в семь и молча сносил
+    # самые старые копии — те, ради которых предел и ставили в ноль.
+    предел = _срок(settings, "backup_keep", 0)
+    if предел > 0:
+        _подчистить(каталог, предел, место_под_ещё_одну=True)
 
     # Имя несёт и экземпляр: на общей базе серверов несколько, и с точностью
     # до секунды два одновременных захода выбирали одно имя — на выходе
@@ -526,10 +531,24 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
             сделано["control"] = review.sample_control(db, settings, queue)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Контрольные прогоны не поставлены: %s", exc)
-    if _пора(db, KV_BACKUP, float(settings.get("backup_interval_hours") or 0)):
+    # Копии снимает модуль `backup`: он собирает архив с описью, настройками
+    # и — по виду копии — базой. Расписание там же: раз в сутки в назначенное
+    # время или по интервалу в часах, если он задан.
+    from . import backup as резерв  # noqa: PLC0415
+
+    if резерв.пора(db, settings, ключ=KV_BACKUP):
         db.set_kv(KV_BACKUP, time.time())
-        копия = make_backup(db, settings)
-        сделано["backup"] = str(копия) if копия else None
+        try:
+            копия = резерв.создать(db, settings,
+                                   kind=str(settings.get("backup_kind") or "full"),
+                                   comment="по расписанию")
+            сделано["backup"] = копия.get("name")
+        except Exception as exc:                             # noqa: BLE001
+            # Сбой копии не должен ронять служебный заход: следом идут
+            # уборка и сводка, и они к копии отношения не имеют.
+            log.warning("Резервная копия не снята: %s", exc)
+            сделано["backup"] = None
+            сделано["backup_error"] = str(exc)
 
     адрес = str(settings.get("digest_url") or "").strip()
     if адрес and _пора(db, KV_DIGEST, float(settings.get("digest_interval_hours") or 0)):

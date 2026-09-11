@@ -16,7 +16,7 @@ import re
 from typing import Any
 
 from . import categories as категории_модуль
-from . import compliance, entities, keywords, sentiment, speech
+from . import compliance, entities, indices, keywords, sentiment, speech
 from .lexicons import (
     ВЕЖЛИВОСТЬ,
     ВОПРОСИТЕЛЬНЫЕ,
@@ -329,6 +329,31 @@ def _тревожные(сегменты: list[dict[str, Any]]) -> list[dict[str
     return найдено
 
 
+def _решён(категории: dict[str, Any], сегменты: list[dict[str, Any]]) -> bool | None:
+    """Похоже ли, что вопрос решён. None — судить не по чему.
+
+    Опора — категории разбора: набор различает «решено» и «не решено»
+    правилами организации, и это надёжнее общих слов. Когда таких категорий
+    в наборе нет, возвращается None, а не False: «не нашли» и «не решено» —
+    разные вещи, и вторая портит предсказанный NPS у всех подряд.
+    """
+    # По подписи, а не по `id`: идентификатор собирается заменой пробелов
+    # на подчёркивания, и «Не решён» становится «не_решен» — подстрока «не
+    # решен» в нём не находится, зато находится «решен». Разговор без
+    # решения получал бонус вместо штрафа: разворот предсказанного NPS на
+    # два балла в сторону благополучия.
+    имена = {str(к.get("label") or к.get("title") or к.get("id") or "")
+             .lower().replace("ё", "е").replace("_", " ")
+             for к in (категории.get("items") or [])}
+    не_решено = any("не решен" in и or "эскалац" in и or "жалоб" in и for и in имена)
+    решено = any("решен" in и or "закрыт" in и for и in имена)
+    if не_решено:
+        return False
+    if решено:
+        return True
+    return None
+
+
 def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             duration_s: float = 0.0,
             script: list[dict[str, Any]] | None = None,
@@ -336,6 +361,7 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             document_frequency: dict[str, int] | None = None,
             corpus_size: int = 0,
             profanity: bool = False,
+            confidence: float | None = None,
             categories: list[Any] | None = None) -> dict[str, Any]:
     """Разбор одной записи.
 
@@ -344,7 +370,9 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
     без них ключевые слова считаются по простой частоте. `profanity` —
     считать ли нецензурную лексику: по умолчанию нет, см. словарь.
     `categories` — набор категорий (сырые словари или уже разобранные);
-    None — готовый набор, пустой список — не искать вовсе.
+    None — готовый набор, пустой список — не искать вовсе. `confidence` —
+    уверенность распознавания 0…1, если движок её вернул: по плохо
+    расслышанной записи судить о точности речи нельзя.
     """
     сегменты = list(segments or [])
     if not сегменты and text:
@@ -396,6 +424,19 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             and меньшая >= СМЕШАННАЯ_ДОЛЯ * большая):
         итог["label"] = "смешанная"
 
+    # Показатели сверх тональности: эмоциональный фон и стресс, понятность и
+    # точность речи, NPS и разрезы по настроению, усталости, персонализации,
+    # вежливости, ритмичности, паразитам и уменьшительно-ласкательным.
+    # Считаются здесь, на уже разобранных сегментах, а не отдельным проходом:
+    # второй разбор часовой расшифровки ради тех же чисел — ровно вдвое
+    # больше работы на каждую запись архива.
+    показатели = indices.показатели(
+        сегменты=сегменты, речь=речь, тон=итог, оценки=оценки,
+        оператор=оператор, клиент=клиент, по_имени=по_имени,
+        фрустрация=len(фрустрация), повторное=len(повторное),
+        мат=(len(мат) if profanity else None),
+        решено=_решён(категории, сегменты), confidence=confidence)
+
     return {
         "version": VERSION,
         "sentiment": {
@@ -434,6 +475,9 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
         },
         "compliance": скрипт,
         "categories": категории,
+        # Показатели одним узлом: карточке записи и отчёту по сотруднику
+        # они нужны целиком, а сводам — по одному числу из каждого.
+        "indices": показатели,
         "scorecard": балл,
         "empathy": эмпатия,
         "by_name": по_имени,
@@ -516,9 +560,52 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
         "agent_score": (разбор.get("scorecard") or {}).get("score"),
         "empathy": (разбор.get("empathy") or {}).get("index"),
         "name_uses": (разбор.get("by_name") or {}).get("count"),
+        **_показатели_в_свод(разбор.get("indices") or {}),
         "detail": разбор,
     }
     return свод, основы
+
+
+def _показатели_в_свод(показатели: dict[str, Any]) -> dict[str, Any]:
+    """Показатели — в колонки свода, по одному числу от каждого.
+
+    В своде только числа и короткие метки: по ним считаются разрезы по
+    всему архиву, а подробности каждого показателя — сигналы стресса,
+    список размытых оборотов, частые паразиты — остаются в `detail` и
+    поднимаются только для карточки записи.
+    """
+    def взять(узел: str, поле: str = "index") -> Any:
+        значение = (показатели.get(узел) or {}).get(поле)
+        return значение if значение is not None else None
+
+    паразиты = показатели.get("fillers") or {}
+    частые = ", ".join(f"{с['word']}×{с['count']}" for с in (паразиты.get("top") or [])[:5])
+    nps_ = показатели.get("nps") or {}
+    return {
+        "mood": взять("mood", "score"),
+        "mood_shift": взять("mood", "shift"),
+        # Интенсивность — уже число, а не узел: `.get("index")` вернул бы
+        # None и молча обнулил бы целую шкалу.
+        "intensity": показатели.get("intensity"),
+        "stress": взять("stress"),
+        "effort": взять("effort", "score"),
+        "fatigue": взять("fatigue"),
+        "clarity": взять("clarity"),
+        "accuracy": взять("accuracy"),
+        "politeness": взять("politeness"),
+        "personalization": взять("personalization"),
+        "rhythm": взять("rhythm"),
+        "filler_top": частые or None,
+        "diminutives": (показатели.get("diminutives") or {}).get("count"),
+        "diminutive_rate": (показатели.get("diminutives") or {}).get("rate"),
+        "nps": nps_.get("score"),
+        "nps_group": nps_.get("group"),
+        # Названный клиентом балл и предсказанный нельзя смешивать в
+        # отчётах, поэтому признак едет отдельной колонкой, а не догадкой
+        # по уверенности.
+        "nps_stated": (0 if nps_.get("score") is None
+                       else int(not nps_.get("predicted", True))),
+    }
 
 
 def _по_говорящим(оценки: list[dict[str, Any]]) -> list[dict[str, Any]]:

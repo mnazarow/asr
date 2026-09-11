@@ -27,6 +27,16 @@ const state = {
   //: сбрасывал бы выбор при каждом переходе между разделами.
   contentPeriod: 'month',
   contentTab: 'summary',
+  //: Разрез, в котором смотрят напряжение и NPS. По сотрудникам — потому
+  //: что первый вопрос к такому показателю всегда «у кого».
+  emoDim: 'agent',
+  npsDim: 'agent',
+  //: Чем считать сотрудника в разделе «Аналитика по сотрудникам»: именем
+  //: из журнала АТС, меткой говорящего, ключом доступа, очередью, станцией.
+  employeeBy: 'agent',
+  employeeCols: 'main',
+  employeeSort: 'records',
+  employeeKey: '',
   contentData: {},
   contentKind: 'negative',
   contentScript: null,
@@ -605,13 +615,16 @@ const VIEWS = {
   results:    { title: 'Результаты', subtitle: 'Выполненные задания и выгрузка' },
   analytics:  { title: 'Аналитика', subtitle: 'Показатели производительности и качества' },
   trends:     { title: 'Тренды', subtitle: 'Как менялось со временем всё, что сервер измеряет: объём, скорость, качество, звук, содержание, железо' },
+  employees:  { title: 'Аналитика по сотрудникам', subtitle: 'Все показатели по каждому: речь, клиенты, скрипт, звонки и что разобрать' },
   content:    { title: 'Аналитика записей', subtitle: 'О чём и как говорили: тональность, речь, темы, обязательства, скрипт' },
-  telephony:  { title: 'Телефония', subtitle: 'Разговоры с АТС Asterisk: забор записей, журнал звонков, направления, очереди и операторы' },
+  pbx:        { title: 'АТС', subtitle: 'Все подключённые станции: состояние, нагрузка, очереди и операторы, забор записей' },
+  telephony:  { title: 'Телефония', subtitle: 'Журнал звонков: кто, кому, когда, чем закончилось и что распознано' },
   models:     { title: 'Модели', subtitle: 'Каталог моделей, лицензии, требования, загрузка весов' },
   compare:    { title: 'Сравнение моделей', subtitle: 'Качество, скорость и лицензии рядом' },
   settings:   { title: 'Настройки', subtitle: 'Все параметры с описаниями, рекомендациями и примерами' },
   system:     { title: 'Сервер', subtitle: 'Оборудование, движки, хранилище, учётные записи и ключи' },
   monitoring: { title: 'Мониторинг', subtitle: 'Метрики наружу, пороги тревог, приёмники телеметрии' },
+  backup:     { title: 'Резервные копии', subtitle: 'Копии настроек и данных, восстановление, расписание и срок хранения' },
   logs:       { title: 'Журнал', subtitle: 'События сервера и заданий' },
   help:       { title: 'Справка', subtitle: 'Как пользоваться, программный интерфейс, устранение неполадок' },
 };
@@ -828,7 +841,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // --------------------------------------------------------------------------
 
 const HOTKEY_VIEWS = ['transcribe', 'dictation', 'queue', 'results', 'analytics', 'trends',
-                      'telephony', 'models', 'compare', 'settings', 'system', 'monitoring'];
+                      'pbx', 'telephony', 'models', 'compare', 'settings', 'system', 'monitoring'];
 
 const HOTKEY_HELP = [
   ['1 … 0', 'переход к разделу по номеру (в порядке меню; на «Журнал» цифры не хватило)'],
@@ -2836,7 +2849,7 @@ function showJobModal(job, opts) {
           начало ${esc(fmtTime(job.call.started_at))} · разговор ${fmtDur(job.call.billsec || 0)}
           из ${fmtDur(job.call.duration || 0)} ·
           ${job.call.answered ? 'ответили' : esc((job.call.disposition || '').toLowerCase() || 'без ответа')}
-          · идентификатор <span class="mono">${esc(job.call.uniqueid || '')}</span>
+          · идентификатор <span class="mono">${esc(job.call.pbx_uid || job.call.uniqueid || '')}</span>
         </div>
       </div>` : ''}
 
@@ -4513,8 +4526,55 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
   low_score: 'low_score', impolite: 'impolite',
 };
 
+
+/* Показатель со шкалой, подсказкой и сравнением с прошлым периодом — тем
+ * же видом, что и остальные карточки раздела. Пусто показывается прочерком,
+ * а не нулём: «не считали» и «ноль» — разные утверждения, и для стресса
+ * второе значит «спокойно», то есть прямо противоположное первому. */
+function пкпи(имя, сейчас, раньше, ключ, знаков, признак) {
+  const значение = сейчас[ключ];
+  const есть = значение !== null && значение !== undefined;
+  const единица = (признак || {}).unit || '';
+  return kpi(имя, есть ? num(значение, знаков) : '—',
+             `${esc(единица)}${(признак || {}).hint
+               ? `<span class="hint" title="${esc(признак.hint)}"> ⓘ</span>` : ''}`
+             + delta(значение, (раньше || {})[ключ], признак));
+}
+
+/* Полоса «сколько из скольких» с долей. Доля и знаменатель рядом с числом
+ * обязательны: «42 записи» не говорит ничего, пока не сказано, из скольких,
+ * а показатель считается не по всякой записи. */
+function полоса(имя, сколько, из, вид) {
+  const всего = Number(из || 0);
+  const часть = Number(сколько || 0);
+  const доля = всего > 0 ? (часть / всего) * 100 : null;
+  const цвет = вид === 'ok' ? 'var(--ok)' : доля >= 25 ? 'var(--warn)' : 'var(--accent)';
+  return `<div style="margin-bottom:10px">
+    <div class="row small" style="gap:8px">
+      <span>${esc(имя)}</span><span class="spacer"></span>
+      <b>${доля === null ? '—' : `${num(доля, 1)} %`}</b>
+      <span class="dim">${num(часть, 0)} из ${num(всего, 0)}</span>
+    </div>
+    <div style="height:6px;border-radius:3px;background:var(--border-soft);margin-top:4px">
+      <div style="height:6px;border-radius:3px;width:${Math.max(0, Math.min(100, доля || 0))}%;
+                  background:${цвет}"></div>
+    </div></div>`;
+}
+
+/* Разрезы, в которых имеет смысл смотреть напряжение и NPS. Перечень общий
+ * для обеих вкладок: вопрос «где тяжелее» и вопрос «где хуже оценка» — это
+ * один и тот же вопрос про одни и те же группы. */
+const ЭМОЦИЯ_РАЗРЕЗЫ = [
+  ['agent', 'По сотрудникам'], ['queue', 'По очередям'], ['station', 'По АТС'],
+  ['category', 'По категориям'], ['direction', 'По направлению'],
+  ['hour', 'По часам'], ['weekday', 'По дням недели'], ['owner', 'По владельцу'],
+];
+
 const CONTENT_TABS = [
   { key: 'summary',    title: 'Свод' },
+  { key: 'emotion',    title: 'Эмоциональный фон и стресс' },
+  { key: 'clarity',    title: 'Понятность и точность' },
+  { key: 'nps',        title: 'NPS' },
   { key: 'categories', title: 'Категории' },
   { key: 'agents',     title: 'Операторы' },
   { key: 'groups',     title: 'Разрезы' },
@@ -5063,6 +5123,7 @@ RENDERERS.telephony = {
           <option value="исходящий">Исходящие</option>
           <option value="внутренний">Внутренние</option>
         </select>
+        <select id="tel-station" style="width:180px"><option value="">Все АТС</option></select>
         <select id="tel-queue" style="width:170px"><option value="">Все очереди</option></select>
         <select id="tel-agent" style="width:170px"><option value="">Все операторы</option></select>
         <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" id="tel-queued"
@@ -5079,11 +5140,11 @@ RENDERERS.telephony = {
       qsa('#tel-period button').forEach((x) => x.classList.toggle('active', x === b));
       this.loadCalls();
     }));
-    ['tel-direction', 'tel-queue', 'tel-agent'].forEach((ид) => {
+    ['tel-direction', 'tel-station', 'tel-queue', 'tel-agent'].forEach((ид) => {
       const поле = qs(`#${ид}`);
       if (поле) поле.addEventListener('change', () => {
-        state[{ 'tel-direction': 'telDirection', 'tel-queue': 'telQueue',
-                'tel-agent': 'telAgent' }[ид]] = поле.value;
+        state[{ 'tel-direction': 'telDirection', 'tel-station': 'telStation',
+                'tel-queue': 'telQueue', 'tel-agent': 'telAgent' }[ид]] = поле.value;
         state.telOffset = 0;
         this.loadCalls();
       });
@@ -5120,75 +5181,78 @@ RENDERERS.telephony = {
     try {
       свод = await API.get('/api/telephony/status');
     } catch (err) {
+      if (err && err.code === 'aborted') return;
       коробка.innerHTML = `<div class="empty">Состояние телефонии недоступно: ${esc(err.message || '')}</div>`;
       return;
     }
     state.telStatus = свод;
     const звонки = свод.calls || {};
+    const архив = свод.archive || звонки;
     const админ = (state.me || {}).role === 'admin';
-    const источники = { cdr_csv: 'журнал CDR', ami: 'интерфейс AMI', folder: 'каталог записей' };
-    const работает = свод.enabled && свод.running;
-    const причины = Object.entries(звонки.reasons || {})
+    const станции = свод.stations || [];
+    const беда = станции.filter((с) => с.enabled && свод.enabled
+                                       && (с.last_error || !с.running));
+    const причины = Object.entries(архив.reasons || {})
       .map(([п, n]) => `<span class="chip" title="звонков пропущено по этой причине">${esc(п)}: ${n}</span>`)
       .join(' ');
+    // Шапка журнала отвечает коротко: доезжают ли записи вообще. Подробности
+    // по каждой станции — в разделе «АТС», и вести туда честнее, чем
+    // пересказывать их здесь мелким шрифтом.
     коробка.innerHTML = `
       <section class="card" style="margin-bottom:14px">
         <div class="card-head">
           <h3>Забор записей с АТС</h3>
-          <span class="chip ${работает ? 'ok' : свод.enabled ? 'warn' : ''}">${
-            работает ? 'работает' : свод.enabled ? 'включено, но поток стоит' : 'выключено'}</span>
-          <span class="chip">источник: ${esc(источники[свод.source] || свод.source || '—')}</span>
+          <span class="chip ${свод.enabled ? (свод.running ? 'ok' : 'warn') : ''}">${
+            !свод.enabled ? 'выключено'
+              : свод.running ? `в работе ${свод.running} из ${свод.configured}`
+              : 'включено, но потоки стоят'}</span>
+          ${беда.length ? `<span class="chip err" title="${esc(беда.map((с) =>
+            `${с.name}: ${с.last_error || 'поток не запущен'}`).join('; '))}">${
+            беда.length} ${plural(беда.length, 'станция требует', 'станции требуют',
+            'станций требуют')} внимания</span>` : ''}
           <span class="spacer"></span>
-          ${админ ? `<button class="ghost sm" id="tel-test"
-            title="Достучаться до источника и сказать, что именно не так">Проверить связь</button>
-          <button class="btn sm" id="tel-scan"
-            title="Заход за новыми звонками прямо сейчас, не дожидаясь интервала">Забрать сейчас</button>` : ''}
-          <button class="ghost sm" onclick="go('settings')"
-            title="Все настройки телефонии с описаниями и примерами">Настройки</button>
+          ${админ ? `<button class="btn sm" id="tel-scan"
+            title="Заход за новыми звонками по всем включённым станциям">Забрать сейчас</button>` : ''}
+          <button class="ghost sm" onclick="__asrhub.go('pbx')"
+            title="Состояние станций, нагрузка, очереди и операторы">Раздел «АТС» →</button>
         </div>
         <div class="grid cols-4" style="padding:14px 16px">
           <div class="kpi"><span class="kpi-label">Всего звонков</span>
-            <span class="kpi-value">${num(звонки.total || 0, 0)}</span>
+            <span class="kpi-value">${num(архив.total || 0, 0)}</span>
             <span class="small dim">за всё время</span></div>
           <div class="kpi"><span class="kpi-label">Распознано</span>
-            <span class="kpi-value">${num(звонки.queued || 0, 0)}</span>
+            <span class="kpi-value">${num(архив.queued || 0, 0)}</span>
             <span class="small dim">поставлено в очередь</span></div>
           <div class="kpi"><span class="kpi-label">Пропущено</span>
-            <span class="kpi-value">${num(звонки.skipped || 0, 0)}</span>
+            <span class="kpi-value">${num(архив.skipped || 0, 0)}</span>
             <span class="small dim">короткие, без ответа, без записи</span></div>
           <div class="kpi"><span class="kpi-label">Наговорено</span>
-            <span class="kpi-value">${fmtDur(звонки.talk_s || 0)}</span>
-            <span class="small dim">${num(звонки.inbound || 0, 0)} вх · ${num(звонки.outbound || 0, 0)} исх</span></div>
+            <span class="kpi-value">${fmtDur(архив.talk_s || 0)}</span>
+            <span class="small dim">${num(архив.inbound || 0, 0)} вх · ${
+              num(архив.outbound || 0, 0)} исх</span></div>
         </div>
         ${причины ? `<div class="row wrap" style="padding:0 16px 12px;gap:6px">${причины}</div>` : ''}
-        ${свод.last_error ? `<div class="banner err" style="margin:0 16px 14px">
-          <b>Источник отвечает ошибкой.</b> ${esc(свод.last_error)}</div>` : ''}
-        ${свод.last_run ? `<p class="small dim" style="padding:0 16px 14px">
-          Последний заход: ${esc(fmtTime(свод.last_run))} · ввезено ${num(свод.imported || 0, 0)},
-          пропущено ${num(свод.skipped || 0, 0)}, сбоев ${num(свод.failed || 0, 0)}</p>` : ''}
+        ${станции.length ? `<div class="row wrap" style="padding:0 16px 14px;gap:6px">${
+          станции.map((с) => `<button class="chip ${
+            !с.enabled || !свод.enabled ? ''
+              : с.last_error ? 'err' : с.running ? 'ok' : 'warn'}"
+            data-station-chip="${esc(с.id)}"
+            title="Показать звонки только этой станции · ${esc(с.last_error || (
+              !с.enabled ? 'станция выключена'
+                : !свод.enabled ? 'забор записей выключен целиком'
+                : с.running ? 'работает' : 'поток стоит'))}"
+            >${esc(с.name)}: ${num((с.calls || {}).total || 0, 0)}</button>`).join('')}</div>` : ''}
       </section>`;
-    const проверка = qs('#tel-test');
-    if (проверка) проверка.addEventListener('click', () => this.test());
+    qsa('[data-station-chip]').forEach((чип) => чип.addEventListener('click', () => {
+      state.telStation = state.telStation === чип.dataset.stationChip
+        ? '' : чип.dataset.stationChip;
+      state.telOffset = 0;
+      const поле = qs('#tel-station');
+      if (поле) поле.value = state.telStation;
+      this.loadCalls();
+    }));
     const заход = qs('#tel-scan');
     if (заход) заход.addEventListener('click', () => this.scan());
-  },
-
-  async test() {
-    const кнопка = qs('#tel-test');
-    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Проверяю…'; }
-    try {
-      const итог = await API.post('/api/telephony/test');
-      const хвост = итог.version ? `Asterisk ${итог.version}`
-        : итог.files !== undefined ? `файлов записей: ${итог.files}`
-        : `журнал ${num((итог.bytes || 0) / 1048576, 1)} МБ, прочитано до ${num((итог.offset || 0) / 1048576, 1)} МБ`;
-      const образцы = (итог.sample || []).length;
-      toast(`Связь есть: ${хвост}${образцы ? `, разобрано строк-образцов: ${образцы}` : ''}`, 'ok',
-            `Ответ за ${num(итог.ms || 0, 0)} мс`);
-    } catch (err) {
-      toast(err.message || 'Источник недоступен', 'err', err.hint || '');
-    } finally {
-      if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Проверить связь'; }
-    }
   },
 
   async scan() {
@@ -5197,8 +5261,9 @@ RENDERERS.telephony = {
     try {
       const итог = await API.post('/api/telephony/scan');
       const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
+      const сбои = (итог.errors || []).map((о) => `${о.name || о.station}: ${о.error}`).join('; ');
       toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
-            итог.imported ? 'ok' : '', причины);
+            сбои ? 'warn' : итог.imported ? 'ok' : '', сбои || причины);
       await this.loadStatus();
       await this.loadCalls();
     } catch (err) {
@@ -5224,6 +5289,13 @@ RENDERERS.telephony = {
     };
     заполнить('tel-queue', оси.queues || [], state.telQueue, 'Все очереди');
     заполнить('tel-agent', оси.agents || [], state.telAgent, 'Все операторы');
+    // Станции подписываем именами из настроек: в звонке лежит
+    // идентификатор («filial-yug»), а человек знает «Филиал „Юг“».
+    const имена = new Map(((state.telStatus || {}).stations || []).map((с) => [с.id, с.name]));
+    const поле = qs('#tel-station');
+    if (поле) поле.innerHTML = '<option value="">Все АТС</option>' + (оси.stations || [])
+      .map((ид) => `<option value="${esc(ид)}"${ид === state.telStation ? ' selected' : ''}>${
+        esc(имена.get(ид) || ид)}</option>`).join('');
   },
 
   async loadCalls() {
@@ -5233,6 +5305,7 @@ RENDERERS.telephony = {
       period: state.telPeriod, limit: '50', offset: String(state.telOffset || 0),
     });
     if (state.telDirection) пар.set('direction', state.telDirection);
+    if (state.telStation) пар.set('station', state.telStation);
     if (state.telQueue) пар.set('queue', state.telQueue);
     if (state.telAgent) пар.set('agent', state.telAgent);
     if (state.telSearch) пар.set('search', state.telSearch);
@@ -5266,8 +5339,11 @@ RENDERERS.telephony = {
       const направление = з.direction
         ? `<span class="chip ${з.direction === 'входящий' ? 'ok' : ''}">${esc(з.direction)}</span>`
         : '<span class="dim">—</span>';
+      const имена = new Map(((state.telStatus || {}).stations || []).map((с) => [с.id, с.name]));
       return `<tr>
         <td class="small">${esc(fmtTime(з.started_at))}</td>
+        <td class="small">${з.station
+          ? esc(имена.get(з.station) || з.station) : '<span class="dim">—</span>'}</td>
         <td>${направление}</td>
         <td class="mono small">${esc(з.src || '—')}</td>
         <td class="mono small">${esc(з.dst || '—')}</td>
@@ -5293,7 +5369,7 @@ RENDERERS.telephony = {
             <button class="ghost sm" id="tel-next" ${текущая >= страниц ? 'disabled' : ''}>→</button>` : ''}
         </div>
         <div class="table-wrap"><table class="table">
-          <thead><tr><th>Начало</th><th>Направление</th><th>Кто</th><th>Кому</th>
+          <thead><tr><th>Начало</th><th>АТС</th><th>Направление</th><th>Кто</th><th>Кому</th>
             <th>Очередь</th><th>Оператор</th><th>Разговор</th><th>Итог</th>
             <th>Распознавание</th><th>Начало расшифровки</th></tr></thead>
           <tbody>${строки}</tbody>
@@ -5311,6 +5387,1025 @@ RENDERERS.telephony = {
     });
   },
 };
+
+/* ========================================================================
+ * Раздел «АТС»: всё про телефонные станции разом и про каждую отдельно.
+ *
+ * Раздел «Телефония» отвечает на вопрос «что было в этом разговоре» — там
+ * журнал звонков. Здесь вопрос другой: «как живут станции» — сколько их,
+ * доезжают ли записи, когда приходит нагрузка, кто и сколько разговаривает.
+ * Поэтому и разделы разные: смешать их значит получить страницу, на
+ * которой ни настройку не найти, ни звонок.
+ * ===================================================================== */
+
+const ПАТС_ВКЛАДКИ = [
+  { key: 'overview', title: 'Обзор', hint: 'Станции, их состояние и вклад каждой' },
+  { key: 'load', title: 'Нагрузка', hint: 'Когда звонят: по времени, по дням недели, по длительности' },
+  { key: 'people', title: 'Очереди и операторы', hint: 'Кто принимает звонки и сколько разговаривает' },
+  { key: 'numbers', title: 'Номера и направления', hint: 'Откуда и куда звонят, чем заканчивается' },
+  { key: 'intake', title: 'Забор записей', hint: 'Что доехало, что пропущено и почему' },
+];
+
+const ПАТС_ИСТОЧНИКИ = {
+  cdr_csv: 'журнал CDR', ami: 'интерфейс AMI', folder: 'каталог записей',
+};
+
+/* Поля станции с описанием, рекомендацией и примерами — тем же набором,
+ * что и параметры сервера в разделе «Настройки». Форма без объяснений
+ * заставляет человека угадывать, что такое «контекст» и чем «журнал CDR»
+ * отличается от «каталога записей», а угадывают обычно неверно. */
+const ПАТС_ПОЛЯ = [
+  { key: 'name', label: 'Название', type: 'text', required: true,
+    desc: 'Как станция называется у вас: «Головной офис», «Филиал Юг», «Склад».',
+    rec: 'Пишите так, как её называют люди — это имя будет в разрезах отчётов.',
+    examples: ['Головной офис', 'Филиал «Юг»', 'Склад и логистика'] },
+  { key: 'source', label: 'Источник', type: 'select', required: true,
+    options: [['cdr_csv', 'журнал CDR (Master.csv)'], ['ami', 'интерфейс AMI'],
+              ['folder', 'каталог записей']],
+    desc: 'Откуда сервер узнаёт о звонках. Журнал CDR — файл, который Asterisk '
+        + 'пишет сам; AMI — живое соединение с управляющим интерфейсом; каталог '
+        + 'записей — просто папка с файлами, без сведений о звонке.',
+    rec: 'Журнал CDR — самый спокойный способ: он не держит соединение и '
+       + 'переживает перезапуск АТС. AMI нужен, когда записи требуются сразу '
+       + 'после разговора.',
+    examples: ['cdr_csv — для большинства установок Asterisk',
+               'ami — когда нужен разбор в течение минуты',
+               'folder — когда записи складывает стороннее решение'] },
+  { key: 'enabled', label: 'Забирать записи', type: 'bool',
+    desc: 'Выключенная станция остаётся в настройках, но сервер к ней не ходит.',
+    rec: 'Выключайте на время работ на АТС: позиция чтения журнала сохранится, '
+       + 'и после включения сервер продолжит с того места, где остановился.',
+    examples: ['включено — обычный режим', 'выключено — АТС на обслуживании'] },
+  { key: 'host', label: 'Адрес АТС', type: 'text', only: 'ami',
+    desc: 'Адрес или имя узла, на котором работает Asterisk.',
+    rec: 'Для АТС на этом же сервере — 127.0.0.1: соединение не выйдет в сеть.',
+    examples: ['127.0.0.1', '10.0.0.5', 'pbx.example.ru'] },
+  { key: 'port', label: 'Порт AMI', type: 'number', only: 'ami',
+    desc: 'Порт управляющего интерфейса из manager.conf.',
+    rec: 'По умолчанию 5038. Менять стоит, только если его сменили на АТС.',
+    examples: ['5038 — значение по умолчанию', '15038 — если порт перенесли'] },
+  { key: 'username', label: 'Учётная запись AMI', type: 'text', only: 'ami',
+    desc: 'Имя из manager.conf, под которым сервер подключается к АТС.',
+    rec: 'Заведите отдельную запись только на чтение: read = call,cdr и '
+       + 'write = <пусто>. Полные права серверу распознавания не нужны.',
+    examples: ['asrhub', 'monitoring'] },
+  { key: 'secret', label: 'Пароль AMI', type: 'password', only: 'ami',
+    desc: 'Пароль этой учётной записи. В ответах интерфейса он не показывается.',
+    rec: 'Не переиспользуйте пароль администратора АТС.',
+    examples: ['длинная случайная строка'] },
+  { key: 'cdr_file', label: 'Журнал звонков', type: 'text', only: 'cdr_csv',
+    desc: 'Путь к файлу Master.csv, который Asterisk пишет после каждого звонка.',
+    rec: 'Обычно /var/log/asterisk/cdr-csv/Master.csv. Нужен доступ на чтение '
+       + 'пользователю, от которого работает сервер.',
+    examples: ['/var/log/asterisk/cdr-csv/Master.csv',
+               '/mnt/pbx-filial/cdr-csv/Master.csv'] },
+  { key: 'recordings_dir', label: 'Каталог записей', type: 'text',
+    desc: 'Где лежат файлы разговоров. Сервер ищет запись по идентификатору '
+        + 'звонка, затем по номерам и времени.',
+    rec: 'Обычно /var/spool/asterisk/monitor. Каталог филиала монтируйте '
+       + 'только на чтение — серверу распознавания писать туда незачем.',
+    examples: ['/var/spool/asterisk/monitor',
+               '/mnt/pbx-filial/monitor'] },
+  { key: 'filename', label: 'Шаблон имени файла', type: 'text',
+    desc: 'Если MixMonitor зовут с особым именем, опишите его здесь: '
+        + '${UNIQUEID}, ${SRC}, ${DST}, ${YYYY}, ${MM}, ${DD}.',
+    rec: 'Оставьте пустым, если имена обычные: поиск по идентификатору '
+       + 'находит запись и без шаблона.',
+    examples: ['${YYYY}/${MM}/${UNIQUEID}.wav',
+               'out-${DST}-${SRC}-${YYYY}${MM}${DD}-${UNIQUEID}'] },
+  { key: 'internal_digits', label: 'Длина внутренних номеров', type: 'text',
+    desc: 'Сколько цифр во внутреннем номере. Можно несколько значений через '
+        + 'запятую — в организации, которая росла или объединялась, рядом живут '
+        + 'трёхзначные и четырёхзначные добавочные.',
+    rec: 'Перечислите все длины, которые встречаются: по ним сервер отличает '
+       + 'внутренний звонок от внешнего, а значит и входящий от исходящего.',
+    examples: ['3', '3, 4', '3, 4, 6'] },
+  { key: 'contexts', label: 'Контексты и направления', type: 'text',
+    desc: 'Правила «контекст диалплана = направление», через запятую. '
+        + 'Порядок важен: первое подходящее правило выигрывает.',
+    rec: 'Частные правила пишите выше общих: from-internal-out=исходящий, '
+       + 'from-internal=внутренний. Иначе общее правило перехватит частный случай.',
+    examples: ['from-trunk=входящий, from-internal=исходящий',
+               'from-pstn=входящий, from-internal-out=исходящий, from-internal=внутренний'] },
+  { key: 'min_duration_s', label: 'Минимальная длительность, с', type: 'number',
+    desc: 'Разговоры короче этого не распознаются.',
+    rec: '10–15 секунд: за это время не успевают сказать ничего, что стоит '
+       + 'расшифровки, а задание в очереди занимает место.',
+    examples: ['10 — обычное значение', '0 — распознавать всё подряд'] },
+  { key: 'skip_unanswered', label: 'Пропускать без ответа', type: 'bool',
+    desc: 'Не заводить задания для звонков, на которые не ответили.',
+    rec: 'Включено: в неотвеченном звонке нечего распознавать, кроме гудков.',
+    examples: ['включено — обычный режим',
+               'выключено — когда нужен разбор автоответчика'] },
+  { key: 'settle_s', label: 'Выдержка перед забором, с', type: 'number',
+    desc: 'Сколько ждать после конца разговора, прежде чем брать файл: запись '
+        + 'дописывается и конвертируется уже после того, как положили трубку.',
+    rec: '30 секунд хватает почти всегда. 0 — брать сразу, годится только '
+       + 'когда записи кладут в каталог уже готовыми.',
+    examples: ['30 — обычное значение', '120 — если АТС перекодирует в mp3'] },
+  { key: 'lookback_days', label: 'Глубина первого захода, дней', type: 'number',
+    desc: 'Насколько далеко в прошлое смотреть при первом подключении станции.',
+    rec: '7 дней: свежий архив приедет сразу, а годовой не забьёт очередь в '
+       + 'первый же час. Увеличьте разово, если нужен весь архив.',
+    examples: ['7 — обычное значение', '90 — разовый перенос архива'] },
+  { key: 'poll_s', label: 'Интервал опроса, с', type: 'number',
+    desc: 'Как часто заглядывать на станцию за новыми звонками.',
+    rec: '60 секунд. Чаще имеет смысл только при AMI и требовании «расшифровка '
+       + 'в течение минуты»; реже — для архивных станций.',
+    examples: ['60 — обычное значение', '600 — архивная станция'] },
+  { key: 'owner', label: 'Владелец звонков', type: 'text',
+    desc: 'Под каким владельцем заводить задания. По нему работает разграничение '
+        + 'доступа: ключ видит свои записи и записи своей группы.',
+    rec: 'Заведите отдельного владельца на каждую станцию, если филиалы не '
+       + 'должны видеть разговоры друг друга.',
+    examples: ['telephony', 'filial-yug', 'sales'] },
+  { key: 'priority', label: 'Приоритет заданий', type: 'number',
+    desc: 'С каким приоритетом ставить звонки этой станции в очередь распознавания.',
+    rec: '40 — ниже ручных загрузок (50), чтобы поток с АТС не задвигал '
+       + 'человека, который ждёт результат у экрана.',
+    examples: ['40 — обычное значение', '60 — когда звонки важнее всего'] },
+  { key: 'tags', label: 'Метки', type: 'text',
+    desc: 'Метки, которые получат задания этой станции, через запятую.',
+    rec: 'Ставьте метку филиала: по ней потом отбираются результаты и отчёты.',
+    examples: ['филиал-юг', 'склад, логистика'] },
+];
+
+RENDERERS.pbx = {
+  async render(root) {
+    if (!state.pbxPeriod) state.pbxPeriod = 'week';
+    if (!state.pbxTab) state.pbxTab = 'overview';
+    if (state.pbxStation === undefined) state.pbxStation = '';
+    const админ = (state.me || {}).role === 'admin';
+
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <span class="small dim">Период:</span>
+        <div class="group-nav" id="pbx-period">
+          ${Object.entries(ТЕЛЕФОНИЯ_ПЕРИОДЫ).map(([k, v]) =>
+            `<button data-period="${k}" class="${state.pbxPeriod === k ? 'active' : ''}"
+               title="Показатели и графики за ${v.toLowerCase()}">${v}</button>`).join('')}
+        </div>
+        <select id="pbx-station" style="width:210px"
+          title="Разрез по одной станции или свод по всем"><option value="">Все станции</option></select>
+        <span class="spacer"></span>
+        ${админ ? `<button class="btn sm" id="pbx-scan-all"
+            title="Заход за новыми звонками по всем включённым станциям прямо сейчас">Забрать со всех</button>
+          <button class="primary sm" id="pbx-add"
+            title="Подключить ещё одну АТС">+ Добавить АТС</button>` : ''}
+        <button class="ghost sm" id="pbx-refresh" title="Обновить данные раздела">Обновить</button>
+      </div>
+      <div id="pbx-top"></div>
+      <div class="tabs" id="pbx-tabs">
+        ${ПАТС_ВКЛАДКИ.map((в) => `<button data-tab="${в.key}" title="${esc(в.hint)}"
+          class="${state.pbxTab === в.key ? 'active' : ''}">${esc(в.title)}</button>`).join('')}
+      </div>
+      <div id="pbx-body"><div class="empty">Загрузка…</div></div>`;
+
+    qsa('#pbx-period button').forEach((b) => b.addEventListener('click', () => {
+      state.pbxPeriod = b.dataset.period;
+      qsa('#pbx-period button').forEach((x) => x.classList.toggle('active', x === b));
+      this.load();
+    }));
+    qsa('#pbx-tabs button').forEach((b) => b.addEventListener('click', () => {
+      state.pbxTab = b.dataset.tab;
+      qsa('#pbx-tabs button').forEach((x) =>
+        x.classList.toggle('active', x.dataset.tab === state.pbxTab));
+      this.draw();
+    }));
+    const выбор = qs('#pbx-station');
+    if (выбор) выбор.addEventListener('change', () => {
+      state.pbxStation = выбор.value;
+      this.load();
+    });
+    const обновить = qs('#pbx-refresh');
+    if (обновить) обновить.addEventListener('click', () => this.load());
+    const заход = qs('#pbx-scan-all');
+    if (заход) заход.addEventListener('click', () => this.scan(''));
+    const добавить = qs('#pbx-add');
+    if (добавить) добавить.addEventListener('click', () => this.edit(null));
+
+    await this.load();
+  },
+
+  /* Весь раздел приезжает одним ответом: восемь графиков — это восемь
+   * разрезов одного и того же отбора, и восемь запросов подряд показали бы
+   * на одном экране части картины от разных мгновений. */
+  async load() {
+    const тело = qs('#pbx-body');
+    if (тело && !state.pbxData) тело.innerHTML = '<div class="empty">Загрузка…</div>';
+    const пар = new URLSearchParams({ period: state.pbxPeriod });
+    if (state.pbxStation) пар.set('station', state.pbxStation);
+    try {
+      state.pbxData = await API.latest('pbx-overview', `/api/telephony/overview?${пар}`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      state.pbxData = null;
+      if (тело) тело.innerHTML = `<div class="empty">Раздел недоступен: ${
+        esc(err.message || '')}${err.hint ? `<div class="small dim" style="margin-top:6px">${
+        esc(err.hint)}</div>` : ''}</div>`;
+      const верх = qs('#pbx-top');
+      if (верх) верх.innerHTML = '';
+      return;
+    }
+    this.fillStations();
+    this.drawTop();
+    this.draw();
+  },
+
+  fillStations() {
+    const поле = qs('#pbx-station');
+    const данные = state.pbxData || {};
+    if (!поле) return;
+    const имена = new Map((данные.stations || []).map((с) => [с.id, с.name]));
+    // В списке и станции из настроек, и те, что встречаются только в архиве:
+    // станцию сняли со стойки, а её прошлогодние разговоры остались, и
+    // посмотреть их разрез — законное желание.
+    (данные.by_station || []).forEach((с) => {
+      if (с.station && !имена.has(с.station)) имена.set(с.station, `${с.station} (в архиве)`);
+    });
+    поле.innerHTML = '<option value="">Все станции</option>' + [...имена.entries()]
+      .map(([ид, имя]) => `<option value="${esc(ид)}"${
+        ид === state.pbxStation ? ' selected' : ''}>${esc(имя)}</option>`).join('');
+  },
+
+  /* Шапка: сколько станций и что с ними прямо сейчас. Она одна и та же на
+   * всех вкладках — это ответ на вопрос «всё ли работает», а его задают
+   * независимо от того, какой график открыт. */
+  drawTop() {
+    const место = qs('#pbx-top');
+    const д = state.pbxData || {};
+    if (!место) return;
+    const за = д.period_calls || {};
+    const станции = д.stations || [];
+    // «Требует внимания» — только то, что чинится на уровне станции.
+    // При общем выключателе не работает вообще ничего, и об этом говорит
+    // соседний признак; дублировать его тремя тревожными чипами незачем.
+    const беда = станции.filter((с) => с.enabled && д.enabled
+                                       && (с.last_error || !с.running));
+    const среднее = за.answered ? за.talk_s / за.answered : 0;
+    const доля = за.total ? (за.queued / за.total) * 100 : 0;
+    const ответ = за.total ? (за.answered / за.total) * 100 : 0;
+    место.innerHTML = `
+      <section class="card" style="margin-bottom:12px">
+        <div class="card-head">
+          <h3>Станции</h3>
+          <span class="chip ${д.enabled ? (д.running ? 'ok' : 'warn') : ''}">${
+            !д.enabled ? 'забор выключен'
+              : д.running ? `в работе ${д.running} из ${д.configured}`
+              : 'включено, но потоки стоят'}</span>
+          ${беда.length ? `<span class="chip err" title="${esc(беда.map((с) =>
+            `${с.name}: ${с.last_error || 'поток не запущен'}`).join('; '))}">${
+            беда.length} ${plural(беда.length, 'станция требует', 'станции требуют',
+            'станций требуют')} внимания</span>` : ''}
+          <span class="spacer"></span>
+          <span class="small dim">${esc(ТЕЛЕФОНИЯ_ПЕРИОДЫ[д.period] || '')}${
+            state.pbxStation ? ` · ${esc((станции.find((с) => с.id === state.pbxStation) || {}).name
+              || state.pbxStation)}` : ''}</span>
+        </div>
+        <div class="grid cols-6" style="padding:14px 16px">
+          ${kpi('Звонков за период', num(за.total || 0, 0),
+                `всего в архиве ${num((д.calls || {}).total || 0, 0)}`)}
+          ${kpi('Ответили', `${num(ответ, 1)} %`,
+                `${num(за.answered || 0, 0)} из ${num(за.total || 0, 0)}`)}
+          ${kpi('Распознано', `${num(доля, 1)} %`,
+                `${num(за.queued || 0, 0)} ${plural(за.queued || 0, 'задание', 'задания', 'заданий')}`)}
+          ${kpi('Наговорено', fmtDur(за.talk_s || 0),
+                `в среднем ${fmtDur(среднее)} на разговор`)}
+          ${kpi('Ожидание', fmtDur(за.answered ? (за.wait_s || 0) / за.answered : 0),
+                'среднее до ответа')}
+          ${kpi('Пропущено', num(за.skipped || 0, 0), 'короткие, без ответа, без записи')}
+        </div>
+      </section>`;
+  },
+
+  draw() {
+    const тело = qs('#pbx-body');
+    const д = state.pbxData;
+    if (!тело || !д) return;
+    const вкладка = state.pbxTab;
+    if (вкладка === 'overview') return this.drawOverview(тело, д);
+    if (вкладка === 'load') return this.drawLoad(тело, д);
+    if (вкладка === 'people') return this.drawPeople(тело, д);
+    if (вкладка === 'numbers') return this.drawNumbers(тело, д);
+    return this.drawIntake(тело, д);
+  },
+
+  /* --- Обзор ---------------------------------------------------------- */
+
+  drawOverview(тело, д) {
+    const станции = д.stations || [];
+    const архивные = (д.by_station || []).filter((с) =>
+      с.station && !станции.some((н) => н.id === с.station));
+    const карточки = станции.map((с) => this.stationCard(с, д)).join('');
+    тело.innerHTML = `
+      ${станции.length ? `<div class="grid cols-3" id="pbx-cards">${карточки}</div>`
+        : `<div class="empty">Ни одной АТС не подключено.
+             ${(state.me || {}).role === 'admin'
+               ? 'Нажмите «Добавить АТС» — сервер проверит связь ещё до сохранения.'
+               : 'Обратитесь к администратору сервера.'}</div>`}
+      ${архивные.length ? `<section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Станции только в архиве</h3>
+          <span class="hint">этих АТС нет в настройках, но их разговоры сохранились</span></div>
+        <div class="row wrap" style="padding:12px 16px;gap:6px">${архивные.map((с) =>
+          `<span class="chip" title="звонков в архиве">${esc(с.station)}: ${num(с.total, 0)}</span>`)
+          .join('')}</div></section>` : ''}
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Вклад станций</h3>
+          <span class="hint">звонки за период</span></div>
+          <div id="pbx-by-station" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Направления</h3>
+          <span class="hint">кто кому звонит</span></div>
+          <div id="pbx-directions" style="padding:12px 16px"></div></section>
+      </div>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Станции рядом</h3>
+          <span class="hint">одни и те же показатели у всех АТС — так видно, какая выпадает</span></div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Станция</th><th>Источник</th><th class="num">Звонков</th>
+            <th class="num">Ответили</th><th class="num">Распознано</th>
+            <th class="num">Наговорено</th><th class="num">Средний разговор</th>
+            <th class="num">Пропущено</th><th>Состояние</th></tr></thead>
+          <tbody>${this.stationRows(д)}</tbody></table></div>
+      </section>`;
+
+    this.bindCards();
+    const по_станциям = (д.by_station || []).filter((с) => с.total > 0);
+    const имя = (ид) => (станции.find((с) => с.id === ид) || {}).name || ид || 'без станции';
+    // Один цвет на все столбцы: величина у них одна и та же — звонки за
+    // период. Разные цвета читались бы как разные виды звонков.
+    const цвет = Charts.palette()[0];
+    Charts.hbars(qs('#pbx-by-station'), {
+      items: по_станциям.slice(0, 12).map((с) => ({
+        label: имя(с.station), value: с.total, color: цвет,
+        display: `${num(с.total, 0)} · ${fmtDur(с.talk_s)}`,
+      })),
+      emptyText: 'За период звонков не было',
+    });
+    const за = д.period_calls || {};
+    Charts.donut(qs('#pbx-directions'), {
+      parts: [
+        { label: "входящие", value: за.inbound || 0 },
+        { label: "исходящие", value: за.outbound || 0 },
+        { label: "внутренние", value: за.internal || 0 },
+        { label: 'без направления',
+          value: Math.max(0, (за.total || 0) - (за.inbound || 0)
+                             - (за.outbound || 0) - (за.internal || 0)) },
+      ],
+      centerLabel: 'звонков за период',
+      emptyText: 'За период звонков не было',
+    });
+  },
+
+  /* Карточка станции: состояние, счётчики, линия последних суток и все
+   * действия рядом. Действия именно здесь, а не в отдельном списке: когда
+   * станция молчит, человек смотрит на неё, и «проверить связь» должно
+   * быть под рукой в этот момент. */
+  stationCard(с, д) {
+    const админ = (state.me || {}).role === 'admin';
+    const свои = (д.by_station || []).find((x) => x.station === с.id) || {};
+    const звонки = с.calls || {};
+    // Когда забор выключен целиком, «поток стоит» у каждой станции — правда,
+    // но не ответ: чинить нужно один общий выключатель, а не три станции.
+    const состояние = !с.enabled ? ['', 'выключена']
+      : с.last_error ? ['err', 'ошибка источника']
+      : с.running ? ['ok', 'работает']
+      : !д.enabled ? ['', 'забор выключен'] : ['warn', 'поток стоит'];
+    return `<section class="card tight pbx-card" data-station="${esc(с.id)}">
+      <div class="card-head">
+        <h3 title="${esc(с.id)}">${esc(с.name)}</h3>
+        <span class="chip ${состояние[0]}">${состояние[1]}</span>
+        <span class="spacer"></span>
+        <span class="chip" title="откуда сервер узнаёт о звонках">${
+          esc(ПАТС_ИСТОЧНИКИ[с.source] || с.source || '—')}</span>
+      </div>
+      <div style="padding:10px 14px 4px">
+        <div class="row" style="gap:16px;align-items:flex-end">
+          <div><div class="kpi-label">За период</div>
+            <div class="kpi-value" style="font-size:22px">${num(свои.total || 0, 0)}</div></div>
+          <div><div class="kpi-label">Распознано</div>
+            <div class="kpi-value" style="font-size:22px">${num(свои.queued || 0, 0)}</div></div>
+          <div><div class="kpi-label">Наговорено</div>
+            <div class="kpi-value" style="font-size:22px">${fmtDur(свои.talk_s || 0)}</div></div>
+          <span class="spacer"></span>
+          <div class="pbx-spark" data-station="${esc(с.id)}"></div>
+        </div>
+        <div class="row wrap small dim" style="gap:6px;margin-top:8px">
+          <span title="всего в архиве этой станции">архив: ${num(звонки.total || 0, 0)}</span>
+          ${звонки.skipped ? `<span title="пропущено: короткие, без ответа, без записи">
+            · пропущено ${num(звонки.skipped, 0)}</span>` : ''}
+          ${звонки.deferred ? `<span title="записи ещё дописываются — вернёмся к ним">
+            · отложено ${num(звонки.deferred, 0)}</span>` : ''}
+          ${с.last_run ? `<span>· заход ${esc(fmtTime(с.last_run))}</span>`
+            : '<span>· заходов ещё не было</span>'}
+        </div>
+        ${с.last_error ? `<div class="banner err" style="margin:10px 0 0">
+          <b>Источник отвечает ошибкой.</b> ${esc(с.last_error)}</div>` : ''}
+      </div>
+      <div class="row wrap" style="gap:6px;padding:10px 14px 12px">
+        <button class="ghost sm" data-act="calls" title="Журнал звонков этой станции">Звонки</button>
+        ${админ ? `
+          <button class="ghost sm" data-act="test" title="Достучаться до источника и сказать, что именно не так">Проверить</button>
+          <button class="btn sm" data-act="scan" title="Заход за новыми звонками прямо сейчас">Забрать</button>
+          <button class="ghost sm" data-act="edit" title="Изменить поля станции">Изменить</button>
+          <button class="ghost sm" data-act="toggle" title="${с.enabled
+            ? 'Перестать ходить на эту АТС; настройки и позиция чтения сохранятся'
+            : 'Снова забирать записи с этой АТС'}">${с.enabled ? 'Выключить' : 'Включить'}</button>
+          <button class="ghost sm danger" data-act="remove"
+            title="Убрать станцию из настроек; её звонки останутся в архиве">Убрать</button>` : ''}
+      </div>
+    </section>`;
+  },
+
+  stationRows(д) {
+    const станции = д.stations || [];
+    const строки = (д.by_station || []).slice().sort((a, b) => b.total - a.total);
+    if (!строки.length) return '<tr><td colspan="9" class="dim">За период звонков не было</td></tr>';
+    return строки.map((с) => {
+      const настроена = станции.find((н) => н.id === с.station);
+      const среднее = с.answered ? с.talk_s / с.answered : 0;
+      const состояние = !настроена ? '<span class="dim">только в архиве</span>'
+        : !настроена.enabled ? '<span class="chip">выключена</span>'
+        : настроена.last_error ? `<span class="chip err" title="${esc(настроена.last_error)}">ошибка</span>`
+        : настроена.running ? '<span class="chip ok">работает</span>'
+        : !д.enabled ? '<span class="chip">забор выключен</span>'
+        : '<span class="chip warn">поток стоит</span>';
+      return `<tr>
+        <td>${esc((настроена || {}).name || с.station || 'без станции')}</td>
+        <td class="small dim">${esc(ПАТС_ИСТОЧНИКИ[(настроена || {}).source] || '—')}</td>
+        <td class="num">${num(с.total, 0)}</td>
+        <td class="num">${с.total ? num((с.answered / с.total) * 100, 1) + ' %' : '—'}</td>
+        <td class="num">${с.total ? num((с.queued / с.total) * 100, 1) + ' %' : '—'}</td>
+        <td class="num">${fmtDur(с.talk_s)}</td>
+        <td class="num">${fmtDur(среднее)}</td>
+        <td class="num">${num(с.skipped, 0)}</td>
+        <td>${состояние}</td></tr>`;
+    }).join('');
+  },
+
+  /* Линия на карточке станции строится из общей ленты: отдельный запрос на
+   * каждую станцию — это десяток запросов при десятке АТС. */
+  bindCards() {
+    qsa('.pbx-card').forEach((карточка) => {
+      const ид = карточка.dataset.station;
+      qsa('button[data-act]', карточка).forEach((кнопка) =>
+        кнопка.addEventListener('click', () => this.act(кнопка.dataset.act, ид, кнопка)));
+    });
+    const д = state.pbxData || {};
+    qsa('.pbx-spark').forEach((место) => {
+      const ид = место.dataset.station;
+      const лента = (д.station_timelines || {})[ид];
+      if (лента && лента.length) Charts.spark(место, лента, { width: 120, height: 30 });
+      else if (!state.pbxStation) место.innerHTML = '';
+    });
+  },
+
+  /* --- Нагрузка ------------------------------------------------------- */
+
+  drawLoad(тело, д) {
+    const шаг = { hour: 'по часам', day: 'по суткам', week: 'по неделям',
+                  month: 'по месяцам' }[д.bucket] || '';
+    тело.innerHTML = `
+      <section class="card">
+        <div class="card-head"><h3>Звонки во времени</h3>
+          <span class="hint">${esc(шаг)} · разложено по направлениям</span>
+          <span class="spacer"></span>
+          <label class="row small" style="gap:6px;cursor:pointer">
+            <input type="checkbox" id="pbx-load-talk" ${state.pbxLoadTalk ? 'checked' : ''}
+              style="width:auto">показывать наговоренное время</label>
+        </div>
+        <div id="pbx-timeline" style="padding:12px 16px"></div>
+      </section>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>День недели и час</h3>
+          <span class="hint">когда приходит нагрузка — основание для расписания смен</span></div>
+          <div id="pbx-heat" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Длительность разговоров</h3>
+          <span class="hint">среднее без этого обманывает</span></div>
+          <div id="pbx-durations" style="padding:12px 16px"></div></section>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Часы суток</h3>
+          <span class="hint">сумма по всем дням периода</span></div>
+          <div id="pbx-hours" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Дни недели</h3>
+          <span class="hint">сумма по всем неделям периода</span></div>
+          <div id="pbx-days" style="padding:12px 16px"></div></section>
+      </div>`;
+
+    const лента = д.timeline || [];
+    const шагСек = { hour: 3600, day: 86400, week: 604800, month: 2592000 }[д.bucket] || 86400;
+    const ряды = state.pbxLoadTalk
+      ? [{ name: 'наговорено, мин', values: лента.map((т) => Math.round(т.talk_s / 60)) }]
+      : [
+        { name: 'входящие', values: лента.map((т) => т.inbound) },
+        { name: 'исходящие', values: лента.map((т) => т.outbound) },
+        { name: 'внутренние', values: лента.map((т) => т.internal) },
+      ];
+    Charts.line(qs('#pbx-timeline'), {
+      labels: лента.map((т) => fmtBucket(т.t, шагСек)), series: ряды, height: 260, yMin: 0,
+      emptyText: 'За период звонков не было',
+    });
+    const переключатель = qs('#pbx-load-talk');
+    if (переключатель) переключатель.addEventListener('change', () => {
+      state.pbxLoadTalk = переключатель.checked;
+      this.draw();
+    });
+
+    const карта = д.heatmap || {};
+    Charts.grid(qs('#pbx-heat'), {
+      rows: карта.days || [], cols: (карта.hours || []).map((ч) => String(ч).padStart(2, '0')),
+      values: карта.calls || [], cell: 20,
+      secondary: (карта.talk_s || []).map((строка) =>
+        (строка || []).map((с) => Math.round((с || 0) / 60))),
+      secondaryUnit: 'мин разговора',
+      emptyText: 'За период звонков не было',
+    });
+    Charts.bars(qs('#pbx-durations'), {
+      labels: (д.durations || []).map((к) => к.label),
+      values: (д.durations || []).map((к) => к.count),
+      height: 220, emptyText: 'За период отвеченных разговоров не было',
+    });
+
+    const по_часам = new Array(24).fill(0);
+    const по_дням = new Array(7).fill(0);
+    (карта.calls || []).forEach((строка, день) => (строка || []).forEach((v, час) => {
+      по_часам[час] += v || 0;
+      по_дням[день] += v || 0;
+    }));
+    Charts.bars(qs('#pbx-hours'), {
+      labels: по_часам.map((_, ч) => String(ч)), values: по_часам, height: 200,
+      showValues: false, emptyText: 'За период звонков не было',
+    });
+    Charts.bars(qs('#pbx-days'), {
+      labels: карта.days || [], values: по_дням, height: 200,
+      emptyText: 'За период звонков не было',
+    });
+  },
+
+  /* --- Очереди и операторы -------------------------------------------- */
+
+  drawPeople(тело, д) {
+    const очереди = (д.tops || {}).queue || [];
+    const операторы = (д.tops || {}).agent || [];
+    тело.innerHTML = `
+      <div class="grid cols-2">
+        <section class="card"><div class="card-head"><h3>Очереди</h3>
+          <span class="hint">звонков за период</span></div>
+          <div id="pbx-queues" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Операторы</h3>
+          <span class="hint">звонков за период</span></div>
+          <div id="pbx-agents" style="padding:12px 16px"></div></section>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Средний разговор по очередям</h3>
+          <span class="hint">длинная очередь — либо сложные вопросы, либо неудачный скрипт</span></div>
+          <div id="pbx-queue-avg" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Средний разговор по операторам</h3>
+          <span class="hint">сравнивать стоит внутри одной очереди</span></div>
+          <div id="pbx-agent-avg" style="padding:12px 16px"></div></section>
+      </div>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Операторы: всё вместе</h3>
+          <span class="hint">звонки, наговоренное время, доля отвеченных</span>
+          <span class="spacer"></span>
+          <button class="ghost sm" onclick="__asrhub.go('employees')"
+            title="Показатели речи, вежливости и скрипта по каждому сотруднику">Аналитика по сотрудникам →</button>
+        </div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Оператор</th><th class="num">Звонков</th><th class="num">Ответили</th>
+            <th class="num">Наговорено</th><th class="num">Средний разговор</th>
+            <th class="num">Доля периода</th></tr></thead>
+          <tbody>${this.peopleRows(операторы, (д.period_calls || {}).total)}</tbody></table></div>
+      </section>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Очереди: всё вместе</h3></div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Очередь</th><th class="num">Звонков</th><th class="num">Ответили</th>
+            <th class="num">Наговорено</th><th class="num">Средний разговор</th>
+            <th class="num">Доля периода</th></tr></thead>
+          <tbody>${this.peopleRows(очереди, (д.period_calls || {}).total)}</tbody></table></div>
+      </section>`;
+
+    const цвет = Charts.palette()[0];
+    const столбики = (место, данные, поле, формат) => Charts.hbars(qs(место), {
+      items: данные.slice(0, 12).map((з) => ({
+        label: з.value, value: поле === 'count' ? з.count : з.avg_s,
+        display: формат(з), color: цвет,
+        note: `ответили ${з.count ? num((з.answered / з.count) * 100, 1) : 0} % · `
+            + `наговорено ${fmtDur(з.talk_s)}`,
+      })),
+      labelWidth: 150, emptyText: 'За период данных нет',
+    });
+    столбики('#pbx-queues', очереди, 'count',
+             (з) => `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`);
+    столбики('#pbx-agents', операторы, 'count',
+             (з) => `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`);
+    столбики('#pbx-queue-avg', очереди.slice().sort((a, b) => b.avg_s - a.avg_s),
+             'avg', (з) => fmtDur(з.avg_s));
+    столбики('#pbx-agent-avg', операторы.slice().sort((a, b) => b.avg_s - a.avg_s),
+             'avg', (з) => fmtDur(з.avg_s));
+  },
+
+  peopleRows(строки, всего_периода) {
+    if (!строки.length) return '<tr><td colspan="6" class="dim">За период данных нет</td></tr>';
+    // Знаменатель — все звонки периода, а не сумма показанных строк: сервер
+    // отдаёт только верхушку (пятнадцать), и доли по ней всегда складывались
+    // ровно в сто процентов, завышая вклад каждого.
+    const всего = Number(всего_периода) > 0
+      ? Number(всего_периода)
+      : (строки.reduce((с, з) => с + з.count, 0) || 1);
+    return строки.map((з) => `<tr>
+      <td>${esc(з.value)}</td>
+      <td class="num">${num(з.count, 0)}</td>
+      <td class="num">${з.count ? num((з.answered / з.count) * 100, 1) + ' %' : '—'}</td>
+      <td class="num">${fmtDur(з.talk_s)}</td>
+      <td class="num">${fmtDur(з.avg_s)}</td>
+      <td class="num">${num((з.count / всего) * 100, 1)} %</td></tr>`).join('');
+  },
+
+  /* --- Номера и направления ------------------------------------------- */
+
+  drawNumbers(тело, д) {
+    const топ = д.tops || {};
+    тело.innerHTML = `
+      <div class="grid cols-2">
+        <section class="card"><div class="card-head"><h3>Кто звонит чаще всего</h3>
+          <span class="hint">исходящий номер звонка</span></div>
+          <div id="pbx-src" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Кому звонят чаще всего</h3>
+          <span class="hint">номер назначения</span></div>
+          <div id="pbx-dst" style="padding:12px 16px"></div></section>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Контексты диалплана</h3>
+          <span class="hint">по ним определяется направление; незнакомый контекст — повод дописать правило</span></div>
+          <div id="pbx-context" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Чем кончился звонок</h3>
+          <span class="hint">как это называет Asterisk</span></div>
+          <div id="pbx-disposition" style="padding:12px 16px"></div></section>
+      </div>`;
+    const цвет = Charts.palette()[0];
+    const нарисовать = (место, данные, подпись) => Charts.hbars(qs(место), {
+      items: (данные || []).slice(0, 12).map((з) => ({
+        label: подпись ? подпись(з.value) : з.value, value: з.count, color: цвет,
+        display: `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`,
+        note: `средний разговор ${fmtDur(з.avg_s)}`,
+      })),
+      labelWidth: 150, emptyText: 'За период данных нет',
+    });
+    нарисовать('#pbx-src', топ.src);
+    нарисовать('#pbx-dst', топ.dst);
+    нарисовать('#pbx-context', топ.context);
+    нарисовать('#pbx-disposition', топ.disposition,
+               (з) => ИТОГ_ЗВОНКА[з] || String(з).toLowerCase());
+  },
+
+  /* --- Забор записей --------------------------------------------------- */
+
+  drawIntake(тело, д) {
+    const станции = д.stations || [];
+    const причины = (д.tops || {}).skipped || [];
+    тело.innerHTML = `
+      <div class="grid cols-2">
+        <section class="card"><div class="card-head"><h3>Почему звонок не распознан</h3>
+          <span class="hint">причина важнее счётчика: «нет записи ×48» и «короткий ×48» — разные поломки</span></div>
+          <div id="pbx-reasons" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Что доехало</h3>
+          <span class="hint">за период</span></div>
+          <div id="pbx-funnel" style="padding:12px 16px"></div>
+          <div class="small dim" style="padding:0 16px 14px">
+            Отложенные — не пропуск: запись ещё дописывается, сервер вернётся к ней
+            следующим заходом.</div>
+        </section>
+      </div>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Заходы по станциям</h3>
+          <span class="hint">когда последний раз ходили и что принесли</span>
+          <span class="spacer"></span>
+          ${(state.me || {}).role === 'admin' ? `<button class="btn sm" id="pbx-scan-2"
+            title="Заход по всем включённым станциям">Забрать со всех</button>` : ''}
+        </div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Станция</th><th>Источник</th><th>Последний заход</th>
+            <th class="num">Взято</th><th class="num">Пропущено</th><th class="num">Отложено</th>
+            <th>Что мешает</th><th></th></tr></thead>
+          <tbody>${станции.length ? станции.map((с) => {
+            const з = с.calls || {};
+            return `<tr>
+              <td>${esc(с.name)}<div class="small dim mono">${esc(с.id)}</div></td>
+              <td class="small">${esc(ПАТС_ИСТОЧНИКИ[с.source] || с.source || '—')}
+                ${(() => { const путь = с.source === 'folder' ? с.recordings_dir : с.cdr_file;
+                   return путь ? `<div class="small dim mono" title="${esc(путь)}">${
+                     esc(String(путь).slice(-38))}</div>` : ''; })()}</td>
+              <td class="small">${с.last_run ? esc(fmtTime(с.last_run)) : '<span class="dim">не было</span>'}
+                ${(с.last_scan || {}).at ? `<div class="small dim">осмотр ${
+                  esc(fmtAgo(с.last_scan.at))}</div>` : ''}</td>
+              <td class="num">${num(з.queued || 0, 0)}</td>
+              <td class="num">${num(з.skipped || 0, 0)}</td>
+              <td class="num">${num(з.deferred || 0, 0)}</td>
+              <td class="small">${с.last_error
+                ? `<span class="chip err" title="${esc(с.last_error)}">${
+                    esc(String(с.last_error).slice(0, 42))}</span>`
+                : !с.enabled ? '<span class="chip">выключена</span>'
+                : с.running ? '<span class="dim">—</span>'
+                : '<span class="chip warn">поток стоит</span>'}</td>
+              <td>${(state.me || {}).role === 'admin' ? `<button class="ghost sm"
+                data-scan="${esc(с.id)}" title="Заход только по этой станции">Забрать</button>` : ''}</td>
+            </tr>`;
+          }).join('') : '<tr><td colspan="8" class="dim">Ни одной АТС не подключено</td></tr>'}</tbody>
+        </table></div>
+      </section>`;
+
+    Charts.hbars(qs('#pbx-reasons'), {
+      items: причины.slice(0, 12).map((п) => ({
+        label: п.value, value: п.count, color: Charts.status().warn })),
+      labelWidth: 170, emptyText: 'Все звонки периода доехали до распознавания',
+    });
+    const за = д.period_calls || {};
+    const пропущено = за.skipped || 0;
+    Charts.stacked(qs('#pbx-funnel'), {
+      parts: [
+        { label: 'распознано', value: за.queued || 0 },
+        { label: 'пропущено', value: пропущено },
+        { label: 'остальное', value: Math.max(0, (за.total || 0) - (за.queued || 0) - пропущено) },
+      ],
+      emptyText: 'За период звонков не было',
+    });
+    const заход = qs('#pbx-scan-2');
+    if (заход) заход.addEventListener('click', () => this.scan(''));
+    qsa('button[data-scan]').forEach((кнопка) =>
+      кнопка.addEventListener('click', () => this.scan(кнопка.dataset.scan, кнопка)));
+  },
+
+  /* --- Действия -------------------------------------------------------- */
+
+  act(действие, ид, кнопка) {
+    if (действие === 'calls') {
+      state.telStation = ид;
+      go('telephony');
+      return null;
+    }
+    if (действие === 'test') return this.test(ид, кнопка);
+    if (действие === 'scan') return this.scan(ид, кнопка);
+    if (действие === 'edit') return this.edit(ид);
+    if (действие === 'toggle') return this.toggle(ид);
+    if (действие === 'remove') return this.remove(ид);
+    return null;
+  },
+
+  async test(ид, кнопка) {
+    const прежний = кнопка ? кнопка.textContent : '';
+    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Проверяю…'; }
+    try {
+      const итог = await API.post(`/api/telephony/test?station=${encodeURIComponent(ид)}`);
+      toast(`Связь есть: ${ПАТС_ОТВЕТ(итог)}`, 'ok', `Ответ за ${num(итог.ms || 0, 0)} мс`);
+    } catch (err) {
+      toast(err.message || 'Источник недоступен', 'err', err.hint || '');
+    } finally {
+      if (кнопка) { кнопка.disabled = false; кнопка.textContent = прежний; }
+    }
+  },
+
+  async scan(ид, кнопка) {
+    const прежний = кнопка ? кнопка.textContent : '';
+    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Забираю…'; }
+    try {
+      const пар = ид ? `?station=${encodeURIComponent(ид)}` : '';
+      const итог = await API.post(`/api/telephony/scan${пар}`);
+      const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
+      const сбои = (итог.errors || []).map((о) => `${о.name || о.station}: ${о.error}`).join('; ');
+      toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
+            сбои ? 'warn' : итог.imported ? 'ok' : '', сбои || причины);
+      await this.load();
+    } catch (err) {
+      toast(err.message || 'Заход не удался', 'err', err.hint || '');
+    } finally {
+      if (кнопка) { кнопка.disabled = false; кнопка.textContent = прежний; }
+    }
+  },
+
+  async toggle(ид) {
+    const станция = (state.pbxData.stations || []).find((с) => с.id === ид);
+    if (!станция) return;
+    try {
+      await API.post(`/api/telephony/stations/${encodeURIComponent(ид)}/enabled?enabled=${
+        станция.enabled ? 'false' : 'true'}`);
+      toast(станция.enabled ? `Станция «${станция.name}» выключена`
+                            : `Станция «${станция.name}» включена`, 'ok',
+            станция.enabled ? 'Настройки и позиция чтения журнала сохранены' : '');
+      await this.load();
+    } catch (err) { fail(err); }
+  },
+
+  async remove(ид) {
+    const станция = (state.pbxData.stations || []).find((с) => с.id === ид);
+    if (!станция) return;
+    const архив = (станция.calls || {}).total || 0;
+    // Подтверждение спрашиваем, но не пугаем: звонки остаются, и человеку
+    // важно это знать до нажатия, а не после.
+    const ответ = confirm(`Убрать станцию «${станция.name}»?\n\n`
+      + `Её ${num(архив, 0)} ${plural(архив, 'звонок', 'звонка', 'звонков')} останутся в архиве `
+      + 'и в отчётах: убирается только подключение. Чтобы убрать и записи, '
+      + 'пользуйтесь сроком хранения в разделе «Сервер».');
+    if (!ответ) return;
+    try {
+      const итог = await API.del(`/api/telephony/stations/${encodeURIComponent(ид)}`);
+      toast(`Станция «${станция.name}» убрана`, 'ok',
+            `Звонков осталось в архиве: ${num(итог.kept_calls || 0, 0)}`);
+      if (state.pbxStation === ид) state.pbxStation = '';
+      await this.load();
+    } catch (err) { fail(err); }
+  },
+};
+
+/* Короткий человеческий ответ на «проверить связь» — один и тот же и в
+ * карточке станции, и в форме её настройки. */
+function ПАТС_ОТВЕТ(итог) {
+  if (итог.version) return `Asterisk ${итог.version}`;
+  if (итог.files !== undefined) return `файлов записей: ${num(итог.files, 0)}`;
+  const строки = (итог.sample || []).length;
+  return `журнал ${num((итог.bytes || 0) / 1048576, 1)} МБ, прочитано до ${
+    num((итог.offset || 0) / 1048576, 1)} МБ${строки ? `, разобрано строк-образцов: ${строки}` : ''}`;
+}
+
+/* Форма станции: все поля с описанием, рекомендацией и примерами, а рядом
+ * кнопка «Проверить подключение», которая работает ДО сохранения. Проверка
+ * после сохранения — это предложение сначала завести в настройках станцию
+ * неизвестно куда, а потом выяснять, доедет ли до неё сервер. */
+RENDERERS.pbx.edit = function (ид) {
+  const станция = ид
+    ? ((state.pbxData || {}).stations || []).find((с) => с.id === ид)
+    : null;
+  if (ид && !станция) return;
+  const значения = станция ? ПАТС_ИЗ_СТАНЦИИ(станция) : ПАТС_ПО_УМОЛЧАНИЮ();
+
+  const поле = (п) => {
+    const значение = значения[п.key];
+    if (п.type === 'bool') {
+      return `<label class="row" style="gap:8px;cursor:pointer">
+        <input type="checkbox" data-field="${п.key}" ${значение ? 'checked' : ''}
+          style="width:auto"><span class="small">${значение ? 'включено' : 'выключено'}</span></label>`;
+    }
+    if (п.type === 'select') {
+      return `<select data-field="${п.key}">${п.options.map(([з, имя]) =>
+        `<option value="${esc(з)}"${з === значение ? ' selected' : ''}>${esc(имя)}</option>`)
+        .join('')}</select>`;
+    }
+    const тип = п.type === 'number' ? 'number' : п.type === 'password' ? 'password' : 'text';
+    return `<input type="${тип}" data-field="${п.key}" value="${esc(String(значение ?? ''))}"
+      ${п.type === 'password' && станция ? 'placeholder="оставьте пустым — пароль не изменится"' : ''}>`;
+  };
+
+  const карточка = (п) => `<div class="param" data-only="${esc(п.only || '')}">
+    <div>
+      <div class="param-head"><span class="param-label">${esc(п.label)}</span>
+        <span class="param-key">${esc(п.key)}</span>
+        ${п.required ? '<span class="chip warn">обязательное</span>' : ''}
+        ${п.only ? `<span class="chip">только для источника «${
+          esc(ПАТС_ИСТОЧНИКИ[п.only] || п.only)}»</span>` : ''}</div>
+      <div class="param-desc">${esc(п.desc)}</div>
+      ${п.rec ? `<div class="param-rec"><b>Рекомендация.</b> ${esc(п.rec)}</div>` : ''}
+      ${(п.examples || []).length ? `<details class="help"><summary>Примеры (${
+        п.examples.length})</summary><ul class="small dim" style="margin:6px 0 0;padding-left:18px">${
+        п.examples.map((пр) => `<li class="mono">${esc(пр)}</li>`).join('')}</ul></details>` : ''}
+    </div>
+    <div class="param-control"><div class="control-slot">${поле(п)}</div></div>
+  </div>`;
+
+  const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:860px">
+    <div class="modal-head"><b>${ид ? `Станция «${esc(станция.name)}»` : 'Новая АТС'}</b>
+      ${ид ? `<span class="chip mono" title="идентификатор станции; к нему привязан её архив">${
+        esc(ид)}</span>` : ''}
+      <span class="spacer"></span>
+      <button class="ghost icon" id="pbx-close" aria-label="Закрыть" title="Закрыть">✕</button></div>
+    <div class="modal-body">
+      <div id="pbx-check"></div>
+      <div class="params" id="pbx-fields">${ПАТС_ПОЛЯ.map(карточка).join('')}</div>
+    </div>
+    <div class="modal-foot">
+      <span class="small dim" id="pbx-form-hint">Проверка связи работает и до сохранения.</span>
+      <span class="spacer"></span>
+      <button class="ghost" id="pbx-check-btn"
+        title="Достучаться до источника с этими полями, ничего не сохраняя">Проверить подключение</button>
+      <button class="primary" id="pbx-save">${ид ? 'Сохранить' : 'Добавить станцию'}</button>
+    </div>
+  </div></div>`);
+  // Через mountModal, как остальные окна: он вешает ловушку фокуса,
+  // гасит прокрутку фона и возвращает фокус на кнопку. Форма из двух
+  // десятков карточек параметров без этого прокручивала страницу под
+  // подложкой, а Tab уводил в разделы за ней.
+  document.body.appendChild(backdrop);
+  mountModal(backdrop, { label: ид ? `Станция «${станция.name}»` : 'Новая АТС' });
+
+  const собрать = () => {
+    const данные = ид ? { id: ид } : {};
+    qsa('[data-field]', backdrop).forEach((вход) => {
+      const имя = вход.dataset.field;
+      const описание = ПАТС_ПОЛЯ.find((п) => п.key === имя) || {};
+      if (описание.type === 'bool') данные[имя] = вход.checked;
+      else if (описание.type === 'number') данные[имя] = Number(вход.value || 0);
+      else данные[имя] = вход.value.trim();
+    });
+    // Пустой пароль у существующей станции — «не менять», а не «стереть»:
+    // интерфейс не показывает сохранённый пароль, и пустое поле здесь
+    // означает только то, что его не трогали.
+    if (ид && !данные.secret) delete данные.secret;
+    return данные;
+  };
+
+  const показать_нужные = () => {
+    const источник = (qs('[data-field="source"]', backdrop) || {}).value || 'cdr_csv';
+    qsa('.param[data-only]', backdrop).forEach((узел) => {
+      const только = узел.dataset.only;
+      узел.style.display = !только || только === источник ? '' : 'none';
+    });
+  };
+  показать_нужные();
+  const выбор = qs('[data-field="source"]', backdrop);
+  if (выбор) выбор.addEventListener('change', показать_нужные);
+  qsa('input[type="checkbox"][data-field]', backdrop).forEach((вход) =>
+    вход.addEventListener('change', () => {
+      const подпись = вход.parentElement.querySelector('span');
+      if (подпись) подпись.textContent = вход.checked ? 'включено' : 'выключено';
+    }));
+
+  const закрыть = () => closeModal(backdrop);
+  qs('#pbx-close', backdrop).addEventListener('click', закрыть);
+  backdrop.addEventListener('click', (ев) => { if (ев.target === backdrop) закрыть(); });
+
+  qs('#pbx-check-btn', backdrop).addEventListener('click', async (ев) => {
+    const кнопка = ев.currentTarget;
+    const место = qs('#pbx-check', backdrop);
+    кнопка.disabled = true;
+    кнопка.textContent = 'Проверяю…';
+    место.innerHTML = '<div class="small dim" style="margin-bottom:10px">Проверяю связь…</div>';
+    try {
+      const итог = await API.post('/api/telephony/test', собрать());
+      const образцы = (итог.sample || []).map((з) => `<tr>
+        <td class="mono small">${esc(з.pbx_uid || з.uniqueid || '')}</td>
+        <td class="mono small">${esc(з.src || '')}</td>
+        <td class="mono small">${esc(з.dst || '')}</td>
+        <td class="small">${esc(з.direction || '—')}</td>
+        <td class="small">${з.billsec ? fmtDur(з.billsec) : '—'}</td>
+        <td class="small">${esc(ИТОГ_ЗВОНКА[з.disposition] || з.disposition || '')}</td></tr>`).join('');
+      место.innerHTML = `<div class="banner ok" style="margin-bottom:12px">
+        <b>Связь есть.</b> ${esc(ПАТС_ОТВЕТ(итог))} · ответ за ${num(итог.ms || 0, 0)} мс
+        ${образцы ? `<div class="table-wrap" style="margin-top:10px"><table class="table">
+          <thead><tr><th>Идентификатор</th><th>Кто</th><th>Кому</th><th>Направление</th>
+            <th>Разговор</th><th>Итог</th></tr></thead><tbody>${образцы}</tbody></table></div>
+          <div class="small dim" style="margin-top:6px">Так сервер прочитает последние строки
+          журнала. Если направление определилось неверно — поправьте длины внутренних
+          номеров и контексты.</div>` : ''}</div>`;
+    } catch (err) {
+      место.innerHTML = `<div class="banner err" style="margin-bottom:12px">
+        <b>${esc(err.message || 'Источник недоступен')}</b>
+        ${err.hint ? `<div class="small" style="margin-top:6px">${esc(err.hint)}</div>` : ''}</div>`;
+      // Ответ проверки — наверху формы, а кнопка внизу: без прокрутки
+      // человек нажимает «Проверить» и видит, что ничего не произошло.
+      место.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    } finally {
+      кнопка.disabled = false;
+      кнопка.textContent = 'Проверить подключение';
+    }
+  });
+
+  qs('#pbx-save', backdrop).addEventListener('click', async (ев) => {
+    const кнопка = ев.currentTarget;
+    кнопка.disabled = true;
+    try {
+      await API.post('/api/telephony/stations', собрать());
+      toast(ид ? 'Станция сохранена' : 'Станция добавлена', 'ok',
+            ид ? '' : 'Первый заход пройдёт в ближайшую минуту — или нажмите «Забрать»');
+      закрыть();
+      await RENDERERS.pbx.load();
+    } catch (err) {
+      toast(err.message || 'Сохранить не удалось', 'err', err.hint || '');
+    } finally {
+      кнопка.disabled = false;
+    }
+  });
+};
+
+function ПАТС_ПО_УМОЛЧАНИЮ() {
+  return {
+    name: '', source: 'cdr_csv', enabled: true, host: '127.0.0.1', port: 5038,
+    username: '', secret: '', cdr_file: '/var/log/asterisk/cdr-csv/Master.csv',
+    recordings_dir: '/var/spool/asterisk/monitor', filename: '',
+    internal_digits: '3, 4', contexts: 'from-trunk=входящий, from-internal=исходящий',
+    min_duration_s: 10, skip_unanswered: true, settle_s: 30, lookback_days: 7,
+    poll_s: 60, owner: 'telephony', priority: 40, tags: '',
+  };
+}
+
+/* Станция из ответа сервера — в поля формы. Длины и правила приходят
+ * разобранными (список и пары), а человеку привычнее строка. */
+function ПАТС_ИЗ_СТАНЦИИ(с) {
+  return {
+    ...ПАТС_ПО_УМОЛЧАНИЮ(), ...с, secret: '',
+    internal_digits: (с.internal_digits || []).join(', '),
+    contexts: (с.contexts || []).map((п) => `${п.context}=${п.direction}`).join(', '),
+  };
+}
 
 RENDERERS.content = {
   async render(root) {
@@ -5436,6 +6531,295 @@ RENDERERS.content = {
       if (state.contentTab !== вкладка) return;
       host.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(err.message)}</div>`;
     }
+  },
+
+
+  // --- эмоциональный фон и стресс -----------------------------------------
+
+  /* Тональность отвечает «хорошо или плохо». Этого мало: разговор бывает
+   * ровным по тону и невыносимым по усилию, спокойным у оператора и
+   * взвинченным у клиента. Здесь то, что в отраслевых методиках стоит
+   * отдельными шкалами: знак эмоции, её сила, напряжение и усилие. */
+  async tab_emotion(host) {
+    const период = state.contentPeriod;
+    const [свод, лента] = await Promise.all([
+      API.latest('content-summary', `/api/content/summary?period=${период}`),
+      API.latest('content-timeline', `/api/content/timeline?period=${период}`),
+    ]);
+    const c = свод.current || {};
+    const p = свод.previous || {};
+    const признак = (k) => (свод.features || []).find((f) => f.key === k) || {};
+    const шкалы = [
+      ['mood', 'Настроение клиента', 2], ['intensity', 'Сила эмоции', 1],
+      ['stress', 'Напряжение', 0], ['effort', 'Усилие клиента', 1],
+      ['fatigue', 'Усталость оператора', 0],
+    ];
+    host.innerHTML = `
+      <div class="grid cols-5">
+        ${шкалы.map(([k, имя, знаков]) => пкпи(имя, c, p, k, знаков, признак(k))).join('')}
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Настроение и напряжение во времени</h3>
+          <span class="hint">по корзинам периода</span></div>
+          <div id="emo-line" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Чем кончаются разговоры</h3>
+          <span class="hint">сдвиг настроения от начала к концу</span></div>
+          <div id="emo-shift" style="padding:12px 16px"></div>
+          <div class="small dim" style="padding:0 16px 14px">
+            Разговор с тяжёлым началом и тёплым концом сделан хорошо — по средней
+            тональности он неотличим от ровно-никакого.</div></section>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Напряжение по разрезам</h3>
+          <span class="hint">где разговоры тяжелее</span>
+          <span class="spacer"></span>
+          <select id="emo-dim" style="width:180px">${ЭМОЦИЯ_РАЗРЕЗЫ.map(([к, и]) =>
+            `<option value="${к}"${state.emoDim === к ? ' selected' : ''}>${esc(и)}</option>`).join('')}</select>
+        </div>
+          <div id="emo-breakdown" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Разговоры на нервах</h3>
+          <span class="hint">напряжение 55 и выше</span></div>
+          <div style="padding:12px 16px">
+            ${полоса('С высоким напряжением', c.stress_high, c.stress_checked)}
+            ${полоса('Клиенту пришлось пробиваться', c.effort_high, c.records)}
+            ${полоса('Клиент раздражён', c.frustrated, c.records)}
+            ${полоса('Повторное обращение', c.repeat, c.records)}
+            ${полоса('Разговор выправился к концу', c.recovered, c.records, 'ok')}
+            ${полоса('Разговор испортился к концу', c.worsened, c.records)}
+          </div></section>
+      </div>`;
+
+    const точки = лента.buckets || [];
+    Charts.line(qs('#emo-line'), {
+      labels: точки.map((т) => fmtBucket(т.ts, лента.step_s || 86400)),
+      series: [
+        { name: 'настроение ×100', values: точки.map((т) =>
+          (т.mood === null || т.mood === undefined ? null : Math.round(т.mood * 100))) },
+        { name: 'напряжение', values: точки.map((т) => т.stress ?? null) },
+      ],
+      height: 250, emptyText: 'За период разобранных записей нет',
+    });
+    Charts.donut(qs('#emo-shift'), {
+      parts: [
+        { label: 'выправился', value: c.recovered || 0 },
+        { label: 'испортился', value: c.worsened || 0 },
+        { label: 'ровно', value: Math.max(0, (c.records || 0) - (c.recovered || 0)
+                                             - (c.worsened || 0)) },
+      ],
+      centerLabel: 'разговоров', emptyText: 'За период разобранных записей нет',
+    });
+    const нарисовать = async () => {
+      let разрез;
+      try {
+        разрез = await API.latest('content-emo-dim',
+          `/api/content/breakdown/${state.emoDim}?period=${период}`);
+      } catch (err) {
+        if (!err || err.code !== 'aborted') fail(err);
+        return;
+      }
+      // Вкладку могли сменить, пока ответ ехал: узла больше нет, и рисовать
+      // в него — это TypeError в консоли и пустое место на экране.
+      const место = qs('#emo-breakdown');
+      if (!место) return;
+      Charts.hbars(место, {
+        items: (разрез.items || []).filter((и) => и.stress !== null && и.stress !== undefined)
+          .slice(0, 12).map((и) => ({
+            label: и.label || и.key, value: и.stress,
+            color: Charts.status().warn,
+            display: `${num(и.stress, 0)} · ${num(и.records, 0)} зап.`,
+            note: `настроение ${fmtNumSafe(и.mood)} · усилие ${fmtNumSafe(и.effort)}`,
+          })),
+        labelWidth: 150, emptyText: 'В этом разрезе напряжение не считалось',
+      });
+    };
+    const выбор = qs('#emo-dim');
+    if (выбор) выбор.addEventListener('change', () => {
+      state.emoDim = выбор.value;
+      нарисовать();
+    });
+    await нарисовать();
+  },
+
+  // --- понятность и точность ----------------------------------------------
+
+  async tab_clarity(host) {
+    const период = state.contentPeriod;
+    const [свод, лента] = await Promise.all([
+      API.latest('content-summary', `/api/content/summary?period=${период}`),
+      API.latest('content-timeline', `/api/content/timeline?period=${период}`),
+    ]);
+    const c = свод.current || {};
+    const p = свод.previous || {};
+    const признак = (k) => (свод.features || []).find((f) => f.key === k) || {};
+    const шкалы = [
+      ['clarity', 'Понятность речи', 0], ['accuracy', 'Точность ответов', 0],
+      ['rhythm', 'Ритмичность речи', 0], ['politeness', 'Вежливость', 0],
+      ['personalization', 'Персонализация', 0],
+    ];
+    host.innerHTML = `
+      <div class="grid cols-5">
+        ${шкалы.map(([k, имя, знаков]) => пкпи(имя, c, p, k, знаков, признак(k))).join('')}
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Понятность и точность во времени</h3></div>
+          <div id="clr-line" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Что мешает слушать</h3>
+          <span class="hint">доли записей с признаком</span></div>
+          <div style="padding:12px 16px">
+            ${полоса('Речь тяжело слушать (понятность ниже 35)', c.clarity_low, c.clarity_checked)}
+            ${полоса('Уменьшительно-ласкательные', c.diminutive_records, c.records)}
+            ${полоса('Долгий монолог оператора', c.long_monologues, c.records)}
+            ${полоса('Клиент раздражён', c.frustrated, c.records)}
+          </div>
+          <div class="small dim" style="padding:0 16px 14px">
+            Понятность считается по речи оператора: длина фраз, канцелярит, темп и
+            слова-паразиты. Точность — конкретика против «наверное» и «где-то так».
+          </div></section>
+      </div>
+      <div class="grid cols-3" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>Слова-паразиты</h3>
+          <span class="hint">доля слов в речи</span></div>
+          <div id="clr-fillers" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Уменьшительно-ласкательные</h3>
+          <span class="hint">доля слов в речи</span></div>
+          <div id="clr-dim" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>Ритмичность</h3>
+          <span class="hint">ровность темпа и пауз</span></div>
+          <div id="clr-rhythm" style="padding:12px 16px"></div></section>
+      </div>`;
+
+    const точки = лента.buckets || [];
+    Charts.line(qs('#clr-line'), {
+      labels: точки.map((т) => fmtBucket(т.ts, лента.step_s || 86400)),
+      series: [
+        { name: 'понятность', values: точки.map((т) => т.clarity ?? null) },
+        { name: 'точность', values: точки.map((т) => т.accuracy ?? null) },
+        { name: 'вежливость', values: точки.map((т) => т.politeness ?? null) },
+      ],
+      height: 250, yMin: 0, yMax: 100,
+      emptyText: 'За период разобранных записей нет',
+    });
+    const по_людям = await API.latest('content-clarity-agents',
+      `/api/content/employees?by=${state.contentAgentBy || 'agent'}&period=${период}`)
+      .catch(() => ({ items: [] }));
+    if (!qs('#clr-fillers')) return;          // вкладку сменили, пока ответ ехал
+    const люди = (по_людям.items || []).filter((ч) => (ч.records || 0) > 0);
+    const столбики = (место, поле, знаков, единица) => Charts.hbars(qs(место), {
+      items: люди.filter((ч) => ч[поле] !== null && ч[поле] !== undefined)
+        .sort((a, b) => b[поле] - a[поле]).slice(0, 10)
+        .map((ч) => ({ label: ч.label || ч.key, value: ч[поле],
+                       color: Charts.palette()[0],
+                       display: `${num(ч[поле], знаков)}${единица}`,
+                       note: `записей ${num(ч.records, 0)}` })),
+      labelWidth: 140, emptyText: 'Разбор по сотрудникам пока пуст',
+    });
+    столбики('#clr-fillers', 'filler_rate', 4, '');
+    столбики('#clr-dim', 'diminutive_rate', 4, '');
+    столбики('#clr-rhythm', 'rhythm', 0, '');
+  },
+
+  // --- NPS ----------------------------------------------------------------
+
+  async tab_nps(host) {
+    const период = state.contentPeriod;
+    const [свод, лента] = await Promise.all([
+      API.latest('content-summary', `/api/content/summary?period=${период}`),
+      API.latest('content-timeline', `/api/content/timeline?period=${период}`),
+    ]);
+    const c = свод.current || {};
+    const p = свод.previous || {};
+    const всего = c.nps_checked || 0;
+    const индекс = c.nps_index;
+    host.innerHTML = `
+      <section class="card">
+        <div class="card-head"><h3>Индекс NPS</h3>
+          <span class="hint">доля промоутеров минус доля критиков</span>
+          <span class="spacer"></span>
+          ${c.nps_stated_count ? `<span class="chip ok" title="балл, который клиент назвал вслух">
+            назвали балл: ${num(c.nps_stated_count, 0)}</span>` : ''}
+          <span class="chip" title="по скольким разговорам вообще есть оценка">${
+            num(всего, 0)} ${plural(всего, 'разговор', 'разговора', 'разговоров')}</span>
+        </div>
+        <div class="grid cols-4" style="padding:14px 16px">
+          ${kpi('Индекс NPS', индекс === null || индекс === undefined ? '—' : num(индекс, 0),
+                p.nps_index !== null && p.nps_index !== undefined
+                  ? `было ${num(p.nps_index, 0)}` : 'от −100 до +100')}
+          ${kpi('Средний балл', c.nps === null || c.nps === undefined ? '—' : num(c.nps, 1),
+                'по шкале 0–10')}
+          ${kpi('Названный балл', c.nps_stated_avg === null || c.nps_stated_avg === undefined
+                  ? '—' : num(c.nps_stated_avg, 1),
+                c.nps_stated_count ? `индекс ${c.nps_stated_index ?? '—'} по ${
+                  num(c.nps_stated_count, 0)} ответам` : 'клиентов не спрашивали')}
+          ${kpi('Промоутеры', num(c.promoters || 0, 0),
+                `нейтралы ${num(c.passives || 0, 0)} · критики ${num(c.detractors || 0, 0)}`)}
+        </div>
+        <div style="padding:0 16px 16px"><div id="nps-bar"></div></div>
+        <div class="banner" style="margin:0 16px 16px">
+          <b>Предсказанный балл — не опрос.</b> Там, где клиента прямо спросили
+          «оцените по шкале», сервер берёт названное число и помечает его как
+          названное. Где не спрашивали — считает балл из настроения к концу
+          разговора, усилия клиента и напряжения. Смешивать эти два числа в
+          отчёте наружу нельзя: первое — факт, второе — оценка.
+        </div>
+      </section>
+      <div class="grid cols-2" style="margin-top:14px">
+        <section class="card"><div class="card-head"><h3>NPS во времени</h3></div>
+          <div id="nps-line" style="padding:12px 16px"></div></section>
+        <section class="card"><div class="card-head"><h3>NPS по разрезам</h3>
+          <span class="spacer"></span>
+          <select id="nps-dim" style="width:180px">${ЭМОЦИЯ_РАЗРЕЗЫ.map(([к, и]) =>
+            `<option value="${к}"${state.npsDim === к ? ' selected' : ''}>${esc(и)}</option>`).join('')}</select>
+        </div>
+          <div id="nps-breakdown" style="padding:12px 16px"></div></section>
+      </div>`;
+
+    Charts.stacked(qs('#nps-bar'), {
+      parts: [
+        { label: 'промоутеры', value: c.promoters || 0, color: Charts.status().ok },
+        { label: 'нейтралы', value: c.passives || 0, color: Charts.status().idle },
+        { label: 'критики', value: c.detractors || 0, color: Charts.status().err },
+      ],
+      height: 30, emptyText: 'За период оценок нет',
+    });
+    const точки = лента.buckets || [];
+    Charts.line(qs('#nps-line'), {
+      labels: точки.map((т) => fmtBucket(т.ts, лента.step_s || 86400)),
+      series: [{ name: 'средний балл', values: точки.map((т) => т.nps ?? null) }],
+      height: 250, yMin: 0, yMax: 10,
+      emptyText: 'За период разобранных записей нет',
+    });
+    const нарисовать = async () => {
+      let разрез;
+      try {
+        разрез = await API.latest('content-nps-dim',
+          `/api/content/breakdown/${state.npsDim}?period=${период}`);
+      } catch (err) {
+        if (!err || err.code !== 'aborted') fail(err);
+        return;
+      }
+      const место = qs('#nps-breakdown');
+      if (!место) return;
+      Charts.hbars(место, {
+        items: (разрез.items || []).filter((и) => и.nps_index !== null
+                                                  && и.nps_index !== undefined)
+          .sort((a, b) => b.nps_index - a.nps_index).slice(0, 12)
+          .map((и) => ({
+            label: и.label || и.key, value: и.nps_index,
+            display: `${num(и.nps_index, 0)} · ${num(и.records, 0)} зап.`,
+            note: `промоутеров ${num(и.promoters, 0)}, критиков ${num(и.detractors, 0)}`,
+          })),
+        // Двусторонний вид не навязываем: когда критиков больше везде,
+        // все значения отрицательные, и деление оси пополам оставляет
+        // половину картинки пустой.
+        labelWidth: 160, emptyText: 'В этом разрезе оценок нет',
+      });
+    };
+    const выбор = qs('#nps-dim');
+    if (выбор) выбор.addEventListener('change', () => {
+      state.npsDim = выбор.value;
+      нарисовать();
+    });
+    await нарисовать();
   },
 
   // --- свод ---------------------------------------------------------------
@@ -7700,6 +9084,729 @@ RENDERERS.settings = {
   },
 };
 
+
+/* ========================================================================
+ * Раздел «Резервные копии»: снять, вернуть, настроить расписание.
+ *
+ * Копия — не одна кнопка, а два разных ответа на два разных вопроса.
+ * «Только настройки» — килобайты, в которых вся работа по подбору моделей,
+ * порогов, словарей и станций АТС: то, что невозможно восстановить по
+ * памяти, и что теряется при переустановке первым. «Настройки и данные» —
+ * ещё и база: задания, результаты, звонки, показатели.
+ *
+ * Поэтому и в разделе два действия, а не одно с переключателем: выбор
+ * делается до нажатия, а не в диалоге после.
+ * ===================================================================== */
+
+const РЕЗЕРВ_ПАРАМЕТРЫ = [
+  'backup_enabled', 'backup_time', 'backup_interval_hours', 'backup_kind',
+  'backup_keep_days', 'backup_keep', 'backup_include_results', 'backup_dir',
+];
+
+RENDERERS.backup = {
+  async render(root) {
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <button class="primary sm" id="bk-settings"
+          title="Снять копию одних настроек — несколько килобайт, снимается мгновенно">Копия настроек</button>
+        <button class="btn sm" id="bk-full"
+          title="Снять копию настроек вместе с базой: задания, результаты, звонки, показатели">Полная копия</button>
+        <span class="spacer"></span>
+        <label class="ghost sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px"
+          title="Положить в каталог копию, снятую на другом сервере">
+          Загрузить копию<input type="file" id="bk-upload" accept=".gz,.db" hidden></label>
+        <button class="ghost sm" id="bk-cleanup"
+          title="Убрать копии старше срока хранения прямо сейчас">Подчистить</button>
+        <button class="ghost sm" id="bk-refresh" title="Обновить данные раздела">Обновить</button>
+      </div>
+      <div id="bk-top"></div>
+      <div id="bk-list"><div class="empty">Загрузка…</div></div>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Расписание и хранение</h3>
+          <span class="hint">те же параметры, что и в разделе «Настройки» — здесь они под рукой</span></div>
+        <div class="params" id="bk-params" style="padding:14px 16px"></div>
+      </section>`;
+
+    qs('#bk-settings').addEventListener('click', (е) => this.create('settings', е.currentTarget));
+    qs('#bk-full').addEventListener('click', (е) => this.create('full', е.currentTarget));
+    qs('#bk-refresh').addEventListener('click', () => this.load());
+    qs('#bk-cleanup').addEventListener('click', () => this.cleanup());
+    qs('#bk-upload').addEventListener('change', (е) => this.upload(е.currentTarget));
+
+    this.drawParams();
+    await this.load();
+  },
+
+  async load() {
+    try {
+      state.backupData = await API.latest('backup-list', '/api/backup');
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      const место = qs('#bk-list');
+      if (место) место.innerHTML = `<div class="empty">Раздел недоступен: ${
+        esc(err.message || '')}</div>`;
+      return;
+    }
+    this.drawTop();
+    this.drawList();
+  },
+
+  drawTop() {
+    const место = qs('#bk-top');
+    const д = state.backupData || {};
+    if (!место) return;
+    const последняя = д.last;
+    const расписание = д.interval_hours > 0
+      ? `каждые ${д.interval_hours} ${plural(д.interval_hours, 'час', 'часа', 'часов')}`
+      : `ежедневно в ${esc(д.time || '00:01')}`;
+    const свежесть = последняя
+      ? (Date.now() / 1000 - последняя.created_at) / 3600 : Infinity;
+    // Отдельно про давность: «копия есть» и «копия свежая» — разные вещи,
+    // и заметить разницу человек должен здесь, а не при восстановлении.
+    const тревога = !д.enabled ? 'выключено'
+      : свежесть > (д.interval_hours > 0 ? д.interval_hours * 2 : 50) ? 'копия устарела' : '';
+    место.innerHTML = `
+      <section class="card" style="margin-bottom:14px">
+        <div class="card-head">
+          <h3>Резервное копирование</h3>
+          <span class="chip ${д.enabled ? (тревога ? 'warn' : 'ok') : ''}">${
+            д.enabled ? esc(расписание) : 'по расписанию не делается'}</span>
+          ${тревога && д.enabled ? `<span class="chip warn">${esc(тревога)}</span>` : ''}
+          <span class="spacer"></span>
+          <span class="small dim mono" title="каталог, в котором лежат копии">${esc(д.dir || '')}</span>
+        </div>
+        <div class="grid cols-4" style="padding:14px 16px">
+          ${kpi('Копий', num(д.total || 0, 0),
+                `занимают ${fmtBytes(д.bytes || 0)}`)}
+          ${kpi('Последняя копия', последняя ? esc(fmtAgo(последняя.created_at)) : '—',
+                последняя ? `${esc(последняя.kind_title)} · ${fmtBytes(последняя.size)}`
+                          : 'копий ещё нет')}
+          ${kpi('Хранить', д.keep_days > 0
+                  ? `${д.keep_days} ${plural(д.keep_days, 'день', 'дня', 'дней')}`
+                  : 'бессрочно',
+                д.keep_count > 0 ? `и не больше ${д.keep_count} штук` : 'по числу — без предела')}
+          ${kpi('Свободно на диске', fmtBytes(д.free_bytes || 0),
+                'в каталоге копий')}
+        </div>
+        ${!д.enabled ? `<div class="banner warn" style="margin:0 16px 14px">
+          <b>Копии по расписанию выключены.</b> Пока это так, единственные копии —
+          те, что сняты вручную. Включить можно ниже, в «Расписании и хранении».</div>` : ''}
+        ${!д.total ? `<div class="banner" style="margin:0 16px 14px">
+          Копий пока нет. Снимите копию настроек прямо сейчас — она весит килобайты,
+          а хранит всю работу по подбору параметров.</div>` : ''}
+      </section>`;
+  },
+
+  drawList() {
+    const место = qs('#bk-list');
+    const д = state.backupData || {};
+    if (!место) return;
+    const копии = д.items || [];
+    if (!копии.length) {
+      место.innerHTML = '<div class="empty">Копий нет</div>';
+      return;
+    }
+    место.innerHTML = `
+      <section class="card">
+        <div class="card-head"><h3>Копии</h3>
+          <span class="chip">${num(копии.length, 0)} ${
+            plural(копии.length, 'копия', 'копии', 'копий')}</span>
+          <span class="hint">свежие сверху</span></div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Когда</th><th>Что внутри</th><th class="num">Размер</th>
+            <th>Версия</th><th>Примечание</th><th>Действия</th></tr></thead>
+          <tbody>${копии.map((к) => this.row(к)).join('')}</tbody>
+        </table></div>
+      </section>`;
+    qsa('#bk-list button[data-act]').forEach((кнопка) => кнопка.addEventListener('click',
+      () => this.act(кнопка.dataset.act, кнопка.dataset.name, кнопка)));
+  },
+
+  row(к) {
+    const внутри = к.kind === 'settings' ? '<span class="chip">только настройки</span>'
+      : к.kind === 'database' ? '<span class="chip">база прежнего образца</span>'
+      : '<span class="chip ok">настройки и данные</span>';
+    const состав = (к.contents || []).includes('results/')
+      ? ' <span class="chip">+ файлы результатов</span>' : '';
+    return `<tr${к.error ? ' class="row-err"' : ''}>
+      <td class="small">${esc(fmtTime(к.created_at))}
+        <div class="small dim">${esc(fmtAgo(к.created_at))}</div></td>
+      <td>${внутри}${состав}
+        ${к.kind === 'full' && (к.calls || к.jobs) ? `<div class="small dim">
+          заданий ${num(к.jobs, 0)} · звонков ${num(к.calls, 0)}</div>` : ''}
+        ${к.error ? `<div class="small" style="color:var(--err)">${esc(к.error)}</div>` : ''}</td>
+      <td class="num">${fmtBytes(к.size || 0)}</td>
+      <td class="small dim">${esc(к.version || '—')}${
+        к.schema_version ? `<div class="small dim">схема ${к.schema_version}</div>` : ''}</td>
+      <td class="small dim">${esc(к.comment || '')}</td>
+      <td class="row wrap" style="gap:6px">
+        ${к.kind !== 'database' ? `<button class="ghost sm" data-act="settings"
+          data-name="${esc(к.name)}"
+          title="Применить параметры из копии прямо сейчас, не трогая данные">Вернуть настройки</button>` : ''}
+        ${к.kind !== 'settings' ? `<button class="ghost sm danger" data-act="full"
+          data-name="${esc(к.name)}"
+          title="Подменить базу данными из копии; потребуется перезапуск сервера">Вернуть всё</button>` : ''}
+        <button class="ghost sm" data-act="download" data-name="${esc(к.name)}"
+          title="Скачать файл копии. Внутри пароли и ключи — храните как пароль">Скачать</button>
+        <button class="ghost sm" data-act="delete" data-name="${esc(к.name)}"
+          title="Удалить эту копию">Убрать</button>
+      </td></tr>`;
+  },
+
+  async create(вид, кнопка) {
+    const прежний = кнопка.textContent;
+    кнопка.disabled = true;
+    кнопка.textContent = 'Снимаю…';
+    try {
+      const итог = await API.post(`/api/backup?kind=${вид}`, { comment: 'вручную' });
+      toast(`Копия снята: ${fmtBytes(итог.size || 0)}`, 'ok',
+            вид === 'settings' ? 'В ней параметры, словари, скрипт и станции АТС'
+                               : 'В ней настройки и база целиком');
+      await this.load();
+    } catch (err) {
+      toast(err.message || 'Копию снять не удалось', 'err', err.hint || '');
+    } finally {
+      кнопка.disabled = false;
+      кнопка.textContent = прежний;
+    }
+  },
+
+  act(действие, имя, кнопка) {
+    if (действие === 'download') {
+      // Скачивание идёт обычной ссылкой: файл бывает в гигабайты, и тянуть
+      // его в память вкладки ради «сохранить как» незачем.
+      const ссылка = document.createElement('a');
+      ссылка.href = `/api/backup/${encodeURIComponent(имя)}/file`;
+      ссылка.download = имя;
+      document.body.appendChild(ссылка);
+      ссылка.click();
+      ссылка.remove();
+      return null;
+    }
+    if (действие === 'delete') return this.remove(имя);
+    return this.restore(имя, действие, кнопка);
+  },
+
+  async restore(имя, что, кнопка) {
+    const копия = (state.backupData.items || []).find((к) => к.name === имя) || {};
+    const когда = fmtTime(копия.created_at);
+    const вопрос = что === 'settings'
+      ? `Применить настройки из копии от ${когда}?\n\n`
+        + 'Текущие значения всех параметров будут заменены на те, что в копии. '
+        + 'Данные — задания, результаты, звонки — не изменятся.'
+      : `Вернуть данные из копии от ${когда}?\n\n`
+        + 'База будет заменена целиком: всё, что появилось после этой копии, '
+        + 'из рабочей базы исчезнет. Прежняя база останется рядом под именем '
+        + '«asrhub.db.before-restore-…», и вернуть её можно.\n\n'
+        + 'После восстановления сервер нужно перезапустить.';
+    if (!confirm(вопрос)) return;
+    const прежний = кнопка.textContent;
+    кнопка.disabled = true;
+    кнопка.textContent = 'Восстанавливаю…';
+    try {
+      const итог = await API.post('/api/backup/restore', { name: имя, what: что });
+      if (итог.restart_required) {
+        toast('Данные восстановлены — перезапустите сервер', 'warn',
+              `Прежняя база сохранена: ${итог.previous || 'рядом с рабочей'}`);
+      } else {
+        toast(`Настройки восстановлены: параметров ${num(итог.applied || 0, 0)}`, 'ok',
+              'Значения применены на ходу, перезапуск не нужен');
+      }
+      // Настройки применены на сервере — вкладка обязана перечитать их,
+      // иначе следующее изменение любого параметра отправит на сервер то,
+      // что лежало в памяти вкладки до восстановления, и молча отменит его.
+      try {
+        const свежие = await API.get('/api/settings');
+        state.settings = свежие.values || state.settings;
+        state.jobSettings = Object.assign({}, state.settings);
+      } catch (e) { /* перечитаем при следующем открытии раздела */ }
+      await this.load();
+      this.drawParams();
+    } catch (err) {
+      toast(err.message || 'Восстановить не удалось', 'err', err.hint || '');
+    } finally {
+      кнопка.disabled = false;
+      кнопка.textContent = прежний;
+    }
+  },
+
+  async remove(имя) {
+    if (!confirm(`Убрать копию «${имя}»?\n\nВосстановить её после удаления будет неоткуда.`)) return;
+    try {
+      const итог = await API.del(`/api/backup/${encodeURIComponent(имя)}`);
+      toast('Копия убрана', 'warn', `Освободилось ${fmtBytes(итог.freed || 0)}`);
+      await this.load();
+    } catch (err) { fail(err); }
+  },
+
+  async cleanup() {
+    try {
+      const итог = await API.post('/api/backup/cleanup');
+      toast(итог.count ? `Убрано копий: ${итог.count}` : 'Убирать нечего',
+            итог.count ? 'warn' : '', (итог.removed || []).join(', '));
+      await this.load();
+    } catch (err) { fail(err); }
+  },
+
+  async upload(поле) {
+    const файл = (поле.files || [])[0];
+    if (!файл) return;
+    поле.value = '';
+    const форма = new FormData();
+    форма.append('file', файл);
+    try {
+      const итог = await API.call('/api/backup/upload', { method: 'POST', body: форма });
+      toast(`Копия принята: ${итог.name}`, 'ok',
+            'Теперь её можно выбрать для восстановления');
+      await this.load();
+    } catch (err) {
+      toast(err.message || 'Файл не принят', 'err', err.hint || '');
+    }
+  },
+
+  /* Настройки раздела — теми же карточками, что и в «Настройках»: с
+   * описанием, рекомендацией и примерами. Копировать их сюда в сокращённом
+   * виде значило бы держать два описания одного параметра, которые рано
+   * или поздно разойдутся. */
+  drawParams() {
+    const место = qs('#bk-params');
+    if (!место) return;
+    const все = state.params || [];
+    место.innerHTML = '';
+    РЕЗЕРВ_ПАРАМЕТРЫ.forEach((ключ) => {
+      const spec = все.find((п) => п.key === ключ);
+      if (!spec) return;
+      место.appendChild(paramCard(spec, state.settings[ключ], async (значение) => {
+        try {
+          await API.put('/api/settings', { [ключ]: значение });
+          state.settings[ключ] = значение;
+          toast('Настройка применена', 'ok');
+          await this.load();
+        } catch (err) { fail(err); }
+      }));
+    });
+    if (!место.children.length) {
+      место.innerHTML = '<div class="empty small">Каталог параметров ещё не загружен</div>';
+    }
+  },
+};
+
+
+/* ========================================================================
+ * Раздел «Аналитика по сотрудникам».
+ *
+ * Всё, что сервер знает о человеке, на одном экране: сколько разговоров и
+ * сколько наговорено, как звучит его речь, как себя чувствуют его клиенты,
+ * что он делает лучше и хуже команды, что стоит разобрать. Разрозненные по
+ * разделам те же числа отвечают на вопрос «как дела у отдела»; вопрос «как
+ * дела у Петровой» требует, чтобы они лежали рядом.
+ *
+ * Кто такой сотрудник — выбирается: имя из журнала АТС (самое точное),
+ * метка говорящего в записи, ключ доступа, очередь или станция.
+ * ===================================================================== */
+
+//: Колонки таблицы сотрудников: ключ, подпись, знаков, куда лучше, подсказка.
+const СОТРУДНИК_КОЛОНКИ = [
+  ['records', 'Записей', 0, 0, 'разобранных разговоров за период'],
+  ['calls', 'Звонков', 0, 0, 'по журналу АТС, включая нераспознанные'],
+  ['talk_s', 'Наговорено', 0, 0, 'суммарное время разговоров'],
+  ['agent_score', 'Балл', 0, 1, 'скрипт с весами минус штрафы'],
+  ['sentiment', 'Тональность', 2, 1, 'средняя окраска разговора'],
+  ['mood', 'Настроение клиента', 2, 1, 'по репликам клиента, от −1 до +1'],
+  ['stress', 'Напряжение', 0, -1, 'резкие реплики, перебивания, раздражение'],
+  ['effort', 'Усилие клиента', 1, 1, 'минус — клиенту пришлось пробиваться'],
+  ['fatigue', 'Усталость', 0, -1, 'падение темпа и рост пауз к концу разговора'],
+  ['clarity', 'Понятность', 0, 1, 'длина фраз, канцелярит, темп, паразиты'],
+  ['accuracy', 'Точность', 0, 1, 'конкретика против «наверное» и «где-то так»'],
+  ['politeness', 'Вежливость', 0, 1, 'формулы вежливости против обрывающих оборотов'],
+  ['personalization', 'Персонализация', 0, 1, 'имя клиента и отсылки к сказанному'],
+  ['rhythm', 'Ритмичность', 0, 1, 'ровность темпа и пауз'],
+  ['filler_rate', 'Паразиты', 4, -1, 'доля слов-паразитов в речи'],
+  ['diminutive_rate', 'Уменьшительные', 4, -1, '«секундочку», «договорчик»'],
+  ['empathy', 'Эмпатия', 0, 1, '(вежливых − невежливых) ÷ сумму'],
+  ['compliance', 'Скрипт', 2, 1, 'доля выполненных пунктов'],
+  ['nps_index', 'Индекс NPS', 0, 1, 'промоутеры минус критики'],
+  ['violation_share', 'Нарушений, %', 1, -1, 'доля записей со стоп-словами'],
+];
+
+//: Наборы колонок. Двадцать показателей в одной таблице не читаются: на
+//: экране помещается половина, и человек листает вбок вместо того, чтобы
+//: сравнивать. Набор выбирается под вопрос, с которым пришли.
+const СОТРУДНИК_НАБОРЫ = [
+  { key: 'main', title: 'Главное',
+    columns: ['records', 'calls', 'talk_s', 'agent_score', 'mood', 'stress',
+              'clarity', 'nps_index'] },
+  { key: 'speech', title: 'Речь',
+    columns: ['records', 'clarity', 'accuracy', 'rhythm', 'filler_rate',
+              'diminutive_rate', 'fatigue'] },
+  { key: 'clients', title: 'Клиенты',
+    columns: ['records', 'sentiment', 'mood', 'stress', 'effort', 'nps_index'] },
+  { key: 'script', title: 'Скрипт и вежливость',
+    columns: ['records', 'agent_score', 'compliance', 'politeness',
+              'personalization', 'empathy', 'violation_share'] },
+  { key: 'calls', title: 'Звонки',
+    columns: ['records', 'calls', 'talk_s'] },
+  { key: 'all', title: 'Все показатели', columns: null },
+];
+
+//: Что рисовать на радаре сравнения с командой. Шкала у всех 0–100 и
+//: «больше — лучше»: складывать на одну картинку показатели с разными
+//: направлениями — способ получить красивую фигуру без смысла.
+const СОТРУДНИК_РАДАР = [
+  ['agent_score', 'Балл'], ['clarity', 'Понятность'], ['accuracy', 'Точность'],
+  ['politeness', 'Вежливость'], ['personalization', 'Персонализация'],
+  ['rhythm', 'Ритмичность'],
+];
+
+RENDERERS.employees = {
+  async render(root) {
+    if (!state.employeePeriod) state.employeePeriod = 'month';
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <span class="small dim">Период:</span>
+        <div class="group-nav" id="emp-period">
+          ${Object.entries(PERIOD_LABELS).filter(([k]) => k !== 'hour').map(([k, v]) =>
+            `<button data-period="${k}" class="${state.employeePeriod === k ? 'active' : ''}">${
+              esc(v[0].toUpperCase() + v.slice(1))}</button>`).join('')}
+        </div>
+        <select id="emp-by" style="width:190px"
+          title="Чем считать сотрудника: именем из журнала АТС, меткой говорящего в записи или ключом доступа">
+        </select>
+        <div class="group-nav" id="emp-cols">
+          ${СОТРУДНИК_НАБОРЫ.map((н) => `<button data-cols="${н.key}"
+            class="${(state.employeeCols || 'main') === н.key ? 'active' : ''}"
+            title="Набор столбцов под вопрос, с которым пришли">${esc(н.title)}</button>`).join('')}
+        </div>
+        <span class="spacer"></span>
+        <input type="search" id="emp-search" placeholder="сотрудник"
+          value="${esc(state.employeeSearch || '')}" style="width:190px">
+        <button class="ghost sm" id="emp-export"
+          title="Выгрузить таблицу в CSV — для сводного отчёта">CSV</button>
+        <button class="ghost sm" id="emp-refresh" title="Обновить данные раздела">Обновить</button>
+      </div>
+      <div id="emp-top"></div>
+      <div id="emp-body"><div class="empty">Загрузка…</div></div>
+      <div id="emp-card"></div>`;
+
+    qsa('#emp-period button').forEach((b) => b.addEventListener('click', () => {
+      state.employeePeriod = b.dataset.period;
+      qsa('#emp-period button').forEach((x) => x.classList.toggle('active', x === b));
+      this.load();
+    }));
+    const выбор = qs('#emp-by');
+    if (выбор) выбор.addEventListener('change', () => {
+      state.employeeBy = выбор.value;
+      state.employeeKey = '';
+      this.load();
+    });
+    qsa('#emp-cols button').forEach((b) => b.addEventListener('click', () => {
+      state.employeeCols = b.dataset.cols;
+      qsa('#emp-cols button').forEach((x) => x.classList.toggle('active', x === b));
+      this.drawTable();
+    }));
+    qs('#emp-refresh').addEventListener('click', () => this.load());
+    qs('#emp-export').addEventListener('click', () => this.exportCsv());
+    const поиск = qs('#emp-search');
+    let таймер = null;
+    if (поиск) поиск.addEventListener('input', () => {
+      clearTimeout(таймер);
+      таймер = setTimeout(() => {
+        state.employeeSearch = поиск.value.trim();
+        this.drawTable();
+      }, 250);
+    });
+    await this.load();
+  },
+
+  async load() {
+    const тело = qs('#emp-body');
+    if (тело && !state.employeeData) тело.innerHTML = '<div class="empty">Загрузка…</div>';
+    try {
+      state.employeeData = await API.latest('employees',
+        `/api/content/employees?by=${state.employeeBy}&period=${state.employeePeriod}`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      if (тело) тело.innerHTML = `<div class="empty">Раздел недоступен: ${
+        esc(err.message || '')}</div>`;
+      return;
+    }
+    const выбор = qs('#emp-by');
+    if (выбор) выбор.innerHTML = (state.employeeData.dimensions || []).map((р) =>
+      `<option value="${esc(р.key)}"${р.key === state.employeeBy ? ' selected' : ''}>${
+        esc(р.title)}</option>`).join('');
+    this.drawTop();
+    this.drawTable();
+    if (state.employeeKey) await this.openCard(state.employeeKey);
+  },
+
+  drawTop() {
+    const место = qs('#emp-top');
+    const д = state.employeeData || {};
+    const к = д.team || {};
+    if (!место) return;
+    const люди = д.items || [];
+    const сравнимые = люди.filter((ч) => !ч.sparse);
+    место.innerHTML = `
+      <section class="card" style="margin-bottom:12px">
+        <div class="card-head"><h3>Команда</h3>
+          <span class="chip">${num(люди.length, 0)} ${
+            plural(люди.length, 'сотрудник', 'сотрудника', 'сотрудников')}</span>
+          ${люди.length - сравнимые.length ? `<span class="chip warn"
+            title="меньше пяти разобранных разговоров за период — средние по ним ещё ни о чём не говорят">${
+            люди.length - сравнимые.length} с малыми данными</span>` : ''}
+          <span class="spacer"></span>
+          <span class="small dim">средние по команде — опора для сравнения</span>
+        </div>
+        <div class="grid cols-6" style="padding:14px 16px">
+          ${kpi('Разговоров', num(к.records || 0, 0), `${num(к.hours || 0, 1)} ч звука`)}
+          ${kpi('Балл оператора', к.agent_score === null || к.agent_score === undefined
+                  ? '—' : num(к.agent_score, 0), 'среднее по команде')}
+          ${kpi('Настроение клиента', к.mood === null || к.mood === undefined
+                  ? '—' : num(к.mood, 2), 'от −1 до +1')}
+          ${kpi('Напряжение', к.stress === null || к.stress === undefined
+                  ? '—' : num(к.stress, 0), 'чем меньше, тем спокойнее')}
+          ${kpi('Понятность речи', к.clarity === null || к.clarity === undefined
+                  ? '—' : num(к.clarity, 0), 'из 100')}
+          ${kpi('Индекс NPS', к.nps_index === null || к.nps_index === undefined
+                  ? '—' : num(к.nps_index, 0), 'промоутеры минус критики')}
+        </div>
+      </section>`;
+  },
+
+  drawTable() {
+    const место = qs('#emp-body');
+    const д = state.employeeData || {};
+    if (!место) return;
+    let люди = д.items || [];
+    const искомое = (state.employeeSearch || '').toLowerCase();
+    if (искомое) {
+      люди = люди.filter((ч) => String(ч.label || ч.key || '').toLowerCase().includes(искомое));
+    }
+    if (!люди.length) {
+      место.innerHTML = `<div class="empty">${искомое
+        ? 'Никто не найден'
+        : 'За период разобранных разговоров нет. Сотрудник берётся из журнала АТС — '
+          + 'проверьте, что записи приезжают с полем оператора.'}</div>`;
+      return;
+    }
+    const ключ = state.employeeSort || 'records';
+    const направление = state.employeeSortDesc === false ? 1 : -1;
+    люди = люди.slice().sort((a, b) => {
+      const х = a[ключ], у = b[ключ];
+      if (х === у) return 0;
+      if (х === null || х === undefined) return 1;
+      if (у === null || у === undefined) return -1;
+      return (х > у ? 1 : -1) * направление;
+    });
+    const команда = д.team || {};
+    const колонки = this.columns();
+    место.innerHTML = `
+      <section class="card">
+        <div class="card-head"><h3>Сотрудники</h3>
+          <span class="hint">строка ведёт в карточку · заголовок столбца сортирует</span>
+          <span class="spacer"></span>
+          <span class="small dim">цветом — отличие от команды</span>
+        </div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Сотрудник</th>${колонки.map(([к, имя, , , подсказка]) =>
+            `<th class="num sortable" data-sort="${к}" title="${esc(подсказка)}"
+               style="cursor:pointer">${esc(имя)}${ключ === к ? (направление < 0 ? ' ↓' : ' ↑') : ''}</th>`
+            ).join('')}</tr></thead>
+          <tbody>${люди.map((ч) => this.row(ч, команда, колонки)).join('')}</tbody>
+        </table></div>
+      </section>`;
+    qsa('#emp-body th[data-sort]').forEach((з) => з.addEventListener('click', () => {
+      if (state.employeeSort === з.dataset.sort) state.employeeSortDesc = state.employeeSortDesc === false;
+      else { state.employeeSort = з.dataset.sort; state.employeeSortDesc = true; }
+      this.drawTable();
+    }));
+    qsa('#emp-body tr[data-key]').forEach((строка) => строка.addEventListener('click',
+      () => this.openCard(строка.dataset.key)));
+  },
+
+  /* Колонки выбранного набора. «Все показатели» — это весь перечень:
+   * таблица уедет вбок, и это осознанный выбор человека, а не то, что мы
+   * показываем по умолчанию. */
+  columns() {
+    const набор = СОТРУДНИК_НАБОРЫ.find((н) => н.key === (state.employeeCols || 'main'))
+      || СОТРУДНИК_НАБОРЫ[0];
+    if (!набор.columns) return СОТРУДНИК_КОЛОНКИ;
+    return набор.columns
+      .map((к) => СОТРУДНИК_КОЛОНКИ.find((с) => с[0] === к))
+      .filter(Boolean);
+  },
+
+  row(ч, команда, колонки) {
+    const клетка = ([к, , знаков, лучше]) => {
+      const значение = ч[к];
+      if (значение === null || значение === undefined) return '<td class="num dim">—</td>';
+      const показать = к === 'talk_s' ? fmtDur(значение) : num(значение, знаков);
+      const общее = команда[к];
+      let класс = '';
+      if (лучше && общее !== null && общее !== undefined && !ч.sparse) {
+        const разница = (значение - общее) * лучше;
+        const порог = Math.abs(общее || 1) * 0.12;
+        класс = разница > порог ? 'good' : разница < -порог ? 'bad' : '';
+      }
+      return `<td class="num ${класс}">${показать}</td>`;
+    };
+    return `<tr data-key="${esc(ч.key)}" style="cursor:pointer">
+      <td><b>${esc(ч.key === '—' ? 'без оператора' : (ч.label || ч.key))}</b>
+        ${ч.sparse ? '<span class="chip warn" title="меньше пяти разобранных разговоров: средние по ним ещё ни о чём не говорят">мало данных</span>' : ''}
+      </td>
+      ${(колонки || СОТРУДНИК_КОЛОНКИ).map(клетка).join('')}
+    </tr>`;
+  },
+
+  /* Карточка: тот же набор, что у вкладки «Операторы», плюс новые
+   * показатели и телефония. Открывается под таблицей, а не вместо неё:
+   * сравнение с соседями — половина смысла разговора о сотруднике. */
+  async openCard(ключ) {
+    state.employeeKey = ключ;
+    const место = qs('#emp-card');
+    if (!место) return;
+    место.innerHTML = '<div class="empty">Загрузка карточки…</div>';
+    let карточка;
+    try {
+      карточка = await API.latest('employee-card',
+        `/api/content/agents/${encodeURIComponent(ключ)}`
+        + `?by=${state.employeeBy}&period=${state.employeePeriod}`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      место.innerHTML = `<div class="empty">Карточка недоступна: ${esc(err.message || '')}</div>`;
+      return;
+    }
+    const свой = карточка.summary || {};
+    const строка = (state.employeeData.items || []).find((ч) => ч.key === ключ) || {};
+    место.innerHTML = `
+      <section class="card" style="margin-top:14px">
+        <div class="card-head">
+          <h3>${esc(строка.label || ключ)}</h3>
+          ${строка.sparse ? '<span class="chip warn">мало данных</span>' : ''}
+          <span class="chip">${num(свой.records || 0, 0)} ${
+            plural(свой.records || 0, 'разговор', 'разговора', 'разговоров')}</span>
+          ${строка.calls ? `<span class="chip">${num(строка.calls, 0)} звонков · ${
+            fmtDur(строка.talk_s || 0)}</span>` : ''}
+          <span class="spacer"></span>
+          ${state.employeeBy === 'agent' ? `<button class="ghost sm" id="emp-calls"
+            title="Звонки этого сотрудника в журнале">Звонки</button>` : ''}
+          <button class="ghost icon" id="emp-close" aria-label="Закрыть" title="Закрыть карточку">✕</button>
+        </div>
+        <div class="grid cols-2" style="padding:14px 16px">
+          <div><h4 style="margin:0 0 8px;font-size:13px">Против команды</h4>
+            <div id="emp-radar"></div></div>
+          <div><h4 style="margin:0 0 8px;font-size:13px">Ход по неделям</h4>
+            <div id="emp-line"></div></div>
+        </div>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Показатель</th><th class="num">Сотрудник</th>
+            <th class="num">Команда</th><th class="num">Прошлый период</th>
+            <th class="num">Разница</th></tr></thead>
+          <tbody>${(карточка.compare || []).map((с) => `<tr>
+            <td>${esc(с.title)}</td>
+            <td class="num"><b>${с.agent === null || с.agent === undefined
+              ? '—' : num(с.agent, с.digits)}</b></td>
+            <td class="num dim">${с.team === null || с.team === undefined
+              ? '—' : num(с.team, с.digits)}</td>
+            <td class="num dim">${с.previous === null || с.previous === undefined
+              ? '—' : num(с.previous, с.digits)}</td>
+            <td class="num ${с.verdict === 'better' ? 'good' : с.verdict === 'worse' ? 'bad' : ''}">${
+              с.delta === null || с.delta === undefined ? '—'
+                : `${с.delta > 0 ? '+' : '−'}${num(Math.abs(с.delta), с.digits)}`}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+        ${(карточка.violations || []).length ? `
+          <div style="padding:12px 16px"><h4 style="margin:0 0 8px;font-size:13px">Нарушения</h4>
+          <div class="row wrap" style="gap:6px">${карточка.violations.map((н) =>
+            `<span class="chip err">${esc(н.label || н.category)}: ${num(н.records, 0)}</span>`).join('')}</div></div>` : ''}
+        <div class="grid cols-2" style="padding:12px 16px">
+          <div><h4 style="margin:0 0 8px;font-size:13px">Разобрать с сотрудником</h4>
+            ${(карточка.coaching || []).length ? `<div class="stack">${
+              карточка.coaching.slice(0, 8).map((з) => `<div class="row small" style="gap:8px">
+                <a href="#" onclick="__asrhub.openJob('${esc(з.job_id || з.id)}');return false"
+                   title="${esc(з.filename || з.job_id || '')}">${
+                  esc((з.filename || з.job_id || '').slice(0, 34))}</a>
+                <span class="spacer"></span>
+                ${(з.reasons || []).slice(0, 2).map((п) =>
+                  `<span class="chip warn">${esc(п)}</span>`).join('')}
+              </div>`).join('')}</div>`
+              : '<div class="empty small">Поводов для разбора не нашлось</div>'}</div>
+          <div><h4 style="margin:0 0 8px;font-size:13px">Лучшие разговоры</h4>
+            ${(карточка.best || []).length ? `<div class="stack">${
+              карточка.best.slice(0, 8).map((з) => `<div class="row small" style="gap:8px">
+                <a href="#" onclick="__asrhub.openJob('${esc(з.job_id || з.id)}');return false"
+                   title="${esc(з.filename || з.job_id || '')}">${
+                  esc((з.filename || з.job_id || '').slice(0, 34))}</a>
+                <span class="spacer"></span>
+                <span class="chip ok">балл ${num(з.agent_score, 0)}</span>
+              </div>`).join('')}</div>`
+              : '<div class="empty small">Пока не из чего выбрать</div>'}</div>
+        </div>
+      </section>`;
+
+    const команда = карточка.team || {};
+    Charts.hbars(qs('#emp-radar'), {
+      items: СОТРУДНИК_РАДАР.filter(([к]) => свой[к] !== null && свой[к] !== undefined)
+        .map(([к, имя]) => ({
+          label: имя, value: Math.round((свой[к] || 0) - (команда[к] || 0)),
+          // Коротко: столбец и так показывает знак и величину, а «против»
+          // словами уезжало влево и наползало на подпись строки.
+          display: `${num(свой[к], 0)} / ${команда[к] === null
+            || команда[к] === undefined ? '—' : num(команда[к], 0)}`,
+          note: `${имя}: у сотрудника ${num(свой[к], 0)}, по команде ${
+            команда[к] === null || команда[к] === undefined ? '—' : num(команда[к], 0)}`,
+        })),
+      labelWidth: 170, emptyText: 'Показателей для сравнения пока нет',
+    });
+    const ход = карточка.timeline || [];
+    Charts.line(qs('#emp-line'), {
+      labels: ход.map((т) => fmtBucket(т.ts, карточка.step_s || 604800)),
+      series: [
+        { name: 'балл', values: ход.map((т) => т.agent_score ?? null) },
+        { name: 'понятность', values: ход.map((т) => т.clarity ?? null) },
+        { name: 'напряжение', values: ход.map((т) => т.stress ?? null) },
+      ],
+      height: 220, yMin: 0, emptyText: 'Истории пока нет',
+    });
+    const закрыть = qs('#emp-close');
+    if (закрыть) закрыть.addEventListener('click', () => {
+      state.employeeKey = '';
+      место.innerHTML = '';
+    });
+    const звонки = qs('#emp-calls');
+    if (звонки) звонки.addEventListener('click', () => {
+      state.telAgent = ключ;
+      go('telephony');
+    });
+    место.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  },
+
+  /* Выгрузка таблицы: то же, что на экране, и ровно теми же числами.
+   * Собирается во вкладке, а не на сервере: отчёт по сотрудникам сводят
+   * в таблице, и ждать ради этого ответа сервера незачем. */
+  exportCsv() {
+    const д = state.employeeData || {};
+    const строки = [['Сотрудник', ...СОТРУДНИК_КОЛОНКИ.map(([, имя]) => имя)]];
+    (д.items || []).forEach((ч) => строки.push([
+      ч.label || ч.key,
+      ...СОТРУДНИК_КОЛОНКИ.map(([к]) => {
+        const з = ч[к];
+        return з === null || з === undefined ? '' : String(з).replace('.', ',');
+      }),
+    ]));
+    // Точка с запятой и BOM — чтобы Excel открыл файл как таблицу, а не
+    // одной колонкой: с запятой и русской локалью он так и делает.
+    const текст = '﻿' + строки.map((с) => с.map((з) =>
+      `"${String(з).replace(/"/g, '""')}"`).join(';')).join('\r\n');
+    const ссылка = document.createElement('a');
+    ссылка.href = URL.createObjectURL(new Blob([текст], { type: 'text/csv;charset=utf-8' }));
+    ссылка.download = `сотрудники-${state.employeePeriod}.csv`;
+    document.body.appendChild(ссылка);
+    ссылка.click();
+    setTimeout(() => { URL.revokeObjectURL(ссылка.href); ссылка.remove(); }, 1000);
+  },
+};
+
 // ==========================================================================
 // Вид: Сервер
 // ==========================================================================
@@ -7716,6 +9823,8 @@ RENDERERS.system = {
     state.system = sys;
     const hw = sys.hardware;
     const gpu = (hw.gpus || [])[0];
+    // Сведения о базе и путях /api/system отдаёт только администратору.
+    const база = sys.database;
 
     root.innerHTML = `
       <div class="grid cols-4" style="margin-bottom:16px">
@@ -7724,7 +9833,11 @@ RENDERERS.system = {
         ${kpi('Оперативная память', `${hw.ram_total_gb} ГБ`,
               `доступно ${hw.ram_available_gb} ГБ`)}
         ${kpi('Свободно на диске', `${hw.disk_free_gb} ГБ`,
-              `база: ${sys.database.size_mb} МБ`)}
+              // База и пути приходят только администратору: /api/system прячет
+              // их от остальных. Раздел читал их без проверки и падал целиком
+              // с «can't access property size_mb» — то есть неадминистратор
+              // видел вместо страницы пустоту, а в консоли ошибку.
+              база ? `база: ${num(база.size_mb, 1)} МБ` : '')}
         ${kpi('Время работы', fmtDur(sys.uptime_s), `версия ${sys.version}`)}
       </div>
 
@@ -7787,14 +9900,16 @@ RENDERERS.system = {
         </tbody></table></div>`)}
 
       <div class="grid cols-2">
-        ${card('Хранилище и пути', '', `<table>
-          ${Object.entries(sys.paths).map(([k, v]) =>
+        ${card('Хранилище и пути', '', !база ? `<div class="empty small">
+            Раскладка хранилища и размер базы доступны только администратору.</div>`
+          : `<table>
+          ${Object.entries(sys.paths || {}).map(([k, v]) =>
             `<tr><td class="dim">${esc(k)}</td><td class="mono small">${esc(v)}</td></tr>`).join('')}
           <tr><td class="dim">Конфигурация</td><td class="mono small">${
             esc(sys.config_file || 'не используется')}</td></tr>
-          <tr><td class="dim">Заданий в базе</td><td class="num">${sys.database.jobs}</td></tr>
-          <tr><td class="dim">Сегментов</td><td class="num">${num(sys.database.segments)}</td></tr>
-          <tr><td class="dim">Метрик</td><td class="num">${num(sys.database.metrics)}</td></tr>
+          <tr><td class="dim">Заданий в базе</td><td class="num">${num(база.jobs)}</td></tr>
+          <tr><td class="dim">Сегментов</td><td class="num">${num(база.segments)}</td></tr>
+          <tr><td class="dim">Метрик</td><td class="num">${num(база.metrics)}</td></tr>
           </table>
           <div class="row" style="margin-top:10px">
             <button class="sm" id="btn-cleanup">Очистить старые данные</button>

@@ -145,7 +145,12 @@ class ContentIndex:
             duration_s=float(задание.get("media_duration_s") or 0.0),
             script=self._скрипт(), agent_speaker=self._оператор(),
             document_frequency=частоты, corpus_size=размер,
-            profanity=self._мат(), categories=self.categories())
+            profanity=self._мат(), categories=self.categories(),
+            # Уверенность распознавания входит в показатель точности речи:
+            # по плохо расслышанной записи судить о конкретности ответов
+            # нельзя, и без этой поправки хуже всех выглядели бы разговоры
+            # с плохой линией, а не с плохими ответами.
+            confidence=задание.get("avg_confidence"))
         свод, основы = content.features(разбор)
         if save:
             self.db.save_content(job_id, свод, основы)
@@ -270,7 +275,8 @@ class ContentIndex:
                     duration_s=float(запись.get("media_duration_s") or 0.0),
                     script=скрипт, agent_speaker=оператор,
                     document_frequency=частоты, corpus_size=корпус,
-                    profanity=мат, categories=набор)
+                    profanity=мат, categories=набор,
+                    confidence=запись.get("avg_confidence"))
                 свод, основы = content.features(разбор)
                 self.db.save_content(job_id, свод, основы)
                 # Здоровье распознавания у записей, сделанных до его

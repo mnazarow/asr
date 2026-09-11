@@ -2099,6 +2099,10 @@ def test_scheduled_work_waits_its_term_and_does_not_repeat(tmp_path: Path,
 
     Без неё копия делалась бы при каждом старте сервера, а сводка приходила
     бы по разу на перезапуск.
+
+    Первый заход на сервере, где копий ещё нет, копию снимает: ждать сутки
+    ради первой копии — значит сутки не иметь ни одной. Повторяться после
+    этого он не должен, и вот это и проверяется.
     """
     from asrhub import maintenance
     from asrhub.analytics import Analytics
@@ -2108,14 +2112,22 @@ def test_scheduled_work_waits_its_term_and_does_not_repeat(tmp_path: Path,
     настройки = _Настройки(данные, backup_interval_hours=24, backup_keep=3)
     аналитика = Analytics(database)
 
-    # Первый заход только ставит отметку: сервер только поднялся.
+    # Первый заход: копии нет ни одной — снимаем.
+    первый = maintenance.run_scheduled(database, настройки, аналитика)
+    assert первый.get("backup"), первый
+    # Сразу следом — уже нет: отметка легла в базу.
     assert maintenance.run_scheduled(database, настройки, аналитика) == {}
     assert maintenance.run_scheduled(database, настройки, аналитика) == {}
 
+    # Сутки прошли — снимаем следующую.
     database.set_kv(maintenance.KV_BACKUP, time.time() - 25 * 3600)
     итог = maintenance.run_scheduled(database, настройки, аналитика)
     assert итог.get("backup"), итог
-    # И сразу следом — уже нет.
+    assert maintenance.run_scheduled(database, настройки, аналитика) == {}
+
+    # Выключенное копирование не делает копий, сколько бы ни прошло.
+    настройки._v["backup_enabled"] = False
+    database.set_kv(maintenance.KV_BACKUP, time.time() - 300 * 3600)
     assert maintenance.run_scheduled(database, настройки, аналитика) == {}
 
 

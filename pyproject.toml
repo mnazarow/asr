@@ -41,6 +41,7 @@ ignore = [
 # оно превратило бы сотни слов в стену закавыченных строк: словарь, который
 # нельзя прочитать глазами, никто и не поправит.
 "server/asrhub/content/lexicons.py" = ["SIM905"]
+"server/asrhub/content/indices.py" = ["SIM905"]
 "server/asrhub/content/names.py" = ["SIM905"]
 
 [tool.pytest.ini_options]

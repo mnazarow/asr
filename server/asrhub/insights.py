@@ -168,6 +168,57 @@ log = get_logger("insights")
     {"key": "named_share", "title": "Обратился по имени", "unit": "% записей",
      "good": 1, "digits": 1,
      "hint": "доля записей, где оператор назвал клиента по имени; по словарю имён"},
+    # Показатели сверх тональности. Шкалы разные и оговорены в подсказке:
+    # у настроения −1…+1, у усилия −5…+5, у силы эмоции 1…5, у NPS 0…10,
+    # у остальных 0…100. У стресса и усталости больше — хуже, поэтому
+    # «good» у них отрицательный.
+    {"key": "mood", "title": "Настроение клиента", "unit": "от −1 до +1",
+     "good": 1, "digits": 2,
+     "hint": "средняя окраска реплик клиента; считается по его стороне, а не по разговору"},
+    {"key": "mood_shift", "title": "Сдвиг настроения", "unit": "", "good": 1,
+     "digits": 2,
+     "hint": "конец разговора минус начало: плюс — клиента отпустило, минус — наоборот"},
+    {"key": "recovered_share", "title": "Разговор выправился", "unit": "% записей",
+     "good": 1, "digits": 1,
+     "hint": "доля разговоров, где клиент к концу подобрел заметно"},
+    {"key": "intensity", "title": "Сила эмоции", "unit": "1–5", "good": 0,
+     "digits": 1,
+     "hint": "отдельно от знака: «слегка недоволен» и «в ярости» — разные разговоры (Qualtrics)"},
+    {"key": "stress", "title": "Напряжение", "unit": "0–100", "good": -1,
+     "digits": 0,
+     "hint": "резкие реплики, перебивания, речь поверх речи, раздражение, брань"},
+    {"key": "stress_high_share", "title": "Разговоров на нервах", "unit": "% записей",
+     "good": -1, "digits": 1, "hint": "доля записей с напряжением 55 и выше"},
+    {"key": "effort", "title": "Усилие клиента", "unit": "от −5 до +5", "good": 1,
+     "digits": 1,
+     "hint": "минус — клиенту пришлось пробиваться; шкала усилия (Qualtrics, CEB)"},
+    {"key": "fatigue", "title": "Усталость оператора", "unit": "0–100", "good": -1,
+     "digits": 0,
+     "hint": "падение темпа, рост пауз и паразитов к концу разговора"},
+    {"key": "clarity", "title": "Понятность речи", "unit": "0–100", "good": 1,
+     "digits": 0,
+     "hint": "длина фраз, канцелярит, темп и паразиты в речи оператора"},
+    {"key": "accuracy", "title": "Точность ответов", "unit": "0–100", "good": 1,
+     "digits": 0,
+     "hint": "конкретика (числа, сроки, документы) против «наверное» и «где-то так»"},
+    {"key": "politeness", "title": "Вежливость", "unit": "0–100", "good": 1,
+     "digits": 0,
+     "hint": "формулы вежливости против обрывающих оборотов, по репликам оператора"},
+    {"key": "personalization", "title": "Персонализация", "unit": "0–100",
+     "good": 1, "digits": 0,
+     "hint": "обращение по имени и отсылки к тому, что клиент уже говорил"},
+    {"key": "rhythm", "title": "Ритмичность речи", "unit": "0–100", "good": 1,
+     "digits": 0,
+     "hint": "ровность темпа и пауз: рваную речь слушать тяжелее при том же темпе"},
+    {"key": "diminutive_rate", "title": "Уменьшительно-ласкательные",
+     "unit": "доля слов", "good": -1, "digits": 4,
+     "hint": "«секундочку», «договорчик»: в деловом разговоре звучат снисходительно"},
+    {"key": "nps", "title": "NPS разговора", "unit": "0–10", "good": 1,
+     "digits": 1,
+     "hint": "названный клиентом балл, а где его не спрашивали — предсказанный"},
+    {"key": "nps_index", "title": "Индекс NPS", "unit": "от −100 до +100",
+     "good": 1, "digits": 0,
+     "hint": "доля промоутеров минус доля критиков (Райхельд)"},
 ]
 ПРИЗНАКИ_ПО_КЛЮЧУ = {п["key"]: п for п in ПРИЗНАКИ}
 
@@ -200,6 +251,13 @@ log = get_logger("insights")
 РАЗРЕЗЫ: dict[str, dict[str, Any]] = {
     "owner": {"title": "Владелец"},
     "speaker": {"title": "Оператор"},
+    # Разрезы из журнала АТС: настоящее имя сотрудника, его очередь и
+    # станция. «Говорящий 1» — техническая метка внутри записи, а здесь
+    # тот, кто действительно взял трубку.
+    "agent": {"title": "Сотрудник"},
+    "queue": {"title": "Очередь"},
+    "station": {"title": "АТС"},
+    "direction": {"title": "Направление звонка"},
     "tag": {"title": "Метка", "multi": True},
     # Запись про оплату и доставку входит в обе группы: суммы по разрезу
     # больше числа записей, и это не ошибка — так же, как у меток.
@@ -312,6 +370,20 @@ _ДНИ = ("воскресенье", "понедельник", "вторник",
 }
 
 
+def _индекс_nps(промоутеров: Any, критиков: Any, всего: Any) -> int | None:
+    """Индекс NPS: доля промоутеров минус доля критиков, −100…+100.
+
+    Нейтралы в формулу не входят — так её и задумал Райхельд: нейтрал не
+    вредит и не помогает, и его вес в индексе нулевой. Пусто, когда
+    считать не по чему: ноль здесь читался бы как «промоутеров и критиков
+    поровну», а это другое утверждение.
+    """
+    знаменатель = int(всего or 0)
+    if знаменатель <= 0:
+        return None
+    return int(round((int(промоутеров or 0) - int(критиков or 0)) * 100 / знаменатель))
+
+
 def _округлить(значение: Any, знаков: int = 4) -> Any:
     if значение is None:
         return None
@@ -389,6 +461,17 @@ _ВЕС_СРЕДНЕГО: dict[str, str] = {
     "sentiment_shift": "scored",
     "agent_score": "scored_agents",
     "empathy": "scored_agents",
+    # Показатели сверх тональности считаются не по всякой записи, и вес у
+    # них свой. По числу записей получалось так: сто записей с понятностью,
+    # измеренной у двух, весили в десять раз больше десяти записей, где она
+    # измерена у всех, — и среднее по метке уезжало вдвое.
+    "stress": "stress_checked",
+    "clarity": "clarity_checked",
+    "accuracy": "accuracy_checked",
+    "politeness": "politeness_checked",
+    "rhythm": "rhythm_checked",
+    "fatigue": "fatigue_checked",
+    "nps": "nps_checked",
 }
 
 
@@ -505,6 +588,47 @@ class Insights:
             "name_checked": int(строка.get("name_checked") or 0),
             "named_share": (_процент(строка.get("named"), строка.get("name_checked"))
                             if int(строка.get("name_checked") or 0) else None),
+            # Показатели сверх тональности: доли и знаменатели. Знаменатель
+            # у каждого свой — показатель считается не по всякой записи, и
+            # среднее по трём записям из тысячи нельзя подавать как среднее
+            # по отделу.
+            "stress_checked": int(строка.get("stress_checked") or 0),
+            "stress_high": int(строка.get("stress_high") or 0),
+            "stress_high_share": (_процент(строка.get("stress_high"),
+                                           строка.get("stress_checked"))
+                                  if int(строка.get("stress_checked") or 0) else None),
+            "recovered": int(строка.get("recovered") or 0),
+            "worsened": int(строка.get("worsened") or 0),
+            "recovered_share": _процент(строка.get("recovered"), всего),
+            "worsened_share": _процент(строка.get("worsened"), всего),
+            "effort_high": int(строка.get("effort_high") or 0),
+            "effort_high_share": _процент(строка.get("effort_high"), всего),
+            "clarity_checked": int(строка.get("clarity_checked") or 0),
+            "clarity_low": int(строка.get("clarity_low") or 0),
+            "clarity_low_share": (_процент(строка.get("clarity_low"),
+                                           строка.get("clarity_checked"))
+                                  if int(строка.get("clarity_checked") or 0) else None),
+            "accuracy_checked": int(строка.get("accuracy_checked") or 0),
+            "politeness_checked": int(строка.get("politeness_checked") or 0),
+            "rhythm_checked": int(строка.get("rhythm_checked") or 0),
+            "fatigue_checked": int(строка.get("fatigue_checked") or 0),
+            "diminutives": int(строка.get("diminutives") or 0),
+            "diminutive_records": int(строка.get("diminutive_records") or 0),
+            "diminutive_share": _процент(строка.get("diminutive_records"), всего),
+            # NPS. Индекс — по Райхельду: доля промоутеров минус доля
+            # критиков. Названный клиентом балл держится отдельным числом:
+            # выдать предсказание за опрос — значит соврать в отчёте.
+            "nps_checked": int(строка.get("nps_checked") or 0),
+            "promoters": int(строка.get("promoters") or 0),
+            "passives": int(строка.get("passives") or 0),
+            "detractors": int(строка.get("detractors") or 0),
+            "nps_index": _индекс_nps(строка.get("promoters"), строка.get("detractors"),
+                                     строка.get("nps_checked")),
+            "nps_stated_count": int(строка.get("nps_stated_count") or 0),
+            "nps_stated_avg": _округлить(строка.get("nps_stated_avg"), 2),
+            "nps_stated_index": _индекс_nps(строка.get("promoters_stated"),
+                                            строка.get("detractors_stated"),
+                                            строка.get("nps_stated_count")),
         }
         for признак in ПРИЗНАКИ:
             ключ = признак["key"]
@@ -516,8 +640,15 @@ class Insights:
 
     def breakdown(self, dimension: str = "owner", period: str = "week",
                   owner: str | list[str] | None = None,
-                  limit: int = 50) -> dict[str, Any]:
-        """Один разрез корпуса: те же показатели по группам."""
+                  limit: int = 50, min_records: int | None = None) -> dict[str, Any]:
+        """Один разрез корпуса: те же показатели по группам.
+
+        `min_records` — со скольких записей группу показывать. По умолчанию
+        МИН_ГРУППА: средние по двум записям — это не показатель разреза, и
+        в общих отчётах такие группы только сбивают. В отчёте по
+        сотрудникам порог снимают: там нужны все, а «мало данных» —
+        отдельная пометка рядом с именем, а не повод спрятать человека.
+        """
         описание = РАЗРЕЗЫ.get(dimension)
         if описание is None:
             return {"dimension": dimension, "title": dimension, "items": []}
@@ -546,12 +677,18 @@ class Insights:
         items = []
         for ключ, строка in группы:
             свод = self._свод(строка)
-            if свод["records"] < МИН_ГРУППА and not описание.get("ordered"):
+            порог = МИН_ГРУППА if min_records is None else max(1, int(min_records))
+            if свод["records"] < порог and not описание.get("ordered"):
                 continue
             items.append({"key": ключ,
                           "label": подписи.get(ключ, {}).get("label")
                           or self._подпись(dimension, ключ),
                           **({"kind": подписи[ключ]["kind"]} if ключ in подписи else {}),
+                          # «Мало данных» — пометка, а не повод спрятать
+                          # человека: у сотрудника с тремя разговорами
+                          # средний балл 92 значит «мало данных», и увидеть
+                          # это можно только рядом с ним самим.
+                          "sparse": свод["records"] < МИН_ГРУППА,
                           **свод})
         отсеяно = len(группы) - len(items)
         if описание.get("ordered"):
@@ -666,6 +803,21 @@ class Insights:
                 "alerts": int(с.get("alerts") or 0),
                 "compliance": _округлить(с.get("compliance"), 3),
                 "wpm": _округлить(с.get("wpm"), 0),
+                # Показатели сверх тональности — тем же рядом: вкладки
+                # «Эмоциональный фон», «Понятность» и «NPS» рисуют ход по
+                # ним, и отдельный запрос ради тех же корзин был бы вторым
+                # проходом по тому же окну.
+                "mood": _округлить(с.get("mood"), 3),
+                "stress": _округлить(с.get("stress"), 0),
+                "effort": _округлить(с.get("effort"), 1),
+                "fatigue": _округлить(с.get("fatigue"), 0),
+                "clarity": _округлить(с.get("clarity"), 0),
+                "accuracy": _округлить(с.get("accuracy"), 0),
+                "politeness": _округлить(с.get("politeness"), 0),
+                "rhythm": _округлить(с.get("rhythm"), 0),
+                "nps": _округлить(с.get("nps"), 1),
+                "nps_index": _индекс_nps(с.get("promoters"), с.get("detractors"),
+                                         с.get("nps_checked")),
             })
         return {"buckets": точки, "step_s": round(шаг, 1),
                 "from": round(начало, 1), "to": round(конец, 1)}
@@ -1025,6 +1177,21 @@ class Insights:
         ("objections_unhandled_share", "Возражений без отработки, %", -1, 1),
         ("frustrated_share", "Клиент раздражён, %", -1, 1),
         ("duration_s", "Длительность, с", 0, 0),
+        # Показатели сверх тональности — теми же тремя колонками «своё,
+        # команда, разница»: именно в сравнении с командой они и читаются.
+        ("mood", "Настроение клиента", 1, 2),
+        ("stress", "Напряжение", -1, 0),
+        ("effort", "Усилие клиента", 1, 1),
+        ("fatigue", "Усталость к концу разговора", -1, 0),
+        ("clarity", "Понятность речи", 1, 0),
+        ("accuracy", "Точность ответов", 1, 0),
+        ("politeness", "Вежливость", 1, 0),
+        ("personalization", "Персонализация", 1, 0),
+        ("rhythm", "Ритмичность речи", 1, 0),
+        ("filler_rate", "Слова-паразиты", -1, 4),
+        ("diminutive_rate", "Уменьшительно-ласкательные", -1, 4),
+        ("nps", "NPS разговора", 1, 1),
+        ("nps_index", "Индекс NPS", 1, 0),
     )
 
     #: Причины попадания в очередь коучинга — по полям записи.
@@ -1114,7 +1281,17 @@ class Insights:
                         "agent_score": _округлить(с.get("agent_score"), 1),
                         "sentiment": _округлить(с.get("sentiment"), 3),
                         "empathy": _округлить(с.get("empathy"), 1),
-                        "violation_records": int(с.get("violation_records") or 0)})
+                        "violation_records": int(с.get("violation_records") or 0),
+                        # Новые показатели тем же рядом: смотреть на них
+                        # в динамике важнее, чем на срез — по срезу не
+                        # отличить «всегда так» от «стало так на неделе».
+                        "stress": _округлить(с.get("stress"), 0),
+                        "clarity": _округлить(с.get("clarity"), 0),
+                        "accuracy": _округлить(с.get("accuracy"), 0),
+                        "politeness": _округлить(с.get("politeness"), 0),
+                        "fatigue": _округлить(с.get("fatigue"), 0),
+                        "nps": _округлить(с.get("nps"), 1),
+                        "mood": _округлить(с.get("mood"), 3)})
         подписи = self._подписи_категорий()
         нарушения = [{**н, "label": подписи.get(н["category"], {}).get("label", н["category"])}
                      for н in self.db.agent_violations(since=начало, owner=owner,
@@ -1132,6 +1309,56 @@ class Insights:
             "violations": нарушения, "worst": худшие, "best": лучшие,
             "coaching": очередь["items"], "coaching_total": очередь["total"],
         }
+
+    def employees(self, by: str = "agent", period: str = "week",
+                  owner: str | list[str] | None = None,
+                  limit: int = 200) -> dict[str, Any]:
+        """Все сотрудники со всеми показателями — таблица раздела.
+
+        К показателям разбора добавляются телефонные: сколько звонков,
+        сколько наговорено, какая доля отвеченных. Одно без другого
+        обманывает: у сотрудника с тремя разговорами за неделю средний
+        балл 92 — это не «лучший», а «мало данных», и увидеть это можно
+        только рядом с числом звонков.
+        """
+        if by not in Database.AGENT_DIMENSIONS:
+            raise ValueError(f"неизвестный разрез оператора: {by}")
+        начало, прошлое = self.window(period)
+        разрез = self.breakdown(by, period, owner, limit=limit, min_records=1)
+        прошлые = {}
+        if начало is not None:
+            for строка in self.db.content_aggregate(
+                    since=прошлое, until=начало, owner=owner, group_by=by, limit=limit):
+                прошлые[str(строка.get("group_key") or "—")] = self._свод(строка)
+        звонки = {}
+        if by in ("agent", "queue", "station"):
+            поле = {"agent": "agent", "queue": "queue", "station": "station"}[by]
+            for строка in self.db.call_tops(поле, owner=owner, since=начало, limit=limit):
+                звонки[строка["value"]] = строка
+        команда = self.summary(period, owner)
+        люди = []
+        for пункт in разрез["items"]:
+            ключ = str(пункт.get("key") or пункт.get("group_key") or "—")
+            свои_звонки = звонки.get(ключ) or {}
+            прошлое_своё = прошлые.get(ключ) or {}
+            люди.append({
+                **пункт, "key": ключ,
+                "calls": свои_звонки.get("count"),
+                "talk_s": свои_звонки.get("talk_s"),
+                "avg_call_s": свои_звонки.get("avg_s"),
+                "answered": свои_звонки.get("answered"),
+                "answered_share": (_процент(свои_звонки.get("answered"),
+                                            свои_звонки.get("count"))
+                                   if свои_звонки.get("count") else None),
+                "previous": {к: прошлое_своё.get(к) for к in
+                             ("agent_score", "sentiment", "stress", "clarity",
+                              "accuracy", "politeness", "nps_index", "records")},
+            })
+        return {"by": by, "period": period, "items": люди,
+                "team": команда, "hidden": разрез.get("hidden", 0),
+                "dimensions": [{"key": к, "title": (РАЗРЕЗЫ.get(к) or {}).get("title", к)}
+                               for к in Database.AGENT_DIMENSIONS],
+                "metrics": list(ПРИЗНАКИ)}
 
     def coaching(self, period: str = "week", owner: str | list[str] | None = None,
                  *, agent: tuple[str, str] | None = None, limit: int = 50,

@@ -189,6 +189,9 @@ def _чисто(страница) -> None:
 
 @pytest.mark.parametrize("вкладка,что_ждём", [
     ("summary", "#tone-bar svg"),
+    ("emotion", "#emo-line svg"),
+    ("clarity", "#clr-line svg"),
+    ("nps", "#nps-bar svg"),
     ("categories", "#cat-table"),
     ("agents", "#agents-table"),
     ("groups", "#chart-by-owner svg"),
@@ -632,3 +635,138 @@ def test_карта_часов_недели_не_подставляет_ноль
                 / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
     assert "values: д.grid || []" in источник, "карта снова получает подменённые значения"
     assert "строка.map((v) => (v === null ? 0 : v))" not in источник
+
+
+# ---------------------------------------------------------------------------
+# Разделы тридцатого захода: АТС, сотрудники, резервные копии
+# ---------------------------------------------------------------------------
+
+def test_the_pbx_section_draws_every_tab_without_stations(страница):
+    """Раздел «АТС» открывается и на сервере, где АТС не подключено.
+
+    Пустой раздел — тоже отрисованный раздел: он обязан сказать, что
+    станций нет и что с этим делать, а не показать пустоту или свалиться
+    на отсутствующем поле.
+    """
+    _открыть(страница, "pbx")
+    страница.wait_for_selector("#pbx-tabs button", timeout=15000)
+    for вкладка in ("overview", "load", "people", "numbers", "intake"):
+        страница.click(f'#pbx-tabs button[data-tab="{вкладка}"]')
+        страница.wait_for_timeout(700)
+        тело = страница.inner_text("#pbx-body")
+        assert "Загрузка" not in тело, (вкладка, тело[:200])
+        assert "Не удалось" not in тело, (вкладка, тело[:200])
+    _чисто(страница)
+    шапка = страница.inner_text("#pbx-top")
+    assert "Станции" in шапка
+
+
+def test_the_pbx_station_form_explains_every_field(страница):
+    """Форма станции — с описанием, рекомендацией и примерами у каждого поля.
+
+    Форма без объяснений заставляет угадывать, что такое «контекст» и чем
+    журнал CDR отличается от каталога записей; угадывают обычно неверно.
+    """
+    _открыть(страница, "pbx")
+    страница.wait_for_selector("#pbx-add", timeout=15000)
+    страница.click("#pbx-add")
+    страница.wait_for_selector("#pbx-fields .param", timeout=10000)
+    полей = страница.locator("#pbx-fields .param").count()
+    assert полей >= 15, полей
+    assert страница.locator("#pbx-fields .param-rec").count() >= 15
+    assert страница.locator("#pbx-fields details").count() >= 15
+    # Поля источника переключаются вместе с ним: путь к журналу не нужен
+    # станции, которую слушают через AMI.
+    страница.select_option('[data-field="source"]', "ami")
+    страница.wait_for_timeout(300)
+    assert страница.locator('.param[data-only="cdr_csv"]').first.is_hidden()
+    assert страница.locator('.param[data-only="ami"]').first.is_visible()
+    _чисто(страница)
+
+
+def test_the_employees_section_lists_people_and_opens_a_card(страница):
+    """Таблица сотрудников и карточка под ней — на одном экране.
+
+    Именно под, а не вместо: сравнение с соседями — половина смысла
+    разговора о сотруднике.
+    """
+    _открыть(страница, "employees")
+    страница.wait_for_selector("#emp-body table", timeout=15000)
+    строк = страница.locator("#emp-body tbody tr").count()
+    assert строк >= 1, "ни одного сотрудника"
+    # Наборы столбцов: двадцать показателей в одной таблице не читаются.
+    страница.click('#emp-cols button[data-cols="speech"]')
+    страница.wait_for_timeout(400)
+    заголовки = страница.inner_text("#emp-body thead").upper()
+    assert "ПОНЯТНОСТЬ" in заголовки and "ЗВОНКОВ" not in заголовки
+    страница.click("#emp-body tbody tr")
+    страница.wait_for_selector("#emp-card table", timeout=10000)
+    карточка = страница.inner_text("#emp-card")
+    assert "Против команды" in карточка and "Ход по неделям" in карточка
+    _чисто(страница)
+
+
+def test_the_backup_section_makes_and_lists_a_copy(страница):
+    """Копия настроек снимается одной кнопкой и сразу видна в списке."""
+    _открыть(страница, "backup")
+    страница.wait_for_selector("#bk-settings", timeout=15000)
+    страница.click("#bk-settings")
+    страница.wait_for_selector("#bk-list table", timeout=15000)
+    список = страница.inner_text("#bk-list")
+    assert "только настройки" in список
+    # Настройки расписания — теми же карточками, что и в «Настройках».
+    assert страница.locator("#bk-params .param").count() >= 6
+    параметры = страница.inner_text("#bk-params")
+    assert "backup_keep_days" in параметры and "backup_time" in параметры
+    _чисто(страница)
+
+
+def test_section_links_between_pbx_telephony_and_employees_work(страница):
+    """Кнопки перехода между разделами — не украшение.
+
+    Весь app.js — замыкание, наружу отдан только `window.__asrhub`, и
+    inline-обработчик `onclick="go('pbx')"` вычисляется в глобальной
+    области, где `go` не существует: кнопка молчала, а в консоли на каждый
+    щелчок падал ReferenceError.
+    """
+    _открыть(страница, "telephony")
+    страница.wait_for_selector("#tel-calls", timeout=15000)
+    страница.click("text=Раздел «АТС» →")
+    страница.wait_for_timeout(1500)
+    assert страница.evaluate("location.hash") == "#pbx"
+    страница.click('#pbx-tabs button[data-tab="people"]')
+    страница.wait_for_timeout(1200)
+    страница.click("text=Аналитика по сотрудникам →")
+    страница.wait_for_timeout(1500)
+    assert страница.evaluate("location.hash") == "#employees"
+    _чисто(страница)
+
+
+def test_the_station_form_behaves_like_every_other_modal(страница):
+    """Форма станции идёт через mountModal: фон не прокручивается, Esc закрывает."""
+    _открыть(страница, "pbx")
+    страница.wait_for_selector("#pbx-add", timeout=15000)
+    страница.click("#pbx-add")
+    страница.wait_for_selector("#pbx-fields .param", timeout=10000)
+    assert страница.evaluate("document.body.classList.contains('modal-open')")
+    страница.keyboard.press("Escape")
+    страница.wait_for_timeout(600)
+    assert страница.evaluate("document.querySelectorAll('.modal-backdrop').length") == 0
+    assert not страница.evaluate("document.body.classList.contains('modal-open')")
+    _чисто(страница)
+
+
+def test_switching_a_breakdown_and_the_tab_at_once_stays_quiet(страница):
+    """Ответ разреза приезжает в узел, которого уже нет.
+
+    Рисовать в него — это TypeError в консоли и пустое место на экране;
+    сама отмена запроса — штатный ход, а не сбой.
+    """
+    _открыть(страница, "content")
+    страница.click('#content-tabs button[data-tab="nps"]')
+    страница.wait_for_selector("#nps-bar svg", timeout=15000)
+    страница.select_option("#nps-dim", "queue")
+    страница.click('#content-tabs button[data-tab="emotion"]')
+    страница.wait_for_selector("#emo-line svg", timeout=15000)
+    страница.wait_for_timeout(1200)
+    _чисто(страница)

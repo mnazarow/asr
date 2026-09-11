@@ -150,9 +150,10 @@ a:hover { text-decoration: underline; }
 .grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .grid.cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-@media (max-width: 1280px) { .grid.cols-4, .grid.cols-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 980px) { .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-6 { grid-template-columns: 1fr; } }
+@media (max-width: 1280px) { .grid.cols-4, .grid.cols-5, .grid.cols-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 980px) { .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-5, .grid.cols-6 { grid-template-columns: 1fr; } }
 
 button, .btn {
   display: inline-flex; align-items: center; gap: 6px; justify-content: center;
@@ -570,7 +571,7 @@ body.modal-open { overflow: hidden; }
 }
 
 @media (max-width: 560px) {
-  .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-6 { grid-template-columns: 1fr; }
+  .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-5, .grid.cols-6 { grid-template-columns: 1fr; }
   .topbar-actions { gap: 4px; }
   .content { padding: 12px 10px 44px; }
   .kpi { padding: 12px 13px; }
@@ -769,3 +770,13 @@ td.pick input, th.pick input { width: auto; margin: 0; cursor: pointer; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--bg-soft, rgba(255,255,255,.03)); }
 .script-item .cat-rule { font-size: 13px; }
+
+/* Таблица сотрудников: отличие от команды цветом самого числа, а не фона.
+   Фоном строка с двадцатью показателями превращается в шахматную доску, на
+   которой не видно ни одного числа. */
+td.num.good { color: var(--ok); }
+td.num.bad  { color: var(--warn); }
+th.sortable:hover { color: var(--text); }
+
+/* Полоса доли в разделах аналитики: подпись сверху, полоса снизу. */
+.share-row { margin-bottom: 10px; }

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from asrhub.db import Database
 from asrhub.errors import ConfigError, StorageError
-from asrhub.telephony import Импортёр
+from asrhub.telephony import Импортёр, Станция
 from asrhub.telephony.asterisk import (
     AMIClient,
     AMIError,
@@ -28,6 +28,7 @@ from asrhub.telephony.asterisk import (
     разобрать_cdr_строку,
     читать_csv,
 )
+from asrhub.telephony.stations import _станция_из
 
 # ---------------------------------------------------------------------------
 # Опоры
@@ -86,25 +87,40 @@ class Очередь:
         return {"id": f"job_{len(self.вызовы)}"}
 
 
-def настройки(tmp_path: Path, **поверх) -> Настройки:
-    значения = {
-        "telephony_enabled": True,
-        "telephony_source": "cdr_csv",
-        "telephony_cdr_file": str(tmp_path / "Master.csv"),
-        "telephony_recordings_dir": str(tmp_path / "monitor"),
-        "telephony_settle_s": 0,
-        "telephony_min_duration_s": 10,
-        "telephony_skip_unanswered": True,
-        "telephony_internal_digits": 5,
-        "telephony_contexts": {"from-trunk": "входящий", "from-internal": "исходящий"},
-        "telephony_owner": "telephony",
-        "telephony_owner_map": {},
-        "telephony_priority": 40,
-        "telephony_lookback_days": 7,
-        "telephony_filename": "",
+def станция(tmp_path: Path, **поверх) -> Станция:
+    """Станция со значениями по умолчанию — то, что раньше было настройками.
+
+    Поля принимаются и в прежнем написании (`telephony_settle_s`), и в
+    новом (`settle_s`): проверки писались до того, как станций стало
+    несколько, и переписывать их все ради приставки незачем.
+    """
+    поля = {
+        "id": "pbx", "name": "АТС", "enabled": True, "source": "cdr_csv",
+        "cdr_file": str(tmp_path / "Master.csv"),
+        "recordings_dir": str(tmp_path / "monitor"),
+        "settle_s": 0, "min_duration_s": 10, "skip_unanswered": True,
+        "internal_digits": 5,
+        "contexts": {"from-trunk": "входящий", "from-internal": "исходящий"},
+        "owner": "telephony", "owner_map": {}, "priority": 40,
+        "lookback_days": 7, "filename": "", "poll_s": 60,
     }
-    значения.update(поверх)
-    return Настройки(значения)
+    for ключ, значение in поверх.items():
+        поля[ключ.replace("telephony_", "")] = значение
+    return _станция_из(поля, 0)
+
+
+def настройки(tmp_path: Path, **поверх) -> Настройки:
+    """Настройки сервера со списком из одной станции."""
+    станции = [{"id": "pbx", "name": "АТС", **{
+        к.replace("telephony_", ""): з for к, з in поверх.items()
+        if к not in ("telephony_enabled",)}}]
+    базовые = станция(tmp_path).__dict__.copy()
+    базовые.pop("id", None)
+    станции[0] = {**базовые, **станции[0]}
+    return Настройки({
+        "telephony_enabled": поверх.get("telephony_enabled", True),
+        "telephony_stations": станции,
+    })
 
 
 def стенд(tmp_path: Path, строки: str, **поверх):
@@ -112,7 +128,8 @@ def стенд(tmp_path: Path, строки: str, **поверх):
     (tmp_path / "monitor").mkdir(exist_ok=True)
     db = Database(tmp_path / "asrhub.db")
     очередь = Очередь()
-    return db, очередь, Импортёр(db, настройки(tmp_path, **поверх), очередь)
+    return db, очередь, Импортёр(db, станция(tmp_path, **поверх), очередь,
+                                 Настройки({}))
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +359,9 @@ def test_повторный_заход_не_заводит_задание_два
     db, очередь, имп = стенд(tmp_path, строка_cdr("f.1", "79161234567", "101"))
     wav(tmp_path / "monitor" / "f.1.wav")
     assert имп.scan()["imported"] == 1
-    db.set_kv("telephony_cdr_offset", 0)          # как будто позицию потеряли
+    # Позиция чтения у каждой станции своя — общая означала бы, что вторая
+    # станция продолжает читать с того места, до которого дочитала первая.
+    db.set_kv(имп._ключ_позиции, 0)               # как будто позицию потеряли
     итог = имп.scan()
     assert итог["imported"] == 0
     assert итог["reasons"] == {"уже импортирован": 1}
@@ -378,12 +397,12 @@ def test_выдержка_не_даёт_взять_недописанную_за
     # Звонок не теряется: он лёг в таблицу с пометкой «взять позже». Из
     # журнала он больше не придёт — позиция чтения уже сдвинута.
     отложенные = db.calls_deferred()
-    assert [з["uniqueid"] for з in отложенные] == ["h.1"]
+    assert [з["pbx_uid"] for з in отложенные] == ["h.1"]
     assert db.call_counts()["deferred"] == 1
     assert db.call_counts()["skipped"] == 0, "отложенный — не пропущенный"
 
     # Выдержка прошла — тот же звонок берётся из таблицы, не из журнала.
-    имп.settings["telephony_settle_s"] = 0
+    имп.станция.settle_s = 0
     второй = имп.scan()
     assert второй["deferred"] == 1
     assert второй["imported"] == 1, "отложенный звонок обязан дойти до очереди"
@@ -394,7 +413,7 @@ def test_звонок_без_записи_помечается_и_не_ищет�
     db, очередь, имп = стенд(tmp_path, строка_cdr("i.1", "79161234567", "101"))
     итог = имп.scan()
     assert итог["reasons"] == {"нет записи": 1}
-    assert db.call_exists("i.1"), "иначе файл искался бы на каждом заходе"
+    assert db.call_exists("pbx:i.1"), "иначе файл искался бы на каждом заходе"
 
 
 def test_владелец_берётся_по_номеру_оператора(tmp_path: Path):
@@ -427,12 +446,12 @@ def test_отказ_очереди_не_помечает_звонок_разоб
                                          encoding="utf-8")
     (tmp_path / "monitor").mkdir()
     wav(tmp_path / "monitor" / "l.1.wav")
-    имп = Импортёр(db, настройки(tmp_path), Очередь(падать=True))
+    имп = Импортёр(db, станция(tmp_path), Очередь(падать=True), Настройки({}))
     итог = имп.scan()
     assert итог["reasons"] == {"очередь отказала": 1}
     # Позиция чтения журнала уже сдвинута, и второго шанса из него не
     # будет: звонок обязан ждать в таблице, пока очередь не оживёт.
-    assert [з["uniqueid"] for з in db.calls_deferred()] == ["l.1"]
+    assert [з["pbx_uid"] for з in db.calls_deferred()] == ["l.1"]
 
 
 def test_один_плохой_звонок_не_уносит_всю_порцию(tmp_path: Path):
@@ -460,7 +479,7 @@ def test_один_плохой_звонок_не_уносит_всю_порци�
     assert итог["seen"] == 4
     assert итог["imported"] == 3, "три оставшихся звонка должны дойти до очереди"
     assert итог["reasons"].get("сбой разбора") == 1
-    assert {з["uniqueid"] for з in db.list_calls()["calls"]} == {"s.0", "s.2", "s.3"}
+    assert {з["pbx_uid"] for з in db.list_calls()["calls"]} == {"s.0", "s.2", "s.3"}
 
 
 def test_два_захода_разом_не_читают_журнал_дважды(tmp_path: Path):
@@ -502,7 +521,7 @@ def test_источник_папка_берёт_каждый_файл_ровно
     wav(каталог / "in-79990001122-102-20260910.wav", секунд=30)
     db = Database(tmp_path / "asrhub.db")
     очередь = Очередь()
-    имп = Импортёр(db, настройки(tmp_path, telephony_source="folder"), очередь)
+    имп = Импортёр(db, станция(tmp_path, source="folder"), очередь, Настройки({}))
     assert имп.scan()["imported"] == 2
     assert имп.scan()["imported"] == 0, "второй заход не должен задваивать"
     assert len(очередь.вызовы) == 2
@@ -521,8 +540,8 @@ def test_длительность_записи_из_папки_берётся_и
     wav(каталог / "in-79990001122-102-длинный.wav", секунд=40)
     db = Database(tmp_path / "asrhub.db")
     очередь = Очередь()
-    имп = Импортёр(db, настройки(tmp_path, telephony_source="folder",
-                                 telephony_min_duration_s=10), очередь)
+    имп = Импортёр(db, станция(tmp_path, source="folder", min_duration_s=10),
+                   очередь, Настройки({}))
     итог = имп.scan()
     assert итог["imported"] == 1, итог
     assert итог["reasons"] == {"короткий": 1}
@@ -621,8 +640,8 @@ def test_ненайденный_журнал_это_настройка_а_не_�
     нечего.
     """
     db = Database(tmp_path / "asrhub.db")
-    имп = Импортёр(db, настройки(tmp_path, telephony_cdr_file=str(tmp_path / "нет.csv")),
-                   Очередь())
+    имп = Импортёр(db, станция(tmp_path, cdr_file=str(tmp_path / "нет.csv")),
+                   Очередь(), Настройки({}))
     with pytest.raises(ConfigError) as ошибка:
         имп.scan()
     assert ошибка.value.http_status == 400
@@ -769,18 +788,18 @@ def test_события_cdr_превращаются_в_звонки(tmp_path: P
     wav(tmp_path / "monitor" / "r.1.wav")
     db = Database(tmp_path / "asrhub.db")
     очередь = Очередь()
-    имп = Импортёр(db, настройки(tmp_path, telephony_source="ami",
-                                 telephony_host="127.0.0.1",
-                                 telephony_port=атс.port,
-                                 telephony_username="asrhub",
-                                 telephony_secret="секрет"), очередь)
+    имп = Импортёр(db, станция(tmp_path, source="ami", host="127.0.0.1",
+                               port=атс.port, username="asrhub", secret="секрет"),
+                   очередь, Настройки({}))
     try:
         итог = имп.scan(limit=5)
     finally:
         имп.stop(timeout=2.0)
         атс.close()
     assert итог["imported"] == 1
-    assert db.call_exists("r.1")
+    # Ключ архива — станция плюс идентификатор станции: у двух АТС
+    # «эпоха.счётчик» совпадает, и общий ключ терял бы второй звонок.
+    assert db.call_exists("pbx:r.1")
     assert очередь.вызовы[0]["source"] == "asterisk"
 
 

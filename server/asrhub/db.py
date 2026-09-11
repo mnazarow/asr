@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 22
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -99,6 +99,31 @@ _CONTENT_SCHEMA = """
         -- Сколько раз оператор обратился к клиенту по имени; NULL без
         -- определённого оператора.
         name_uses         INTEGER,
+        -- Версия 21: показатели сверх тональности. Каждый — своей колонкой,
+        -- а не полем в `detail`: разрез «средняя понятность речи по
+        -- сотруднику за квартал» по JSON означал бы поднять в память весь
+        -- разбор каждой записи квартала ради одного числа из него.
+        --
+        -- Шкалы: у mood_* это −1…+1, у nps 0…10, у effort −5…+5, у
+        -- intensity 1…5, у остальных 0…100. У stress и fatigue больше —
+        -- хуже; у прочих индексов больше — лучше.
+        mood              REAL,
+        mood_shift        REAL,
+        intensity         INTEGER,
+        stress            INTEGER,
+        effort            REAL,
+        fatigue           INTEGER,
+        clarity           INTEGER,
+        accuracy          INTEGER,
+        politeness        INTEGER,
+        personalization   INTEGER,
+        rhythm            INTEGER,
+        filler_top        TEXT,
+        diminutives       INTEGER,
+        diminutive_rate   REAL,
+        nps               INTEGER,
+        nps_group         TEXT,
+        nps_stated        INTEGER,
         -- Подробности: сам разбор целиком, как его показывает карточка.
         detail            TEXT
     )
@@ -626,10 +651,27 @@ _SCHEMA = [
         accountcode  TEXT DEFAULT '',
         owner        TEXT DEFAULT '',
         skipped      TEXT DEFAULT '',
-        imported_at  REAL
+        imported_at  REAL,
+        -- С какой станции приехал звонок. Станций может быть несколько, и
+        -- без этой колонки архив филиала неотличим от архива головного
+        -- офиса: ни разреза, ни ответа на вопрос «эта станция вообще
+        -- присылает записи?».
+        station      TEXT DEFAULT '',
+        -- Версия 22: идентификатор звонка так, как его дала станция.
+        --
+        -- `uniqueid` — ключ архива, и он обязан быть уникальным на весь
+        -- сервер. У Asterisk он уникален только внутри одной АТС:
+        -- «эпоха.счётчик», где счётчик локален станции и сбрасывается при
+        -- её перезапуске. Две станции в одну секунду дают одинаковый
+        -- идентификатор, и второй звонок молча выбрасывался как «уже
+        -- импортирован». Поэтому ключ собирается как «станция:идентификатор»,
+        -- а настоящий идентификатор станции живёт здесь: по нему ищется
+        -- файл записи и по нему звонок узнают на самой АТС.
+        pbx_uid      TEXT DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_station ON calls(station, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_agent ON calls(agent, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_queue ON calls(queue, started_at DESC)",
@@ -813,6 +855,23 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "agent_score": "REAL",
         "empathy": "REAL",
         "name_uses": "INTEGER",
+        "mood": "REAL",
+        "mood_shift": "REAL",
+        "intensity": "INTEGER",
+        "stress": "INTEGER",
+        "effort": "REAL",
+        "fatigue": "INTEGER",
+        "clarity": "INTEGER",
+        "accuracy": "INTEGER",
+        "politeness": "INTEGER",
+        "personalization": "INTEGER",
+        "rhythm": "INTEGER",
+        "filler_top": "TEXT",
+        "diminutives": "INTEGER",
+        "diminutive_rate": "REAL",
+        "nps": "INTEGER",
+        "nps_group": "TEXT",
+        "nps_stated": "INTEGER",
         "detail": "TEXT",
     },
     "content_marks": {
@@ -981,6 +1040,8 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "owner": "TEXT DEFAULT ''",
         "skipped": "TEXT DEFAULT ''",
         "imported_at": "REAL",
+        "station": "TEXT DEFAULT ''",
+        "pbx_uid": "TEXT DEFAULT ''",
     },
 }
 
@@ -1266,10 +1327,20 @@ class Database:
                 continue
             if not existing:
                 continue                    # таблицы ещё нет — её создаст _SCHEMA
+            добавлены = []
             for name, declaration in columns.items():
                 if name not in existing:
                     log.info("Миграция: в таблицу «%s» добавлена колонка «%s»", table, name)
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                    добавлены.append(name)
+            if table == "calls" and "pbx_uid" in добавлены:
+                # Прежние звонки лежат под ключом станции — он же и был их
+                # настоящим идентификатором, пока станция была одна. Без
+                # этого переноса у всего старого архива не нашлось бы ни
+                # записи (поиск идёт по идентификатору в имени файла), ни
+                # самого звонка на АТС.
+                conn.execute("UPDATE calls SET pbx_uid = uniqueid "
+                             "WHERE COALESCE(pbx_uid,'') = ''")
 
     # --- задания --------------------------------------------------------
 
@@ -1709,7 +1780,10 @@ class Database:
         "money_max, speakers, agent_speaker, overlap_s, dead_air_s, switches, "
         "talk_share, monologue_s, customer_story_s, reply_delay_s, tempo_ratio, "
         "frustration, repeat_contact, profanity, profanity_agent, objections, "
-        "objections_unhandled, violations, agent_score, empathy, name_uses"
+        "objections_unhandled, violations, agent_score, empathy, name_uses, "
+        "mood, mood_shift, intensity, stress, effort, fatigue, clarity, "
+        "accuracy, politeness, personalization, rhythm, filler_top, "
+        "diminutives, diminutive_rate, nps, nps_group, nps_stated"
     )
 
     def save_content(self, job_id: str, features: dict[str, Any],
@@ -1816,7 +1890,8 @@ class Database:
         правила меняются — по версии видно, что пора считать заново.
         """
         rows = self.query(
-            "SELECT j.id, j.text, j.media_duration_s, j.quality_flags FROM jobs j "
+            "SELECT j.id, j.text, j.media_duration_s, j.quality_flags, "
+            "       j.avg_confidence FROM jobs j "
             "LEFT JOIN content c ON c.job_id = j.id "
             "WHERE j.status='completed' AND j.text IS NOT NULL AND j.text != '' "
             # Контрольные прогоны второй моделью — та же запись второй раз:
@@ -1964,6 +2039,50 @@ class Database:
         # имени, среди тех, где оператор был определён.
         ("named", "SUM(CASE WHEN COALESCE(c.name_uses,0) > 0 THEN 1 ELSE 0 END)"),
         ("name_checked", "SUM(CASE WHEN c.name_uses IS NOT NULL THEN 1 ELSE 0 END)"),
+        # Показатели сверх тональности. У каждого рядом со средним идёт
+        # число записей, где его было чем считать: средняя понятность по
+        # трём записям из тысячи — это не показатель отдела, и без
+        # знаменателя её не отличить от средней по всем.
+        ("mood", "AVG(c.mood)"),
+        ("mood_shift", "AVG(c.mood_shift)"),
+        ("recovered", "SUM(CASE WHEN c.mood_shift > 0.15 THEN 1 ELSE 0 END)"),
+        ("worsened", "SUM(CASE WHEN c.mood_shift < -0.15 THEN 1 ELSE 0 END)"),
+        ("intensity", "AVG(c.intensity)"),
+        ("stress", "AVG(c.stress)"),
+        ("stress_high", "SUM(CASE WHEN c.stress >= 55 THEN 1 ELSE 0 END)"),
+        ("stress_checked", "SUM(CASE WHEN c.stress IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("effort", "AVG(c.effort)"),
+        ("effort_high", "SUM(CASE WHEN c.effort <= -2 THEN 1 ELSE 0 END)"),
+        ("fatigue", "AVG(c.fatigue)"),
+        ("fatigue_checked", "SUM(CASE WHEN c.fatigue IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("clarity", "AVG(c.clarity)"),
+        ("clarity_checked", "SUM(CASE WHEN c.clarity IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("clarity_low", "SUM(CASE WHEN c.clarity < 35 THEN 1 ELSE 0 END)"),
+        ("accuracy", "AVG(c.accuracy)"),
+        ("accuracy_checked", "SUM(CASE WHEN c.accuracy IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("politeness", "AVG(c.politeness)"),
+        ("politeness_checked", "SUM(CASE WHEN c.politeness IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("personalization", "AVG(c.personalization)"),
+        ("rhythm", "AVG(c.rhythm)"),
+        ("rhythm_checked", "SUM(CASE WHEN c.rhythm IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("diminutives", "SUM(COALESCE(c.diminutives,0))"),
+        ("diminutive_records",
+         "SUM(CASE WHEN COALESCE(c.diminutives,0) > 0 THEN 1 ELSE 0 END)"),
+        ("diminutive_rate", "AVG(c.diminutive_rate)"),
+        # NPS: названный клиентом и предсказанный считаются раздельно.
+        # Смешать их — значит объявить настоящим то, что сервер угадал.
+        ("nps", "AVG(c.nps)"),
+        ("nps_stated_avg",
+         "AVG(CASE WHEN c.nps_stated = 1 THEN c.nps END)"),
+        ("nps_stated_count", "SUM(CASE WHEN c.nps_stated = 1 THEN 1 ELSE 0 END)"),
+        ("nps_checked", "SUM(CASE WHEN c.nps IS NOT NULL THEN 1 ELSE 0 END)"),
+        ("promoters", "SUM(CASE WHEN c.nps_group = 'промоутер' THEN 1 ELSE 0 END)"),
+        ("passives", "SUM(CASE WHEN c.nps_group = 'нейтрал' THEN 1 ELSE 0 END)"),
+        ("detractors", "SUM(CASE WHEN c.nps_group = 'критик' THEN 1 ELSE 0 END)"),
+        ("promoters_stated",
+         "SUM(CASE WHEN c.nps_stated = 1 AND c.nps_group = 'промоутер' THEN 1 ELSE 0 END)"),
+        ("detractors_stated",
+         "SUM(CASE WHEN c.nps_stated = 1 AND c.nps_group = 'критик' THEN 1 ELSE 0 END)"),
     )
 
     #: Как группировать свод. Значение — выражение SQL; None — без
@@ -1980,6 +2099,22 @@ class Database:
         "language": "COALESCE(NULLIF(j.language,''),'—')",
         "source": "COALESCE(NULLIF(j.source,''),'—')",
         "speaker": "COALESCE(NULLIF(c.agent_speaker,''),'—')",
+        # Разрезы из журнала звонков: сотрудник, очередь, станция. Через
+        # подзапрос, а не соединение: соединение с `calls` размножило бы
+        # строку задания, если у него почему-то оказалось два звонка, и
+        # средние поехали бы молча.
+        "agent": "COALESCE(NULLIF(("
+                 "SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id"
+                 "),''),'—')",
+        "queue": "COALESCE(NULLIF(("
+                 "SELECT cl.queue FROM calls cl WHERE cl.job_id = j.id"
+                 "),''),'—')",
+        "station": "COALESCE(NULLIF(("
+                   "SELECT cl.station FROM calls cl WHERE cl.job_id = j.id"
+                   "),''),'—')",
+        "direction": "COALESCE(NULLIF(("
+                     "SELECT cl.direction FROM calls cl WHERE cl.job_id = j.id"
+                     "),''),'—')",
         "tag": "COALESCE(j.tags,'')",
         "label": "COALESCE(NULLIF(c.sentiment_label,''),'—')",
         "weekday": "CAST(strftime('%w', j.created_at, 'unixepoch', 'localtime') AS INTEGER)",
@@ -2010,6 +2145,17 @@ class Database:
         "negative_segments": "c.negative_segments",
         "positive_segments": "c.positive_segments",
         "duration_s": "j.media_duration_s",
+        "mood": "c.mood",
+        "stress": "c.stress",
+        "effort": "c.effort",
+        "fatigue": "c.fatigue",
+        "clarity": "c.clarity",
+        "accuracy": "c.accuracy",
+        "politeness": "c.politeness",
+        "personalization": "c.personalization",
+        "rhythm": "c.rhythm",
+        "diminutive_rate": "c.diminutive_rate",
+        "nps": "c.nps",
         "overlap_s": "c.overlap_s",
         "dead_air_s": "c.dead_air_s",
         "switches": "c.switches",
@@ -2034,6 +2180,18 @@ class Database:
     AGENT_DIMENSIONS: dict[str, str] = {
         "speaker": "COALESCE(NULLIF(c.agent_speaker,''),'—') = ?",
         "owner": "COALESCE(NULLIF(j.owner,''),'—') = ?",
+        # Сотрудник из журнала АТС. Это самый полезный разрез из трёх:
+        # «говорящий 1» — техническая метка внутри записи, владелец — это
+        # отдел или интеграция, а здесь настоящее имя из очереди.
+        "agent": "COALESCE(NULLIF(("
+                 "SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id"
+                 "),''),'—') = ?",
+        "queue": "COALESCE(NULLIF(("
+                 "SELECT cl.queue FROM calls cl WHERE cl.job_id = j.id"
+                 "),''),'—') = ?",
+        "station": "COALESCE(NULLIF(("
+                   "SELECT cl.station FROM calls cl WHERE cl.job_id = j.id"
+                   "),''),'—') = ?",
     }
 
     @staticmethod
@@ -2548,7 +2706,19 @@ class Database:
             "       SUM(COALESCE(c.alerts,0)) AS alerts, "
             "       AVG(c.compliance) AS compliance, AVG(c.wpm) AS wpm, "
             "       AVG(c.agent_score) AS agent_score, AVG(c.empathy) AS empathy, "
-            "       SUM(CASE WHEN COALESCE(c.violations,0) > 0 THEN 1 ELSE 0 END) AS violation_records "
+            "       SUM(CASE WHEN COALESCE(c.violations,0) > 0 THEN 1 ELSE 0 END) AS violation_records, "
+            # Показатели сверх тональности — тем же рядом: динамика у них
+            # важнее среза, по срезу не отличить «всегда так» от «стало так».
+            "       AVG(c.mood) AS mood, AVG(c.stress) AS stress, "
+            "       AVG(c.effort) AS effort, AVG(c.fatigue) AS fatigue, "
+            "       AVG(c.clarity) AS clarity, AVG(c.accuracy) AS accuracy, "
+            "       AVG(c.politeness) AS politeness, AVG(c.rhythm) AS rhythm, "
+            "       AVG(c.personalization) AS personalization, "
+            "       AVG(c.diminutive_rate) AS diminutive_rate, "
+            "       AVG(c.filler_rate) AS filler_rate, AVG(c.nps) AS nps, "
+            "       SUM(CASE WHEN c.nps_group = 'промоутер' THEN 1 ELSE 0 END) AS promoters, "
+            "       SUM(CASE WHEN c.nps_group = 'критик' THEN 1 ELSE 0 END) AS detractors, "
+            "       SUM(CASE WHEN c.nps IS NOT NULL THEN 1 ELSE 0 END) AS nps_checked "
             "FROM content c JOIN jobs j ON j.id = c.job_id "
             f"WHERE {условие} GROUP BY bucket ORDER BY bucket",
             [since, шаг, *args])
@@ -3140,6 +3310,7 @@ class Database:
         "src", "dst", "clid", "channel", "dstchannel", "context",
         "disposition", "direction", "queue", "agent", "duration", "billsec",
         "answered", "started_at", "recording", "userfield", "accountcode",
+        "station", "pbx_uid",
     )
 
     def save_call(self, uniqueid: str, *, job_id: str | None = None,
@@ -3195,7 +3366,8 @@ class Database:
     #: нельзя распознать, от звонка, который распознавать не надо.
     ОТЛОЖЕН = "отложен: "
 
-    def calls_deferred(self, limit: int = 50) -> list[dict[str, Any]]:
+    def calls_deferred(self, limit: int = 50, *, station: str = "",
+                       older_than: float | None = None) -> list[dict[str, Any]]:
         """Звонки, отложенные до следующего захода, — старые первыми.
 
         Из журнала они больше не придут: позиция чтения сдвинута сразу
@@ -3203,11 +3375,29 @@ class Database:
         звонок, у которого запись ещё дописывалась, терялся навсегда — а
         при выдержке в тридцать секунд и опросе раз в минуту под это
         попадала половина потока.
+
+        `station` обязателен, когда станций несколько: без него импортёр
+        головного офиса забирал отложенные звонки филиала, обрабатывал их
+        своими правилами и переписывал им владельца и станцию — то есть
+        разговоры филиала уезжали в чужой отчёт и в чужую очередь, а запись
+        искалась в чужом каталоге и не находилась никогда.
+
+        `older_than` отсекает безнадёжных: звонок, чья запись не появится
+        уже никогда, иначе навечно занимает место в очереди отложенных, и
+        импорт по станции встаёт целиком после одного сбоя записи.
         """
+        условия = ["skipped LIKE ? ESCAPE '\\'"]
+        args: list[Any] = [f"{_экранировать_like(self.ОТЛОЖЕН)}%"]
+        if station:
+            условия.append("COALESCE(station,'')=?")
+            args.append(str(station))
+        if older_than is not None:
+            условия.append("COALESCE(started_at,0) >= ?")
+            args.append(float(older_than))
+        args.append(max(1, int(limit)))
         rows = self.query(
-            "SELECT * FROM calls WHERE skipped LIKE ? ESCAPE '\\' "
-            "ORDER BY started_at LIMIT ?",
-            (f"{_экранировать_like(self.ОТЛОЖЕН)}%", max(1, int(limit))))
+            f"SELECT * FROM calls WHERE {' AND '.join(условия)} "
+            "ORDER BY started_at LIMIT ?", args)
         звонки = []
         for r in rows:
             звонок = dict(r)
@@ -3222,21 +3412,30 @@ class Database:
         return self.query_one("SELECT 1 FROM calls WHERE uniqueid=?",
                               (str(uniqueid),)) is not None
 
-    def known_call_ids(self, limit: int = 100000) -> set[str]:
+    def known_call_ids(self, limit: int = 100000, *,
+                       station: str = "") -> set[str]:
         """Множество известных идентификаторов — для обхода папки записей.
 
         Спрашивать базу по файлу на каждом заходе — это тысячи запросов на
         каталог в десять тысяч записей. Одно множество дешевле и по времени,
         и по блокировкам.
         """
+        где = " WHERE station=?" if station else ""
+        args: list[Any] = [station] if station else []
         rows = self.query(
-            "SELECT uniqueid FROM calls ORDER BY imported_at DESC LIMIT ?",
-            (max(1, int(limit)),))
+            f"SELECT uniqueid FROM calls{где} ORDER BY imported_at DESC LIMIT ?",
+            (*args, max(1, int(limit))))
         return {str(r["uniqueid"]) for r in rows}
 
-    def call_counts(self, *, owner: str | list[str] | None = None) -> dict[str, Any]:
+    def call_counts(self, *, owner: str | list[str] | None = None,
+                    station: str = "") -> dict[str, Any]:
         """Сводка по звонкам: всего, поставлено, пропущено и почему."""
         условие, args = self._owner_clause(owner, "c")
+        части = [условие] if условие else []
+        if station:
+            части.append("c.station=?")
+            args = [*args, station]
+        условие = " AND ".join(части)
         где = f" WHERE {условие}" if условие else ""
         строка = self.query_one(
             "SELECT COUNT(*) AS total,"
@@ -3264,6 +3463,7 @@ class Database:
 
     def list_calls(self, *, owner: str | list[str] | None = None,
                    direction: str = "", queue: str = "", agent: str = "",
+                   station: str = "", skipped: str = "",
                    since: float | None = None, until: float | None = None,
                    only_queued: bool = False, search: str = "",
                    limit: int = 100, offset: int = 0) -> dict[str, Any]:
@@ -3283,6 +3483,15 @@ class Database:
         if agent:
             where.append("c.agent=?")
             args.append(agent)
+        if station:
+            where.append("c.station=?")
+            args.append(station)
+        if skipped == "yes":
+            where.append("COALESCE(c.skipped,'')<>'' AND c.skipped NOT LIKE 'отложен: %'")
+        elif skipped == "deferred":
+            where.append("c.skipped LIKE 'отложен: %'")
+        elif skipped == "no":
+            where.append("COALESCE(c.skipped,'')=''")
         if since is not None:
             where.append("c.started_at>=?")
             args.append(float(since))
@@ -3293,9 +3502,13 @@ class Database:
             where.append("c.job_id IS NOT NULL")
         if search:
             образец = f"%{_экранировать_like(search)}%"
+            # И по ключу архива, и по идентификатору станции: в журнале АТС
+            # человек видит второй, а в наших ответах — первый, и искать он
+            # будет тот, что у него перед глазами.
             where.append("(c.src LIKE ? ESCAPE '\\' OR c.dst LIKE ? ESCAPE '\\' "
-                         "OR c.clid LIKE ? ESCAPE '\\' OR c.uniqueid LIKE ? ESCAPE '\\')")
-            args += [образец] * 4
+                         "OR c.clid LIKE ? ESCAPE '\\' OR c.uniqueid LIKE ? ESCAPE '\\' "
+                         "OR c.pbx_uid LIKE ? ESCAPE '\\')")
+            args += [образец] * 5
         где = f" WHERE {' AND '.join(where)}" if where else ""
         всего = self.query_one(f"SELECT COUNT(*) AS n FROM calls c{где}", args)
         предел = max(1, min(int(limit), 500))
@@ -3324,9 +3537,15 @@ class Database:
         звонок["answered"] = bool(звонок.get("answered"))
         return звонок
 
-    def call_dimensions(self, *, owner: str | list[str] | None = None) -> dict[str, list[str]]:
-        """Очереди и операторы, которые вообще встречались, — для отбора."""
+    def call_dimensions(self, *, owner: str | list[str] | None = None,
+                        station: str = "") -> dict[str, list[str]]:
+        """Очереди, операторы и станции, которые встречались, — для отбора."""
         условие, args = self._owner_clause(owner, "c")
+        части = [условие] if условие else []
+        if station:
+            части.append("c.station=?")
+            args = [*args, station]
+        условие = " AND ".join(части)
         где = f" WHERE {условие}" if условие else ""
         def значения(поле: str) -> list[str]:
             rows = self.query(
@@ -3335,7 +3554,251 @@ class Database:
                 f"GROUP BY {поле} ORDER BY n DESC LIMIT 200", args)
             return [str(r["v"]) for r in rows]
         return {"queues": значения("c.queue"), "agents": значения("c.agent"),
-                "directions": значения("c.direction")}
+                "directions": значения("c.direction"),
+                "stations": значения("c.station")}
+
+    # --- разрезы для раздела «АТС» ----------------------------------------
+
+    def _условия_звонков(self, owner: Any, station: str, since: float | None,
+                         until: float | None) -> tuple[list[str], list[Any]]:
+        """Общее «где» для всех сводок раздела: владелец, станция, период.
+
+        Одно место вместо пяти: разрез по владельцу — самая частая забытая
+        строчка в этом проекте, и повторять её в каждом запросе значит рано
+        или поздно один раз не повторить.
+        """
+        условие, args = self._owner_clause(owner, "c")
+        части = [условие] if условие else []
+        if station:
+            части.append("c.station=?")
+            args = [*args, str(station)]
+        if since is not None:
+            части.append("c.started_at>=?")
+            args = [*args, float(since)]
+        if until is not None:
+            части.append("c.started_at<?")
+            args = [*args, float(until)]
+        return части, args
+
+    #: Что считаем в каждой корзине времени. Держим одним списком: колонки
+    #: нужны и линии нагрузки, и сводке за период, и расходиться они не должны.
+    СЧЁТ_ЗВОНКОВ = (
+        "COUNT(*) AS total",
+        "SUM(CASE WHEN c.direction='входящий' THEN 1 ELSE 0 END) AS inbound",
+        "SUM(CASE WHEN c.direction='исходящий' THEN 1 ELSE 0 END) AS outbound",
+        "SUM(CASE WHEN c.direction='внутренний' THEN 1 ELSE 0 END) AS internal",
+        "SUM(CASE WHEN c.answered=1 THEN 1 ELSE 0 END) AS answered",
+        "SUM(CASE WHEN c.job_id IS NOT NULL THEN 1 ELSE 0 END) AS queued",
+        "SUM(CASE WHEN COALESCE(c.skipped,'')<>'' "
+        "         AND c.skipped NOT LIKE 'отложен: %' THEN 1 ELSE 0 END) AS skipped",
+        "SUM(COALESCE(c.billsec,0)) AS talk_s",
+        "SUM(CASE WHEN c.answered=1 THEN "
+        "    MAX(COALESCE(c.duration,0) - COALESCE(c.billsec,0), 0) ELSE 0 END) AS wait_s",
+    )
+
+    ШАГ_КОРЗИНЫ = {"hour": 3600, "day": 86400, "week": 7 * 86400, "month": 30 * 86400}
+
+    @staticmethod
+    def _сдвиг_времени() -> int:
+        """Смещение местного времени от UTC, секунды.
+
+        Нужно там, где сутки режутся арифметикой, а не `strftime`: вопрос
+        «сколько звонков было в четверг» задаёт человек, живущий по своим
+        часам, и сутки у него начинаются в полночь, а не в 03:00.
+
+        Берётся на текущий момент, а не на каждую строку: внутри одного
+        отчёта сдвиг обязан быть один, иначе переход на зимнее время
+        разрезал бы одни сутки на двое.
+        """
+        return -int(time.timezone if not time.daylight or not time.localtime().tm_isdst
+                    else time.altzone)
+
+    def call_timeline(self, *, owner: str | list[str] | None = None,
+                      station: str = "", since: float | None = None,
+                      until: float | None = None, bucket: str = "day",
+                      limit: int = 2000) -> list[dict[str, Any]]:
+        """Звонки по корзинам времени — линия нагрузки в разделе «АТС».
+
+        Корзина считается на стороне SQLite из `started_at`, а не в Python:
+        за год звонков набегает миллион, и тащить их в память ради
+        группировки по часам — это секунды ожидания при каждом открытии
+        раздела.
+        """
+        шаг = self.ШАГ_КОРЗИНЫ.get(str(bucket), 86400)
+        части, args = self._условия_звонков(owner, station, since, until)
+        части.append("c.started_at>0")
+        # Суточные и более крупные корзины режутся по МЕСТНОМУ времени, а не
+        # по UTC: сервер живёт в UTC, и без поправки сутки начинались в 03:00,
+        # ночные звонки попадали во вчера, а соседняя тепловая карта (она
+        # считается через `localtime`) противоречила этой же линии в одном
+        # и том же ответе.
+        сдвиг = self._сдвиг_времени() if шаг >= 86400 else 0
+        rows = self.query(
+            f"SELECT CAST((c.started_at + {сдвиг}) / {шаг} AS INTEGER) * {шаг} - {сдвиг} "
+            "AS bucket, "
+            + ", ".join(self.СЧЁТ_ЗВОНКОВ)
+            + f" FROM calls c WHERE {' AND '.join(части)} "
+            f"GROUP BY bucket ORDER BY bucket LIMIT {int(limit)}", args)
+        return [{"t": float(r["bucket"]),
+                 **{к: int(r[к] or 0) for к in
+                    ("total", "inbound", "outbound", "internal", "answered",
+                     "queued", "skipped", "talk_s", "wait_s")}}
+                for r in rows]
+
+    def call_timeline_by_station(self, *, owner: str | list[str] | None = None,
+                                 since: float | None = None,
+                                 until: float | None = None, bucket: str = "day",
+                                 points: int = 24) -> dict[str, list[int]]:
+        """Короткая лента звонков по каждой станции — линия на её карточке.
+
+        Возвращает ровно `points` последних корзин у всех станций, включая
+        пустые: линия с пропущенными сутками врёт о нагрузке сильнее, чем
+        линия с нулём, потому что читается как «в этот день было столько
+        же».
+        """
+        шаг = self.ШАГ_КОРЗИНЫ.get(str(bucket), 86400)
+        части, args = self._условия_звонков(owner, "", since, until)
+        части.append("c.started_at>0")
+        сдвиг = self._сдвиг_времени() if шаг >= 86400 else 0
+        rows = self.query(
+            f"SELECT COALESCE(c.station,'') AS station, "
+            f"       CAST((c.started_at + {сдвиг}) / {шаг} AS INTEGER) AS bucket, "
+            "       COUNT(*) AS n "
+            f"FROM calls c WHERE {' AND '.join(части)} "
+            "GROUP BY station, bucket", args)
+        if not rows:
+            return {}
+        последняя = max(int(r["bucket"]) for r in rows)
+        первая = последняя - max(1, int(points)) + 1
+        ленты: dict[str, list[int]] = {}
+        for r in rows:
+            корзина = int(r["bucket"])
+            if корзина < первая:
+                continue
+            лента = ленты.setdefault(str(r["station"] or ""), [0] * (последняя - первая + 1))
+            лента[корзина - первая] = int(r["n"] or 0)
+        return ленты
+
+    def call_by_station(self, *, owner: str | list[str] | None = None,
+                        since: float | None = None,
+                        until: float | None = None) -> list[dict[str, Any]]:
+        """Те же счётчики, но в разрезе станций — для сравнения АТС между собой."""
+        части, args = self._условия_звонков(owner, "", since, until)
+        где = f" WHERE {' AND '.join(части)}" if части else ""
+        rows = self.query(
+            "SELECT COALESCE(c.station,'') AS station, "
+            + ", ".join(self.СЧЁТ_ЗВОНКОВ)
+            + f" FROM calls c{где} GROUP BY c.station ORDER BY total DESC", args)
+        return [{"station": str(r["station"] or ""),
+                 **{к: int(r[к] or 0) for к in
+                    ("total", "inbound", "outbound", "internal", "answered",
+                     "queued", "skipped", "talk_s", "wait_s")}}
+                for r in rows]
+
+    def call_tops(self, field: str, *, owner: str | list[str] | None = None,
+                  station: str = "", since: float | None = None,
+                  until: float | None = None, limit: int = 15) -> list[dict[str, Any]]:
+        """Топ по очереди, оператору, направлению, причине пропуска или номеру.
+
+        Поле не подставляется в запрос как есть: имена колонок в SQL нельзя
+        передать параметром, а значит любая опечатка снаружи стала бы
+        внедрением. Разрешён только известный список.
+        """
+        колонки = {"queue": "c.queue", "agent": "c.agent",
+                   "direction": "c.direction", "skipped": "c.skipped",
+                   "src": "c.src", "dst": "c.dst", "context": "c.context",
+                   "disposition": "c.disposition", "station": "c.station"}
+        колонка = колонки.get(str(field))
+        if колонка is None:
+            raise ValueError(f"Неизвестный разрез звонков: {field}")
+        части, args = self._условия_звонков(owner, station, since, until)
+        части.append(f"COALESCE({колонка},'')<>''")
+        if field == "skipped":
+            # Отложенные — не причина пропуска, а «ещё подождём»: смешивать
+            # их с «нет записи» значит каждый раз объяснять человеку, почему
+            # в причинах лидирует строка, которая сама рассосётся.
+            части.append(f"{колонка} NOT LIKE 'отложен: %'")
+        rows = self.query(
+            f"SELECT {колонка} AS value, COUNT(*) AS n, "
+            "       SUM(COALESCE(c.billsec,0)) AS talk_s, "
+            # Среднее — только по отвеченным: недозвон длится ноль секунд,
+            # и в знаменателе он занижает «средний разговор» ровно на свою
+            # долю. Соседняя гистограмма длительностей считает так же.
+            "       AVG(CASE WHEN c.answered=1 THEN COALESCE(c.billsec,0) END) AS avg_s, "
+            "       SUM(CASE WHEN c.answered=1 THEN 1 ELSE 0 END) AS answered "
+            f"FROM calls c WHERE {' AND '.join(части)} "
+            f"GROUP BY {колонка} ORDER BY n DESC LIMIT {int(limit)}", args)
+        return [{"value": str(r["value"]), "count": int(r["n"] or 0),
+                 "talk_s": int(r["talk_s"] or 0),
+                 "avg_s": round(float(r["avg_s"] or 0), 1),
+                 "answered": int(r["answered"] or 0)} for r in rows]
+
+    def call_load_heatmap(self, *, owner: str | list[str] | None = None,
+                          station: str = "", since: float | None = None,
+                          until: float | None = None) -> dict[str, Any]:
+        """День недели × час: когда звонят. Основание для графика смен.
+
+        Время местное — то же, в котором человек смотрит на расписание.
+        SQLite переводит эпоху в местное время сам (`localtime`), и делать
+        это в Python значило бы тащить сюда все звонки поимённо.
+        """
+        части, args = self._условия_звонков(owner, station, since, until)
+        части.append("c.started_at>0")
+        rows = self.query(
+            "SELECT CAST(strftime('%w', c.started_at, 'unixepoch', 'localtime') AS INTEGER) AS dow,"
+            "       CAST(strftime('%H', c.started_at, 'unixepoch', 'localtime') AS INTEGER) AS hour,"
+            "       COUNT(*) AS n, SUM(COALESCE(c.billsec,0)) AS talk_s "
+            f"FROM calls c WHERE {' AND '.join(части)} "
+            "GROUP BY dow, hour", args)
+        # В SQLite неделя начинается с воскресенья; у нас — с понедельника.
+        сетка = [[0] * 24 for _ in range(7)]
+        разговор = [[0] * 24 for _ in range(7)]
+        for r in rows:
+            день = (int(r["dow"] or 0) + 6) % 7
+            час = max(0, min(23, int(r["hour"] or 0)))
+            сетка[день][час] = int(r["n"] or 0)
+            разговор[день][час] = int(r["talk_s"] or 0)
+        return {"days": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+                "hours": list(range(24)), "calls": сетка, "talk_s": разговор}
+
+    #: Границы корзин длительности, секунды. До полминуты — «не разговор»,
+    #: дальше шаг растёт: разницу между 20 и 25 минутами никто не смотрит.
+    КОРЗИНЫ_ДЛИТЕЛЬНОСТИ = (30, 60, 120, 300, 600, 1200, 1800)
+
+    def call_duration_histogram(self, *, owner: str | list[str] | None = None,
+                                station: str = "", since: float | None = None,
+                                until: float | None = None) -> list[dict[str, Any]]:
+        """Сколько звонков какой длины. Среднее без этого обманывает.
+
+        Средняя длительность в три минуты бывает и у равномерных разговоров,
+        и у сотни тридцатисекундных плюс десятка получасовых — а это разные
+        организации с разными проблемами.
+        """
+        части, args = self._условия_звонков(owner, station, since, until)
+        части.append("c.answered=1")
+        границы = self.КОРЗИНЫ_ДЛИТЕЛЬНОСТИ
+        случаи = " ".join(
+            f"WHEN COALESCE(c.billsec,0) < {г} THEN {номер}"
+            for номер, г in enumerate(границы))
+        rows = self.query(
+            f"SELECT CASE {случаи} ELSE {len(границы)} END AS корзина,"
+            "        COUNT(*) AS n, SUM(COALESCE(c.billsec,0)) AS talk_s "
+            f"FROM calls c WHERE {' AND '.join(части)} "
+            "GROUP BY корзина ORDER BY корзина", args)
+        имена = []
+        предыдущая = 0
+        for г in границы:
+            имена.append(f"{предыдущая // 60 if предыдущая >= 60 else предыдущая}"
+                         f"{'м' if предыдущая >= 60 else 'с'}–"
+                         f"{г // 60 if г >= 60 else г}{'м' if г >= 60 else 'с'}")
+            предыдущая = г
+        имена.append(f"дольше {границы[-1] // 60}м")
+        по_корзинам = {int(r["корзина"]): (int(r["n"] or 0), int(r["talk_s"] or 0))
+                       for r in rows}
+        return [{"label": имя,
+                 "count": по_корзинам.get(н, (0, 0))[0],
+                 "talk_s": по_корзинам.get(н, (0, 0))[1]}
+                for н, имя in enumerate(имена)]
 
     def forget_calls(self, *, before: float) -> int:
         """Убирает старые записи журнала звонков вместе с их заданиями.

@@ -1,6 +1,6 @@
-"""Фоновый импорт звонков: из журнала АТС — в очередь распознавания.
+"""Фоновый импорт звонков: из журналов АТС — в очередь распознавания.
 
-Один поток, один заход раз в `telephony_poll_s`: спросить источник о новых
+Поток на станцию, заход раз в её `poll_s`: спросить источник о новых
 звонках, найти файл записи, поставить задание, запомнить звонок. Всё
 остальное — уже обычная жизнь задания: очередь, распознавание, разбор
 содержания, смысловой слой.
@@ -16,8 +16,15 @@
   обрезанной. Поэтому свежие звонки выдерживаются `telephony_settle_s`
   секунд, а файл проверяется на то, что он перестал расти.
 * **Не тащить всё подряд.** Звонок в шесть секунд — это «ошиблись
-  номером», и распознавать его незачем: `telephony_min_duration_s`
-  отсекает такие, а `telephony_skip_unanswered` — неотвеченные.
+  номером», и распознавать его незачем: `min_duration_s` отсекает такие,
+  а `skip_unanswered` — неотвеченные.
+
+Станций может быть сколько угодно, и у каждой своё всё: источник, учётные
+данные, каталог записей, длины внутренних номеров, правила контекстов,
+владелец, приоритет. `Импортёр` обслуживает ОДНУ станцию и ничего не знает
+про остальные; `Телефония` держит их набор и приводит его в соответствие с
+настройкой — заводит потоки для новых станций, гасит для убранных и
+перезапускает для изменившихся.
 """
 from __future__ import annotations
 
@@ -28,7 +35,7 @@ import wave
 from pathlib import Path
 from typing import Any
 
-from ..errors import ConfigError
+from ..errors import ASRHubError, ConfigError
 from ..logging_setup import get_logger
 from .asterisk import ПОЛЯ_AMI as _ПОЛЯ_AMI
 from .asterisk import (
@@ -38,8 +45,12 @@ from .asterisk import (
     звонок_из_полей,
     найти_запись,
     направление,
+    проверить,
+    разобрать_cdr_строку,
     читать_csv,
 )
+from .stations import Станция
+from .stations import список as станции_из_настроек
 
 log = get_logger("telephony")
 
@@ -47,6 +58,12 @@ log = get_logger("telephony")
 #: весь журнал; без предела он поставил бы в очередь десятки тысяч заданий
 #: разом и занял бы сервер на сутки.
 ПОРЦИЯ = 50
+
+#: Сколько держать звонок в очереди отложенных. Запись, не появившаяся за
+#: сутки, не появится уже никогда: либо её не делали, либо она легла не туда.
+#: Держать такие вечно — значит однажды забить очередь ими целиком и
+#: остановить импорт по станции, не сказав об этом ни слова.
+СРОК_ОТЛОЖЕННЫХ = 24 * 3600
 
 #: Пауза после сбоя источника: АТС перезапускают, сеть моргает.
 ПАУЗА_СБОЯ = 60.0
@@ -101,10 +118,11 @@ def _число(настройки: Any, ключ: str, по_умолчанию:
 
 
 class Импортёр:
-    """Фоновый перенос звонков с АТС в очередь распознавания."""
+    """Фоновый перенос звонков с ОДНОЙ станции в очередь распознавания."""
 
-    def __init__(self, db: Any, settings: Any, queue: Any):
+    def __init__(self, db: Any, станция: Станция, queue: Any, settings: Any = None):
         self.db = db
+        self.станция = станция
         self.settings = settings
         self.queue = queue
         self._stop = threading.Event()
@@ -122,44 +140,109 @@ class Импортёр:
         #: Чем было открыто соединение: адрес, порт, учётная запись, пароль.
         self._подпись_ami: tuple[str, int, str, str] | None = None
         self._ami_события: list[dict[str, str]] = []
+        #: Свод последнего захода — для раздела «АТС».
+        self.last_scan: dict[str, Any] = {}
+        #: Позиция чтения журнала — СВОЯ у каждой станции. Общий ключ
+        #: означал бы, что вторая станция продолжает читать с того места,
+        #: до которого дочитала первая: половина архива не приехала бы
+        #: никогда, и понять почему было бы нельзя.
+        self._ключ_позиции = f"telephony_cdr_offset:{станция.id}"
 
     # --- настройки --------------------------------------------------------
 
     @property
+    def id(self) -> str:                                     # noqa: A003
+        return self.станция.id
+
+    @property
     def enabled(self) -> bool:
-        return bool(self.settings.get("telephony_enabled", False))
+        return bool(self.станция.enabled)
 
     @property
     def source(self) -> str:
-        return str(self.settings.get("telephony_source") or "cdr_csv")
+        return self.станция.source
 
-    def путь(self, ключ: str) -> Path | None:
-        значение = str(self.settings.get(ключ) or "").strip()
-        return Path(значение) if значение else None
+    def путь(self, поле: str) -> Path | None:
+        """Путь станции по имени поля. Поля называются без приставки."""
+        имя = поле.replace("telephony_", "")
+        return self.станция.путь(имя)
 
     # --- состояние --------------------------------------------------------
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, for_admin: bool = False,
+               owner: Any = None) -> dict[str, Any]:
         with self._lock:
             свод = {
-                "enabled": self.enabled,
-                "source": self.source,
+                **self.станция.to_dict(for_admin=for_admin),
                 "running": bool(self._thread and self._thread.is_alive()),
                 "imported": self.imported,
                 "skipped": self.skipped,
                 "failed": self.failed,
-                "last_error": self.last_error,
                 "last_run": self.last_run,
-                "host": str(self.settings.get("telephony_host") or ""),
-                "recordings_dir": str(self.settings.get("telephony_recordings_dir") or ""),
-                "cdr_file": str(self.settings.get("telephony_cdr_file") or ""),
+                "last_scan": dict(self.last_scan),
             }
+            if for_admin:
+                свод["last_error"] = self.last_error
         try:
-            свод["calls"] = self.db.call_counts()
+            свод["calls"] = self.db.call_counts(owner=owner, station=self.id)
         except Exception as exc:                             # noqa: BLE001
             log.debug("Счётчики звонков не прочитаны: %s", exc)
             свод["calls"] = {}
         return свод
+
+    def проверить_связь(self) -> dict[str, Any]:
+        """Достучаться до источника этой станции и сказать, что именно не так.
+
+        «Не работает» — не диагноз. Проверка отвечает по-разному на «порт
+        закрыт», «пароль не тот», «файла нет» и «файл есть, но в нём ноль
+        строк»: каждое из этих состояний чинится по-своему.
+        """
+        начало = time.perf_counter()
+        станция = self.станция
+        если_мс = lambda: round((time.perf_counter() - начало) * 1000, 1)  # noqa: E731
+        if станция.source == "ami":
+            итог = проверить(станция.host or "127.0.0.1", станция.port or 5038,
+                             станция.username, станция.secret)
+            итог.update({"source": "ami", "station": станция.id})
+            return итог
+        if станция.source == "folder":
+            каталог = станция.путь("recordings_dir")
+            if каталог is None or not каталог.is_dir():
+                raise ConfigError(
+                    f"«{станция.name}»: каталог записей не найден.",
+                    hint="Проверьте путь и права на чтение у пользователя, "
+                         "от которого работает сервер.")
+            файлов = sum(1 for п in каталог.rglob("*")
+                         if п.suffix.lower() in (".wav", ".mp3", ".ogg"))
+            return {"ok": True, "source": "folder", "station": станция.id,
+                    "dir": str(каталог), "files": файлов, "ms": если_мс()}
+        журнал = станция.путь("cdr_file")
+        if журнал is None or not журнал.is_file():
+            raise ConfigError(
+                f"«{станция.name}»: журнал звонков не найден.",
+                hint="Обычно это /var/log/asterisk/cdr-csv/Master.csv; "
+                     "нужен доступ на чтение.")
+        размер = журнал.stat().st_size
+        # Читаем хвост, а не начало: журнал бывает в гигабайт, а вопрос
+        # проверки — «разбирается ли то, что станция пишет сейчас».
+        with журнал.open("rb") as файл:
+            файл.seek(max(0, размер - 65536))
+            строки = [с for с in файл.read().decode("utf-8", "replace").splitlines()
+                      if с.strip()]
+        образцы = [z for z in (разобрать_cdr_строку(с) for с in строки[-5:]) if z]
+        return {
+            "ok": True, "source": "cdr_csv", "station": станция.id,
+            "file": str(журнал), "bytes": размер,
+            "offset": int(self.db.get_kv(self._ключ_позиции, 0) or 0),
+            "lines": len(строки),
+            "sample": [{"uniqueid": z.uniqueid, "src": z.src, "dst": z.dst,
+                        "disposition": z.disposition, "billsec": z.billsec,
+                        "direction": направление(
+                            z, внутренние_знаков=станция.internal_digits,
+                            контексты=станция.contexts),
+                        "started_at": z.started_at} for z in образцы],
+            "ms": если_мс(),
+        }
 
     # --- поток ------------------------------------------------------------
 
@@ -168,7 +251,8 @@ class Импортёр:
             self._stop.clear()
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="asrhub-telephony",
+        self._thread = threading.Thread(target=self._loop,
+                                        name=f"asrhub-pbx-{self.станция.id}"[:15],
                                         daemon=True)
         self._thread.start()
 
@@ -191,7 +275,7 @@ class Импортёр:
                 continue
             try:
                 итог = self.scan()
-                пауза = max(5.0, _число(self.settings, "telephony_poll_s", 60))
+                пауза = max(5.0, float(self.станция.poll_s or 60))
                 if итог.get("imported"):
                     # Есть что везти — заходим чаще: живой поток звонков
                     # не должен ждать полного интервала.
@@ -200,7 +284,7 @@ class Импортёр:
                 with self._lock:
                     self.last_error = str(exc)
                     self.failed += 1
-                log.warning("Заход телефонии не удался: %s", exc)
+                log.warning("Заход «%s» не удался: %s", self.станция.name, exc)
                 пауза = ПАУЗА_СБОЯ
 
     # --- один заход -------------------------------------------------------
@@ -222,8 +306,13 @@ class Импортёр:
         # или не влезли в очередь. Из журнала они больше не придут — позиция
         # чтения сдвинута, событие AMI разовое, — поэтому очередь отложенных
         # разбирается раньше новых и своей долей порции.
-        отложенные = [Звонок.из_записи(з)
-                      for з in self.db.calls_deferred(limit=max(1, limit // 2))]
+        # Только свои и только те, у которых ещё есть шанс: запись, не
+        # появившаяся за срок хранения отложенных, не появится уже никогда,
+        # а очередь она занимает вечно — после одного сбоя записи импорт по
+        # станции вставал целиком.
+        порог = time.time() - СРОК_ОТЛОЖЕННЫХ
+        отложенные = [Звонок.из_записи(з) for з in self.db.calls_deferred(
+            limit=max(1, limit // 2), station=self.id, older_than=порог)]
         источник = self.source
         if источник != "ami" and self._ami is not None:
             # Источник переключили — соединение больше не нужно. Без этой
@@ -268,21 +357,25 @@ class Импортёр:
         if поставлено:
             log.info("Телефония: поставлено заданий %d, пропущено %d %s",
                      поставлено, пропущено, причины or "")
-        return {"seen": len(звонки), "imported": поставлено,
+        свод = {"station": self.станция.id, "name": self.станция.name,
+                "seen": len(звонки), "imported": поставлено,
                 "skipped": пропущено, "reasons": причины,
-                "deferred": len(отложенные)}
+                "deferred": len(отложенные), "at": time.time()}
+        with self._lock:
+            self.last_scan = свод
+        return свод
 
     # --- источники --------------------------------------------------------
 
     def _из_csv(self, limit: int) -> list[Звонок]:
-        путь = self.путь("telephony_cdr_file")
+        путь = self.станция.путь("cdr_file")
         if путь is None:
             raise ConfigError(
-                "Не задан журнал звонков (telephony_cdr_file).",
+                f"«{self.станция.name}»: не задан журнал звонков.",
                 hint="Обычно это /var/log/asterisk/cdr-csv/Master.csv")
-        позиция = int(self.db.get_kv("telephony_cdr_offset", 0) or 0)
+        позиция = int(self.db.get_kv(self._ключ_позиции, 0) or 0)
         звонки, новая = читать_csv(путь, offset=позиция, limit=limit)
-        self.db.set_kv("telephony_cdr_offset", новая)
+        self.db.set_kv(self._ключ_позиции, новая)
         return звонки
 
     def _из_ami(self, limit: int) -> list[Звонок]:
@@ -298,20 +391,14 @@ class Импортёр:
         # ничего не меняла, а переключение источника на журнал CDR
         # оставляло сокет и сессию на станции висеть навсегда — а сессий у
         # AMI ограниченное число.
-        подпись = (str(self.settings.get("telephony_host") or "127.0.0.1"),
-                   int(_число(self.settings, "telephony_port", 5038)),
-                   str(self.settings.get("telephony_username") or ""),
-                   str(self.settings.get("telephony_secret") or ""))
+        подпись = (self.станция.host or "127.0.0.1", int(self.станция.port or 5038),
+                   self.станция.username, self.станция.secret)
         if self._ami is not None and self._подпись_ami != подпись:
             log.info("Настройки AMI изменились — соединение открывается заново")
             self._закрыть_ami()
         клиент = self._ami
         if клиент is None:
-            клиент = AMIClient(
-                str(self.settings.get("telephony_host") or "127.0.0.1"),
-                int(self.settings.get("telephony_port") or 5038),
-                str(self.settings.get("telephony_username") or ""),
-                str(self.settings.get("telephony_secret") or ""))
+            клиент = AMIClient(*подпись)
             клиент.connect()
             self._ami = клиент
             self._подпись_ami = подпись
@@ -351,14 +438,14 @@ class Импортёр:
         служит имя файла: оно уникально в пределах папки, а большего для
         защиты от повторного импорта не нужно.
         """
-        каталог = self.путь("telephony_recordings_dir")
+        каталог = self.станция.путь("recordings_dir")
         if каталог is None or not каталог.is_dir():
             raise ConfigError(
-                "Каталог записей не найден (telephony_recordings_dir).",
-                hint="Проверьте путь в настройке «Каталог записей» и права "
-                     "на чтение у пользователя, от которого работает сервер.")
-        известные = self.db.known_call_ids()
-        свежее = time.time() - _число(self.settings, "telephony_lookback_days", 7) * 86400
+                f"«{self.станция.name}»: каталог записей не найден.",
+                hint="Проверьте путь и права на чтение у пользователя, "
+                     "от которого работает сервер.")
+        известные = self.db.known_call_ids(station=self.id)
+        свежее = time.time() - float(self.станция.lookback_days or 7) * 86400
         звонки: list[Звонок] = []
         for путь in sorted(каталог.rglob("*")):
             if len(звонки) >= limit:
@@ -371,8 +458,16 @@ class Импортёр:
                 continue
             if изменён < свежее:
                 continue
-            ключ = f"file:{путь.name}"
-            if ключ in известные:
+            # Ключ — по пути от каталога, а не по имени: Asterisk
+            # раскладывает записи по годам и месяцам, и «out-101-…wav» из
+            # марта и из апреля — это два разных разговора с одним именем.
+            # По имени второй молча терялся как «уже импортирован».
+            try:
+                относительный = путь.relative_to(каталог).as_posix()
+            except ValueError:
+                относительный = путь.name
+            свой = f"file:{относительный}"
+            if (f"{self.id}:{свой}" if self.id else свой) in известные:
                 continue
             # Длительность из имени файла не узнать, и поставить ноль
             # значило бы выключить и порог длительности, и выдержку разом:
@@ -385,7 +480,7 @@ class Импортёр:
             # значило бы отодвинуть конец разговора в будущее на всю его
             # длину — и выдержка откладывала бы каждый файл до тех пор,
             # пока это будущее не наступит.
-            звонок = Звонок(uniqueid=ключ,
+            звонок = Звонок(uniqueid=свой,
                             started_at=изменён - длительность,
                             duration=длительность,
                             disposition="ANSWERED", answered=True)
@@ -414,31 +509,46 @@ class Импортёр:
         # ключа подразделения вечный ноль, а причины пусты — то есть
         # единственное, что объясняет расхождение архива со станцией, не
         # видно тому, кто с архивом и работает.
-        self.db.save_call(звонок.uniqueid, job_id=None,
+        self.db.save_call(self._ключ(звонок), job_id=None,
                           skipped=f"{self.db.ОТЛОЖЕН}{почему}",
-                          owner=self._владелец(звонок), **звонок.поля_записи())
+                          owner=self._владелец(звонок), station=self.id, **звонок.поля_записи())
         return почему
+
+    def _ключ(self, звонок: Звонок) -> str:
+        """Ключ звонка в архиве: станция плюс её идентификатор звонка.
+
+        У Asterisk `uniqueid` уникален только внутри одной АТС — это
+        «эпоха.счётчик», где счётчик локален станции и сбрасывается при её
+        перезапуске. Две станции в одну секунду дают одинаковый
+        идентификатор, и второй звонок молча выбрасывался как «уже
+        импортирован». Настоящий идентификатор при этом никуда не девается:
+        он едет в колонке `pbx_uid`.
+        """
+        if not звонок.uniqueid:
+            return ""
+        return f"{self.id}:{звонок.uniqueid}" if self.id else звонок.uniqueid
 
     def _взять(self, звонок: Звонок, *, отложенный: bool = False) -> str | None:
         """Ставит задание по звонку; возвращает причину пропуска или None."""
         if not звонок.uniqueid:
             return "без идентификатора"
-        if not отложенный and self.db.call_exists(звонок.uniqueid):
+        ключ = self._ключ(звонок)
+        if not отложенный and self.db.call_exists(ключ):
             return "уже импортирован"
 
-        минимум = int(_число(self.settings, "telephony_min_duration_s", 0))
+        минимум = int(self.станция.min_duration_s or 0)
         длительность = звонок.billsec or звонок.duration
         if минимум and длительность and длительность < минимум:
-            self.db.save_call(звонок.uniqueid, job_id=None, skipped="короткий",
-                              owner=self._владелец(звонок), **звонок.поля_записи())
+            self.db.save_call(ключ, job_id=None, skipped="короткий",
+                              owner=self._владелец(звонок), station=self.id, **звонок.поля_записи())
             return "короткий"
-        if bool(self.settings.get("telephony_skip_unanswered", True)) and звонок.disposition \
+        if bool(self.станция.skip_unanswered) and звонок.disposition \
                 and not звонок.answered:
-            self.db.save_call(звонок.uniqueid, job_id=None, skipped="без ответа",
-                              owner=self._владелец(звонок), **звонок.поля_записи())
+            self.db.save_call(ключ, job_id=None, skipped="без ответа",
+                              owner=self._владелец(звонок), station=self.id, **звонок.поля_записи())
             return "без ответа"
 
-        выдержка = _число(self.settings, "telephony_settle_s", 30)
+        выдержка = float(self.станция.settle_s or 0)
         # Конец разговора — по полной длительности, а не по разговорной:
         # `billsec` не считает гудки, и разговор «минута дозвона, десять
         # секунд разговора» выглядел законченным пятьдесят секунд назад,
@@ -451,12 +561,11 @@ class Импортёр:
 
         путь = Path(звонок.recording) if звонок.recording else None
         if путь is None:
-            каталог = self.путь("telephony_recordings_dir")
+            каталог = self.станция.путь("recordings_dir")
             if каталог is None:
                 return self._отложить(звонок, "не задан каталог записей")
-            путь = найти_запись(звонок, каталог,
-                                шаблон=str(self.settings.get("telephony_filename") or ""),
-                                окно_дней=int(_число(self.settings, "telephony_lookback_days", 7)))
+            путь = найти_запись(звонок, каталог, шаблон=self.станция.filename,
+                                окно_дней=int(self.станция.lookback_days or 7))
         if путь is not None and путь.is_file() and выдержка > 0 and not self._дописан(путь):
             # Обещано в справке параметра и в шапке модуля: сервер проверяет,
             # что файл перестал расти. Проверки не было вовсе, и запись,
@@ -465,14 +574,13 @@ class Импортёр:
         if путь is None or not путь.is_file():
             # Файла может не быть законно: запись не велась. Отмечаем, чтобы
             # не искать его на каждом заходе до скончания века.
-            self.db.save_call(звонок.uniqueid, job_id=None, skipped="нет записи",
-                              owner=self._владелец(звонок), **звонок.поля_записи())
+            self.db.save_call(ключ, job_id=None, skipped="нет записи",
+                              owner=self._владелец(звонок), station=self.id, **звонок.поля_записи())
             return "нет записи"
 
         звонок.direction = направление(
-            звонок,
-            внутренние_знаков=int(_число(self.settings, "telephony_internal_digits", 5)),
-            контексты=dict(self.settings.get("telephony_contexts") or {}))
+            звонок, внутренние_знаков=self.станция.internal_digits,
+            контексты=self.станция.contexts)
         звонок.agent = звонок.dst if звонок.direction == "входящий" else звонок.src
         звонок.queue = str(звонок.raw.get("lastdata") or "").split(",")[0] \
             if str(звонок.raw.get("lastapp") or "").lower() == "queue" else ""
@@ -480,14 +588,16 @@ class Импортёр:
 
         владелец = self._владелец(звонок)
         метки = ",".join(м for м in (
-            "АТС", звонок.direction or "", f"очередь {звонок.queue}" if звонок.queue else "",
+            "АТС", self.станция.name, звонок.direction or "",
+            f"очередь {звонок.queue}" if звонок.queue else "",
+            self.станция.tags,
         ) if м)
         try:
             задание = self.queue.submit(
                 file_path=путь, filename=путь.name,
-                settings=self.settings.merged({}),
+                settings=(self.settings.merged({}) if self.settings is not None else {}),
                 owner=владелец, api_key_name="telephony",
-                priority=int(_число(self.settings, "telephony_priority", 40)),
+                priority=int(self.станция.priority or 40),
                 source="asterisk", tags=метки)
         except Exception as exc:                             # noqa: BLE001
             with self._lock:
@@ -498,8 +608,8 @@ class Импортёр:
             # временное. Потерять из-за него разговор нельзя: вернёмся к
             # нему следующим заходом.
             return self._отложить(звонок, "очередь отказала")
-        self.db.save_call(звонок.uniqueid, job_id=задание.get("id"), skipped="",
-                          owner=владелец, **звонок.поля_записи())
+        self.db.save_call(ключ, job_id=задание.get("id"), skipped="",
+                          owner=владелец, station=self.id, **звонок.поля_записи())
         return None
 
     def _дописан(self, путь: Path) -> bool:
@@ -529,8 +639,188 @@ class Импортёр:
         отчётах. Сопоставление «номер → владелец» задаётся настройкой; чего
         в нём нет, достаётся общему владельцу.
         """
-        карта = dict(self.settings.get("telephony_owner_map") or {})
+        карта = self.станция.owner_map
         for номер in (звонок.agent, звонок.dst, звонок.src):
             if номер and номер in карта:
                 return str(карта[номер])
-        return str(self.settings.get("telephony_owner") or "telephony")
+        return self.станция.owner or "telephony"
+
+
+# ---------------------------------------------------------------------------
+# Набор станций
+# ---------------------------------------------------------------------------
+
+class Телефония:
+    """Все станции сразу: заводит потоки, гасит лишние, сводит состояние.
+
+    Настройку правят на ходу — добавили филиал, отключили архив, сменили
+    пароль. Каждый заход сверяется со списком станций и приводит набор
+    потоков в соответствие: у новой станции поток появляется, у убранной
+    исчезает, у изменившейся — перезапускается с новыми полями.
+
+    Сверка идёт по идентификатору, а не по порядку в списке: переставить
+    станции местами в настройке не должно ничего значить.
+    """
+
+    def __init__(self, db: Any, settings: Any, queue: Any):
+        self.db = db
+        self.settings = settings
+        self.queue = queue
+        self._lock = threading.Lock()
+        self._станции: dict[str, Импортёр] = {}
+        self._работает = False
+
+    # --- набор ------------------------------------------------------------
+
+    @property
+    def enabled(self) -> bool:
+        """Включён ли забор записей вообще."""
+        return bool(self.settings.get("telephony_enabled", False))
+
+    def станции(self) -> list[Станция]:
+        return станции_из_настроек(self.settings)
+
+    def _свести(self) -> None:
+        """Приводит набор потоков к тому, что написано в настройке."""
+        # Настройки читаются ПОД замком, а не до него. Иначе два запроса,
+        # пришедшие одновременно, читали разные версии списка, и тот, что
+        # прочитал старую, воскрешал под замком станцию, которую сосед
+        # только что убрал: удалённая АТС продолжала ходить и заводить
+        # задания, и само это не проходило — `_свести` зовут только ручки.
+        with self._lock:
+            нужные = {с.id: с for с in self.станции()}
+            for ид in list(self._станции):
+                if ид not in нужные:
+                    log.info("Станция «%s» убрана из настроек — останавливаем",
+                             self._станции[ид].станция.name)
+                    self._станции.pop(ид).stop(timeout=2.0)
+            for ид, станция in нужные.items():
+                живая = self._станции.get(ид)
+                if живая is None:
+                    self._станции[ид] = Импортёр(self.db, станция, self.queue,
+                                                 self.settings)
+                    if self._работает and self.enabled and станция.enabled:
+                        self._станции[ид].start()
+                    continue
+                if живая.станция != станция:
+                    # Поля изменились. Перезапуск честнее донастройки: у
+                    # станции может смениться источник, и держать открытым
+                    # соединение с прежним — значит не сказать об этом ни
+                    # себе, ни человеку.
+                    log.info("Настройки станции «%s» изменились — перезапуск",
+                             станция.name)
+                    живая.stop(timeout=2.0)
+                    новая = Импортёр(self.db, станция, self.queue, self.settings)
+                    # Счётчики переносим: они про архив, а не про поток.
+                    новая.imported, новая.skipped = живая.imported, живая.skipped
+                    новая.last_run, новая.last_scan = живая.last_run, живая.last_scan
+                    self._станции[ид] = новая
+                    живая = новая
+                if self._работает and self.enabled and станция.enabled:
+                    живая.start()
+                elif not станция.enabled or not self.enabled:
+                    живая.stop(timeout=2.0)
+
+    def импортёр(self, station_id: str) -> Импортёр | None:
+        self._свести()
+        with self._lock:
+            return self._станции.get(str(station_id or ""))
+
+    # --- жизнь ------------------------------------------------------------
+
+    def start(self) -> None:
+        self._работает = True
+        self._свести()
+        живых = sum(1 for и in self._станции.values() if и.enabled)
+        if живых:
+            log.info("Телефония: станций в работе %d из %d", живых, len(self._станции))
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._работает = False
+        with self._lock:
+            станции = list(self._станции.values())
+        доля = max(0.5, timeout / max(1, len(станции)))
+        for импортёр in станции:
+            импортёр.stop(timeout=доля)
+
+    # --- наружу -----------------------------------------------------------
+
+    def status(self, *, for_admin: bool = False, owner: Any = None) -> dict[str, Any]:
+        """Состояние всех станций и общий свод по ним."""
+        self._свести()
+        with self._lock:
+            импортёры = list(self._станции.values())
+        станции = [и.status(for_admin=for_admin, owner=owner) for и in импортёры]
+        итого = {"total": 0, "queued": 0, "skipped": 0, "deferred": 0,
+                 "inbound": 0, "outbound": 0, "talk_s": 0}
+        for с in станции:
+            for ключ in итого:
+                итого[ключ] += int(с.get("calls", {}).get(ключ) or 0)
+        return {
+            "enabled": self.enabled,
+            "stations": станции,
+            "running": sum(1 for с in станции if с.get("running")),
+            "configured": len(станции),
+            "calls": итого,
+            # Звонки станций, которых больше нет в настройке, из архива не
+            # исчезают: сводка по всему архиву отвечает на вопрос «сколько
+            # у нас вообще разговоров», а не «сколько прислали живые».
+            "archive": self.db.call_counts(owner=owner),
+        }
+
+    def scan(self, *, station_id: str = "", limit: int = ПОРЦИЯ) -> dict[str, Any]:
+        """Заход по требованию: по одной станции или по всем сразу."""
+        self._свести()
+        with self._lock:
+            импортёры = list(self._станции.values())
+        if station_id:
+            импортёры = [и for и in импортёры if и.id == station_id]
+            if not импортёры:
+                raise ConfigError(f"Станция «{station_id}» не настроена.",
+                                  hint="Список: GET /api/telephony/stations.")
+        итоги, сбои = [], []
+        for импортёр in импортёры:
+            if not импортёр.enabled and not station_id:
+                continue
+            try:
+                итоги.append(импортёр.scan(limit=limit))
+            except ASRHubError as exc:
+                сбои.append({"station": импортёр.id, "name": импортёр.станция.name,
+                             "error": exc.message, "hint": exc.hint})
+            except Exception as exc:                         # noqa: BLE001
+                сбои.append({"station": импортёр.id, "name": импортёр.станция.name,
+                             "error": str(exc), "hint": ""})
+        свод = {"stations": итоги, "errors": сбои}
+        for ключ in ("seen", "imported", "skipped", "deferred"):
+            свод[ключ] = sum(int(и.get(ключ) or 0) for и in итоги)
+        причины: dict[str, int] = {}
+        for и in итоги:
+            for почему, сколько in (и.get("reasons") or {}).items():
+                причины[почему] = причины.get(почему, 0) + int(сколько)
+        свод["reasons"] = причины
+        return свод
+
+    def проверить(self, station_id: str) -> dict[str, Any]:
+        """Проверка связи с одной станцией."""
+        импортёр = self.импортёр(station_id)
+        if импортёр is None:
+            raise ConfigError(f"Станция «{station_id}» не настроена.",
+                              hint="Список: GET /api/telephony/stations.")
+        return импортёр.проверить_связь()
+
+    def проверить_набросок(self, данные: dict[str, Any]) -> dict[str, Any]:
+        """Проверка связи со станцией, которой ещё нет в настройках.
+
+        Это и есть «проверить при добавлении»: человек заполнил форму и
+        хочет знать, доедет ли сервер до станции, ДО того как сохранит
+        настройки. Заводить ради этого станцию в настройках и потом убирать
+        — способ оставить мусор при первом же закрытии вкладки.
+        """
+        from .stations import _станция_из  # noqa: PLC0415
+
+        набросок = _станция_из(dict(данные or {}), 0)
+        набросок.id = набросок.id or "проба"
+        return Импортёр(self.db, набросок, self.queue, self.settings).проверить_связь()
+
+
+__all__ = ["ПОРЦИЯ", "Импортёр", "Телефония"]

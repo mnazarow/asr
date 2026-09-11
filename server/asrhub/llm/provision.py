@@ -33,6 +33,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tarfile
 import threading
 import time
 import urllib.error
@@ -53,6 +54,17 @@ log = get_logger("llm")
 
 #: Официальный установщик для Linux.
 УСТАНОВЩИК = "https://ollama.com/install.sh"
+
+#: Готовые архивы Ollama по архитектурам. Ставятся распаковкой в любой
+#: каталог и не требуют ни root, ни службы: это и есть путь для среды, где
+#: sudo недоступен — контейнер с «no new privileges», машина без sudo,
+#: пользователь без права его вызывать.
+АРХИВЫ = {
+    "x86_64": "https://ollama.com/download/ollama-linux-amd64.tgz",
+    "amd64": "https://ollama.com/download/ollama-linux-amd64.tgz",
+    "aarch64": "https://ollama.com/download/ollama-linux-arm64.tgz",
+    "arm64": "https://ollama.com/download/ollama-linux-arm64.tgz",
+}
 
 #: Адрес службы Ollama по умолчанию.
 АДРЕС = "http://127.0.0.1:11434"
@@ -236,6 +248,36 @@ def _не_root() -> bool:
     """Нужен ли sudo. На системах без понятия «root» (Windows) — нет."""
     получить = getattr(os, "geteuid", None)
     return bool(получить) and получить() != 0
+
+
+def sudo_работает() -> tuple[bool, str]:
+    """Можно ли вообще воспользоваться sudo без пароля. И если нет — почему.
+
+    Спрашивать это надо ДО установки, а не узнавать из её обломков. В
+    контейнере с `no_new_privileges` sudo отказывает всегда — флаг запрещает
+    процессу получить больше прав, чем у него есть, и это не поломка
+    настройки, а осознанное ограничение среды. Точно так же его может не
+    быть вовсе или он может требовать пароль, которого нам негде взять.
+
+    Во всех трёх случаях ответ один: ставим без root, в свой каталог.
+    """
+    if not _не_root():
+        return True, "уже root"
+    if not shutil.which("sudo"):
+        return False, "sudo на этой машине нет"
+    try:
+        итог = subprocess.run(["sudo", "-n", "true"],  # noqa: S603, S607
+                              capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"sudo не запускается: {exc}"
+    if итог.returncode == 0:
+        return True, ""
+    ошибка = (итог.stderr or "").strip().splitlines()
+    текст = ошибка[0] if ошибка else f"код {итог.returncode}"
+    if "no new privileges" in " ".join(ошибка).lower():
+        текст = ("в этой среде выставлен флаг «no new privileges» — "
+                 "sudo в ней не работает по устройству")
+    return False, текст
 
 
 def _запрос(method: str, url: str, body: dict[str, Any] | None = None, *,
@@ -643,6 +685,20 @@ class Установщик:
                 hint="Скачайте OllamaSetup.exe с ollama.com, установите "
                      "и повторите.")
         self._шаг("установка", "идёт")
+
+        # Сначала спрашиваем, можно ли вообще воспользоваться root. Штатный
+        # установщик пишет в /usr/local и заводит службу systemd — без прав
+        # он не работает. Раньше мы просто звали `sudo -n` и показывали
+        # человеку его обломки: «The "no new privileges" flag is set» —
+        # сообщение, по которому непонятно ни что случилось, ни что делать.
+        # А делать есть что: Ollama прекрасно ставится и без root.
+        можно, почему = sudo_работает()
+        if not можно:
+            self._записать(f"Установка от root недоступна ({почему}).")
+            self._записать("Ставим в каталог данных сервера, без root.")
+            self._в_свой_каталог()
+            return
+
         файл = Path(str(self.settings.paths.data if getattr(self.settings, "paths", None)
                         else "/tmp")) / "ollama-install.sh"
         self._записать(f"Скачиваем установщик {УСТАНОВЩИК}")
@@ -657,10 +713,7 @@ class Установщик:
                 hint="Проверьте выход в интернет с сервера или поставьте "
                      "Ollama вручную: https://ollama.com/download") from exc
         команда = ["sh", str(файл)]
-        if _не_root():                                       # noqa: SIM108
-            # Установщик пишет в /usr/local и заводит службу — без прав
-            # это не работает. Пробуем sudo без пароля: спросить пароль
-            # нам всё равно негде.
+        if _не_root():
             команда = ["sudo", "-n", *команда]
         self._записать("Запускаем установщик; это займёт минуту-другую.")
         try:
@@ -672,16 +725,114 @@ class Установщик:
             self._записать(строка.strip())
         if итог.returncode != 0:
             хвост = (итог.stderr or "").strip().splitlines()[-3:]
-            raise ConfigError(
-                "Установщик Ollama завершился с ошибкой: " + ("; ".join(хвост) or
-                                                              f"код {итог.returncode}"),
-                hint=("Запустите на сервере от root: curl -fsSL "
-                      "https://ollama.com/install.sh | sh"))
+            self._записать("Штатный установщик не справился: "
+                           + ("; ".join(хвост) or f"код {итог.returncode}"))
+            self._записать("Пробуем поставить без root, в каталог данных.")
+            try:
+                файл.unlink()
+            except OSError:
+                pass
+            self._в_свой_каталог(причина="; ".join(хвост) or f"код {итог.returncode}")
+            return
         try:
             файл.unlink()
         except OSError:
             pass
         self._шаг("установка", "готово", "Ollama установлена")
+
+    def _в_свой_каталог(self, причина: str = "") -> None:
+        """Ставит Ollama распаковкой архива в каталог данных — без root.
+
+        Это не запасной путь «на всякий случай», а нормальный способ: архив
+        официальный, тот же, что распаковывает штатный установщик. Разница
+        только в том, куда ложится и кто запускает: не /usr/local и systemd,
+        а каталог данных сервера и обычный процесс.
+
+        Что теряется: служба не переживёт перезагрузку машины сама. Об этом
+        говорим прямо в журнале установки — тихо подменять обещание
+        «поставил и работает» на «поставил, но после перезагрузки поднимите
+        руками» нельзя.
+        """
+        машина = (platform.machine() or "").lower()
+        адрес_архива = АРХИВЫ.get(машина)
+        if адрес_архива is None:
+            raise ConfigError(
+                f"Для архитектуры «{машина or 'неизвестно'}» "
+                "готового архива Ollama нет.",
+                hint="Поставьте Ollama вручную по инструкции с ollama.com "
+                     "и повторите — установленную сервер найдёт сам.")
+
+        корень = Path(str(self.settings.paths.data if getattr(self.settings, "paths", None)
+                          else ".")) / "ollama"
+        архив = корень.parent / "ollama.tgz"
+        корень.mkdir(parents=True, exist_ok=True)
+        self._записать(f"Скачиваем {адрес_архива}")
+        try:
+            запрос = urllib.request.Request(  # noqa: S310
+                адрес_архива, headers={"User-Agent": "ASR Hub"})
+            with urllib.request.urlopen(запрос, timeout=900) as ответ:  # noqa: S310
+                # Пишем потоком: архив — это сотни мегабайт, и читать его
+                # целиком в память на сервере, где память и так считают под
+                # веса моделей, незачем.
+                скачано = 0
+                with архив.open("wb") as файл:
+                    while кусок := ответ.read(1 << 20):
+                        файл.write(кусок)
+                        скачано += len(кусок)
+                        if скачано % (64 << 20) < (1 << 20):
+                            self._записать(f"…{скачано / 1024 ** 2:.0f} МБ")
+        except (urllib.error.URLError, OSError) as exc:
+            архив.unlink(missing_ok=True)
+            raise ConfigError(
+                f"Не удалось скачать Ollama: {getattr(exc, 'reason', exc)}",
+                hint="Проверьте выход в интернет с сервера. В закрытом "
+                     "контуре скачайте архив на машине с доступом и "
+                     f"распакуйте в {корень}.") from exc
+
+        self._записать(f"Распаковываем в {корень}")
+        try:
+            with tarfile.open(архив, "r:gz") as пакет:
+                # filter="data" отсекает из архива всё, чему не место в
+                # обычной распаковке: пути наружу каталога, ссылки, права
+                # setuid. Мы распаковываем скачанное из сети.
+                try:
+                    пакет.extractall(корень, filter="data")  # noqa: S202
+                except TypeError:                            # python < 3.12
+                    пакет.extractall(корень)                 # noqa: S202
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"Архив Ollama не распаковался: {exc}",
+                              hint="Проверьте место на диске в каталоге данных.") from exc
+        finally:
+            архив.unlink(missing_ok=True)
+
+        двоичный = корень / "bin" / "ollama"
+        if not двоичный.is_file():
+            найдено = next((п for п in корень.rglob("ollama") if п.is_file()), None)
+            if найдено is None:
+                raise ConfigError(
+                    "В архиве Ollama не нашлось исполняемого файла.",
+                    hint="Скачайте установщик с ollama.com вручную.")
+            двоичный = найдено
+        двоичный.chmod(0o755)
+
+        # PATH этого процесса — чтобы `shutil.which("ollama")` и все
+        # последующие шаги (запуск, скачивание весов, прогрев) нашли её без
+        # особых случаев в каждом месте.
+        каталог_бин = str(двоичный.parent)
+        путь = os.environ.get("PATH", "")
+        if каталог_бин not in путь.split(os.pathsep):
+            os.environ["PATH"] = f"{каталог_бин}{os.pathsep}{путь}"
+        # Веса тоже кладём в каталог данных: домашний каталог службы может
+        # быть недоступен на запись, а места под модели нужно десятки ГБ.
+        os.environ.setdefault("OLLAMA_MODELS", str(корень / "models"))
+
+        подробность = f"без root, в {корень}"
+        if причина:
+            подробность += f" (штатный установщик: {причина})"
+        self._записать("Готово. Служба поднимется отдельным процессом; "
+                       "после перезагрузки машины запустите её заново или "
+                       "заведите службу от root.")
+        self._шаг("установка", "готово", подробность)
 
     def _запуск(self, адрес: str) -> None:
         """Поднимает службу и ждёт, пока она ответит."""
@@ -690,7 +841,8 @@ class Установщик:
             self._шаг("запуск", "пропущен", f"уже отвечает, версия {состояние['version']}")
             return
         self._шаг("запуск", "идёт")
-        if shutil.which("systemctl"):
+        можно_root, почему_нет = sudo_работает()
+        if shutil.which("systemctl") and можно_root:
             команда = ["systemctl", "enable", "--now", "ollama"]
             if _не_root():
                 команда = ["sudo", "-n", *команда]
@@ -700,6 +852,10 @@ class Установщик:
                                timeout=60, check=False)
             except (OSError, subprocess.SubprocessError) as exc:
                 self._записать(f"systemctl не сработал: {exc}")
+        elif shutil.which("systemctl"):
+            # Права нужны, а их нет. Говорим об этом один раз и внятно, а не
+            # выводим человеку обломки sudo.
+            self._записать(f"Служба через systemctl недоступна: {почему_нет}.")
         if not служба(адрес)["running"]:
             # Ни системы инициализации, ни прав — запускаем сами и
             # переживём перезагрузку разве что до неё.
