@@ -687,7 +687,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:13788",
+  "instance": "vm:1993",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1265,52 +1265,51 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789073438.220464,
+    "generated_at": 1789138050.5106392,
     "jobs": {
-      "total": 282,
-      "completed": 269,
+      "total": 267,
+      "completed": 254,
       "failed": 9,
       "cancelled": 4,
       "in_progress": 0,
       "cached": 0,
-      "success_rate": 0.9539
+      "success_rate": 0.9513
     },
     "volume": {
-      "audio_seconds": 280062.1,
-      "audio_hours": 77.8,
-      "processing_seconds": 43964.0,
-      "words": 643092,
-      "characters": 3797022,
-      "segments": 29503,
-      "files_per_hour": 1.6,
-      "audio_hours_per_hour": 0.46
+      "audio_seconds": 250692.8,
+      "audio_hours": 69.64,
+      "processing_seconds": 39205.7,
+      "words": 575977,
+      "characters": 3394332,
+      "segments": 26106,
+      "files_per_hour": 1.51,
+      "audio_hours_per_hour": 0.41
     },
     "performance": {
       "rtf": {
-        "count": 269,
-        "avg": 0.14827,
+        "count": 254,
+        "avg": 0.149443,
         "min": 0.0177,
         "max": 0.5543,
-        "p10": 0.03844,
-        "p50": 0.1101,
-        "p90": 0.3343,
+        "p10": 0.03632,
+        "p50": 0.1106,
+        "p90": 0.34055,
         "p95": 0.42,
-        "p99": 0.516404,
-        "stdev": 0.118658
+        "p99": 0.520109,
+        "stdev": 0.119749
       },
       "processing_time_s": {
-        "count": 269,
-        "avg": 163.434848,
+        "count": 254,
+        "avg": 154.353008,
         "min": 0.72,
         "max": 2411.75,
-        "p10": 3.722,
-        "p50": 46.0,
-        "p90": 387.198,
-        "p95": 746.896,
-        "p99": 1897.54,
-        "stdev": 341.491961
+        "p10": 3.677,
+        "p50": 45.325,
+        "p90": 362.522,
+        "p95": 659.73,
+        "p99": 1935.3775,
+        "stdev": 332.421916
       },
-      "queue_time_s": {
 …
 ```
 
@@ -1367,63 +1366,62 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics/latency?p
 {
   "period": "week",
   "overall": {
-    "jobs": 269,
-    "audio_hours": 77.795,
-    "processing_p50": 46.0,
-    "processing_p95": 746.9,
-    "processing_p99": 1897.54,
-    "rtf_p50": 0.1101,
+    "jobs": 254,
+    "audio_hours": 69.637,
+    "processing_p50": 45.33,
+    "processing_p95": 659.73,
+    "processing_p99": 1935.38,
+    "rtf_p50": 0.1106,
     "rtf_p95": 0.42,
-    "rtf_p99": 0.5164,
-    "queue_p50": 14.22,
-    "queue_p95": 66.03
+    "rtf_p99": 0.5201,
+    "queue_p50": 13.7,
+    "queue_p95": 65.15
   },
   "by_model": [
     {
       "key": "gigaam-v3-rnnt",
-      "jobs": 49,
-      "audio_hours": 10.749,
-      "processing_p50": 48.0,
-      "processing_p95": 494.87,
-      "processing_p99": 717.97,
-      "rtf_p50": 0.1392,
-      "rtf_p95": 0.1618,
-      "rtf_p99": 0.1852,
-      "queue_p50": 14.22,
-      "queue_p95": 74.66
+      "jobs": 46,
+      "audio_hours": 8.932,
+      "processing_p50": 47.5,
+      "processing_p95": 405.94,
+      "processing_p99": 725.48,
+      "rtf_p50": 0.1407,
+      "rtf_p95": 0.1621,
+      "rtf_p99": 0.1854,
+      "queue_p50": 10.98,
+      "queue_p95": 77.47
     },
     {
       "key": "gigaam-v3-e2e-rnnt",
-      "jobs": 42,
-      "audio_hours": 13.404,
-      "processing_p50": 34.53,
-      "processing_p95": 537.12,
-      "processing_p99": 642.99,
-      "rtf_p50": 0.1153,
-      "rtf_p95": 0.1631,
-      "rtf_p99": 0.1874,
-      "queue_p50": 14.29,
-      "queue_p95": 76.01
+      "jobs": 39,
+      "audio_hours": 12.578,
+      "processing_p50": 28.15,
+      "processing_p95": 547.38,
+      "processing_p99": 644.45,
+      "rtf_p50": 0.1165,
+      "rtf_p95": 0.1647,
+      "rtf_p99": 0.1881,
+      "queue_p50": 13.35,
+      "queue_p95": 63.89
     },
     {
       "key": "gigaam-v3-ctc",
-      "jobs": 41,
-      "audio_hours": 14.386,
-      "processing_p50": 31.92,
-      "processing_p95": 270.18,
-      "processing_p99": 299.65,
-      "rtf_p50": 0.0554,
-      "rtf_p95": 0.0798,
-      "rtf_p99": 0.0944,
-      "queue_p50": 18.56,
-      "queue_p95": 51.32
+      "jobs": 38,
+      "audio_hours": 11.917,
+      "processing_p50": 31.4,
+      "processing_p95": 224.91,
+      "processing_p99": 300.95,
+      "rtf_p50": 0.0557,
+      "rtf_p95": 0.0814,
+      "rtf_p99": 0.0946,
+      "queue_p50": 18.79,
+      "queue_p95": 51.86
     },
     {
-      "key": "tone-ru",
-      "jobs": 39,
-      "audio_hours": 14.53,
-      "processing_p50": 191.72,
-      "processing_p95": 2089.7,
+      "key": "faster-whisper-large-v3-turbo",
+      "jobs": 37,
+      "audio_hours": 9.805,
+      "processing_p50": 30.84,
 …
 ```
 
@@ -1465,7 +1463,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.0.0",
-  "uptime_s": 989.7,
+  "uptime_s": 145.3,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1544,7 +1542,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.0.0",
-  "uptime_s": 989.8,
+  "uptime_s": 145.4,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v24",
@@ -1553,7 +1551,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
+    "ram_available_gb": 7.1,
     "disk_free_gb": 19.6,
     "gpus": [],
     "accelerator": "cpu",
@@ -2077,7 +2075,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "period": "week",
   "enabled": true,
   "model": "qwen3:14b",
-  "records": 269,
+  "records": 254,
   "analyzed": 0,
   "errors": 0,
   "stale": 0,
@@ -2238,6 +2236,11 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
 
 Сколько записей разобрано, сколько ждёт, какой версией.
 
+Числа записей — по своим: полоса разбора в интерфейсе должна отвечать
+на вопрос «мои разговоры разобраны?», а не показывать чужой архив.
+Версия, набор категорий и признак «идёт разбор» общие — это про
+сервер.
+
 **Доступ:** любой действующий ключ.
 
 
@@ -2330,9 +2333,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "total_gb": 7.8,
-    "free_gb": 7.0,
+    "free_gb": 7.1,
     "reserve_gb": 4.0,
-    "budget_gb": 2.9,
+    "budget_gb": 3.0,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [

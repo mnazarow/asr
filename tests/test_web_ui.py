@@ -617,3 +617,18 @@ def test_the_settings_offer_to_install_a_model_for_this_hardware(страниц�
     assert страница.evaluate(
         "() => document.querySelectorAll('#params-body .params').length") >= 1
     _чисто(страница)
+
+
+def test_карта_часов_недели_не_подставляет_ноль_вместо_пустоты():
+    """Пустая клетка — «не было», а не ноль.
+
+    Подстановка нуля стоила двух вещей: у показателя с отрицательными
+    значениями ноль сам по себе значение, а у показателя без данных вся
+    карта заливалась одним тоном при подписи «от — до —» под ней.
+    """
+    from pathlib import Path
+
+    источник = (Path(__file__).resolve().parent.parent
+                / "server" / "asrhub" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "values: д.grid || []" in источник, "карта снова получает подменённые значения"
+    assert "строка.map((v) => (v === null ? 0 : v))" not in источник

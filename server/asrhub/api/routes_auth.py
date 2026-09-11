@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Request, Response
@@ -44,7 +45,13 @@ def _set_cookie(request: Request, response: Response, token: str, expires: float
     https = (forwarded or request.url.scheme) == "https"
     response.set_cookie(
         SESSION_COOKIE, token,
-        max_age=int(max(0, expires - request.scope.get("_now", 0)) or 0) or None,
+        # `request.scope["_now"]` не заполняет никто, поэтому раньше сюда
+        # уходила не длительность, а абсолютная метка времени: кука
+        # получала срок годности 2083 год, а Starlette из целого `expires`
+        # делает «столько секунд от сейчас». Серверная сессия при этом
+        # честно истекала — но браузер хранил мёртвый токен десятилетиями
+        # и слал его при каждом запросе.
+        max_age=int(max(0, expires - time.time())) or None,
         expires=int(expires),
         httponly=True,          # javascript до куки не дотянется
         samesite="lax",         # чужая страница не отправит её POST-запросом
@@ -61,6 +68,17 @@ def login(request: Request, response: Response,
     Ответ одинаков для несуществующего логина и неверного пароля: иначе
     список существующих логинов собирается простым перебором.
     """
+    state = get_state(request)
+    # Предел частоты — до scrypt, а не после. Это единственный маршрут без
+    # ключа доступа, и единственный, где сервер считает хеш пароля: 32 МБ
+    # и сотня миллисекунд на попытку. Без предела шестьдесят запросов с
+    # одного адреса за семь секунд поднимали потребление памяти с 89 МБ до
+    # 1,1 ГБ, а /api/health отвечал четыре секунды вместо десятой доли.
+    # Блокировка учётной записи здесь не помощник: она привязана к
+    # существующему логину, а наплыв идёт по выдуманным.
+    адрес = request.client.host if request.client else "неизвестно"
+    state.check_rate(f"login:{адрес}",
+                     int(state.settings.get("login_rate_limit") or 0))
     accounts = _accounts(request)
     username = str(payload.get("username") or "").strip()
     password = str(payload.get("password") or "")

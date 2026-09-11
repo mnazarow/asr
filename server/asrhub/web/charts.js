@@ -590,16 +590,35 @@ function fmtNum(value, digits) {
                             width: '100%', style: 'width:100%;height:auto',
                             preserveAspectRatio: 'xMidYMid meet' }, host);
 
-    let max = 0;
-    values.forEach((row) => row.forEach((v) => { if (v > max) max = v; }));
+    // Границы берём по настоящим данным, а не от нуля. Показатель бывает
+    // отрицательным целиком (громкость в LUFS — от −26 до −23) и бывает
+    // знакопеременным (тональность от −0,4 до +0,4). Максимум, начатый с
+    // нуля, давал в первом случае max = 0 и одноцветную карту, а во
+    // втором — Math.sqrt отрицательного, то есть NaN, ramp[NaN] =
+    // undefined и <rect fill="undefined">: чёрные клетки посреди карты.
+    const точки = [];
+    values.forEach((row) => (row || []).forEach((v) => {
+      if (v !== null && v !== undefined && Number.isFinite(v)) точки.push(v);
+    }));
+    const низ = точки.length ? Math.min(...точки) : 0;
+    const верх = точки.length ? Math.max(...точки) : 0;
+    // Шкала считается от размаха: ноль внизу там, где все значения
+    // положительны (счётные показатели так и читаются), и минимум внизу
+    // там, где есть отрицательные.
+    const дно = низ < 0 ? низ : 0;
+    const max = верх - дно;
     // Шкалу берём корневую, а не линейную. Один выброс (тридцать заданий в
     // час против обычных трёх) при линейной шкале укладывает всю остальную
     // неделю в один тон, и карта перестаёт что-либо показывать, кроме пика,
     // — а пик и так подписан текстом.
     const rampLight = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95'];
     const ramp = mode() === 'light' ? rampLight : rampLight.slice().reverse();
-    const уровень = (v) => (max ? Math.min(ramp.length - 1,
-      Math.floor(Math.sqrt(v / max) * ramp.length)) : 0);
+    const уровень = (v) => {
+      if (!max || v === null || v === undefined || !Number.isFinite(v)) return 0;
+      const доля = Math.max(0, Math.min(1, (v - дно) / max));
+      return Math.min(ramp.length - 1, Math.floor(Math.sqrt(доля) * ramp.length));
+    };
+    const есть = (v) => v !== null && v !== undefined && Number.isFinite(v);
 
     // Подписи столбцов — через две, иначе часы сливаются в кашу.
     cols.forEach((label, c) => {
@@ -615,7 +634,9 @@ function fmtNum(value, digits) {
         const level = уровень(value);
         const rect = el('rect', {
           x: left + c * cell, y: 20 + r * cell, width: cell - 2, height: cell - 2, rx: 3,
-          fill: value ? ramp[level] : gridColor(),
+          // Пустая клетка — «не было», а не «ноль»: у показателя с
+          // отрицательными значениями ноль сам по себе значение.
+          fill: есть(value) ? ramp[level] : gridColor(),
         }, svg);
         const extra = config.secondary && config.secondary[r]
           ? ` · ${fmtNum(config.secondary[r][c], 2)} ${config.secondaryUnit || ''}` : '';

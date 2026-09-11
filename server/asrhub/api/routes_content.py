@@ -73,8 +73,14 @@ def report(request: Request, period: str = ПЕРИОД,
 @router.get("/status", summary="Состояние разбора")
 def status(request: Request,
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    """Сколько записей разобрано, сколько ждёт, какой версией."""
-    return _index(request).status()
+    """Сколько записей разобрано, сколько ждёт, какой версией.
+
+    Числа записей — по своим: полоса разбора в интерфейсе должна отвечать
+    на вопрос «мои разговоры разобраны?», а не показывать чужой архив.
+    Версия, набор категорий и признак «идёт разбор» общие — это про
+    сервер.
+    """
+    return _index(request).status(owner=scope_owner(principal))
 
 
 @router.get("/summary", summary="Свод по корпусу")

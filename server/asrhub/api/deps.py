@@ -209,6 +209,40 @@ def _session_principal(request: Request, state: AppState) -> Principal | None:
     return principal
 
 
+def token_from(x_api_key: str | None, authorization: str | None,
+               query_key: str | None = None) -> str:
+    """Ключ доступа из того, чем его прислали, — одним местом на всех.
+
+    Разбор заголовка повторялся в шести местах: в проверке ключа, в двух
+    маршрутах мониторинга, в двух веб-сокетах и в прослойке маскирования.
+    Пять из них принимали `Authorization: <ключ>` без схемы, а шестая —
+    только `Bearer <ключ>`. Этой шестой была прослойка маскирования: ключ,
+    заведённый администратором именно затем, чтобы не видеть персональных
+    данных, получал их целиком, стоит убрать из заголовка слово «Bearer».
+
+    Разъезжаться такому разбору нельзя вообще: он решает, кто есть кто, и
+    любое расхождение между «кем тебя считает проверка» и «кем тебя
+    считает защита» — это дыра, а не неудобство.
+    """
+    token = (x_api_key or "").strip()
+    if not token and authorization:
+        части = authorization.split(" ", 1)
+        token = (части[1].strip()
+                 if len(части) == 2 and части[0].lower() == "bearer"
+                 else authorization.strip())
+    if not token:
+        token = (query_key or "").strip()
+    return token
+
+
+def token_of(request: Request) -> str:
+    """То же самое для запроса или веб-сокета, у которого нет Depends."""
+    query = getattr(request, "query_params", None)
+    return token_from(request.headers.get("x-api-key"),
+                      request.headers.get("authorization"),
+                      query.get("api_key") if query is not None else None)
+
+
 def authenticate(request: Request,
                  x_api_key: str | None = Header(default=None, alias="X-API-Key"),
                  authorization: str | None = Header(default=None)) -> Principal:
@@ -217,13 +251,8 @@ def authenticate(request: Request,
     if not state.settings.get("auth_enabled", True):
         return Principal(name="без аутентификации", role="admin")
 
-    token = x_api_key or ""
-    if not token and authorization:
-        parts = authorization.split(" ", 1)
-        token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
-            else authorization.strip()
-    if not token:
-        token = request.query_params.get("api_key", "")
+    token = token_from(x_api_key, authorization,
+                       request.query_params.get("api_key"))
 
     info = state.settings.api_keys.get(token)
     if not info:

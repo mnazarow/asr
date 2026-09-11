@@ -338,11 +338,15 @@ class Accounts:
             raise AuthError("Учётная запись отключена.",
                             hint="Обратитесь к администратору сервера.")
         if not verify_password(password, str(row["password_hash"])):
-            attempts = int(row["failed_attempts"] or 0) + 1
-            locked = now + LOCKOUT_S if attempts >= MAX_FAILED_ATTEMPTS else 0.0
-            self.db.execute(
-                "UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?",
-                [attempts, locked, row["id"]])
+            # Счёт ведёт сама база, а не мы по прочитанному снимку. Между
+            # чтением строки и записью обратно стоит scrypt — около ста
+            # миллисекунд, — и в это окно помещается сколько угодно
+            # параллельных попыток: каждая читала «ноль», прибавляла
+            # единицу и записывала единицу. Проверка пяти попыток
+            # пропускала двести паролей за шестнадцать секунд, и предела у
+            # этого усиления не было: сколько потоков, во столько раз.
+            attempts = self._отметить_неудачу(str(row["id"]), now)
+            locked = attempts >= MAX_FAILED_ATTEMPTS
             if locked:
                 log.warning("Учётная запись «%s» заблокирована на %d мин: %d неудачных попыток",
                             row["username"], int(LOCKOUT_S / 60), attempts)
@@ -352,6 +356,25 @@ class Accounts:
             "UPDATE users SET failed_attempts = 0, locked_until = 0, last_login = ? "
             "WHERE id = ?", [now, row["id"]])
         return _account(row)
+
+    def _отметить_неудачу(self, user_id: str, now: float) -> int:
+        """Прибавляет неудачную попытку в базе и возвращает новое число.
+
+        Прибавление и решение о блокировке — один оператор UPDATE: SQLite
+        исполняет его под своей блокировкой записи, поэтому параллельные
+        попытки складываются, а не затирают друг друга. Читаем после — уже
+        просто чтобы знать, что получилось, и записать это в журнал.
+        """
+        self.db.execute(
+            "UPDATE users SET failed_attempts = COALESCE(failed_attempts, 0) + 1, "
+            "    locked_until = CASE "
+            "        WHEN COALESCE(failed_attempts, 0) + 1 >= ? THEN ? "
+            "        ELSE locked_until END "
+            "WHERE id = ?",
+            [MAX_FAILED_ATTEMPTS, now + LOCKOUT_S, user_id])
+        строка = self.db.query_one(
+            "SELECT failed_attempts FROM users WHERE id = ?", [user_id])
+        return int(строка["failed_attempts"] or 0) if строка else MAX_FAILED_ATTEMPTS
 
     # --- сессии ---------------------------------------------------------
 

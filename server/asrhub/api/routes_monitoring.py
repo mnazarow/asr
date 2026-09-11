@@ -20,7 +20,14 @@ from ..monitoring import METRICS, MetricSpec, exporters, probes
 from ..monitoring import catalog as metric_catalog
 from ..monitoring.alerts import Rule
 from ..monitoring.pushers import KINDS, Target
-from .deps import Principal, authenticate, error_response, get_state, require_admin
+from .deps import (
+    Principal,
+    authenticate,
+    error_response,
+    get_state,
+    require_admin,
+    token_of,
+)
 
 router = APIRouter(prefix="/api/monitoring", tags=["Мониторинг"])
 
@@ -51,14 +58,7 @@ def _guard(request: Request) -> None:
     if _open_access(request):
         return
     state = get_state(request)
-    token = request.headers.get("x-api-key") or ""
-    if not token:
-        header = request.headers.get("authorization", "")
-        parts = header.split(" ", 1)
-        token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
-            else header.strip()
-    if not token:
-        token = request.query_params.get("api_key", "")
+    token = token_of(request)
     info = state.settings.api_keys.get(token)
     if not info:
         raise error_response(AuthError("Ключ доступа отсутствует или недействителен."))
@@ -305,7 +305,8 @@ def alerts(request: Request, only_firing: bool = False,
 
 
 @router.get("/alerts/history", summary="История срабатываний")
-def alerts_history(request: Request, limit: int = 100,
+def alerts_history(request: Request,
+                   limit: int = Query(default=100, ge=1, le=2000),
                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     return {"items": _monitoring(request).alerts.history(limit)}
 

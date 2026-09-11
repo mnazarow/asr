@@ -636,6 +636,19 @@ class JobQueue:
             self._retiring -= set(range(workers))
             if workers > current:
                 for index in range(current, workers):
+                    # Поднимаем поток только там, где его нет. Пометка на
+                    # выход снята строкой выше, а помеченный воркер уходит
+                    # не сразу — он замечает её, лишь когда проснётся.
+                    # Поэтому после «4 → 1 → 4» (две правки подряд на
+                    # странице настроек или отказ от только что сделанной)
+                    # индексы 1–3 всё ещё заняты живыми потоками: прежний
+                    # код заводил им вторые, да ещё и затирал WorkerState.
+                    # Три лишних потока ОС на каждую правку, и два потока
+                    # на одно состояние — страница очереди показывала не то
+                    # задание, а уходящий воркер убирал состояние из-под
+                    # живого соседа того же номера.
+                    if index in self._states:
+                        continue
                     self._states[index] = WorkerState(index=index)
                     thread = threading.Thread(target=self._worker_loop, args=(index,),
                                               name=f"asrhub-worker-{index}", daemon=True)
@@ -939,6 +952,19 @@ class JobQueue:
 
         elapsed = time.time() - started
         accuracy = outcome.stats.get("accuracy") or {}
+        # Реплики пишутся ДО отметки «готово», а не после. Порядок решает:
+        # между отметкой и записью реплик стоял незащищённый вызов, и любое
+        # исключение там (занятая база — обычное дело на общем архиве)
+        # оставляло задание в состоянии «готово» с `segments_count = 40` и
+        # пустой таблицей реплик. Восстановиться из этого состояния не
+        # может ничто: подхват зависших ищет «выполняется», а обработчик
+        # сбоя пишет только из него же.
+        #
+        # Если отметка ниже не пройдёт (задание отменили или отобрали),
+        # реплики останутся без задания — их уберёт `delete_job` или
+        # подметание сирот в уборке. Это несравнимо дешевле, чем «готово»
+        # без текста.
+        self.db.save_segments(job_id, outcome.segments)
         # Только из состояния «выполняется». Отмена аккуратно сверяет статус
         # перед записью, а обратное направление было незащищено: отмена,
         # пришедшая между последней проверкой в конвейере и этой записью,
@@ -981,10 +1007,10 @@ class JobQueue:
             log.info("Задание %s завершилось, но его состояние уже изменено — "
                      "результат отброшен", job_id, extra={"job_id": job_id})
             self._discard_unless_taken(outdir, job_id)
+            self.db.clear_segments(job_id)
             with self._lock:
                 self._cancelled.discard(job_id)
             return
-        self.db.save_segments(job_id, outcome.segments)
         with self._lock:
             self._cancelled.discard(job_id)
 
@@ -1060,6 +1086,10 @@ class JobQueue:
 
         log.info("Задание %s: готово за %.1f с, RTF %.3f", job_id, elapsed, outcome.rtf,
                  extra={"job_id": job_id, "model": job.get("model")})
+        # Дальше — только уведомление, и оно тоже не должно ронять готовое
+        # задание: сбой здесь уходил в общий обработчик, а тот пытался
+        # записать «ошибка» поверх «готово», не мог и не писал ничего —
+        # даже в журнал событий задания.
         self.db.add_event(job_id, "completed",
                           f"Готово за {elapsed:.1f} с, RTF {outcome.rtf:.3f}")
         self._emit("job.completed", {"id": job_id, "rtf": outcome.rtf,
@@ -1214,9 +1244,25 @@ class JobQueue:
                       job_id, exc)
             return
         чей = str(строка.get("instance_id") or "")
-        if чей and чей != INSTANCE_ID and строка.get("status") == STATUS_RUNNING:
+        статус = str(строка.get("status") or "")
+        if чей and чей != INSTANCE_ID and статус == STATUS_RUNNING:
             log.info("Каталог результатов %s оставлен: заданием занят экземпляр «%s»",
                      job_id, чей, extra={"job_id": job_id})
+            return
+        # Готовое задание — тоже чужая работа, и её здесь сносили. Проверка
+        # закрывала только случай «сосед ещё считает», а завершённое
+        # задание пишет instance_id=NULL и статус completed: условие выше
+        # оказывалось ложным, и rmtree сносил каталог результатов соседа.
+        #
+        # Случай не выдуманный: экземпляр A залипает дольше STALE_AFTER_S,
+        # B возвращает задание в очередь и досчитывает его за сорок минут,
+        # A оживает и либо досчитывает сам, либо получает отказ движка — и
+        # в обоих случаях стирает файлы B. В базе задание остаётся
+        # completed с result_path, указывающим в пустоту: все скачивания
+        # отвечают 404 навсегда.
+        if статус == STATUS_COMPLETED:
+            log.info("Каталог результатов %s оставлен: задание уже завершено",
+                     job_id, extra={"job_id": job_id})
             return
         self._discard_results(outdir)
 

@@ -142,15 +142,36 @@ def to_markdown(result: dict[str, Any], settings: dict[str, Any]) -> str:
 
 
 def to_json(result: dict[str, Any], settings: dict[str, Any]) -> str:
+    """Результат книгой JSON — не трогая сам результат.
+
+    `dict(result)` — мелкая копия: список реплик и сами словари реплик
+    остаются общими, и `seg.pop("confidence")` вычищал их у оригинала. А
+    оригинал — это `outcome.segments`, который сразу после выгрузки уходит
+    в `save_segments` и в оценку качества. То есть настройка «не включать
+    уверенность в JSON» стирала уверенность и пословные тайминги из базы
+    для всей записи: признак «тишина» переставал срабатывать, а рабочий
+    ход «отсортировать реплики по уверенности и править пять процентов»
+    становился невозможен — при том что средняя уверенность в карточке
+    оставалась на месте, потому что считается раньше.
+    """
+    без_уверенности = not settings.get("include_confidence", True)
+    без_слов = not settings.get("word_timestamps", True)
     payload = dict(result)
-    if not settings.get("include_confidence", True):
-        for seg in payload.get("segments", []):
-            seg.pop("confidence", None)
-            for word in seg.get("words") or []:
-                word.pop("confidence", None)
-    if not settings.get("word_timestamps", True):
-        for seg in payload.get("segments", []):
-            seg.pop("words", None)
+    if без_уверенности or без_слов:
+        реплики = []
+        for seg in result.get("segments", []) or []:
+            копия = dict(seg)
+            if без_слов:
+                копия.pop("words", None)
+            else:
+                слова = копия.get("words") or []
+                if без_уверенности and слова:
+                    копия["words"] = [{к: з for к, з in слово.items()
+                                       if к != "confidence"} for слово in слова]
+            if без_уверенности:
+                копия.pop("confidence", None)
+            реплики.append(копия)
+        payload["segments"] = реплики
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 

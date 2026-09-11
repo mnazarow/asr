@@ -31,7 +31,7 @@ from ..monitoring import RUNTIME, MonitoringService
 from ..streaming import StreamSession
 from ..telephony import Импортёр
 from ..trends import Trends
-from .deps import SESSION_COOKIE, AppState
+from .deps import SESSION_COOKIE, AppState, token_of
 from .routes_auth import router as auth_router
 from .routes_auth import users_router
 from .routes_catalog import router as catalog_router
@@ -457,14 +457,11 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         response = await call_next(request)
         if not settings.get("auth_enabled", True):
             return response
-        token = (request.headers.get("x-api-key") or "").strip()
-        if not token:
-            header = request.headers.get("authorization", "")
-            parts = header.split(" ", 1)
-            token = (parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer"
-                     else "")
-        if not token:
-            token = request.query_params.get("api_key", "")
+        # Разбор общий с `authenticate`. Своя копия здесь принимала только
+        # «Bearer», а проверка ключа — ещё и голый заголовок: ключ с
+        # mask_pii получал полные телефоны и карты, стоило убрать одно
+        # слово из заголовка.
+        token = token_of(request)
         info = settings.api_keys.get(token) if token else None
         if not info or not info.get("mask_pii"):
             return response
@@ -608,10 +605,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 # маршрута, и /ws его разбирает. Здесь его не было, и
                 # сторонний клиент, написанный по документации, получал
                 # 4401 «ключ недействителен» на действующем ключе.
-                header = websocket.headers.get("authorization", "")
-                parts = header.split(" ", 1)
-                token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
-                    else header.strip()
+                token = token_of(websocket)
             info = settings.api_keys.get(token)
             if not info or info.get("enabled") is False:
                 await websocket.close(code=4401,
@@ -722,10 +716,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 token = (websocket.query_params.get("api_key")
                          or websocket.headers.get("x-api-key") or "")
             if not token:
-                header = websocket.headers.get("authorization", "")
-                parts = header.split(" ", 1)
-                token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
-                    else header.strip()
+                token = token_of(websocket)
             info = settings.api_keys.get(token)
             account = None
             if not info:

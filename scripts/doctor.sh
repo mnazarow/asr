@@ -395,8 +395,13 @@ PORT_CAP="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev
 PORT_CAP="${PORT_CAP:-8080}"
 KEY_FILE="${DATA_DIR}/api-key.txt"
 if have curl && [[ -r "${KEY_FILE}" ]]; then
-  QUEUE_JSON="$(curl -fsS --max-time 3 -H "X-API-Key: $(cat "${KEY_FILE}")" \
-                "http://127.0.0.1:${PORT_CAP}/api/queue" 2>/dev/null || true)"
+  # Ключ идёт в curl через --config со стандартного ввода, а не аргументом:
+  # аргументы командной строки видны в `ps` и в /proc/*/cmdline любому
+  # пользователю машины, а здесь это ключ администратора. Клиент asrctl
+  # делает ровно так же и объясняет почему.
+  QUEUE_JSON="$(printf 'header = "X-API-Key: %s"\n' "$(cat "${KEY_FILE}")" \
+                | curl -fsS --max-time 3 --config - \
+                  "http://127.0.0.1:${PORT_CAP}/api/queue" 2>/dev/null || true)"
   if [[ -n "${QUEUE_JSON}" ]] && have python3; then
     INSTANCES="$(printf '%s' "${QUEUE_JSON}" | python3 -c "
 import json, sys

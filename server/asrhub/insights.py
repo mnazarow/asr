@@ -642,9 +642,15 @@ class Insights:
         конец = time.time()
         начало = self.window(period)[0]
         if начало is None:
+            # «Всё время» — это всё время ТОГО, кто спрашивает. Начало по
+            # всему серверу давало отделу, подключённому вчера, годовой
+            # график с двадцатью тремя пустыми корзинами — и заодно
+            # сообщало возраст архива соседей.
+            условие, args = self.db._owner_clause(owner, "j")
+            где = f" WHERE {условие}" if условие else ""
             первая = self.db.query_one(
                 "SELECT MIN(j.created_at) AS ts FROM content c "
-                "JOIN jobs j ON j.id = c.job_id")
+                f"JOIN jobs j ON j.id = c.job_id{где}", args)
             начало = float((первая["ts"] if первая else None) or конец - 86400)
         buckets, шаг, строки = self.db.content_series(
             since=начало, until=конец, buckets=buckets, owner=owner)
@@ -786,7 +792,11 @@ class Insights:
         # Срабатывания трекеров — по журналу событий; подпись берём из
         # действующего набора, а у переименованной с тех пор — из события.
         подписи_набора = {к.id: к.label for к in набор}
-        трекеры = self.db.tracker_hits(since=начало)
+        # Владелец здесь обязателен, как и у соседних вызовов в этом же
+        # методе. Без него ключ с одной своей записью узнавал из
+        # «Категорий», что у соседнего отдела сорок разговоров с угрозой
+        # суда, — и то же уезжало в отчёт и в книгу Excel.
+        трекеры = self.db.tracker_hits(since=начало, owner=owner)
         for т in трекеры:
             т["label"] = подписи_набора.get(т["category"], т.get("label") or т["category"])
         return {"period": period, "corpus": n_сейчас, "corpus_previous": n_раньше,
@@ -1531,7 +1541,7 @@ class Insights:
 
         # 9. Разбор ещё не закончен — об этом надо сказать до выводов, а не
         #    после: свод по половине архива читается как свод по архиву.
-        состояние = self.index.status() if self.index else {}
+        состояние = self.index.status(owner=owner) if self.index else {}
         if состояние.get("pending"):
             добавить("info",
                      f"Разобрано {состояние.get('analyzed', 0)} записей из "
@@ -1575,7 +1585,7 @@ class Insights:
             "period": period,
             "generated_at": time.time(),
             "took_s": round(time.time() - начало_счёта, 3),
-            "coverage": self.index.status() if self.index else {},
+            "coverage": self.index.status(owner=owner) if self.index else {},
             "summary": свод,
             "previous": прошлый,
             "timeline": self.timeline(period, owner),

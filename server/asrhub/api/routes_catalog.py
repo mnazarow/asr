@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from .. import catalog, model_files
 from ..engines import ENGINE_CLASSES, engine_status
@@ -80,7 +80,7 @@ def list_models(
 
 
 @router.get("/models/recommended", summary="Рекомендуемые модели для русского языка")
-def recommended(limit: int = 8) -> dict[str, Any]:
+def recommended(limit: int = Query(default=8, ge=1, le=100)) -> dict[str, Any]:
     items = catalog.recommended_ru(limit)
     return {"items": [{**m.to_dict(), "mean_ru_wer": catalog.mean_ru_wer(m)} for m in items],
             "note": ("Значения WER измерены на разных наборах данных и разными авторами. "

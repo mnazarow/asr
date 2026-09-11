@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import ASRHubError, AudioError, ConfigError
+from .errors import ASRHubError, AudioError, ConfigError, EngineError
 from .logging_setup import get_logger
 
 log = get_logger("streaming")
@@ -280,12 +280,27 @@ class StreamSession:
         if self._since_flush < need:
             return []
         self._since_flush = 0
-        text = self._recognize(bytes(self._pcm))
 
         # Хвост перерос предел — закрепляем распознанное и выбрасываем звук.
         # Иначе каждое следующее окно считало бы всё сказанное с начала.
+        #
+        # Проверка стоит ДО распознавания, а не после: раньше окно сначала
+        # прогоняло весь хвост через движок, а потом выбрасывало результат
+        # и звало `_commit`, который считал то же самое ещё раз. На
+        # тридцати четырёх секундах записи через движок проходило сто
+        # семьдесят восемь секунд звука, из них шестьдесят два — два
+        # подряд прогона одного и того же куска.
         if len(self._pcm) >= int(MAX_TAIL_S * SAMPLE_RATE * 2):
             return self._commit()
+
+        try:
+            text = self._recognize(bytes(self._pcm))
+        except ASRHubError as exc:
+            # Промежуточный результат — вещь необязательная: не посчитался,
+            # и ладно, следующее окно посчитает. Ронять из-за него сессию
+            # незачем, но и молчать не будем.
+            log.info("Промежуточное распознавание пропущено: %s", exc.message)
+            return []
 
         if text and text != self._last_partial:
             self._last_partial = text
@@ -320,7 +335,20 @@ class StreamSession:
         полминуты.
         """
         cut = _quiet_split(self._pcm)
-        text = self._recognize(bytes(self._pcm[:cut])) if cut else ""
+        if not cut:
+            return []
+        try:
+            text = self._recognize(bytes(self._pcm[:cut]))
+        except ASRHubError as exc:
+            # Звук НЕ выбрасываем. Раньше `_recognize` глотал любое
+            # исключение и отвечал пустой строкой, а хвост удалялся в любом
+            # случае: одна нехватка видеопамяти ровно на этом прогоне — и
+            # тридцать секунд речи исчезали безвозвратно, причём клиенту не
+            # уходило ни `final`, ни `error`, и сессия заканчивалась
+            # штатным `done`. Человек видел в `partial` текст, которого в
+            # итоговой расшифровке не оказалось.
+            log.warning("Закрепление не удалось, звук сохранён: %s", exc.message)
+            return [StreamEvent("error", extra={"message": exc.message})]
         start, end = self._committed_s, self._committed_s + cut / (SAMPLE_RATE * 2)
         del self._pcm[:cut]
         self._committed_s = end
@@ -415,7 +443,18 @@ class StreamSession:
         if text:
             self._note_first_text()
             self._final_text = (self._final_text + " " + text).strip()
-        return [StreamEvent("final", text=self._final_text, start=0.0, end=self.duration_s)]
+        elif not self._final_text:
+            # Ни хвоста, ни накопленного — сказать нечего, и пустой `final`
+            # клиенту не нужен: у него уже есть всё, что приходило по ходу.
+            return []
+        # Отдаём ТОЛЬКО хвост, а не всё накопленное. Событие `final` в
+        # обоих режимах означает «вот ещё кусок, он больше не изменится», и
+        # веб-интерфейс складывает такие события подряд (`this.final.push`).
+        # Возврат всего текста сессии заставлял клиента показать расшифровку
+        # дважды: сначала приращениями, потом её же целиком. Итоговый текст
+        # и так уходит следом в событии `done`.
+        return [StreamEvent("final", text=text, start=self._committed_s,
+                            end=self.duration_s)]
 
     def _recognize(self, pcm: bytes) -> str:
         """Распознаёт накопленный звук целиком — путь скользящего окна."""
@@ -432,10 +471,10 @@ class StreamSession:
                 result = engine.transcribe(path, self.settings, None)
         except ASRHubError as exc:
             log.info("Распознавание куска не удалось: %s", exc.message)
-            return ""
+            raise
         except Exception as exc:                        # noqa: BLE001
             log.warning("Распознавание куска не удалось: %s", exc)
-            return ""
+            raise EngineError(f"Распознавание куска не удалось: {exc}") from exc
         finally:
             path.unlink(missing_ok=True)
         return " ".join(s.text.strip() for s in result.segments if s.text).strip()

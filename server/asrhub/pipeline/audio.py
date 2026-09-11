@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import settings_access as S
-from ..errors import AudioError, AudioTooLong, BinaryMissing, UnsupportedFormat
+from ..errors import AudioError, AudioTooLong, BinaryMissing, UnsupportedFormat, без_путей
 from ..logging_setup import get_logger
 
 log = get_logger("audio")
@@ -91,7 +91,7 @@ def probe(path: Path) -> AudioInfo:
     """Определяет параметры файла. Использует ffprobe, при его отсутствии — WAV-разбор."""
     path = Path(path)
     if not path.exists():
-        raise AudioError(f"Файл не найден: {path}")
+        raise AudioError(f"Файл не найден: {path.name}")
     if path.stat().st_size == 0:
         raise AudioError(f"Файл пуст: {path.name}")
 
@@ -103,9 +103,11 @@ def probe(path: Path) -> AudioInfo:
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
         except subprocess.SubprocessError as exc:
-            raise AudioError(f"ffprobe не смог прочитать файл: {exc}") from exc
+            raise AudioError(
+                f"ffprobe не смог прочитать файл: {без_путей(str(exc))}") from exc
         if res.returncode != 0:
-            raise UnsupportedFormat(path.name, (res.stderr or "").strip()[:200])
+            raise UnsupportedFormat(path.name,
+                                    без_путей((res.stderr or "").strip())[:200])
         try:
             data = json.loads(res.stdout or "{}")
         except json.JSONDecodeError as exc:
@@ -306,13 +308,18 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
         raise AudioError("Конвертация аудио не завершилась за час.",
                          hint="Файл слишком большой или ffmpeg завис.") from exc
     except OSError as exc:
-        raise AudioError(f"Не удалось запустить ffmpeg: {exc}") from exc
+        raise AudioError(
+            f"Не удалось запустить ffmpeg: {без_путей(str(exc))}") from exc
 
     if res.returncode != 0 or not dst.exists() or dst.stat().st_size < 128:
         stderr = (res.stderr or "").strip()
         raise AudioError(
             f"ffmpeg не смог обработать «{src.name}».",
-            hint=("Проверьте целостность файла. Сообщение ffmpeg: " + stderr[-500:])
+            # Вывод ffmpeg несёт полный путь к файлу, а подсказка уходит
+            # клиенту и на заданный им адрес уведомления. Имя файла в ней
+            # остаётся, каталог — нет.
+            hint=("Проверьте целостность файла. Сообщение ffmpeg: "
+                  + без_путей(stderr)[-500:])
                  if stderr else "Проверьте целостность файла.",
             details={"returncode": res.returncode, "stderr": stderr[-2000:]})
     return dst
@@ -343,6 +350,19 @@ class Prepared:
     def to_source_time(self, value: float) -> float:
         """Время подготовленного файла -> время исходной записи."""
         return self.offset_s + value * self.speed
+
+    def to_prepared_time(self, value: float) -> float:
+        """Обратный перевод: время исходной записи — во время подготовленной.
+
+        Нужен там, где реплики уже вернулись в координаты исходника, а
+        работать надо по подготовленному звуку: полоса громкости по
+        говорящим индексирует отсчёты подготовленного файла, и брать для
+        этого исходные секунды значит промахнуться ровно на длину
+        обрезанной тишины.
+        """
+        if self.speed <= 0:
+            return max(0.0, value - self.offset_s)
+        return max(0.0, (value - self.offset_s) / self.speed)
 
     @property
     def shifted(self) -> bool:

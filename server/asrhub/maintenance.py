@@ -239,7 +239,13 @@ def build_digest(analytics: Any, settings: Any, *, period: str = "",
                               **llm_tasks.summarize_for_digest(ответы)}
     метка = str(settings.get("consent_tag") or "").strip()
     if метка and getattr(analytics, "db", None) is not None:
-        срок_дней = int(settings.get("consent_days") or 30)
+        # Ноль — осмысленное значение: «предупреждать про любую запись без
+        # метки». В Python он ложен, и `or 30` превращал его в месяц —
+        # тот же дефект, ради которого тридцатью строками ниже написана
+        # `retention_days` с длинным объяснением. Отчёт о согласиях и
+        # строка в сводке показывали «нарушений нет», пока записи не
+        # перевалят за тридцать дней.
+        срок_дней = int(_срок(settings, "consent_days", 30))
         без = analytics.db.jobs_without_tag(
             метка, older_than=time.time() - срок_дней * 86400)
         готовое["consent_missing"] = len(без)
@@ -579,11 +585,22 @@ def restore(path: Path, target: Path) -> None:
 #: ничего не удалять, а часовая уборка сносила всё старше тридцати дней —
 #: вместе с исходными файлами. Пустое значение и None — это «не задано»,
 #: там месяц по умолчанию уместен.
-def retention_days(settings: Any, default: int = 30) -> int:
-    значение = settings.get("result_retention_days")
+def _срок(settings: Any, ключ: str, default: int = 30) -> int:
+    """Числовая настройка, у которой ноль — значение, а не «не задано».
+
+    В Python ноль ложен, поэтому `int(значение or 30)` молча превращает
+    «хранить вечно» в месяц, а «предупреждать про любую запись» — в
+    «предупреждать про записи старше месяца». Каталог у обоих параметров
+    объявляет минимум 0 и объясняет, что он означает.
+    """
+    значение = settings.get(ключ)
     if значение is None or значение == "":
         return default
     try:
         return max(0, int(значение))
     except (TypeError, ValueError):
         return default
+
+
+def retention_days(settings: Any, default: int = 30) -> int:
+    return _срок(settings, "result_retention_days", default)

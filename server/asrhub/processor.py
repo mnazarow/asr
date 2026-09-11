@@ -455,7 +455,27 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         try:
             from .pipeline.waveform import build as build_waveform
 
-            outcome.waveform = build_waveform(channels, outcome.segments, settings)
+            # Реплики для маскирования — в координатах ПОДГОТОВЛЕННОГО
+            # звука: `_by_speakers` индексирует его отсчёты напрямую, а
+            # `outcome.segments` к этому моменту уже вернулись в координаты
+            # исходной записи (шаг 6 выше). Без обратного перевода кривая
+            # говорящего уезжала ровно на длину обрезанной тишины, а у
+            # того, чья последняя реплика выходила за конец подготовленного
+            # файла, полоса оказывалась пустой совсем. Обрезка тишины и
+            # полоса включены по умолчанию обе, так что для записи звонка
+            # это был обычный случай, а не краевой.
+            для_полосы = outcome.segments
+            if prepared_audio.shifted:
+                для_полосы = [
+                    {**(с if isinstance(с, dict) else vars(с)),
+                     "start": prepared_audio.to_prepared_time(
+                         float((с.get("start") if isinstance(с, dict)
+                                else getattr(с, "start", 0.0)) or 0.0)),
+                     "end": prepared_audio.to_prepared_time(
+                         float((с.get("end") if isinstance(с, dict)
+                                else getattr(с, "end", 0.0)) or 0.0))}
+                    for с in outcome.segments]
+            outcome.waveform = build_waveform(channels, для_полосы, settings)
             # Полоса считается по подготовленному звуку, а расшифровка уже
             # вернулась в координаты исходной записи. Без перевода оси
             # карточка задания рисовала их рядом на разных шкалах: щелчок по

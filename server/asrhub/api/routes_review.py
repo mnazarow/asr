@@ -60,7 +60,8 @@ def review_list(request: Request, status: str = Query(default="pending",
                                  owner=owner, limit=limit, offset=offset)
     return {
         "items": items,
-        "counts": state.db.review_counts(since=time.time() - 7 * 86400),
+        "counts": state.db.review_counts(since=time.time() - 7 * 86400,
+                                        owner=owner),
         "enabled": bool(state.settings.get("review_enabled", True)),
         "last_sampled_at": state.db.get_kv("review_sampled_at"),
         "reasons": {"random": "случайная выборка",

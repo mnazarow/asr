@@ -245,17 +245,7 @@ def _redistribute(segments: list[Any], words: list[dict[str, Any]],
             aligned_segments.append(segment)
             continue
 
-        segment.words = [
-            {
-                "word": source_words[index] if keep_text and index < len(source_words)
-                        else item["word"],
-                "start": round(item["start"], 3),
-                "end": round(item["end"], 3),
-                **({"score": round(float(item["score"]), 4)}
-                   if item.get("score") is not None else {}),
-            }
-            for index, item in enumerate(chunk)
-        ]
+        segment.words = _слова_сегмента(source_words, chunk, keep_text=keep_text)
         # Границы сегмента подтягиваем к фактическим границам его слов.
         segment.start = round(chunk[0]["start"], 3)
         segment.end = round(chunk[-1]["end"], 3)
@@ -265,6 +255,68 @@ def _redistribute(segments: list[Any], words: list[dict[str, Any]],
         log.debug("Выравнивание: осталось нераспределённых слов — %d",
                   len(words) - cursor)
     return _merge_close(aligned_segments, S.num(settings, "alignment_max_gap_s", 0.0))
+
+
+def _слова_сегмента(source_words: list[str], chunk: list[dict[str, Any]], *,
+                    keep_text: bool) -> list[dict[str, Any]]:
+    """Сопоставляет исходные слова с выровненными — по содержимому, не по номеру.
+
+    `_match_length` выше специально разрешает выравнивателю отдать БОЛЬШЕ
+    слов, чем в исходном тексте: MFA делит «из-за» на «из» и «за». А
+    раздача шла по номеру — `source_words[index]`, где index нумерует
+    выровненные слова, — и каждое слово с дефисом сдвигало пословные
+    границы всего остатка реплики на одно слово, дублируя последнее:
+
+        из-за 0.10–0.30 | дождя 0.30–0.55 | отменили 0.60–1.10 | отменили 1.20–1.90
+
+    вместо
+
+        из-за 0.10–0.55 | дождя 0.60–1.10 | отменили 1.20–1.90
+
+    В русском разговоре это «из-за», «кто-то», «что-то», «какой-то»,
+    «по-моему» — на сорокаминутном звонке сотни раз, и портятся от этого
+    и реплики в базе, и выгрузка JSON, и караоке-субтитры, и калибровка,
+    которая считается по этим же словам.
+
+    Поэтому идём по обоим спискам разом: набираем выровненные слова, пока
+    их склеенное написание не покроет очередное исходное. Границы берём от
+    первого и последнего набранного.
+    """
+    if not keep_text or not source_words:
+        return [_слово(item["word"], item, item) for item in chunk]
+
+    out: list[dict[str, Any]] = []
+    i = 0
+    for исходное in source_words:
+        if i >= len(chunk):
+            break
+        цель = _normalize(исходное)
+        взяли = [chunk[i]]
+        i += 1
+        собрано = _normalize(взяли[0]["word"])
+        # Добираем, пока выровненные слова складываются в исходное. Предел
+        # в четыре куска — защита от расхождения: без него одно потерянное
+        # слово съедало бы весь остаток реплики.
+        while (цель and собрано and собрано != цель and цель.startswith(собрано)
+               and i < len(chunk) and len(взяли) < 4):
+            взяли.append(chunk[i])
+            собрано += _normalize(chunk[i]["word"])
+            i += 1
+        out.append(_слово(исходное, взяли[0], взяли[-1]))
+    # Хвост выровненных слов, которому не нашлось исходных, — своим текстом.
+    out.extend(_слово(item["word"], item, item) for item in chunk[i:])
+    return out
+
+
+def _слово(текст: str, первый: dict[str, Any], последний: dict[str, Any]
+           ) -> dict[str, Any]:
+    оценка = первый.get("score")
+    return {
+        "word": текст,
+        "start": round(float(первый["start"]), 3),
+        "end": round(float(последний["end"]), 3),
+        **({"score": round(float(оценка), 4)} if оценка is not None else {}),
+    }
 
 
 def _normalize(word: str) -> str:

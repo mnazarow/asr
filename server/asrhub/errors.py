@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -463,6 +464,34 @@ _GATED_MARKERS = (
 )
 
 
+#: Абсолютный путь в тексте, который увидит человек. Достаточно широко,
+#: чтобы поймать и POSIX, и Windows.
+_ПУТЬ = re.compile(r"(?:[A-Za-z]:)?[/\\][^\s'\"<>|,;]{2,}")
+
+
+def без_путей(текст: str) -> str:
+    """Оставляет от абсолютного пути только имя файла.
+
+    `error_message` и `error_hint` лежат в строке задания и уходят наружу
+    как есть: в карточке задания, в списке, в уведомлении на адрес, который
+    задаёт сам клиент. То есть раскладку хранилища — каталог загрузок,
+    каталог моделей, схему именования — видел любой владелец ключа,
+    включая ключ «только чтение» и ключ с mask_pii, а при желании и
+    произвольный внешний адрес: загрузить битый файл и указать
+    `webhook_url`. Соседний `/api/system` прячет ту же раскладку за правами
+    администратора, и не зря — это разведка перед атакой.
+
+    Имя файла остаётся: без него сообщение перестаёт отвечать на вопрос
+    «с каким файлом беда». Полный путь есть в журнале сервера.
+    """
+    def заменить(совпадение: re.Match[str]) -> str:
+        путь = совпадение.group(0)
+        хвост = путь.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        return хвост or "файл"
+
+    return _ПУТЬ.sub(заменить, текст or "")
+
+
 def classify_exception(exc: BaseException, *, engine: str = "", model: str = "") -> ASRHubError:
     """Превращает произвольное исключение в понятную ошибку ASR Hub.
 
@@ -498,10 +527,13 @@ def classify_exception(exc: BaseException, *, engine: str = "", model: str = "")
         return DependencyMissing(engine or "неизвестный", name, cause=exc)
 
     if isinstance(exc, FileNotFoundError):
-        return AudioError(f"Файл не найден: {exc.filename or exc}", cause=exc)
+        return AudioError(
+            f"Файл не найден: {без_путей(str(exc.filename or exc))}", cause=exc)
 
     if isinstance(exc, PermissionError):
-        return StorageError(f"Нет доступа к файлу: {exc.filename or exc}", cause=exc)
+        return StorageError(
+            f"Нет доступа к файлу: {без_путей(str(exc.filename or exc))}",
+            cause=exc)
 
     if isinstance(exc, (TimeoutError, )) or "timed out" in text:
         return EngineError("Превышено время ожидания ответа движка.", cause=exc)
@@ -516,7 +548,9 @@ def classify_exception(exc: BaseException, *, engine: str = "", model: str = "")
     if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
         return StorageError("На диске закончилось место.", cause=exc)
 
-    return EngineError(f"Непредвиденная ошибка движка: {type(exc).__name__}: {exc}", cause=exc)
+    return EngineError(
+        f"Непредвиденная ошибка движка: {type(exc).__name__}: "
+        f"{без_путей(str(exc))}", cause=exc)
 
 
 def _with_hint(self: ASRHubError, hint: str) -> ASRHubError:

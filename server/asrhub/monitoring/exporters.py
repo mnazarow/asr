@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import time
@@ -107,8 +109,20 @@ def json_snapshot(samples: list[Sample], errors: list[str] | None = None,
 
 
 def _influx_tag(value: str) -> str:
-    """Influx требует экранировать пробел, запятую и знак равенства в тегах."""
-    text = str(value)
+    """Значение метки для Influx: экранируем спецзнаки, убираем переводы строк.
+
+    Перевод строки в метке — это не опечатка, а подлог: строка в line
+    protocol заканчивается переводом строки, и всё после него читается как
+    новое измерение. Значение метки `model` приходит из настроек задания и
+    проверку каталога проходит любое (`model` объявлен enum без списка
+    допустимых), так что ключ с ролью `user` мог одним заданием дописать в
+    InfluxDB подложную точку — например, «свободного места на диске ноль».
+    То же и с обратной косой в конце: она экранировала бы наш собственный
+    разделитель.
+    """
+    text = str(value).replace("\\", "\\\\")
+    for знак in ("\r", "\n", "\t", "\x00"):
+        text = text.replace(знак, " ")
     for char in (",", " ", "="):
         text = text.replace(char, "\\" + char)
     return text
@@ -130,13 +144,22 @@ def influx_line(samples: list[Sample], *, measurement_prefix: str = "") -> str:
     return "\n".join(lines) + "\n"
 
 
+def _графит_часть(value: str) -> str:
+    """Часть имени метрики Graphite: только безопасные знаки."""
+    очищено = re.sub(r"[^0-9A-Za-z_\-]+", "_", value).strip("_")
+    return очищено or "нет"
+
+
 def graphite(samples: list[Sample], *, prefix: str = "asrhub") -> str:
     """Формат Graphite и StatsD: точка в имени вместо меток."""
     stamp = int(time.time())
     lines = []
     for sample in samples:
         parts = [prefix, sample.name.replace("asrhub_", "")]
-        parts += [str(v).replace(".", "_").replace(" ", "_")
+        # В имени метрики Graphite разделители — точка и перевод строки.
+        # Оставляем только буквы, цифры, дефис и подчёркивание: значение
+        # метки приходит из настроек задания, а туда попадает что угодно.
+        parts += [_графит_часть(str(v))
                   for _, v in sorted(sample.labels.items()) if v != ""]
         lines.append(f"{'.'.join(parts)} {_format(sample.value)} {stamp}")
     return "\n".join(lines) + "\n"
@@ -170,13 +193,19 @@ def zabbix_sender(samples: list[Sample], host: str) -> str:
 
 def csv_table(samples: list[Sample]) -> str:
     """Плоская таблица: имя, метки, значение, единица, группа."""
-    rows = ["metric,labels,value,unit,group"]
+    # Собираем настоящим csv, а не склейкой строк. Значение метки приходит
+    # из настроек задания, и кавычка внутри него разваливала разбор всей
+    # таблицы: поле `model` объявлено enum без списка допустимых, так что
+    # положить туда можно что угодно.
+    буфер = io.StringIO()
+    писарь = csv.writer(буфер, lineterminator="\n")
+    писарь.writerow(["metric", "labels", "value", "unit", "group"])
     for sample in samples:
         spec = METRICS_BY_NAME.get(_base_name(sample.name))
         labels = ";".join(f"{k}={v}" for k, v in sorted(sample.labels.items()))
-        rows.append(f'{sample.name},"{labels}",{_format(sample.value)},'
-                    f'{spec.unit if spec else ""},{spec.group if spec else ""}')
-    return "\n".join(rows) + "\n"
+        писарь.writerow([sample.name, labels, _format(sample.value),
+                         spec.unit if spec else "", spec.group if spec else ""])
+    return буфер.getvalue()
 
 
 def otlp_payload(samples: list[Sample], service_name: str = "asrhub",

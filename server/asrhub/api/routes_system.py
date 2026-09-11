@@ -28,6 +28,7 @@ from .deps import (
     get_state,
     require_admin,
     scope_owner,
+    token_of,
 )
 
 log = get_logger("api.settings")
@@ -185,7 +186,8 @@ def queue_clear(request: Request,
 
 
 @router.post("/queue/retry-failed", summary="Повторить все неудавшиеся задания")
-def queue_retry_failed(request: Request, limit: int = 100,
+def queue_retry_failed(request: Request,
+                       limit: int = Query(default=100, ge=1, le=10000),
                        principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
@@ -423,7 +425,8 @@ def analytics_section(request: Request, section: str, period: str = "week",
 
 
 @router.get("/logs", summary="Журнал сервера")
-def logs(request: Request, limit: int = 200, level: str = "", search: str = "",
+def logs(request: Request, limit: int = Query(default=200, ge=1, le=5000),
+         level: str = "", search: str = "",
          job_id: str = "", principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Журнал сервера целиком.
 
@@ -601,14 +604,7 @@ def _guard_metrics(request: Request, state: Any) -> None:
         return
     if state.settings.get("monitoring_public", True):
         return
-    token = (request.headers.get("x-api-key") or "").strip()
-    if not token:
-        header = request.headers.get("authorization", "")
-        parts = header.split(" ", 1)
-        token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" \
-            else header.strip()
-    if not token:
-        token = request.query_params.get("api_key", "")
+    token = token_of(request)
     info = state.settings.api_keys.get(token)
     if not info:
         raise error_response(AuthError("Ключ доступа отсутствует или недействителен."))
@@ -786,7 +782,9 @@ def consent(request: Request,
     state = get_state(request)
     require_admin(principal)
     метка = str(state.settings.get("consent_tag") or "").strip()
-    срок = days if days is not None else int(state.settings.get("consent_days") or 30)
+    значение = state.settings.get("consent_days")
+    срок = days if days is not None else int(
+        значение if значение not in (None, "") else 30)
     if not метка:
         return {"enabled": False, "tag": "", "days": срок, "count": 0, "ids": []}
     номера = state.db.jobs_without_tag(метка, older_than=time.time() - срок * 86400)

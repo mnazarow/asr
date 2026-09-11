@@ -534,8 +534,14 @@ def merge_segments(segments: list[dict[str, Any]], min_duration: float = 1.5,
         if same_speaker and short and gap <= max_gap and combined <= max_duration:
             last["end"] = seg.get("end")
             last["text"] = normalize_spaces(f"{last.get('text', '')} {seg.get('text', '')}")
-            if last.get("words") and seg.get("words"):
-                last["words"] = list(last["words"]) + list(seg["words"])
+            # Условие «и там, и там» выбрасывало слова целиком, когда у
+            # одной из склеиваемых реплик список пуст, — а это обычное
+            # дело: движки часто не дают слов для реплики в одно слово.
+            # Склейка «да» + «конечно поможем» теряла границы двух слов
+            # безвозвратно, и оба параметра стоят по умолчанию.
+            if last.get("words") or seg.get("words"):
+                last["words"] = [*(last.get("words") or []),
+                                 *(seg.get("words") or [])]
             confs = [c for c in (last.get("confidence"), seg.get("confidence")) if c is not None]
             if confs:
                 last["confidence"] = sum(confs) / len(confs)

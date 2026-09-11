@@ -1479,7 +1479,16 @@ class Database:
             # было именно `text LIKE '%…%'` — оно поднимало с диска все
             # расшифровки подряд, и редкое слово (то есть ровно тот запрос,
             # ради которого поиском и пользуются) читало таблицу насквозь.
-            найденные = self.jobs_matching(search) if self.fts_ready else None
+            найденные = (self.jobs_matching(search, owner=owner)
+                         if self.fts_ready else None)
+            # Достигнутый предел — не повод молчать. Список сортирован
+            # «сначала новые», и на шестистах совпадениях девятая страница
+            # оказывалась последней без единого слова об этом: человек
+            # делал вывод, что старых разговоров нет, а они просто не
+            # попали в четыреста. Признак поднимается здесь и уезжает в
+            # ответ, чтобы интерфейс мог предложить уточнить запрос.
+            self.last_search_truncated = bool(
+                найденные is not None and len(найденные) >= self.SEARCH_LIMIT)
             # Проценты и подчёркивания экранируем: «скидка 50%» и «part_1»
             # — это то, что люди ищут, а не образцы LIKE. Без экранирования
             # запрос «%» находил вообще всё, и то же самое находило
@@ -1564,12 +1573,31 @@ class Database:
         Метки лежат строкой через запятую, поэтому сравнение — по
         обрамлённой запятыми строке: иначе метка «согласие» находилась бы и
         в «несогласие».
+
+        Пробелы вокруг метки убираются. Колонку заполняют трое, и все
+        по-разному: интерфейс кладёт то, что человек набрал (`prompt` плюс
+        `trim`), телефония склеивает свои метки через запятую, а аналитика
+        читает ту же колонку через `split(",")` и `strip()`. Из-за этого
+        «срочно, согласие» и «АТС, входящий, согласие» считались здесь
+        записями БЕЗ согласия — и попадали в список на уничтожение по
+        152-ФЗ, хотя согласие у них есть. Вторая метка телефонии вместе с
+        правкой руками давала ровно такую строку.
+
+        Метасимволы LIKE в самой метке экранируются: это единственный LIKE
+        в файле, где их не экранировали, а метка приходит из настройки.
+        Значение `%` означало «без метки — никто», и проверка согласия
+        отвечала «нарушений нет» на всём архиве.
         """
+        образец = f"%,{_экранировать_like(str(tag).strip())},%"
         rows = self.query(
             "SELECT id FROM jobs WHERE status='completed' AND created_at < ? "
-            "  AND (',' || COALESCE(tags,'') || ',') NOT LIKE ? "
+            # REPLACE убирает пробелы вокруг запятых — «срочно, согласие»
+            # становится «срочно,согласие», и обрамление работает как
+            # задумано, а не только на метках без пробелов.
+            "  AND (',' || REPLACE(REPLACE(COALESCE(tags,''), ', ', ','), ' ,', ',') "
+            "       || ',') NOT LIKE ? ESCAPE '\\' "
             "ORDER BY created_at LIMIT ?",
-            (older_than, f"%,{tag},%", limit))
+            (older_than, образец, limit))
         return [str(r["id"]) for r in rows]
 
     #: Сколько разговоров максимум приносит один поиск. Список на экране
@@ -1578,11 +1606,30 @@ class Database:
     #: параметров.
     SEARCH_LIMIT = 400
 
-    def jobs_matching(self, search: str, limit: int = 0) -> list[str]:
-        """Номера заданий, в расшифровках которых встретилось искомое."""
+    #: Уперся ли последний поиск в этот предел. Читают `list_jobs` и
+    #: `count_jobs` сразу после сборки условий — в том же потоке и до
+    #: любого следующего запроса.
+    last_search_truncated = False
+
+    def jobs_matching(self, search: str, limit: int = 0, *,
+                      owner: str | list[str] | None = None) -> list[str]:
+        """Номера заданий, в расшифровках которых встретилось искомое.
+
+        Разрез по владельцу применяется ЗДЕСЬ, внутри запроса, а не снаружи
+        к результату. Предел в четыреста совпадений иначе съедали чужие
+        записи: отдел с одной вчерашней записью на фоне четырёхсот более
+        свежих чужих не находил её вовсе — поиск отвечал «ничего», при том
+        что слово в разговоре было.
+
+        Тем же порядком чинится и листалка администратора: предел,
+        наложенный до `LIMIT/OFFSET`, обрезал выборку на четырёхстах, и
+        страница девятая была последней даже там, где совпадений шестьсот.
+        """
         запрос = fts_query(search)
         if not запрос or not self.fts_ready:
             return []
+        условие, свои = self._owner_clause(owner, "j")
+        где = f" AND {условие}" if условие else ""
         try:
             # Порядок обязателен: без него FTS отдаёт совпадения по
             # возрастанию номера строки, то есть от самых старых реплик, а
@@ -1594,9 +1641,9 @@ class Database:
                 "SELECT s.job_id, MAX(j.created_at) AS свежесть FROM segments_fts f "
                 "JOIN segments s ON s.rowid = f.rowid "
                 "JOIN jobs j ON j.id = s.job_id "
-                "WHERE f.text MATCH ? GROUP BY s.job_id "
+                f"WHERE f.text MATCH ?{где} GROUP BY s.job_id "
                 "ORDER BY свежесть DESC LIMIT ?",
-                (запрос, limit or self.SEARCH_LIMIT))
+                (запрос, *свои, limit or self.SEARCH_LIMIT))
         except StorageError as exc:
             log.warning("Поиск по указателю не удался (%s) — идём перебором", exc)
             return []
@@ -1686,9 +1733,22 @@ class Database:
         имена = ", ".join(поля)
         места = ",".join("?" for _ in поля)
         with self.write() as conn:
-            conn.execute(
-                f"INSERT OR REPLACE INTO content ({имена}) VALUES ({места})",
-                list(поля.values()))
+            # Пишем только если задание ещё существует. Между тем, как
+            # фоновый разбор взял список записей, и тем, как он дописал
+            # ответ, проходят секунды (разбор содержания) или минуты
+            # (языковая модель), — и в это окно запись могут удалить:
+            # часовой уборкой по сроку, кнопкой в интерфейсе или удалением
+            # по требованию субъекта. Дописанный после удаления пересказ
+            # разговора не убирает потом никто: уборка ходит по `jobs`, а
+            # задания уже нет. То есть данные, которые считаются
+            # удалёнными, оставались в базе навсегда.
+            строк = conn.execute(
+                f"INSERT OR REPLACE INTO content ({имена}) "
+                f"SELECT {места} WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?)",
+                [*поля.values(), job_id]).rowcount
+            if not строк:
+                log.debug("Разбор записи %s не сохранён: задание удалено", job_id)
+                return
             if совпадения is not None:
                 conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
                 conn.executemany(
@@ -1767,7 +1827,8 @@ class Database:
             (version, limit))
         return [dict(r) for r in rows]
 
-    def content_stats(self, version: int) -> dict[str, int]:
+    def content_stats(self, version: int, *,
+                      owner: str | list[str] | None = None) -> dict[str, int]:
         """Сколько записей разобрано, сколько ждёт разбора.
 
         Обе цифры считаются по одному и тому же набору заданий —
@@ -1782,15 +1843,23 @@ class Database:
         # же запись второй раз), и в «всего» им тоже не место — иначе
         # «ожидают разбора» растёт на пять записей в сутки и не приходит к
         # нулю никогда, а метрика покрытия показывает вечный недоразбор.
+        #
+        # Разрез по владельцу: те же числа попадают в отчёт по содержанию
+        # под ключом «coverage», а отчёт строится для конкретного ключа.
+        # Без разреза отдел с одной полностью разобранной записью видел
+        # «ожидают разбора 41» и предупреждение «показатели посчитаны по
+        # части архива» — при том что его часть разобрана целиком.
+        условие, свои = self._owner_clause(owner, "j")
+        где = f" AND {условие}" if условие else ""
         всего = int(self.query_one(
-            "SELECT COUNT(*) n FROM jobs WHERE status='completed' "
-            "AND text IS NOT NULL AND text != '' "
-            "AND COALESCE(source,'') <> 'control'")["n"])
+            "SELECT COUNT(*) n FROM jobs j WHERE j.status='completed' "
+            "AND j.text IS NOT NULL AND j.text != '' "
+            f"AND COALESCE(j.source,'') <> 'control'{где}", свои)["n"])
         разобрано = int(self.query_one(
             "SELECT COUNT(*) n FROM content c JOIN jobs j ON j.id = c.job_id "
             "WHERE c.version >= ? AND j.status='completed' "
             "AND j.text IS NOT NULL AND j.text != '' "
-            "AND COALESCE(j.source,'') <> 'control'", (version,))["n"])
+            f"AND COALESCE(j.source,'') <> 'control'{где}", (version, *свои))["n"])
         return {"total": всего, "analyzed": разобрано,
                 "pending": max(0, всего - разобрано)}
 
@@ -2173,12 +2242,23 @@ class Database:
             [*args, limit, offset])
         return [dict(r) for r in rows]
 
-    def review_counts(self, since: float | None = None) -> dict[str, int]:
-        """Сколько ожидает, сколько разобрано и пропущено за окно."""
+    def review_counts(self, since: float | None = None, *,
+                      owner: str | list[str] | None = None) -> dict[str, int]:
+        """Сколько ожидает, сколько разобрано и пропущено за окно.
+
+        Разрез по владельцу тот же, что у списка рядом. Без него в одном
+        ответе оказывались список из трёх своих записей и счётчик «ожидают
+        десять» — и это не только несогласованная пара на экране, но и
+        сообщение о том, сколько разговоров у соседнего подразделения.
+        """
         out = {"pending": 0, "done": 0, "skipped": 0}
+        условие, args = self._owner_clause(owner, "j")
+        соединение = " JOIN jobs j ON j.id = r.job_id" if условие else ""
+        где = f" AND {условие}" if условие else ""
         for r in self.query(
-                "SELECT status, COUNT(*) n FROM review_queue "
-                "WHERE status='pending' OR done_at >= ? GROUP BY status", (since or 0.0,)):
+                f"SELECT r.status AS status, COUNT(*) n FROM review_queue r{соединение} "
+                f"WHERE (r.status='pending' OR r.done_at >= ?){где} "
+                "GROUP BY r.status", (since or 0.0, *args)):
             out[str(r["status"])] = int(r["n"])
         return out
 
@@ -2221,9 +2301,14 @@ class Database:
             строка["resolved"] = 1 if строка["resolved"] else 0
         колонки = ["job_id", "version", "created_at", *строка]
         значения = [job_id, version, now(), *строка.values()]
+        # Как и у разбора содержания: ответ модели считается минутами, и
+        # за это время запись могут удалить. Пересказ разговора, дописанный
+        # после удаления, не находит потом ни уборка, ни удаление по
+        # требованию субъекта — они ходят по таблице заданий.
         self.execute(
             f"INSERT OR REPLACE INTO llm_results ({', '.join(колонки)}) "
-            f"VALUES ({', '.join('?' for _ in колонки)})", значения)
+            f"SELECT {', '.join('?' for _ in колонки)} "
+            "WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?)", [*значения, job_id])
 
     def llm_get(self, job_id: str) -> dict[str, Any] | None:
         row = self.query_one("SELECT * FROM llm_results WHERE job_id=?", (job_id,))
@@ -2760,6 +2845,16 @@ class Database:
                 "confidence, no_speech, compression, temperature, language, words) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
 
+    def clear_segments(self, job_id: str) -> None:
+        """Убирает реплики задания.
+
+        Нужно там, где реплики записаны, а отметка «готово» не прошла:
+        задание успели отменить или отобрать. Реплики пишутся первыми —
+        так «готово» никогда не врёт про их число, — и остаться без
+        задания они могут только на этом пути.
+        """
+        self.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
+
     def get_segments(self, job_id: str) -> list[dict[str, Any]]:
         rows = self.query("SELECT * FROM segments WHERE job_id=? ORDER BY idx", (job_id,))
         out = []
@@ -3096,6 +3191,30 @@ class Database:
             f"ON CONFLICT(uniqueid) DO UPDATE SET {обновить}",
             [данные[к] for к in колонки])
 
+    #: Приставка пометки «взять позже». Отличает звонок, который ещё
+    #: нельзя распознать, от звонка, который распознавать не надо.
+    ОТЛОЖЕН = "отложен: "
+
+    def calls_deferred(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Звонки, отложенные до следующего захода, — старые первыми.
+
+        Из журнала они больше не придут: позиция чтения сдвинута сразу
+        после чтения, а событие AMI вообще разовое. Без этой очереди
+        звонок, у которого запись ещё дописывалась, терялся навсегда — а
+        при выдержке в тридцать секунд и опросе раз в минуту под это
+        попадала половина потока.
+        """
+        rows = self.query(
+            "SELECT * FROM calls WHERE skipped LIKE ? ESCAPE '\\' "
+            "ORDER BY started_at LIMIT ?",
+            (f"{_экранировать_like(self.ОТЛОЖЕН)}%", max(1, int(limit))))
+        звонки = []
+        for r in rows:
+            звонок = dict(r)
+            звонок["answered"] = bool(звонок.get("answered"))
+            звонки.append(звонок)
+        return звонки
+
     def call_exists(self, uniqueid: str) -> bool:
         """Был ли звонок уже разобран — главный предохранитель импортёра."""
         if not uniqueid:
@@ -3122,7 +3241,9 @@ class Database:
         строка = self.query_one(
             "SELECT COUNT(*) AS total,"
             "       SUM(CASE WHEN job_id IS NOT NULL THEN 1 ELSE 0 END) AS queued,"
-            "       SUM(CASE WHEN COALESCE(skipped,'')<>'' THEN 1 ELSE 0 END) AS skipped,"
+            "       SUM(CASE WHEN COALESCE(skipped,'')<>'' "
+            "                AND skipped NOT LIKE 'отложен: %' THEN 1 ELSE 0 END) AS skipped,"
+            "       SUM(CASE WHEN skipped LIKE 'отложен: %' THEN 1 ELSE 0 END) AS deferred,"
             "       SUM(CASE WHEN direction='входящий' THEN 1 ELSE 0 END) AS inbound,"
             "       SUM(CASE WHEN direction='исходящий' THEN 1 ELSE 0 END) AS outbound,"
             "       SUM(COALESCE(billsec,0)) AS talk_s,"
@@ -3130,11 +3251,13 @@ class Database:
             "       MAX(imported_at) AS last_import "
             f"FROM calls c{где}", args)
         свод = {к: (строка[к] if строка and строка[к] is not None else 0)
-                for к in ("total", "queued", "skipped", "inbound", "outbound",
-                          "talk_s", "last_call", "last_import")}
+                for к in ("total", "queued", "skipped", "deferred",
+                          "inbound", "outbound", "talk_s", "last_call",
+                          "last_import")}
         причины = self.query(
             "SELECT skipped AS reason, COUNT(*) AS n FROM calls c "
-            f"WHERE COALESCE(skipped,'')<>''{(' AND ' + условие) if условие else ''} "
+            "WHERE COALESCE(skipped,'')<>'' AND skipped NOT LIKE 'отложен: %'"
+            f"{(' AND ' + условие) if условие else ''} "
             "GROUP BY skipped ORDER BY n DESC LIMIT 20", args)
         свод["reasons"] = {str(r["reason"]): int(r["n"]) for r in причины}
         return свод
@@ -3229,7 +3352,8 @@ class Database:
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
                 events_days: int = 90) -> dict[str, int]:
         removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0,
-                   "gpu_samples": 0, "llm_cache": 0, "calls": 0, "bytes": 0}
+                   "gpu_samples": 0, "llm_cache": 0, "calls": 0,
+                   "orphans": 0, "bytes": 0}
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
@@ -3284,6 +3408,25 @@ class Database:
             removed["llm_cache"] = self.execute(
                 "DELETE FROM llm_cache WHERE created_at<?",
                 (ts - results_days * 86400,))
+        # Строки разбора, потерявшие своё задание. Сегодня их появиться
+        # не должно — запись разбора идёт условием «если задание есть», —
+        # но на базе, пережившей прежние версии, они уже лежат, и убрать
+        # их больше некому: и уборка по сроку, и удаление по требованию
+        # субъекта ходят по таблице заданий. Заход дешёвый: у всех этих
+        # таблиц job_id в указателе.
+        осиротевшие = 0
+        for таблица in ("content", "content_terms", "content_hits",
+                        "content_marks", "review_queue", "llm_results",
+                        "segments", "events"):
+            осиротевшие += self.execute(
+                f"DELETE FROM {таблица} WHERE job_id IS NOT NULL "
+                "AND job_id NOT IN (SELECT id FROM jobs)")
+        осиротевшие += self.execute(
+            "DELETE FROM model_checks WHERE job_id NOT IN (SELECT id FROM jobs)")
+        removed["orphans"] = осиротевшие
+        if осиротевшие:
+            log.info("Убрано строк разбора без задания: %d", осиротевшие)
+
         # Журнал звонков — по тому же сроку и по той же причине. Запись
         # звонка занимает сотни байт, но это номер клиента и номер
         # оператора: пережить удаление самого разговора они не должны. К

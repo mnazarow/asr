@@ -21,8 +21,10 @@
 """
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,54 @@ log = get_logger("telephony")
 #: Пауза после сбоя источника: АТС перезапускают, сеть моргает.
 ПАУЗА_СБОЯ = 60.0
 
+#: Сколько ждать между двумя замерами размера файла записи.
+ПАУЗА_ЗАМЕРА = 0.4
+
+
+def _длительность_файла(путь: Path) -> int:
+    """Секунды звука в файле — из заголовка, без чтения самого звука.
+
+    Нужна источнику «каталог записей»: у такого звонка длительности нет
+    ниоткуда, а ноль выключал бы разом и порог «не брать короче», и
+    выдержку — обе проверки написаны как «если длительность известна».
+
+    WAV читается заголовком, остальное — через ffprobe, если он есть.
+    Не прочиталось — ноль, и это честнее выдуманного числа.
+    """
+    if путь.suffix.lower() == ".wav":
+        try:
+            with wave.open(str(путь), "rb") as файл:
+                частота = файл.getframerate() or 1
+                return int(файл.getnframes() / частота)
+        except (OSError, wave.Error) as exc:
+            log.debug("Длительность %s не прочиталась: %s", путь, exc)
+            return 0
+    try:
+        вывод = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(путь)],
+            capture_output=True, text=True, timeout=10, check=False)
+        return int(float(вывод.stdout.strip() or 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def _число(настройки: Any, ключ: str, по_умолчанию: float) -> float:
+    """Значение настройки с оглядкой на то, что ноль — это значение.
+
+    `float(настройки.get(ключ) or 30)` выглядит безобидно и врёт ровно на
+    нуле: в Python ноль ложен, и «выдержка ноль секунд» превращалась в
+    тридцать. Каталог объявляет минимум 0 у половины этих параметров и
+    объясняет, что он означает, — значит, ноль надо уметь принимать.
+    """
+    значение = настройки.get(ключ)
+    if значение is None or значение == "":
+        return float(по_умолчанию)
+    try:
+        return float(значение)
+    except (TypeError, ValueError):
+        return float(по_умолчанию)
+
 
 class Импортёр:
     """Фоновый перенос звонков с АТС в очередь распознавания."""
@@ -69,6 +119,8 @@ class Импортёр:
         self.skipped = 0
         self.failed = 0
         self._ami: AMIClient | None = None
+        #: Чем было открыто соединение: адрес, порт, учётная запись, пароль.
+        self._подпись_ami: tuple[str, int, str, str] | None = None
         self._ami_события: list[dict[str, str]] = []
 
     # --- настройки --------------------------------------------------------
@@ -129,9 +181,7 @@ class Импортёр:
                 log.warning("Поток телефонии ещё занят; завершится сам.")
                 return
         self._thread = None
-        клиент, self._ami = self._ami, None
-        if клиент is not None:
-            клиент.close()
+        self._закрыть_ami()
 
     def _loop(self) -> None:
         пауза = 2.0
@@ -141,7 +191,7 @@ class Импортёр:
                 continue
             try:
                 итог = self.scan()
-                пауза = max(5.0, float(self.settings.get("telephony_poll_s") or 60))
+                пауза = max(5.0, _число(self.settings, "telephony_poll_s", 60))
                 if итог.get("imported"):
                     # Есть что везти — заходим чаще: живой поток звонков
                     # не должен ждать полного интервала.
@@ -168,13 +218,25 @@ class Импортёр:
             return self._scan(limit=limit)
 
     def _scan(self, *, limit: int = ПОРЦИЯ) -> dict[str, Any]:
+        # Сначала отложенные: звонки, которые в прошлый заход ещё писались
+        # или не влезли в очередь. Из журнала они больше не придут — позиция
+        # чтения сдвинута, событие AMI разовое, — поэтому очередь отложенных
+        # разбирается раньше новых и своей долей порции.
+        отложенные = [Звонок.из_записи(з)
+                      for з in self.db.calls_deferred(limit=max(1, limit // 2))]
         источник = self.source
+        if источник != "ami" and self._ami is not None:
+            # Источник переключили — соединение больше не нужно. Без этой
+            # строки сокет и сессия на станции держались до перезапуска.
+            self._закрыть_ami()
         if источник == "ami":
-            звонки = self._из_ami(limit)
+            новые = self._из_ami(limit)
         elif источник == "folder":
-            звонки = self._из_папки(limit)
+            новые = self._из_папки(limit)
         else:
-            звонки = self._из_csv(limit)
+            новые = self._из_csv(limit)
+        звонки = [*отложенные, *новые]
+        было_отложено = {з.uniqueid for з in отложенные}
 
         поставлено, пропущено = 0, 0
         причины: dict[str, int] = {}
@@ -184,7 +246,8 @@ class Импортёр:
             # придёт больше никогда: исключение здесь означало бы тихую
             # потерю сорока девяти разговоров из-за одного.
             try:
-                почему = self._взять(звонок)
+                почему = self._взять(
+                    звонок, отложенный=звонок.uniqueid in было_отложено)
             except Exception as exc:                         # noqa: BLE001
                 log.warning("Звонок %s не разобран: %s", звонок.uniqueid, exc)
                 with self._lock:
@@ -206,7 +269,8 @@ class Импортёр:
             log.info("Телефония: поставлено заданий %d, пропущено %d %s",
                      поставлено, пропущено, причины or "")
         return {"seen": len(звонки), "imported": поставлено,
-                "skipped": пропущено, "reasons": причины}
+                "skipped": пропущено, "reasons": причины,
+                "deferred": len(отложенные)}
 
     # --- источники --------------------------------------------------------
 
@@ -228,6 +292,19 @@ class Импортёр:
         строка в журнале безопасности АТС раз в минуту и повод для
         подозрений у того, кто этот журнал читает.
         """
+        # Подпись соединения: адрес, порт, учётная запись и пароль. Раньше
+        # соединение просто держалось, и смена любого из них не доходила
+        # до станции до перезапуска сервера: правка пароля в настройках
+        # ничего не меняла, а переключение источника на журнал CDR
+        # оставляло сокет и сессию на станции висеть навсегда — а сессий у
+        # AMI ограниченное число.
+        подпись = (str(self.settings.get("telephony_host") or "127.0.0.1"),
+                   int(_число(self.settings, "telephony_port", 5038)),
+                   str(self.settings.get("telephony_username") or ""),
+                   str(self.settings.get("telephony_secret") or ""))
+        if self._ami is not None and self._подпись_ami != подпись:
+            log.info("Настройки AMI изменились — соединение открывается заново")
+            self._закрыть_ami()
         клиент = self._ami
         if клиент is None:
             клиент = AMIClient(
@@ -237,6 +314,7 @@ class Импортёр:
                 str(self.settings.get("telephony_secret") or ""))
             клиент.connect()
             self._ami = клиент
+            self._подпись_ami = подпись
         звонки: list[Звонок] = []
         крайний = time.time() + 5.0
         while len(звонки) < limit and time.time() < крайний:
@@ -246,8 +324,7 @@ class Импортёр:
                 # Соединение не просто забывается, а закрывается: брошенный
                 # сокет держит и дескриптор здесь, и сессию на станции —
                 # а сессий у AMI ограниченное число.
-                self._ami = None
-                клиент.close()
+                self._закрыть_ami()
                 raise
             if not событие:
                 break
@@ -258,6 +335,13 @@ class Импортёр:
             if звонок.uniqueid:
                 звонки.append(звонок)
         return звонки
+
+    def _закрыть_ami(self) -> None:
+        """Закрывает соединение со станцией и забывает его подпись."""
+        клиент, self._ami = self._ami, None
+        self._подпись_ami = None
+        if клиент is not None:
+            клиент.close()
 
     def _из_папки(self, limit: int) -> list[Звонок]:
         """Когда до АТС не дотянуться: звонок — это файл записи.
@@ -274,7 +358,7 @@ class Импортёр:
                 hint="Проверьте путь в настройке «Каталог записей» и права "
                      "на чтение у пользователя, от которого работает сервер.")
         известные = self.db.known_call_ids()
-        свежее = time.time() - float(self.settings.get("telephony_lookback_days") or 7) * 86400
+        свежее = time.time() - _число(self.settings, "telephony_lookback_days", 7) * 86400
         звонки: list[Звонок] = []
         for путь in sorted(каталог.rglob("*")):
             if len(звонки) >= limit:
@@ -290,8 +374,22 @@ class Импортёр:
             ключ = f"file:{путь.name}"
             if ключ in известные:
                 continue
-            звонок = Звонок(uniqueid=ключ, started_at=изменён,
-                            duration=0, disposition="ANSWERED", answered=True)
+            # Длительность из имени файла не узнать, и поставить ноль
+            # значило бы выключить и порог длительности, и выдержку разом:
+            # обе проверки написаны как «если длительность известна». Берём
+            # настоящую — из самого файла; не прочиталась, значит ноль, и
+            # это честно.
+            длительность = _длительность_файла(путь)
+            # Время последней записи в файл — это КОНЕЦ разговора, а не его
+            # начало: запись дописывается по ходу. Ставить mtime началом
+            # значило бы отодвинуть конец разговора в будущее на всю его
+            # длину — и выдержка откладывала бы каждый файл до тех пор,
+            # пока это будущее не наступит.
+            звонок = Звонок(uniqueid=ключ,
+                            started_at=изменён - длительность,
+                            duration=длительность,
+                            disposition="ANSWERED", answered=True)
+            звонок.billsec = звонок.duration
             звонок.recording = str(путь)
             # Номера из имени файла: «...-79161234567-101-...» встречается
             # в шаблонах чаще всего.
@@ -303,49 +401,77 @@ class Импортёр:
 
     # --- один звонок ------------------------------------------------------
 
-    def _взять(self, звонок: Звонок) -> str | None:
+    def _отложить(self, звонок: Звонок, почему: str) -> str:
+        """Кладёт звонок в таблицу с пометкой «взять позже».
+
+        Из журнала он больше не придёт: позиция чтения сдвигается сразу
+        после чтения строки, а событие AMI вообще разовое. Раньше такой
+        звонок просто терялся — и при выдержке в тридцать секунд с опросом
+        раз в минуту под это попадала половина потока: за час импортёр
+        ставил 289 заданий и терял 311.
+        """
+        # Владелец нужен и пропущенным: без него карточка «Пропущено» у
+        # ключа подразделения вечный ноль, а причины пусты — то есть
+        # единственное, что объясняет расхождение архива со станцией, не
+        # видно тому, кто с архивом и работает.
+        self.db.save_call(звонок.uniqueid, job_id=None,
+                          skipped=f"{self.db.ОТЛОЖЕН}{почему}",
+                          owner=self._владелец(звонок), **звонок.поля_записи())
+        return почему
+
+    def _взять(self, звонок: Звонок, *, отложенный: bool = False) -> str | None:
         """Ставит задание по звонку; возвращает причину пропуска или None."""
         if not звонок.uniqueid:
             return "без идентификатора"
-        if self.db.call_exists(звонок.uniqueid):
+        if not отложенный and self.db.call_exists(звонок.uniqueid):
             return "уже импортирован"
 
-        минимум = int(self.settings.get("telephony_min_duration_s") or 0)
+        минимум = int(_число(self.settings, "telephony_min_duration_s", 0))
         длительность = звонок.billsec or звонок.duration
         if минимум and длительность and длительность < минимум:
             self.db.save_call(звонок.uniqueid, job_id=None, skipped="короткий",
-                              **звонок.поля_записи())
+                              owner=self._владелец(звонок), **звонок.поля_записи())
             return "короткий"
         if bool(self.settings.get("telephony_skip_unanswered", True)) and звонок.disposition \
                 and not звонок.answered:
             self.db.save_call(звонок.uniqueid, job_id=None, skipped="без ответа",
-                              **звонок.поля_записи())
+                              owner=self._владелец(звонок), **звонок.поля_записи())
             return "без ответа"
 
-        выдержка = float(self.settings.get("telephony_settle_s") or 30)
-        if звонок.started_at and длительность:
-            конец = звонок.started_at + длительность
+        выдержка = _число(self.settings, "telephony_settle_s", 30)
+        # Конец разговора — по полной длительности, а не по разговорной:
+        # `billsec` не считает гудки, и разговор «минута дозвона, десять
+        # секунд разговора» выглядел законченным пятьдесят секунд назад,
+        # хотя MixMonitor закрыл файл только что.
+        полная = звонок.duration or звонок.billsec
+        if звонок.started_at and полная:
+            конец = звонок.started_at + полная
             if time.time() - конец < выдержка:
-                return "ещё пишется"
+                return self._отложить(звонок, "ещё пишется")
 
         путь = Path(звонок.recording) if звонок.recording else None
         if путь is None:
             каталог = self.путь("telephony_recordings_dir")
             if каталог is None:
-                return "не задан каталог записей"
+                return self._отложить(звонок, "не задан каталог записей")
             путь = найти_запись(звонок, каталог,
                                 шаблон=str(self.settings.get("telephony_filename") or ""),
-                                окно_дней=int(self.settings.get("telephony_lookback_days") or 7))
+                                окно_дней=int(_число(self.settings, "telephony_lookback_days", 7)))
+        if путь is not None and путь.is_file() and выдержка > 0 and not self._дописан(путь):
+            # Обещано в справке параметра и в шапке модуля: сервер проверяет,
+            # что файл перестал расти. Проверки не было вовсе, и запись,
+            # взятая в момент дописывания, распознавалась обрезанной.
+            return self._отложить(звонок, "файл ещё растёт")
         if путь is None or not путь.is_file():
             # Файла может не быть законно: запись не велась. Отмечаем, чтобы
             # не искать его на каждом заходе до скончания века.
             self.db.save_call(звонок.uniqueid, job_id=None, skipped="нет записи",
-                              **звонок.поля_записи())
+                              owner=self._владелец(звонок), **звонок.поля_записи())
             return "нет записи"
 
         звонок.direction = направление(
             звонок,
-            внутренние_знаков=int(self.settings.get("telephony_internal_digits") or 5),
+            внутренние_знаков=int(_число(self.settings, "telephony_internal_digits", 5)),
             контексты=dict(self.settings.get("telephony_contexts") or {}))
         звонок.agent = звонок.dst if звонок.direction == "входящий" else звонок.src
         звонок.queue = str(звонок.raw.get("lastdata") or "").split(",")[0] \
@@ -361,17 +487,40 @@ class Импортёр:
                 file_path=путь, filename=путь.name,
                 settings=self.settings.merged({}),
                 owner=владелец, api_key_name="telephony",
-                priority=int(self.settings.get("telephony_priority") or 50),
+                priority=int(_число(self.settings, "telephony_priority", 40)),
                 source="asterisk", tags=метки)
         except Exception as exc:                             # noqa: BLE001
             with self._lock:
                 self.failed += 1
                 self.last_error = str(exc)
             log.warning("Звонок %s не поставлен в очередь: %s", звонок.uniqueid, exc)
-            return "очередь отказала"
+            # Очередь отказала (полон диск, предел глубины) — это состояние
+            # временное. Потерять из-за него разговор нельзя: вернёмся к
+            # нему следующим заходом.
+            return self._отложить(звонок, "очередь отказала")
         self.db.save_call(звонок.uniqueid, job_id=задание.get("id"), skipped="",
                           owner=владелец, **звонок.поля_записи())
         return None
+
+    def _дописан(self, путь: Path) -> bool:
+        """Перестал ли файл расти — короткая проверка в два замера.
+
+        MixMonitor закрывает запись уже после того, как станция отчиталась
+        о звонке, а иногда ещё и перекодирует её. Выдержка по времени
+        отвечает на вопрос «наверное, пора», а этот замер — на вопрос
+        «точно ли». Полсекунды на звонок, и только для тех, что дошли
+        досюда.
+        """
+        try:
+            было = путь.stat().st_size
+        except OSError:
+            return False
+        time.sleep(ПАУЗА_ЗАМЕРА)
+        try:
+            стало = путь.stat().st_size
+        except OSError:
+            return False
+        return стало == было and стало > 0
 
     def _владелец(self, звонок: Звонок) -> str:
         """Кому принадлежит запись: по внутреннему номеру или общий.

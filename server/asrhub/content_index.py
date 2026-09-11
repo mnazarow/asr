@@ -321,7 +321,7 @@ class ContentIndex:
         self.forget_frequency()
         return {"recomputed": 0, "queued": int(сброшено)}
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, owner: str | list[str] | None = None) -> dict[str, Any]:
         """Состояние разбора: сколько посчитано, сколько ждёт, чем занят.
 
         Считается двумя счётчиками, а не снимком корпусных частот. Снимок
@@ -330,7 +330,7 @@ class ContentIndex:
         пятнадцать секунд — он не попадал в кеш ни разу, и каждый опрос
         делал полную группировку по таблице основ под общей блокировкой.
         """
-        сведения = self.db.content_stats(content.VERSION)
+        сведения = self.db.content_stats(content.VERSION, owner=owner)
         набор = self.categories()
         return {
             **сведения,
@@ -342,7 +342,7 @@ class ContentIndex:
             if self.settings else True,
             "running": bool(self._thread and self._thread.is_alive()),
             "vocabulary": self.db.vocabulary_size(),
-            "corpus": self.db.content_window_size(),
+            "corpus": self.db.content_window_size(owner=owner),
             "backfilled": self.backfilled,
             "last_error": self.last_error,
         }

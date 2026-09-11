@@ -63,8 +63,18 @@ def content_disposition(filename: str) -> str:
     """
     from urllib.parse import quote
 
-    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
-    quoted = quote(filename, safe="")
+    # Управляющие знаки — прочь, и первым делом перевод строки. Имя файла
+    # приходит снаружи (в том числе из адреса в /process-call, где хвост
+    # адреса берётся как имя), а значение заголовка, в котором есть \r\n, —
+    # это либо отказ сервера («Invalid HTTP header value», пустой ответ и
+    # оборванное соединение при каждой попытке скачать задание), либо, на
+    # ASGI-сервере попроще, расщепление ответа. Кавычка в ASCII-варианте
+    # закрывала бы заголовок раньше времени.
+    чистое = "".join(" " if знак < " " or знак == "\x7f" else знак
+                     for знак in str(filename or "")).strip() or "результат"
+    чистое = чистое.replace('"', "'")
+    ascii_name = чистое.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    quoted = quote(чистое, safe="")
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
 
 
@@ -330,10 +340,36 @@ async def create_batch(
         except OSError as exc:
             target.unlink(missing_ok=True)
             errors.append({"filename": filename, "error": str(exc)})
+        except BaseException:
+            # Всё остальное — тоже с уборкой файла. `check_quota` поднимает
+            # HTTPException, а не ASRHubError: он пролетал мимо обеих веток
+            # выше, и уже записанный файл оставался на диске без задания.
+            # Найти его потом не может никто: и уборка по сроку, и удаление
+            # ходят по таблице заданий. Ключ с квотой навсегда съедал по
+            # max_upload_mb за каждую попытку повторить пакет.
+            target.unlink(missing_ok=True)
+            raise
         finally:
             await item.close()
 
     return {"group_id": group, "created": len(created), "jobs": created, "errors": errors}
+
+
+#: Колонки задания, которые не нужны никому снаружи: раскладка хранилища.
+#: `/api/system` прячет её за правами администратора с прямым объяснением —
+#: «разведка перед атакой», — а в карточке задания та же информация уходила
+#: любому ключу с ролью `user`, да ещё и в каждой строке списка. Интерфейс
+#: их не читает, облегчённый список не отдаёт.
+ПУТИ_НА_ДИСКЕ = ("file_path", "result_path")
+
+
+def _без_раскладки(job: dict[str, Any], principal: Principal) -> dict[str, Any]:
+    """Убирает пути на диске у всех, кроме администратора."""
+    if principal.is_admin:
+        return job
+    for ключ in ПУТИ_НА_ДИСКЕ:
+        job.pop(ключ, None)
+    return job
 
 
 @router.get("", summary="Список заданий")
@@ -386,6 +422,8 @@ def list_jobs(
     jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
                               order=order, light=light, content=content)
+    if not light:
+        jobs = [_без_раскладки(j, principal) for j in jobs]
     # При поиске к каждой строке добавляется сама найденная фраза с
     # обрамлением и её время. Без этого список отвечал «нашлось в этом
     # разговоре» и замолкал: дальше человек открывал карточку и искал
@@ -407,6 +445,11 @@ def list_jobs(
         "total": state.db.count_jobs(status=statuses, owner=scope, model=model,
                                      search=search, group_id=group_id,
                                      since=since, content=content),
+        # Поиск по расшифровкам берёт не больше `SEARCH_LIMIT` совпадений,
+        # и об этом надо сказать. Молчаливая обрезка читается как «старых
+        # разговоров на эту тему нет», а это разные утверждения.
+        "search_truncated": bool(search) and state.db.last_search_truncated,
+        "search_limit": state.db.SEARCH_LIMIT if search else None,
         "limit": limit,
         "offset": offset,
     }
@@ -465,8 +508,12 @@ def get_job(request: Request, job_id: str,
     if str(job.get("source") or "") == "asterisk":
         звонок = state.db.call_for_job(job_id)
         if звонок:
+            # `recording` — путь на станции; наружу он не нужен и попадает
+            # под то же правило, что и раскладка хранилища.
+            if not principal.is_admin:
+                звонок.pop("recording", None)
             job["call"] = звонок
-    return job
+    return _без_раскладки(job, principal)
 
 
 @router.get("/{job_id}/waveform", summary="Полоса громкости записи")
@@ -574,8 +621,14 @@ def get_audio(request: Request, job_id: str,
     media = _AUDIO_TYPES.get(real.suffix.lower())
     if media is None:
         media, _ = mimetypes.guess_type(real.name)
-    # Имя для скачивания берём человеческое, а не служебное «up-xxxx.wav».
+    # Имя для скачивания берём человеческое, а не служебное «up-xxxx.wav»,
+    # но ключу с mask_pii — обезличенное: в колл-центре имя файла это номер
+    # клиента, и заголовок скачивания не должен обходить то, что делает тело.
     name = str(job.get("filename") or "").strip() or real.name
+    if getattr(principal, "mask_pii", False):
+        from ..content import masking  # noqa: PLC0415
+
+        name = masking.mask_text(name)
     if not Path(name).suffix:
         name = f"{name}{real.suffix}"
     return FileResponse(str(real), media_type=media or "application/octet-stream",
@@ -662,7 +715,17 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
 
         payload = masking.mask_payload(payload)
     merged = state.settings.merged(job.get("params") or {})
-    name = Path(job.get("filename") or job_id).stem
+    # Имя для заголовка скачивания берётся из ТОГО ЖЕ, что и тело: из
+    # маскированной карточки. Раньше тело обезличивалось, а заголовок брал
+    # имя из исходной строки задания — и обезличенная выгрузка приезжала
+    # файлом «+79161234567 Иванов.json». В колл-центре имя файла это номер
+    # клиента, ради чего маскирование имени и делалось.
+    имя_файла = job.get("filename") or job_id
+    if маскировать:
+        from ..content import masking  # noqa: PLC0415
+
+        имя_файла = masking.mask_text(str(имя_файла))
+    name = Path(имя_файла).stem
     if fmt == "docx":
         out = state.settings.paths.tmp / f"{job_id}.docx"
         export_mod.to_docx(payload, merged, out)
