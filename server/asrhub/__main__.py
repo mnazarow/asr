@@ -75,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Вывести пример config.yaml и выйти")
     parser.add_argument("--check", action="store_true",
                         help="Проверить окружение и выйти")
+    parser.add_argument("--check-config", action="store_true",
+                        help="Показать, какие значения конфигурации не приняты, и выйти")
     # Путь назад, когда пароль забыт. Без него единственный администратор,
     # потерявший пароль, остаётся снаружи навсегда: ключ доступа управлять
     # учётными записями не позволяет, а руками в базе — не вариант.
@@ -92,7 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        settings = load(args.config)
+        # Проверка конфигурации ничего не создаёт: см. `ensure_key`.
+        settings = load(args.config, ensure_key=not args.check_config)
     except Exception as exc:
         sys.stderr.write(f"Ошибка конфигурации: {exc}\n")
         return 2
@@ -101,6 +104,23 @@ def main(argv: list[str] | None = None) -> int:
         settings.set("max_concurrent_jobs", args.workers)
     if args.log_level:
         settings.set("log_level", args.log_level)
+
+    # Отдельно от `--check`: там полсотни проверок окружения, а здесь один
+    # вопрос — принял ли сервер файл конфигурации целиком. Его задаёт
+    # обновление перед тем, как перезапускать службу, и человек после
+    # правки файла. Ответ короткий и без цветных таблиц.
+    if args.check_config:
+        файл = settings.config_file
+        print(f"Файл конфигурации: {файл or 'не используется, взяты умолчания'}")
+        if not settings.problems:
+            print("Все значения приняты.")
+            return 0
+        print(f"Не принято значений: {len(settings.problems)}. "
+              "Вместо них работают умолчания:")
+        for проблема in settings.problems:
+            print(f"  • {проблема}")
+        print("\nПоправьте записи в файле и перезапустите сервер.")
+        return 1
 
     if args.check:
         from .doctor import run_checks

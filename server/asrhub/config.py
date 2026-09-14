@@ -205,6 +205,9 @@ class Settings:
     hf_token: str = ""
     hardware_hint: str = ""
     sources: dict[str, str] = field(default_factory=dict)   # ключ -> откуда взято значение
+    #: Что в конфигурации не сошлось: лишний ключ, значение не того вида.
+    #: Сервер при этом работает на умолчаниях — см. `load`.
+    problems: list[str] = field(default_factory=list)
 
     # --- доступ ---------------------------------------------------------
 
@@ -217,6 +220,11 @@ class Settings:
         return self.values[key]
 
     def set(self, key: str, value: Any, source: str = "runtime") -> None:
+        # Приведение до проверки: «5» для параметра-числа и 5 для
+        # параметра-строки — одно и то же значение, записанное разными
+        # руками. Интерфейс, API и восстановление из копии приходят сюда же,
+        # и каждому из них незачем знать про тип каталога.
+        value = catalog.coerce_value(key, value)
         ok, msg = catalog.validate_value(key, value)
         if not ok:
             raise ConfigError(msg)
@@ -227,13 +235,12 @@ class Settings:
         """Настройки задания поверх серверных, с проверкой значений."""
         result = dict(self.values)
         if overrides:
-            errors = catalog.validate_all(
+            свои = catalog.coerce_all(
                 {k: v for k, v in overrides.items() if k in catalog.PARAMS_BY_KEY})
+            errors = catalog.validate_all(свои)
             if errors:
                 raise ConfigError("; ".join(errors))
-            for key, value in overrides.items():
-                if key in catalog.PARAMS_BY_KEY:
-                    result[key] = value
+            result.update(свои)
         return result
 
     #: Параметры, которые нельзя показывать без include_secrets. Это обычные
@@ -280,6 +287,9 @@ class Settings:
                       if (self.paths and for_admin) else {}),
             "hardware_hint": self.hardware_hint,
             "api_key_count": len(self.api_keys),
+            # Проблемы конфигурации — не секрет, но и не повод пугать
+            # оператора без прав: чинит их тот, кто правит файл.
+            "problems": list(self.problems) if for_admin else [],
         }
         return data
 
@@ -428,11 +438,34 @@ def find_config_file(explicit: str | os.PathLike[str] | None = None) -> Path | N
     return None
 
 
+def _видимое(key: str, value: Any) -> str:
+    """Значение в виде, пригодном для журнала и интерфейса.
+
+    Сообщение о негодном значении попадает и в журнал, и на экран, поэтому
+    пароль АМИ или адрес чата с токеном внутри показывать в нём нельзя:
+    достаточно один раз ошибиться в типе секрета, чтобы он лёг в журнал
+    открытым текстом. Длинное значение ещё и укорачиваем — строка с
+    полутысячей знаков делает сообщение нечитаемым.
+    """
+    if key in Settings.SECRET_KEYS:
+        return "***"
+    текст = str(value)
+    return текст if len(текст) <= 80 else текст[:77] + "…"
+
+
 def load(config_path: str | os.PathLike[str] | None = None,
-         *, apply_hardware: bool = True) -> Settings:
-    """Собирает конфигурацию из всех источников."""
+         *, apply_hardware: bool = True, ensure_key: bool = True) -> Settings:
+    """Собирает конфигурацию из всех источников.
+
+    `ensure_key=False` просит ничего не создавать: ни ключа доступа, ни
+    файла с ним. Нужно тому, кто только смотрит, — проверке конфигурации из
+    обновления. Она запускается от root, а служба работает от своего
+    пользователя: созданный «заодно» api-key.txt достался бы не тому
+    владельцу, и сервер после обновления не смог бы его прочитать.
+    """
     values: dict[str, Any] = catalog.defaults()
     sources: dict[str, str] = dict.fromkeys(values, "default")
+    problems: list[str] = []
 
     hardware_hint = ""
     if apply_hardware:
@@ -473,16 +506,38 @@ def load(config_path: str | os.PathLike[str] | None = None,
                 continue
             else:
                 flat[key] = value
-        unknown = [k for k in flat if k not in catalog.PARAMS_BY_KEY]
-        if unknown:
-            raise ConfigError(
-                "Неизвестные параметры в файле конфигурации: " + ", ".join(sorted(unknown)),
-                hint="Полный список параметров: asrctl config schema",
-            )
-        errors = catalog.validate_all(flat)
-        if errors:
-            raise ConfigError("Ошибки в файле конфигурации: " + "; ".join(errors))
+        # Ниже — главное правило этого места: НИ ОДНА строка конфигурации не
+        # имеет права не пустить сервер. Раньше имела, и это стоило простоя.
+        #
+        # Обновление меняет форму записи параметра (было одно число — стало
+        # «несколько через запятую»), файл на сервере остаётся прежним, и
+        # сервер после обновления не поднимается: «ожидается строка» про
+        # строку, которую человек не писал. Откат наступает на те же грабли с
+        # другой стороны: новый интерфейс успел записать в файл параметр,
+        # которого в прежней версии нет, и прежняя версия падает на
+        # «неизвестном параметре» — откат из спасения превращается во вторую
+        # аварию.
+        #
+        # Поэтому: сперва приводим запись к типу этой версии, а то, что не
+        # сошлось и после приведения, откладываем в `problems` и берём
+        # умолчание. Молчать об этом нельзя — иначе «я поправил настройку, а
+        # она не работает». Проблемы кричат в трёх местах: ошибкой в журнале
+        # при старте, красной полосой в интерфейсе и провалом `--check`.
+        неизвестные = sorted(k for k in flat if k not in catalog.PARAMS_BY_KEY)
+        if неизвестные:
+            problems.append(
+                f"{cfg_file.name}: неизвестные параметры — {', '.join(неизвестные)}. "
+                "Они пропущены; полный список: asrctl config schema")
+            for ключ in неизвестные:
+                flat.pop(ключ, None)
+        flat = catalog.coerce_all(flat)
         for key, value in flat.items():
+            ok, msg = catalog.validate_value(key, value)
+            if not ok:
+                problems.append(
+                    f"{cfg_file.name}: {msg}; записано «{_видимое(key, value)}». "
+                    f"Взято значение по умолчанию: «{_видимое(key, values.get(key))}»")
+                continue
             values[key] = value
             sources[key] = f"config:{cfg_file.name}"
 
@@ -504,12 +559,16 @@ def load(config_path: str | os.PathLike[str] | None = None,
             continue
         try:
             parsed = _parse_env_value(env_val, spec.type)
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise ConfigError(
-                f"Переменная {env_key}: не удалось разобрать значение «{env_val}» ({exc})") from exc
+        except (ValueError, json.JSONDecodeError, ConfigError) as exc:
+            problems.append(f"Переменная {env_key}: не удалось разобрать значение "
+                            f"«{_видимое(name, env_val)}» ({exc}). Переменная пропущена")
+            continue
+        parsed = catalog.coerce_value(name, parsed)
         ok, msg = catalog.validate_value(name, parsed)
         if not ok:
-            raise ConfigError(f"Переменная {env_key}: {msg}")
+            problems.append(f"Переменная {env_key}: {msg}; "
+                            f"записано «{_видимое(name, env_val)}». Переменная пропущена")
+            continue
         values[name] = parsed
         sources[name] = f"env:{env_key}"
 
@@ -531,9 +590,12 @@ def load(config_path: str | os.PathLike[str] | None = None,
         hf_token=hf_token,
         hardware_hint=hardware_hint,
         sources=sources,
+        problems=problems,
     )
+    for проблема in problems:
+        log.error("Конфигурация: %s", проблема)
 
-    if settings.get("auth_enabled") and not api_keys:
+    if settings.get("auth_enabled") and not api_keys and ensure_key:
         keyfile = paths.data / "api-key.txt"
 
         # Сначала пробуем прочитать уже созданный ключ. Без этого каждая

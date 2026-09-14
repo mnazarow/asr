@@ -215,6 +215,13 @@ span.warn { color: var(--warn); }
           border: 1px solid transparent; }
 .banner.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
 .banner.err  { background: var(--err-soft);  color: var(--err);  border-color: var(--err); }
+.config-problems { padding: 14px 22px 0; }
+.config-problems .banner { margin-bottom: 0; }
+.config-problems ul { margin: 6px 0 0; padding-left: 18px; }
+.config-problems li { margin: 2px 0; }
+.config-problems .cp-file { color: var(--text-dim); font-family: var(--mono); font-size: 12px; }
+.config-problems .cp-close { float: right; }
+
 .chip.err { background: var(--err-soft); color: var(--err); border-color: transparent; }
 .chip.info { background: var(--info-soft); color: var(--info); border-color: transparent; }
 .chip.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }

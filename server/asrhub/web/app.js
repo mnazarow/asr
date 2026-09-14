@@ -305,16 +305,26 @@ async function bootstrap() {
     // должна их снимать. Иначе переход по меню в первую секунду после
     // загрузки отменял загрузку каталога, и вместо интерфейса появлялась
     // карточка «Не удалось связаться с сервером. Запрос отменён».
-    const [catalog, settings] = await Promise.all([
+    // Версию спрашиваем у сервера, а не держим вписанной в разметку: после
+    // обновления в шапке оставалась прежняя, и «какая у нас версия» отвечали
+    // три места по-разному. `/api/health` открыт всем, поэтому подпись верна
+    // и без прав администратора.
+    const [catalog, settings, здоровье] = await Promise.all([
       API.background('/api/catalog'),
       API.background('/api/settings').catch(() => ({ values: {} })),
+      API.background('/api/health').catch(() => null),
     ]);
+    if (здоровье && здоровье.version) {
+      const подпись = qs('#version-label');
+      if (подпись) подпись.textContent = `v${здоровье.version}`;
+    }
     state.catalog = catalog;
     state.models = catalog.models;
     state.params = catalog.params;
     state.presets = catalog.presets;
     state.settings = settings.values || {};
     state.jobSettings = Object.assign({}, state.settings);
+    renderConfigProblems(settings);
     qs('#badge-models').textContent = catalog.models.length;
     qs('#badge-params').textContent = catalog.params.length;
     applyWhoAmI();
@@ -472,6 +482,37 @@ function promptPasswordChange(optional) {
   });
   const cancel = qs('#pw-cancel');
   if (cancel) cancel.onclick = (e) => { e.preventDefault(); renderView(); };
+}
+
+/**
+ * Полоса проблем конфигурации.
+ *
+ * Сервер больше не отказывается стартовать из-за одной строки в config.yaml:
+ * значение, которое не прочиталось, заменяется умолчанием, а сам факт
+ * откладывается в `problems`. Терпимость без этой полосы была бы хуже
+ * падения: настройка молча не действует, и человек ищет причину в другом
+ * месте. Поэтому — над всеми разделами, красным, со списком и путём к файлу.
+ *
+ * Проблемы отдаются только администратору: правит файл он.
+ */
+function renderConfigProblems(ответ) {
+  const место = qs('#config-problems');
+  if (!место) return;
+  const список = (ответ && ответ.problems) || [];
+  if (!список.length) { место.hidden = true; место.innerHTML = ''; return; }
+  const файл = (ответ && ответ.config_file) || '';
+  место.hidden = false;
+  место.innerHTML = `<div class="banner err">
+    <button class="ghost sm cp-close" id="cp-close" title="До перезагрузки страницы">Скрыть</button>
+    <b>Часть настроек не принята — сервер работает на значениях по умолчанию</b>
+    <ul>${список.map((с) => `<li>${esc(с)}</li>`).join('')}</ul>
+    <div class="small" style="margin-top:6px">Поправьте значение в разделе
+      «Настройки» и нажмите «Сохранить в конфигурацию»: файл будет перезаписан
+      в нынешнем виде. Изменение вступит в силу после перезапуска сервера.</div>
+    ${файл ? `<div class="cp-file">${esc(файл)}</div>` : ''}
+  </div>`;
+  const кнопка = qs('#cp-close', место);
+  if (кнопка) кнопка.addEventListener('click', () => { место.hidden = true; });
 }
 
 function applyWhoAmI() {

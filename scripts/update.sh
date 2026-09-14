@@ -98,7 +98,21 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
   bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" 2>/dev/null || true
   # Только поверх: в снимке лежит код, а --delete снёс бы venv, а на macOS
   # ещё и каталог данных внутри prefix.
+  # Файл конфигурации лежит не в prefix, поэтому переносится отдельно — и
+  # только если он в снимке есть. Нынешний не выбрасываем: человек мог
+  # успеть поправить в нём что-то нужное.
   run cp -a "${SNAPSHOT_DIR}/." "${PREFIX}/"
+  rm -f "${PREFIX}/config.yaml.snapshot" 2>/dev/null || true
+  if [[ -f "${SNAPSHOT_DIR}/config.yaml.snapshot" ]]; then
+    if [[ -f "${DATA_DIR}/config.yaml" ]] \
+       && ! cmp -s "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"; then
+      KEEP="${DATA_DIR}/config.yaml.new.$(date +%Y%m%d-%H%M%S)"
+      run cp -a "${DATA_DIR}/config.yaml" "${KEEP}"
+      info "Конфигурация новой версии сохранена рядом: $(basename "${KEEP}")"
+    fi
+    run cp -a "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"
+    ok "Конфигурация возвращена к виду до обновления"
+  fi
   bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" 2>/dev/null || true
   ok "Откат выполнен: версия $(cat "${PREFIX}/VERSION" 2>/dev/null || echo '?')"
   exit 0
@@ -149,6 +163,15 @@ if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
   for item in server scripts config requirements docker examples VERSION README.md; do
     [[ -e "${PREFIX}/${item}" ]] && cp -a "${PREFIX}/${item}" "${SNAPSHOT_DIR}/"
   done
+  # Конфигурация лежит в каталоге данных и обновлением не трогается — но
+  # откат без неё всё равно неполон: за время работы новой версии интерфейс
+  # мог записать в файл параметры, которых в прежней версии нет, и прежняя
+  # версия на них не поднимется. Снимок файла делает откат обратимым до
+  # конца.
+  # Имя с суффиксом — нарочно: откат копирует снимок поверх prefix целиком,
+  # и файл с именем config.yaml осел бы там лишним.
+  [[ -f "${DATA_DIR}/config.yaml" ]] \
+    && cp -a "${DATA_DIR}/config.yaml" "${SNAPSHOT_DIR}/config.yaml.snapshot"
   ok "Снимок: ${SNAPSHOT_DIR}"
   hint "Откат при проблемах: bash scripts/update.sh --rollback"
 fi
@@ -338,6 +361,22 @@ elif [[ -x "${VPIP}" ]]; then
   ok "Зависимости обновлены"
 else
   warn "Виртуальное окружение не найдено — зависимости не обновлялись."
+fi
+
+# --- Конфигурация под новой версией -----------------------------------------
+
+# Спрашиваем новую версию о старом файле ДО перезапуска. Сервер из-за
+# несогласия больше не падает — берёт умолчание, — но узнать об этом лучше
+# здесь, одной строкой, чем через неделю по формуле «настройка не
+# действует». Ни при каких ответах не прерываем обновление: это сведения, а
+# не преграда.
+if [[ "${DOCKER_MODE}" -eq 0 && -x "${VPY}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+  CFG_OUT="$(ASRHUB_DATA_DIR="${DATA_DIR}" "${VPY}" -m asrhub --check-config 2>&1 || true)"
+  if grep -q "Не принято значений" <<<"${CFG_OUT}"; then
+    warn "Часть значений конфигурации новая версия не приняла:"
+    printf '%s\n' "${CFG_OUT}" | sed 's/^/  /' >&2
+    hint "Сервер запустится с умолчаниями вместо них; поправьте файл и перезапустите."
+  fi
 fi
 
 # --- Запуск и проверка ------------------------------------------------------

@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import Header, HTTPException, Request
 
+from .. import __version__
 from ..accounts import Accounts
 from ..analytics import Analytics
 from ..config import Settings
@@ -81,7 +82,10 @@ class AppState:
     #: Смысловой слой: клиент языковой модели и фоновый поток разбора.
     llm: Any = None
     llm_worker: Any = None
-    version: str = "3.0.0"
+    #: Версия сервера. Одна на всех: раньше число было вписано в десяток
+    #: мест по отдельности, и после обновления интерфейс показывал одну
+    #: версию, `/api/health` — другую, а файл VERSION — третью.
+    version: str = __version__
     tickets: TicketStore = field(default_factory=TicketStore)
     #: Учётные записи и сессии веб-интерфейса. Ключи доступа живут отдельно и
     #: работают как раньше: они для программ, учётные записи — для людей.

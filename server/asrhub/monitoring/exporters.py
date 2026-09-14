@@ -13,6 +13,7 @@ import re
 import time
 from typing import Any
 
+from .. import __version__
 from .catalog import GROUPS_BY_ID, METRICS, METRICS_BY_NAME, MetricSpec
 from .collector import Sample
 
@@ -209,7 +210,7 @@ def csv_table(samples: list[Sample]) -> str:
 
 
 def otlp_payload(samples: list[Sample], service_name: str = "asrhub",
-                 service_version: str = "3.0.0") -> dict[str, Any]:
+                 service_version: str = __version__) -> dict[str, Any]:
     """Тело запроса OTLP/HTTP для OpenTelemetry Collector.
 
     Собирается вручную, без пакета opentelemetry: формат стабилен, а лишняя

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .. import __version__
 from ..accounts import Accounts
 from ..analytics import Analytics
 from ..config import Settings, load
@@ -394,7 +395,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app = FastAPI(
         title="ASR Hub",
         description=DESCRIPTION,
-        version="3.0.0",
+        version=__version__,
         lifespan=lifespan,
         docs_url="/api/docs",
         redoc_url="/api/redoc",

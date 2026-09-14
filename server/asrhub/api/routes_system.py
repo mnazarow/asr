@@ -63,7 +63,7 @@ def _health_body(state: Any) -> tuple[dict[str, Any], int]:
 
     body = {
         "status": "ok" if healthy else "degraded",
-        "version": "3.0.0",
+        "version": state.version,
         "uptime_s": round(time.time() - state.started_at, 1),
         "queue_paused": state.queue.is_paused,
         "catalog_date": catalog.CATALOG_DATE,
@@ -121,7 +121,7 @@ def system(request: Request, principal: Principal = Depends(authenticate)) -> di
     state = get_state(request)
     hardware = detect(str(state.settings.paths.data))
     data: dict[str, Any] = {
-        "version": "3.0.0",
+        "version": state.version,
         "uptime_s": round(time.time() - state.started_at, 1),
         "hardware": hardware.to_dict(),
         "recommended": recommended_settings(hardware),
@@ -222,15 +222,17 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    errors = catalog.validate_all({k: v for k, v in values.items()
-                                   if k in catalog.PARAMS_BY_KEY})
+    # Приведение до проверки: интерфейс и внешние клиенты присылают то, что
+    # ввёл человек, — «5» там, где каталог ждёт число, и 5 там, где строку.
+    свои = catalog.coerce_all({k: v for k, v in values.items()
+                               if k in catalog.PARAMS_BY_KEY})
+    errors = catalog.validate_all(свои)
     if errors:
         raise error_response(ConfigError("; ".join(errors)))
     applied = {}
-    for key, value in values.items():
-        if key in catalog.PARAMS_BY_KEY:
-            state.settings.set(key, value, source="api")
-            applied[key] = value
+    for key, value in свои.items():
+        state.settings.set(key, value, source="api")
+        applied[key] = value
     if "max_concurrent_jobs" in applied:
         state.queue.set_concurrency(int(applied["max_concurrent_jobs"]))
     if "model_cache_size" in applied or "model_idle_unload_s" in applied:

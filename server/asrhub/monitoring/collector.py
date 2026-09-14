@@ -22,6 +22,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
+from .. import __version__
 from ..db import SCHEMA_VERSION
 from ..logging_setup import get_logger
 from ..pipeline import metrics as M
@@ -237,7 +238,7 @@ class Collector:
         out.append(Sample("asrhub_uptime_seconds",
                           round(time.time() - self.state.started_at, 1)))
         out.append(Sample("asrhub_build_info", 1, {
-            "version": str(getattr(self.state, "version", "3.0.0")),
+            "version": str(getattr(self.state, "version", __version__)),
             "schema_version": str(SCHEMA_VERSION),
             "python": platform.python_version(),
             "catalog_date": str(model_catalog.CATALOG_DATE),

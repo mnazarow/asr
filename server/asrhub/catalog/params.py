@@ -11,6 +11,9 @@
 """
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from .schema import ParamExample as Ex
 from .schema import ParamSpec as P
 
@@ -5487,6 +5490,172 @@ def _проверить_категории(value: object) -> list[str]:
 
 #: Проверки значений сверх типа — по ключу параметра.
 _ПРОВЕРКИ = {"content_categories": _проверить_категории}
+
+
+#: Как записывают «да» и «нет» руками и в переменных окружения.
+_ДА = frozenset({"да", "yes", "true", "on", "1", "вкл", "включено", "истина"})
+_НЕТ = frozenset({"нет", "no", "false", "off", "0", "выкл", "выключено", "ложь"})
+
+
+def _пусто_для(spec: P) -> Any:
+    """Чем заменить пустую запись: пустым списком или пустым объектом."""
+    return {} if isinstance(spec.default, dict) else []
+
+
+def _строкой(value: Any) -> str:
+    """Число — в ту запись, которой его написал бы человек: 5, а не 5.0."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def coerce_value(key: str, value: Any) -> Any:
+    """Приводит значение к типу параметра, если запись читается однозначно.
+
+    Нужно ради обновлений. Тип параметра со временем расширяется: было одно
+    число — стало «несколько через запятую». Файл конфигурации на сервере
+    при этом остаётся прежним, и строгая проверка останавливает сервер на
+    файле, который вчера работал. Так и случилось с «длинами внутренних
+    номеров»: в config.yaml лежало ``5``, параметр стал строкой, и сервер
+    после обновления не поднялся — с сообщением «ожидается строка» про
+    строку, которую человек не писал.
+
+    Приводится только то, что нельзя прочитать двояко: ``5`` → ``«5»``,
+    ``«5»`` → ``5``, ``«да»`` → ``True``, ``«a, b»`` → ``[«a», «b»]``,
+    ``«[]»`` → ``[]``, пустая запись — в пустое значение своего типа.
+    Всё остальное возвращается нетронутым и уходит в :func:`validate_value`,
+    которая объяснит человеку, что не так.
+
+    Угадывать здесь нельзя: ``«2»`` для параметра-числа — это два, а вот
+    «похожее» имя модели или «почти подходящее» значение перечисления
+    исправлять молча — значит запустить сервер не с теми настройками и
+    ничего об этом не сказать.
+    """
+    spec = PARAMS_BY_KEY.get(key)
+    if spec is None:
+        return value
+    t = spec.type
+
+    if t == "bool":
+        if isinstance(value, bool):
+            return value
+        # ``isinstance(True, int)`` истинно, поэтому сначала bool, потом int.
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            низ = value.strip().lower()
+            if низ in _ДА:
+                return True
+            if низ in _НЕТ:
+                return False
+        return value
+
+    if t == "int":
+        # `bool` — разновидность `int`, поэтому «да» проходит здесь
+        # нетронутым: единицей оно не станет, об этом скажет проверка.
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if value.is_integer() else value
+        if isinstance(value, str):
+            текст = value.strip()
+            try:
+                return int(текст)
+            except ValueError:
+                pass
+            try:
+                дробное = float(текст)
+            except ValueError:
+                return value
+            return int(дробное) if дробное.is_integer() else дробное
+        return value
+
+    if t == "float":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return value
+        return value
+
+    if t in ("str", "text"):
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""                          # пустой ключ в YAML — это «не задано»
+        if isinstance(value, bool):
+            return value                       # «да» — не строка «True»
+        if isinstance(value, (int, float)):
+            return _строкой(value)
+        # Список там, где ждут перечисление через запятую. Записать «3, 4, 6»
+        # списком YAML — естественное движение руки, а смысл ровно тот же.
+        if isinstance(value, (list, tuple)) and all(
+                isinstance(ч, (str, int, float)) and not isinstance(ч, bool) for ч in value):
+            return ", ".join(_строкой(ч) for ч in value)
+        return value
+
+    if t == "multi":
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if value is None:
+            return []
+        if isinstance(value, str):
+            текст = value.strip()
+            if not текст:
+                return []
+            if текст.startswith("["):
+                try:
+                    разобрано = json.loads(текст)
+                except ValueError:
+                    разобрано = None
+                if isinstance(разобрано, list):
+                    return разобрано
+            return [ч.strip() for ч in текст.replace(";", ",").split(",") if ч.strip()]
+        if isinstance(value, (int, float, bool)):
+            return [value]                     # одно значение записали без списка
+        return value
+
+    if t == "json":
+        if isinstance(value, (dict, list)):
+            return value
+        if value is None:
+            return _пусто_для(spec)
+        if isinstance(value, str):
+            текст = value.strip()
+            if not текст:
+                return _пусто_для(spec)
+            try:
+                разобрано = json.loads(текст)
+            except ValueError:
+                return value
+            if isinstance(разобрано, (dict, list)):
+                return разобрано
+        return value
+
+    if t == "enum" and spec.options:
+        допустимые = [o["value"] for o in spec.options]
+        if value in допустимые:
+            return value
+        # Значение записано числом там, где в каталоге строка (``2`` вместо
+        # ``«2»``), или наоборот. Сверяем по записи, а не «на похожесть».
+        как_текст = _строкой(value).strip().lower()
+        for допустимое in допустимые:
+            if _строкой(допустимое).strip().lower() == как_текст:
+                return допустимое
+        return value
+
+    return value
+
+
+def coerce_all(values: dict[str, Any]) -> dict[str, Any]:
+    """То же для набора значений. Неизвестные ключи не трогает."""
+    return {ключ: coerce_value(ключ, значение) for ключ, значение in values.items()}
 
 
 def validate_value(key: str, value: object) -> tuple[bool, str]:

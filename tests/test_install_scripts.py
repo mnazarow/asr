@@ -218,14 +218,20 @@ def test_generated_config_is_readable_by_the_server(repo_root: Path, tmp_path: P
     assert settings.get("stream_window_s") == 4
     assert settings.get("server_port") == 8080
 
-    # И наоборот: опечатка в имени параметра обязана валить загрузку — иначе
-    # проверка выше ничего не стоит.
-    from asrhub.errors import ASRHubError
-
+    # И наоборот: опечатка в имени параметра не должна пройти незамеченной —
+    # иначе проверка выше ничего не стоит.
+    #
+    # Раньше опечатка валила загрузку. Теперь — нет: сервер, который не
+    # стартует из-за одной строки, однажды не стартовал после обновления,
+    # сменившего тип параметра, и это стоило простоя. Требование осталось
+    # прежним, наказание изменилось: значение не применяется, а опечатка
+    # названа в `problems` — её видно в журнале при старте, красной полосой
+    # в интерфейсе и в `--check-config`.
     config.write_text(config.read_text(encoding="utf-8")
                       .replace("stream_enabled:", "stream_enable:"), encoding="utf-8")
-    with pytest.raises(ASRHubError):
-        load(config)
+    настройки = load(config)
+    assert any("stream_enable" in проблема for проблема in настройки.problems)
+    assert настройки.sources.get("stream_enabled") == "default"
 
 
 def test_doctor_knows_about_the_new_capabilities(repo_root: Path, tmp_path: Path):

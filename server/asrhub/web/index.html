@@ -101,7 +101,7 @@
     <div class="sidebar-foot">
       <div id="conn-status" role="status" aria-live="polite"><span class="status-dot warn"></span>подключение…</div>
       <div class="row">
-        <span id="version-label">v3.0.0</span>
+        <span id="version-label">v3.0.1</span>
         <span class="spacer"></span>
         <button class="ghost sm" id="theme-toggle" title="Сменить тему">◐</button>
       </div>
@@ -129,6 +129,13 @@
         </button>
       </div>
     </header>
+
+    <!-- Полоса проблем конфигурации. Сервер запускается даже тогда, когда
+         строка в config.yaml не принята: берёт умолчание и работает. Цена
+         такой терпимости — обязанность сказать об этом вслух, иначе выйдет
+         «я поправил настройку, а она не действует». Место — над всеми
+         разделами: проблема не относится ни к одному из них. -->
+    <div class="config-problems" id="config-problems" hidden></div>
 
     <main class="content" id="content" tabindex="-1"></main>
   </div>

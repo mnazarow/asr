@@ -81,9 +81,19 @@ def test_env_override(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_env_validation(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    """Негодное значение не применяется — но и сервер не останавливает.
+
+    Раньше здесь ждали исключения, то есть отказ запускаться. Файл env.sh
+    переживает обновления так же, как config.yaml, и однажды сервер после
+    обновления не поднялся именно потому, что одна строка перестала
+    подходить. Требование осталось прежним — значение не применить и
+    сказать об этом, — а наказание стало соразмерным.
+    """
     monkeypatch.setenv("ASRHUB_BEAM_SIZE", "1000")
-    with pytest.raises(errors.ConfigError):
-        load()
+    settings = load()
+    assert settings["beam_size"] == 5, "негодное значение не должно примениться"
+    assert settings.sources["beam_size"] == "default"
+    assert any("ASRHUB_BEAM_SIZE" in проблема for проблема in settings.problems)
 
 
 def test_example_config_is_complete():

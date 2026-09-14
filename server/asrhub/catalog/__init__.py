@@ -21,6 +21,8 @@ from .params import (
     GROUPS_BY_ID,
     PARAMS,
     PARAMS_BY_KEY,
+    coerce_all,
+    coerce_value,
     defaults,
     get_param,
     params_for_engine,
@@ -52,7 +54,7 @@ __all__ = [
     "catalog_summary", "get_model", "get_engine", "get_param", "get_preset", "suggest_models",
     "mean_ru_wer", "models_for_engine", "suggest_models", "models_for_language", "recommended_ru",
     "defaults", "params_for_engine", "params_for_group", "translate_key",
-    "validate_all", "validate_value", "params_stats",
+    "validate_all", "validate_value", "coerce_all", "coerce_value", "params_stats",
 ]
 
 

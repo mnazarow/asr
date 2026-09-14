@@ -13,7 +13,15 @@ $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
-$script:AsrHubVersion   = '3.0.0'
+# Версия — из файла VERSION рядом с деревом скриптов; вписанное число
+# расходится с файлом при первом же выпуске.
+$script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
+    (Join-Path $PSScriptRoot '..\..\VERSION'))
+if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
+    $script:AsrHubVersion = '3.0.1'
+} else {
+    $script:AsrHubVersion = $script:AsrHubVersion.Trim()
+}
 $script:MinPython       = [version]'3.10'
 $script:LogFile         = $null
 $script:RollbackActions = [System.Collections.ArrayList]::new()
