@@ -19,6 +19,7 @@ param(
     [switch]$Check,
     [switch]$Rollback,
     [switch]$NoRestart,
+    [switch]$SkipGpuCheck,
     [switch]$Yes,
     [switch]$DryRun
 )
@@ -80,7 +81,34 @@ if (-not $EnginesOnly -and -not (Test-Path (Join-Path $Source 'server'))) {
     Write-Hint 'Укажите путь к распакованному дистрибутиву: -Source C:\путь\asr-hub'
     exit 2
 }
-if ($Check) { Write-Info 'Режим проверки — изменения не вносились.'; exit 0 }
+# Карта проверяется до снимка и до первого изменённого файла: обновление её
+# не лечит, а проверка работоспособности в конце ничего не заметит — служба
+# поднимется, /api/health ответит двумястами, и падать будет каждое задание.
+$gpuOk = $true
+if ($SkipGpuCheck) {
+    Write-Info 'Проверка видеокарты пропущена (-SkipGpuCheck).'
+} elseif (-not $EnginesOnly) {
+    Write-Host ''
+    $codeDir = Join-Path $Source 'server'
+    if (-not (Test-Path $codeDir)) { $codeDir = Join-Path $Prefix 'server' }
+    $gpuOk = Test-GpuRuntime -Python $venvPython -DataDir $DataDir -CodeDir $codeDir
+}
+
+if ($Check) {
+    Write-Info 'Режим проверки — изменения не вносились.'
+    # Отдельный код, а не единица: «карта недоступна» и «скрипт не отработал» —
+    # разные новости, и задача в планировщике должна их различать.
+    if (-not $gpuOk) { exit 3 }
+    exit 0
+}
+
+if (-not $gpuOk) {
+    Write-Warn 'Обновление это не лечит: карта недоступна и до, и после него.'
+    if (-not (Confirm-Action 'Обновиться всё равно?' 'n')) {
+        Write-Info 'Отменено. Сначала карта.'; exit 1
+    }
+}
+
 if (-not (Confirm-Action 'Выполнить обновление?')) { Write-Info 'Отменено.'; exit 0 }
 
 Set-StepTotal 6

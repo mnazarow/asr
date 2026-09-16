@@ -648,3 +648,305 @@ gpu_config_lines() {
     intel) return 0 ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# Видит ли карту тот процесс, который будет распознавать
+# ---------------------------------------------------------------------------
+#
+# Это не тот же вопрос, что «есть ли карта в машине», и расхождение между
+# двумя ответами — отдельный класс отказа, дорогой именно тем, что снаружи
+# выглядит исправной системой. Обновление, поставленное на такую машину,
+# проходит все проверки: служба поднимается, /api/health отвечает двумястами,
+# а каждое задание падает с невнятным текстом про загрузку модели.
+#
+# Разбираются три причины. Драйвер, обновлённый без перезагрузки (модуль в
+# памяти старый, userspace новые). Карта, отвалившаяся на ходу, — после неё
+# ошибка CUDA липкая, и процесс не поправится без перезапуска. И чужой номер
+# карты: CUDA_VISIBLE_DEVICES в окружении службы или device: cuda:N с
+# номером больше, чем карт в машине.
+
+# Откуда читается состояние драйвера. Пути вынесены в переменные по той же
+# причине, что и ASRHUB_PCI_ROOT: иначе проверить разбор можно было бы
+# только на машине, где драйвер сломан именно нужным образом.
+ASRHUB_NVIDIA_PROC="${ASRHUB_NVIDIA_PROC:-/proc/driver/nvidia/version}"
+ASRHUB_NVIDIA_DEV="${ASRHUB_NVIDIA_DEV:-/dev}"
+
+nvidia_loaded_version() {
+  # Версия модуля, который сейчас в памяти. Читается из /proc, а не из
+  # nvidia-smi: в том самом случае, ради которого всё это написано,
+  # nvidia-smi уже не отвечает, а /proc отвечает по-прежнему.
+  [[ -r "${ASRHUB_NVIDIA_PROC}" ]] || { printf ''; return 0; }
+  sed -n 's/.*Kernel Module *\([0-9][0-9.]*\).*/\1/p' \
+    "${ASRHUB_NVIDIA_PROC}" 2>/dev/null | head -1
+}
+
+nvidia_ondisk_version() {
+  # Версия модуля, лежащего на диске под текущим ядром. Отвечает на вопрос,
+  # ради которого разбор и затеян: поможет ли перезагрузка. Если на диске
+  # лежит ровно тот модуль, что уже loaded, — не поможет, и человека надо
+  # отправить не в reboot, а в dkms.
+  have modinfo || { printf ''; return 0; }
+  modinfo -F version nvidia 2>/dev/null | head -1
+}
+
+nvidia_userspace_version() {
+  # Версия пользовательских библиотек. nvidia-smi печатает её сам — и
+  # печатает именно тогда, когда работать отказывается:
+  #     Failed to initialize NVML: Driver/library version mismatch
+  #     NVML library version: 595.99
+  local v="" so=""
+  # Код возврата гасится намеренно, и дважды: nvidia-smi в этой ситуации
+  # отвечает единицей, а под `set -o pipefail` это роняет весь разбор —
+  # ровно тогда, когда он и нужен.
+  if have nvidia-smi; then
+    v="$( { nvidia-smi 2>&1 || true; } \
+         | sed -n 's/.*NVML library version: *\([0-9][0-9.]*\).*/\1/p' | head -1)"
+    [[ -z "${v}" ]] && v="$( { nvidia-smi --query-gpu=driver_version \
+                               --format=csv,noheader 2>/dev/null || true; } | head -1)"
+  fi
+  # Запасной путь — имя файла userspace. Версия в нём полная (595.99.02),
+  # а NVML печатает укороченную (595.99), поэтому сравнение идёт по началу.
+  if [[ -z "${v}" ]]; then
+    for so in "${ASRHUB_NVIDIA_LIB_GLOB:-/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*}" \
+              /usr/lib64/libnvidia-ml.so.* /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.*; do
+      [[ -e "${so}" ]] || continue
+      case "${so##*libnvidia-ml.so.}" in
+        [0-9]*) v="${so##*libnvidia-ml.so.}"; break ;;
+      esac
+    done
+  fi
+  printf '%s' "${v}"
+}
+
+nvidia_versions_match() {
+  # Сравнение по первым двум числам: «595.91.07» и «595.91» — одна версия,
+  # записанная по-разному. Пустое значение сравнивать не с чем, и выдумывать
+  # расхождение на пустом месте хуже, чем промолчать.
+  local a="$1" b="$2"
+  [[ -z "${a}" || -z "${b}" ]] && return 0
+  [[ "$(printf '%s' "${a}" | cut -d. -f1-2)" == "$(printf '%s' "${b}" | cut -d. -f1-2)" ]]
+}
+
+nvidia_driver_verdict() {
+  # Печатает приговор и два числа через «|»:
+  #   ok|<в памяти>|<библиотеки>       версии сходятся, дело не в драйвере
+  #   reboot|<в памяти>|<на диске>     на диске новый модуль — перезагрузка поможет
+  #   rebuild|<в памяти>|<библиотеки>  на диске тот же модуль — не поможет
+  #   unknown||                        сравнивать нечего
+  local loaded ondisk userspace
+  loaded="$(nvidia_loaded_version)"
+  ondisk="$(nvidia_ondisk_version)"
+  userspace="$(nvidia_userspace_version)"
+  if [[ -z "${loaded}" || -z "${userspace}" ]]; then
+    printf 'unknown|%s|%s' "${loaded}" "${userspace}"
+    return 0
+  fi
+  if nvidia_versions_match "${loaded}" "${userspace}"; then
+    printf 'ok|%s|%s' "${loaded}" "${userspace}"
+    return 0
+  fi
+  if [[ -n "${ondisk}" ]] && ! nvidia_versions_match "${loaded}" "${ondisk}"; then
+    printf 'reboot|%s|%s' "${loaded}" "${ondisk}"
+    return 0
+  fi
+  printf 'rebuild|%s|%s' "${loaded}" "${userspace}"
+}
+
+config_device() {
+  # Значение device из config.yaml. Пусто — значит «auto»: сервер выберет
+  # сам. Читается grep'ом, а не разбором YAML, по той же причине, что и
+  # порт, — питона под рукой может не быть вовсе.
+  local data_dir="$1" v=""
+  [[ -r "${data_dir}/config.yaml" ]] || { printf ''; return 0; }
+  v="$(grep -E '^[[:space:]]*device:[[:space:]]*' "${data_dir}/config.yaml" 2>/dev/null \
+       | head -1 | sed 's/^[[:space:]]*device:[[:space:]]*//')"
+  v="$(printf '%s' "${v}" | sed 's/[[:space:]]*#.*$//' | tr -d "\"'\\r" | tr -d '[:space:]')"
+  printf '%s' "${v}"
+}
+
+service_cuda_devices() {
+  # Что служба видит в CUDA_VISIBLE_DEVICES. Спрашиваем у systemd, а не у
+  # своей оболочки: окружение службы и окружение человека, запустившего
+  # скрипт, — разные вещи, и расходятся они как раз в этом месте.
+  local service="${1:-asrhub}"
+  have systemctl || { printf ''; return 0; }
+  { systemctl show "${service}" -p Environment --value 2>/dev/null || true; } \
+    | tr ' ' '\n' | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' | head -1
+}
+
+gpu_torch_probe() {
+  # Спрашивает карту у того самого питона, который будет распознавать.
+  # Печатает «состояние|устройство|подробность»:
+  #   ok|cuda|NVIDIA GeForce RTX 5090     карта отвечает
+  #   cpu|auto → cpu|…                    карты нет, сервер уйдёт на процессор
+  #   fail|cuda|…                         карта настроена, но недоступна
+  #   skip|…|…                            проверить нечем
+  #
+  # Ответ берётся у torch, а не у nvidia-smi: они расходятся, и заданию
+  # важен именно первый.
+  local py="$1" code_dir="$2" device="${3:-auto}"
+  [[ -x "${py}" ]] || { printf 'skip|%s|нет интерпретатора: %s' "${device}" "${py}"; return 0; }
+  "${py}" - "${code_dir}" "${device}" 2>/dev/null <<'PYEOF' || printf 'skip|%s|проба не выполнилась' "${device}"
+import sys
+
+sys.path.insert(0, sys.argv[1])
+устройство = (sys.argv[2] or "auto").strip().lower()
+
+try:
+    import torch
+except Exception:                                   # noqa: BLE001
+    torch = None
+
+
+def имя_карты() -> str:
+    try:
+        return torch.cuda.get_device_name(0) if torch.cuda.device_count() else ""
+    except Exception:                               # noqa: BLE001
+        return ""
+
+
+def проверка(устройство: str):
+    # Спрашиваем ту же функцию, которой пользуется сервер, чтобы ответы
+    # скрипта и сервера не разошлись. Её может не быть: перед обновлением в
+    # каталоге лежит прежняя версия. Тогда — своими силами, тем же способом.
+    try:
+        from asrhub.hardware import проверить_ускоритель
+    except Exception:                               # noqa: BLE001
+        pass
+    else:
+        return проверить_ускоритель(устройство)
+    try:
+        всего = int(torch.cuda.device_count())
+    except Exception as exc:                        # noqa: BLE001
+        return False, f"CUDA не отвечает на перечислении устройств: {exc}"
+    if всего <= 0:
+        return False, "CUDA не видит ни одной карты."
+    номер = 0
+    if ":" in устройство:
+        хвост = устройство.split(":", 1)[1].strip()
+        if хвост.isdigit():
+            номер = int(хвост)
+    if номер >= всего:
+        return False, f"Запрошена карта {номер}, а доступно карт: {всего} (номера с 0)."
+    try:
+        torch.cuda.get_device_name(номер)
+    except Exception as exc:                        # noqa: BLE001
+        return False, f"Карта {номер} не отвечает: {exc}"
+    return True, ""
+
+
+if устройство == "cpu":
+    print("cpu|cpu|распознавание настроено на процессор")
+    raise SystemExit(0)
+
+if torch is None:
+    print(f"skip|{устройство}|torch не установлен — спросить карту нечем")
+    raise SystemExit(0)
+
+if устройство in ("", "auto"):
+    try:
+        есть = bool(torch.cuda.is_available())
+    except Exception:                               # noqa: BLE001
+        есть = False
+    if есть:
+        print(f"ok|auto → cuda|{имя_карты()}")
+    else:
+        print("cpu|auto → cpu|карта не отвечает, сервер уйдёт на процессор")
+    raise SystemExit(0)
+
+годно, причина = проверка(устройство)
+print(f"ok|{устройство}|{имя_карты()}" if годно else f"fail|{устройство}|{причина}")
+PYEOF
+}
+
+gpu_runtime_report() {
+  # Полный разбор: спросить карту и, если её нет, объяснить почему.
+  #
+  #   gpu_runtime_report <питон> <каталог_данных> <каталог_кода> [служба]
+  #
+  # Код возврата: 0 — распознавание поедет, 1 — настроена карта, которой у
+  # процесса нет. Второе сознательно не считается «просто предупреждением»:
+  # на таком сервере падает каждое задание.
+  local py="$1" data_dir="$2" code_dir="$3" service="${4:-asrhub}"
+  local device probe state shown detail
+  device="$(config_device "${data_dir}")"
+  [[ -z "${device}" ]] && device="auto"
+
+  probe="$(gpu_torch_probe "${py}" "${code_dir}" "${device}")"
+  state="$(printf '%s' "${probe}" | cut -d'|' -f1)"
+  shown="$(printf '%s' "${probe}" | cut -d'|' -f2)"
+  detail="$(printf '%s' "${probe}" | cut -d'|' -f3-)"
+
+  case "${state}" in
+    ok)
+      ok "Видеокарта доступна процессу: ${shown}${detail:+ — ${detail}}"
+      return 0 ;;
+    cpu)
+      if [[ "${device}" == "cpu" ]]; then
+        info "Распознавание настроено на процессор — видеокарту проверять незачем."
+        return 0
+      fi
+      warn "Видеокарта не отвечает: ${shown}."
+      hint "Задания пойдут на процессоре — в несколько раз медленнее реального времени."
+      gpu_runtime_diagnose "${service}"
+      return 0 ;;
+    skip)
+      info "Видеокарту проверить нечем: ${detail}"
+      return 0 ;;
+    *)
+      error "Настроено «device: ${device}», но карта процессу недоступна."
+      printf '  %s\n' "${detail}" >&2
+      gpu_runtime_diagnose "${service}"
+      hint "Чтобы приём не стоял, пока карта чинится: device: cpu в ${data_dir}/config.yaml"
+      return 1 ;;
+  esac
+}
+
+gpu_runtime_diagnose() {
+  # Почему карты нет. Три причины по порядку проверки — и по каждой сразу
+  # команда, а не совет «разберитесь с драйвером».
+  local service="${1:-asrhub}"
+  local verdict word loaded other visible xid
+
+  verdict="$(nvidia_driver_verdict)"
+  word="$(printf '%s' "${verdict}" | cut -d'|' -f1)"
+  loaded="$(printf '%s' "${verdict}" | cut -d'|' -f2)"
+  other="$(printf '%s' "${verdict}" | cut -d'|' -f3)"
+  case "${word}" in
+    reboot)
+      warn "Драйвер обновлён без перезагрузки: модуль в памяти ${loaded}, на диске ${other}."
+      hint "Перезагрузка поможет: sudo reboot"
+      hint "Без перезагрузки — только модуль (карту должны отпустить все, включая Ollama):"
+      hint "  sudo systemctl stop ${service} ollama"
+      hint "  sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia_uvm" ;;
+    rebuild)
+      warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись, а новый модуль на диске не появился."
+      hint "Перезагрузка тут не поможет — модуль не пересобрался под текущее ядро:"
+      hint "  sudo dkms status && sudo dkms autoinstall"
+      hint "  затем sudo reboot" ;;
+    ok)
+      info "Версии драйвера сходятся (модуль ${loaded}, библиотеки ${other}) — дело не в них." ;;
+  esac
+
+  visible="$(service_cuda_devices "${service}")"
+  if [[ -n "${visible}" ]]; then
+    warn "В окружении службы задано CUDA_VISIBLE_DEVICES=${visible}."
+    hint "Если такой карты нет, CUDA отвечает «invalid device ordinal». Убрать: env.sh в каталоге данных."
+  fi
+
+  if have dmesg; then
+    xid="$( { dmesg 2>/dev/null || true; } | grep -iE 'NVRM: Xid' | tail -2 || true)"
+    if [[ -n "${xid}" ]]; then
+      warn "Карта отваливалась (Xid в журнале ядра):"
+      printf '  %s\n' "${xid}" >&2
+      hint "Ошибка CUDA липкая: процесс службы не поправится сам — sudo systemctl restart ${service}"
+    fi
+  fi
+
+  if [[ ! -e "${ASRHUB_NVIDIA_DEV}/nvidia0" && ! -e "${ASRHUB_NVIDIA_DEV}/nvidiactl" ]]; then
+    warn "Узлов /dev/nvidia* нет — карта процессу не видна вовсе."
+    hint "Проверьте, что модуль драйвера загружен: lsmod | grep nvidia"
+  fi
+
+  hint "Первая проверка руками: nvidia-smi -L"
+}

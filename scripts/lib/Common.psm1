@@ -18,7 +18,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.1'
+    $script:AsrHubVersion = '3.1.2'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
@@ -754,3 +754,141 @@ function Show-WizardSummary {
 }
 
 Export-ModuleMember -Function *
+
+# ---------------------------------------------------------------------------
+# Видит ли карту процесс, который будет распознавать
+# ---------------------------------------------------------------------------
+#
+# «Карта есть в машине» и «карту видит процесс» — разные ответы, и расходятся
+# они тихо: диспетчер устройств показывает исправную карту, nvidia-smi
+# отвечает, а torch получает отказ. Обновление, поставленное на такую машину,
+# проходит все проверки, а падает каждое задание по отдельности.
+#
+# На Windows это чаще всего чужой номер в CUDA_VISIBLE_DEVICES, процессорная
+# сборка PyTorch или драйвер, поставленный без перезагрузки.
+
+function Get-ConfigDevice {
+    param([string]$DataDir)
+    $file = Join-Path $DataDir 'config.yaml'
+    if (-not (Test-Path $file)) { return '' }
+    foreach ($line in Get-Content $file) {
+        if ($line -match '^\s*device:\s*(.+?)\s*(#.*)?$') {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return ''
+}
+
+function Test-GpuRuntime {
+    <#
+    .SYNOPSIS
+    Спрашивает карту у того самого питона, который будет распознавать.
+    .OUTPUTS
+    $true — распознавание поедет; $false — настроена карта, которой у процесса нет.
+    #>
+    param(
+        [string]$Python,
+        [string]$DataDir,
+        [string]$CodeDir
+    )
+    $device = Get-ConfigDevice -DataDir $DataDir
+    if (-not $device) { $device = 'auto' }
+    if ($device -eq 'cpu') {
+        Write-Info 'Распознавание настроено на процессор — видеокарту проверять незачем.'
+        return $true
+    }
+    if (-not (Test-Path $Python)) {
+        Write-Info "Видеокарту проверить нечем: нет интерпретатора $Python"
+        return $true
+    }
+
+    $probe = @'
+import sys
+sys.path.insert(0, sys.argv[1])
+устройство = (sys.argv[2] or "auto").strip().lower()
+try:
+    import torch
+except Exception:
+    print("skip||torch не установлен — спросить карту нечем"); raise SystemExit(0)
+try:
+    from asrhub.hardware import проверить_ускоритель
+except Exception:
+    проверить_ускоритель = None
+if устройство in ("", "auto"):
+    try:
+        есть = bool(torch.cuda.is_available())
+    except Exception:
+        есть = False
+    print("ok|auto -> cuda|" if есть else "cpu|auto -> cpu|карта не отвечает, сервер уйдёт на процессор")
+    raise SystemExit(0)
+if проверить_ускоритель is not None:
+    годно, причина = проверить_ускоритель(устройство)
+else:
+    try:
+        годно, причина = (int(torch.cuda.device_count()) > 0), ""
+    except Exception as exc:
+        годно, причина = False, f"CUDA не отвечает на перечислении устройств: {exc}"
+    if годно:
+        try:
+            torch.cuda.get_device_name(0)
+        except Exception as exc:
+            годно, причина = False, f"Карта не отвечает: {exc}"
+print(f"ok|{устройство}|" if годно else f"fail|{устройство}|{причина}")
+'@
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("asrhub-gpu-{0}.py" -f ([guid]::NewGuid()))
+    # Файл, а не аргумент -c: код на кириллице через командную строку теряет
+    # кодировку ровно на тех машинах, где он и нужен.
+    [System.IO.File]::WriteAllText($tmp, $probe, [System.Text.UTF8Encoding]::new($false))
+    try {
+        $out = & $Python $tmp $CodeDir $device 2>$null
+    } catch {
+        $out = ''
+    } finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $out) {
+        Write-Info 'Видеокарту проверить нечем: проба не выполнилась.'
+        return $true
+    }
+    $parts = ($out | Select-Object -Last 1) -split '\|', 3
+    switch ($parts[0]) {
+        'ok'   { Write-Ok "Видеокарта доступна процессу: $($parts[1])"; return $true }
+        'skip' { Write-Info "Видеокарту проверить нечем: $($parts[2])"; return $true }
+        'cpu'  {
+            Write-Warn "Видеокарта не отвечает: $($parts[1])."
+            Write-Hint 'Задания пойдут на процессоре — в несколько раз медленнее реального времени.'
+            Show-GpuRuntimeDiagnosis
+            return $true
+        }
+        default {
+            Write-Err "Настроено «device: $device», но карта процессу недоступна."
+            Write-Host "  $($parts[2])"
+            Show-GpuRuntimeDiagnosis
+            Write-Hint "Чтобы приём не стоял, пока карта чинится: device: cpu в $DataDir\config.yaml"
+            return $false
+        }
+    }
+}
+
+function Show-GpuRuntimeDiagnosis {
+    $visible = [Environment]::GetEnvironmentVariable('CUDA_VISIBLE_DEVICES', 'Machine')
+    if (-not $visible) { $visible = $env:CUDA_VISIBLE_DEVICES }
+    if ($visible) {
+        Write-Warn "Задано CUDA_VISIBLE_DEVICES=$visible."
+        Write-Hint 'Если такой карты нет, CUDA отвечает «invalid device ordinal».'
+    }
+    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+        $smi = & nvidia-smi -L 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn 'nvidia-smi не отвечает:'
+            Write-Host ('  ' + $smi.Trim())
+            Write-Hint 'Обычно это драйвер, поставленный без перезагрузки. Перезагрузите машину.'
+        } else {
+            Write-Info ('Карты по nvidia-smi: ' + $smi.Trim())
+            Write-Hint 'Карта видна системе, но не питону — обычно установлена процессорная сборка PyTorch.'
+            Write-Hint 'Переустановить: venv\Scripts\pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu130 torch torchaudio'
+        }
+    } else {
+        Write-Warn 'nvidia-smi не найдена — драйвер NVIDIA не установлен.'
+    }
+}

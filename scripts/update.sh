@@ -15,6 +15,8 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/detect.sh"
+# shellcheck source=lib/gpu.sh
+source "${SCRIPT_DIR}/lib/gpu.sh"
 
 PREFIX=""
 DATA_DIR=""
@@ -23,6 +25,7 @@ ENGINES_ONLY=0
 CHECK_ONLY=0
 DO_ROLLBACK=0
 NO_RESTART=0
+SKIP_GPU_CHECK=0
 
 usage() {
   cat <<'USAGE'
@@ -37,9 +40,16 @@ usage() {
   --check           Только показать, что изменится
   --rollback        Вернуть предыдущую версию из снимка
   --no-restart      Не перезапускать службу после обновления
+  --skip-gpu-check  Не проверять видеокарту перед обновлением
   --yes             Не задавать вопросов
   --dry-run         Показать план без изменений
   -h, --help        Справка
+
+Коды возврата:
+  0  всё хорошо
+  1  обновление не удалось (или отменено из-за недоступной видеокарты)
+  2  ошибка в параметрах или установка не найдена
+  3  только с --check: видеокарта настроена, но процессу недоступна
 USAGE
 }
 
@@ -52,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --check)  CHECK_ONLY=1; shift ;;
     --rollback) DO_ROLLBACK=1; shift ;;
     --no-restart) NO_RESTART=1; shift ;;
+    --skip-gpu-check) SKIP_GPU_CHECK=1; shift ;;
     --yes|-y) ASRHUB_ASSUME_YES=1; shift ;;
     --dry-run) ASRHUB_DRY_RUN=1; shift ;;
     --quiet|-q) ASRHUB_QUIET=1; shift ;;
@@ -144,9 +155,43 @@ else
   info "Различий в коде сервера не обнаружено."
 fi
 
+# --- Видеокарта -------------------------------------------------------------
+
+# Проверяется до снимка и до первого изменённого файла — иначе обновление
+# ляжет на сервер, который всё равно не сможет распознавать, а его проверка
+# работоспособности этого не заметит: служба поднимется, /api/health ответит
+# двумястами, и падать будет каждое задание по отдельности.
+#
+# Спрашивается новый код старым питоном: каталог источника отдаёт разбор
+# устройства той версии, которую ставим, а venv — тот самый torch, которым
+# сервер и будет считать.
+GPU_RC=0
+if [[ "${SKIP_GPU_CHECK}" -eq 1 ]]; then
+  info "Проверка видеокарты пропущена (--skip-gpu-check)."
+elif [[ "${ENGINES_ONLY}" -eq 1 ]]; then
+  : # обновление пакетов движков карты не касается
+else
+  printf '\n'
+  GPU_CODE_DIR="${SOURCE_DIR}/server"
+  [[ -d "${GPU_CODE_DIR}" ]] || GPU_CODE_DIR="${PREFIX}/server"
+  gpu_runtime_report "${VPY}" "${DATA_DIR}" "${GPU_CODE_DIR}" asrhub || GPU_RC=$?
+fi
+
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then
   info "Режим проверки — изменения не вносились."
+  # Отдельный код, а не единица: «карта недоступна» и «скрипт не отработал» —
+  # разные новости, и задача в cron должна их различать.
+  [[ "${GPU_RC}" -ne 0 ]] && exit 3
   exit 0
+fi
+
+# Умолчание «нет» здесь не формальность: обновление на сервере с недоступной
+# картой выглядит успешным и им же и заканчивается — до первого задания.
+# Человеку, который запустил update.sh вслепую по ssh, правильный ответ —
+# сначала карта.
+if [[ "${GPU_RC}" -ne 0 ]]; then
+  warn "Обновление это не лечит: карта недоступна и до, и после него."
+  confirm "Обновиться всё равно?" n || { info "Отменено. Сначала карта."; exit 1; }
 fi
 
 confirm "Выполнить обновление?" || { info "Отменено."; exit 0; }
@@ -449,8 +494,16 @@ wait_for_health "${PORT}" "${HEALTH_WAIT_S:-60}" asrhub "${PROBE_HOST}" || HEALT
 
 if [[ "${HEALTH_RC}" -eq 0 ]]; then
   ok "Сервер отвечает — обновление успешно"
+  # Карту спрашиваем ещё раз, уже новым кодом и после перезапуска. Первый
+  # заход смотрел на прежнюю установку, а обновление могло подменить torch —
+  # и «до» с «после» тут расходятся в обе стороны: сломаться и починиться.
+  if [[ "${SKIP_GPU_CHECK}" -eq 0 && "${ENGINES_ONLY}" -eq 0 ]]; then
+    gpu_runtime_report "${VPY}" "${DATA_DIR}" "${PREFIX}/server" asrhub || true
+  fi
   printf '\n%s%sОбновление завершено: %s → %s%s\n\n' "${C_BOLD}" "${C_GREEN}" \
     "${CURRENT_VERSION}" "${NEW_VERSION}" "${C_RESET}"
+  hint "Сплошная проверка всех частей: раздел «Дашборд» → «Глубокая проверка»"
+  hint "или из оболочки: bash ${PREFIX}/scripts/doctor.sh"
   hint "Откат при необходимости: bash ${PREFIX}/scripts/update.sh --rollback"
 elif [[ "${HEALTH_RC}" -eq 2 ]]; then
   # Сервер поднялся, но сам сообщает о неисправности. Это не повод для

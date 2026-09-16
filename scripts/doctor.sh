@@ -162,6 +162,21 @@ case "${ACCEL}" in
     fi ;;
 esac
 
+# Настроенное устройство против того, которое видно процессу. Проверки выше
+# отвечают на вопрос «что есть в машине» и читают nvidia-smi; эта — на вопрос
+# «сможет ли задание считать», и спрашивает тот же питон, которым работает
+# сервер. Расходятся ответы после обновления драйвера без перезагрузки, после
+# отвала карты и при чужом номере в CUDA_VISIBLE_DEVICES — и во всех трёх
+# случаях проверки выше зелёные, а распознавание стоит.
+if [[ -n "${PREFIX}" && -n "${DATA_DIR}" && -x "${PREFIX}/venv/bin/python" ]]; then
+  if gpu_runtime_report "${PREFIX}/venv/bin/python" "${DATA_DIR}" \
+       "${PREFIX}/server" asrhub; then
+    PASSED=$((PASSED + 1))
+  else
+    FAILED=$((FAILED + 1))
+  fi
+fi
+
 if [[ -n "${DATA_DIR}" ]]; then
   FREE_GB="$(df -Pk "${DATA_DIR}" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}')"
   check "Свободное место" "$( [[ ${FREE_GB:-0} -ge 20 ]] && echo ok || ( [[ ${FREE_GB:-0} -ge 5 ]] && echo warn || echo fail ) )" \
