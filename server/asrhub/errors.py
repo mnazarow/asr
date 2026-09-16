@@ -451,6 +451,23 @@ _OOM_MARKERS = (
     "out of memory", "cuda out of memory", "cublas_status_alloc_failed",
     "hip out of memory", "mps backend out of memory", "не хватает памяти",
 )
+#: Признаки того, что видеокарты у процесса нет вовсе. Их легко спутать с
+#: нехваткой памяти или поломкой движка, а лечатся они совсем иначе: движок
+#: и веса тут ни при чём, разбираться нужно с драйвером и окружением службы.
+#:
+#: «invalid device ordinal» из cudaGetDeviceCount — почти всегда
+#: CUDA_VISIBLE_DEVICES, указывающий на карту, которой нет (индекс 1 при
+#: единственной карте 0 или устаревший UUID после переустановки драйвера).
+#: «no cuda-capable device» — карта не видна процессу: нет узлов /dev/nvidia*,
+#: служба заперта PrivateDevices, или карта отвалилась с Xid. «driver/library
+#: version mismatch» — драйвер обновили, а модуль в памяти остался прежний.
+_CUDA_DEAD_MARKERS = (
+    "invalid device ordinal", "cudagetdevicecount", "numcudadevices",
+    "no cuda-capable device", "no cuda gpus are available",
+    "driver/library version mismatch", "cuda driver version is insufficient",
+    "system has unsupported display driver", "unknown error (999)",
+    "device-side assert", "cuda_error_no_device", "os call failed",
+)
 _CUDNN_MARKERS = (
     "libcudnn", "cudnn_ops_infer", "cudnn64_", "could not load library",
 )
@@ -506,6 +523,31 @@ def classify_exception(exc: BaseException, *, engine: str = "", model: str = "")
     if any(m in text for m in _OOM_MARKERS):
         device = "GPU" if "cuda" in text or "hip" in text else "MPS" if "mps" in text else "RAM"
         return OutOfMemoryError(device=device, cause=exc)
+
+    # Проверяется до cuDNN и до всего прочего, что упоминает CUDA: отказ на
+    # самом перечислении устройств означает, что до библиотек дело даже не
+    # дошло. Раньше он доезжал до общего разбора и получал подсказку
+    # «проверьте установку движка и наличие весов» — то есть отправлял
+    # чинить ровно то, что исправно.
+    if any(m in text for m in _CUDA_DEAD_MARKERS):
+        return HardwareError(
+            "Видеокарта недоступна процессу: CUDA не отвечает на перечислении "
+            "устройств.", cause=exc,
+        ).with_hint(
+            "Движок и веса тут ни при чём — отказ приходит до загрузки модели.\n"
+            "Три обычные причины, по порядку проверки:\n"
+            "  1. CUDA_VISIBLE_DEVICES указывает на карту, которой нет "
+            "(индекс 1 при единственной карте 0 или устаревший UUID GPU-… "
+            "после переустановки драйвера). Смотреть в окружении службы: "
+            "systemctl show asrhub -p Environment и env.sh в каталоге данных.\n"
+            "  2. Карта отвалилась на ходу (Xid в dmesg). Ошибка CUDA липкая: "
+            "процесс службы уже не поправится сам, нужен перезапуск "
+            "(systemctl restart asrhub).\n"
+            "  3. Драйвер обновлён без перезагрузки — модуль в памяти старый.\n"
+            "Первая проверка: nvidia-smi -L. Если карты в выводе нет, "
+            "разбираться нужно с драйвером, а не с ASR Hub.\n"
+            "Чтобы приём не стоял, пока карта чинится: device: cpu в config.yaml."
+        )
 
     if any(m in text for m in _CUDNN_MARKERS):
         return DependencyMissing(

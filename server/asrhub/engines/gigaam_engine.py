@@ -63,6 +63,21 @@ _LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (("no space left", "errno 28"),
      "не хватило места на диске",
      "Освободите место в каталоге моделей и повторите."),
+    # Проверяется раньше памяти и драйвера: отказ на перечислении устройств
+    # приходит до всякой загрузки, и подсказка про веса и движок отправляет
+    # чинить исправное. Разговор при этом уходит в телефонию одной строкой,
+    # где видно только это сообщение, — поэтому причина названа прямо.
+    ((r"invalid device ordinal", r"cudagetdevicecount", r"numcudadevices",
+      r"no cuda-capable device", r"no cuda gpus are available",
+      r"driver/library version mismatch",
+      r"cuda driver version is insufficient",
+      r"system has unsupported display driver"),
+     "видеокарта недоступна процессу, CUDA не отвечает на перечислении "
+     "устройств",
+     "Движок и веса ни при чём: отказ приходит до загрузки модели. Проверьте "
+     "nvidia-smi -L, затем CUDA_VISIBLE_DEVICES в окружении службы, затем "
+     "dmesg на Xid. Ошибка CUDA липкая — после отвала карты помогает только "
+     "перезапуск службы. Пока карта чинится, приём держит device=cpu."),
     (("out of memory", "cuda error", "cublas", "cudnn"),
      "не хватило памяти видеокарты или сломан её драйвер",
      "Попробуйте device=cpu или модель поменьше; проверьте nvidia-smi."),

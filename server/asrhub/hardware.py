@@ -376,3 +376,74 @@ def check_model_fits(vram_needed_gb: float, info: HardwareInfo | None = None) ->
         return False, (f"Модели нужно около {needed_ram:.1f} ГБ оперативной памяти, "
                        f"доступно {info.ram_available_gb:.1f} ГБ.")
     return True, ""
+
+
+def проверить_ускоритель(device: str) -> tuple[bool, str]:
+    """Отвечает, доступно ли вычислительное устройство прямо сейчас.
+
+    Кеша здесь нет намеренно: `detect()` кешируется на весь процесс, а этот
+    ответ обязан быть свежим. Карта отваливается на ходу — Xid в dmesg, и
+    дальше любое обращение к CUDA возвращает одну и ту же липкую ошибку. Ответ
+    из кеша в такой момент врал бы ровно тогда, когда его читают.
+
+    Проверка идёт до загрузки модели и отвечает за один вопрос: видит ли
+    процесс карту. Раньше на этот вопрос отвечала сама библиотека движка —
+    посреди загрузки весов, текстом про `cudaGetDeviceCount` и «invalid device
+    ordinal», из которого следовало разве что «что-то с CUDA».
+    """
+    название = (device or "auto").strip().lower()
+    if название in ("", "auto", "cpu"):
+        return True, ""
+    # Устройство не из тех, про которые мы что-то знаем (xpu, npu и прочая
+    # экзотика): проверять нечем, и отказывать не за что. Отсев идёт до
+    # импорта torch — иначе «нечем проверить» превращалось бы в «PyTorch не
+    # установлен», то есть в обвинение на ровном месте.
+    if not название.startswith(("cuda", "hip", "rocm", "mps")):
+        return True, ""
+
+    try:
+        import torch  # type: ignore
+    except Exception:                               # noqa: BLE001
+        # Отсутствие torch — не доказательство того, что карты нет: движки
+        # вроде whisper.cpp, vosk и sherpa-onnx работают на видеокарте без
+        # него вовсе. Отказать здесь значило бы уронить их на ровном месте,
+        # а движок, которому torch нужен, скажет об этом сам и точнее.
+        return True, ""
+
+    if название.startswith("mps"):
+        try:
+            if torch.backends.mps.is_available():
+                return True, ""
+        except Exception as exc:                    # noqa: BLE001
+            return False, f"Metal (MPS) не отвечает: {exc}"
+        return False, "Metal (MPS) недоступен на этой машине."
+
+    try:
+        всего = int(torch.cuda.device_count())
+    except Exception as exc:                        # noqa: BLE001
+        return False, f"CUDA не отвечает на перечислении устройств: {exc}"
+    if всего <= 0:
+        return False, ("CUDA не видит ни одной карты. Обычно это "
+                       "CUDA_VISIBLE_DEVICES, отвалившаяся карта или драйвер, "
+                       "обновлённый без перезагрузки.")
+
+    # Номер карты из «cuda:N». Спрашивать несуществующую бессмысленно: именно
+    # так и получается «invalid device ordinal», только этажом ниже и без
+    # объяснения, какой номер запрашивали и сколько карт есть на самом деле.
+    номер = 0
+    if ":" in название:
+        хвост = название.split(":", 1)[1].strip()
+        if hasattr(хвост, "isdigit") and хвост.isdigit():
+            номер = int(хвост)
+    if номер >= всего:
+        return False, (f"Запрошена карта {номер}, а доступно карт: {всего} "
+                       f"(номера с 0). Проверьте параметр «device» и "
+                       f"CUDA_VISIBLE_DEVICES.")
+
+    # Обращение к самой карте: счётчик устройств отвечает и на сломанном
+    # драйвере, а вот имя карты требует уже настоящей инициализации.
+    try:
+        torch.cuda.get_device_name(номер)
+    except Exception as exc:                        # noqa: BLE001
+        return False, f"Карта {номер} не отвечает: {exc}"
+    return True, ""

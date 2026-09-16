@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from ..catalog import ModelSpec
-from ..errors import ASRHubError, EngineError, classify_exception
+from ..errors import ASRHubError, EngineError, HardwareError, classify_exception
+from ..hardware import проверить_ускоритель
 from ..logging_setup import get_logger
 
 ProgressCallback = Callable[[float, str], None]
@@ -145,6 +146,23 @@ class Engine(ABC):
             return 0.0
         if self._model is not None:
             self.unload()
+        # Проверка устройства — до загрузки, а не вместо неё. Отвалившаяся
+        # карта раньше выяснялась посреди чтения весов, и каждый движок
+        # рассказывал об этом на своём языке: GigaAM — текстом про
+        # cudaGetDeviceCount, transformers — про «тензор на cpu, а ждали
+        # meta». Ни одна из этих строк не содержала ответа «карты нет».
+        устройство = self.resolve_device(settings)
+        годно, причина = проверить_ускоритель(устройство)
+        if not годно:
+            raise HardwareError(
+                f"Устройство «{устройство}» недоступно: {причина}",
+            ).with_hint(
+                "Первая проверка — nvidia-smi -L. Дальше по порядку: "
+                "CUDA_VISIBLE_DEVICES в окружении службы, Xid в dmesg "
+                "(после отвала карты помогает только перезапуск службы), "
+                "драйвер, обновлённый без перезагрузки. Пока карта чинится, "
+                "приём держит device=cpu."
+            )
         started = time.perf_counter()
         try:
             self._model = self._load(settings)
