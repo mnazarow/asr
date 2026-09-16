@@ -48,7 +48,9 @@ def драйвер(tmp_path: Path, *, загружен: str = "595.91.07",
             на_диске: str = "595.91.07", библиотеки: str = "595.91.07",
             smi_работает: bool = True, modinfo_есть: bool = True,
             ядра: dict[str, str] | None = None,
-            ядро_имя: str = "") -> dict[str, str]:
+            ядро_имя: str = "", dkms: str = "нет",
+            исходники: str = "",
+            ядра_где: dict[str, str] | None = None) -> dict[str, str]:
     """Машина с заданным состоянием драйвера NVIDIA.
 
     `ядра` — модули, лежащие на диске под другими ядрами: «имя ядра: версия».
@@ -88,7 +90,9 @@ exit 1
     mods = tmp_path / "modules"
     ветки = ""
     for ядро, версия in (ядра or {}).items():
-        каталог = mods / ядро / "updates" / "dkms"
+        # Куда класть модуль — не мелочь: DKMS кладёт в updates/dkms, а готовые
+        # модули Ubuntu приезжают в kernel/nvidia-<ветка>/.
+        каталог = mods / ядро / (ядра_где or {}).get(ядро, "updates/dkms")
         каталог.mkdir(parents=True, exist_ok=True)
         (каталог / "nvidia.ko").touch()
         ветки += f'    */{ядро}/*) echo "{версия}"; exit 0 ;;\n'
@@ -108,6 +112,16 @@ exit 1
     else:
         # PATH без modinfo вовсе: пакет kmod бывает не установлен.
         подложка(bin_dir, "modinfo", 'exit 127\n')
+    # dkms: «знает» — в status есть nvidia; «молчит» — status пуст;
+    # «нет» — самой dkms в системе не установлено.
+    if dkms != "нет":
+        подложка(bin_dir, "dkms",
+                 'echo "nvidia/595.99.02, 7.0.0-31-generic: installed"\n'
+                 if dkms == "знает" else 'exit 0\n')
+    src = tmp_path / "usr-src"
+    src.mkdir(parents=True, exist_ok=True)
+    if исходники:
+        (src / f"nvidia-{исходники}").mkdir(exist_ok=True)
     dev = tmp_path / "dev"
     dev.mkdir(exist_ok=True)
     (dev / "nvidia0").touch()
@@ -117,6 +131,7 @@ exit 1
         "ASRHUB_NVIDIA_PROC": str(proc),
         "ASRHUB_NVIDIA_DEV": str(dev),
         "ASRHUB_MODULES_ROOT": str(mods),
+        "ASRHUB_DKMS_SRC": str(src),
     }
     if not modinfo_есть:
         # `have modinfo` смотрит в PATH, поэтому файла быть не должно вовсе.
@@ -292,12 +307,18 @@ def test_модуль_собран_под_другое_ядро(repo_root: Path,
 def test_про_другое_ядро_сказано_прямо(repo_root: Path, tmp_path: Path):
     """Одного приговора мало: человеку нужно имя ядра и что с ним делать."""
     env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
-                  библиотеки="595.99", smi_работает=False,
+                  библиотеки="595.99", smi_работает=False, dkms="знает",
                   ядра={"6.8.0-60-generic": "595.99.02"})
     вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
     текст = вывод.stdout + вывод.stderr
     assert "6.8.0-60-generic" in текст
-    assert "reboot" in текст
+    # Сначала пересборка под работающее ядро, и только потом «загрузиться
+    # обратно». Обратная загрузка работает сразу, но возвращает на ядро без
+    # последних исправлений, и при следующем обновлении всё повторится.
+    сборка = текст.index("dkms autoinstall")
+    откат = текст.index("Запасной путь")
+    assert сборка < откат, "совет откатиться на старое ядро стоит первым"
+    assert "linux-headers-generic" in текст
 
 
 def test_модуль_работающего_ядра_не_выдаётся_за_чужой(repo_root: Path, tmp_path: Path):
@@ -362,13 +383,21 @@ def test_без_modinfo_не_выдумываем_приговор(repo_root: Pa
 
 
 def test_совет_про_заголовки_ядра(repo_root: Path, tmp_path: Path):
-    """Чаще всего dkms не собрал именно из-за отсутствующих заголовков."""
+    """Когда DKMS о драйвере знает, он чаще всего не собрал из-за заголовков.
+
+    Подложный dkms здесь обязателен: без него состояние другое, и совет
+    правильно будет другим — про пакеты, а не про заголовки.
+    """
     env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
-                  библиотеки="595.99", smi_работает=False)
+                  библиотеки="595.99", smi_работает=False, dkms="знает")
     вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
     текст = вывод.stdout + вывод.stderr
     assert "linux-headers" in текст
     assert "dkms autoinstall" in текст
+    # Метапакет ставится не «на всякий случай»: без него DKMS молча пропускает
+    # пересборку при каждом обновлении ядра. Команда без объяснения выглядит
+    # лишней, и её выбросят из инструкции первой.
+    assert "молча" in текст and "пересборку" in текст
 
 
 def test_версии_сходятся(repo_root: Path, tmp_path: Path):
@@ -777,3 +806,78 @@ def test_без_питона_выбор_установщика_остаётся(
     код, строки = конфигурация(repo_root, tmp_path / "нет-такого", env)
     assert код == 0
     assert "device: cuda" in строки
+
+
+# ---------------------------------------------------------------------------
+# Как поставлен драйвер — от этого зависит, что советовать
+# ---------------------------------------------------------------------------
+#
+# Спутать эти пути дорого: команда из чужого варианта отвечает тишиной, а
+# человек считает, что починил, и идёт перезагружаться.
+
+
+def test_run_установщик_поверх_пакетов(repo_root: Path, tmp_path: Path):
+    """Ровно то, что оказалось на боевом сервере.
+
+    Исходники драйвера в /usr/src есть, а `dkms status` пуст: .run-установщик
+    NVIDIA поверх пакетных модулей, чья регистрация теряется при обновлении
+    ядра. «dkms autoinstall» тут отвечает тишиной, а «поставьте пакет
+    модулей» — мимо: пакет уже стоит.
+    """
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False,
+                  ядро_имя="7.0.0-31-generic", dkms="молчит",
+                  исходники="595.99.02",
+                  ядра={"7.0.0-30-generic": "595.99.02",
+                        "7.0.0-31-generic": "595.91.07"},
+                  ядра_где={"7.0.0-31-generic": "kernel/nvidia-595srv"})
+    assert оболочка(repo_root, "nvidia_dkms_state", env).stdout.strip() == "stale"
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    текст = вывод.stdout + вывод.stderr
+    assert "dkms add -m nvidia -v 595.99.02" in текст
+    assert ".run" in текст
+    assert "autoinstall" not in текст, "совет из чужого варианта"
+
+
+def test_готовые_модули_без_dkms(repo_root: Path, tmp_path: Path):
+    """DKMS пуст и исходников нет — драйвер приехал готовыми модулями."""
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False, dkms="молчит")
+    assert оболочка(repo_root, "nvidia_dkms_state", env).stdout.strip() == "unknown"
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    текст = вывод.stdout + вывод.stderr
+    assert "linux-modules-nvidia-595" in текст
+    assert "dkms add" not in текст
+
+
+def test_dkms_знает_советуем_сборку(repo_root: Path, tmp_path: Path):
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False, dkms="знает")
+    assert оболочка(repo_root, "nvidia_dkms_state", env).stdout.strip() == "known"
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    текст = вывод.stdout + вывод.stderr
+    assert "dkms autoinstall" in текст
+    assert "linux-headers-generic" in текст
+
+
+def test_без_dkms_вовсе(repo_root: Path, tmp_path: Path):
+    env = драйвер(tmp_path, dkms="нет")
+    assert оболочка(repo_root, "nvidia_dkms_state", env).stdout.strip() == "absent"
+
+
+def test_пакетный_модуль_ubuntu_виден(repo_root: Path, tmp_path: Path):
+    """Готовые модули Ubuntu лежат в kernel/nvidia-595srv, а не в updates/dkms.
+
+    Без этого каталога в обходе пакетный модуль под работающим ядром был
+    невидим, и разбор считал, что под ним модуля нет вовсе.
+    """
+    env = драйвер(tmp_path, ядра={"7.0.0-31-generic": "595.91.07"},
+                  ядра_где={"7.0.0-31-generic": "kernel/nvidia-595srv"})
+    вывод = оболочка(repo_root, "nvidia_module_versions", env).stdout
+    assert "7.0.0-31-generic" in вывод and "595.91.07" in вывод
+
+
+def test_ветка_драйвера_из_версии_библиотек(repo_root: Path, tmp_path: Path):
+    """«595» из «595.99» — имя ветки для команды установки."""
+    env = драйвер(tmp_path, библиотеки="595.99", smi_работает=False)
+    assert оболочка(repo_root, "nvidia_branch_hint", env).stdout.strip() == "595"

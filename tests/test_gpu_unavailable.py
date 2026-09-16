@@ -446,3 +446,356 @@ def test_проверка_устройства_попадает_в_свод(data
     разделы = {к["id"]: к for к in свод["components"]}
     пункты = {п["id"] for п in разделы["hardware"]["checks"]}
     assert "device" in пункты
+
+
+# ---------------------------------------------------------------------------
+# Драйвер: почему карты нет
+# ---------------------------------------------------------------------------
+#
+# «Карта недоступна» — это факт. Что с ним делать, зависит от того, где
+# разошлись версии: перезагрузиться, пересобрать модуль под новое ядро или
+# чинить пакеты. Три разных действия, и ошибка стоит чужого простоя — поэтому
+# приговор считается, а не угадывается.
+
+
+def драйвер_на_диске(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, *,
+                     загружен: str = "595.91.07", библиотеки: str = "595.99",
+                     ядра: dict[str, str] | None = None,
+                     по_имени: str = "", работает: str = "7.0.0-31-generic",
+                     modinfo: bool = True, dkms: str = "",
+                     исходники: str = "",
+                     ядра_где: dict[str, str] | None = None) -> None:
+    """Подкладывает состояние драйвера: /proc, каталоги модулей и утилиты."""
+    from asrhub import hardware
+
+    proc = tmp_path / "proc-nvidia"
+    proc.write_text(
+        f"NVRM version: NVIDIA UNIX x86_64 Kernel Module  {загружен}  x\n",
+        encoding="utf-8")
+    корень = tmp_path / "modules"
+    версии = dict(ядра or {})
+    for ядро in версии:
+        # Куда класть модуль — не мелочь: DKMS кладёт в updates/dkms, а готовые
+        # модули Ubuntu приезжают в kernel/nvidia-<ветка>/. Обходить надо оба,
+        # иначе пакетный модуль под работающим ядром остаётся невидимым.
+        путь = (ядра_где or {}).get(ядро, "updates/dkms")
+        каталог = корень / ядро / путь
+        каталог.mkdir(parents=True, exist_ok=True)
+        (каталог / "nvidia.ko").touch()
+    корень.mkdir(parents=True, exist_ok=True)
+
+    src = tmp_path / "usr-src"
+    src.mkdir(parents=True, exist_ok=True)
+    if исходники:
+        (src / f"nvidia-{исходники}").mkdir(exist_ok=True)
+
+    monkeypatch.setattr(hardware, "NVIDIA_PROC", str(proc))
+    monkeypatch.setattr(hardware, "MODULES_ROOT", str(корень))
+    monkeypatch.setattr(hardware, "DKMS_SRC", str(src))
+    monkeypatch.setattr(hardware.platform, "release", lambda: работает)
+    def найдена(имя):
+        if имя == "modinfo" and not modinfo:
+            return None
+        if имя == "dkms" and dkms == "нет":
+            return None
+        return f"/usr/bin/{имя}"
+
+    monkeypatch.setattr(hardware.shutil, "which", найдена)
+
+    def запуск(cmd, timeout=6.0, *, со_стдерр=False):
+        if cmd[0] == "nvidia-smi":
+            if "--query-gpu=driver_version" in cmd:
+                return ""
+            # На живой машине это уходит в поток ошибок. Мок ведёт себя так
+            # же: иначе проверка прошла бы и на коде, который стдерр не
+            # читает, — а именно там версия библиотек и печатается.
+            if not со_стдерр:
+                return ""
+            return ("Failed to initialize NVML: Driver/library version mismatch\n"
+                    f"NVML library version: {библиотеки}")
+        if cmd[0] == "dkms":
+            # Пустой ответ — это «DKMS не знает ни об одном модуле», а вовсе
+            # не «модуль не собрался». Различение и проверяется.
+            return "nvidia/595.99.02, 7.0.0-31-generic: installed" \
+                if dkms == "знает" else ""
+        if cmd[0] == "modinfo":
+            цель = cmd[-1]
+            if цель == "nvidia":
+                return по_имени
+            for ядро, версия in версии.items():
+                if f"/{ядро}/" in цель:
+                    return версия
+            return ""
+        return ""
+
+    monkeypatch.setattr(hardware, "_run", запуск)
+
+
+def test_драйвер_обновлён_без_перезагрузки(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Новый модуль уже лежит под работающим ядром — хватит перезагрузки."""
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.99.02")
+    приговор = проверить_драйвер()
+    assert приговор["state"] == "reboot"
+    assert приговор["ondisk"] == "595.99.02"
+
+
+def test_ядро_обновилось_а_драйвер_нет(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Ровно то, что случилось на боевом сервере.
+
+    Модуль 595.99.02 собран под 7.0.0-30, а работает 7.0.0-31. Под работающим
+    ядром модуля нет — и `modinfo nvidia` об этом честно молчит.
+    """
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07",
+                     ядра={"7.0.0-30-generic": "595.99.02",
+                           "7.0.0-31-generic": "595.91.07"})
+    приговор = проверить_драйвер()
+    assert приговор["state"] == "other-kernel"
+    assert приговор["kernel"] == "7.0.0-30-generic"
+    assert приговор["running"] == "7.0.0-31-generic"
+
+
+def test_модуля_нет_ни_под_одним_ядром(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07")
+    assert проверить_драйвер()["state"] == "rebuild"
+
+
+def test_версии_сходятся_дело_не_в_драйвере(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, загружен="595.91.07",
+                     библиотеки="595.91")
+    assert проверить_драйвер()["state"] == "ok"
+
+
+def test_без_драйвера_проверять_нечего(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Машина без NVIDIA: сравнивать нечего, и строки в панели быть не должно."""
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, загружен="", библиотеки="")
+    assert проверить_драйвер()["state"] == "unknown"
+    проверки: list[dict[str, Any]] = []
+    from asrhub import selfcheck
+
+    selfcheck._драйвер_проверка(проверки)
+    assert проверки == []
+
+
+def test_без_modinfo_приговор_мягче(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, modinfo=False)
+    assert проверить_драйвер()["state"] == "unknown-disk"
+
+
+def test_панель_называет_ядро_и_команду(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Панель обязана отвечать так же подробно, как скрипт.
+
+    Человек читает их по очереди, и расходиться им в такой мелочи нельзя.
+    """
+    from asrhub import selfcheck
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07",
+                     dkms="знает", ядра={"7.0.0-30-generic": "595.99.02"})
+    проверки: list[dict[str, Any]] = []
+    selfcheck._драйвер_проверка(проверки)
+    assert len(проверки) == 1
+    пункт = проверки[0]
+    assert пункт["id"] == "driver"
+    assert пункт["state"] == "fail"
+    assert "7.0.0-30-generic" in пункт["value"]
+    assert "dkms autoinstall" in пункт["hint"]
+    assert "linux-headers-generic" in пункт["hint"]
+    # Одних команд мало: человек должен понимать, что чинит. Без объяснения
+    # «ядро обновилось, драйвер не пересобран» команды выглядят заклинанием.
+    assert "не пересобран" in пункт["hint"]
+
+
+def test_панель_молчит_когда_версии_сходятся(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    from asrhub import selfcheck
+
+    драйвер_на_диске(tmp_path, monkeypatch, загружен="595.91.07",
+                     библиотеки="595.91")
+    проверки: list[dict[str, Any]] = []
+    selfcheck._драйвер_проверка(проверки)
+    assert проверки[0]["state"] == "ok"
+    assert проверки[0]["hint"] == ""
+
+
+def test_модуль_работающего_ядра_не_выдаётся_за_чужой(tmp_path,
+                                                     monkeypatch: pytest.MonkeyPatch):
+    """Под работающим ядром два модуля, а modprobe берёт старый.
+
+    Совет «загрузитесь в ядро 7.0.0-31» человеку, который в нём и сидит, —
+    издевательство. Приговор должен быть про пересборку, а не про ядро.
+    """
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07",
+                     работает="7.0.0-31-generic",
+                     ядра={"7.0.0-31-generic": "595.99.02"})
+    приговор = проверить_драйвер()
+    assert приговор["state"] != "other-kernel", приговор
+    assert приговор["kernel"] == ""
+
+
+def test_версия_с_диска_берётся_обходом_когда_имени_мало(
+        tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """`modinfo nvidia` находит модуль по имени не везде — в RHEL он в extra/.
+
+    Тогда версию под работающим ядром берём обходом каталогов. Без этого
+    исправно собранный модуль выглядел бы отсутствующим.
+    """
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="",
+                     работает="7.0.0-31-generic",
+                     ядра={"7.0.0-31-generic": "595.99.02"})
+    приговор = проверить_драйвер()
+    assert приговор["state"] == "reboot"
+    assert приговор["ondisk"] == "595.99.02"
+
+
+@pytest.mark.parametrize("a,b,сходятся", [
+    ("595.91.07", "595.91", True),
+    ("595.91.07", "595.99", False),
+    ("", "595.99", True),          # сравнивать не с чем — не выдумываем
+    ("595.91", "", True),
+])
+def test_сравнение_версий_драйвера(a: str, b: str, сходятся: bool):
+    """Пустое значение — это «нечего сравнивать», а не «расходятся».
+
+    Выдуманное расхождение отправило бы человека чинить исправный драйвер.
+    """
+    from asrhub.hardware import _версии_сходятся
+
+    assert _версии_сходятся(a, b) is сходятся
+
+
+def test_проверка_драйвера_попадает_в_свод(data_dir: Path,
+                                           monkeypatch: pytest.MonkeyPatch):
+    """Написанная, но не подключённая проверка — то же молчание панели."""
+    from asrhub import hardware, selfcheck
+    from asrhub.api import create_app
+    from asrhub.config import load
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(hardware, "проверить_драйвер", lambda **_: {
+        "state": "other-kernel", "loaded": "595.91.07", "userspace": "595.99",
+        "ondisk": "595.91.07", "kernel": "7.0.0-30-generic",
+        "running": "7.0.0-31-generic"})
+    monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
+    monkeypatch.setenv("ASRHUB_ENGINE", "demo")
+    app = create_app(load(), start_queue=False)
+    with TestClient(app):
+        свод = selfcheck.состояние(app.state.hub)
+    разделы = {к["id"]: к for к in свод["components"]}
+    пункты = {п["id"]: п for п in разделы["hardware"]["checks"]}
+    assert "driver" in пункты
+    assert пункты["driver"]["state"] == "fail"
+    assert "7.0.0-30-generic" in пункты["driver"]["value"]
+
+
+# ---------------------------------------------------------------------------
+# Как поставлен драйвер — от этого зависит, что советовать
+# ---------------------------------------------------------------------------
+
+
+def test_run_установщик_поверх_пакетов(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Ровно то, что оказалось на боевом сервере.
+
+    Исходники драйвера в /usr/src есть, а `dkms status` пуст: .run-установщик
+    NVIDIA поверх пакетных модулей, чья регистрация в DKMS теряется при
+    обновлении ядра. Совет «dkms autoinstall» тут отвечает тишиной, а совет
+    «поставьте пакет модулей» — мимо: пакет уже стоит.
+    """
+    from asrhub import selfcheck
+    from asrhub.hardware import dkms_состояние
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07",
+                     dkms="молчит", исходники="595.99.02",
+                     ядра={"7.0.0-30-generic": "595.99.02"})
+    assert dkms_состояние() == "stale"
+    проверки: list[dict[str, Any]] = []
+    selfcheck._драйвер_проверка(проверки)
+    подсказка = проверки[0]["hint"]
+    assert "dkms add -m nvidia -v 595.99.02" in подсказка
+    assert ".run" in подсказка
+    assert "autoinstall" not in подсказка, "совет из чужого варианта"
+
+
+def test_готовые_модули_без_dkms(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """DKMS пуст и исходников нет — драйвер приехал готовыми модулями."""
+    from asrhub import selfcheck
+    from asrhub.hardware import dkms_состояние
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07",
+                     dkms="молчит", ядра={"7.0.0-30-generic": "595.99.02"})
+    assert dkms_состояние() == "unknown"
+    проверки: list[dict[str, Any]] = []
+    selfcheck._драйвер_проверка(проверки)
+    подсказка = проверки[0]["hint"]
+    assert "linux-modules-nvidia-595" in подсказка
+    assert "dkms add" not in подсказка
+
+
+def test_без_dkms_вовсе(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    from asrhub.hardware import dkms_состояние
+
+    драйвер_на_диске(tmp_path, monkeypatch, dkms="нет")
+    assert dkms_состояние() == "absent"
+
+
+def test_ветка_драйвера_из_версии_библиотек(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """«595» из «595.99» — имя ветки для команды установки.
+
+    Брать его из имени пакета нельзя: пакеты называются по-разному
+    (nvidia-driver-595, -595-server, -595-open), а первая часть версии — это
+    и есть ветка.
+    """
+    from asrhub.hardware import проверить_драйвер
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07",
+                     библиотеки="595.99", dkms="молчит")
+    assert проверить_драйвер()["branch"] == "595"
+
+
+def test_пакетный_модуль_ubuntu_виден(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Готовые модули Ubuntu лежат в kernel/nvidia-595srv, а не в updates/dkms.
+
+    Без этого каталога в обходе пакетный модуль под работающим ядром был
+    невидим, и разбор считал, что под ним модуля нет вовсе.
+    """
+    from asrhub.hardware import модули_по_ядрам
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="",
+                     работает="7.0.0-31-generic",
+                     ядра={"7.0.0-31-generic": "595.91.07"},
+                     ядра_где={"7.0.0-31-generic": "kernel/nvidia-595srv"})
+    from asrhub import hardware
+
+    найдено = модули_по_ядрам(hardware.MODULES_ROOT)
+    assert найдено == {"7.0.0-31-generic": "595.91.07"}
+
+
+def test_запасной_путь_назван_с_именем_ядра(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Совет «загрузиться обратно» обязан называть ядро и свою цену.
+
+    Без имени ядра он бесполезен, без цены — вреден: человек уедет на ядро
+    без последних исправлений и вернётся сюда же после следующего обновления.
+    """
+    from asrhub import selfcheck
+
+    драйвер_на_диске(tmp_path, monkeypatch, по_имени="595.91.07", dkms="знает",
+                     ядра={"7.0.0-30-generic": "595.99.02"})
+    проверки: list[dict[str, Any]] = []
+    selfcheck._драйвер_проверка(проверки)
+    подсказка = проверки[0]["hint"]
+    assert "Запасной путь" in подсказка
+    assert "7.0.0-30-generic" in подсказка
+    assert "без последних исправлений" in подсказка

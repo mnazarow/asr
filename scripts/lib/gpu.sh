@@ -708,7 +708,11 @@ nvidia_module_versions() {
   have modinfo || return 0
   # Три каталога: dkms кладёт по-разному в Debian и RHEL, а бывает и модуль
   # из самого ядра.
+  # Четыре места. updates/dkms — то, что собрал DKMS; extra — RHEL; готовые
+  # модули Ubuntu лежат в kernel/nvidia-<ветка>/ (например nvidia-595srv), и
+  # без этого образца пакетный модуль под работающим ядром оставался невидим.
   for f in "${root}"/*/updates/dkms/nvidia.ko* "${root}"/*/extra/nvidia.ko* \
+           "${root}"/*/kernel/nvidia*/nvidia.ko* \
            "${root}"/*/kernel/drivers/video/nvidia.ko*; do
     [[ -e "${f}" ]] || continue
     kern="${f#"${root}/"}"; kern="${kern%%/*}"
@@ -745,6 +749,46 @@ nvidia_userspace_version() {
     done
   fi
   printf '%s' "${v}"
+}
+
+nvidia_dkms_state() {
+  # Знает ли DKMS о драйвере NVIDIA. Печатает: known | unknown | absent.
+  #
+  # Различение не теоретическое. Пустой `dkms status` означает не «модуль не
+  # собрался», а «DKMS не знает ни об одном модуле»: драйвер поставлен
+  # готовыми модулями (linux-modules-nvidia-*) или пакет nvidia-dkms был
+  # удалён при обновлении. В обоих случаях `dkms autoinstall` отвечает
+  # тишиной, и совет собрать модуль отправляет человека в пустоту.
+  have dkms || { printf 'absent'; return 0; }
+  if { dkms status 2>/dev/null || true; } | grep -qi nvidia; then
+    printf 'known'; return 0
+  fi
+  # Исходники на месте, а регистрации нет — это .run-установщик NVIDIA поверх
+  # пакетов: он кладёт свои библиотеки мимо dpkg и заводит DKMS, а при
+  # обновлении ядра регистрация теряется. Снаружи выглядит как «драйвер
+  # поставлен не через DKMS», и совет про пакеты в этом случае — мимо.
+  [[ -n "$(nvidia_dkms_source)" ]] && { printf 'stale'; return 0; }
+  printf 'unknown'
+}
+
+nvidia_dkms_source() {
+  # Версия исходников драйвера в /usr/src (каталог nvidia-<версия>).
+  local d
+  for d in "${ASRHUB_DKMS_SRC:-/usr/src}"/nvidia-[0-9]*; do
+    [[ -d "${d}" ]] || continue
+    printf '%s' "${d##*/nvidia-}"
+    return 0
+  done
+  printf ''
+}
+
+nvidia_branch_hint() {
+  # Имя ветки драйвера для команд установки: «595» из nvidia-driver-595.
+  # Берётся из версии библиотек, а не из имени пакета: пакет может
+  # называться по-разному, а первая часть версии — это и есть ветка.
+  local v="${1:-}"
+  [[ -n "${v}" ]] || v="$(nvidia_userspace_version)"
+  printf '%s' "${v%%.*}"
 }
 
 nvidia_versions_match() {
@@ -959,6 +1003,55 @@ gpu_runtime_report() {
   esac
 }
 
+nvidia_repair_hint() {
+  # Что делать с несобранным модулем. Ответ зависит от того, как вообще
+  # поставлен драйвер, и спутать эти два пути дорого: команда из чужого
+  # варианта отвечает тишиной, а человек считает, что починил.
+  local branch
+  branch="$(nvidia_branch_hint)"
+  case "$(nvidia_dkms_state)" in
+    known)
+      hint "Собрать под работающее ядро:"
+      hint "  sudo apt-get install -y \"linux-headers-\$(uname -r)\" linux-headers-generic"
+      hint "  sudo dkms autoinstall -k \"\$(uname -r)\" && sudo reboot"
+      hint "Метапакет linux-headers-generic ставится не зря: без него DKMS молча"
+      hint "пропускает пересборку при каждом следующем обновлении ядра."
+      hint "Если сборка упадёт, её журнал: /var/lib/dkms/nvidia/*/build/make.log" ;;
+    stale)
+      local src
+      src="$(nvidia_dkms_source)"
+      warn "Исходники драйвера ${src} лежат в /usr/src, но DKMS о них не знает."
+      hint "Так выглядит .run-установщик NVIDIA поверх пакетных модулей: его"
+      hint "регистрация в DKMS теряется при обновлении ядра, и загружается"
+      hint "пакетный модуль — другой версии, чем библиотеки."
+      hint "Вернуть сборку и собрать под работающее ядро:"
+      hint "  sudo dkms add -m nvidia -v ${src} 2>/dev/null || true"
+      hint "  sudo dkms build -m nvidia -v ${src} -k \"\$(uname -r)\""
+      hint "  sudo dkms install -m nvidia -v ${src} -k \"\$(uname -r)\" && sudo reboot"
+      hint "Журнал сборки, если упадёт: /var/lib/dkms/nvidia/${src}/build/make.log"
+      hint "На будущее надёжнее вернуться к пакетному драйверу целиком:"
+      hint "  sudo nvidia-uninstall && sudo apt-get install -y nvidia-driver-${branch:-<ветка>}-server"
+      hint "Гибрид «.run поверх пакетов» ломается при каждом обновлении ядра." ;;
+    unknown)
+      warn "DKMS о драйвере NVIDIA не знает — собирать ему нечего."
+      hint "Драйвер поставлен готовыми модулями (или пакет nvidia-dkms удалён при"
+      hint "обновлении). Модули под каждое ядро приезжают своим пакетом:"
+      hint "  sudo apt-get install -y \"linux-modules-nvidia-${branch:-<ветка>}-\$(uname -r)\""
+      hint "  либо метапакетом, который следит за ядром сам:"
+      hint "  sudo apt-get install -y linux-modules-nvidia-${branch:-<ветка>}-generic"
+      hint "Вернуть сборку через DKMS: sudo apt-get install -y nvidia-dkms-${branch:-<ветка>}"
+      hint "Что вообще стоит: dpkg -l | grep -i nvidia" ;;
+    *)
+      hint "DKMS не установлен. Модули под каждое ядро приезжают пакетом:"
+      hint "  sudo apt-get install -y \"linux-modules-nvidia-${branch:-<ветка>}-\$(uname -r)\"" ;;
+  esac
+  # Незавершённое обновление пакетов — частая причина того, что библиотеки
+  # уехали вперёд, а модули остались. Проверяется дёшево, а объясняет много.
+  hint "Проверьте заодно, что обновление пакетов доведено до конца:"
+  hint "  sudo dpkg --configure -a && sudo apt-get -f install"
+  hint "  apt list --upgradable | grep -i nvidia"
+}
+
 gpu_runtime_diagnose() {
   # Почему карты нет. Три причины по порядку проверки — и по каждой сразу
   # команда, а не совет «разберитесь с драйвером».
@@ -977,19 +1070,15 @@ gpu_runtime_diagnose() {
       hint "  sudo systemctl stop ${service} ollama"
       hint "  sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia_uvm" ;;
     other-kernel)
-      warn "Новый модуль собран под ядро ${other}, а работает $(uname -r 2>/dev/null)."
-      hint "Загрузитесь в него — этого достаточно: sudo reboot (и выберите ${other})"
-      hint "Либо соберите под работающее ядро:"
-      hint "  sudo dkms autoinstall -k \"\$(uname -r)\" && sudo reboot" ;;
+      warn "Ядро обновилось, а драйвер под него не пересобран: модуль есть под ${other}, работает $(uname -r 2>/dev/null)."
+      nvidia_repair_hint
+      hint "Запасной путь — загрузиться обратно в ${other}. Работает сразу, но"
+      hint "возвращает на ядро без последних исправлений, и при следующем"
+      hint "обновлении всё повторится." ;;
     rebuild)
-      warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись, а новый модуль не собран ни под одно установленное ядро."
-      hint "Перезагрузка тут не поможет — собирать нужно заново:"
-      hint "  sudo apt-get install -y \"linux-headers-\$(uname -r)\"   # без них dkms не соберёт"
-      hint "  sudo dkms status && sudo dkms autoinstall"
-      hint "  затем sudo reboot"
-      hint "Если в dkms status новой версии нет вовсе — приехали только библиотеки:"
-      hint "  sudo dpkg --configure -a && sudo apt-get -f install"
-      hint "  sudo apt-get install --reinstall nvidia-dkms-<ветка>" ;;
+      warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись, а нового модуля нет ни под одно установленное ядро."
+      hint "Перезагрузка тут не поможет:"
+      nvidia_repair_hint ;;
     unknown-disk)
       warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись."
       hint "Сравнить с модулем на диске нечем: нет modinfo (пакет kmod)."

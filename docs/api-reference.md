@@ -814,7 +814,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:16283",
+  "instance": "vm:15071",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1392,7 +1392,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789581329.6675942,
+    "generated_at": 1789585294.7341447,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1559,8 +1559,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.3",
-  "uptime_s": 112.2,
+  "version": "3.1.4",
+  "uptime_s": 114.9,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1638,8 +1638,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.3",
-  "uptime_s": 112.3,
+  "version": "3.1.4",
+  "uptime_s": 115.0,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v33",
@@ -1649,7 +1649,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 7.1,
-    "disk_free_gb": 17.3,
+    "disk_free_gb": 17.2,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1660,7 +1660,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 17.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 17.2 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {

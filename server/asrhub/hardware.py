@@ -63,10 +63,19 @@ class HardwareInfo:
         return max(self.gpus, key=lambda g: g.memory_total_mb) if self.gpus else None
 
 
-def _run(cmd: list[str], timeout: float = 6.0) -> str:
+def _run(cmd: list[str], timeout: float = 6.0, *, со_стдерр: bool = False) -> str:
+    """Вывод команды. Код возврата не проверяется намеренно.
+
+    ``со_стдерр`` нужен там, где полезное сообщение программа печатает в
+    поток ошибок: nvidia-smi именно так сообщает о расхождении версий
+    драйвера — то есть ровно тогда, когда её и спрашивают.
+    """
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-        return (out.stdout or "").strip()
+        текст = out.stdout or ""
+        if со_стдерр:
+            текст += "\n" + (out.stderr or "")
+        return текст.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -447,3 +456,187 @@ def проверить_ускоритель(device: str) -> tuple[bool, str]:
     except Exception as exc:                        # noqa: BLE001
         return False, f"Карта {номер} не отвечает: {exc}"
     return True, ""
+
+
+#: Откуда читается состояние драйвера NVIDIA. Вынесено в константы по той же
+#: причине, что и пути в скриптах: иначе проверить разбор можно было бы только
+#: на машине, где драйвер сломан именно нужным образом.
+NVIDIA_PROC = "/proc/driver/nvidia/version"
+MODULES_ROOT = "/lib/modules"
+NVML_GLOBS = (
+    "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*",
+    "/usr/lib64/libnvidia-ml.so.*",
+    "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.*",
+)
+
+
+def _версия_модуля(путь: str) -> str:
+    """Версия модуля ядра по пути к файлу — спрашивается у modinfo."""
+    if not shutil.which("modinfo"):
+        return ""
+    строки = _run(["modinfo", "-F", "version", путь]).splitlines()
+    return строки[0].strip() if строки else ""
+
+
+def модули_по_ядрам(корень: str = MODULES_ROOT) -> dict[str, str]:
+    """Версия модуля nvidia под каждым установленным ядром.
+
+    Нужно ровно для одного различения, которого иначе не сделать: модуль мог
+    собраться не под то ядро, что работает сейчас. Так бывает, когда ядро
+    обновилось, а DKMS под него драйвер не пересобрал — и `modinfo nvidia`,
+    который смотрит только на работающее ядро, об этом честно молчит.
+    """
+    import glob  # noqa: PLC0415
+
+    if not shutil.which("modinfo"):
+        return {}
+    # Четыре места. updates/dkms — то, что собрал DKMS; extra — RHEL; готовые
+    # модули Ubuntu лежат в kernel/nvidia-<ветка>/ (например nvidia-595srv), и
+    # без этого образца пакетный модуль под работающим ядром оставался невидим.
+    образцы = ("*/updates/dkms/nvidia.ko*", "*/extra/nvidia.ko*",
+               "*/kernel/nvidia*/nvidia.ko*",
+               "*/kernel/drivers/video/nvidia.ko*")
+    найдено: dict[str, str] = {}
+    for образец in образцы:
+        for путь in glob.glob(os.path.join(корень, образец)):
+            ядро = os.path.relpath(путь, корень).split(os.sep)[0]
+            if ядро in найдено:
+                continue
+            версия = _версия_модуля(путь)
+            if версия:
+                найдено[ядро] = версия
+    return найдено
+
+
+#: Где лежат исходники драйвера, заведённые .run-установщиком NVIDIA.
+DKMS_SRC = "/usr/src"
+
+
+def dkms_исходники(корень: str = "") -> str:
+    """Версия исходников драйвера в /usr/src (каталог nvidia-<версия>)."""
+    import glob  # noqa: PLC0415
+
+    for путь in sorted(glob.glob(os.path.join(корень or DKMS_SRC, "nvidia-[0-9]*"))):
+        if os.path.isdir(путь):
+            return os.path.basename(путь).split("nvidia-", 1)[-1]
+    return ""
+
+
+def dkms_состояние(корень: str = "") -> str:
+    """Знает ли DKMS о драйвере NVIDIA: known | stale | unknown | absent.
+
+    Различение не теоретическое. Пустой ``dkms status`` означает не «модуль не
+    собрался», а «DKMS не знает ни об одном модуле», и совет собрать модуль
+    отправляет человека в пустоту. А если при этом исходники в /usr/src лежат
+    — это .run-установщик NVIDIA поверх пакетных модулей: он кладёт свои
+    библиотеки мимо dpkg и заводит DKMS, а при обновлении ядра регистрация
+    теряется, и загружается пакетный модуль другой версии.
+    """
+    if not shutil.which("dkms"):
+        return "absent"
+    if "nvidia" in _run(["dkms", "status"], со_стдерр=True).lower():
+        return "known"
+    return "stale" if dkms_исходники(корень) else "unknown"
+
+
+def _версии_сходятся(a: str, b: str) -> bool:
+    """«595.91.07» и «595.91» — одна версия, записанная по-разному.
+
+    Пустое значение сравнивать не с чем, и выдумывать расхождение на пустом
+    месте хуже, чем промолчать.
+    """
+    if not a or not b:
+        return True
+    return a.split(".")[:2] == b.split(".")[:2]
+
+
+def _версия_библиотек() -> str:
+    """Версия пользовательских библиотек NVIDIA.
+
+    nvidia-smi печатает её сам — и печатает именно тогда, когда работать
+    отказывается: «Failed to initialize NVML: Driver/library version
+    mismatch / NVML library version: 595.99».
+    """
+    import glob  # noqa: PLC0415
+    import re  # noqa: PLC0415
+
+    if shutil.which("nvidia-smi"):
+        вывод = _run(["nvidia-smi"], со_стдерр=True)
+        совпало = re.search(r"NVML library version:\s*([0-9][0-9.]*)", вывод)
+        if совпало:
+            return совпало.group(1)
+        строка = _run(["nvidia-smi", "--query-gpu=driver_version",
+                       "--format=csv,noheader"]).strip().splitlines()
+        if строка and строка[0].strip():
+            return строка[0].strip()
+    for образец in NVML_GLOBS:
+        for путь in sorted(glob.glob(образец)):
+            хвост = путь.rsplit("libnvidia-ml.so.", 1)[-1]
+            if хвост[:1].isdigit():
+                return хвост
+    return ""
+
+
+def проверить_драйвер(*, proc: str = "", корень: str = "") -> dict[str, Any]:
+    """Сходятся ли модуль ядра NVIDIA и его библиотеки.
+
+    Отдельно от проверки устройства не случайно. «Карта недоступна» — это
+    факт, а вот что с ним делать, зависит от того, где разошлись версии:
+    перезагрузиться, пересобрать модуль под новое ядро или чинить пакеты. Три
+    разных действия, и ошибка стоит чужого простоя.
+
+    Возвращает состояние: ``ok`` — версии сходятся; ``reboot`` — новый модуль
+    уже лежит под работающим ядром; ``other-kernel`` — модуль есть, но под
+    другим установленным ядром (ядро обновилось, DKMS не пересобрал);
+    ``rebuild`` — модуля нет ни под одним ядром; ``unknown`` — сравнивать
+    нечего (драйвера нет вовсе); ``unknown-disk`` — нет modinfo.
+    """
+    proc = proc or NVIDIA_PROC
+    корень = корень or MODULES_ROOT
+    загружен = ""
+    try:
+        with open(proc, encoding="utf-8", errors="replace") as файл:
+            import re  # noqa: PLC0415
+
+            совпало = re.search(r"Kernel Module\s+([0-9][0-9.]*)", файл.read())
+            загружен = совпало.group(1) if совпало else ""
+    except OSError:
+        загружен = ""
+    библиотеки = _версия_библиотек()
+    работает = platform.release()
+    итог: dict[str, Any] = {
+        "state": "unknown", "loaded": загружен, "userspace": библиотеки,
+        "ondisk": "", "kernel": "", "running": работает,
+        "dkms": dkms_состояние(), "source": dkms_исходники(),
+        "branch": библиотеки.split(".")[0] if библиотеки else "",
+    }
+    if not загружен or not библиотеки:
+        return итог
+
+    по_ядрам = модули_по_ядрам(корень)
+    # Сначала спрашиваем modinfo по имени: он отвечает тем модулем, который
+    # действительно загрузит modprobe. Обход каталогов — запасной путь: в
+    # RHEL модуль лежит в extra/, и по имени modinfo его не находит.
+    на_диске = ""
+    if shutil.which("modinfo"):
+        строки = _run(["modinfo", "-F", "version", "nvidia"]).splitlines()
+        на_диске = строки[0].strip() if строки else ""
+    if not на_диске:
+        на_диске = по_ядрам.get(работает, "")
+    итог["ondisk"] = на_диске
+
+    if _версии_сходятся(загружен, библиотеки):
+        итог["state"] = "ok"
+        return итог
+    if на_диске and not _версии_сходятся(загружен, на_диске):
+        итог["state"] = "reboot"
+        return итог
+    for ядро, версия in sorted(по_ядрам.items()):
+        if ядро == работает:
+            continue
+        if _версии_сходятся(версия, библиотеки):
+            итог["state"] = "other-kernel"
+            итог["kernel"] = ядро
+            return итог
+    итог["state"] = "unknown-disk" if not shutil.which("modinfo") else "rebuild"
+    return итог
