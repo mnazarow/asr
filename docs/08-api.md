@@ -532,7 +532,32 @@ POST   /api/telephony/scan?station=filial         заход по требова
 GET    /api/telephony/overview?period=week        всё для раздела «АТС» одним ответом
 GET    /api/telephony/calls?station=&direction=&queue=&agent=
 GET    /api/telephony/dimensions?station=         очереди и операторы для отбора
+POST   /api/telephony/diagnose?station=filial     разбор забора: почему нет звонков
+POST   /api/telephony/collect                     собрать весь архив или период
+GET    /api/telephony/collect                     ход сбора
+POST   /api/telephony/rewind?station=filial       забыть позицию чтения журнала
 ```
+
+`POST /api/telephony/diagnose` отвечает списком проверок с состояниями `ok`, `warn`, `fail` и подсказкой у каждой: журнал не пополняется, позиция чтения в конце повёрнутого файла, AMI не шлёт событий `Cdr`, записи не находятся, пороги отсекают всё. Ничего не меняет — позиция чтения остаётся на месте, звонки в очередь не ставятся.
+
+`POST /api/telephony/collect` принимает `{"station": "…", "mode": "all"}` или `{"mode": "period", "since": …, "until": …}` и запускает сбор в фоне; ход читается тем же адресом методом GET.
+
+### Агент на станции
+
+```
+POST /api/telephony/agent/hello                   агент представляется, получает задание
+POST /api/telephony/agent/ask                     какие звонки серверу ещё нужны
+POST /api/telephony/agent/call                    звонок и запись одним запросом
+GET  /api/telephony/agent/command?agent_id=       задание, если оно есть
+GET  /api/telephony/agent/install.sh              установщик с подставленным адресом
+GET  /api/telephony/agent/asrhub-agent.py         исходный текст агента
+GET  /api/telephony/agents                        список агентов (администратор)
+POST /api/telephony/agents/{id}/command           задание агенту: all, new, period, stop
+POST /api/telephony/agents/{id}/enabled           включить или выключить агента
+DELETE /api/telephony/agents/{id}                 забыть агента (звонки остаются)
+```
+
+Обмен и установка описаны в главе «Агент на станции Asterisk». `POST /call` — многочастный запрос: поле `meta` (JSON со сведениями о звонке) и необязательное поле `file` (сама запись). Звонки агента лежат в архиве под станцией `agent:<идентификатор>`.
 
 `POST /api/telephony/test` с телом запроса проверяет станцию, которой ещё нет в настройках: это и есть «проверить при добавлении». Заводить ради проверки станцию и потом убирать — способ оставить мусор при первом закрытии вкладки.
 
@@ -549,6 +574,63 @@ GET /api/content/coaching?by=agent&agent=Иванов%20А.
 `by` выбирает, что считать сотрудником: `agent` — имя из журнала АТС (самый полезный разрез), `speaker` — метка говорящего в записи, `owner` — ключ доступа, `queue` и `station` — очередь и станция.
 
 В ответе `employees` к показателям разбора добавлены телефонные: число звонков, наговоренное время, доля отвеченных. Признак `sparse` означает «меньше пяти разобранных разговоров»: средние по ним ещё ни о чём не говорят.
+
+## Справочник сотрудников
+
+```
+GET    /api/employees?query=&department=&active=   карточки с отбором и сводкой по отделам
+GET    /api/employees/stats                        сколько людей, отделов, номеров в звонках
+GET    /api/employees/{id}                         одна карточка
+POST   /api/employees                              завести (источник «ручной»)
+PUT    /api/employees/{id}                         изменить
+DELETE /api/employees/{id}                         удалить (администратор)
+POST   /api/employees/import                       импорт по адресу или файлом
+POST   /api/employees/link                         сверить номера со звонками
+```
+
+Импорт принимает `{"url": "…"}` либо многочастный запрос с полем `file`. Форматы: Excel XML 2003 (SpreadsheetML), CSV (разделитель и кодировка определяются сами), JSON. Без `url` берётся адрес из настройки `employees_url`. В ответе — `added`, `updated`, `unchanged`, `deactivated`, `received` и список замечаний по строкам.
+
+## Очередь к языковой модели
+
+```
+GET    /api/llm/queue?state=&hours=24&limit=50     всё для раздела одним ответом
+POST   /api/llm/queue/pause                        {"paused": true|false}
+POST   /api/llm/queue/add                          отбор pending, failed, period или job_ids
+POST   /api/llm/queue/{job_id}/top                 разобрать следующей
+DELETE /api/llm/queue/{job_id}                     убрать из очереди (только ждущую)
+POST   /api/llm/queue/clear                        очистить, кроме идущего
+```
+
+`GET /api/llm/queue` отдаёт состояние потока, текущий запрос с именем файла, счётчики по состояниям, сводку за окно, ряд для графика, саму очередь и значения настроек. Раздел опрашивается раз в пару секунд, и пять запросов вместо одного стоили бы впятеро дороже ради одной картинки.
+
+`POST /api/llm/queue/add` принимает `{"scope": "pending"}` (всё без разбора), `{"scope": "failed"}` (повторить упавшие), `{"scope": "period", "since": …, "until": …}` или явный `{"job_ids": [...]}` — так работает кнопка «Разобрать моделью» в разделе «Результаты».
+
+## Модель из сети
+
+```
+POST /api/llm/v1/chat/completions                  формат OpenAI, поддерживает stream
+GET  /api/llm/v1/models                            список моделей
+POST /api/llm/v1/embeddings                        если сервер модели умеет
+```
+
+Включается параметром `llm_network_enabled`; пока он выключен, маршруты отвечают отказом с объяснением. Ключ принимается и заголовком `X-API-Key`, и `Authorization: Bearer …` — как его шлют клиенты OpenAI. Запрос из сети занимает тот же единственный слот, что и внутренний разбор.
+
+## Автодиагностика
+
+```
+GET /api/system/selfcheck?deep=0|1                 свод по четырнадцати частям системы
+GET /api/system/problems?since=&limit=             журнал проблем и неисправностей
+```
+
+`deep=1` добавляет дорогие проверки: целостность базы, разбор станций, пробу сервера модели, обход каталогов. Неадминистратору пути и адреса не показываются.
+
+## Повторное распознавание
+
+```
+POST /api/jobs/rescan                              по списку или по отбору
+```
+
+Тело: `{"ids": [...]}` либо `{"filter": {"status": [...], "since": …, "until": …, "model": "…", "search": "…"}}`, плюс `overrides` — параметры, которые заменят прежние (`model`, `engine`, `language`, `beam_size` и другие из каталога), и `priority`. Отбор считается на сервере: «перераспознать всё за квартал» — это десятки тысяч заданий, и присылать их списком значит гонять мегабайт идентификаторов ради одной кнопки.
 
 ## Резервные копии
 

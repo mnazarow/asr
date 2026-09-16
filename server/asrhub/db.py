@@ -1558,6 +1558,17 @@ class Database:
         "llm_unresolved": "jobs.id IN (SELECT job_id FROM llm_results WHERE resolved = 0)",
         "llm_actions": ("jobs.id IN (SELECT job_id FROM llm_results "
                         "WHERE actions IS NOT NULL AND actions <> '[]')"),
+        # Записи, до которых модель ещё не дошла, и записи со сбоем разбора.
+        # Без этих двух отборов «разобрать всё, что не разобрано» в разделе
+        # «Результаты» приходилось делать глазами: список показывает сто
+        # строк, а в архиве их сорок тысяч.
+        "llm_missing": ("jobs.status = 'completed' AND COALESCE(jobs.text,'') <> '' "
+                        "AND jobs.id NOT IN (SELECT job_id FROM llm_results "
+                        "WHERE COALESCE(error,'') = '')"),
+        "llm_failed": ("jobs.id IN (SELECT job_id FROM llm_results "
+                       "WHERE COALESCE(error,'') <> '')"),
+        "llm_done": ("jobs.id IN (SELECT job_id FROM llm_results "
+                     "WHERE COALESCE(error,'') = '')"),
     }
 
     #: Приставка отбора по категории обращения: `category:payment`. Имя

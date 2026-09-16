@@ -339,7 +339,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `limit` | в адресе | integer | `50` | — |
 | `offset` | в адресе | integer | `0` | — |
 | `order` | в адресе | string | `created_at DESC` | — |
-| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent), по здоровью распознавания (suspect, hallucination, speakers_mismatch), по звуку на входе (bad_audio, noisy, clipped) или по ответу языковой модели (llm_unresolved, llm_actions, outcome:<исход>, reason:<причина>) |
+| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent), по здоровью распознавания (suspect, hallucination, speakers_mismatch), по звуку на входе (bad_audio, noisy, clipped) или по ответу языковой модели (llm_unresolved, llm_actions, llm_missing, llm_failed, llm_done, outcome:<исход>, reason:<причина>) |
 | `light` | в адресе | boolean | `False` | Только поля для таблицы, без текста и сегментов |
 
 **Пример**
@@ -814,7 +814,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:30819",
+  "instance": "vm:20643",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1392,7 +1392,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789560569.2562673,
+    "generated_at": 1789562191.9698257,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1560,7 +1560,7 @@ curl http://сервер:8080/api/health
 {
   "status": "ok",
   "version": "3.1.0",
-  "uptime_s": 115.6,
+  "uptime_s": 31.1,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1604,8 +1604,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 21,
-    "WARNING": 2
+    "INFO": 2
   }
 }
 ```
@@ -1640,7 +1639,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 ```json
 {
   "version": "3.1.0",
-  "uptime_s": 115.7,
+  "uptime_s": 31.1,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v33",
@@ -1649,8 +1648,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
-    "disk_free_gb": 16.9,
+    "ram_available_gb": 6.7,
+    "disk_free_gb": 17.3,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1661,7 +1660,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 16.9 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 17.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -2510,9 +2509,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "total_gb": 7.8,
-    "free_gb": 7.0,
+    "free_gb": 6.7,
     "reserve_gb": 4.0,
-    "budget_gb": 2.9,
+    "budget_gb": 2.7,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [

@@ -2378,6 +2378,10 @@ const Bulk = {
   async run(action) {
     const ids = [...this.ids];
     if (!ids.length) return;
+    // Разбор моделью — не действие над заданием, а постановка в другую
+    // очередь: у неё своя ручка, свои важности и свой раздел. Поэтому он
+    // здесь же, но идёт мимо /api/jobs/bulk.
+    if (action === 'llm') return this.llm(ids);
     const тело = { action, ids };
     if (action === 'tag') {
       const метка = prompt(
@@ -2410,6 +2414,25 @@ const Bulk = {
       await refreshQueue();
     } catch (err) { fail(err); }
   },
+
+  /** Ставит выбранные записи в очередь смыслового разбора. */
+  async llm(ids) {
+    try {
+      const ответ = await API.post('/api/llm/queue/add',
+        { job_ids: ids, kind: 'из результатов' });
+      const сколько = Number(ответ.queued || 0);
+      toast(сколько
+        ? `В очередь разбора: ${сколько} ${plural(сколько, 'запись', 'записи', 'записей')}`
+        : 'Все выбранные записи уже разобраны или уже стоят в очереди',
+        сколько ? 'ok' : 'warn',
+        сколько ? 'Ход разбора виден в разделе «Очередь LLM»' : '');
+      this.ids.clear();
+      this.sync();
+      if (this.reload) this.reload();
+    } catch (err) {
+      fail(err);
+    }
+  },
 };
 
 // ==========================================================================
@@ -2430,6 +2453,9 @@ RENDERERS.results = {
           <select id="r-content" style="max-width:280px"
             title="Отбор по содержанию разговора — считается разбором записей">
             <option value="">любое содержание</option>
+            <option value="llm_missing">не разобраны моделью</option>
+            <option value="llm_failed">разбор моделью сорвался</option>
+            <option value="llm_done">разобраны моделью</option>
             <option value="negative">отрицательные</option>
             <option value="positive">положительные</option>
             <option value="downturn">кончились хуже, чем начались</option>
@@ -2471,6 +2497,9 @@ RENDERERS.results = {
         </div>
         <div class="bulk-bar" id="r-bulk" hidden>
           <span class="count" id="r-bulk-count"></span>
+          <button class="btn sm" data-bulk="llm"
+            title="Поставить выбранные записи в очередь смыслового разбора языковой моделью">
+            Разобрать моделью</button>
           <button class="btn sm" data-bulk="retry">Повторить</button>
           <button class="btn sm" data-bulk="tag">Пометить</button>
           <button class="btn sm danger" data-bulk="delete">Удалить</button>

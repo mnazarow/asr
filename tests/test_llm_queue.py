@@ -420,3 +420,57 @@ def test_отборы_проверяются_при_включённом_сло�
     assert "pending" in чепуха.text
 
     client.put("/api/settings", json={"llm_backend": "off"})
+
+
+# ---------------------------------------------------------------------------
+# Разбор моделью из раздела «Результаты»
+# ---------------------------------------------------------------------------
+
+def test_отбор_показывает_что_модель_ещё_не_смотрела(tmp_path):
+    """«Разобрать всё неразобранное» нужно уметь отобрать, а не выбрать глазами.
+
+    Список в разделе показывает сто строк, а в архиве их сорок тысяч.
+    Отбор считается в базе: записи без ответа модели, записи со сбоем
+    разбора и записи с готовым ответом — три разных вопроса.
+    """
+    db = база(tmp_path, записей=3)
+    db.llm_save("job0", 1, model="m", summary="разобрано")
+    db.llm_save("job1", 1, model="m", error="сервер лёг")
+
+    не_разобрано = {з["id"] for з in db.list_jobs(content="llm_missing", limit=10, light=True)}
+    сорвалось = {з["id"] for з in db.list_jobs(content="llm_failed", limit=10, light=True)}
+    разобрано = {з["id"] for з in db.list_jobs(content="llm_done", limit=10, light=True)}
+
+    assert не_разобрано == {"job1", "job2"}, "запись со сбоем тоже ждёт разбора"
+    assert сорвалось == {"job1"}
+    assert разобрано == {"job0"}
+    db.close()
+
+
+def test_маршрут_принимает_отбор_по_разбору_моделью(client):
+    """Отбор проверяется ручкой до запроса: неизвестный не должен молча
+    превращаться в «показать всё»."""
+    ответ = client.get("/api/jobs?content=llm_missing&limit=5&light=true")
+    assert ответ.status_code == 200, ответ.text
+    плохой = client.get("/api/jobs?content=llm_чепуха&limit=5")
+    assert плохой.status_code == 400
+    assert "llm_missing" in плохой.text
+
+
+def test_записи_из_результатов_встают_в_очередь_разбора(client, sample_wav):
+    """Кнопка «Разобрать моделью» в разделе «Результаты» — это постановка в
+    очередь смыслового разбора, а не действие над заданием."""
+    client.put("/api/settings", json={"llm_backend": "stub", "llm_model": "test"})
+    with sample_wav.open("rb") as файл:
+        задание = client.post("/api/jobs", files={"file": ("тест.wav", файл, "audio/wav")})
+    assert задание.status_code == 200, задание.text
+    job_id = задание.json()["id"]
+
+    ответ = client.post("/api/llm/queue/add",
+                        json={"job_ids": [job_id], "kind": "из результатов"})
+
+    assert ответ.status_code == 200, ответ.text
+    assert ответ.json()["queued"] == 1
+    строки = client.get("/api/llm/queue").json()["queue"]["items"]
+    assert any(с["job_id"] == job_id and с["kind"] == "из результатов" for с in строки)
+    client.put("/api/settings", json={"llm_backend": "off"})

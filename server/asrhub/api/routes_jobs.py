@@ -728,7 +728,8 @@ def list_jobs(
                     "profanity_agent), по здоровью распознавания (suspect, "
                     "hallucination, speakers_mismatch), по звуку на входе "
                     "(bad_audio, noisy, clipped) или по ответу языковой модели "
-                    "(llm_unresolved, llm_actions, outcome:<исход>, reason:<причина>)"),
+                    "(llm_unresolved, llm_actions, llm_missing, llm_failed, "
+                    "llm_done, outcome:<исход>, reason:<причина>)"),
     light: bool = Query(default=False,
                         description="Только поля для таблицы, без текста и сегментов"),
     principal: Principal = Depends(authenticate),
