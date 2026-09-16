@@ -814,7 +814,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:15071",
+  "instance": "vm:19114",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1392,7 +1392,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789585294.7341447,
+    "generated_at": 1789587847.6762304,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1559,8 +1559,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.4",
-  "uptime_s": 114.9,
+  "version": "3.1.5",
+  "uptime_s": 107.2,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1638,8 +1638,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.4",
-  "uptime_s": 115.0,
+  "version": "3.1.5",
+  "uptime_s": 107.3,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v33",
@@ -1648,7 +1648,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
+    "ram_available_gb": 7.0,
     "disk_free_gb": 17.2,
     "gpus": [],
     "accelerator": "cpu",
@@ -2509,9 +2509,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "total_gb": 7.8,
-    "free_gb": 7.1,
+    "free_gb": 7.0,
     "reserve_gb": 4.0,
-    "budget_gb": 3.0,
+    "budget_gb": 2.9,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [

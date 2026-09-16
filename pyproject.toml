@@ -1,6 +1,6 @@
 [project]
 name = "asrhub"
-version = "3.1.4"
+version = "3.1.5"
 description = "Сервер распознавания речи на свободных моделях: GigaAM, Whisper и другие"
 readme = "README.md"
 requires-python = ">=3.10"
