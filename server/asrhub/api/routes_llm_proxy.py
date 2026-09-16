@@ -1,0 +1,1036 @@
+"""Доступ к языковой модели из сети: OpenAI-совместимый шлюз ASR Hub.
+
+Задача поставлена так: «дать доступ к модели из сети». Прямой путь —
+разрешить Ollama слушать 0.0.0.0 — отпадает сразу: Ollama не спрашивает
+ключа вообще, и открытый порт означает, что любой в сети может и болтать с
+моделью, и скачать чужие веса, и выгрузить их с диска. Поэтому наружу
+смотрит только ASR Hub, а сервер модели остаётся на 127.0.0.1.
+
+Здесь — три маршрута под ``/api/llm/v1`` ровно того вида, который умеет
+любой клиент OpenAI (библиотеки openai для Python и JS, плагины редакторов,
+чаты, n8n): ``/chat/completions`` (в том числе ``stream: true``),
+``/models`` и ``/embeddings``. Сторонняя программа настраивается на
+``http://asr-hub:8081/api/llm/v1`` с обычным ключом доступа ASR Hub — и
+работает с той же моделью, что разбирает записи.
+
+Что этот слой добавляет поверх голого проброса и зачем:
+
+* **выключен по умолчанию** — параметр ``llm_network_enabled``. Пока он
+  выключен, маршруты отвечают 403 с объяснением. Открыть модель наружу
+  должно быть осознанным действием, а не побочным эффектом обновления:
+  сервер, у которого смысловой слой уже настроен, после установки новой
+  версии иначе начал бы раздавать модель всей сети молча;
+* **ключ доступа** — тот же, что у остальных маршрутов, с проверкой прав
+  на запись. Клиенты OpenAI шлют ключ заголовком ``Authorization: Bearer``,
+  и это уже поддержано общим разбором в ``deps.token_from``;
+* **общий ограничитель одновременности** с внутренним разбором — см.
+  ``_взять_слот``. Сеть не должна отбирать видеокарту у разбора записей;
+* **учёт** — каждый проброшенный запрос попадает в те же счётчики, что и
+  обычные вызовы модели (их показывает ``GET /api/llm/status``), плюс
+  токены; в журнал событий пишется не каждый запрос, а каждый N-й и сбои;
+* **пределы** — тайм-аут из ``llm_timeout_s`` и предел размера тела: без
+  него один запрос с мегабайтами текста занимал бы память сервера
+  распознавания до тайм-аута модели.
+
+Второго клиента модели здесь нет: и настройки, и разбор ошибок сети, и
+отправка запроса берутся у ``LLMClient``. Собственного кода ровно столько,
+сколько нужно на перевод форматов и на поток — ``LLMClient.chat``
+возвращает готовую строку и потока не умеет по своему назначению.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import http.client
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from collections.abc import Iterator
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+from ..errors import ASRHubError, ConfigError, FileTooLarge, ForbiddenError
+from ..llm import LLMError
+from ..logging_setup import get_logger
+from .deps import Principal, authenticate, get_state, require_write
+
+log = get_logger("api.llm_proxy")
+
+router = APIRouter(prefix="/api/llm/v1", tags=["Языковая модель"])
+
+#: Предел тела запроса к шлюзу. Разговор на сорок тысяч знаков — это
+#: примерно сотня килобайт; четыре мегабайта оставляют запас на длинную
+#: переписку с историей и на разбор в векторы пачкой, но не дают одним
+#: запросом занять память сервера распознавания. Проверяется дважды: по
+#: заголовку Content-Length (до чтения) и по факту (заголовка может не
+#: быть — тело приходит кусками).
+ПРЕДЕЛ_ТЕЛА = 4 * 1024 * 1024
+
+#: Каждый N-й проброшенный запрос пишется в журнал событий. На каждый
+#: писать нельзя: чат на десяток сотрудников — это тысячи запросов в день,
+#: и раздел «Журнал» перестал бы показывать что-либо, кроме них.
+СОБЫТИЕ_КАЖДЫЕ = 50
+
+#: Сбой пишется сразу, но не чаще одного события за это время. Упавший
+#: сервер модели и клиент с повтором в цикле иначе дают сотню одинаковых
+#: строк в минуту — то же засорение, только хуже: именно в этот момент в
+#: журнал и приходят смотреть.
+ПАУЗА_ОШИБОК = 60.0
+
+#: Сколько векторов отдаём за один запрос к /embeddings. Предел нужен по
+#: той же причине, что и предел тела: пачка на тысячу строк — это минуты
+#: работы видеокарты в одном HTTP-запросе, и всё это время разбор записей
+#: стоит.
+ПРЕДЕЛ_ВЕКТОРОВ = 128
+
+
+# ---------------------------------------------------------------------------
+# Ошибки шлюза
+# ---------------------------------------------------------------------------
+
+class ШлюзВыключен(ForbiddenError):
+    """Доступ к модели из сети не включён."""
+
+    code = "llm_network_disabled"
+
+
+class ШлюзЗанят(ASRHubError):
+    """Свободного слота к модели не дождались."""
+
+    code = "llm_busy"
+    http_status = 503
+    retryable = True
+
+
+class ШлюзНеОтветил(ASRHubError):
+    """Сервер модели не ответил шлюзу."""
+
+    code = "llm_upstream_error"
+    http_status = 502
+    retryable = True
+
+
+class НетВозможности(ASRHubError):
+    """Сервер модели этого не умеет."""
+
+    code = "not_supported"
+    http_status = 501
+
+
+def _отказ(exc: ASRHubError) -> HTTPException:
+    """Ошибка в привычном для ASR Hub виде и заодно в виде OpenAI.
+
+    Обработчик ошибок приложения кладёт `code`, `message` и `hint` на
+    верхний уровень ответа, и все наши клиенты читают именно их. Но сюда
+    ходят чужие клиенты — библиотека openai показывает пользователю
+    `error.message` и больше ничего. Без этого поля человек в стороннем
+    чате видел бы «Error code: 403» без единого слова о том, что случилось
+    и что делать. Поэтому в теле есть оба вида: лишний ключ никому не
+    мешает, а отсутствующий стоит человеку получаса догадок.
+    """
+    тело = exc.to_dict()
+    тело["error"] = {"message": exc.message, "type": exc.code,
+                     "code": exc.code, "hint": exc.hint, "param": None}
+    return HTTPException(status_code=exc.http_status, detail=тело)
+
+
+# ---------------------------------------------------------------------------
+# Учёт
+# ---------------------------------------------------------------------------
+
+class _Учёт:
+    """Счётчики шлюза: запросы, сбои, токены, время и отметки журнала.
+
+    Живут рядом с приложением (``app.state``), а не в модуле: в наборе
+    тестов приложений несколько, и общий на модуль счётчик протекал бы из
+    одной проверки в другую, превращая «после трёх запросов» в «после
+    скольких-то».
+    """
+
+    __slots__ = ("_lock", "requests", "errors", "tokens_in", "tokens_out",
+                 "total_ms", "_с_события", "_ошибка_в")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.errors = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.total_ms = 0.0
+        self._с_события = 0
+        self._ошибка_в = 0.0
+
+    def добавить(self, мс: float, usage: dict[str, Any] | None,
+                 ошибка: BaseException | None) -> dict[str, Any] | None:
+        """Считает запрос и говорит, пора ли писать событие в базу."""
+        with self._lock:
+            self.requests += 1
+            self.total_ms += max(0.0, мс)
+            if ошибка is not None:
+                self.errors += 1
+            if usage:
+                self.tokens_in += int(usage.get("prompt_tokens") or 0)
+                self.tokens_out += int(usage.get("completion_tokens") or 0)
+            self._с_события += 1
+            пора = self._с_события >= СОБЫТИЕ_КАЖДЫЕ
+            if ошибка is not None and time.time() - self._ошибка_в >= ПАУЗА_ОШИБОК:
+                пора = True
+                self._ошибка_в = time.time()
+            if not пора:
+                return None
+            self._с_события = 0
+            return {"requests": self.requests, "errors": self.errors,
+                    "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
+                    "avg_ms": round(self.total_ms / self.requests, 1) if self.requests else None}
+
+    def свод(self) -> dict[str, Any]:
+        with self._lock:
+            return {"requests": self.requests, "errors": self.errors,
+                    "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
+                    "avg_ms": round(self.total_ms / self.requests, 1) if self.requests else None}
+
+
+_ЗАМОК_УЧЁТА = threading.Lock()
+
+
+def _учёт(request: Request) -> _Учёт:
+    счёт = getattr(request.app.state, "llm_proxy", None)
+    if счёт is not None:
+        return счёт
+    with _ЗАМОК_УЧЁТА:
+        счёт = getattr(request.app.state, "llm_proxy", None)
+        if счёт is None:
+            счёт = _Учёт()
+            request.app.state.llm_proxy = счёт
+    return счёт
+
+
+def _записать(state: Any, клиент: Any, счёт: _Учёт, мс: float, *,
+              usage: dict[str, Any] | None = None,
+              ошибка: BaseException | None = None) -> None:
+    """Учёт проброшенного запроса — в те же счётчики, что у разбора записей.
+
+    Отдельные счётчики для сети завести было бы проще, но тогда «Состояние
+    языковой модели» показывало бы неправду: вызовов десять, а видеокарта
+    занята весь день. Один сервер модели — один учёт, и средняя задержка в
+    состоянии слоя обязана включать чужие запросы: именно они объясняют,
+    почему разбор записей вдруг стал ждать.
+
+    Поля клиента трогаем под его же замком: их читает `status()` из другого
+    потока, а `calls += 1` без замка теряет запросы на любом потоке, кроме
+    первого.
+    """
+    with клиент._lock:                                        # noqa: SLF001
+        клиент.calls += 1
+        клиент.last_call_at = time.time()
+        if ошибка is not None:
+            клиент.errors += 1
+            клиент.last_error = str(ошибка)
+        else:
+            # Время сбойного вызова в среднюю не идёт — так же, как в
+            # `LLMClient.chat`: иначе тайм-аут в полторы минуты навсегда
+            # портит среднюю задержку слоя.
+            клиент.total_ms += max(0.0, мс)
+            клиент.last_ms = round(мс, 1)
+            клиент.last_error = None
+    событие = счёт.добавить(мс, usage, ошибка)
+    if событие is None:
+        return
+    сообщение = (f"Шлюз модели: сбой — {ошибка}" if ошибка is not None
+                 else f"Шлюз модели: запросов {событие['requests']}, "
+                      f"токенов {событие['tokens_in'] + событие['tokens_out']}")
+    try:
+        state.db.add_event(None, "llm_proxy", сообщение[:500], data=событие)
+    except Exception as exc:                                  # noqa: BLE001
+        # Журнал — не причина ронять ответ клиенту: модель уже ответила.
+        log.debug("Событие шлюза модели не записано: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Общий слот к видеокарте
+# ---------------------------------------------------------------------------
+
+def _взять_слот(клиент: Any, ждать: float) -> threading.BoundedSemaphore:
+    """Занимает ТОТ ЖЕ слот одновременности, что и внутренний разбор.
+
+    Это главное решение всего файла, поэтому объясню целиком.
+
+    `LLMClient` держит семафор на `llm_max_concurrent` (по умолчанию —
+    один) и берёт его на каждый вызов модели. Смысл настройки не в
+    вежливости, а в памяти: модель и распознавание живут на одной
+    видеокарте, и второй одновременный вызов не ускоряет ответ, а делит
+    память — в худшем случае до отказа «не хватило памяти» у обоих.
+
+    Если бы шлюз завёл свой семафор на ту же единицу, предел стал бы
+    двойкой: один разбор записи и один запрос из сети идут разом, и
+    настройка «одновременных вызовов: 1» перестала бы значить то, что
+    написано в её описании. Поэтому мы берём не такой же семафор, а
+    буквально тот же объект — через `LLMClient._семафор()`, который
+    вдобавок пересобирает его при смене настройки на живом сервере.
+
+    Отсюда и обращение к «внутреннему» методу клиента: любой другой способ
+    честным не будет. Дублировать семафор нельзя по написанному выше,
+    а публичного «дай слот» у клиента нет, потому что до сих пор он был
+    нужен только ему самому.
+
+    Ждать вечно тоже нельзя: очередь разбора архива занимает слот часами, а
+    на том конце сидит чужая программа со своим тайм-аутом. Ждём столько,
+    сколько отведено на один вызов модели (`llm_timeout_s`), и отвечаем
+    503 с понятным текстом — клиент OpenAI такой ответ повторяет сам.
+    """
+    семафор = клиент._семафор()                               # noqa: SLF001
+    if not семафор.acquire(timeout=max(0.5, float(ждать))):
+        raise ШлюзЗанят(
+            f"Модель занята: свободного слота не дождались за {ждать:g} с.",
+            hint="Сейчас идёт разбор записей или другой запрос из сети. "
+                 "Повторите позже или поднимите llm_max_concurrent, если "
+                 "сервер модели держит несколько запросов разом (vLLM).")
+    return семафор
+
+
+@contextlib.contextmanager
+def _слот(клиент: Any) -> Iterator[None]:
+    """Слот на время одного обычного (не потокового) запроса."""
+    семафор = _взять_слот(клиент, клиент.timeout)
+    try:
+        yield
+    finally:
+        # Освобождаем именно тот объект, который заняли. При смене
+        # `llm_max_concurrent` клиент заводит новый семафор, и `release()`
+        # на новом уронил бы `ValueError` из BoundedSemaphore, а заодно
+        # раздал бы лишний слот.
+        семафор.release()
+
+
+# ---------------------------------------------------------------------------
+# Вход: проверки доступа и разбор тела
+# ---------------------------------------------------------------------------
+
+def _шлюз(request: Request, principal: Principal) -> tuple[Any, Any, _Учёт]:
+    """Общая проверка для всех маршрутов шлюза: права, выключатель, модель."""
+    state = get_state(request)
+    require_write(principal)
+    if not bool(state.settings.get("llm_network_enabled", False)):
+        raise _отказ(ШлюзВыключен(
+            "Доступ к языковой модели из сети выключен.",
+            hint="Включите параметр llm_network_enabled в настройках сервера "
+                 "(раздел «Языковая модель»). Выключен по умолчанию: отдавать "
+                 "модель в сеть — осознанное действие."))
+    клиент = getattr(state, "llm", None)
+    if клиент is None:
+        raise _отказ(ASRHubError(
+            "Смысловой слой не инициализирован.",
+            hint="Сервер запущен в урезанном режиме; перезапустите его обычным способом."))
+    if not клиент.enabled:
+        raise _отказ(ConfigError(
+            "Языковая модель выключена (llm_backend = off).",
+            hint="Задайте llm_backend, llm_url и llm_model в настройках сервера."))
+    return state, клиент, _учёт(request)
+
+
+async def _тело_запроса(request: Request) -> dict[str, Any]:
+    """Тело запроса как объект JSON, с пределом размера.
+
+    Читаем потоком и считаем байты сами: `await request.json()` сначала
+    соберёт в память всё, что прислали, и только потом мы узнаем, что
+    прислали двести мегабайт.
+    """
+    объявлено = request.headers.get("content-length") or ""
+    if объявлено.isdigit() and int(объявлено) > ПРЕДЕЛ_ТЕЛА:
+        raise _отказ(FileTooLarge(int(объявлено) / 1024 / 1024,
+                                 ПРЕДЕЛ_ТЕЛА // (1024 * 1024)))
+    куски: list[bytes] = []
+    всего = 0
+    async for кусок in request.stream():
+        всего += len(кусок)
+        if всего > ПРЕДЕЛ_ТЕЛА:
+            raise _отказ(FileTooLarge(всего / 1024 / 1024, ПРЕДЕЛ_ТЕЛА // (1024 * 1024)))
+        куски.append(кусок)
+    сырое = b"".join(куски)
+    if not сырое.strip():
+        raise _отказ(ConfigError(
+            "Пустое тело запроса.",
+            hint='Ожидается объект JSON, например {"model":"…","messages":[…]}.'))
+    try:
+        данные = json.loads(сырое.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _отказ(ConfigError(
+            f"Тело запроса — не JSON: {exc}",
+            hint="Проверьте заголовок Content-Type: application/json и сам текст запроса.")) from exc
+    if not isinstance(данные, dict):
+        raise _отказ(ConfigError("Тело запроса должно быть объектом JSON."))
+    return данные
+
+
+def _текст_сообщения(содержимое: Any) -> str:
+    """Текст реплики. OpenAI разрешает и строку, и список частей.
+
+    Части бывают не только текстовые (картинки), и они здесь теряются: у
+    Ollama и заглушки для них нет места. Молча терять нельзя только смысл,
+    а не формат, поэтому текстовые части склеиваются, а остальные
+    пропускаются — запрос доходит, а не отвергается целиком.
+    """
+    if isinstance(содержимое, list):
+        return "".join(str(ч.get("text") or "") for ч in содержимое if isinstance(ч, dict))
+    if содержимое is None:
+        return ""
+    return str(содержимое)
+
+
+def _разобрать_чат(данные: dict[str, Any], клиент: Any) -> dict[str, Any]:
+    """Проверяет запрос в формате OpenAI и приводит реплики к тексту."""
+    сообщения = данные.get("messages")
+    if not isinstance(сообщения, list) or not сообщения:
+        raise _отказ(ConfigError(
+            "В запросе нет поля messages со списком реплик.",
+            hint='Формат OpenAI: {"model":"…","messages":[{"role":"user","content":"…"}]}'))
+    разобранные: list[dict[str, str]] = []
+    for номер, реплика in enumerate(сообщения, 1):
+        if not isinstance(реплика, dict):
+            raise _отказ(ConfigError(
+                f"Реплика №{номер} — не объект JSON.",
+                hint='Каждая реплика: {"role":"system|user|assistant","content":"текст"}'))
+        разобранные.append({"role": str(реплика.get("role") or "user"),
+                            "content": _текст_сообщения(реплика.get("content"))})
+    if not any(р["content"].strip() for р in разобранные):
+        raise _отказ(ConfigError(
+            "Все реплики пусты — модели нечего отвечать.",
+            hint="Проверьте поле content: оно передаётся строкой или списком частей с text."))
+    return {
+        "model": str(данные.get("model") or "").strip() or клиент.model,
+        "messages": разобранные,
+        "stream": bool(данные.get("stream")),
+        # Исходный запрос нужен OpenAI-совместимому серверу целиком:
+        # инструменты, response_format, seed и прочее мы не понимаем, но и
+        # выбрасывать не вправе — их прислали не нам, а модели.
+        "сырое": данные,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Перевод форматов
+# ---------------------------------------------------------------------------
+
+def _идентификатор() -> str:
+    """Идентификатор ответа в стиле OpenAI: клиенты его показывают и логируют."""
+    return f"chatcmpl-{uuid.uuid4().hex}"
+
+
+def _подсказки(сообщения: list[dict[str, str]]) -> tuple[str, str]:
+    """Системная часть и всё остальное — для Ollama и заглушки."""
+    system = "\n".join(м["content"] for м in сообщения if м["role"] == "system")
+    прочее = "\n".join(f"{м['role']}: {м['content']}" if м["role"] != "user" else м["content"]
+                       for м in сообщения if м["role"] != "system")
+    return system, прочее
+
+
+def _тело_ollama(запрос: dict[str, Any], поток: bool) -> dict[str, Any]:
+    """Запрос в том виде, в каком его ждёт /api/chat Ollama."""
+    сырое = запрос["сырое"]
+    options: dict[str, Any] = {}
+    if сырое.get("temperature") is not None:
+        options["temperature"] = float(сырое["temperature"])
+    if сырое.get("top_p") is not None:
+        options["top_p"] = float(сырое["top_p"])
+    if сырое.get("max_tokens") is not None:
+        # У Ollama предел ответа называется num_predict. Без перевода
+        # max_tokens просто пропадал бы, и клиент, который просил короткий
+        # ответ, получал бы полотно — молча.
+        options["num_predict"] = int(сырое["max_tokens"])
+    if сырое.get("stop") is not None:
+        стоп = сырое["stop"]
+        options["stop"] = [str(с) for с in стоп] if isinstance(стоп, list) else [str(стоп)]
+    if сырое.get("seed") is not None:
+        options["seed"] = int(сырое["seed"])
+    тело: dict[str, Any] = {
+        "model": запрос["model"],
+        "messages": запрос["messages"],
+        "stream": bool(поток),
+        # Тот же keep_alive, что у внутреннего разбора: иначе запрос из
+        # сети выгружал бы веса из памяти сразу после ответа, и следующий
+        # разбор записи снова поднимал бы модель с диска.
+        "keep_alive": _KEEP_ALIVE,
+    }
+    if options:
+        тело["options"] = options
+    # Формат ответа не навязываем: внутренний разбор просит JSON, потому
+    # что сам его и читает, а чужому клиенту нужен обычный текст. Но если
+    # клиент попросил JSON сам — просьбу передаём: у Ollama это не поле
+    # response_format, а format, и без перевода она бы потерялась.
+    формат = сырое.get("response_format")
+    if isinstance(формат, dict) and str(формат.get("type") or "") == "json_object":
+        тело["format"] = "json"
+    return тело
+
+
+def _тело_openai(запрос: dict[str, Any], поток: bool) -> dict[str, Any]:
+    """Запрос для OpenAI-совместимого сервера — почти как пришёл.
+
+    Всё, чего мы не понимаем (tools, response_format, logit_bias), едет
+    дальше как есть: понимает его сервер модели, а не мы. Подменяем только
+    модель (если её не назвали) и признак потока.
+    """
+    тело = {к: з for к, з in запрос["сырое"].items()
+            if к not in ("model", "stream", "messages")}
+    тело["model"] = запрос["model"]
+    # Реплики — исходные, а не приведённые к тексту: в них могут быть
+    # картинки и вызовы инструментов, и совместимый сервер их поймёт.
+    тело["messages"] = запрос["сырое"].get("messages")
+    тело["stream"] = bool(поток)
+    return тело
+
+
+def _ответ_openai(текст: str, запрос: dict[str, Any], usage: dict[str, Any] | None,
+                  finish: str = "stop") -> dict[str, Any]:
+    """Обычный (не потоковый) ответ в формате OpenAI."""
+    свод = usage or {}
+    вход = int(свод.get("prompt_tokens") or 0)
+    выход = int(свод.get("completion_tokens") or 0)
+    return {
+        "id": _идентификатор(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": запрос["model"],
+        "choices": [{"index": 0, "finish_reason": finish,
+                     "message": {"role": "assistant", "content": текст}}],
+        "usage": {"prompt_tokens": вход, "completion_tokens": выход,
+                  "total_tokens": вход + выход},
+    }
+
+
+def _usage_ollama(данные: dict[str, Any]) -> dict[str, Any]:
+    """Счётчики токенов Ollama под именами OpenAI."""
+    вход = int(данные.get("prompt_eval_count") or 0)
+    выход = int(данные.get("eval_count") or 0)
+    return {"prompt_tokens": вход, "completion_tokens": выход,
+            "total_tokens": вход + выход}
+
+
+def _строка_чанка(ид: str, создано: int, модель: str, delta: dict[str, Any],
+                  finish: str | None, **лишнее: Any) -> str:
+    """Один кусок потока в формате OpenAI, готовый к отправке (SSE)."""
+    чанк: dict[str, Any] = {
+        "id": ид, "object": "chat.completion.chunk", "created": создано,
+        "model": модель,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+    чанк.update(лишнее)
+    return f"data: {json.dumps(чанк, ensure_ascii=False)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Сеть: то же, что у клиента, но с возможностью читать ответ кусками
+# ---------------------------------------------------------------------------
+
+#: Столько же держим модель в памяти, сколько и внутренний разбор.
+_KEEP_ALIVE = "30m"
+
+
+def _заголовки(клиент: Any, поток: bool) -> dict[str, str]:
+    """Заголовки к серверу модели — те же, что собирает LLMClient._http."""
+    заголовки = {"Content-Type": "application/json; charset=utf-8",
+                 "Accept": "text/event-stream" if поток else "application/json",
+                 "User-Agent": "ASR Hub"}
+    ключ = str(клиент.settings.get("llm_api_key") or "")
+    if ключ:
+        заголовки["Authorization"] = f"Bearer {ключ}"
+    return заголовки
+
+
+def _как_ошибка(exc: BaseException, клиент: Any, timeout: float) -> LLMError:
+    """Сбой сети — понятным текстом. Разбор тот же, что в LLMClient._http.
+
+    Повторён здесь, а не вызван оттуда, по одной причине: `_http` читает
+    ответ целиком и разбирает его как JSON, а потоку нужен незакрытый
+    сокет. Тексты ошибок совпадают намеренно — человек не должен по
+    формулировке гадать, каким путём сервер ходил к модели.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        кусок = ""
+        try:
+            кусок = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:                                     # noqa: BLE001
+            pass
+        return LLMError(f"Сервер модели ответил {exc.code}: {кусок or exc.reason}")
+    if isinstance(exc, urllib.error.URLError):
+        причина = getattr(exc, "reason", exc)
+        if isinstance(причина, TimeoutError) or "timed out" in str(причина):
+            return LLMError(f"Сервер модели не ответил за {timeout:g} с.")
+        return LLMError(f"Сервер модели недоступен по адресу {клиент.url}: {причина}")
+    if isinstance(exc, TimeoutError):
+        return LLMError(f"Сервер модели не ответил за {timeout:g} с.")
+    if isinstance(exc, http.client.HTTPException):
+        return LLMError(f"Ответ сервера модели оборвался: {type(exc).__name__}")
+    if isinstance(exc, OSError):
+        return LLMError(f"Сервер модели недоступен: {exc}")
+    return LLMError(f"Сбой обращения к серверу модели: {type(exc).__name__}: {exc}")
+
+
+def _открыть_поток(клиент: Any, url: str, тело: dict[str, Any]) -> Any:
+    """Открывает соединение и отдаёт незакрытый ответ для чтения строками.
+
+    Соединение открывается ДО того, как отдан HTTP-ответ клиенту: иначе
+    лежащий сервер модели выглядел бы как успешный поток, который сразу
+    оборвался, — а это ровно тот случай, когда чужой клиент показывает
+    пустой ответ вместо ошибки и человек ищет причину в своём коде.
+    """
+    данные = json.dumps(тело, ensure_ascii=False).encode("utf-8")
+    запрос = urllib.request.Request(url, data=данные, method="POST",  # noqa: S310
+                                    headers=_заголовки(клиент, поток=True))
+    try:
+        return urllib.request.urlopen(запрос, timeout=клиент.timeout)  # noqa: S310
+    except Exception as exc:                                  # noqa: BLE001
+        raise _как_ошибка(exc, клиент, клиент.timeout) from exc
+
+
+def _не_поток(ответ: Any) -> bool:
+    """Ответил ли сервер обычным JSON вместо потока.
+
+    Не все совместимые серверы умеют `stream: true`: часть их просто
+    игнорирует и отвечает целиком. Такой ответ надо отдать одним куском, а
+    не молчать до тайм-аута клиента.
+    """
+    try:
+        тип = (ответ.headers.get_content_type() or "").lower()
+    except Exception:                                         # noqa: BLE001
+        return False
+    return тип in ("application/json", "text/json")
+
+
+# ---------------------------------------------------------------------------
+# Обычный ответ
+# ---------------------------------------------------------------------------
+
+def _спросить(клиент: Any, запрос: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str]:
+    """Один вызов модели без потока: текст, токены, причина остановки."""
+    if клиент.backend == "stub":
+        from ..llm import stub  # noqa: PLC0415
+
+        system, прочее = _подсказки(запрос["messages"])
+        return stub.reply(system, прочее), None, "stop"
+    if клиент.backend == "ollama":
+        данные = клиент._http("POST", f"{клиент.url}/api/chat",   # noqa: SLF001
+                              _тело_ollama(запрос, поток=False), timeout=клиент.timeout)
+        текст = str((данные.get("message") or {}).get("content") or "")
+        if not текст:
+            raise LLMError("Ollama вернул пустой ответ.")
+        return текст, _usage_ollama(данные), str(данные.get("done_reason") or "stop")
+    данные = клиент._http("POST", f"{клиент.url}/v1/chat/completions",  # noqa: SLF001
+                          _тело_openai(запрос, поток=False), timeout=клиент.timeout)
+    выборы = данные.get("choices") or []
+    первый = выборы[0] if выборы else {}
+    текст = str((первый.get("message") or {}).get("content") or "")
+    if not текст:
+        raise LLMError("Сервер модели вернул пустой ответ.")
+    return текст, данные.get("usage"), str(первый.get("finish_reason") or "stop")
+
+
+def _одним_ответом(state: Any, клиент: Any, счёт: _Учёт,
+                   запрос: dict[str, Any]) -> dict[str, Any]:
+    начало = time.perf_counter()
+    try:
+        with _слот(клиент):
+            текст, usage, finish = _спросить(клиент, запрос)
+    except ШлюзЗанят as exc:
+        # Занятая очередь — не сбой модели: в счётчик ошибок слоя он не
+        # идёт, иначе «Состояние языковой модели» показывало бы неполадку
+        # там, где всё работает, просто занято.
+        raise _отказ(exc) from exc
+    except LLMError as exc:
+        _записать(state, клиент, счёт, (time.perf_counter() - начало) * 1000, ошибка=exc)
+        raise _отказ(ШлюзНеОтветил(
+            f"Сервер модели не ответил: {exc}",
+            hint=f"Проверьте сервер модели ({клиент.url}) и имя модели "
+                 f"«{запрос['model']}»: список — GET /api/llm/v1/models, "
+                 f"состояние — GET /api/llm/status.")) from exc
+    прошло = (time.perf_counter() - начало) * 1000
+    _записать(state, клиент, счёт, прошло, usage=usage)
+    return _ответ_openai(текст, запрос, usage, finish=finish or "stop")
+
+
+# ---------------------------------------------------------------------------
+# Поток
+# ---------------------------------------------------------------------------
+
+def _чанки_ollama(источник: Any, ид: str, создано: int,
+                  модель: str) -> Iterator[tuple[str, dict[str, Any] | None]]:
+    """Ответ Ollama потоком: строка JSON на кусок текста."""
+    for сырая in источник:
+        строка = сырая.decode("utf-8", "replace").strip()
+        if not строка:
+            continue
+        try:
+            данные = json.loads(строка)
+        except ValueError:
+            # Мусорная строка — не повод рвать поток: ответ уже идёт, и
+            # клиент лучше получит остальное, чем оборванное соединение.
+            log.debug("Строка потока Ollama не разобралась: %.120s", строка)
+            continue
+        if данные.get("error"):
+            raise LLMError(f"Ollama ответил ошибкой: {данные['error']}")
+        кусок = str((данные.get("message") or {}).get("content") or "")
+        if кусок:
+            yield _строка_чанка(ид, создано, модель, {"content": кусок}, None), None
+        if данные.get("done"):
+            yield (_строка_чанка(ид, создано, модель, {},
+                                 str(данные.get("done_reason") or "stop")),
+                   _usage_ollama(данные))
+            return
+    # Сервер закрыл соединение, не сказав «готово»: закрываем сами, иначе
+    # клиент будет ждать финального куска до своего тайм-аута.
+    yield _строка_чанка(ид, создано, модель, {}, "stop"), None
+
+
+def _чанки_openai(источник: Any, ид: str, создано: int,
+                  модель: str) -> Iterator[tuple[str, dict[str, Any] | None]]:
+    """Ответ совместимого сервера — почти как есть.
+
+    Куски пересылаются теми же строками, какими пришли: в них бывают
+    вызовы инструментов и поля, которых мы не знаем, и пересобирать их
+    своими руками значит терять часть по дороге. Разбираем строку только
+    ради счётчика токенов — и только ту, где он может быть.
+    """
+    usage: dict[str, Any] | None = None
+    for сырая in источник:
+        строка = сырая.decode("utf-8", "replace").rstrip("\r\n")
+        if not строка:
+            # Пустая строка — разделитель событий SSE. Свой мы ставим сами
+            # (ниже), поэтому чужой пропускаем: два разделителя подряд
+            # клиент читает как пустое событие.
+            continue
+        if строка.strip() == "data: [DONE]":
+            break
+        if not строка.startswith("data:"):
+            # Комментарий SSE («: keep-alive») или поле event/id. Разделитель
+            # к нему не добавляем: событие ещё не кончилось.
+            yield строка + "\n", None
+            continue
+        if '"usage"' in строка:
+            try:
+                данные = json.loads(строка[5:].strip())
+                if isinstance(данные, dict) and isinstance(данные.get("usage"), dict):
+                    usage = данные["usage"]
+            except ValueError:
+                pass
+        # Полезная часть пересылается как есть, а разделитель ставится
+        # свой: часть серверов шлёт куски без пустой строки между ними, и
+        # такой поток библиотека openai читает как один бесконечный кусок
+        # — то есть не показывает ничего до самого конца ответа.
+        yield строка + "\n\n", None
+    yield "", usage
+
+
+def _чанки_одним(данные: dict[str, Any], ид: str, создано: int,
+                 модель: str) -> Iterator[tuple[str, dict[str, Any] | None]]:
+    """Сервер потоком не умеет: отдаём ответ одним куском и закрываем."""
+    выборы = данные.get("choices") or []
+    первый = выборы[0] if выборы else {}
+    текст = str((первый.get("message") or {}).get("content") or "")
+    yield _строка_чанка(ид, создано, модель, {"role": "assistant", "content": текст}, None), None
+    yield (_строка_чанка(ид, создано, модель, {},
+                         str(первый.get("finish_reason") or "stop")),
+           данные.get("usage"))
+
+
+def _поток_ответа(state: Any, клиент: Any, счёт: _Учёт, запрос: dict[str, Any],
+                  источник: Any, семафор: threading.BoundedSemaphore,
+                  начало: float) -> Iterator[str]:
+    """Тело потокового ответа: куски, финальный [DONE], учёт и уборка.
+
+    Слот освобождается здесь, а не в обработчике: пока идут куски, модель
+    занята — и разбор записей обязан ждать ровно столько же, сколько ждал
+    бы чужой запрос без потока.
+    """
+    ид, создано, модель = _идентификатор(), int(time.time()), запрос["model"]
+    usage: dict[str, Any] | None = None
+    сбой: BaseException | None = None
+    отдано = 0
+    try:
+        try:
+            if источник is None:                              # заглушка
+                from ..llm import stub  # noqa: PLC0415
+
+                system, прочее = _подсказки(запрос["messages"])
+                текст = stub.reply(system, прочее)
+                yield _строка_чанка(ид, создано, модель,
+                                    {"role": "assistant", "content": текст}, None)
+                yield _строка_чанка(ид, создано, модель, {}, "stop")
+                отдано = 1
+            else:
+                if клиент.backend == "ollama":
+                    поток = _чанки_ollama(источник, ид, создано, модель)
+                elif _не_поток(источник):
+                    поток = _чанки_одним(
+                        json.loads(источник.read().decode("utf-8", "replace")),
+                        ид, создано, модель)
+                else:
+                    поток = _чанки_openai(источник, ид, создано, модель)
+                for кусок, свод in поток:
+                    if свод:
+                        usage = свод
+                    if кусок:
+                        отдано += 1
+                        yield кусок
+        except (LLMError, OSError, ValueError, http.client.HTTPException) as exc:
+            сбой = exc if isinstance(exc, LLMError) else _как_ошибка(exc, клиент, клиент.timeout)
+            # Ответ уже начался — кодом состояния об ошибке не сказать.
+            # Говорим куском: клиенты OpenAI показывают поле error, а те,
+            # что не показывают, хотя бы корректно закончат чтение на
+            # [DONE] вместо обрыва соединения с невнятной ошибкой сети.
+            yield _строка_чанка(ид, создано, модель, {}, "error",
+                                error={"message": str(сбой), "type": "llm_upstream_error"})
+        # Признак конца — здесь, а НЕ в `finally`. Когда клиент отключается
+        # на середине ответа, Python закрывает этот генератор изнутри
+        # (GeneratorExit на текущем `yield`), а отдать что-то ещё из finally
+        # закрываемому генератору нельзя: Python отвечает «generator ignored
+        # GeneratorExit». Уборка при этом всё равно нужна — она ниже, и она
+        # ничего не отдаёт.
+        yield "data: [DONE]\n\n"
+    finally:
+        if источник is not None:
+            try:
+                источник.close()
+            except Exception:                                 # noqa: BLE001
+                pass
+        семафор.release()
+        _записать(state, клиент, счёт, (time.perf_counter() - начало) * 1000,
+                  usage=usage, ошибка=сбой)
+        log.debug("Шлюз модели: поток закончен, кусков %d", отдано)
+
+
+def _потоком(state: Any, клиент: Any, счёт: _Учёт,
+             запрос: dict[str, Any]) -> StreamingResponse:
+    семафор = _взять_слот(клиент, клиент.timeout)
+    начало = time.perf_counter()
+    try:
+        if клиент.backend == "stub":
+            источник = None
+        elif клиент.backend == "ollama":
+            источник = _открыть_поток(клиент, f"{клиент.url}/api/chat",
+                                      _тело_ollama(запрос, поток=True))
+        else:
+            источник = _открыть_поток(клиент, f"{клиент.url}/v1/chat/completions",
+                                      _тело_openai(запрос, поток=True))
+    except LLMError as exc:
+        семафор.release()
+        _записать(state, клиент, счёт, (time.perf_counter() - начало) * 1000, ошибка=exc)
+        raise _отказ(ШлюзНеОтветил(
+            f"Сервер модели не ответил: {exc}",
+            hint=f"Проверьте сервер модели ({клиент.url}) и имя модели "
+                 f"«{запрос['model']}»: список — GET /api/llm/v1/models.")) from exc
+    except BaseException:
+        семафор.release()
+        raise
+    return StreamingResponse(
+        _поток_ответа(state, клиент, счёт, запрос, источник, семафор, начало),
+        media_type="text/event-stream",
+        # Обратный прокси любит копить ответ в буфере — для потока это
+        # означает «всё разом в конце», то есть отсутствие потока.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Маршруты
+# ---------------------------------------------------------------------------
+
+ОПИСАНИЕ_ЧАТА = """
+Ответ языковой модели в формате OpenAI: тот же адрес и то же тело, что у
+`POST /v1/chat/completions` OpenAI. Сторонняя программа настраивается на
+`http://сервер:8081/api/llm/v1`, ключ — обычный ключ доступа ASR Hub
+(заголовок `X-API-Key` или `Authorization: Bearer <ключ>`).
+
+Поля: `messages` (обязательно), `model` (по умолчанию — модель из настроек
+сервера), `temperature`, `max_tokens`, `top_p`, `stop`, `seed`, `stream`.
+Для OpenAI-совместимого сервера модели остальные поля (`tools`,
+`response_format` и прочие) передаются дальше как есть.
+
+При `stream: true` ответ идёт кусками `data: {…}` (Server-Sent Events) и
+заканчивается `data: [DONE]`. Если сервер модели потоком не умеет, ответ
+приходит одним куском и поток закрывается — клиенту переделываться не надо.
+
+Запросы из сети делят видеокарту с разбором записей: одновременных вызовов
+не больше `llm_max_concurrent` на всех. Если свободного слота нет, ответ —
+503 с объяснением. Пока `llm_network_enabled` выключен — 403.
+"""
+
+
+@router.post("/chat/completions", summary="Ответ модели (формат OpenAI)",
+             description=ОПИСАНИЕ_ЧАТА)
+async def chat_completions(request: Request,
+                           principal: Principal = Depends(authenticate)) -> Any:
+    state, клиент, счёт = _шлюз(request, principal)
+    запрос = _разобрать_чат(await _тело_запроса(request), клиент)
+    # Обращение к модели — это блокирующая сеть с тайм-аутом в полторы
+    # минуты и ожидание слота. В обработчике `async` такой вызов встал бы
+    # поперёк всего сервера: ни очередь, ни веб-интерфейс не отвечали бы,
+    # пока модель думает.
+    if запрос["stream"]:
+        return await asyncio.to_thread(_потоком, state, клиент, счёт, запрос)
+    return await asyncio.to_thread(_одним_ответом, state, клиент, счёт, запрос)
+
+
+@router.get("/models", summary="Список моделей (формат OpenAI)",
+            description="Модели, которые знает сервер модели, в формате "
+                        "`{\"object\":\"list\",\"data\":[…]}`. Клиенты OpenAI "
+                        "спрашивают этот список, чтобы показать выбор модели.")
+async def list_models(request: Request,
+                      principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    state, клиент, счёт = _шлюз(request, principal)
+    return await asyncio.to_thread(_список_моделей, state, клиент, счёт)
+
+
+def _список_моделей(state: Any, клиент: Any, счёт: _Учёт) -> dict[str, Any]:
+    """Каталог моделей сервера модели, переведённый в формат OpenAI.
+
+    Слот одновременности здесь НЕ занимается: это обращение к списку, а не
+    к весам, видеокарту оно не трогает. Клиент OpenAI спрашивает список при
+    каждом открытии окна настроек, и если бы список ждал очереди разбора,
+    чужая программа выглядела бы сломанной там, где всё исправно.
+    """
+    начало = time.perf_counter()
+    try:
+        if клиент.backend == "stub":
+            имена = [клиент.model or "stub"]
+        elif клиент.backend == "ollama":
+            данные = клиент._http("GET", f"{клиент.url}/api/tags",  # noqa: SLF001
+                                  None, timeout=min(клиент.timeout, 15.0))
+            имена = [str(м.get("name") or "") for м in (данные.get("models") or [])]
+        else:
+            данные = клиент._http("GET", f"{клиент.url}/v1/models",  # noqa: SLF001
+                                  None, timeout=min(клиент.timeout, 15.0))
+            имена = [str(м.get("id") or "") for м in (данные.get("data") or [])]
+    except LLMError as exc:
+        _записать(state, клиент, счёт, (time.perf_counter() - начало) * 1000, ошибка=exc)
+        raise _отказ(ШлюзНеОтветил(
+            f"Сервер модели не ответил: {exc}",
+            hint=f"Проверьте адрес сервера модели ({клиент.url}) и то, что он запущен.")) from exc
+    _записать(state, клиент, счёт, (time.perf_counter() - начало) * 1000)
+    создано = int(time.time())
+    # Модель из настроек — первой и обязательно в списке: именно её отдаёт
+    # шлюз, когда клиент модель не назвал, и не увидеть её в списке было бы
+    # странно. Сервер мог не показать её в каталоге (vLLM отдаёт то имя, с
+    # которым запущен, и оно не всегда совпадает с настройкой).
+    порядок = [клиент.model] if клиент.model else []
+    порядок += [и for и in имена if и and и != клиент.model]
+    return {"object": "list",
+            "data": [{"id": имя, "object": "model", "created": создано,
+                      "owned_by": клиент.backend} for имя in порядок]}
+
+
+@router.post("/embeddings", summary="Векторы текста (формат OpenAI)",
+             description="Векторное представление текста, если сервер модели "
+                         "это умеет. Поле `input` — строка или список строк, "
+                         "`model` — модель векторизации (по умолчанию — модель "
+                         "из настроек). Если сервер модели векторы не считает, "
+                         "ответ — 501 с объяснением.")
+async def embeddings(request: Request,
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    state, клиент, счёт = _шлюз(request, principal)
+    данные = await _тело_запроса(request)
+    строки = данные.get("input")
+    if isinstance(строки, str):
+        строки = [строки]
+    if not isinstance(строки, list) or not строки:
+        raise _отказ(ConfigError(
+            "В запросе нет поля input с текстом.",
+            hint='Формат OpenAI: {"model":"…","input":"текст"} или список строк.'))
+    if len(строки) > ПРЕДЕЛ_ВЕКТОРОВ:
+        raise _отказ(ConfigError(
+            f"За раз считается не больше {ПРЕДЕЛ_ВЕКТОРОВ} строк, прислано {len(строки)}.",
+            hint="Разбейте список на части: длинная пачка занимает видеокарту "
+                 "на всё время запроса, и разбор записей в это время стоит."))
+    тексты = [_текст_сообщения(с) for с in строки]
+    модель = str(данные.get("model") or "").strip() or клиент.model
+    return await asyncio.to_thread(_векторы, state, клиент, счёт, тексты, модель)
+
+
+def _векторы(state: Any, клиент: Any, счёт: _Учёт, тексты: list[str],
+             модель: str) -> dict[str, Any]:
+    if клиент.backend == "stub":
+        raise _отказ(НетВозможности(
+            "Заглушка языковой модели векторы не считает.",
+            hint="Выберите настоящий сервер модели: llm_backend = ollama или openai."))
+    начало = time.perf_counter()
+    try:
+        with _слот(клиент):
+            векторы, usage = _спросить_векторы(клиент, тексты, модель)
+    except ШлюзЗанят as exc:
+        raise _отказ(exc) from exc
+    except НетВозможности as exc:
+        raise _отказ(exc) from exc
+    except LLMError as exc:
+        _записать(state, клиент, счёт, (time.perf_counter() - начало) * 1000, ошибка=exc)
+        raise _отказ(ШлюзНеОтветил(
+            f"Сервер модели не ответил: {exc}",
+            hint=f"Проверьте, что модель «{модель}» умеет считать векторы: "
+                 f"для Ollama это отдельные модели (nomic-embed-text, "
+                 f"bge-m3), обычная разговорная модель их не считает.")) from exc
+    прошло = (time.perf_counter() - начало) * 1000
+    _записать(state, клиент, счёт, прошло, usage=usage)
+    return {
+        "object": "list",
+        "model": модель,
+        "data": [{"object": "embedding", "index": номер, "embedding": вектор}
+                 for номер, вектор in enumerate(векторы)],
+        "usage": usage or {"prompt_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _спросить_векторы(клиент: Any, тексты: list[str],
+                      модель: str) -> tuple[list[list[float]], dict[str, Any] | None]:
+    """Векторы у сервера модели. Ollama и OpenAI зовут это по-разному."""
+    if клиент.backend == "ollama":
+        try:
+            данные = клиент._http("POST", f"{клиент.url}/api/embed",  # noqa: SLF001
+                                  {"model": модель, "input": тексты},
+                                  timeout=клиент.timeout)
+        except LLMError as exc:
+            # /api/embed появился в Ollama 0.1.39; на сборке постарше он
+            # отвечает 404, и единственный работающий путь — старый
+            # /api/embeddings по одной строке за раз. Разбирать версию
+            # сервера ради этого не стоит: проще спросить и отступить.
+            if "ответил 404" not in str(exc) and "ответил 405" not in str(exc):
+                raise
+            векторы = []
+            for текст in тексты:
+                старое = клиент._http("POST", f"{клиент.url}/api/embeddings",  # noqa: SLF001
+                                      {"model": модель, "prompt": текст},
+                                      timeout=клиент.timeout)
+                векторы.append([float(з) for з in (старое.get("embedding") or [])])
+            if not any(векторы):
+                raise НетВозможности(
+                    f"Модель «{модель}» не вернула векторов.",
+                    hint="Для векторов нужна модель векторизации: "
+                         "ollama pull nomic-embed-text или bge-m3.") from exc
+            return векторы, None
+        ряды = данные.get("embeddings")
+        if not isinstance(ряды, list) or not ряды:
+            raise НетВозможности(
+                f"Модель «{модель}» не вернула векторов.",
+                hint="Для векторов нужна модель векторизации: "
+                     "ollama pull nomic-embed-text или bge-m3.")
+        вход = int(данные.get("prompt_eval_count") or 0)
+        return ([[float(з) for з in ряд] for ряд in ряды],
+                {"prompt_tokens": вход, "total_tokens": вход})
+    try:
+        данные = клиент._http("POST", f"{клиент.url}/v1/embeddings",  # noqa: SLF001
+                              {"model": модель, "input": тексты}, timeout=клиент.timeout)
+    except LLMError as exc:
+        # Совместимые серверы, поднятые с разговорной моделью, отвечают на
+        # этот адрес 404 или 501. Это не сбой сети, и говорить о нём надо
+        # иначе: возможности нет, повторять бессмысленно.
+        if any(п in str(exc) for п in ("ответил 404", "ответил 405", "ответил 501")):
+            raise НетВозможности(
+                "Сервер модели не считает векторы.",
+                hint="Поднимите рядом модель векторизации (у Ollama — "
+                     "nomic-embed-text или bge-m3) или уберите обращения к "
+                     "/api/llm/v1/embeddings из клиента.") from exc
+        raise
+    ряды = данные.get("data") or []
+    return ([[float(з) for з in (р.get("embedding") or [])] for р in ряды],
+            данные.get("usage"))

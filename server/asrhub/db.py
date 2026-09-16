@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -670,6 +670,82 @@ _SCHEMA = [
         pbx_uid      TEXT DEFAULT ''
     )
     """,
+    # --- версия 23: сотрудники, агенты на АТС, очередь к языковой модели ---
+    """
+    CREATE TABLE IF NOT EXISTS employees (
+        id            TEXT PRIMARY KEY,
+        -- Внешний ключ источника: по нему запись узнаётся при повторном
+        -- импорте. Для справочника это «фамилия|имя|отчество» или
+        -- внутренний номер — что устойчивее в конкретной выгрузке.
+        external_id   TEXT DEFAULT '',
+        source        TEXT DEFAULT 'ручной',
+        active        INTEGER DEFAULT 1,
+        active_until  TEXT DEFAULT '',
+        last_name     TEXT DEFAULT '',
+        first_name    TEXT DEFAULT '',
+        middle_name   TEXT DEFAULT '',
+        position      TEXT DEFAULT '',
+        department    TEXT DEFAULT '',
+        phone_work    TEXT DEFAULT '',
+        phone_ext     TEXT DEFAULT '',
+        phone_mobile  TEXT DEFAULT '',
+        email         TEXT DEFAULT '',
+        suppliers     TEXT DEFAULT '',
+        note          TEXT DEFAULT '',
+        owner         TEXT DEFAULT '',
+        created_at    REAL,
+        updated_at    REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_employees_ext ON employees(phone_ext)",
+    "CREATE INDEX IF NOT EXISTS idx_employees_dept ON employees(department, last_name)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_external ON employees(source, external_id)",
+    """
+    CREATE TABLE IF NOT EXISTS agents (
+        id           TEXT PRIMARY KEY,
+        name         TEXT DEFAULT '',
+        host         TEXT DEFAULT '',
+        station      TEXT DEFAULT '',
+        version      TEXT DEFAULT '',
+        asterisk     TEXT DEFAULT '',
+        os           TEXT DEFAULT '',
+        source       TEXT DEFAULT '',
+        first_seen   REAL,
+        last_seen    REAL,
+        calls_sent   INTEGER DEFAULT 0,
+        files_sent   INTEGER DEFAULT 0,
+        bytes_sent   INTEGER DEFAULT 0,
+        errors       INTEGER DEFAULT 0,
+        last_error   TEXT DEFAULT '',
+        state        TEXT DEFAULT '',
+        -- Задание агенту: собрать всё, собрать за период. Ставится из
+        -- раздела «АТС», забирается агентом на следующем обращении.
+        command      TEXT DEFAULT '',
+        command_at   REAL,
+        enabled      INTEGER DEFAULT 1
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_agents_seen ON agents(last_seen DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS llm_queue (
+        job_id       TEXT PRIMARY KEY,
+        kind         TEXT DEFAULT 'разбор',
+        state        TEXT DEFAULT 'ждёт',
+        priority     INTEGER DEFAULT 50,
+        enqueued_at  REAL,
+        started_at   REAL,
+        finished_at  REAL,
+        attempts     INTEGER DEFAULT 0,
+        error        TEXT DEFAULT '',
+        latency_ms   INTEGER,
+        calls        INTEGER DEFAULT 0,
+        chunks       INTEGER DEFAULT 0,
+        source       TEXT DEFAULT '',
+        owner        TEXT DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_llmq_state ON llm_queue(state, priority DESC, enqueued_at)",
+    "CREATE INDEX IF NOT EXISTS idx_llmq_finished ON llm_queue(finished_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_station ON calls(station, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
@@ -1070,6 +1146,11 @@ def fts_query(text: str) -> str:
     return " ".join(части)
 
 
+def _нижний(значение: Any) -> Any:
+    """LOWER() для SQLite, знающий кириллицу. NULL остаётся NULL."""
+    return значение.lower() if isinstance(значение, str) else значение
+
+
 class Database:
     """Тонкая обёртка над SQLite с пулом соединений по потокам."""
 
@@ -1104,6 +1185,14 @@ class Database:
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA temp_store=MEMORY")
             conn.execute("PRAGMA cache_size=-32000")
+            # LOWER() в SQLite понимает только латиницу: «Иванов» она
+            # оставляет как есть, и поиск по справочнику не находил
+            # человека, если регистр не совпал буква в букву. Подменяем
+            # своей — питоновский str.lower() знает все алфавиты.
+            try:
+                conn.create_function("lower", 1, _нижний, deterministic=True)
+            except (sqlite3.NotSupportedError, TypeError):    # старая сборка
+                conn.create_function("lower", 1, _нижний)
             self._local.conn = conn
         return conn
 
@@ -3809,6 +3898,395 @@ class Database:
         """
         return self.execute("DELETE FROM calls WHERE imported_at < ?",
                             (float(before),))
+
+    # --- сотрудники -------------------------------------------------------
+
+    #: Поля карточки сотрудника, которые приходят снаружи. Список закрытый:
+    #: он же — белый список колонок для записи, и через него нельзя
+    #: дописать в таблицу ничего постороннего.
+    ПОЛЯ_СОТРУДНИКА = (
+        "external_id", "source", "active", "active_until",
+        "last_name", "first_name", "middle_name", "position", "department",
+        "phone_work", "phone_ext", "phone_mobile", "email", "suppliers",
+        "note", "owner",
+    )
+
+    def employee_save(self, данные: dict[str, Any], *,
+                      id: str | None = None) -> dict[str, Any]:       # noqa: A002
+        """Заводит или обновляет карточку сотрудника; возвращает её целиком.
+
+        Ключ поиска — сначала явный `id`, потом пара «источник и внешний
+        ключ». Вторая нужна импорту: справочник отдаёт одних и тех же людей
+        каждый раз, и без неё повторный импорт заводил бы отдел заново.
+        """
+        поля = {к: данные.get(к) for к in self.ПОЛЯ_СОТРУДНИКА if к in данные}
+        поля.setdefault("source", "ручной")
+        if "active" in поля:
+            поля["active"] = 1 if поля["active"] else 0
+        существующий = None
+        if id:
+            существующий = self.employee_get(str(id))
+        if существующий is None and поля.get("external_id"):
+            существующий = self.query_one(
+                "SELECT * FROM employees WHERE source=? AND external_id=?",
+                (str(поля.get("source") or "ручной"), str(поля["external_id"])))
+            существующий = dict(существующий) if существующий else None
+        мгновение = now()
+        if существующий is None:
+            новый = new_id("emp")
+            колонки = ["id", *поля.keys(), "created_at", "updated_at"]
+            значения = [новый, *поля.values(), мгновение, мгновение]
+            self.execute(
+                f"INSERT INTO employees ({', '.join(колонки)}) "
+                f"VALUES ({', '.join('?' * len(колонки))})", значения)
+            return self.employee_get(новый) or {}
+        if not поля:
+            return существующий
+        назначения = ", ".join(f"{к}=?" for к in поля)
+        self.execute(f"UPDATE employees SET {назначения}, updated_at=? WHERE id=?",
+                     [*поля.values(), мгновение, существующий["id"]])
+        return self.employee_get(str(существующий["id"])) or {}
+
+    def employee_get(self, id: str) -> dict[str, Any] | None:         # noqa: A002
+        row = self.query_one("SELECT * FROM employees WHERE id=?", (str(id),))
+        return dict(row) if row else None
+
+    def employee_by_ext(self, номер: str) -> dict[str, Any] | None:
+        """Сотрудник по внутреннему номеру — так звонок узнаёт оператора."""
+        номер = str(номер or "").strip()
+        if not номер:
+            return None
+        row = self.query_one(
+            "SELECT * FROM employees WHERE phone_ext=? ORDER BY active DESC, updated_at DESC",
+            (номер,))
+        return dict(row) if row else None
+
+    def employee_list(self, *, query: str = "", department: str = "",
+                      active: bool | None = None, source: str = "",
+                      limit: int = 500, offset: int = 0) -> dict[str, Any]:
+        условия, параметры = [], []
+        if query:
+            искомое = f"%{query.strip().lower()}%"
+            условия.append(
+                "(LOWER(last_name) LIKE ? OR LOWER(first_name) LIKE ? OR "
+                " LOWER(middle_name) LIKE ? OR LOWER(position) LIKE ? OR "
+                " LOWER(department) LIKE ? OR LOWER(email) LIKE ? OR "
+                " phone_ext LIKE ? OR phone_mobile LIKE ? OR phone_work LIKE ?)")
+            параметры.extend([искомое] * 9)
+        if department:
+            условия.append("department=?")
+            параметры.append(department)
+        if source:
+            условия.append("source=?")
+            параметры.append(source)
+        if active is not None:
+            условия.append("active=?")
+            параметры.append(1 if active else 0)
+        где = (" WHERE " + " AND ".join(условия)) if условия else ""
+        всего = self.query_one(f"SELECT COUNT(*) AS n FROM employees{где}", параметры)
+        rows = self.query(
+            f"SELECT * FROM employees{где} ORDER BY active DESC, last_name, first_name "
+            f"LIMIT ? OFFSET ?", [*параметры, max(1, int(limit)), max(0, int(offset))])
+        return {"total": int(всего["n"]) if всего else 0,
+                "items": [dict(r) for r in rows]}
+
+    def employee_delete(self, id: str) -> bool:                       # noqa: A002
+        return self.execute("DELETE FROM employees WHERE id=?", (str(id),)) > 0
+
+    def employee_departments(self) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT department, COUNT(*) AS n, "
+            "       SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) AS active "
+            "FROM employees GROUP BY department ORDER BY n DESC")
+        return [dict(r) for r in rows]
+
+    def employees_import(self, записи: list[dict[str, Any]], *, source: str,
+                         deactivate_missing: bool = True) -> dict[str, Any]:
+        """Разом заводит выгрузку справочника. Возвращает, что изменилось.
+
+        Пропавших из выгрузки не удаляем, а помечаем неработающими: по ним
+        есть звонки, и удаление превратило бы половину архива в разговоры
+        неизвестно с кем. Это же и честнее: человек уволился, а разговоры
+        остались.
+        """
+        было = {str(r["external_id"]): dict(r) for r in self.query(
+            "SELECT * FROM employees WHERE source=?", (source,)) if r["external_id"]}
+        добавлено = обновлено = без_изменений = 0
+        пришли: set[str] = set()
+        for запись in записи:
+            данные = {к: з for к, з in запись.items() if к in self.ПОЛЯ_СОТРУДНИКА}
+            данные["source"] = source
+            ключ = str(данные.get("external_id") or "").strip()
+            if not ключ:
+                continue
+            пришли.add(ключ)
+            прежний = было.get(ключ)
+            if прежний is None:
+                self.employee_save(данные)
+                добавлено += 1
+                continue
+            различия = {к: з for к, з in данные.items()
+                        if str(прежний.get(к) or "") != str(з or "")}
+            if not различия:
+                без_изменений += 1
+                continue
+            self.employee_save(данные, id=str(прежний["id"]))
+            обновлено += 1
+        уволено = 0
+        if deactivate_missing:
+            for ключ, прежний in было.items():
+                if ключ not in пришли and int(прежний.get("active") or 0):
+                    self.execute("UPDATE employees SET active=0, updated_at=? WHERE id=?",
+                                 (now(), прежний["id"]))
+                    уволено += 1
+        return {"added": добавлено, "updated": обновлено, "unchanged": без_изменений,
+                "deactivated": уволено, "received": len(пришли)}
+
+    # --- агенты на станциях ------------------------------------------------
+
+    ПОЛЯ_АГЕНТА = ("name", "host", "station", "version", "asterisk", "os",
+                   "source", "state", "enabled")
+
+    def agent_save(self, id: str, данные: dict[str, Any] | None = None,  # noqa: A002
+                   *, seen: bool = True) -> dict[str, Any]:
+        """Заводит или обновляет агента, приславшего о себе весть."""
+        поля = {к: з for к, з in (данные or {}).items() if к in self.ПОЛЯ_АГЕНТА}
+        if "enabled" in поля:
+            поля["enabled"] = 1 if поля["enabled"] else 0
+        мгновение = now()
+        прежний = self.agent_get(id)
+        if прежний is None:
+            колонки = ["id", *поля.keys(), "first_seen", "last_seen"]
+            значения = [str(id), *поля.values(), мгновение, мгновение]
+            self.execute(
+                f"INSERT INTO agents ({', '.join(колонки)}) "
+                f"VALUES ({', '.join('?' * len(колонки))})", значения)
+            return self.agent_get(id) or {}
+        назначения = [f"{к}=?" for к in поля]
+        параметры = list(поля.values())
+        if seen:
+            назначения.append("last_seen=?")
+            параметры.append(мгновение)
+        if назначения:
+            self.execute(f"UPDATE agents SET {', '.join(назначения)} WHERE id=?",
+                         [*параметры, str(id)])
+        return self.agent_get(id) or {}
+
+    def agent_get(self, id: str) -> dict[str, Any] | None:            # noqa: A002
+        row = self.query_one("SELECT * FROM agents WHERE id=?", (str(id),))
+        return dict(row) if row else None
+
+    def agent_list(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.query(
+            "SELECT * FROM agents ORDER BY last_seen DESC")]
+
+    def agent_delete(self, id: str) -> bool:                          # noqa: A002
+        return self.execute("DELETE FROM agents WHERE id=?", (str(id),)) > 0
+
+    def agent_count(self, id: str, *, calls: int = 0, files: int = 0,  # noqa: A002
+                    size: int = 0, errors: int = 0, error: str = "") -> None:
+        """Счётчики агента. Пишутся одним запросом: их шлют часто."""
+        self.execute(
+            "UPDATE agents SET calls_sent=calls_sent+?, files_sent=files_sent+?, "
+            "bytes_sent=bytes_sent+?, errors=errors+?, "
+            "last_error=CASE WHEN ?<>'' THEN ? ELSE last_error END, last_seen=? "
+            "WHERE id=?",
+            (int(calls), int(files), int(size), int(errors), error, error, now(), str(id)))
+
+    def agent_command_set(self, id: str, команда: str) -> bool:       # noqa: A002
+        return self.execute("UPDATE agents SET command=?, command_at=? WHERE id=?",
+                            (команда, now(), str(id))) > 0
+
+    def agent_command_take(self, id: str) -> str:                     # noqa: A002
+        """Отдаёт задание агенту и тут же его снимает — чтобы не повторялось."""
+        строка = self.agent_get(id)
+        команда = str((строка or {}).get("command") or "")
+        if команда:
+            self.execute("UPDATE agents SET command='' WHERE id=?", (str(id),))
+        return команда
+
+    # --- очередь запросов к языковой модели --------------------------------
+
+    #: Состояния очереди. Строками, а не числами: их читает человек в
+    #: разделе, и «ждёт» понятнее, чем 0.
+    LLMQ_ЖДЁТ = "ждёт"
+    LLMQ_ИДЁТ = "идёт"
+    LLMQ_ГОТОВО = "готово"
+    LLMQ_ОШИБКА = "ошибка"
+    LLMQ_ОТМЕНЁН = "отменён"
+
+    def llmq_put(self, job_id: str, *, kind: str = "разбор", priority: int = 50,
+                 source: str = "", owner: str = "") -> bool:
+        """Ставит запись в очередь к модели. Повтор не задваивает.
+
+        Запись, которая уже ждёт, поднимается в приоритете, если новый
+        выше: нажатие «разобрать сейчас» по записи, стоящей в хвосте
+        фоновой очереди, должно её двигать, а не создавать вторую.
+        """
+        прежняя = self.query_one("SELECT * FROM llm_queue WHERE job_id=?", (str(job_id),))
+        мгновение = now()
+        if прежняя is None:
+            self.execute(
+                "INSERT INTO llm_queue (job_id, kind, state, priority, enqueued_at, "
+                "source, owner) VALUES (?,?,?,?,?,?,?)",
+                (str(job_id), kind, self.LLMQ_ЖДЁТ, int(priority), мгновение, source, owner))
+            return True
+        if str(прежняя["state"]) == self.LLMQ_ИДЁТ:
+            return False
+        self.execute(
+            "UPDATE llm_queue SET state=?, kind=?, priority=MAX(priority, ?), "
+            "enqueued_at=CASE WHEN state=? THEN enqueued_at ELSE ? END, "
+            "error='', finished_at=NULL WHERE job_id=?",
+            (self.LLMQ_ЖДЁТ, kind, int(priority), self.LLMQ_ЖДЁТ, мгновение, str(job_id)))
+        return True
+
+    def llmq_take(self) -> dict[str, Any] | None:
+        """Берёт следующую запись и помечает её выполняющейся.
+
+        Отбор и пометка — одним запросом под замком записи: иначе два
+        потока (фоновый разбор и ручной вызов из интерфейса) взяли бы одну
+        и ту же запись и сходили бы к модели дважды.
+        """
+        with self.write() as conn:
+            строка = conn.execute(
+                "SELECT * FROM llm_queue WHERE state=? "
+                "ORDER BY priority DESC, enqueued_at LIMIT 1",
+                (self.LLMQ_ЖДЁТ,)).fetchone()
+            if строка is None:
+                return None
+            conn.execute(
+                "UPDATE llm_queue SET state=?, started_at=?, attempts=attempts+1 "
+                "WHERE job_id=?", (self.LLMQ_ИДЁТ, now(), строка["job_id"]))
+            данные = dict(строка)
+        данные["state"] = self.LLMQ_ИДЁТ
+        return данные
+
+    def llmq_begin(self, job_id: str, *, kind: str = "вручную",
+                   priority: int = 70) -> None:
+        """Отмечает, что к записи пошли прямо сейчас, мимо очереди.
+
+        Разбор по кнопке «Разобрать сейчас» идёт в потоке запроса, а не в
+        фоновом: человек ждёт ответа. Но в разделе очереди он обязан быть
+        виден — иначе «сейчас ничего не идёт» соседствует с работающей
+        видеокартой, и понять, кто её занял, нельзя.
+        """
+        self.llmq_put(job_id, kind=kind, priority=priority)
+        self.execute(
+            "UPDATE llm_queue SET state=?, started_at=?, attempts=attempts+1 "
+            "WHERE job_id=?", (self.LLMQ_ИДЁТ, now(), str(job_id)))
+
+    def llmq_prune(self, keep_days: int = 14, *, limit: int = 20000) -> int:
+        """Убирает старые завершённые записи очереди.
+
+        История нужна для графика и разбора сбоев, но не вечно: на сервере,
+        разбирающем тысячу записей в сутки, таблица за год станет больше
+        самого архива разборов.
+        """
+        порог = now() - max(1, int(keep_days)) * 86400
+        return self.execute(
+            "DELETE FROM llm_queue WHERE state IN (?,?,?) AND finished_at<? "
+            "AND job_id IN (SELECT job_id FROM llm_queue WHERE finished_at<? "
+            "ORDER BY finished_at LIMIT ?)",
+            (self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, self.LLMQ_ОТМЕНЁН,
+             порог, порог, max(1, int(limit))))
+
+    def llmq_finish(self, job_id: str, *, error: str = "", latency_ms: int | None = None,
+                    calls: int = 0, chunks: int = 0) -> None:
+        self.execute(
+            "UPDATE llm_queue SET state=?, finished_at=?, error=?, latency_ms=?, "
+            "calls=?, chunks=? WHERE job_id=?",
+            (self.LLMQ_ОШИБКА if error else self.LLMQ_ГОТОВО, now(), error,
+             latency_ms, int(calls), int(chunks), str(job_id)))
+
+    def llmq_reset_running(self) -> int:
+        """Возвращает в очередь то, что «шло» в момент остановки сервера.
+
+        Без этого запись, на которой сервер перезапустили, оставалась бы
+        выполняющейся навсегда: раздел показывал бы вечный текущий запрос,
+        а сама запись больше никогда не разобралась бы.
+        """
+        return self.execute(
+            "UPDATE llm_queue SET state=?, started_at=NULL WHERE state=?",
+            (self.LLMQ_ЖДЁТ, self.LLMQ_ИДЁТ))
+
+    def llmq_cancel(self, job_id: str) -> bool:
+        return self.execute(
+            "UPDATE llm_queue SET state=?, finished_at=? WHERE job_id=? AND state=?",
+            (self.LLMQ_ОТМЕНЁН, now(), str(job_id), self.LLMQ_ЖДЁТ)) > 0
+
+    def llmq_clear(self, state: str = "") -> int:
+        if state:
+            return self.execute("DELETE FROM llm_queue WHERE state=?", (state,))
+        return self.execute("DELETE FROM llm_queue WHERE state<>?", (self.LLMQ_ИДЁТ,))
+
+    def llmq_retry_failed(self, limit: int = 500) -> int:
+        строки = self.query(
+            "SELECT job_id FROM llm_queue WHERE state=? ORDER BY finished_at DESC LIMIT ?",
+            (self.LLMQ_ОШИБКА, max(1, int(limit))))
+        for строка in строки:
+            self.llmq_put(str(строка["job_id"]), kind="повтор", priority=60)
+        return len(строки)
+
+    def llmq_counts(self) -> dict[str, int]:
+        строки = self.query("SELECT state, COUNT(*) AS n FROM llm_queue GROUP BY state")
+        свод = {str(с["state"]): int(с["n"]) for с in строки}
+        for состояние in (self.LLMQ_ЖДЁТ, self.LLMQ_ИДЁТ, self.LLMQ_ГОТОВО,
+                          self.LLMQ_ОШИБКА, self.LLMQ_ОТМЕНЁН):
+            свод.setdefault(состояние, 0)
+        return свод
+
+    def llmq_list(self, *, state: str = "", limit: int = 100,
+                  offset: int = 0) -> dict[str, Any]:
+        """Очередь с именем файла рядом: по идентификатору задания человек
+        ничего не узнаёт, а раздел показывает именно список записей."""
+        условие, параметры = "", []
+        if state:
+            условие = " WHERE q.state=?"
+            параметры.append(state)
+        всего = self.query_one(
+            f"SELECT COUNT(*) AS n FROM llm_queue q{условие}", параметры)
+        rows = self.query(
+            "SELECT q.*, j.filename, j.media_duration_s, j.model, j.created_at AS job_at "
+            "FROM llm_queue q LEFT JOIN jobs j ON j.id=q.job_id"
+            f"{условие} ORDER BY "
+            "CASE q.state WHEN 'идёт' THEN 0 WHEN 'ждёт' THEN 1 ELSE 2 END, "
+            "q.priority DESC, COALESCE(q.finished_at, q.enqueued_at) DESC "
+            "LIMIT ? OFFSET ?", [*параметры, max(1, int(limit)), max(0, int(offset))])
+        return {"total": int(всего["n"]) if всего else 0,
+                "items": [dict(r) for r in rows]}
+
+    def llmq_stats(self, since: float) -> dict[str, Any]:
+        """Сводка по завершённым запросам за окно: сколько, как долго, как часто ошибались."""
+        строка = self.query_one(
+            "SELECT COUNT(*) AS n, "
+            "       SUM(CASE WHEN state=? THEN 1 ELSE 0 END) AS ok, "
+            "       SUM(CASE WHEN state=? THEN 1 ELSE 0 END) AS failed, "
+            "       AVG(latency_ms) AS avg_ms, MAX(latency_ms) AS max_ms, "
+            "       SUM(calls) AS calls, "
+            "       AVG(CASE WHEN started_at IS NOT NULL AND enqueued_at IS NOT NULL "
+            "                THEN started_at-enqueued_at END) AS wait_s "
+            "FROM llm_queue WHERE finished_at>=?",
+            (self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, float(since)))
+        свод = dict(строка) if строка else {}
+        свод["since"] = float(since)
+        return свод
+
+    def llmq_series(self, since: float, until: float,
+                    buckets: int) -> tuple[int, list[dict[str, Any]]]:
+        """Ряд «сколько разобрано и за сколько» — для графика раздела."""
+        buckets = max(1, min(int(buckets), SERIES_MAX_BUCKETS))
+        шаг = max(1e-6, (float(until) - float(since)) / buckets)
+        rows = self.query(
+            "SELECT CAST((finished_at-?)/? AS INTEGER) AS bucket, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN state=? THEN 1 ELSE 0 END) AS failed, "
+            "       AVG(latency_ms) AS avg_ms, "
+            "       AVG(CASE WHEN started_at IS NOT NULL AND enqueued_at IS NOT NULL "
+            "                THEN started_at-enqueued_at END) AS wait_s "
+            "FROM llm_queue WHERE finished_at>=? AND finished_at<? "
+            "GROUP BY bucket ORDER BY bucket",
+            (since, шаг, self.LLMQ_ОШИБКА, since, until))
+        return buckets, [dict(r) for r in rows]
 
     # --- обслуживание ---------------------------------------------------
 

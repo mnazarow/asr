@@ -203,6 +203,81 @@ def scan(request: Request, station: str = Query(default="", max_length=64),
         raise error_response(exc) from exc
 
 
+@router.post("/diagnose", summary="Почему со станции не приходят звонки")
+def diagnose(request: Request, station: str = Query(default="", max_length=64),
+             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Подробный разбор забора — по пунктам, с подсказками.
+
+    Самый частый ответ станции — «заход прошёл, новых звонков ноль», и
+    он же самый бесполезный: выглядит как исправная работа. Разбор
+    проходит по всем молчаливым причинам подряд: журнал не пополняется,
+    позиция чтения стоит в конце повёрнутого файла, AMI подключается, но
+    не шлёт события Cdr, каталог записей пуст, пороги отсекают всё,
+    глубина просмотра короче возраста архива.
+
+    Ничего не меняет: позиция чтения остаётся на месте, звонки в очередь
+    не ставятся.
+    """
+    require_admin(require_write(principal))
+    try:
+        итоги = _телефония(request).диагностика(station)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    беды = sum(int(и.get("failed") or 0) for и in итоги)
+    return {"stations": итоги, "failed": беды,
+            "state": "fail" if беды else (
+                "warn" if any(и.get("state") == "warn" for и in итоги) else "ok"),
+            "at": time.time()}
+
+
+@router.post("/collect", summary="Собрать весь архив станции или его часть")
+def collect(request: Request, данные: dict[str, Any] = Body(default={}),
+            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Сбор идёт в фоне: на архиве в сорок тысяч звонков это часы.
+
+    Обычный заход берёт порцию и уходит спать до следующего такта —
+    именно поэтому «поднять весь архив» через кнопку «Забрать сейчас»
+    занимало недели. Здесь заходы идут подряд, пока журнал не кончится.
+    """
+    require_admin(require_write(principal))
+    режим = str(данные.get("mode") or "all")
+    if режим not in ("all", "period"):
+        raise error_response(ConfigError(
+            f"Неизвестный режим сбора: «{режим}».",
+            hint="Ожидается all или period."))
+    try:
+        итоги = _телефония(request).собрать(
+            station_id=str(данные.get("station") or ""), режим=режим,
+            since=float(данные.get("since") or 0),
+            until=float(данные.get("until") or 0))
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    return {"runs": итоги, "at": time.time()}
+
+
+@router.get("/collect", summary="Ход сбора архива")
+def collect_state(request: Request,
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    require_admin(require_write(principal))
+    return {"runs": _телефония(request).сбор_состояние(), "at": time.time()}
+
+
+@router.post("/rewind", summary="Забыть позицию чтения журнала")
+def rewind(request: Request, station: str = Query(..., max_length=64),
+           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Следующий заход пойдёт по журналу с начала.
+
+    Звонки при этом не задваиваются — от повтора держит первичный ключ
+    архива. Нужно после подмены журнала или когда позиция уехала вперёд
+    содержимого.
+    """
+    require_admin(require_write(principal))
+    try:
+        return _телефония(request).забыть_позицию(station)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+
+
 @router.get("/overview", summary="Всё для раздела «АТС» одним ответом")
 def overview(request: Request,
              period: str = Query(default="week",

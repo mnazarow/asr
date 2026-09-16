@@ -150,6 +150,157 @@ def llm_backfill(request: Request, limit: int = Body(default=100, embed=True),
     return {"queued": поставлено, "worker": поток.status()}
 
 
+# ---------------------------------------------------------------------------
+# Очередь запросов к модели
+# ---------------------------------------------------------------------------
+
+#: Сколько корзин рисовать на графике очереди. Двести — предел, за которым
+#: линия перестаёт читаться, а ответ перестаёт быть дешёвым.
+КОРЗИН = 96
+
+
+@router.get("/llm/queue", summary="Очередь запросов к модели")
+def llm_queue(request: Request, state_filter: str = Query(default="", alias="state"),
+              limit: int = Query(default=50, ge=1, le=500),
+              offset: int = Query(default=0, ge=0),
+              hours: int = Query(default=24, ge=1, le=24 * 30),
+              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Всё для раздела одним ответом: что идёт, что ждёт, что было.
+
+    Одним, а не пятью: раздел опрашивается раз в пару секунд, и пять
+    запросов вместо одного — это пятикратная нагрузка на сервер ради
+    картинки, которая всё равно рисуется целиком.
+    """
+    state, клиент, поток = _slot(request)
+    require_write(principal)
+    с_какого = time.time() - hours * 3600
+    корзин, ряд = state.db.llmq_series(с_какого, time.time(), КОРЗИН)
+    состояние = поток.status()
+    # Текущая запись — с именем файла: по идентификатору задания человек не
+    # узнаёт ничего, а в разделе он смотрит именно на «какую запись жуют».
+    текущее = None
+    if состояние.get("current"):
+        задание = state.db.get_job(str(состояние["current"]))
+        текущее = {
+            "job_id": состояние["current"],
+            "filename": (задание or {}).get("filename") or "",
+            "duration_s": (задание or {}).get("media_duration_s") or 0,
+            "since": состояние.get("current_since"),
+        }
+    return {
+        "worker": состояние,
+        "current": текущее,
+        "counts": state.db.llmq_counts(),
+        "stats": state.db.llmq_stats(с_какого),
+        "series": {"buckets": корзин, "since": с_какого, "rows": ряд},
+        "queue": state.db.llmq_list(state=state_filter, limit=limit, offset=offset),
+        "client": клиент.status(),
+        "settings": {
+            "paused": bool(state.settings.get("llm_queue_paused", False)),
+            "auto": bool(state.settings.get("llm_auto", True)),
+            "backfill": bool(state.settings.get("llm_backfill", False)),
+            "max_concurrent": int(state.settings.get("llm_max_concurrent") or 1),
+            "batch": int(state.settings.get("llm_queue_batch") or 5),
+            "idle_s": int(state.settings.get("llm_queue_idle_s") or 15),
+            "keep_days": int(state.settings.get("llm_queue_keep_days") or 14),
+            "yield_to_queue": bool(state.settings.get("llm_yield_to_queue", True)),
+        },
+        "at": time.time(),
+    }
+
+
+@router.post("/llm/queue/pause", summary="Приостановить или продолжить очередь")
+def llm_queue_pause(request: Request, paused: bool = Body(default=True, embed=True),
+                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    state, _клиент, поток = _slot(request)
+    require_admin(principal)
+    state.settings.set("llm_queue_paused", bool(paused), source="api")
+    state.db.add_event(None, "llm_queue",
+                       "Очередь разбора приостановлена" if paused else "Очередь разбора продолжена")
+    return {"paused": bool(paused), "worker": поток.status()}
+
+
+@router.post("/llm/queue/add", summary="Поставить записи в очередь разбора")
+def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default={}),
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Поставить в очередь: явный список, всё неразобранное или период.
+
+    Отбор делается запросом к базе, а не перебором в интерфейсе: «разобрать
+    всё за квартал» — это десятки тысяч записей, и присылать их списком
+    значит гонять мегабайт идентификаторов ради одной кнопки.
+    """
+    state, клиент, поток = _slot(request)
+    require_write(principal)
+    if not клиент.enabled:
+        raise error_response(ConfigError(
+            "Языковая модель выключена.",
+            hint="Включите её в настройках: «Языковая модель» → «Как подключена»."))
+    ids = [str(и) for и in (данные.get("job_ids") or []) if str(и).strip()]
+    предел = max(1, min(int(данные.get("limit") or 1000), 50000))
+    if not ids:
+        отбор = str(данные.get("scope") or "pending")
+        if отбор == "pending":
+            ids = [str(з["id"]) for з in state.db.llm_pending(tasks.VERSION, limit=предел)]
+        elif отбор == "failed":
+            повторено = state.db.llmq_retry_failed(limit=предел)
+            return {"queued": повторено, "scope": отбор, "worker": поток.status()}
+        elif отбор == "period":
+            начало = float(данные.get("since") or 0)
+            конец = float(данные.get("until") or time.time())
+            if not начало or конец <= начало:
+                raise error_response(ConfigError(
+                    "Для отбора за период нужны начало и конец промежутка."))
+            # У `list_jobs` есть «с какого», но нет «по какое»: верхнюю
+            # границу отсекаем сами. Брать с запасом и резать в питоне
+            # дешевле, чем заводить ещё один разрез в базе ради кнопки.
+            задания = state.db.list_jobs(status="completed", since=начало,
+                                         limit=предел, light=True,
+                                         owner=scope_owner(principal))
+            ids = [str(з["id"]) for з in задания
+                   if float(з.get("created_at") or 0) <= конец]
+        else:
+            raise error_response(ConfigError(
+                f"Неизвестный отбор: «{отбор}».",
+                hint="Ожидается pending, failed, period или явный список job_ids."))
+    поставлено = поток.enqueue_many(ids, kind=str(данные.get("kind") or "по просьбе"))
+    return {"queued": поставлено, "asked": len(ids), "worker": поток.status()}
+
+
+@router.post("/llm/queue/{job_id}/top", summary="Поднять запись в начало очереди")
+def llm_queue_top(request: Request, job_id: str,
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    state, _клиент, поток = _slot(request)
+    require_write(principal)
+    state.db.llmq_put(job_id, kind="срочно", priority=100)
+    return {"ok": True, "job_id": job_id, "worker": поток.status()}
+
+
+@router.delete("/llm/queue/{job_id}", summary="Убрать запись из очереди")
+def llm_queue_cancel(request: Request, job_id: str,
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Снимает запись, которая ещё ждёт. Идущую не трогаем: ответ модели
+    уже оплачен временем видеокарты, и бросать его на полпути незачем."""
+    state, _клиент, _поток = _slot(request)
+    require_write(principal)
+    if not state.db.llmq_cancel(job_id):
+        raise error_response(ConfigError(
+            f"Запись «{job_id}» в очереди не ждёт.",
+            hint="Возможно, её уже разобрали или она разбирается прямо сейчас."))
+    return {"ok": True, "job_id": job_id}
+
+
+@router.post("/llm/queue/clear", summary="Очистить очередь")
+def llm_queue_clear(request: Request, state_filter: str = Body(default="", embed=True,
+                                                               alias="state"),
+                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Пустое значение убирает всё, кроме идущего прямо сейчас."""
+    state, _клиент, поток = _slot(request)
+    require_admin(principal)
+    убрано = state.db.llmq_clear(state_filter)
+    state.db.add_event(None, "llm_queue", f"Из очереди разбора убрано записей: {убрано}")
+    return {"removed": убрано, "worker": поток.status()}
+
+
 @router.get("/content/llm", summary="Свод ответов модели за период")
 def llm_report(request: Request, period: str = ПЕРИОД,
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:

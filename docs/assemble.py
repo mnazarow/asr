@@ -40,6 +40,10 @@ CHAPTERS: list[tuple[str, str]] = [
     ("21-telephony.md", "Телефония: разговоры с АТС Asterisk"),
     ("22-employees.md", "Аналитика по сотрудникам"),
     ("23-backup.md", "Резервные копии и восстановление"),
+    ("24-agent.md", "Агент на станции Asterisk"),
+    ("25-dashboard.md", "Дашборд и автодиагностика"),
+    ("26-voice-analytics.md", "Голосовая аналитика и очередь к модели"),
+    ("27-employees-directory.md", "Справочник сотрудников"),
     ("18-review.md", "Ревизия кода"),
     ("appendix-phone-asr.md", "Приложение. Разбор проектов phone_asr"),
 ]

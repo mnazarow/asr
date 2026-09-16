@@ -505,6 +505,55 @@ def send_digest(digest: dict[str, Any], url: str) -> bool:
 KV_REVIEW = "review_sampled_at"
 KV_CONTROL = "control_sampled_at"
 
+#: Когда последний раз обновляли справочник сотрудников.
+KV_EMPLOYEES = "employees_synced_at"
+
+#: Когда последний раз подчищали историю очереди к языковой модели.
+KV_LLM_QUEUE = "llm_queue_pruned_at"
+
+
+def _справочник(db: Any, settings: Any) -> dict[str, Any] | None:
+    """Обновление справочника сотрудников по расписанию.
+
+    Возвращает сводку импорта, `None` — если ходить ещё рано или не за чем.
+
+    Сбой обновления намеренно не выходит наружу. Справочник — это удобство
+    (имя вместо номера в отчёте), а не условие работы сервера, и падение
+    служебного потока из-за недоступного портала остановило бы заодно
+    резервные копии и уборку хранилища — то есть поменяло бы мелкое
+    неудобство на настоящую аварию. Поэтому всё, что случилось, уходит в
+    журнал и событием в базу: там его видно в разделе «Журнал», рядом с
+    остальной жизнью сервера.
+    """
+    if not settings.get("employees_sync_enabled"):
+        return None
+    адрес = str(settings.get("employees_url") or "").strip()
+    if not адрес:
+        # Расписание включено, а адрес не задан — это не ошибка захода, но
+        # и молчать нельзя: человек включил обновление и ждёт его.
+        log.warning("Обновление справочника включено, но employees_url не задан")
+        return None
+    if not _пора(db, KV_EMPLOYEES, float(_срок(settings, "employees_sync_hours", 24))):
+        return None
+    db.set_kv(KV_EMPLOYEES, time.time())
+    from . import employees as справочник_сотрудников  # noqa: PLC0415
+
+    try:
+        итог = справочник_сотрудников.импорт(
+            db, url=адрес, source="справочник",
+            deactivate_missing=bool(settings.get("employees_deactivate_missing", True)))
+    except Exception as exc:                                 # noqa: BLE001
+        log.warning("Справочник сотрудников не обновлён: %s", exc)
+        db.add_event(None, "employees_sync_failed",
+                     f"Справочник не обновлён: {exc}", {"url": адрес})
+        return {"error": str(exc), "url": адрес}
+    db.add_event(None, "employees_synced",
+                 f"Справочник обновлён: +{итог.get('added')} новых, "
+                 f"{итог.get('updated')} изменено, {итог.get('deactivated')} уволено",
+                 {"url": адрес, "rows": итог.get("rows"),
+                  "skipped": итог.get("skipped")})
+    return итог
+
 
 def run_scheduled(db: Any, settings: Any, analytics: Any,
                   insights: Any = None, queue: Any = None) -> dict[str, Any]:
@@ -531,6 +580,24 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
             сделано["control"] = review.sample_control(db, settings, queue)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Контрольные прогоны не поставлены: %s", exc)
+    # Справочник сотрудников: раз в employees_sync_hours часов забрать
+    # выгрузку по employees_url. Стоит до копии намеренно — чтобы свежий
+    # справочник попал в неё же, а не оказался на сутки старше базы.
+    справочник = _справочник(db, settings)
+    if справочник is not None:
+        сделано["employees"] = справочник
+    # История очереди к языковой модели. По ней строится график раздела и
+    # разбираются сбои, но не вечно: на сервере, разбирающем тысячу записей
+    # в сутки, за год таблица станет больше самого архива разборов.
+    if _пора(db, KV_LLM_QUEUE, 24.0):
+        db.set_kv(KV_LLM_QUEUE, time.time())
+        try:
+            убрано = db.llmq_prune(_срок(settings, "llm_queue_keep_days", 14))
+            if убрано:
+                сделано["llm_queue"] = {"removed": убрано}
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("История очереди разбора не подчищена: %s", exc)
+
     # Копии снимает модуль `backup`: он собирает архив с описью, настройками
     # и — по виду копии — базой. Расписание там же: раз в сутки в назначенное
     # время или по интервалу в часах, если он задан.

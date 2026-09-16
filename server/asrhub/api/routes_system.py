@@ -13,7 +13,7 @@ from fastapi.responses import (
     Response,
 )
 
-from .. import catalog
+from .. import catalog, selfcheck
 from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
@@ -801,3 +801,209 @@ def unload_models(request: Request,
     require_admin(principal)
     state.registry.unload_all()
     return {"unloaded": True}
+
+
+# ---------------------------------------------------------------------------
+# Автодиагностика
+# ---------------------------------------------------------------------------
+
+@router.get("/system/selfcheck", summary="Автодиагностика всей системы")
+def system_selfcheck(request: Request,
+                     deep: bool = Query(default=False),
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Состояние всех подсистем сразу: что работает, что сломано, что делать.
+
+    `deep=1` добавляет дорогие проверки: целостность базы, разбор станций
+    АТС, пробу сервера языковой модели, обход каталогов и попытку
+    достучаться до внешних адресов. Это секунды против миллисекунд,
+    поэтому панель опрашивает обычный вариант, а «проверить всё» —
+    глубокий.
+
+    Ключу без прав администратора ответ выдаётся без раскладки каталогов и
+    без адресов: соседние GET /api/system и GET /api/settings прячут
+    `paths` ровно по этой причине, и диагностика, отдающая путь к базе и
+    адрес приёмника метрик любому ключу, сводила бы ту защиту на нет.
+    Сами неисправности при этом видны всем — скрывать от оператора, что
+    сервер нездоров, незачем.
+    """
+    state = get_state(request)
+    свод = selfcheck.состояние(state, глубоко=bool(deep))
+    # Запись в журнал — только по изменениям и только от администратора.
+    # Иначе опрос панели обычным ключом наполнял бы ленту событий теми же
+    # строками, а мы бы ещё и писали в базу на каждый GET.
+    if principal.is_admin:
+        try:
+            свод["journal"] = selfcheck.записать_проблемы(state.db, свод)
+        except Exception as exc:                               # noqa: BLE001
+            # Диагностика не обязана падать из-за того, что не смогла
+            # записать о себе в журнал: свод уже собран, и он нужен.
+            log.warning("Проблемы не записаны в журнал: %s", exc)
+    else:
+        свод = selfcheck.спрятать_пути(свод, state.settings)
+    return свод
+
+
+#: Виды событий, которые считаются неисправностями, и их уровень. Уровня у
+#: события в базе нет — есть вид; перечень явный, потому что «всё, кроме
+#: хорошего» затащило бы в список проблем создание заданий и смену
+#: приоритета, а в них ничего неисправного нет.
+PROBLEM_KINDS = {
+    "failed": "error",
+    "warning": "warning",
+    "retry_scheduled": "warning",
+    "alert_firing": "error",
+    "employees_sync_failed": "warning",
+    "selfcheck": "warning",
+    "agent_removed": "warning",
+}
+
+
+def _problem_row(at: Any, level: str, source: str, what: str,
+                 hint: str = "", **extra: Any) -> dict[str, Any]:
+    """Одна строка журнала проблем — одинаковая для всех источников."""
+    return {"at": at, "level": level, "source": source,
+            "what": str(what or "")[:1000], "hint": str(hint or "")[:1000], **extra}
+
+
+@router.get("/system/problems", summary="Журнал проблем и неисправностей")
+def system_problems(request: Request,
+                    since: float = Query(default=0.0, ge=0),
+                    limit: int = Query(default=200, ge=1, le=2000),
+                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Всё плохое в одном списке: и то, что происходит сейчас, и то, что было.
+
+    До этого маршрута ответ на вопрос «что у нас ломалось на прошлой
+    неделе» собирался из четырёх мест: неудавшиеся задания — в разделе
+    заданий, тревоги — в мониторинге, сбои станций — в «АТС», ошибки
+    разбора — в смысловом слое. Пока их четыре, никто не смотрит ни в
+    одно.
+
+    `since` — момент времени (секунды эпохи); по умолчанию сутки назад.
+    Ключ без прав администратора видит только свои задания и события своих
+    заданий — ровно как в GET /api/jobs и GET /api/events.
+    """
+    state = get_state(request)
+    начало = float(since) if since else time.time() - 86400
+    записи: list[dict[str, Any]] = []
+
+    # 1. То, что не так прямо сейчас. Без глубоких проверок: этот маршрут
+    #    вызывают из ленты, а не по кнопке «проверить всё».
+    свод: dict[str, Any] = {}
+    try:
+        свод = selfcheck.состояние(state, глубоко=False)
+        for проблема in свод.get("problems", []):
+            записи.append(_problem_row(
+                проблема["at"],
+                "error" if проблема["state"] == "fail" else "warning",
+                f"диагностика · {проблема.get('component_title')}",
+                f"{проблема['title']}: {проблема.get('value', '')}",
+                проблема.get("hint", ""),
+                component=проблема.get("component"), id=проблема.get("id"),
+                current=True))
+    except Exception as exc:                                   # noqa: BLE001
+        log.warning("Свод диагностики для журнала проблем не собран: %s", exc)
+        записи.append(_problem_row(
+            time.time(), "error", "диагностика",
+            f"Автодиагностика не отработала: {exc}",
+            "Смотрите журнал сервера: не работает сама проверка."))
+
+    # 2. Неудавшиеся задания за период. Разрез по владельцу тот же, что у
+    #    списка заданий: иначе в «журнале проблем» показывались бы чужие
+    #    имена файлов — а в колл-центре имя файла это номер клиента.
+    try:
+        for job in state.db.list_jobs(status="failed", since=начало,
+                                      owner=scope_owner(principal),
+                                      limit=min(limit, 500), light=True):
+            записи.append(_problem_row(
+                job.get("finished_at") or job.get("created_at"), "error",
+                "задание",
+                f"{job.get('filename') or job.get('id')}: "
+                f"{job.get('error_message') or 'ошибка без описания'}",
+                job.get("error_hint") or "",
+                job_id=job.get("id"), code=job.get("error_code")))
+    except Exception as exc:                                   # noqa: BLE001
+        log.warning("Неудавшиеся задания не прочитаны: %s", exc)
+
+    # 3. События сервера. Своими руками их не отфильтровать по виду в SQL —
+    #    берём с запасом и отбираем здесь; лента событий и так подрезана по
+    #    сроку хранения.
+    try:
+        свои: set[str] = set()
+        if not principal.is_admin:
+            свои = {j["id"] for j in state.db.list_jobs(
+                owner=scope_owner(principal), limit=2000, light=True)}
+        for событие in state.db.get_events(limit=min(limit * 5, 5000)):
+            уровень = PROBLEM_KINDS.get(str(событие.get("kind") or ""))
+            if уровень is None or float(событие.get("ts") or 0) < начало:
+                continue
+            # События без задания — общесистемные: тревоги, диагностика,
+            # сбои синхронизации. Их видит только администратор: в них
+            # имена ключей, адреса приёмников и пути.
+            job_id = событие.get("job_id")
+            if not principal.is_admin and (not job_id or job_id not in свои):
+                continue
+            данные = событие.get("data") if isinstance(событие.get("data"), dict) else {}
+            записи.append(_problem_row(
+                событие.get("ts"), уровень,
+                f"событие · {событие.get('kind')}",
+                событие.get("message") or str(событие.get("kind")),
+                str(данные.get("hint") or ""),
+                job_id=job_id))
+    except Exception as exc:                                   # noqa: BLE001
+        log.warning("Лента событий для журнала проблем не прочитана: %s", exc)
+
+    # 4. Телефония: у каждой станции своя последняя ошибка, и в общую
+    #    ленту она не попадает — поток забора пишет её только себе.
+    try:
+        телефония = getattr(state, "telephony", None)
+        if телефония is not None:
+            состояние_атс = телефония.status(for_admin=principal.is_admin)
+            for станция in состояние_атс.get("stations", []):
+                if станция.get("last_error"):
+                    записи.append(_problem_row(
+                        станция.get("last_run"), "error",
+                        f"АТС · {станция.get('name')}",
+                        str(станция["last_error"]),
+                        "Подробный разбор: GET /api/system/selfcheck?deep=1 — "
+                        "он называет причину, по которой звонки не приезжают.",
+                        component="telephony", id=станция.get("id")))
+    except Exception as exc:                                   # noqa: BLE001
+        log.warning("Состояние станций для журнала проблем не прочитано: %s", exc)
+
+    # 5. Смысловой слой: ошибки вызовов модели и очередь разбора.
+    try:
+        клиент = getattr(state, "llm", None)
+        if клиент is not None and клиент.enabled and клиент.last_error:
+            записи.append(_problem_row(
+                getattr(клиент, "last_call_at", None), "warning",
+                "языковая модель", str(клиент.last_error),
+                "Разбор пропускает записи, на которых модель ответила "
+                "ошибкой, и возвращается к ним позже.",
+                component="llm"))
+        сводка = state.db.llmq_stats(начало)
+        неудач = int(float(сводка.get("failed") or 0))
+        if неудач:
+            записи.append(_problem_row(
+                time.time(), "warning", "языковая модель",
+                f"Разбор не удался у {неудач} записей за период",
+                "Повторить: POST /api/llm/queue/retry-failed.",
+                component="llm"))
+    except Exception as exc:                                   # noqa: BLE001
+        log.warning("Состояние смыслового слоя для журнала проблем не прочитано: %s", exc)
+
+    # Свежее сверху: журнал читают с начала, и первым должно стоять то,
+    # что случилось только что. Записи без времени (их даёт станция, у
+    # которой ещё не было ни одного захода) не должны при этом уезжать в
+    # непредсказуемое место — считаем их самыми свежими.
+    записи.sort(key=lambda з: float(з.get("at") or time.time()), reverse=True)
+    ответ = {
+        "since": начало,
+        "at": time.time(),
+        "total": len(записи),
+        "items": записи[:limit],
+        "state": свод.get("state", "unknown"),
+        "summary": свод.get("summary", {}),
+    }
+    if not principal.is_admin:
+        ответ = selfcheck.спрятать_пути(ответ, state.settings)
+    return ответ

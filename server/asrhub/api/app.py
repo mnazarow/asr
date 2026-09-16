@@ -33,13 +33,17 @@ from ..streaming import StreamSession
 from ..telephony import Телефония
 from ..trends import Trends
 from .deps import SESSION_COOKIE, AppState, token_of
+from .routes_agent import router as agent_router
+from .routes_agent import управление as agent_admin_router
 from .routes_auth import router as auth_router
 from .routes_auth import users_router
 from .routes_backup import router as backup_router
 from .routes_catalog import router as catalog_router
 from .routes_content import router as content_router
+from .routes_employees import router as employees_router
 from .routes_jobs import router as jobs_router
 from .routes_llm import router as llm_router
+from .routes_llm_proxy import router as llm_proxy_router
 from .routes_monitoring import router as monitoring_router
 from .routes_phone import router as phone_router
 from .routes_review import router as review_router
@@ -564,8 +568,20 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(content_router)
     app.include_router(review_router)
     app.include_router(llm_router)
+    # Шлюз к модели из сети идёт ПОСЛЕ маршрутов слоя: у них общая
+    # приставка «/api/llm», и порядок здесь — единственное, что отделяет
+    # «/api/llm/v1/models» (список для чужих клиентов) от «/api/llm/models»
+    # (каталог установки). Пути разные, но держать их рядом надёжнее:
+    # добавит кто-нибудь «/api/llm/{раздел}» — и перехват станет возможен.
+    app.include_router(llm_proxy_router)
     app.include_router(trends_router)
     app.include_router(telephony_router)
+    # Справочник сотрудников: кто стоит за внутренним номером в журнале АТС.
+    app.include_router(employees_router)
+    # Маршруты агента идут ПОСЛЕ маршрутов телефонии: «/api/telephony/
+    # agents» не должен перехватываться «/api/telephony/{station}».
+    app.include_router(agent_router)
+    app.include_router(agent_admin_router)
     app.include_router(backup_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.

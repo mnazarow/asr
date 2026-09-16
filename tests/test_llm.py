@@ -446,8 +446,9 @@ def test_the_worker_yields_to_recognition_and_walks_the_archive(tmp_path):
         == {"l0", "l2"}
     # Выключенный разбор новых записей ничего не ставит в очередь.
     настройки.значения["llm_auto"] = False
+    db.llmq_clear()
     поток2.enqueue("l0")
-    assert поток2._pending.qsize() == 0
+    assert поток2.status()["queued"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +699,10 @@ def test_a_record_that_just_failed_waits_before_the_next_attempt(tmp_path):
     db.llm_save("l0", tasks.VERSION - 1, model="старая", summary="прежний разбор")
     assert поток._next() == "l0"
     поток._отметить_сбой("l0", "сервер лёг")
+    # `_next()` не подглядывает, а БЕРЁТ: запись, взятую из очереди, надо
+    # закрыть, иначе она так и останется выполняющейся. В рабочем потоке это
+    # делает `analyze_job`; здесь — руками.
+    db.llmq_finish("l0", error="сервер лёг")
     assert db.llm_get("l0")["summary"] == "прежний разбор"
     assert поток._next() is None, "к записи вернулись сразу после сбоя"
     поток._сбои["l0"] = time.time() - ОСТЫТЬ - 1

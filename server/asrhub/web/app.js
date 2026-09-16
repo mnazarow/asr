@@ -650,7 +650,12 @@ function updateProgress(message) {
 // ==========================================================================
 
 const VIEWS = {
+  dashboard:  { title: 'Дашборд', subtitle: 'Вся система разом: составные части, их состояние, связи между ними и журнал неисправностей' },
   transcribe: { title: 'Транскрибация', subtitle: 'Загрузка файлов и распознавание речи' },
+  rescan:     { title: 'Распознавание записей', subtitle: 'Повторное распознавание: одной записи, отобранных или всего архива — другой моделью или после правки настроек' },
+  voice:      { title: 'Голосовая аналитика', subtitle: 'Что языковая модель поняла из разговоров: темы и причины, исходы, обязательства, риски, соблюдение скрипта' },
+  llmqueue:   { title: 'Очередь LLM', subtitle: 'Ход смыслового разбора в реальном времени: что идёт сейчас, что ждёт, сколько заняло и чем кончилось' },
+  staff:      { title: 'Сотрудники', subtitle: 'Справочник: карточки, отделы, внутренние номера, импорт из выгрузки по адресу' },
   dictation:  { title: 'Диктовка', subtitle: 'Распознавание с микрофона на лету, без ожидания конца записи' },
   queue:      { title: 'Очередь', subtitle: 'Управление заданиями, приоритетами и воркерами' },
   results:    { title: 'Результаты', subtitle: 'Выполненные задания и выгрузка' },
@@ -881,11 +886,16 @@ document.addEventListener('DOMContentLoaded', () => {
 // Горячие клавиши
 // --------------------------------------------------------------------------
 
-const HOTKEY_VIEWS = ['transcribe', 'dictation', 'queue', 'results', 'analytics', 'trends',
-                      'pbx', 'telephony', 'models', 'compare', 'settings', 'system', 'monitoring'];
+// Цифры идут строго в порядке меню — иначе «раздел номер три» означает
+// разное у человека и у программы. Разделов больше, чем цифр, поэтому
+// номера получают первые десять, а список показывается в подсказке.
+const HOTKEY_VIEWS = ['dashboard', 'transcribe', 'dictation', 'queue', 'results',
+                      'rescan', 'analytics', 'trends', 'content', 'voice',
+                      'llmqueue', 'employees', 'pbx', 'telephony', 'models',
+                      'compare', 'staff', 'settings', 'system', 'monitoring'];
 
 const HOTKEY_HELP = [
-  ['1 … 0', 'переход к разделу по номеру (в порядке меню; на «Журнал» цифры не хватило)'],
+  ['1 … 0', 'переход к разделу по номеру: первые десять разделов в порядке меню'],
   ['/', 'поиск в текущем разделе'],
   ['u', 'выбрать файлы для загрузки'],
   ['r', 'обновить данные раздела'],
@@ -5445,6 +5455,8 @@ const ПАТС_ВКЛАДКИ = [
   { key: 'people', title: 'Очереди и операторы', hint: 'Кто принимает звонки и сколько разговаривает' },
   { key: 'numbers', title: 'Номера и направления', hint: 'Откуда и куда звонят, чем заканчивается' },
   { key: 'intake', title: 'Забор записей', hint: 'Что доехало, что пропущено и почему' },
+  { key: 'diag', title: 'Разбор', hint: 'Почему со станции не приходят звонки — по пунктам' },
+  { key: 'agents', title: 'Агенты на станциях', hint: 'Когда до АТС не дотянуться: агент живёт на ней сам' },
 ];
 
 const ПАТС_ИСТОЧНИКИ = {
@@ -5728,7 +5740,248 @@ RENDERERS.pbx = {
     if (вкладка === 'load') return this.drawLoad(тело, д);
     if (вкладка === 'people') return this.drawPeople(тело, д);
     if (вкладка === 'numbers') return this.drawNumbers(тело, д);
+    if (вкладка === 'diag') return this.drawDiag(тело);
+    if (вкладка === 'agents') return this.drawAgents(тело);
     return this.drawIntake(тело, д);
+  },
+
+  /* --- Разбор забора -------------------------------------------------- */
+
+  /**
+   * Почему со станции не приходят звонки.
+   *
+   * Самый частый ответ станции — «заход прошёл, новых звонков ноль», и он
+   * же самый бесполезный: выглядит как исправная работа. Разбор проходит
+   * по всем молчаливым причинам подряд и говорит не «не работает», а «вот
+   * что именно не так и что с этим делать».
+   */
+  drawDiag(тело) {
+    тело.innerHTML = `
+      <div class="row" style="gap:8px;margin-bottom:12px">
+        <button class="primary sm" id="pbx-diag-run">Разобрать забор</button>
+        <button class="btn sm" id="pbx-collect-all"
+          title="Пройти журнал станции с начала и поднять весь архив">Собрать весь архив</button>
+        <button class="ghost sm" id="pbx-collect-period"
+          title="Поднять звонки за выбранный промежуток">Собрать за период</button>
+        <span class="spacer"></span>
+        <button class="ghost sm" id="pbx-rewind"
+          title="Следующий заход пойдёт по журналу с начала; звонки не задваиваются">
+          Забыть позицию чтения</button>
+      </div>
+      <div id="pbx-collect"></div>
+      <div id="pbx-diag"><div class="empty">Нажмите «Разобрать забор»: проверка читает
+        журнал, каталог записей и настройки станции и ничего не меняет.</div></div>`;
+    qs('#pbx-diag-run').onclick = (е) => this.runDiag(е.currentTarget);
+    qs('#pbx-collect-all').onclick = (е) => this.collect('all', е.currentTarget);
+    qs('#pbx-collect-period').onclick = (е) => this.collect('period', е.currentTarget);
+    qs('#pbx-rewind').onclick = () => this.rewind();
+    this.pollCollect();
+  },
+
+  async runDiag(кнопка) {
+    const место = qs('#pbx-diag');
+    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Разбираю…'; }
+    if (место) место.innerHTML = '<div class="empty">Читаю журнал и каталог записей…</div>';
+    try {
+      const итог = await API.post(
+        `/api/telephony/diagnose?station=${encodeURIComponent(state.pbxStation || '')}`);
+      this.drawDiagResult(итог);
+    } catch (err) {
+      if (место) место.innerHTML = `<div class="empty">Разбор не удался: ${
+        esc(err.message || '')}</div>`;
+    } finally {
+      if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Разобрать забор'; }
+    }
+  },
+
+  drawDiagResult(итог) {
+    const место = qs('#pbx-diag');
+    if (!место) return;
+    const станции = (итог || {}).stations || [];
+    if (!станции.length) {
+      место.innerHTML = '<div class="empty">Станции не настроены.</div>';
+      return;
+    }
+    место.innerHTML = станции.map((с) => {
+      const вид = СОСТОЯНИЕ_ВИД[с.state] || СОСТОЯНИЕ_ВИД.off;
+      return card(`${с.name || с.station} · ${ПАТС_ИСТОЧНИКИ[с.source] || с.source}`,
+        `${с.failed ? `${с.failed} неисправностей` : (с.warned ? `${с.warned} предупреждений` : 'всё в порядке')}`,
+        `<div class="banner ${с.state === 'fail' ? 'err' : (с.state === 'warn' ? 'warn' : '')}"
+           style="${с.state === 'ok' ? 'background:var(--bg-elev-2);color:inherit;border-color:var(--border)' : ''}">
+           ${esc(с.verdict || '')}</div>
+         <div class="table-wrap"><table><tbody>
+          ${(с.checks || []).map((п) => `<tr>
+            <td style="width:18px"><span class="status-dot ${
+              (СОСТОЯНИЕ_ВИД[п.state] || СОСТОЯНИЕ_ВИД.off).dot}"></span></td>
+            <td style="width:220px">${esc(п.title)}</td>
+            <td class="small">${esc(String(п.value || ''))}
+              ${п.hint ? `<div class="dim" style="margin-top:3px">${esc(п.hint)}</div>` : ''}</td>
+          </tr>`).join('')}
+        </tbody></table></div>`,
+        `<span class="chip ${вид.cls}">${esc(вид.label)}</span>`);
+    }).join('');
+  },
+
+  async collect(режим, кнопка) {
+    let тело = { station: state.pbxStation || '', mode: режим };
+    if (режим === 'period') {
+      const с = window.prompt('Начало периода (ГГГГ-ММ-ДД):', '');
+      if (!с) return;
+      const по = window.prompt('Конец периода (ГГГГ-ММ-ДД):', '');
+      if (!по) return;
+      const начало = Date.parse(`${с}T00:00:00`) / 1000;
+      const конец = Date.parse(`${по}T23:59:59`) / 1000;
+      if (!начало || !конец || конец <= начало) {
+        toast('Не разобрал даты', 'warn', 'Ожидается вид 2026-09-01.');
+        return;
+      }
+      тело = { ...тело, since: начало, until: конец };
+    } else if (!window.confirm(
+      'Пройти журнал станции с начала и поднять весь архив?\n\n'
+      + 'Звонки не задваиваются: уже импортированные пропускаются. '
+      + 'На большом архиве это часы — ход виден здесь же.')) {
+      return;
+    }
+    if (кнопка) кнопка.disabled = true;
+    try {
+      await API.post('/api/telephony/collect', тело);
+      toast('Сбор запущен', 'ok');
+      this.pollCollect();
+    } catch (err) {
+      fail(err);
+    } finally {
+      if (кнопка) кнопка.disabled = false;
+    }
+  },
+
+  async pollCollect() {
+    const место = qs('#pbx-collect');
+    if (!место) return;
+    let данные;
+    try {
+      данные = await API.latest('pbx-collect', '/api/telephony/collect');
+    } catch (err) {
+      return;
+    }
+    const заходы = (данные || {}).runs || [];
+    if (!заходы.length) { место.innerHTML = ''; return; }
+    место.innerHTML = заходы.map((з) => card(
+      `Сбор архива · ${esc(з.station)}`,
+      з.running ? 'идёт' : 'завершён',
+      `<div class="grid cols-5">
+        ${kpi('Проходов', num(з.passes || 0), '')}
+        ${kpi('Увидено', num(з.seen || 0), 'звонков в журнале')}
+        ${kpi('Поставлено', num(з.imported || 0), 'в очередь распознавания')}
+        ${kpi('Пропущено', num(з.skipped || 0),
+          Object.entries(з.reasons || {}).map(([к, в]) => `${к}: ${в}`).join(', '))}
+        ${kpi('Вне периода', num(з.outside || 0), 'не попали в промежуток')}
+      </div>
+      ${з.error ? `<div class="banner err" style="margin-top:10px">${esc(з.error)}</div>` : ''}`)).join('');
+    if (заходы.some((з) => з.running)) setTimeout(() => this.pollCollect(), 3000);
+  },
+
+  async rewind() {
+    if (!state.pbxStation) {
+      toast('Выберите станцию', 'warn', 'Позиция чтения своя у каждой станции.');
+      return;
+    }
+    if (!window.confirm('Забыть позицию чтения журнала?\n\n'
+      + 'Следующий заход пойдёт с начала файла. Звонки не задваиваются.')) return;
+    try {
+      const итог = await API.post(
+        `/api/telephony/rewind?station=${encodeURIComponent(state.pbxStation)}`);
+      toast(`Позиция сброшена (была ${итог.was})`, 'ok');
+    } catch (err) { fail(err); }
+  },
+
+  /* --- Агенты на станциях --------------------------------------------- */
+
+  async drawAgents(тело) {
+    тело.innerHTML = '<div class="empty">Загрузка…</div>';
+    let данные;
+    try {
+      данные = await API.latest('pbx-agents', '/api/telephony/agents');
+    } catch (err) {
+      тело.innerHTML = `<div class="empty">Список агентов недоступен: ${
+        esc(err.message || '')}</div>`;
+      return;
+    }
+    const агенты = (данные || {}).agents || [];
+    const адрес = `${location.protocol}//${location.host}`;
+    const команда = `curl -fsSL '${адрес}/api/telephony/agent/install.sh' \\
+`
+      + `  -H 'X-API-Key: ВАШ_КЛЮЧ' | sudo bash -s -- \\
+`
+      + `  --url ${адрес} --key ВАШ_КЛЮЧ --name pbx`;
+    тело.innerHTML = `
+      ${card('Установка агента на станцию',
+        'одной командой по ssh — станции не нужно открывать наружу ни одного порта',
+        `<div class="small" style="margin-bottom:10px">
+          Агент читает журнал звонков и каталог записей прямо на АТС и сам
+          присылает разговоры сюда. Это путь для станции, до файлов которой
+          сервер распознавания дотянуться не может: за NAT, в другом городе,
+          под чужим присмотром.</div>
+        <pre class="mono" style="background:var(--bg);padding:12px;border-radius:6px;
+          white-space:pre-wrap;overflow-x:auto;margin:0">${esc(команда)}</pre>
+        <div class="small dim" style="margin-top:8px">
+          Подставьте ключ доступа с правом записи (раздел «Настройки» →
+          «Доступ»). Агент поставится службой, проверит себя и начнёт
+          присылать звонки. Полная установка и ключи — в справке.</div>`,
+        `<button class="ghost sm" id="pbx-copy-install">Скопировать</button>`)}
+      ${агенты.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Агент</th><th style="width:150px">Станция</th>
+          <th style="width:130px">Версия</th><th style="width:150px">Последняя связь</th>
+          <th style="width:110px">Прислал</th><th style="width:240px">Действия</th></tr></thead>
+        <tbody>${агенты.map((а) => {
+          const давно = а.last_seen ? (Date.now() / 1000 - а.last_seen) : Infinity;
+          return `<tr${а.enabled ? '' : ' class="dim"'}>
+            <td><b>${esc(а.name || а.id)}</b>
+              <div class="small dim mono">${esc(а.host || '')} · ${esc(а.id)}</div>
+              ${а.last_error ? `<div class="small err">${esc(а.last_error)}</div>` : ''}</td>
+            <td class="small mono">${esc(а.station || '')}</td>
+            <td class="small">${esc(а.version || '—')}
+              <div class="small dim">${esc(а.asterisk || '')}</div></td>
+            <td class="small ${давно > 86400 ? 'err' : ''}">${
+              а.last_seen ? fmtAgo(а.last_seen) : 'ни разу'}</td>
+            <td class="small">${num((а.calls || {}).total || а.calls_sent || 0)} звонков
+              <div class="small dim">${num(а.files_sent || 0)} записей</div></td>
+            <td class="nowrap">
+              <button class="ghost sm" data-cmd="all" data-agent="${esc(а.id)}"
+                title="Агент пришлёт весь архив станции">Собрать всё</button>
+              <button class="ghost sm" data-cmd="new" data-agent="${esc(а.id)}"
+                title="Только новые звонки">Новые</button>
+              <button class="ghost sm" data-drop="${esc(а.id)}" title="Забыть агента">×</button>
+            </td></tr>`;
+        }).join('')}</tbody></table></div>`
+        : '<div class="empty">Агенты пока не подключались.</div>'}`;
+
+    const копия = qs('#pbx-copy-install');
+    if (копия) копия.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(команда);
+        toast('Команда скопирована', 'ok');
+      } catch (err) {
+        toast('Скопировать не вышло', 'warn', 'Выделите текст команды вручную.');
+      }
+    };
+    qsa('[data-cmd]', тело).forEach((к) => {
+      к.onclick = async () => {
+        try {
+          await API.post(`/api/telephony/agents/${encodeURIComponent(к.dataset.agent)}/command`,
+            { mode: к.dataset.cmd });
+          toast('Задание поставлено: агент заберёт его при следующей связи', 'ok');
+        } catch (err) { fail(err); }
+      };
+    });
+    qsa('[data-drop]', тело).forEach((к) => {
+      к.onclick = async () => {
+        if (!window.confirm('Забыть агента?\n\nПрисланные им звонки останутся в архиве.')) return;
+        try {
+          await API.del(`/api/telephony/agents/${encodeURIComponent(к.dataset.drop)}`);
+          this.drawAgents(тело);
+        } catch (err) { fail(err); }
+      };
+    });
   },
 
   /* --- Обзор ---------------------------------------------------------- */
@@ -6418,7 +6671,11 @@ RENDERERS.pbx.edit = function (ид) {
       toast(ид ? 'Станция сохранена' : 'Станция добавлена', 'ok',
             ид ? '' : 'Первый заход пройдёт в ближайшую минуту — или нажмите «Забрать»');
       закрыть();
-      await RENDERERS.pbx.load();
+      // Форму станции открывают из двух мест: раздела «АТС» и настроек
+      // телефонии. Обновлять надо тот, из которого пришли, — иначе вызов
+      // рисовальщика чужого раздела пишет в узлы, которых на странице нет.
+      if (state.view === 'pbx') await RENDERERS.pbx.load();
+      else if (qs('#set-stations')) await drawStationsBox(qs('#set-stations'));
     } catch (err) {
       toast(err.message || 'Сохранить не удалось', 'err', err.hint || '');
     } finally {
@@ -9083,6 +9340,14 @@ RENDERERS.settings = {
     const врезка = (state.paramGroup === 'llm' && !search)
       ? h('<section class="card" id="llm-setup"><div class="empty">Смотрим, что стоит на сервере…</div></section>')
       : null;
+    // «Телефония» — та же история, что и с языковой моделью: главное здесь
+    // не параметр, а список станций. Раньше добавить вторую АТС можно было
+    // только из раздела «АТС», и человек, пришедший настраивать телефонию
+    // в «Настройки», видел два десятка полей одной-единственной станции и
+    // json-поле `telephony_stations`, которое надо было заполнять руками.
+    const станции = (state.paramGroup === 'telephony' && !search)
+      ? h('<section class="card" id="set-stations"><div class="empty">Смотрим станции…</div></section>')
+      : null;
 
     let items = state.params;
     if (search) {
@@ -9097,6 +9362,7 @@ RENDERERS.settings = {
       host.innerHTML = '<div class="card"><div class="empty">Параметров не найдено. ' +
         'Возможно, стоит включить показ параметров для опытных.</div></div>';
       if (врезка) { host.prepend(врезка); drawLlmSetup(врезка); }
+      if (станции) { host.prepend(станции); drawStationsBox(станции); }
       return;
     }
 
@@ -9122,8 +9388,68 @@ RENDERERS.settings = {
       host.appendChild(section);
     });
     if (врезка) { host.prepend(врезка); drawLlmSetup(врезка); }
+    if (станции) { host.prepend(станции); drawStationsBox(станции); }
   },
 };
+
+/**
+ * Врезка со списком станций прямо в настройках телефонии.
+ *
+ * Добавление станции — это не «изменить значение параметра», а отдельное
+ * действие с формой на два десятка полей и проверкой связи. Поэтому здесь
+ * — список и кнопки, а сама форма та же, что в разделе «АТС»: две разные
+ * формы для одного и того же разошлись бы через месяц.
+ */
+async function drawStationsBox(host) {
+  let д;
+  try {
+    д = await API.get('/api/telephony/stations');
+  } catch (err) {
+    host.innerHTML = `<div class="card-head"><h3>Подключённые АТС</h3></div>
+      <div class="empty small">${esc((err && err.message) || 'нет доступа')}</div>`;
+    return;
+  }
+  if (!host.isConnected) return;
+  const станции = (д && д.stations) || [];
+  host.innerHTML = `
+    <div class="card-head"><h3>Подключённые АТС</h3>
+      <span class="hint">станций может быть сколько угодно: у каждой свой источник,
+        учётные данные, каталог записей и правила</span>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="set-pbx-open">Раздел «АТС»</button>
+      <button class="primary sm" id="set-pbx-add">+ Добавить АТС</button></div>
+    ${станции.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Станция</th><th style="width:150px">Источник</th>
+        <th style="width:220px">Откуда берём</th><th style="width:110px">Состояние</th>
+        <th style="width:90px"></th></tr></thead>
+      <tbody>${станции.map((с) => `<tr${с.enabled ? '' : ' class="dim"'}>
+        <td><b>${esc(с.name || с.id)}</b>
+          <div class="small dim mono">${esc(с.id)}</div></td>
+        <td class="small">${esc(ПАТС_ИСТОЧНИКИ[с.source] || с.source || '')}</td>
+        <td class="small dim truncate" style="max-width:220px">${
+          esc(с.cdr_file || с.host || с.recordings_dir || '')}</td>
+        <td><span class="chip ${с.enabled ? 'ok' : ''}">${
+          с.enabled ? 'включена' : 'выключена'}</span></td>
+        <td><button class="ghost sm" data-station="${esc(с.id)}">Правка</button></td>
+      </tr>`).join('')}</tbody></table></div>`
+      : `<div class="empty">Ни одной станции не подключено.
+           <div class="small dim" style="margin-top:6px">Добавьте АТС здесь или поставьте
+           на неё агента — раздел «АТС» → «Агенты на станциях».</div></div>`}
+    <div class="small dim" style="padding:10px 16px 14px">
+      Параметры ниже — умолчания для станций, у которых своё значение не
+      задано: станция, заведённая без каталога записей, возьмёт его отсюда.</div>`;
+
+  // Редактор станции ищет её в `state.pbxData` — он написан для раздела
+  // «АТС», и заводить ему второй способ получения данных значило бы
+  // получить две формы, которые разойдутся через месяц. Кладём станции
+  // туда, где он их ищет.
+  state.pbxData = Object.assign({}, state.pbxData || {}, { stations: станции });
+  qs('#set-pbx-add', host).onclick = () => RENDERERS.pbx.edit(null);
+  qs('#set-pbx-open', host).onclick = () => go('pbx');
+  qsa('[data-station]', host).forEach((к) => {
+    к.onclick = () => RENDERERS.pbx.edit(к.dataset.station);
+  });
+}
 
 
 /* ========================================================================
@@ -10735,4 +11061,1560 @@ curl -H "X-API-Key: ${esc(key)}" "${location.origin}/api/analytics?period=week"<
   },
 };
 
+
+// ==========================================================================
+// Очередь запросов к языковой модели
+// ==========================================================================
+
+/** Подписи состояний очереди и их цвета. Ключи — те же слова, что в базе. */
+const LLMQ_СОСТОЯНИЯ = {
+  'идёт': { label: 'идёт', cls: 'accent' },
+  'ждёт': { label: 'ждёт', cls: '' },
+  'готово': { label: 'готово', cls: 'ok' },
+  'ошибка': { label: 'ошибка', cls: 'err' },
+  'отменён': { label: 'отменён', cls: 'warn' },
+};
+
+/** Параметры очереди, вынесенные в раздел: те же карточки, что в настройках. */
+const LLMQ_ПАРАМЕТРЫ = ['llm_queue_paused', 'llm_max_concurrent', 'llm_queue_batch',
+                        'llm_queue_idle_s', 'llm_queue_cooldown_s',
+                        'llm_queue_keep_days', 'llm_queue_priority_new',
+                        'llm_queue_priority_manual', 'llm_queue_priority_backfill',
+                        'llm_yield_to_queue', 'llm_auto', 'llm_backfill'];
+
+RENDERERS.llmqueue = {
+  async render(root) {
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <button class="primary sm" id="lq-pause">Приостановить</button>
+        <button class="btn sm" id="lq-pending" title="Поставить в очередь все записи без разбора">
+          Разобрать всё неразобранное</button>
+        <button class="btn sm" id="lq-failed" title="Повторить записи, на которых разбор сорвался">
+          Повторить упавшие</button>
+        <span class="spacer"></span>
+        <select id="lq-state" style="width:170px"
+          title="Показывать только записи в этом состоянии">
+          <option value="">все состояния</option>
+          <option value="идёт">идёт</option>
+          <option value="ждёт">ждёт</option>
+          <option value="готово">готово</option>
+          <option value="ошибка">ошибка</option>
+          <option value="отменён">отменён</option>
+        </select>
+        <select id="lq-hours" style="width:140px" title="Окно графика и сводки">
+          <option value="6">6 часов</option>
+          <option value="24" selected>сутки</option>
+          <option value="72">трое суток</option>
+          <option value="168">неделя</option>
+        </select>
+        <button class="ghost sm" id="lq-clear" title="Убрать из очереди всё, кроме идущего">Очистить</button>
+        <button class="ghost sm" id="lq-refresh" title="Обновить сейчас">Обновить</button>
+      </div>
+      <div id="lq-top"></div>
+      <div id="lq-current"></div>
+      <div id="lq-chart"></div>
+      <div id="lq-table"><div class="empty">Загрузка…</div></div>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Настройки очереди</h3>
+          <span class="hint">те же параметры, что в разделе «Настройки» → «Очередь запросов к модели»</span></div>
+        <div class="params" id="lq-params" style="padding:14px 16px"></div>
+      </section>`;
+
+    qs('#lq-pause').addEventListener('click', () => this.pause());
+    qs('#lq-pending').addEventListener('click', (е) => this.add('pending', е.currentTarget));
+    qs('#lq-failed').addEventListener('click', (е) => this.add('failed', е.currentTarget));
+    qs('#lq-clear').addEventListener('click', () => this.clear());
+    qs('#lq-refresh').addEventListener('click', () => this.load());
+    qs('#lq-state').addEventListener('change', () => this.load());
+    qs('#lq-hours').addEventListener('change', () => this.load());
+
+    this.drawParams();
+    await this.load();
+    // Раздел про «в реальном времени»: опрос чаще, чем в остальных, но не
+    // чаще двух секунд — ответ собирается из пяти запросов к базе.
+    viewTimer(() => this.load(true), 2500);
+    // Секундомер идущего запроса тикает отдельно и без запросов к серверу:
+    // «идёт 4 с» должно расти плавно, а не прыгать через опрос.
+    viewTimer(() => this.tickCurrent(), 1000);
+  },
+
+  async load(тихо) {
+    const состояние = qs('#lq-state') ? qs('#lq-state').value : '';
+    const часы = qs('#lq-hours') ? qs('#lq-hours').value : '24';
+    try {
+      state.llmQueue = await API.latest('llm-queue',
+        `/api/llm/queue?state=${encodeURIComponent(состояние)}&hours=${часы}&limit=100`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      if (!тихо) {
+        const место = qs('#lq-table');
+        if (место) место.innerHTML = `<div class="empty">Раздел недоступен: ${
+          esc(err.message || '')}</div>`;
+      }
+      return;
+    }
+    this.drawTop();
+    this.drawCurrent();
+    this.drawChart();
+    this.drawTable();
+  },
+
+  drawTop() {
+    const место = qs('#lq-top');
+    const д = state.llmQueue || {};
+    if (!место) return;
+    const счёт = д.counts || {};
+    const свод = д.stats || {};
+    const нстр = д.settings || {};
+    const клиент = д.client || {};
+    const всего = Number(свод.n || 0);
+    const сбоев = Number(свод.failed || 0);
+    const доля = всего ? сбоев / всего : 0;
+    // Значок в меню: очередь, о которой не знаешь, — это очередь, которая
+    // стоит. Счётчик виден из любого раздела.
+    const значок = qs('#badge-llmq');
+    if (значок) {
+      const ждут = Number(счёт['ждёт'] || 0);
+      значок.hidden = !ждут;
+      значок.textContent = ждут > 999 ? '999+' : String(ждут);
+    }
+    место.innerHTML = `<div class="grid cols-6" style="margin-bottom:16px">
+      ${kpi('Идёт сейчас', клиент.enabled === false ? '—' : (д.current ? '1' : '0'),
+        нстр.paused ? '<span class="err">очередь приостановлена</span>'
+          : (клиент.enabled === false ? 'модель выключена'
+            : `не больше ${нстр.max_concurrent || 1} за раз`))}
+      ${kpi('Ждут разбора', num(счёт['ждёт'] || 0),
+        `${num(счёт['идёт'] || 0)} в работе`)}
+      ${kpi('Разобрано за окно', num(всего),
+        `${num(свод.ok || 0)} успешно`)}
+      ${kpi('Сбоев', num(сбоев),
+        всего ? `${pct(доля, 1)} от разобранного` : 'разборов не было',
+        сбоев ? { dir: 'down', text: доля > 0.1 ? 'много' : 'бывает' } : null)}
+      ${kpi('Среднее время ответа', свод.avg_ms ? fmtDur(свод.avg_ms / 1000) : '—',
+        свод.max_ms ? `дольше всего ${fmtDur(свод.max_ms / 1000)}` : '')}
+      ${kpi('Среднее ожидание', свод.wait_s ? fmtDur(свод.wait_s) : '—',
+        'от постановки до начала разбора')}
+    </div>`;
+  },
+
+  drawCurrent() {
+    const место = qs('#lq-current');
+    const д = state.llmQueue || {};
+    if (!место) return;
+    const т = д.current;
+    const нстр = д.settings || {};
+    if (!т) {
+      const причина = нстр.paused ? 'Очередь приостановлена.'
+        : (д.client && д.client.enabled === false ? 'Языковая модель выключена в настройках.'
+          : (Number((д.counts || {})['ждёт'] || 0)
+            ? 'Записи ждут: разбор уступает распознаванию, пока очередь заданий не опустеет.'
+            : 'Очередь пуста — разбирать нечего.'));
+      место.innerHTML = card('Сейчас', '', `<div class="empty">${esc(причина)}</div>`);
+      return;
+    }
+    место.innerHTML = card('Сейчас разбирается', 'запрос к модели идёт один за раз',
+      `<div class="row" style="gap:16px;align-items:flex-start;padding:2px 0">
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+               title="${esc(т.filename || т.job_id)}">${esc(т.filename || т.job_id)}</div>
+          <div class="small dim mono">${esc(т.job_id)}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="kpi-value" id="lq-timer">—</div>
+          <div class="small dim">${т.duration_s ? `запись ${fmtDur(т.duration_s)}` : ''}</div>
+        </div>
+        <button class="ghost sm" id="lq-open">Открыть запись</button>
+      </div>
+      <div class="progress" style="margin-top:10px"><span id="lq-progress"
+        style="width:8%"></span></div>`);
+    const кнопка = qs('#lq-open');
+    if (кнопка) кнопка.onclick = () => window.__asrhub.openJob(т.job_id);
+    this.tickCurrent();
+  },
+
+  /** Секундомер идущего запроса: растёт сам, без обращений к серверу. */
+  tickCurrent() {
+    const д = state.llmQueue || {};
+    const т = д.current;
+    const место = qs('#lq-timer');
+    if (!место || !т || !т.since) return;
+    const прошло = Math.max(0, Date.now() / 1000 - т.since);
+    место.textContent = fmtDur(прошло);
+    const полоса = qs('#lq-progress');
+    if (!полоса) return;
+    // Настоящего хода у разбора нет: модель не сообщает, сколько осталось.
+    // Показываем долю от среднего времени ответа — это честная оценка, и
+    // она же выдаёт затык: полоса упёрлась в конец и стоит.
+    const среднее = Number((д.stats || {}).avg_ms || 0) / 1000 || 30;
+    const доля = Math.min(0.98, прошло / (среднее * 1.5));
+    полоса.style.width = `${Math.max(4, доля * 100).toFixed(1)}%`;
+    полоса.classList.toggle('warn', прошло > среднее * 3);
+  },
+
+  drawChart() {
+    const место = qs('#lq-chart');
+    const д = state.llmQueue || {};
+    if (!место) return;
+    const ряд = ((д.series || {}).rows) || [];
+    if (!ряд.length) {
+      место.innerHTML = card('Ход разбора', '', '<div class="empty">За окно разборов не было.</div>');
+      return;
+    }
+    const корзин = (д.series || {}).buckets || ряд.length;
+    const с_какого = (д.series || {}).since || 0;
+    const ширина = ((д.stats || {}).since ? (Date.now() / 1000 - с_какого) : 3600) / корзин;
+    const метки = [];
+    const разобрано = [];
+    const сбои = [];
+    const время = [];
+    // Корзины приходят разрежённо: пустые сервер не присылает. Развернём в
+    // сплошной ряд, иначе линия времени ответа склеит соседние часы.
+    const по_корзинам = new Map(ряд.map((с) => [Number(с.bucket), с]));
+    for (let i = 0; i < корзин; i += 1) {
+      const с = по_корзинам.get(i);
+      метки.push(подписьВремени(с_какого + i * ширина, ширина));
+      разобрано.push(с ? Number(с.n || 0) : 0);
+      сбои.push(с ? Number(с.failed || 0) : 0);
+      время.push(с && с.avg_ms ? Number(с.avg_ms) / 1000 : null);
+    }
+    место.innerHTML = `<div class="grid cols-2">
+      ${card('Разобрано', 'по корзинам окна', '<div id="lq-c1" class="chart"></div>')}
+      ${card('Время ответа модели', 'среднее по корзине, секунды',
+        '<div id="lq-c2" class="chart"></div>')}
+    </div>`;
+    window.Charts.stacked(qs('#lq-c1'), {
+      labels: метки,
+      series: [{ name: 'успешно', values: разобрано.map((з, i) => з - сбои[i]) },
+               { name: 'сбои', values: сбои, color: 'err' }],
+      height: 200,
+    });
+    window.Charts.line(qs('#lq-c2'), {
+      labels: метки,
+      series: [{ name: 'секунд на запись', values: время }],
+      height: 200, emptyText: 'нет завершённых разборов',
+    });
+  },
+
+  drawTable() {
+    const место = qs('#lq-table');
+    const д = state.llmQueue || {};
+    if (!место) return;
+    const строки = ((д.queue || {}).items) || [];
+    if (!строки.length) {
+      место.innerHTML = card('Очередь', '', '<div class="empty">Очередь пуста.</div>');
+      return;
+    }
+    const сейчас = Date.now() / 1000;
+    место.innerHTML = card('Очередь', `${num((д.queue || {}).total || 0)} записей`,
+      `<div class="table-wrap"><table>
+        <thead><tr>
+          <th style="width:90px">Состояние</th>
+          <th>Запись</th>
+          <th style="width:110px">Повод</th>
+          <th style="width:70px" title="Из очереди первой берётся запись с большей важностью">Важн.</th>
+          <th style="width:110px">Ждала</th>
+          <th style="width:110px">Заняло</th>
+          <th style="width:80px">Попыток</th>
+          <th style="width:130px">Действия</th>
+        </tr></thead><tbody>
+        ${строки.map((с) => {
+          const вид = LLMQ_СОСТОЯНИЯ[с.state] || { label: с.state, cls: '' };
+          const ждала = с.started_at && с.enqueued_at ? с.started_at - с.enqueued_at
+            : (с.state === 'ждёт' && с.enqueued_at ? сейчас - с.enqueued_at : null);
+          return `<tr>
+            <td><span class="chip ${вид.cls}">${esc(вид.label)}</span></td>
+            <td><a href="#" data-open="${esc(с.job_id)}"
+                  title="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a>
+                ${с.error ? `<div class="small err">${esc(с.error)}</div>` : ''}</td>
+            <td class="small dim">${esc(с.kind || '')}</td>
+            <td>${num(с.priority || 0)}</td>
+            <td class="small">${ждала === null ? '—' : fmtDur(ждала)}</td>
+            <td class="small">${с.latency_ms ? fmtDur(с.latency_ms / 1000) : '—'}</td>
+            <td class="small">${num(с.attempts || 0)}</td>
+            <td class="row" style="gap:4px">
+              ${с.state === 'ждёт' ? `<button class="ghost sm" data-top="${esc(с.job_id)}"
+                  title="Разобрать следующей">↑</button>
+                <button class="ghost sm" data-drop="${esc(с.job_id)}"
+                  title="Убрать из очереди">×</button>` : ''}
+              ${с.state === 'ошибка' ? `<button class="ghost sm" data-retry="${esc(с.job_id)}"
+                  title="Поставить в очередь заново">↻</button>` : ''}
+            </td></tr>`;
+        }).join('')}
+      </tbody></table></div>`);
+
+    qsa('[data-open]', место).forEach((к) => {
+      к.onclick = (е) => { е.preventDefault(); window.__asrhub.openJob(к.dataset.open); };
+    });
+    qsa('[data-top]', место).forEach((к) => {
+      к.onclick = async () => {
+        await API.post(`/api/llm/queue/${encodeURIComponent(к.dataset.top)}/top`);
+        toast('Запись поднята в начало очереди', 'ok');
+        this.load();
+      };
+    });
+    qsa('[data-retry]', место).forEach((к) => {
+      к.onclick = async () => {
+        await API.post('/api/llm/queue/add', { job_ids: [к.dataset.retry], kind: 'повтор' });
+        toast('Запись поставлена в очередь', 'ok');
+        this.load();
+      };
+    });
+    qsa('[data-drop]', место).forEach((к) => {
+      к.onclick = async () => {
+        try {
+          await API.del(`/api/llm/queue/${encodeURIComponent(к.dataset.drop)}`);
+          this.load();
+        } catch (err) { fail(err); }
+      };
+    });
+  },
+
+  drawParams() {
+    const место = qs('#lq-params');
+    if (!место) return;
+    место.innerHTML = '';
+    LLMQ_ПАРАМЕТРЫ.forEach((ключ) => {
+      const spec = paramByKey(ключ);
+      if (!spec) return;
+      место.appendChild(paramCard(spec, state.settings[ключ], async (значение) => {
+        try {
+          await API.put('/api/settings', { [ключ]: значение });
+          state.settings[ключ] = значение;
+          toast('Сохранено', 'ok');
+          this.load();
+        } catch (err) { fail(err); }
+      }));
+    });
+  },
+
+  async pause() {
+    const д = state.llmQueue || {};
+    const было = Boolean((д.settings || {}).paused);
+    try {
+      await API.post('/api/llm/queue/pause', { paused: !было });
+      state.settings.llm_queue_paused = !было;
+      toast(было ? 'Очередь продолжена' : 'Очередь приостановлена', 'ok');
+      this.drawParams();
+      this.load();
+    } catch (err) { fail(err); }
+  },
+
+  async add(отбор, кнопка) {
+    if (кнопка) кнопка.disabled = true;
+    try {
+      const итог = await API.post('/api/llm/queue/add', { scope: отбор, limit: 20000 });
+      toast(итог.queued ? `Поставлено в очередь: ${итог.queued}` : 'Ставить нечего',
+        итог.queued ? 'ok' : 'warn');
+      this.load();
+    } catch (err) {
+      fail(err);
+    } finally {
+      if (кнопка) кнопка.disabled = false;
+    }
+  },
+
+  async clear() {
+    if (!window.confirm('Убрать из очереди всё, что ещё не разобрано?\n\n'
+      + 'Идущий разбор не прерывается, разобранное остаётся на месте.')) return;
+    try {
+      const итог = await API.post('/api/llm/queue/clear', { state: '' });
+      toast(`Убрано записей: ${итог.removed}`, 'ok');
+      this.load();
+    } catch (err) { fail(err); }
+  },
+};
+
+// ==========================================================================
+// Распознавание записей: повторный проход по архиву
+// ==========================================================================
+
+/** Что можно поменять при повторном распознавании — и в каком порядке
+ *  показывать. Порядок не случаен: сверху то, ради чего перераспознают
+ *  чаще всего (модель), снизу — тонкая настройка. */
+const РАСПОЗН_ПАРАМЕТРЫ = ['model', 'engine', 'language', 'task',
+                           'vad_enabled', 'diarization_enabled', 'punctuation',
+                           'beam_size', 'temperature'];
+
+RENDERERS.rescan = {
+  выбранные: new Set(),
+  переопределения: {},
+
+  async render(root) {
+    this.выбранные = new Set();
+    this.переопределения = {};
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <select id="rs-status" style="width:190px" title="Какие записи показывать">
+          <option value="completed">готовые</option>
+          <option value="failed">с ошибкой</option>
+          <option value="completed,failed">готовые и с ошибкой</option>
+        </select>
+        <select id="rs-period" style="width:150px" title="За какой срок">
+          <option value="">за всё время</option>
+          <option value="1">за сутки</option>
+          <option value="7">за неделю</option>
+          <option value="30">за месяц</option>
+          <option value="90">за квартал</option>
+        </select>
+        <select id="rs-model" style="width:210px"
+          title="Только записи, распознанные этой моделью">
+          <option value="">любой моделью</option>
+        </select>
+        <input type="search" id="rs-search" placeholder="поиск по имени файла" style="width:220px">
+        <span class="spacer"></span>
+        <button class="btn sm" id="rs-selected" disabled>Распознать отмеченные</button>
+        <button class="danger sm" id="rs-all" title="Повторно распознать всё, что подходит под отбор">
+          Распознать все заново</button>
+        <button class="ghost sm" id="rs-refresh">Обновить</button>
+      </div>
+
+      <section class="card">
+        <div class="card-head"><h3>Чем распознавать</h3>
+          <span class="hint">пусто — теми же параметрами, что и в прошлый раз</span>
+          <span class="spacer"></span>
+          <button class="ghost sm" id="rs-reset-params">Сбросить</button></div>
+        <div style="padding:12px 16px" class="row" id="rs-params"></div>
+        <div class="small dim" style="padding:0 16px 14px">
+          Заданное здесь заменит параметры записи при повторном проходе. Всё
+          остальное останется прежним: файл, метки, владелец, связь со звонком.
+        </div>
+      </section>
+
+      <div id="rs-top"></div>
+      <div id="rs-table"><div class="empty">Загрузка…</div></div>`;
+
+    qs('#rs-status').addEventListener('change', () => this.load());
+    qs('#rs-period').addEventListener('change', () => this.load());
+    qs('#rs-model').addEventListener('change', () => this.load());
+    qs('#rs-refresh').addEventListener('click', () => this.load());
+    qs('#rs-selected').addEventListener('click', () => this.rescan(false));
+    qs('#rs-all').addEventListener('click', () => this.rescan(true));
+    qs('#rs-reset-params').addEventListener('click', () => {
+      this.переопределения = {};
+      this.drawParams();
+    });
+    let таймер;
+    qs('#rs-search').addEventListener('input', () => {
+      clearTimeout(таймер);
+      таймер = setTimeout(() => this.load(), 350);
+    });
+
+    // Список моделей для отбора — из того, чем архив уже распознан, а не из
+    // каталога: в каталоге семьдесят моделей, а в архиве обычно две.
+    const выбор = qs('#rs-model');
+    (state.models || []).forEach((м) => {
+      const о = document.createElement('option');
+      о.value = м.id;
+      о.textContent = м.name || м.id;
+      выбор.appendChild(о);
+    });
+
+    this.drawParams();
+    await this.load();
+    viewTimer(() => this.load(true), 6000);
+  },
+
+  drawParams() {
+    const место = qs('#rs-params');
+    if (!место) return;
+    место.innerHTML = '';
+    место.style.flexWrap = 'wrap';
+    место.style.gap = '12px';
+    РАСПОЗН_ПАРАМЕТРЫ.forEach((ключ) => {
+      const spec = paramByKey(ключ);
+      if (!spec) return;
+      const обёртка = document.createElement('label');
+      обёртка.className = 'small';
+      обёртка.style.cssText = 'display:flex;flex-direction:column;gap:4px;min-width:170px';
+      обёртка.innerHTML = `<span class="dim">${esc(spec.label)}</span>`;
+      обёртка.appendChild(paramControl(spec, this.переопределения[ключ], (значение) => {
+        if (значение === '' || значение === null || значение === undefined) {
+          delete this.переопределения[ключ];
+        } else {
+          this.переопределения[ключ] = значение;
+        }
+        this.drawTop();
+      }, true));
+      место.appendChild(обёртка);
+    });
+  },
+
+  параметрыОтбора() {
+    const дней = qs('#rs-period') ? qs('#rs-period').value : '';
+    const п = new URLSearchParams();
+    п.set('status', qs('#rs-status') ? qs('#rs-status').value : 'completed');
+    п.set('limit', '200');
+    if (дней) п.set('since', String(Math.floor(Date.now() / 1000 - Number(дней) * 86400)));
+    const модель = qs('#rs-model') ? qs('#rs-model').value : '';
+    if (модель) п.set('model', модель);
+    const поиск = qs('#rs-search') ? qs('#rs-search').value.trim() : '';
+    if (поиск) п.set('search', поиск);
+    return п;
+  },
+
+  async load(тихо) {
+    try {
+      const п = this.параметрыОтбора();
+      state.rescanData = await API.latest('rescan', `/api/jobs?${п.toString()}`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      if (!тихо) {
+        const место = qs('#rs-table');
+        if (место) место.innerHTML = `<div class="empty">Не удалось получить список: ${
+          esc(err.message || '')}</div>`;
+      }
+      return;
+    }
+    this.drawTop();
+    this.drawTable();
+  },
+
+  drawTop() {
+    const место = qs('#rs-top');
+    const д = state.rescanData || {};
+    if (!место) return;
+    const записи = д.jobs || d_items(д);
+    const всего = Number(д.total || записи.length);
+    const часы = записи.reduce((с, з) => с + Number(з.media_duration_s || 0), 0) / 3600;
+    const с_ошибкой = записи.filter((з) => з.status === 'failed').length;
+    const правки = Object.keys(this.переопределения);
+    место.innerHTML = `<div class="grid cols-4" style="margin:14px 0">
+      ${kpi('Подходит под отбор', num(всего), `показано ${записи.length}`)}
+      ${kpi('Звука в показанном', `${num(часы, 1)} ч`,
+        'столько придётся распознать заново')}
+      ${kpi('С ошибкой', num(с_ошибкой), с_ошибкой ? 'их стоит повторить в первую очередь' : '')}
+      ${kpi('Отмечено', num(this.выбранные.size),
+        правки.length ? `правок параметров: ${правки.length}` : 'параметры не меняются')}
+    </div>`;
+    const кнопка = qs('#rs-selected');
+    if (кнопка) {
+      кнопка.disabled = !this.выбранные.size;
+      кнопка.textContent = this.выбранные.size
+        ? `Распознать отмеченные (${this.выбранные.size})` : 'Распознать отмеченные';
+    }
+  },
+
+  drawTable() {
+    const место = qs('#rs-table');
+    const д = state.rescanData || {};
+    if (!место) return;
+    const записи = д.jobs || d_items(д);
+    if (!записи.length) {
+      место.innerHTML = card('Записи', '', '<div class="empty">Под отбор ничего не подошло.</div>');
+      return;
+    }
+    место.innerHTML = card('Записи', `${записи.length} на экране`,
+      `<div class="table-wrap"><table>
+        <thead><tr>
+          <th style="width:34px"><input type="checkbox" id="rs-check-all"
+            title="Отметить все показанные"></th>
+          <th>Файл</th>
+          <th style="width:110px">Состояние</th>
+          <th style="width:150px">Модель</th>
+          <th style="width:90px">Длительность</th>
+          <th style="width:90px">RTF</th>
+          <th style="width:150px">Когда</th>
+          <th style="width:110px"></th>
+        </tr></thead><tbody>
+        ${записи.map((з) => `<tr>
+          <td><input type="checkbox" data-pick="${esc(з.id)}"
+            ${this.выбранные.has(з.id) ? 'checked' : ''}></td>
+          <td class="truncate" style="max-width:320px">
+            <a href="#" data-open="${esc(з.id)}">${esc(з.filename || з.id)}</a>
+            ${з.error_message ? `<div class="small err">${esc(з.error_message)}</div>` : ''}</td>
+          <td>${statusChip(з.status)}</td>
+          <td class="small dim truncate" style="max-width:150px">${esc(з.model || '—')}</td>
+          <td class="small">${з.media_duration_s ? fmtDur(з.media_duration_s) : '—'}</td>
+          <td class="small mono">${з.rtf ? num(з.rtf, 3) : '—'}</td>
+          <td class="small faint nowrap">${fmtTime(з.created_at)}</td>
+          <td><button class="ghost sm" data-one="${esc(з.id)}">Распознать</button></td>
+        </tr>`).join('')}
+      </tbody></table></div>`);
+
+    const все = qs('#rs-check-all');
+    if (все) все.onchange = () => {
+      записи.forEach((з) => {
+        if (все.checked) this.выбранные.add(з.id);
+        else this.выбранные.delete(з.id);
+      });
+      this.drawTable();
+      this.drawTop();
+    };
+    qsa('[data-pick]', место).forEach((к) => {
+      к.onchange = () => {
+        if (к.checked) this.выбранные.add(к.dataset.pick);
+        else this.выбранные.delete(к.dataset.pick);
+        this.drawTop();
+      };
+    });
+    qsa('[data-open]', место).forEach((к) => {
+      к.onclick = (е) => { е.preventDefault(); window.__asrhub.openJob(к.dataset.open); };
+    });
+    qsa('[data-one]', место).forEach((к) => {
+      к.onclick = () => this.rescanIds([к.dataset.one], к);
+    });
+  },
+
+  async rescan(всё) {
+    if (!всё) {
+      await this.rescanIds(Array.from(this.выбранные), qs('#rs-selected'));
+      return;
+    }
+    const д = state.rescanData || {};
+    const всего = Number(д.total || (д.jobs || []).length);
+    const правки = Object.entries(this.переопределения)
+      .map(([к, з]) => `${(paramByKey(к) || {}).label || к}: ${з}`).join(', ');
+    if (!window.confirm(
+      `Распознать заново все записи под отбором (${всего})?\n\n`
+      + (правки ? `Новые параметры — ${правки}.\n\n` : 'Параметры остаются прежними.\n\n')
+      + 'Прежние расшифровки будут заменены новыми, когда очередь дойдёт до записи. '
+      + 'Записи ставятся с пониженной важностью, чтобы не задерживать свежие загрузки.')) return;
+    await this.rescanIds(null, qs('#rs-all'));
+  },
+
+  async rescanIds(ids, кнопка) {
+    if (кнопка) кнопка.disabled = true;
+    const тело = { overrides: this.переопределения, priority: 20, limit: 5000 };
+    if (ids) {
+      тело.ids = ids;
+    } else {
+      const п = this.параметрыОтбора();
+      тело.filter = {
+        status: (п.get('status') || '').split(','),
+        since: п.get('since') ? Number(п.get('since')) : null,
+        model: п.get('model') || '',
+        search: п.get('search') || '',
+      };
+    }
+    try {
+      const итог = await API.post('/api/jobs/rescan', тело);
+      toast(`Поставлено на распознавание: ${итог.queued}`
+        + (итог.failed && итог.failed.length ? `, отказов ${итог.failed.length}` : ''),
+        итог.queued ? 'ok' : 'warn');
+      this.выбранные.clear();
+      await refreshQueue();
+      this.load();
+    } catch (err) {
+      fail(err);
+    } finally {
+      if (кнопка) кнопка.disabled = false;
+    }
+  },
+};
+
+/** Ответы разных ручек зовут список по-разному: где items, где jobs. */
+function d_items(ответ) { return (ответ && (ответ.items || ответ.jobs)) || []; }
+
+
+// ==========================================================================
+// Дашборд: вся система разом
+// ==========================================================================
+
+/** Цвет и подпись состояния компонента. */
+const СОСТОЯНИЕ_ВИД = {
+  ok: { cls: 'ok', label: 'в порядке', dot: 'ok' },
+  warn: { cls: 'warn', label: 'предупреждение', dot: 'warn' },
+  fail: { cls: 'err', label: 'неисправность', dot: 'err' },
+  off: { cls: '', label: 'выключено', dot: '' },
+};
+
+/** Порядок групп на схеме — слева направо, как течёт работа. */
+const ГРУППЫ_СХЕМЫ = ['основа', 'источники', 'хранение', 'работа',
+                      'распознавание', 'смысл', 'наблюдение', 'обслуживание'];
+
+RENDERERS.dashboard = {
+  глубоко: false,
+
+  async render(root) {
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <button class="primary sm" id="db-deep"
+          title="Полная проверка: целостность базы, разбор забора с АТС, проба сервера модели и адресов">
+          Глубокая проверка</button>
+        <button class="ghost sm" id="db-refresh">Обновить</button>
+        <span class="spacer"></span>
+        <select id="db-since" style="width:190px"
+          title="За какой срок показывать журнал неисправностей">
+          <option value="86400">журнал за сутки</option>
+          <option value="604800">за неделю</option>
+          <option value="2592000">за месяц</option>
+        </select>
+      </div>
+      <div id="db-top"></div>
+      <div id="db-map"></div>
+      <div id="db-components"><div class="empty">Загрузка…</div></div>
+      <div id="db-problems"></div>`;
+
+    qs('#db-deep').addEventListener('click', (е) => this.deep(е.currentTarget));
+    qs('#db-refresh').addEventListener('click', () => this.load());
+    qs('#db-since').addEventListener('change', () => this.loadProblems());
+
+    await this.load();
+    viewTimer(() => this.load(true), 10000);
+  },
+
+  async load(тихо) {
+    try {
+      state.health = await API.latest('selfcheck',
+        `/api/system/selfcheck?deep=${this.глубоко ? 1 : 0}`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      if (!тихо) {
+        const место = qs('#db-components');
+        if (место) место.innerHTML = `<div class="empty">Диагностика недоступна: ${
+          esc(err.message || '')}<div class="small dim" style="margin-top:6px">
+          Полный свод отдаётся администратору.</div></div>`;
+      }
+      return;
+    }
+    this.глубоко = false;        // глубокая проверка — разовая, по кнопке
+    this.drawTop();
+    this.drawMap();
+    this.drawComponents();
+    this.loadProblems();
+  },
+
+  async deep(кнопка) {
+    if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Проверяю…'; }
+    this.глубоко = true;
+    try {
+      await this.load();
+      toast('Глубокая проверка выполнена', 'ok');
+    } finally {
+      if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Глубокая проверка'; }
+    }
+  },
+
+  drawTop() {
+    const место = qs('#db-top');
+    const д = state.health || {};
+    if (!место) return;
+    const с = д.summary || {};
+    const вид = СОСТОЯНИЕ_ВИД[д.state] || СОСТОЯНИЕ_ВИД.off;
+    const значок = qs('#badge-health');
+    if (значок) {
+      const плохо = Number(с.fail || 0) + Number(с.warn || 0);
+      значок.hidden = !плохо;
+      значок.textContent = String(плохо);
+      значок.className = `nav-badge ${Number(с.fail || 0) ? 'err' : 'warn'}`;
+    }
+    место.innerHTML = `<div class="grid cols-5" style="margin-bottom:16px">
+      ${kpi('Система', `<span class="${вид.cls}">${esc(вид.label)}</span>`,
+        д.deep ? 'глубокая проверка' : 'быстрая проверка')}
+      ${kpi('В порядке', num(с.ok || 0), 'составных частей')}
+      ${kpi('Предупреждений', num(с.warn || 0), 'работает, но не так, как задумано')}
+      ${kpi('Неисправностей', num(с.fail || 0), с.fail ? 'нужно вмешательство' : '')}
+      ${kpi('Выключено', num(с.off || 0), 'намеренно не используется')}
+    </div>`;
+  },
+
+  /** Схема системы: узлы по группам и связи между ними.
+   *
+   *  Рисуется своими руками, без библиотеки: узлов полтора десятка, связи
+   *  известны заранее (`depends_on`), а раскладка по группам-колонкам
+   *  читается лучше любой автоматической. Заодно это единственный способ
+   *  покрасить узел в цвет его состояния и сделать его кнопкой.
+   */
+  drawMap() {
+    const место = qs('#db-map');
+    const д = state.health || {};
+    const части = д.components || [];
+    if (!место || !части.length) return;
+
+    const колонки = new Map();
+    части.forEach((ч) => {
+      const группа = ч.group || 'прочее';
+      if (!колонки.has(группа)) колонки.set(группа, []);
+      колонки.get(группа).push(ч);
+    });
+    const порядок = [...ГРУППЫ_СХЕМЫ.filter((г) => колонки.has(г)),
+                     ...Array.from(колонки.keys()).filter((г) => !ГРУППЫ_СХЕМЫ.includes(г))];
+
+    const Ш = 150, В = 54, ЗАЗОР_X = 54, ЗАЗОР_Y = 18, ОТСТУП = 16;
+    const координаты = new Map();
+    порядок.forEach((группа, кол) => {
+      колонки.get(группа).forEach((ч, ряд) => {
+        координаты.set(ч.id, {
+          x: ОТСТУП + кол * (Ш + ЗАЗОР_X),
+          y: ОТСТУП + 24 + ряд * (В + ЗАЗОР_Y),
+          ч,
+        });
+      });
+    });
+    const рядов = Math.max(1, ...высотыКолонок(колонки, порядок));
+    const высота = ОТСТУП * 2 + 24 + рядов * (В + ЗАЗОР_Y);
+    const ширина = ОТСТУП * 2 + порядок.length * (Ш + ЗАЗОР_X) - ЗАЗОР_X;
+
+    const связи = [];
+    части.forEach((ч) => {
+      (ч.depends_on || []).forEach((откуда) => {
+        const a = координаты.get(откуда);
+        const b = координаты.get(ч.id);
+        if (!a || !b) return;
+        const x1 = a.x + Ш, y1 = a.y + В / 2;
+        const x2 = b.x, y2 = b.y + В / 2;
+        const середина = (x1 + x2) / 2;
+        связи.push(`<path d="M${x1} ${y1} C${середина} ${y1} ${середина} ${y2} ${x2} ${y2}"
+          fill="none" stroke="currentColor" stroke-width="1.2" opacity=".28"/>`);
+      });
+    });
+
+    const узлы = части.map((ч) => {
+      const к = координаты.get(ч.id);
+      const вид = СОСТОЯНИЕ_ВИД[ч.state] || СОСТОЯНИЕ_ВИД.off;
+      return `<g class="map-node" data-node="${esc(ч.id)}" style="cursor:pointer">
+        <rect x="${к.x}" y="${к.y}" width="${Ш}" height="${В}" rx="8"
+          class="map-box ${вид.cls}"></rect>
+        <circle cx="${к.x + 14}" cy="${к.y + 18}" r="5" class="map-dot ${вид.cls}"></circle>
+        <text x="${к.x + 26}" y="${к.y + 22}" class="map-title">${esc(ч.title)}</text>
+        <text x="${к.x + 12}" y="${к.y + 40}" class="map-sub">${
+          esc(String(ч.value || вид.label).slice(0, 24))}</text>
+      </g>`;
+    }).join('');
+
+    const подписи = порядок.map((группа, кол) =>
+      `<text x="${ОТСТУП + кол * (Ш + ЗАЗОР_X)}" y="${ОТСТУП}" class="map-group">${
+        esc(группа)}</text>`).join('');
+
+    место.innerHTML = card('Схема системы',
+      'стрелки — зависимости: что сломается следом',
+      `<div class="map-wrap"><svg viewBox="0 0 ${ширина} ${высота}"
+         class="system-map" role="img" aria-label="Схема составных частей системы">
+        ${подписи}${связи.join('')}${узлы}
+      </svg></div>`);
+
+    qsa('[data-node]', место).forEach((узел) => {
+      узел.onclick = () => {
+        const цель = qs(`#comp-${узел.dataset.node}`);
+        if (цель) {
+          цель.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          цель.classList.add('flash');
+          setTimeout(() => цель.classList.remove('flash'), 1200);
+        }
+      };
+    });
+  },
+
+  drawComponents() {
+    const место = qs('#db-components');
+    const д = state.health || {};
+    const части = д.components || [];
+    if (!место) return;
+    if (!части.length) {
+      место.innerHTML = '<div class="empty">Диагностика ничего не вернула.</div>';
+      return;
+    }
+    место.innerHTML = `<div class="grid cols-3">${части.map((ч) => {
+      const вид = СОСТОЯНИЕ_ВИД[ч.state] || СОСТОЯНИЕ_ВИД.off;
+      const проверки = ч.checks || [];
+      const плохие = проверки.filter((п) => п.state === 'fail' || п.state === 'warn');
+      return `<section class="card" id="comp-${esc(ч.id)}">
+        <div class="card-head">
+          <span class="status-dot ${вид.dot}"></span>
+          <h3 style="margin-left:6px">${esc(ч.title)}</h3>
+          <span class="spacer"></span>
+          <span class="chip ${вид.cls}">${esc(вид.label)}</span>
+        </div>
+        <div style="padding:10px 16px 14px">
+          <div class="small">${esc(ч.value || '')}</div>
+          ${ч.hint ? `<div class="small dim" style="margin-top:6px">${esc(ч.hint)}</div>` : ''}
+          ${плохие.length ? `<ul class="small" style="margin:8px 0 0;padding-left:18px">
+            ${плохие.map((п) => `<li class="${п.state === 'fail' ? 'err' : 'warn'}">
+              ${esc(п.title)}: ${esc(п.value || '')}
+              ${п.hint ? `<div class="dim">${esc(п.hint)}</div>` : ''}</li>`).join('')}
+          </ul>` : ''}
+          ${проверки.length ? `<details class="help" style="margin-top:8px">
+            <summary>все проверки (${проверки.length})</summary>
+            <table class="small" style="width:100%;margin-top:6px">
+              ${проверки.map((п) => `<tr>
+                <td style="width:16px"><span class="status-dot ${
+                  (СОСТОЯНИЕ_ВИД[п.state] || СОСТОЯНИЕ_ВИД.off).dot}"></span></td>
+                <td>${esc(п.title)}</td>
+                <td class="dim">${esc(String(п.value || ''))}</td></tr>`).join('')}
+            </table></details>` : ''}
+        </div>
+      </section>`;
+    }).join('')}</div>`;
+  },
+
+  async loadProblems() {
+    const место = qs('#db-problems');
+    if (!место) return;
+    const срок = qs('#db-since') ? Number(qs('#db-since').value) : 86400;
+    let данные;
+    try {
+      данные = await API.latest('problems',
+        `/api/system/problems?since=${Math.floor(Date.now() / 1000 - срок)}&limit=300`);
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      место.innerHTML = '';
+      return;
+    }
+    const строки = данные.items || данные.problems || [];
+    место.innerHTML = card('Журнал неисправностей',
+      `${строки.length} записей за выбранный срок`,
+      строки.length ? `<div class="table-wrap"><table>
+        <thead><tr><th style="width:150px">Когда</th><th style="width:90px">Уровень</th>
+          <th style="width:220px">Откуда</th><th>Что</th></tr></thead>
+        <tbody>${строки.map((с) => `<tr>
+          <td class="small faint nowrap">${fmtTime(с.at)}</td>
+          <td><span class="chip ${с.level === 'error' ? 'err' : 'warn'}">${
+            с.level === 'error' ? 'ошибка' : 'предупреждение'}</span></td>
+          <td class="small dim">${esc(с.source || '')}</td>
+          <td class="small">${esc(с.what || '')}
+            ${с.hint ? `<div class="dim">${esc(с.hint)}</div>` : ''}
+            ${с.job_id ? `<a href="#" data-open="${esc(с.job_id)}" class="small">открыть запись</a>` : ''}
+          </td></tr>`).join('')}</tbody></table></div>`
+        : '<div class="empty">За выбранный срок неисправностей не было.</div>');
+    qsa('[data-open]', место).forEach((к) => {
+      к.onclick = (е) => { е.preventDefault(); window.__asrhub.openJob(к.dataset.open); };
+    });
+  },
+};
+
+/** Высоты колонок схемы — отдельной функцией, чтобы не считать дважды. */
+function высотыКолонок(колонки, порядок) {
+  return порядок.map((г) => (колонки.get(г) || []).length);
+}
+
+// ==========================================================================
+// Голосовая аналитика: что модель поняла из разговоров
+// ==========================================================================
+
+/**
+ * Вкладки раздела. Порядок — от «что происходит» к «с кем разбираться»:
+ * именно так этот раздел читают в колл-центрах, где им пользуются каждый
+ * день, а не раз в квартал.
+ */
+const ГОЛОС_ВКЛАДКИ = [
+  ['summary', 'Сводка'],
+  ['reasons', 'Причины и исходы'],
+  ['actions', 'Обязательства'],
+  ['trackers', 'Трекеры и риски'],
+  ['scorecard', 'Скоркарта'],
+  ['records', 'Записи'],
+];
+
+RENDERERS.voice = {
+  вкладка: 'summary',
+  период: 'week',
+
+  async render(root) {
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <select id="vo-period" style="width:170px" title="За какой срок считать">
+          <option value="day">за сутки</option>
+          <option value="week" selected>за неделю</option>
+          <option value="month">за месяц</option>
+          <option value="quarter">за квартал</option>
+          <option value="year">за год</option>
+          <option value="all">за всё время</option>
+        </select>
+        <button class="btn sm" id="vo-analyze"
+          title="Поставить в очередь разбора всё, что модель ещё не смотрела">
+          Разобрать неразобранное</button>
+        <button class="ghost sm" id="vo-queue" title="Открыть очередь запросов к модели">Очередь</button>
+        <button class="ghost sm" id="vo-refresh">Обновить</button>
+      </div>
+      <div class="tabs" id="vo-tabs">
+        ${ГОЛОС_ВКЛАДКИ.map(([к, п]) =>
+          `<button data-tab="${к}" class="${this.вкладка === к ? 'active' : ''}">${п}</button>`).join('')}
+      </div>
+      <div id="vo-head"></div>
+      <div id="vo-body"><div class="empty">Загрузка…</div></div>`;
+
+    qsa('#vo-tabs button').forEach((к) => к.addEventListener('click', () => {
+      this.вкладка = к.dataset.tab;
+      qsa('#vo-tabs button').forEach((б) => б.classList.toggle('active', б === к));
+      this.draw();
+    }));
+    qs('#vo-period').addEventListener('change', () => { this.период = qs('#vo-period').value; this.load(); });
+    qs('#vo-refresh').addEventListener('click', () => this.load());
+    qs('#vo-queue').addEventListener('click', () => go('llmqueue'));
+    qs('#vo-analyze').addEventListener('click', (е) => this.analyze(е.currentTarget));
+
+    await this.load();
+  },
+
+  async load() {
+    try {
+      const [свод, состояние] = await Promise.all([
+        API.latest('voice', `/api/content/llm?period=${this.период}`),
+        API.latest('voice-status', '/api/llm/status').catch(() => null),
+      ]);
+      state.voice = свод;
+      state.voiceStatus = состояние;
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      const место = qs('#vo-body');
+      if (место) место.innerHTML = `<div class="empty">Раздел недоступен: ${
+        esc(err.message || '')}</div>`;
+      return;
+    }
+    this.drawHead();
+    this.draw();
+  },
+
+  drawHead() {
+    const место = qs('#vo-head');
+    const д = state.voice || {};
+    const с = state.voiceStatus || {};
+    if (!место) return;
+    const всего = Number(д.total || 0);
+    const разобрано = Number(д.analyzed ?? д.rows_count ?? (д.rows || []).length);
+    const покрытие = всего ? разобрано / всего : 0;
+    const решено = Number(д.resolved_rate ?? д.resolved ?? 0);
+    const действий = Number(д.actions_total || (д.actions || []).length || 0);
+    место.innerHTML = `<div class="grid cols-5" style="margin-bottom:16px">
+      ${kpi('Разговоров за период', num(всего), 'с расшифровкой')}
+      ${kpi('Разобрано моделью', num(разобрано),
+        всего ? `${pct(покрытие, 0)} покрытия` : '',
+        покрытие < 0.5 && всего ? { dir: 'down', text: 'модель отстаёт' } : null)}
+      ${kpi('Решено при обращении', решено ? pct(решено > 1 ? решено / 100 : решено, 0) : '—',
+        'по мнению модели')}
+      ${kpi('Обязательств', num(действий), 'обещаний, данных клиентам')}
+      ${kpi('Модель', esc(с.model || '—'),
+        с.enabled ? (с.reachable === false ? '<span class="err">сервер не отвечает</span>' : 'на связи')
+          : '<span class="warn">слой выключен</span>')}
+    </div>`;
+  },
+
+  draw() {
+    const место = qs('#vo-body');
+    const д = state.voice || {};
+    if (!место) return;
+    const строки = д.rows || [];
+    if (!строки.length && this.вкладка !== 'summary') {
+      место.innerHTML = '<div class="empty">За период модель ничего не разобрала.</div>';
+      return;
+    }
+    if (this.вкладка === 'summary') this.drawSummary(место, д);
+    else if (this.вкладка === 'reasons') this.drawReasons(место, д);
+    else if (this.вкладка === 'actions') this.drawActions(место, д);
+    else if (this.вкладка === 'trackers') this.drawTrackers(место, д);
+    else if (this.вкладка === 'scorecard') this.drawScorecard(место, д);
+    else this.drawRecords(место, д);
+  },
+
+  drawSummary(место, д) {
+    const строки = д.rows || [];
+    if (!строки.length) {
+      место.innerHTML = `<div class="empty">
+        За период модель ничего не разобрала.
+        <div class="small dim" style="margin-top:8px">
+          Смысловой слой включается в настройках («Языковая модель»), а ход
+          разбора виден в разделе «Очередь LLM».</div></div>`;
+      return;
+    }
+    const причины = свести(строки, 'reason');
+    const исходы = свести(строки, 'outcome');
+    место.innerHTML = `
+      <div class="grid cols-2">
+        ${card('Причины обращений', 'о чём звонили', '<div id="vo-s1" class="chart"></div>')}
+        ${card('Чем закончилось', 'исход из закрытого списка', '<div id="vo-s2" class="chart"></div>')}
+      </div>
+      ${card('Последние разборы', 'резюме, причина и исход по каждой записи',
+        this.таблицаЗаписей(строки.slice(0, 25)))}`;
+    window.Charts.hbars(qs('#vo-s1'), {
+      labels: причины.map((п) => п[0]), values: причины.map((п) => п[1]), height: 240,
+    });
+    window.Charts.donut(qs('#vo-s2'), {
+      labels: исходы.map((п) => п[0]), values: исходы.map((п) => п[1]), height: 240,
+    });
+    this.связатьТаблицу(место);
+  },
+
+  drawReasons(место, д) {
+    const строки = д.rows || [];
+    const причины = свести(строки, 'reason');
+    const исходы = свести(строки, 'outcome');
+    // Перекрёстная таблица «причина × исход» — то, ради чего этот раздел и
+    // нужен: сама по себе причина не говорит ничего, а «доставка → не
+    // решено, 40 %» говорит всё.
+    const пары = new Map();
+    строки.forEach((с) => {
+      const ключ = `${с.reason || '—'}|${с.outcome || '—'}`;
+      пары.set(ключ, (пары.get(ключ) || 0) + 1);
+    });
+    const топ_причин = причины.slice(0, 12).map((п) => п[0]);
+    const топ_исходов = исходы.slice(0, 6).map((п) => п[0]);
+    место.innerHTML = `
+      ${card('Причина и исход', 'сколько разговоров в каждой клетке',
+        `<div class="table-wrap"><table><thead><tr><th>Причина</th>
+          ${топ_исходов.map((и) => `<th class="num">${esc(и)}</th>`).join('')}
+          <th class="num">всего</th></tr></thead><tbody>
+          ${топ_причин.map((п) => {
+            const всего = топ_исходов.reduce((с, и) => с + (пары.get(`${п}|${и}`) || 0), 0);
+            return `<tr><td>${esc(п)}</td>
+              ${топ_исходов.map((и) => {
+                const n = пары.get(`${п}|${и}`) || 0;
+                return `<td class="num ${n ? '' : 'faint'}">${n || '—'}</td>`;
+              }).join('')}
+              <td class="num mono">${num(всего)}</td></tr>`;
+          }).join('')}
+        </tbody></table></div>`)}
+      ${card('Цитаты, по которым модель решила', 'проверка на доверие: видно, за что зацепилась модель',
+        `<div class="table-wrap"><table>
+          <thead><tr><th style="width:170px">Причина</th><th>Цитата</th>
+            <th style="width:170px">Исход</th><th>Цитата</th></tr></thead>
+          <tbody>${строки.filter((с) => с.reason_quote || с.outcome_quote).slice(0, 30)
+            .map((с) => `<tr>
+              <td class="small">${esc(с.reason || '—')}</td>
+              <td class="small dim">${esc(с.reason_quote || '')}</td>
+              <td class="small">${esc(с.outcome || '—')}</td>
+              <td class="small dim">${esc(с.outcome_quote || '')}</td></tr>`).join('')}
+          </tbody></table></div>`)}`;
+  },
+
+  drawActions(место, д) {
+    const строки = д.rows || [];
+    const действия = [];
+    строки.forEach((с) => {
+      (с.actions || []).forEach((д2) => действия.push({ ...(typeof д2 === 'string'
+        ? { text: д2 } : д2), job_id: с.job_id, filename: с.filename, at: с.created_at }));
+    });
+    место.innerHTML = card('Обязательства перед клиентами',
+      `${действия.length} за период — то, что обещали сделать`,
+      действия.length ? `<div class="table-wrap"><table>
+        <thead><tr><th style="width:150px">Когда</th><th>Что обещано</th>
+          <th style="width:140px">Срок</th><th style="width:200px">Запись</th></tr></thead>
+        <tbody>${действия.slice(0, 200).map((д2) => `<tr>
+          <td class="small faint nowrap">${fmtTime(д2.at)}</td>
+          <td class="small">${esc(д2.text || д2.what || '')}</td>
+          <td class="small dim">${esc(д2.due || д2.when || '—')}</td>
+          <td class="small truncate" style="max-width:200px">
+            <a href="#" data-open="${esc(д2.job_id)}">${esc(д2.filename || д2.job_id)}</a></td>
+        </tr>`).join('')}</tbody></table></div>`
+        : `<div class="empty">Модель не нашла ни одного обещания.
+             <div class="small dim" style="margin-top:6px">Проверьте, включена ли задача
+             «действия» в настройке «Что спрашивать у модели».</div></div>`);
+    this.связатьТаблицу(место);
+  },
+
+  drawTrackers(место, д) {
+    const строки = д.rows || [];
+    const счёт = new Map();
+    строки.forEach((с) => {
+      const т = с.trackers || {};
+      Object.entries(т).forEach(([имя, значение]) => {
+        if (!значение) return;
+        счёт.set(имя, (счёт.get(имя) || 0) + 1);
+      });
+    });
+    const пары = Array.from(счёт.entries()).sort((a, b) => b[1] - a[1]);
+    место.innerHTML = `
+      ${card('Умные трекеры', 'сколько разговоров задело каждый',
+        пары.length ? '<div id="vo-t1" class="chart"></div>'
+          : `<div class="empty">Трекеры не настроены или ни один не сработал.
+               <div class="small dim" style="margin-top:6px">Список трекеров — в настройках
+               языковой модели.</div></div>`)}
+      ${пары.length ? card('Разговоры со срабатываниями', '',
+        `<div class="table-wrap"><table>
+          <thead><tr><th style="width:150px">Когда</th><th style="width:220px">Запись</th>
+            <th>Сработало</th></tr></thead>
+          <tbody>${строки.filter((с) => Object.values(с.trackers || {}).some(Boolean))
+            .slice(0, 100).map((с) => `<tr>
+              <td class="small faint nowrap">${fmtTime(с.created_at)}</td>
+              <td class="small truncate" style="max-width:220px">
+                <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
+              <td><div class="chips">${Object.entries(с.trackers || {})
+                .filter(([, з]) => з)
+                .map(([имя]) => `<span class="chip warn">${esc(имя)}</span>`).join('')}</div></td>
+            </tr>`).join('')}</tbody></table></div>`) : ''}`;
+    if (пары.length) {
+      window.Charts.hbars(qs('#vo-t1'), {
+        labels: пары.map((п) => п[0]), values: пары.map((п) => п[1]), height: 260,
+      });
+    }
+    this.связатьТаблицу(место);
+  },
+
+  drawScorecard(место, д) {
+    const строки = д.rows || [];
+    const вопросы = new Map();
+    строки.forEach((с) => {
+      Object.entries(с.scorecard || {}).forEach(([вопрос, ответ]) => {
+        const св = вопросы.get(вопрос) || { да: 0, нет: 0 };
+        if (ответ === true || ответ === 'да' || ответ === 'yes') св.да += 1;
+        else if (ответ === false || ответ === 'нет' || ответ === 'no') св.нет += 1;
+        вопросы.set(вопрос, св);
+      });
+    });
+    const пары = Array.from(вопросы.entries())
+      .map(([в, с]) => [в, с.да, с.нет, с.да + с.нет ? с.да / (с.да + с.нет) : 0])
+      .sort((a, b) => a[3] - b[3]);
+    место.innerHTML = card('Скоркарта', 'доля разговоров, где пункт выполнен',
+      пари(пары) ? `<div class="table-wrap"><table>
+        <thead><tr><th>Пункт</th><th class="num">выполнено</th><th class="num">нет</th>
+          <th style="width:240px">доля</th></tr></thead>
+        <tbody>${пары.map(([в, да, нет, доля]) => `<tr>
+          <td class="small">${esc(в)}</td>
+          <td class="num mono">${num(да)}</td>
+          <td class="num mono">${num(нет)}</td>
+          <td>${полоса(доля, доля > 0.8 ? 'ok' : (доля > 0.5 ? 'warn' : 'err'))}</td>
+        </tr>`).join('')}</tbody></table></div>`
+        : `<div class="empty">Скоркарта не настроена.
+             <div class="small dim" style="margin-top:6px">Вопросы задаются настройкой
+             «Скоркарта» в разделе языковой модели.</div></div>`);
+  },
+
+  drawRecords(место, д) {
+    место.innerHTML = card('Разобранные записи',
+      `${(д.rows || []).length} за период`, this.таблицаЗаписей(д.rows || []));
+    this.связатьТаблицу(место);
+  },
+
+  таблицаЗаписей(строки) {
+    if (!строки.length) return '<div class="empty">Ничего не разобрано.</div>';
+    return `<div class="table-wrap"><table>
+      <thead><tr><th style="width:140px">Когда</th><th style="width:200px">Запись</th>
+        <th>Резюме</th><th style="width:150px">Причина</th>
+        <th style="width:150px">Исход</th><th style="width:90px">Решено</th></tr></thead>
+      <tbody>${строки.map((с) => `<tr>
+        <td class="small faint nowrap">${fmtTime(с.created_at)}</td>
+        <td class="small truncate" style="max-width:200px">
+          <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
+        <td class="small">${esc(с.summary || '')}
+          ${с.error ? `<div class="err small">${esc(с.error)}</div>` : ''}</td>
+        <td class="small">${esc(с.reason || '—')}</td>
+        <td class="small">${esc(с.outcome || '—')}</td>
+        <td>${с.resolved === null || с.resolved === undefined ? '—'
+          : `<span class="chip ${с.resolved ? 'ok' : 'warn'}">${с.resolved ? 'да' : 'нет'}</span>`}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  },
+
+  связатьТаблицу(место) {
+    qsa('[data-open]', место).forEach((к) => {
+      к.onclick = (е) => { е.preventDefault(); window.__asrhub.openJob(к.dataset.open); };
+    });
+  },
+
+  async analyze(кнопка) {
+    if (кнопка) кнопка.disabled = true;
+    try {
+      const итог = await API.post('/api/llm/queue/add', { scope: 'pending', limit: 20000 });
+      toast(итог.queued ? `Поставлено в очередь: ${итог.queued}` : 'Всё уже разобрано',
+        итог.queued ? 'ok' : 'warn');
+    } catch (err) {
+      fail(err);
+    } finally {
+      if (кнопка) кнопка.disabled = false;
+    }
+  },
+};
+
+/** Свод по полю: [[значение, сколько], …] по убыванию. */
+function свести(строки, поле) {
+  const счёт = new Map();
+  строки.forEach((с) => {
+    const з = с[поле];
+    if (!з) return;
+    счёт.set(з, (счёт.get(з) || 0) + 1);
+  });
+  return Array.from(счёт.entries()).sort((a, b) => b[1] - a[1]);
+}
+
+/** Есть ли что показывать в скоркарте. Отдельной функцией ради читаемости. */
+function пари(пары) { return пары && пары.length > 0; }
+
+/** Горизонтальная полоса доли в ячейке таблицы. */
+function полоса(доля, вид) {
+  const п = Math.max(0, Math.min(1, Number(доля) || 0));
+  return `<div class="row" style="gap:8px;align-items:center">
+    <div class="progress ${вид || ''}" style="flex:1"><span style="width:${(п * 100).toFixed(1)}%"></span></div>
+    <span class="small mono" style="width:44px;text-align:right">${pct(п, 0)}</span></div>`;
+}
+
+
+// ==========================================================================
+// Сотрудники: справочник
+// ==========================================================================
+
+/** Поля карточки: ключ, подпись, вид поля. Один список — и форма, и таблица. */
+const СОТР_ПОЛЯ = [
+  ['last_name', 'Фамилия', 'text'],
+  ['first_name', 'Имя', 'text'],
+  ['middle_name', 'Отчество', 'text'],
+  ['position', 'Должность', 'text'],
+  ['department', 'Отдел', 'text'],
+  ['phone_ext', 'Внутренний номер', 'text'],
+  ['phone_work', 'Рабочий телефон', 'text'],
+  ['phone_mobile', 'Мобильный', 'text'],
+  ['email', 'Электропочта', 'text'],
+  ['suppliers', 'Поставщики', 'text'],
+  ['active_until', 'Работает до', 'text'],
+  ['note', 'Примечание', 'textarea'],
+];
+
+RENDERERS.staff = {
+  отбор: { query: '', department: '', active: '' },
+
+  async render(root) {
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <input type="search" id="st-search" placeholder="поиск по ФИО, должности, номеру"
+          style="width:280px" value="${esc(this.отбор.query)}">
+        <select id="st-dept" style="width:210px"><option value="">все отделы</option></select>
+        <select id="st-active" style="width:150px">
+          <option value="">все</option>
+          <option value="true" selected>работают</option>
+          <option value="false">не работают</option>
+        </select>
+        <span class="spacer"></span>
+        <button class="primary sm" id="st-add">Добавить</button>
+        <button class="btn sm" id="st-import" title="Забрать выгрузку по адресу из настроек">
+          Импорт по адресу</button>
+        <label class="ghost sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px"
+          title="Загрузить файл выгрузки: Excel XML, CSV или JSON">
+          Загрузить файл<input type="file" id="st-file" accept=".xml,.csv,.json,.txt" hidden></label>
+        <button class="ghost sm" id="st-refresh">Обновить</button>
+      </div>
+      <div id="st-top"></div>
+      <div id="st-table"><div class="empty">Загрузка…</div></div>`;
+
+    let таймер;
+    qs('#st-search').addEventListener('input', (е) => {
+      clearTimeout(таймер);
+      this.отбор.query = е.target.value;
+      таймер = setTimeout(() => this.load(), 300);
+    });
+    qs('#st-dept').addEventListener('change', (е) => {
+      this.отбор.department = е.target.value;
+      this.load();
+    });
+    qs('#st-active').addEventListener('change', (е) => {
+      this.отбор.active = е.target.value;
+      this.load();
+    });
+    qs('#st-refresh').addEventListener('click', () => this.load());
+    qs('#st-add').addEventListener('click', () => this.edit(null));
+    qs('#st-import').addEventListener('click', (е) => this.importUrl(е.currentTarget));
+    qs('#st-file').addEventListener('change', (е) => this.importFile(е.currentTarget));
+
+    await this.load();
+  },
+
+  async load() {
+    const п = new URLSearchParams();
+    if (this.отбор.query) п.set('query', this.отбор.query);
+    if (this.отбор.department) п.set('department', this.отбор.department);
+    if (this.отбор.active) п.set('active', this.отбор.active);
+    п.set('limit', '500');
+    try {
+      const [список, сводка] = await Promise.all([
+        API.latest('staff', `/api/employees?${п.toString()}`),
+        API.latest('staff-stats', '/api/employees/stats').catch(() => null),
+      ]);
+      state.staff = список;
+      state.staffStats = сводка;
+    } catch (err) {
+      if (err.code === 'aborted') return;
+      const место = qs('#st-table');
+      if (место) место.innerHTML = `<div class="empty">Справочник недоступен: ${
+        esc(err.message || '')}</div>`;
+      return;
+    }
+    this.drawTop();
+    this.drawDepartments();
+    this.drawTable();
+  },
+
+  drawTop() {
+    const место = qs('#st-top');
+    const с = state.staffStats || {};
+    if (!место) return;
+    const совпало = Number(с.matched_in_calls || 0);
+    const с_номером = Number(с.with_ext || 0);
+    место.innerHTML = `<div class="grid cols-5" style="margin-bottom:16px">
+      ${kpi('Всего карточек', num(с.total || 0), `${num(с.active || 0)} работают`)}
+      ${kpi('Отделов', num(с.departments_count || 0), '')}
+      ${kpi('С внутренним номером', num(с_номером),
+        `${num(с.with_ext_active || 0)} из работающих`)}
+      ${kpi('Видно в звонках', num(совпало),
+        с_номером ? `${pct(с_номером ? совпало / с_номером : 0, 0)} номеров справочника`
+          : 'номеров нет',
+        с_номером && !совпало ? { dir: 'down', text: 'нумерация разошлась' } : null)}
+      ${kpi('Номеров вне справочника', num(с.unknown_agents_count || 0),
+        'очереди, служебные линии или уволенные')}
+    </div>
+    ${с_номером && !совпало ? `<div class="banner warn" style="margin-bottom:14px">
+      Ни один внутренний номер из справочника не встречается в журнале звонков.
+      Обычно это значит, что нумерация станции и нумерация кадровой системы
+      разъехались: где-то есть префикс филиала или другое число цифр.
+      ${(с.unknown_agents || []).length ? `Номера из журнала: ${
+        esc((с.unknown_agents || []).slice(0, 10).join(', '))}.` : ''}
+    </div>` : ''}`;
+  },
+
+  drawDepartments() {
+    const выбор = qs('#st-dept');
+    const д = state.staff || {};
+    if (!выбор) return;
+    const текущий = this.отбор.department;
+    выбор.innerHTML = '<option value="">все отделы</option>'
+      + (д.departments || []).filter((о) => о.department).map((о) =>
+        `<option value="${esc(о.department)}"${о.department === текущий ? ' selected' : ''}>${
+          esc(о.department)} (${о.n})</option>`).join('');
+  },
+
+  drawTable() {
+    const место = qs('#st-table');
+    const д = state.staff || {};
+    if (!место) return;
+    const люди = д.items || [];
+    if (!люди.length) {
+      место.innerHTML = card('Сотрудники', '',
+        '<div class="empty">Под отбор никто не подошёл.</div>');
+      return;
+    }
+    место.innerHTML = card('Сотрудники',
+      `${люди.length} из ${num(д.total || люди.length)}`,
+      `<div class="table-wrap"><table>
+        <thead><tr>
+          <th>ФИО</th><th style="width:200px">Должность</th><th style="width:180px">Отдел</th>
+          <th style="width:90px">Внутр.</th><th style="width:150px">Мобильный</th>
+          <th style="width:200px">Почта</th><th style="width:90px">Статус</th>
+          <th style="width:120px"></th>
+        </tr></thead><tbody>
+        ${люди.map((ч) => `<tr${ч.active ? '' : ' class="dim"'}>
+          <td>${esc([ч.last_name, ч.first_name, ч.middle_name].filter(Boolean).join(' ') || '—')}
+            ${ч.source && ч.source !== 'ручной'
+              ? `<span class="chip small" title="Источник карточки">${esc(ч.source)}</span>` : ''}</td>
+          <td class="small">${esc(ч.position || '')}</td>
+          <td class="small">${esc(ч.department || '')}</td>
+          <td class="mono">${esc(ч.phone_ext || '')}</td>
+          <td class="small mono">${esc(ч.phone_mobile || '')}</td>
+          <td class="small">${esc(ч.email || '')}</td>
+          <td><span class="chip ${ч.active ? 'ok' : ''}">${ч.active ? 'работает' : 'уволен'}</span></td>
+          <td class="nowrap">
+            <button class="ghost sm" data-edit="${esc(ч.id)}">Правка</button>
+            <button class="ghost sm" data-del="${esc(ч.id)}" title="Удалить карточку">×</button>
+          </td></tr>`).join('')}
+      </tbody></table></div>`);
+
+    qsa('[data-edit]', место).forEach((к) => {
+      к.onclick = () => this.edit((state.staff.items || []).find((ч) => ч.id === к.dataset.edit));
+    });
+    qsa('[data-del]', место).forEach((к) => {
+      к.onclick = () => this.remove(к.dataset.del);
+    });
+  },
+
+  edit(карточка) {
+    const новая = !карточка;
+    const ч = карточка || { active: true };
+    const фон = h(`<div class="modal-backdrop"><div class="modal" style="max-width:640px">
+      <div class="modal-head"><b>${новая ? 'Новый сотрудник' : 'Карточка сотрудника'}</b>
+        <span class="spacer"></span><button class="ghost icon" data-close>✕</button></div>
+      <div class="modal-body">
+        <div class="grid cols-2" style="gap:12px">
+          ${СОТР_ПОЛЯ.map(([ключ, подпись, вид]) => `
+            <label class="small" style="display:flex;flex-direction:column;gap:4px${
+              вид === 'textarea' ? ';grid-column:span 2' : ''}">
+              <span class="dim">${esc(подпись)}</span>
+              ${вид === 'textarea'
+                ? `<textarea data-field="${ключ}" rows="2">${esc(ч[ключ] || '')}</textarea>`
+                : `<input type="text" data-field="${ключ}" value="${esc(ч[ключ] || '')}">`}
+            </label>`).join('')}
+        </div>
+        <label class="row" style="gap:8px;margin-top:12px;cursor:pointer">
+          <input type="checkbox" id="st-active-box" ${ч.active ? 'checked' : ''} style="width:auto">
+          <span>Работает</span></label>
+        ${новая ? '' : `<div class="small faint" style="margin-top:10px">
+          Источник: ${esc(ч.source || 'ручной')} · изменено ${fmtAgo(ч.updated_at)}</div>`}
+      </div>
+      <div class="modal-foot">
+        <span class="spacer"></span>
+        <button class="ghost" data-close>Отмена</button>
+        <button class="primary" id="st-save">Сохранить</button>
+      </div></div></div>`);
+    document.body.appendChild(фон);
+    mountModal(фон, { label: новая ? 'Новый сотрудник' : 'Карточка сотрудника' });
+    qsa('[data-close]', фон).forEach((к) => { к.onclick = () => closeModal(фон); });
+    фон.querySelector('#st-save').onclick = async () => {
+      const тело = { active: фон.querySelector('#st-active-box').checked };
+      qsa('[data-field]', фон).forEach((поле) => { тело[поле.dataset.field] = поле.value.trim(); });
+      try {
+        if (новая) await API.post('/api/employees', тело);
+        else await API.put(`/api/employees/${encodeURIComponent(ч.id)}`, тело);
+        toast('Сохранено', 'ok');
+        closeModal(фон);
+        this.load();
+      } catch (err) { fail(err); }
+    };
+  },
+
+  async remove(id) {
+    const ч = (state.staff.items || []).find((к) => к.id === id) || {};
+    const имя = [ч.last_name, ч.first_name].filter(Boolean).join(' ') || id;
+    if (!window.confirm(`Удалить карточку «${имя}»?\n\n`
+      + 'Звонки этого номера останутся в архиве: они привязаны к номеру, а не к карточке.')) return;
+    try {
+      await API.del(`/api/employees/${encodeURIComponent(id)}`);
+      toast('Карточка удалена', 'ok');
+      this.load();
+    } catch (err) { fail(err); }
+  },
+
+  async importUrl(кнопка) {
+    const адрес = state.settings.employees_url || '';
+    if (!адрес) {
+      toast('Адрес выгрузки не задан', 'warn',
+        'Задайте «Адрес выгрузки справочника» в настройках, раздел «Справочник сотрудников».');
+      state.paramGroup = 'employees';
+      go('settings');
+      return;
+    }
+    if (кнопка) кнопка.disabled = true;
+    try {
+      const итог = await API.post('/api/employees/import', {});
+      this.показатьИтог(итог);
+      this.load();
+    } catch (err) {
+      fail(err);
+    } finally {
+      if (кнопка) кнопка.disabled = false;
+    }
+  },
+
+  async importFile(поле) {
+    const файл = поле.files && поле.files[0];
+    if (!файл) return;
+    const форма = new FormData();
+    форма.append('file', файл);
+    try {
+      const итог = await API.call('/api/employees/import', { method: 'POST', body: форма });
+      this.показатьИтог(итог);
+      this.load();
+    } catch (err) {
+      fail(err);
+    } finally {
+      поле.value = '';
+    }
+  },
+
+  показатьИтог(итог) {
+    const и = итог || {};
+    const части = [
+      и.added ? `добавлено ${и.added}` : '',
+      и.updated ? `обновлено ${и.updated}` : '',
+      и.unchanged ? `без изменений ${и.unchanged}` : '',
+      и.deactivated ? `уволено ${и.deactivated}` : '',
+    ].filter(Boolean);
+    toast(части.length ? `Импорт: ${части.join(', ')}` : 'Импорт: изменений нет', 'ok');
+    const замечания = и.notes || и.warnings || [];
+    if (замечания.length) {
+      const фон = h(`<div class="modal-backdrop"><div class="modal" style="max-width:640px">
+        <div class="modal-head"><b>Замечания импорта</b><span class="spacer"></span>
+          <button class="ghost icon" data-close>✕</button></div>
+        <div class="modal-body"><ul class="small">${замечания.slice(0, 100)
+          .map((з) => `<li>${esc(String(з))}</li>`).join('')}</ul></div>
+        <div class="modal-foot"><span class="spacer"></span>
+          <button class="primary" data-close>Понятно</button></div></div></div>`);
+      document.body.appendChild(фон);
+      mountModal(фон, { label: 'Замечания импорта' });
+      qsa('[data-close]', фон).forEach((к) => { к.onclick = () => closeModal(фон); });
+    }
+  },
+};
 })();
