@@ -676,6 +676,14 @@ Write-Step 'Проверка установки'
 
 if (Get-DryRun) { Write-Ok 'Пробный запуск завершён — изменений не вносилось.'; exit 0 }
 
+# Чем сервер будет считать — до того, как стучаться в порт. Порт ответит и на
+# машине, где распознавание не работает вовсе: /api/health видеокарту не
+# спрашивает, а первое задание спросит.
+if (Test-Path $venvPython) {
+    Test-GpuRuntime -Python $venvPython -DataDir $DataDir `
+        -CodeDir (Join-Path $Prefix 'server') | Out-Null
+}
+
 $healthy = $false
 for ($i = 0; $i -lt 20; $i++) {
     try {

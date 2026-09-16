@@ -46,8 +46,16 @@ def подложка(каталог: Path, имя: str, тело: str) -> Path:
 
 def драйвер(tmp_path: Path, *, загружен: str = "595.91.07",
             на_диске: str = "595.91.07", библиотеки: str = "595.91.07",
-            smi_работает: bool = True) -> dict[str, str]:
-    """Машина с заданным состоянием драйвера NVIDIA."""
+            smi_работает: bool = True, modinfo_есть: bool = True,
+            ядра: dict[str, str] | None = None,
+            ядро_имя: str = "") -> dict[str, str]:
+    """Машина с заданным состоянием драйвера NVIDIA.
+
+    `ядра` — модули, лежащие на диске под другими ядрами: «имя ядра: версия».
+    Это отдельный случай, а не мелочь: модуль мог собраться не под то ядро,
+    что работает сейчас, и тогда «на диске нет» и «чинить нечем» — разные
+    вещи с разной ценой ошибки.
+    """
     bin_dir = tmp_path / "bin"
     proc = tmp_path / "proc-nvidia"
     proc.write_text(
@@ -58,8 +66,11 @@ def драйвер(tmp_path: Path, *, загружен: str = "595.91.07",
         подложка(bin_dir, "nvidia-smi", f'''
 case "$*" in
   *driver_version*) echo "{библиотеки}" ;;
+  *memory.total*) echo "32768" ;;
+  *memory.free*) echo "32000" ;;
+  *--query-gpu=name*) echo "NVIDIA GeForce RTX 5090" ;;
   -L) echo "GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-x)" ;;
-  *) echo "NVIDIA-SMI {библиотеки}  Driver Version: {библиотеки}" ;;
+  *) echo "NVIDIA-SMI {библиотеки}  Driver Version: {библиотеки}  CUDA Version: 13.0" ;;
 esac
 ''')
     else:
@@ -68,19 +79,49 @@ echo "Failed to initialize NVML: Driver/library version mismatch"
 echo "NVML library version: {библиотеки}"
 exit 1
 ''')
-    подложка(bin_dir, "modinfo", f'''
-[[ "$1" == "-F" && "$2" == "version" ]] && {{ echo "{на_диске}"; exit 0; }}
+    if ядро_имя:
+        # `uname -r` подменяется целиком: проверить разбор «модуль собран
+        # под другое ядро» иначе можно было бы только перезагрузившись.
+        подложка(bin_dir, "uname",
+                 f'[[ "$1" == "-r" ]] && {{ echo "{ядро_имя}"; exit 0; }}\n'
+                 'exec /usr/bin/uname "$@"\n')
+    mods = tmp_path / "modules"
+    ветки = ""
+    for ядро, версия in (ядра or {}).items():
+        каталог = mods / ядро / "updates" / "dkms"
+        каталог.mkdir(parents=True, exist_ok=True)
+        (каталог / "nvidia.ko").touch()
+        ветки += f'    */{ядро}/*) echo "{версия}"; exit 0 ;;\n'
+    mods.mkdir(parents=True, exist_ok=True)
+    # Пустая «версия на диске» означает, что modinfo не находит модуль по
+    # имени: так бывает, когда он лежит не в updates/dkms.
+    по_имени = f'echo "{на_диске}"; exit 0' if на_диске else "exit 1"
+    if modinfo_есть:
+        подложка(bin_dir, "modinfo", f'''
+if [[ "$1" == "-F" && "$2" == "version" ]]; then
+  case "$3" in
+{ветки}    nvidia) {по_имени} ;;
+  esac
+fi
 exit 1
 ''')
+    else:
+        # PATH без modinfo вовсе: пакет kmod бывает не установлен.
+        подложка(bin_dir, "modinfo", 'exit 127\n')
     dev = tmp_path / "dev"
     dev.mkdir(exist_ok=True)
     (dev / "nvidia0").touch()
     (dev / "nvidiactl").touch()
-    return {
+    env = {
         "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         "ASRHUB_NVIDIA_PROC": str(proc),
         "ASRHUB_NVIDIA_DEV": str(dev),
+        "ASRHUB_MODULES_ROOT": str(mods),
     }
+    if not modinfo_есть:
+        # `have modinfo` смотрит в PATH, поэтому файла быть не должно вовсе.
+        (bin_dir / "modinfo").unlink()
+    return env
 
 
 ТОРЧ_СЛОМАН = f'''
@@ -232,6 +273,102 @@ def test_модуль_не_пересобрался(repo_root: Path, tmp_path: P
                   библиотеки="595.99", smi_работает=False)
     assert оболочка(repo_root, "nvidia_driver_verdict", env).stdout.strip() \
         == "rebuild|595.91.07|595.99"
+
+
+def test_модуль_собран_под_другое_ядро(repo_root: Path, tmp_path: Path):
+    """Вместе с драйвером приехало новое ядро — и модуль собран под него.
+
+    Под работающим ядром модуля действительно нет, и `modinfo nvidia` честно
+    молчит. Но перезагрузка (уже в новое ядро) как раз помогает, а отправлять
+    человека в dkms — значит гонять его по кругу вокруг исправного модуля.
+    """
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False,
+                  ядра={"6.8.0-60-generic": "595.99.02"})
+    итог = оболочка(repo_root, "nvidia_driver_verdict", env)
+    assert итог.stdout.strip() == "other-kernel|595.91.07|6.8.0-60-generic"
+
+
+def test_про_другое_ядро_сказано_прямо(repo_root: Path, tmp_path: Path):
+    """Одного приговора мало: человеку нужно имя ядра и что с ним делать."""
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False,
+                  ядра={"6.8.0-60-generic": "595.99.02"})
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    текст = вывод.stdout + вывод.stderr
+    assert "6.8.0-60-generic" in текст
+    assert "reboot" in текст
+
+
+def test_модуль_работающего_ядра_не_выдаётся_за_чужой(repo_root: Path, tmp_path: Path):
+    """`modinfo nvidia` находит модуль по имени не везде — в RHEL он в extra/.
+
+    Тогда версию под работающим ядром берём обходом каталогов. Без этого
+    исправно собранный модуль выглядел бы отсутствующим, и человеку
+    предложили бы «загрузиться в ядро», в котором он и так сидит.
+    """
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="", библиотеки="595.99",
+                  smi_работает=False, ядро_имя="6.8.0-50-generic",
+                  ядра={"6.8.0-50-generic": "595.99.02"})
+    итог = оболочка(repo_root, "nvidia_driver_verdict", env)
+    assert итог.stdout.strip() == "reboot|595.91.07|595.99.02"
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    текст = вывод.stdout + вывод.stderr
+    assert "Перезагрузка поможет" in текст
+    assert "выберите" not in текст, "предложено грузиться в то ядро, что уже работает"
+
+
+def test_работающее_ядро_не_предлагают_загрузить(repo_root: Path, tmp_path: Path):
+    """Под работающим ядром два модуля, а modprobe берёт старый.
+
+    Так бывает после ручной установки поверх пакетной. Новый модуль на диске
+    есть, но заработает он только после depmod — а совет «загрузитесь в ядро
+    6.8.0-50» человеку, который в нём и сидит, выглядит издевательством.
+    """
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False,
+                  ядро_имя="6.8.0-50-generic",
+                  ядра={"6.8.0-50-generic": "595.99.02"})
+    итог = оболочка(repo_root, "nvidia_driver_verdict", env)
+    assert not итог.stdout.startswith("other-kernel|"), итог.stdout
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    assert "выберите" not in вывод.stdout + вывод.stderr
+
+
+def test_чужое_ядро_со_старым_модулем_не_спасает(repo_root: Path, tmp_path: Path):
+    """Модуль под другим ядром есть, но он той же старой версии.
+
+    Загружаться в него незачем — там будет ровно то же расхождение.
+    """
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False,
+                  ядра={"6.8.0-40-generic": "595.91.07"})
+    assert оболочка(repo_root, "nvidia_driver_verdict", env).stdout.strip() \
+        == "rebuild|595.91.07|595.99"
+
+
+def test_без_modinfo_не_выдумываем_приговор(repo_root: Path, tmp_path: Path):
+    """Нет modinfo — значит, сравнить с диском нечем.
+
+    «Модуль не собрался» тут было бы выдачей отсутствия данных за вывод, и
+    человек пошёл бы пересобирать исправный модуль.
+    """
+    env = драйвер(tmp_path, загружен="595.91.07", библиотеки="595.99",
+                  smi_работает=False, modinfo_есть=False)
+    итог = оболочка(repo_root, "nvidia_driver_verdict", env)
+    assert итог.stdout.strip() == "unknown-disk|595.91.07|595.99"
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    assert "нечем" in вывод.stdout + вывод.stderr
+
+
+def test_совет_про_заголовки_ядра(repo_root: Path, tmp_path: Path):
+    """Чаще всего dkms не собрал именно из-за отсутствующих заголовков."""
+    env = драйвер(tmp_path, загружен="595.91.07", на_диске="595.91.07",
+                  библиотеки="595.99", smi_работает=False)
+    вывод = оболочка(repo_root, "gpu_runtime_diagnose asrhub", env)
+    текст = вывод.stdout + вывод.stderr
+    assert "linux-headers" in текст
+    assert "dkms autoinstall" in текст
 
 
 def test_версии_сходятся(repo_root: Path, tmp_path: Path):
@@ -552,3 +689,91 @@ class backends:
     итог = оболочка(repo_root, f'gpu_torch_probe "{py}" "{пусто}" cuda')
     assert итог.stdout.startswith("fail|cuda|")
     assert "не отвечает" in итог.stdout
+
+
+# ---------------------------------------------------------------------------
+# Установка: чем сервер будет считать, решается один раз и надолго
+# ---------------------------------------------------------------------------
+#
+# Устройство в config.yaml выбирает установщик — по nvidia-smi. Считать будет
+# torch. Разойтись они могут и в первый же день: драйвер поставлен, карта
+# видна, а колёса PyTorch приехали процессорные. «device: cuda» в этом
+# положении отключает уход на процессор, и сервер падает на каждом задании —
+# при внешне исправной установке.
+
+
+def конфигурация(repo_root: Path, py: Path, env: dict) -> tuple[int, str]:
+    """Строки устройства для config.yaml и код возврата проверки."""
+    # Код возврата ловится через «|| код=$?»: функция отвечает единицей по
+    # делу, а под `set -o errexit` голый вызов оборвал бы оболочку. Ровно так
+    # её и зовёт установщик.
+    итог = оболочка(
+        repo_root,
+        'rc=0\n'
+        f'gpu_config_lines_checked "{py}" "{repo_root / "server"}" || rc=$?\n'
+        'echo "КОД:${rc}"',
+        env)
+    текст = итог.stdout
+    код = int(текст.rsplit("КОД:", 1)[1].strip() or 0)
+    return код, текст.rsplit("КОД:", 1)[0]
+
+
+def карта_на_шине(tmp_path: Path, env: dict) -> dict:
+    """Машина, где nvidia-smi показывает исправную карту.
+
+    Установщик в этом состоянии и записывает «device: cuda» — ему довольно
+    того, что карта отвечает.
+    """
+    pci = tmp_path / "pci" / "0000:01:00.0"
+    pci.mkdir(parents=True, exist_ok=True)
+    (pci / "vendor").write_text("0x10de\n", encoding="utf-8")
+    (pci / "class").write_text("0x030000\n", encoding="utf-8")
+    (pci / "device").write_text("0x2684\n", encoding="utf-8")
+    (pci / "resource").write_text(
+        "0x0000004000000000 0x00000040ffffffff 0x000000000014220c\n"
+        + "0x0000000000000000 0x0000000000000000 0x0000000000000000\n" * 6,
+        encoding="utf-8")
+    return {**env, "ASRHUB_PCI_ROOT": str(tmp_path / "pci")}
+
+
+def test_установка_не_пишет_cuda_если_питон_карты_не_видит(repo_root: Path,
+                                                          tmp_path: Path):
+    """Главная развилка установки.
+
+    «device: cuda» на такой машине — это сервер, у которого падает каждое
+    задание. «auto» — сервер, который работает медленно и возьмёт карту, как
+    только она отзовётся.
+    """
+    env = карта_на_шине(tmp_path, драйвер(tmp_path))
+    код, строки = конфигурация(repo_root, питон(tmp_path, ТОРЧ_СЛОМАН), env)
+    assert код == 1
+    assert "device:" not in строки
+
+
+def test_установка_пишет_cuda_на_исправной_карте(repo_root: Path, tmp_path: Path):
+    env = карта_на_шине(tmp_path, драйвер(tmp_path))
+    код, строки = конфигурация(repo_root, питон(tmp_path, ТОРЧ_ЖИВ), env)
+    assert код == 0
+    assert "device: cuda" in строки
+
+
+def test_без_карты_на_шине_проверять_нечего(repo_root: Path, tmp_path: Path):
+    """Машина без карты: строк нет и без всякой пробы, отказа тоже нет."""
+    пусто = tmp_path / "pci-пусто"
+    пусто.mkdir()
+    env = {**драйвер(tmp_path), "ASRHUB_PCI_ROOT": str(пусто)}
+    код, строки = конфигурация(repo_root, питон(tmp_path, ТОРЧ_СЛОМАН), env)
+    assert код == 0
+    assert строки.strip() == ""
+
+
+def test_без_питона_выбор_установщика_остаётся(repo_root: Path, tmp_path: Path):
+    """Проверять нечем — не повод отказываться от найденной карты.
+
+    Так бывает в docker-режиме и при --dry-run: виртуального окружения ещё
+    нет, а конфигурацию писать уже надо.
+    """
+    env = карта_на_шине(tmp_path, драйвер(tmp_path))
+    код, строки = конфигурация(repo_root, tmp_path / "нет-такого", env)
+    assert код == 0
+    assert "device: cuda" in строки

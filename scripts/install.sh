@@ -1115,8 +1115,21 @@ else
     # Устройство и точность под найденную карту. Пусто — оставляем auto:
     # сервер определит сам, и это правильное поведение для машины без карты
     # и для той, где драйвер заработает только после перезагрузки.
-    GPU_BATCHING_BLOCK="$(gpu_config_lines | sed 's/^/  /')"
-    [[ -z "${GPU_BATCHING_BLOCK}" ]] && GPU_BATCHING_BLOCK="  device: auto
+    # Карту для конфигурации выбирает nvidia-smi, а считать будет torch —
+    # и эти двое расходятся. Проверка нужна здесь, а не только при
+    # обновлении: «device: cuda», записанное на машине, где torch карты не
+    # видит, заводит сервер, у которого падает каждое задание.
+    GPU_RC=0
+    GPU_BATCHING_BLOCK="$(gpu_config_lines_checked "${VENV}/bin/python" \
+                          "${PREFIX}/server" | sed 's/^/  /')" || GPU_RC=$?
+    if [[ "${GPU_RC}" -ne 0 ]]; then
+      warn "Карта видна системе, но не питону — оставляем device: auto."
+      hint "С жёстким устройством падало бы каждое задание; с «auto» сервер"
+      hint "уйдёт на процессор и возьмёт карту, как только она отзовётся."
+      gpu_runtime_diagnose asrhub
+      GPU_BATCHING_BLOCK=""
+    fi
+    [[ -z "${GPU_BATCHING_BLOCK// /}" ]] && GPU_BATCHING_BLOCK="  device: auto
   compute_type: auto"
     # 0640: в config.yaml сервер дописывает ключи доступа с их группами и
   # квотами. Читать его должен только владелец установки.
@@ -1360,6 +1373,13 @@ step "Проверка установки"
 if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
   ok "Пробный запуск завершён — изменений не вносилось."
   exit 0
+fi
+
+# Чем сервер будет считать — до того, как стучаться в порт. Порт ответит и
+# на машине, где распознавание не работает вовсе: /api/health не спрашивает
+# видеокарту, а первое задание спросит.
+if [[ "${MODE}" == "native" && -x "${VENV}/bin/python" ]]; then
+  gpu_runtime_report "${VENV}/bin/python" "${DATA_DIR}" "${PREFIX}/server" asrhub || true
 fi
 
 HEALTH_RC=0

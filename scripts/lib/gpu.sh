@@ -670,6 +670,7 @@ gpu_config_lines() {
 # только на машине, где драйвер сломан именно нужным образом.
 ASRHUB_NVIDIA_PROC="${ASRHUB_NVIDIA_PROC:-/proc/driver/nvidia/version}"
 ASRHUB_NVIDIA_DEV="${ASRHUB_NVIDIA_DEV:-/dev}"
+ASRHUB_MODULES_ROOT="${ASRHUB_MODULES_ROOT:-/lib/modules}"
 
 nvidia_loaded_version() {
   # Версия модуля, который сейчас в памяти. Читается из /proc, а не из
@@ -686,7 +687,35 @@ nvidia_ondisk_version() {
   # лежит ровно тот модуль, что уже loaded, — не поможет, и человека надо
   # отправить не в reboot, а в dkms.
   have modinfo || { printf ''; return 0; }
-  modinfo -F version nvidia 2>/dev/null | head -1
+  # Код возврата гасится: modinfo отвечает единицей, когда не находит модуль
+  # по имени, — а это не поломка, а обычное дело (в RHEL он лежит в extra/,
+  # и находится обходом каталогов). Под `set -o pipefail` эта единица роняла
+  # весь разбор, и роняла молча: падение случалось внутри подстановки.
+  { modinfo -F version nvidia 2>/dev/null || true; } | head -1
+}
+
+nvidia_module_versions() {
+  # Печатает «ядро<TAB>версия» по каждому установленному ядру, где модуль
+  # nvidia лежит на диске.
+  #
+  # Нужно ровно для одного различения, которого иначе не сделать: модуль мог
+  # собраться не под то ядро, что работает сейчас. Так бывает, когда вместе с
+  # драйвером приехало и новое ядро. Под работающим ядром модуля тогда
+  # действительно нет — и `modinfo nvidia` честно об этом молчит, — но
+  # перезагрузка (уже в новое ядро) как раз помогает, и отправлять человека
+  # в dkms значит гонять его по кругу.
+  local root="${ASRHUB_MODULES_ROOT}" f kern ver
+  have modinfo || return 0
+  # Три каталога: dkms кладёт по-разному в Debian и RHEL, а бывает и модуль
+  # из самого ядра.
+  for f in "${root}"/*/updates/dkms/nvidia.ko* "${root}"/*/extra/nvidia.ko* \
+           "${root}"/*/kernel/drivers/video/nvidia.ko*; do
+    [[ -e "${f}" ]] || continue
+    kern="${f#"${root}/"}"; kern="${kern%%/*}"
+    ver="$( { modinfo -F version "${f}" 2>/dev/null || true; } | head -1)"
+    [[ -n "${ver}" ]] && printf '%s\t%s\n' "${kern}" "${ver}"
+  done
+  return 0
 }
 
 nvidia_userspace_version() {
@@ -733,10 +762,20 @@ nvidia_driver_verdict() {
   #   reboot|<в памяти>|<на диске>     на диске новый модуль — перезагрузка поможет
   #   rebuild|<в памяти>|<библиотеки>  на диске тот же модуль — не поможет
   #   unknown||                        сравнивать нечего
-  local loaded ondisk userspace
+  local loaded ondisk userspace running kern ver
   loaded="$(nvidia_loaded_version)"
   ondisk="$(nvidia_ondisk_version)"
   userspace="$(nvidia_userspace_version)"
+  running="$(uname -r 2>/dev/null || true)"
+  # `modinfo nvidia` ищет модуль по имени и находит его не везде: в RHEL он
+  # лежит в extra/, а не в updates/dkms/. Тогда версию под работающим ядром
+  # берём из обхода каталогов — иначе исправно собранный модуль выглядел бы
+  # как отсутствующий, и дальше его приняли бы за «собран под другое ядро».
+  if [[ -z "${ondisk}" && -n "${running}" ]]; then
+    while IFS=$'\t' read -r kern ver; do
+      [[ "${kern}" == "${running}" ]] && { ondisk="${ver}"; break; }
+    done < <(nvidia_module_versions)
+  fi
   if [[ -z "${loaded}" || -z "${userspace}" ]]; then
     printf 'unknown|%s|%s' "${loaded}" "${userspace}"
     return 0
@@ -747,6 +786,24 @@ nvidia_driver_verdict() {
   fi
   if [[ -n "${ondisk}" ]] && ! nvidia_versions_match "${loaded}" "${ondisk}"; then
     printf 'reboot|%s|%s' "${loaded}" "${ondisk}"
+    return 0
+  fi
+  # Под работающим ядром нового модуля нет. Прежде чем отправлять в dkms,
+  # смотрим на остальные установленные ядра: если под одним из них модуль
+  # уже собран и сходится с библиотеками, чинить нечего — надо загрузиться
+  # в него.
+  while IFS=$'\t' read -r kern ver; do
+    [[ -n "${kern}" ]] || continue
+    [[ "${kern}" == "${running}" ]] && continue
+    if nvidia_versions_match "${ver}" "${userspace}"; then
+      printf 'other-kernel|%s|%s' "${loaded}" "${kern}"
+      return 0
+    fi
+  done < <(nvidia_module_versions)
+  # Без modinfo сравнивать не с чем, и утверждать «модуль не собрался» —
+  # значит выдавать отсутствие данных за вывод.
+  if ! have modinfo; then
+    printf 'unknown-disk|%s|%s' "${loaded}" "${userspace}"
     return 0
   fi
   printf 'rebuild|%s|%s' "${loaded}" "${userspace}"
@@ -919,11 +976,24 @@ gpu_runtime_diagnose() {
       hint "Без перезагрузки — только модуль (карту должны отпустить все, включая Ollama):"
       hint "  sudo systemctl stop ${service} ollama"
       hint "  sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia_uvm" ;;
+    other-kernel)
+      warn "Новый модуль собран под ядро ${other}, а работает $(uname -r 2>/dev/null)."
+      hint "Загрузитесь в него — этого достаточно: sudo reboot (и выберите ${other})"
+      hint "Либо соберите под работающее ядро:"
+      hint "  sudo dkms autoinstall -k \"\$(uname -r)\" && sudo reboot" ;;
     rebuild)
-      warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись, а новый модуль на диске не появился."
-      hint "Перезагрузка тут не поможет — модуль не пересобрался под текущее ядро:"
+      warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись, а новый модуль не собран ни под одно установленное ядро."
+      hint "Перезагрузка тут не поможет — собирать нужно заново:"
+      hint "  sudo apt-get install -y \"linux-headers-\$(uname -r)\"   # без них dkms не соберёт"
       hint "  sudo dkms status && sudo dkms autoinstall"
-      hint "  затем sudo reboot" ;;
+      hint "  затем sudo reboot"
+      hint "Если в dkms status новой версии нет вовсе — приехали только библиотеки:"
+      hint "  sudo dpkg --configure -a && sudo apt-get -f install"
+      hint "  sudo apt-get install --reinstall nvidia-dkms-<ветка>" ;;
+    unknown-disk)
+      warn "Модуль ядра ${loaded} и библиотеки ${other} разошлись."
+      hint "Сравнить с модулем на диске нечем: нет modinfo (пакет kmod)."
+      hint "Обычно помогает перезагрузка; если не помогла — sudo dkms autoinstall" ;;
     ok)
       info "Версии драйвера сходятся (модуль ${loaded}, библиотеки ${other}) — дело не в них." ;;
   esac
@@ -949,4 +1019,31 @@ gpu_runtime_diagnose() {
   fi
 
   hint "Первая проверка руками: nvidia-smi -L"
+}
+
+gpu_config_lines_checked() {
+  # То же, что gpu_config_lines, но с проверкой у питона.
+  #
+  #   gpu_config_lines_checked <питон> <каталог_кода>
+  #
+  # Карту для config.yaml выбирает nvidia-smi, а считать будет torch — и эти
+  # двое расходятся. Записать «device: cuda» там, где torch карты не видит,
+  # значит завести сервер, у которого падает каждое задание: жёсткое
+  # устройство отключает уход на процессор. Поэтому в таком положении строки
+  # не пишутся вовсе — остаётся «auto», то есть медленно, но работает.
+  #
+  # Печатает строки для конфигурации; пусто — значит оставить auto. Код
+  # возврата 1 означает «карта есть, но питон её не видит» — на случай, если
+  # вызывающий хочет об этом сказать.
+  local py="$1" code_dir="$2" lines wanted probe
+  lines="$(gpu_config_lines)"
+  [[ -n "${lines}" ]] || return 0
+  [[ -x "${py}" ]] || { printf '%s\n' "${lines}"; return 0; }
+  wanted="$(printf '%s' "${lines}" | sed -n 's/^[[:space:]]*device:[[:space:]]*//p' | head -1)"
+  [[ -n "${wanted}" ]] || { printf '%s\n' "${lines}"; return 0; }
+  probe="$(gpu_torch_probe "${py}" "${code_dir}" "${wanted}")"
+  case "${probe}" in
+    fail\|*) return 1 ;;
+    *) printf '%s\n' "${lines}"; return 0 ;;
+  esac
 }

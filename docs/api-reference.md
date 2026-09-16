@@ -814,7 +814,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:8218",
+  "instance": "vm:16283",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1392,7 +1392,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789572089.152047,
+    "generated_at": 1789581329.6675942,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1559,8 +1559,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.2",
-  "uptime_s": 118.1,
+  "version": "3.1.3",
+  "uptime_s": 112.2,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1638,8 +1638,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.2",
-  "uptime_s": 118.2,
+  "version": "3.1.3",
+  "uptime_s": 112.3,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v33",
