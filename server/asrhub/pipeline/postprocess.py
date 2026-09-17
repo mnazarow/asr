@@ -11,9 +11,12 @@
 """
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import unicodedata
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 from .. import settings_access as S
@@ -185,6 +188,25 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
     explicit = model != "auto"
     if model == "auto":
         choice = "rupunct" if language == "ru" else "multilingual"
+    if choice == "multilingual" and language == "ru":
+        # У deepmultilingualpunctuation русского нет НИ В ОДНОЙ модели:
+        # `fullstop-punctuation-multilang-large` — это английский, немецкий,
+        # французский и итальянский, «sonar-base» добавляет нидерландский.
+        # Выбранный вручную для русской записи, он раньше молча возвращал
+        # текст без знаков — и это выглядело как «модель не справилась», а
+        # не как «модель этого языка не знает».
+        log.warning("Модель пунктуации «multilingual» русского языка не знает "
+                    "— берётся RUPunct. Список языков: en, de, fr, it, nl.")
+        choice = "rupunct"
+
+    if choice == "rupunct_onnx":
+        try:
+            фн = _рупункт_onnx()
+            if фн is not None:
+                return _register(фн)
+        except Exception as exc:                            # noqa: BLE001
+            _report_missing("Модуль расстановки знаков препинания",
+                            "rupunct_onnx", explicit, exc)
 
     if choice == "rupunct":
         try:
@@ -222,6 +244,41 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
                             "multilingual", explicit, exc)
 
     return _register(None)
+
+
+#: Откуда берётся лёгкая модель пунктуации. Меняется переменной окружения:
+#: на сервере без доступа в интернет веса кладут рядом и указывают путь.
+RUPUNCT_ONNX = "ekhodzitsky/rupunct-small-onnx"
+
+
+def _рупункт_onnx() -> Callable[[str], str] | None:
+    """RUPunct в виде ONNX: двадцать девять мегабайт вместо семисот.
+
+    Зачем ещё одна модель пунктуации, когда есть RUPunct_big. Тот весит
+    711 МБ, требует transformers и torch и держит их в памяти всё время
+    работы сервера. Здесь — та же разметка, но квантованная до int8 и
+    исполняемая onnxruntime: он ставится на Python 3.14 (в отличие от
+    половины речевых пакетов), работает на процессоре с приемлемой
+    скоростью и не отнимает видеопамять у распознавания. Для сервера, где
+    видеокарта занята моделью на тридцать гигабайт, это не мелочь.
+
+    Разметка у моделей одна и та же, поэтому разбор меток общий с
+    `_apply_rupunct` — расходиться им нельзя.
+    """
+    from optimum.onnxruntime import ORTModelForTokenClassification  # type: ignore
+    from transformers import AutoTokenizer, pipeline  # type: ignore
+
+    источник = os.environ.get("ASRHUB_RUPUNCT_ONNX", RUPUNCT_ONNX)
+    токенизатор = AutoTokenizer.from_pretrained(источник, strip_accents=False,
+                                                add_prefix_space=True)
+    модель = ORTModelForTokenClassification.from_pretrained(источник)
+    труба = pipeline("ner", model=модель, tokenizer=токенизатор,
+                     aggregation_strategy="first")
+
+    def применить(text: str) -> str:
+        return _apply_rupunct(труба, text)
+
+    return применить
 
 
 def _apply_rupunct(pipe: Any, text: str) -> str:
@@ -316,9 +373,26 @@ def _load_itn(backend: str, language: str):
                 InverseNormalizer,
             )
 
-            normalizer = InverseNormalizer(lang=language)
+            # Каталог для готовых грамматик. Без него NeMo собирает их ЗАНОВО
+            # при каждом запуске процесса: замеренные 125 секунд против 1,6
+            # с кешем. Сервер перезапускают при каждом обновлении, а
+            # воркеров бывает несколько — две минуты тишины на старте
+            # выглядели как зависший сервер, и причина нигде не называлась.
+            normalizer = InverseNormalizer(lang=language, cache_dir=_кеш_грамматик())
             _ITN_CACHE[key] = normalizer.inverse_normalize
             return _ITN_CACHE[key]
+        except TypeError:
+            # Старая версия пакета без `cache_dir` — работаем как раньше.
+            try:
+                from nemo_text_processing.inverse_text_normalization.inverse_normalize import (  # type: ignore
+                    InverseNormalizer,
+                )
+
+                normalizer = InverseNormalizer(lang=language)
+                _ITN_CACHE[key] = normalizer.inverse_normalize
+                return _ITN_CACHE[key]
+            except Exception as exc:
+                _report_missing("Нормализатор чисел", "nemo", explicit, exc)
         except Exception as exc:
             _report_missing("Нормализатор чисел", "nemo", explicit, exc)
     if choice in ("rus2num", "nemo") and language == "ru":
@@ -331,6 +405,49 @@ def _load_itn(backend: str, language: str):
         except Exception as exc:
             _report_missing("Нормализатор чисел", "rus2num", explicit, exc)
     _ITN_CACHE[key] = None
+    return None
+
+
+#: Основы порядковых числительных: «четверт» + окончание → 4.
+#: «ё» здесь не нужна: сравнение идёт по тексту, уже приведённому к «е».
+_ПОРЯДКОВЫЕ_ОСНОВЫ: dict[str, int] = {
+    "перв": 1, "втор": 2, "трет": 3, "четверт": 4, "пят": 5, "шест": 6,
+    "седьм": 7, "восьм": 8, "девят": 9, "десят": 10, "одиннадцат": 11,
+    "двенадцат": 12, "тринадцат": 13, "четырнадцат": 14, "пятнадцат": 15,
+    "шестнадцат": 16, "семнадцат": 17, "восемнадцат": 18, "девятнадцат": 19,
+    "двадцат": 20, "тридцат": 30, "сороков": 40, "пятидесят": 50,
+    "шестидесят": 60, "семидесят": 70, "восьмидесят": 80, "девяност": 90,
+    "сот": 100, "двухсот": 200, "трехсот": 300, "четырехсот": 400,
+    "пятисот": 500, "шестисот": 600, "семисот": 700, "восьмисот": 800,
+    "девятисот": 900, "тысячн": 1000,
+}
+
+#: Окончание порядкового → наращение при цифре. Правило русской типографики:
+#: одна буква, если окончанию предшествует гласная, две — если согласная.
+#: Здесь оно записано таблицей, потому что читать таблицу проще, чем правило.
+_НАРАЩЕНИЯ: dict[str, str] = {
+    "ый": "й", "ий": "й", "ой": "й", "ья": "я", "ье": "е", "ьи": "и",
+    "ая": "я", "яя": "я", "ое": "е", "ее": "е", "ые": "е", "ие": "е",
+    "ого": "го", "его": "го", "ьего": "го",
+    "ому": "му", "ему": "му", "ьему": "му",
+    "ым": "м", "им": "м", "ом": "м", "ем": "м", "ьем": "м",
+    "ую": "ю", "юю": "ю", "ьюю": "ю",
+    "ых": "х", "их": "х", "ьих": "х",
+    "ыми": "ми", "ими": "ми", "ьими": "ми",
+}
+
+
+def _порядковое(слово: str) -> tuple[int, str] | None:
+    """Порядковое числительное → (значение, наращение). Иначе None.
+
+    «четвертом» → (4, «м»), «двадцать третий» разбирается по слову.
+    """
+    низ = без_ё(слово.lower().strip(".,!?;:…()«»\"'"))
+    for длина in range(len(низ) - 1, 2, -1):
+        основа, окончание = низ[:длина], низ[длина:]
+        значение = _ПОРЯДКОВЫЕ_ОСНОВЫ.get(основа)
+        if значение is not None and окончание in _НАРАЩЕНИЯ:
+            return значение, _НАРАЩЕНИЯ[окончание]
     return None
 
 
@@ -357,6 +474,24 @@ def _builtin_itn_ru(text: str) -> str:
     trailing = ".,!?;:…()«»\"'"
     for token in tokens:
         bare = token.lower().strip(trailing)
+        # Порядковое числительное ПОСЛЕ разобранной группы — хвост того же
+        # числа: «две тысячи двадцать» + «четвёртом» — это 2024-м, а не
+        # «2020 четвёртом». Раньше выходило именно второе: группа
+        # складывалась в круглое число, а порядковое оставалось словом, и
+        # получался правдоподобный мусор — «в 2020 четвёртом году». В
+        # расшифровке такое не отличить от настоящей даты.
+        #
+        # Одиноко стоящее порядковое («первый раз», «третья попытка») не
+        # трогаем: это слово, а не число, и цифра вместо него читается хуже.
+        хвост = _порядковое(bare) if buffer else None
+        if хвост is not None:
+            значение, наращение = хвост
+            начало = _parse_number_ru(buffer)
+            if начало is not None and значение < max(1, _magnitude(начало) * 10):
+                знаки = token[len(token.rstrip(trailing)):]
+                out.append(f"{начало + значение}-{наращение}{знаки}")
+                buffer.clear()
+                continue
         if bare in _UNITS_RU or bare in _SCALES_RU:
             # Знак препинания разрывает число. Раньше он снимался при
             # strip и группа продолжалась дальше, поэтому «три, четыре
@@ -418,13 +553,62 @@ def _parse_number_ru(words: list[str]) -> int | None:
     return total + current
 
 
+def _кеш_грамматик() -> str:
+    """Куда класть собранные грамматики NeMo.
+
+    Каталог данных, если он задан окружением, иначе общий временный. Важно
+    не то, где именно он лежит, а что он вообще есть и переживает
+    перезапуск: сборка грамматик занимает две минуты.
+    """
+    корень = (os.environ.get("ASRHUB_DATA_DIR")
+              or os.environ.get("XDG_CACHE_HOME")
+              or tempfile.gettempdir())
+    путь = Path(корень) / "itn-grammars"
+    try:
+        путь.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return tempfile.gettempdir()
+    return str(путь)
+
+
+#: Слова, где «ё» обязана остаться: без неё меняется смысл, а не написание.
+#: Список короткий намеренно — он про смысл, а не про орфографию.
+_Ё_ЗНАЧИМА = ("все", "всё", "небо", "нёбо", "узнаем", "узнаём",
+              "передохнем", "передохнём")
+
+
+def без_ё(text: str) -> str:
+    """«ё» → «е». Нужно перед грамматиками NeMo.
+
+    Грамматика русских числительных в NeMo написана без «ё», и слово с ней
+    рассыпает разбор всей конструкции:
+
+        «в две тысячи двадцать четвёртом году»  → «в 2020 четвёртом г.»
+        «в две тысячи двадцать четвертом году»  → «в 2024г.»
+
+    Первое — не опечатка, а то, что выдают русские движки распознавания:
+    и GigaAM, и Whisper ставят «ё» охотно. То есть нормализация чисел
+    ломалась ровно на тех записях, где движок работал лучше всего, и
+    ломалась молча: на выходе получался правдоподобный мусор.
+    """
+    return text.replace("ё", "е").replace("Ё", "Е")
+
+
 def apply_itn(text: str, backend: str = "auto", language: str = "ru") -> str:
     if not text.strip():
         return text
     fn = _load_itn(backend, language)
     if fn is not None:
         try:
-            return normalize_spaces(fn(text))
+            # «ё» снимается только с того, что уходит в грамматику: если
+            # нормализация ничего не изменила, возвращаем ИСХОДНЫЙ текст с
+            # «ё» на месте. Терять её в расшифровке нельзя — это буква
+            # русского языка, а не служебный знак.
+            подано = без_ё(text) if language == "ru" else text
+            итог = normalize_spaces(fn(подано))
+            if language == "ru" and итог.strip() == подано.strip():
+                return normalize_spaces(text)
+            return итог
         except Exception as exc:
             log.warning("Нормализация чисел дала сбой (%s), применено встроенное правило", exc)
     if language == "ru":

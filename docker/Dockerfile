@@ -116,7 +116,7 @@ ARG ACCEL=cpu
 # Версия образа. Значение по умолчанию обязано совпадать с файлом VERSION —
 # это проверяется тестом: раньше оно было вписано числом и тихо отставало от
 # файла на каждом выпуске, а docker inspect показывал прошлогоднюю версию.
-ARG VERSION=3.1.6
+ARG VERSION=3.1.7
 
 LABEL org.opencontainers.image.title="ASR Hub" \
       org.opencontainers.image.description="Сервер распознавания речи на свободных моделях" \

@@ -53,6 +53,14 @@ _СОВЕТ_ТИШИНА = (
     "текст, выключите «Обрезать тишину»."
 )
 
+#: Частота, на которой работает DeepFilterNet. Не настройка: модель обучена
+#: на 48 кГц и другой не понимает.
+DEEPFILTER_ЧАСТОТА = 48000
+
+#: Сколько секунд записи мерить, решая, нужна ли очистка. Минуты хватает: мы
+#: выбираем между «чистить» и «не чистить», а не считаем паспорт записи.
+ЗАМЕР_СЕКУНД = 60.0
+
 AUDIO_EXTENSIONS = {
     ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus",
     ".wma", ".aiff", ".aif", ".amr", ".ac3", ".caf", ".mp2", ".w64",
@@ -254,6 +262,119 @@ def lead_silence_s(src: Path, settings: dict[str, Any]) -> float:
     return 0.0
 
 
+def deepfilter_путь() -> str | None:
+    """Путь к бинарю `deep-filter`, если он на машине есть.
+
+    Почему отдельный бинарь, а не пакет с PyPI: питоновский DeepFilterNet
+    собран расширением на Rust, и колёс новее Python 3.11 у него нет —
+    установить его рядом с сервером на 3.14 нельзя вовсе. Готовый бинарь с
+    той же моделью лежит в релизах проекта и ни от какого Python не зависит.
+    """
+    задан = os.environ.get("ASRHUB_DEEPFILTER", "").strip()
+    if задан:
+        return задан if Path(задан).is_file() else None
+    return shutil.which("deep-filter")
+
+
+def очистить_deepfilter(src: Path, workdir: Path,
+                        settings: dict[str, Any]) -> tuple[Path, str]:
+    """Прогоняет запись через DeepFilterNet. Возвращает (файл, замечание).
+
+    Это единственное шумоподавление в наборе, у которого есть ЗАМЕРЕННАЯ
+    польза для распознавания, а не только для человеческого уха: на
+    умеренном шуме (отношение сигнал/шум от нуля децибел и выше) ошибка
+    распознавания падает вдвое — 9,7 % против 4,4 % на наборе DNS. Там же
+    измерена и обратная сторона: на очень шумной записи та же модель ошибку
+    УВЕЛИЧИВАЕТ. Поэтому она идёт в паре с порогом (см. `нужна_очистка`),
+    а не включается на всё подряд.
+
+    Работает модель на 48 кГц, поэтому проход обкладывается ресемплингом.
+    На телефонных 8 кГц это означает пустую верхнюю половину спектра —
+    случай, в котором модель видит не то, на чём обучалась. Для 8 кГц
+    очистку стоит включать только после собственного замера.
+    """
+    бинарь = deepfilter_путь()
+    if бинарь is None:
+        return src, ("DeepFilterNet выбран, но программа deep-filter не найдена — "
+                     "шумоподавление пропущено")
+    exe = _ffmpeg()
+    workdir.mkdir(parents=True, exist_ok=True)
+    на_вход = workdir / f"{src.stem}.dfn-in.wav"
+    каталог = workdir / f"{src.stem}.dfn-out"
+    каталог.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+             "-i", str(src), "-vn", "-sn", "-dn", "-ac", "1",
+             "-ar", str(DEEPFILTER_ЧАСТОТА), "-acodec", "pcm_s16le",
+             str(на_вход)], capture_output=True, text=True, timeout=1800, check=True)
+        subprocess.run([бинарь, "-o", str(каталог), str(на_вход)],
+                       capture_output=True, text=True, timeout=3600, check=True)
+    except (OSError, subprocess.SubprocessError) as сбой:
+        log.warning("DeepFilterNet не отработал: %s", сбой)
+        return src, f"DeepFilterNet не отработал ({сбой}) — шумоподавление пропущено"
+    очищенный = каталог / на_вход.name
+    if not очищенный.is_file() or очищенный.stat().st_size < ПУСТОЙ_WAV:
+        # Пустой выход — это отказ, а не тишина: подавать его дальше значит
+        # заменить разговор на ничто и назвать это обработкой.
+        return src, "DeepFilterNet вернул пустой файл — взята исходная запись"
+    return очищенный, ""
+
+
+def оценить_snr(src: Path, секунд: float = ЗАМЕР_СЕКУНД) -> float | None:
+    """Отношение сигнал/шум исходной записи, дБ. None — померить не вышло.
+
+    Меряется по началу записи и без единого фильтра: решение «чистить или
+    не чистить» принимается по тому, что пришло, а не по тому, что уже
+    обработали.
+    """
+    exe = _ffmpeg()
+    временный = src.with_suffix(".snr.wav")
+    try:
+        subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+             "-t", f"{max(1.0, секунд):.1f}", "-i", str(src),
+             "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000",
+             "-acodec", "pcm_s16le", str(временный)],
+            capture_output=True, text=True, timeout=600, check=True)
+        from . import audio_profile  # noqa: PLC0415
+
+        профиль = audio_profile.profile_file(временный, max_seconds=секунд)
+        значение = профиль.get("snr_db")
+        return float(значение) if значение is not None else None
+    except (OSError, subprocess.SubprocessError, ASRHubError, ValueError, TypeError) as сбой:
+        log.debug("SNR исходника не померен: %s", сбой)
+        return None
+    finally:
+        временный.unlink(missing_ok=True)
+
+
+def нужна_очистка(src: Path, settings: dict[str, Any]) -> tuple[bool, str]:
+    """Стоит ли вообще чистить ЭТУ запись. Возвращает (да/нет, замечание).
+
+    Безусловная очистка всего потока — приём, который измерения последних
+    лет не подтверждают: на чистой записи любой шумоподавитель убирает
+    вместе с шумом часть речи, и распознавание становится ХУЖЕ. Отдельная
+    работа 2025 года прогнала одну из популярных моделей по сорока
+    сочетаниям «запись × шум» и не нашла ни одного, где ошибка уменьшилась
+    бы; в других работах выигрыш есть, но только на умеренном шуме.
+
+    Отсюда правило: чистим по порогу. Запись, у которой сигнал/шум выше
+    порога, идёт в распознавание как есть — и это не экономия времени, а
+    прямая забота о точности.
+    """
+    порог = S.num(settings, "audio_denoise_below_snr_db", 0.0)
+    if порог <= 0:
+        return True, ""                      # порог не задан — как раньше
+    snr = оценить_snr(src)
+    if snr is None:
+        return True, ""                      # не померили — не отменяем
+    if snr >= порог:
+        return False, (f"шумоподавление пропущено: сигнал/шум {snr:.0f} дБ "
+                       f"выше порога {порог:g} дБ")
+    return True, ""
+
+
 def build_filter_chain(settings: dict[str, Any]) -> str:
     """Собирает цепочку фильтров ffmpeg по настройкам задания."""
     filters: list[str] = []
@@ -271,6 +392,9 @@ def build_filter_chain(settings: dict[str, Any]) -> str:
             filters.append(f"arnndn=m={model}")
         else:
             log.warning("arnndn выбран, но файл модели не задан — шумоподавление пропущено")
+    # deepfilternet в цепочку фильтров не попадает: он работает отдельным
+    # проходом до неё (см. `очистить_deepfilter`). Причина в частоте: модель
+    # работает на 48 кГц и требует своего ресемплинга туда и обратно.
 
     if settings.get("audio_trim_silence"):
         # Режем только тишину в КОНЦЕ. Начальную здесь трогать нельзя: она
@@ -564,6 +688,26 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
         raise AudioError(f"Длительность файла «{src.name}» близка к нулю.",
                          hint="Возможно, файл повреждён или содержит только заголовок.")
 
+    замечания: list[str] = []
+    # Шумоподавление решается ПЕРВЫМ: и «нужно ли оно этой записи», и
+    # отдельный проход DeepFilterNet, который в цепочку фильтров ffmpeg не
+    # укладывается. Первым — потому что начальная тишина меряется дальше, и
+    # мерить её надо по тому самому звуку, который потом обрежут. Дальше по
+    # коду настройки идут уже поправленными: `audio_denoise` в них может
+    # оказаться выключенным, и это осознанно.
+    настройки = dict(settings)
+    if str(настройки.get("audio_denoise") or "none") != "none":
+        чистить, почему = нужна_очистка(src, настройки)
+        if not чистить:
+            настройки["audio_denoise"] = "none"
+            замечания.append(почему)
+        elif str(настройки.get("audio_denoise")) == "deepfilternet":
+            src, беда = очистить_deepfilter(src, workdir, настройки)
+            настройки["audio_denoise"] = "none"
+            if беда:
+                замечания.append(беда)
+    settings = настройки
+
     # Начальная тишина отмеряется один раз на исходном файле и одинаково
     # применяется ко всем каналам: иначе левый и правый разъехались бы во
     # времени между собой.
@@ -571,7 +715,7 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
     speed = float(settings.get("audio_speed") or 1.0)
 
     mode = str(settings.get("audio_channels") or "mono")
-    замечания: list[str] = []
+
     if mode in ("left", "right") and info.channels < 2:
         # Второго канала нет. `pan=mono|c0=c1` на одноканальном файле даёт
         # тишину, и отказ винил бы фильтры — при исправной записи и
