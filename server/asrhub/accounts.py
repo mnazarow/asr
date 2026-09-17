@@ -153,6 +153,13 @@ class Account:
     must_change_password: bool = False
     created_at: float = 0.0
     last_login: float = 0.0
+    #: «local» — своя запись со своим паролем; «ldap» — запись из каталога
+    #: предприятия: пароля у неё нет, роль приходит из групп при каждом входе.
+    source: str = "local"
+
+    @property
+    def from_directory(self) -> bool:
+        return self.source == "ldap"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -165,6 +172,7 @@ class Account:
             "must_change_password": self.must_change_password,
             "created_at": self.created_at,
             "last_login": self.last_login,
+            "source": self.source,
         }
 
 
@@ -179,7 +187,18 @@ def _account(row: Any) -> Account:
         must_change_password=bool(row["must_change"]),
         created_at=float(row["created_at"] or 0),
         last_login=float(row["last_login"] or 0),
+        # База прошлой версии колонки не имеет; догонялка добавит её при
+        # запуске, но читать эту строку могут и до того.
+        source=str(_поле(row, "source") or "local"),
     )
+
+
+def _поле(row: Any, имя: str) -> Any:
+    """Значение колонки, если она в этой базе есть."""
+    try:
+        return row[имя]
+    except (IndexError, KeyError):
+        return None
 
 
 class Accounts:
@@ -251,6 +270,69 @@ class Accounts:
         account = self.get(user_id)
         assert account is not None
         return account
+
+    def ensure_directory(self, username: str, *, role: str,
+                         display_name: str = "") -> Account:
+        """Заводит или обновляет запись, пришедшую из каталога предприятия.
+
+        Роль и отображаемое имя переписываются при каждом входе: каталог —
+        источник истины, и человек, снятый из группы администраторов, обязан
+        потерять права на следующем входе, а не когда кто-то вспомнит.
+
+        Пароль ставится случайный и никому не сообщается. Он нужен только
+        потому, что колонка не пустая; войти по нему нельзя ни теоретически
+        (тридцать два случайных байта), ни практически — вход такой записи
+        идёт через каталог, минуя проверку пароля.
+        """
+        if role not in ROLES:
+            raise AccountError(f"Неизвестная роль «{role}».")
+        запись = self.by_username(username)
+        if запись is None:
+            проблема = username_problem(username)
+            if проблема:
+                raise AccountError(проблема)
+            now = time.time()
+            user_id = uuid.uuid4().hex[:16]
+            self.db.execute(
+                "INSERT INTO users (id, username, password_hash, display_name, role, "
+                "user_group, enabled, must_change, created_at, updated_at, last_login, "
+                "failed_attempts, locked_until, source) "
+                "VALUES (?, ?, ?, ?, ?, '', 1, 0, ?, ?, 0, 0, 0, 'ldap')",
+                [user_id, username, hash_password(secrets.token_urlsafe(32)),
+                 display_name, role, now, now])
+            log.info("Из каталога заведена учётная запись «%s» с ролью %s",
+                     username, role)
+            созданная = self.get(user_id)
+            assert созданная is not None
+            return созданная
+        поля: list[str] = []
+        args: list[Any] = []
+        if запись.role != role:
+            поля.append("role=?")
+            args.append(role)
+            log.info("Роль «%s» изменена каталогом: %s → %s",
+                     username, запись.role, role)
+        if display_name and запись.display_name != display_name:
+            поля.append("display_name=?")
+            args.append(display_name)
+        if запись.source != "ldap":
+            поля.append("source=?")
+            args.append("ldap")
+        # Запись из каталога не запирается счётчиком неудач: её пароль здесь
+        # не проверяется вовсе, и счётчик рос бы от чужих попыток.
+        поля.extend(["failed_attempts=0", "locked_until=0", "updated_at=?"])
+        args.append(time.time())
+        self.db.execute(f"UPDATE users SET {', '.join(поля)} WHERE id=?",
+                        [*args, запись.id])
+        обновлённая = self.get(запись.id)
+        assert обновлённая is not None
+        return обновлённая
+
+    def note_login(self, user_id: str) -> None:
+        """Отмечает удачный вход — для записи, проверенной не нами."""
+        self.db.execute(
+            "UPDATE users SET last_login=?, failed_attempts=0, locked_until=0 "
+            "WHERE id=?", [time.time(), str(user_id)])
 
     def update(self, user_id: str, **fields: Any) -> Account:
         allowed = {"display_name", "role", "user_group", "enabled", "must_change"}

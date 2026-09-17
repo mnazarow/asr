@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.7"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.8"
 ASRHUB_MIN_PYTHON="3.10"
 # Верхняя граница — не каприз, а состояние экосистемы. Движки распознавания
 # тянут за собой torch, onnxruntime, nemo и десяток библиотек с колёсами под
@@ -932,6 +932,79 @@ deliberate_deviations() {
   printf '%s' "${names}" | tr '_' '-' | sort -u
 }
 
+# Имена всех пакетов, которые ещё перечислены хоть в одном списке требований.
+#
+#   required_packages КАТАЛОГ_ТРЕБОВАНИЙ
+#
+# Нормализация — как у pip: нижний регистр, точки и подчёркивания в дефисы,
+# дополнения в скобках отброшены. «optimum[onnxruntime]» и «optimum» — одно имя.
+required_packages() {
+  local root="${1:-}" file line name names=""
+  [[ -d "${root}" ]] || return 0
+  while IFS= read -r file; do
+    [[ -f "${file}" ]] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="${line%%@*}"
+      line="${line%%[<>=!;[]*}"
+      name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+      [[ -n "${name}" ]] && names="${names}${name}"$'\n'
+    done < "${file}"
+  done < <(find "${root}" -name '*.txt' 2>/dev/null)
+  printf '%s' "${names}" | tr '_.' '--' | tr '[:upper:]' '[:lower:]' | sort -u
+}
+
+# Подсказывает, что расхождение версий осталось от прежней версии сервера.
+#
+#   orphan_conflict_hint ТЕКСТ_ЖАЛОБ КАТАЛОГ_ТРЕБОВАНИЙ ПУТЬ_К_PIP
+#
+# Так вышло с optimum: заход 36 добавил его ради лёгкой пунктуации, заход 37
+# заменил голым onnxruntime — но у того, кто уже обновился, пакет остался в
+# окружении и тянет за собой старый transformers. Сказать «версии не сходятся»
+# и замолчать — значит оставить человека с жалобой, на которую нечего ответить.
+# Поэтому здесь называется и виновник, и команда, которая его убирает.
+#
+# Пакет считается лишним, только если выполняются оба условия: его нет ни в
+# одном списке требований И его никто не тянет за собой (пустое «Required-by»
+# у pip show). Одного первого условия мало: пакеты вроде tokenizers не
+# перечислены нигде, но живут как спутник transformers, и советовать их снести
+# — вредный совет.
+orphan_conflict_hint() {
+  local text="$1" root="${2:-}" pip="${3:-}" required="" line subject want mine
+  local needed orphans="" checked=0
+  [[ -x "${pip}" ]] || return 0
+  required="$(required_packages "${root}")"
+  [[ -n "${required}" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    [[ ${checked} -ge 10 ]] && break
+    subject="$(printf '%s' "${line}" | awk '{print $1}' \
+      | tr '_.' '--' | tr '[:upper:]' '[:lower:]')"
+    [[ -n "${subject}" ]] || continue
+    grep -qxF "${subject}" <<<"${orphans}" && continue
+    mine=0
+    while IFS= read -r want; do
+      [[ -n "${want}" ]] || continue
+      if [[ "${subject}" == "${want}" || "${subject}" == "${want}-"* ]]; then
+        mine=1
+        break
+      fi
+    done <<< "${required}"
+    [[ ${mine} -eq 1 ]] && continue
+    checked=$((checked + 1))
+    needed="$("${pip}" show "${subject}" 2>/dev/null \
+      | sed -n 's/^Required-by:[[:space:]]*//p' | tr -d '[:space:]')"
+    [[ -n "${needed}" ]] && continue
+    orphans="${orphans}${subject}"$'\n'
+  done <<< "${text}"
+  orphans="$(printf '%s' "${orphans}" | sort -u | tr '\n' ' ')"
+  orphans="${orphans% }"
+  [[ -n "${orphans}" ]] || return 0
+  hint "Лишнее от прежней версии — этих пакетов нет ни в одном списке"
+  hint "требований, и никто их за собой не тянет. Расхождение уйдёт с ними:"
+  hint "  ${pip} uninstall -y ${orphans}"
+}
+
 # Отбрасывает жалобы, которые описывают наше же решение.
 #
 #   filter_deliberate ТЕКСТ СПИСОК_ПАКЕТОВ [СПИСОК_ЗАДАННЫХ_ВЕРСИЙ]
@@ -1019,6 +1092,7 @@ check_dependency_health() {
   hint "Движки требуют несовместимых версий одного пакета. Работать это чаще"
   hint "всего продолжает, но именно отсюда берутся необъяснимые сбои загрузки."
   hint "Полная картина: ${pip} check"
+  orphan_conflict_hint "${out}" "${root}" "${pip}"
   return 0
 }
 

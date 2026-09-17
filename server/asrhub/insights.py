@@ -68,7 +68,8 @@ log = get_logger("insights")
 #: Признаки, по которым считается норма: числовые показатели записи, у
 #: которых есть значение в каждой записи (не суммы за период).
 ПРИЗНАКИ_НОРМЫ: tuple[str, ...] = (
-    "sentiment", "wpm", "silence_share", "interruptions", "pauses", "longest_pause_s",
+    "sentiment", "wpm", "silence_share", "interruptions", "pauses", "long_pauses",
+    "longest_pause_s",
     "filler_rate", "compliance", "duration_s", "talk_share", "monologue_s",
     "customer_story_s", "switches", "reply_delay_s", "overlap_s", "dead_air_s",
     "tempo_ratio", "agent_score", "empathy",
@@ -111,7 +112,13 @@ log = get_logger("insights")
      "digits": 3},
     {"key": "interruptions", "title": "Перебивания", "unit": "", "good": -1,
      "digits": 1},
-    {"key": "pauses", "title": "Долгие паузы", "unit": "", "good": -1, "digits": 1},
+    {"key": "pauses", "title": "Паузы", "unit": "", "good": -1, "digits": 1},
+    # Второй счётчик пауз — по отраслевой границе в четыре секунды. Держать
+    # оба рядом обязательно: обычный отвечает «сколько раз задумались»,
+    # длинный — «сколько раз собеседник решил, что связь оборвалась», и
+    # именно длинный сверяют с чужими отчётами.
+    {"key": "long_pauses", "title": "Длинные паузы", "unit": "", "good": -1,
+     "digits": 1},
     {"key": "longest_pause_s", "title": "Самая долгая пауза", "unit": "с",
      "good": -1, "digits": 1},
     {"key": "filler_rate", "title": "Слова-паразиты", "unit": "доля", "good": -1,

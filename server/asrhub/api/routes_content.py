@@ -159,7 +159,7 @@ def records(request: Request, kind: str = Query(default="negative"),
 
 
 @router.get("/kinds", summary="Перечень отборов и разрезов")
-def kinds(request: Request,
+def kinds(request: Request, preset: str = Query(default="", max_length=32),
           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Что раздел умеет показывать — чтобы интерфейс не держал копию списка.
 
@@ -184,6 +184,15 @@ def kinds(request: Request,
         "categories": [к.to_dict() for к in индекс.categories()],
         "categories_own": индекс.categories_own(),
         "default_categories": категории.ГОТОВЫЕ,
+        # Отраслевые наборы — чтобы редактор мог предложить «добавить набор»,
+        # а не заставлять писать двадцать правил про свою отрасль руками.
+        "category_presets": категории.наборы(),
+        "category_preset": str(get_state(request).settings.get(
+            "content_category_preset") or ""),
+        # Правила запрошенного набора — чтобы редактор добавил их в черновик
+        # и человек увидел их до сохранения, а не после.
+        "preset_categories": ((категории.НАБОРЫ.get(preset) or {})
+                              .get("categories") or []) if preset else [],
         "category_kinds": категории.ВИДЫ,
         "category_who": категории.КТО,
         "category_where": категории.ГДЕ,
@@ -568,3 +577,70 @@ def export(request: Request,
         # вчерашние числа под сегодняшним именем.
         "Cache-Control": "no-store",
     })
+
+
+@router.get("/discover", summary="Темы без правил: о чём говорят, а правила нет")
+def discover_topics(request: Request, period: str = ПЕРИОД,
+                  threshold: float = Query(default=0.0, ge=0.0, le=0.95),
+                  min_size: int = Query(default=0, ge=0, le=500),
+                  name: bool = Query(default=True),
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Собирает записи периода в кучки по похожести и показывает непокрытые.
+
+    Категории показывают то, что уже искали. Новая причина звонков — сбой в
+    приложении, слух в соцсетях, изменившийся тариф — не попадает никуда, и
+    заметить её можно только случайно. Здесь она находится сама: кучка из
+    двухсот разговоров, у которых не сработало ни одной категории.
+
+    Считается по требованию, а не фоном: проход по архиву стоит секунд, а
+    смотрят этот отчёт раз в неделю.
+    """
+    from .. import topics as темы_модуль  # noqa: PLC0415
+
+    состояние = get_state(request)
+    индекс = _index(request)
+    свод = _insights(request)
+    начало, _ = свод.window(period)
+    владелец = scope_owner(principal)
+
+    записи = состояние.db.terms_matrix(since=начало, owner=владелец)
+    частоты, корпус = индекс.corpus_frequency()
+    найденные = темы_модуль.собрать(
+        записи, частоты, корпус,
+        порог=threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
+        минимум=min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ)
+    все_ид = [ид for тема in найденные for ид in тема.jobs]
+    темы_модуль.пометить_покрытие(найденные,
+                                  состояние.db.hits_for_jobs(все_ид))
+
+    назвали = False
+    клиент = getattr(состояние, "llm", None)
+    if name and клиент is not None and getattr(клиент, "enabled", False):
+        # Выдержки нужны только для названия, поэтому поднимаются лишь у тех
+        # записей, что пойдут в подсказку: по три на тему, а не весь архив.
+        нужные = [ид for тема in найденные for ид in тема.jobs[:3]]
+        тексты = {}
+        for ид in нужные:
+            задание = состояние.db.get_job(ид)
+            if задание:
+                тексты[ид] = str(задание.get("text") or "")[:1200]
+
+        def спросить(подсказка: str) -> str:
+            return клиент.chat(
+                "Ты помогаешь назвать тему группы телефонных разговоров.",
+                подсказка, kind="topic_name", json_mode=False, max_tokens=40)
+
+        темы_модуль.назвать(найденные, спросить, тексты)
+        назвали = True
+
+    всего = len(записи)
+    return {
+        "period": period, "since": начало,
+        "records": всего,
+        "topics": [т.to_dict(всего) for т in найденные],
+        "uncovered": sum(1 for т in найденные
+                         if т.covered / т.size < темы_модуль.ПОКРЫТА_ДОЛЯ),
+        "named_by_model": назвали,
+        "threshold": threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
+        "min_size": min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ,
+    }

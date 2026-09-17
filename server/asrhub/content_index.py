@@ -19,7 +19,8 @@ import threading
 import time
 from typing import Any
 
-from . import content
+from . import content, crm
+from .content import speech
 from .db import Database
 
 log = logging.getLogger("asrhub.content")
@@ -109,17 +110,31 @@ class ContentIndex:
         правил дешёвый, но делать его на каждую запись архива незачем:
         набор меняется раз в неделю, а записей — тысячи в день. Ключ кеша —
         само значение настройки: сменилось — разберём заново.
+
+        Отраслевой набор (`content_category_preset`) добавляется к готовому:
+        в банке «просрочка» — это долг, в доставке — опоздание курьера, и
+        одним правилом оба случая не закрыть.
         """
         from .content import categories as категории  # noqa: PLC0415
 
         значение = self.settings.get("content_categories") if self.settings else None
-        сырой = значение if isinstance(значение, list) and значение else категории.ГОТОВЫЕ
+        отрасль = str((self.settings.get("content_category_preset")
+                       if self.settings else "") or "")
+        # Свой набор всегда важнее отраслевого: человек, написавший правила
+        # руками, не должен получить к ним довесок, о котором не просил.
+        # Отрасль дополняет только готовый набор.
+        сырой = (значение if isinstance(значение, list) and значение
+                 else категории.с_набором(отрасль))
         ключ = json.dumps(сырой, ensure_ascii=False, sort_keys=True)
         with self._lock:
             if self._категории_ключ != ключ:
                 self._категории = категории.compile(сырой)
                 self._категории_ключ = ключ
             return self._категории
+
+    def _пороги(self) -> speech.Пороги:
+        """Границы паузы, тишины и перебивания из настроек сервера."""
+        return speech.Пороги.из_настроек(self.settings)
 
     def categories_own(self) -> bool:
         """Сохранён ли свой набор категорий (иначе действует готовый)."""
@@ -130,8 +145,15 @@ class ContentIndex:
 
     def analyze_job(self, job_id: str, *, job: dict[str, Any] | None = None,
                     segments: list[dict[str, Any]] | None = None,
+                    agent_speaker: str = "",
                     save: bool = True) -> dict[str, Any] | None:
-        """Разбирает одну запись и (по умолчанию) кладёт результат в базу."""
+        """Разбирает одну запись и (по умолчанию) кладёт результат в базу.
+
+        `agent_speaker` перебивает настройку сервера. Нужен переписке: там
+        стороны названы словами («Оператор», «Клиент»), и кто из них кто,
+        видно прямо из неё — а настройка сервера рассчитана на диаризацию с
+        её «SPEAKER_00» и к переписке отношения не имеет.
+        """
         задание = job or self.db.get_job(job_id)
         if not задание:
             return None
@@ -143,9 +165,15 @@ class ContentIndex:
         разбор = content.analyze(
             text=текст, segments=реплики,
             duration_s=float(задание.get("media_duration_s") or 0.0),
-            script=self._скрипт(), agent_speaker=self._оператор(),
+            script=self._скрипт(),
+            agent_speaker=agent_speaker or self._оператор(),
             document_frequency=частоты, corpus_size=размер,
             profanity=self._мат(), categories=self.categories(),
+            thresholds=self._пороги(),
+            # Переписка: времени у реплик нет, и показатели в секундах для
+            # неё не считаются вовсе. Ноль пауз в чате читался бы как
+            # «отвечали мгновенно», хотя мерить там нечего.
+            timed=str(задание.get("source") or "") != "text",
             # Уверенность распознавания входит в показатель точности речи:
             # по плохо расслышанной записи судить о конкретности ответов
             # нельзя, и без этой поправки хуже всех выглядели бы разговоры
@@ -161,6 +189,15 @@ class ContentIndex:
                 self._оценить_качество(job_id, реплики)
             except Exception as exc:                         # noqa: BLE001
                 log.warning("Признаки качества для %s не пересчитаны: %s",
+                            job_id, exc, extra={"job_id": job_id})
+            # Обратная запись в CRM — после разбора, а не после распознавания:
+            # без разбора отправлять было бы нечего, кроме расшифровки. Ошибки
+            # внутри не поднимаются: чужая система, которая не отвечает, не
+            # должна ронять разбор записи.
+            try:
+                crm.отправить_разбор(self.db, self.settings, job_id, разбор=разбор)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Обратная запись в CRM для %s не удалась: %s",
                             job_id, exc, extra={"job_id": job_id})
         # Возвращаем то же, что легло бы в базу: `features` убирает из
         # разбора служебные основы для знаменателя TF-IDF. Без этого
@@ -262,6 +299,7 @@ class ContentIndex:
         частоты, корпус = self.corpus_frequency()
         скрипт, оператор, мат = self._скрипт(), self._оператор(), self._мат()
         набор = self.categories()
+        пороги = self._пороги()
         сделано = 0
         for запись in ожидают:
             if self._stop.is_set():
@@ -275,7 +313,8 @@ class ContentIndex:
                     duration_s=float(запись.get("media_duration_s") or 0.0),
                     script=скрипт, agent_speaker=оператор,
                     document_frequency=частоты, corpus_size=корпус,
-                    profanity=мат, categories=набор,
+                    profanity=мат, categories=набор, thresholds=пороги,
+                    timed=str(запись.get("source") or "") != "text",
                     confidence=запись.get("avg_confidence"))
                 свод, основы = content.features(разбор)
                 self.db.save_content(job_id, свод, основы)

@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import __version__
+from .. import __version__, audit
 from .. import settings_access as S
 from ..accounts import Accounts
 from ..analytics import Analytics
@@ -36,8 +36,8 @@ from ..trends import Trends
 from .deps import SESSION_COOKIE, AppState, token_of
 from .routes_agent import router as agent_router
 from .routes_agent import управление as agent_admin_router
+from .routes_auth import audit_router, users_router
 from .routes_auth import router as auth_router
-from .routes_auth import users_router
 from .routes_backup import router as backup_router
 from .routes_catalog import router as catalog_router
 from .routes_content import router as content_router
@@ -498,6 +498,45 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                         headers=headers, media_type="application/json")
 
     @app.middleware("http")
+    async def access_journal(request: Request, call_next):
+        """Пишет журнал доступа: кто, когда и что сделал.
+
+        Стоит ПОСЛЕ обработчика, а не до: до него неизвестно ни чем кончился
+        запрос, ни кто его прислал — участника кладёт в `request.state`
+        аутентификация, а она живёт внутри маршрута. Отказы попадают в журнал
+        ровно так же, как удачи: чужой подбор пароля — это череда четырёхсот
+        первых, и журнал без них отвечает «ничего не было».
+
+        Ошибка записи не должна ронять ответ, который уже готов и верен.
+        """
+        response = await call_next(request)
+        if not settings.get("audit_enabled", True):
+            return response
+        путь = request.url.path
+        if not audit.записывать(request.method, путь,
+                                reads=bool(settings.get("audit_reads", False))):
+            return response
+        участник = getattr(request.state, "principal", None)
+        # Имя, названное самим маршрутом, важнее найденного аутентификацией:
+        # у входа и выхода аутентификации нет вовсе, а записать их без имени
+        # — значит выбросить самые нужные строки журнала.
+        назвался = str(getattr(request.state, "audit_actor", "") or "")
+        try:
+            state.db.audit_add(
+                action=audit.описать(request.method, путь),
+                actor=назвался or getattr(участник, "name", "") or "аноним",
+                actor_id=getattr(участник, "user_id", "") or "",
+                kind=("user" if (getattr(участник, "user_id", "") or назвался)
+                      else "key" if getattr(участник, "key", "") else "anon"),
+                role=getattr(участник, "role", "") or "",
+                method=request.method, path=путь,
+                status=int(getattr(response, "status_code", 0) or 0),
+                ip=audit.адрес(request.headers, request.client))
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Журнал доступа не записан: %s", exc)
+        return response
+
+    @app.middleware("http")
     async def add_timing(request: Request, call_next):
         started = time.perf_counter()
         RUNTIME.request_started()
@@ -566,6 +605,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
 
     app.include_router(auth_router)
     app.include_router(users_router)
+    app.include_router(audit_router)
     app.include_router(jobs_router)
     app.include_router(catalog_router)
     app.include_router(system_router)

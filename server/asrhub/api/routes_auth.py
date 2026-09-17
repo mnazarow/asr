@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Request, Response
+from fastapi import APIRouter, Body, Depends, Query, Request, Response
 
 from ..accounts import DEFAULT_PASSWORD, DEFAULT_USERNAME, AccountError, AccountNotFound
 from ..errors import AuthError, ForbiddenError
@@ -84,7 +84,13 @@ def login(request: Request, response: Response,
     password = str(payload.get("password") or "")
     if not username or not password:
         raise AuthError("Введите логин и пароль.")
-    account = accounts.authenticate(username, password)
+    # Имя для журнала доступа — до проверки пароля, а не после. Неудачный вход
+    # и есть то, ради чего журнал читают: череда отказов под одним логином —
+    # это подбор пароля, а «аноним не смог войти» об этом не говорит ничего.
+    # Само имя при отказе ничего не подтверждает: логин мог быть выдуман.
+    request.state.audit_actor = username
+    account = _войти(state, accounts, username, password)
+    request.state.audit_actor = account.username
     token, expires = accounts.open_session(
         account.id,
         user_agent=request.headers.get("user-agent", ""),
@@ -98,10 +104,67 @@ def login(request: Request, response: Response,
     }
 
 
+def _войти(state, accounts, username: str, password: str):
+    """Проверяет пару: своей записью или через каталог предприятия.
+
+    Порядок именно такой, и он не случаен:
+
+    1. Запись, пришедшая из каталога, проверяется ТОЛЬКО каталогом. Пробовать
+       для неё местный пароль нельзя: пароля у неё нет, каждая попытка была бы
+       неудачей, и после нескольких входов подряд счётчик неудач запер бы
+       человека, который всё делал правильно.
+    2. Своя запись проверяется своим паролем. Администратор, заведённый при
+       установке, обязан входить и тогда, когда каталог недоступен, — иначе
+       сервер запирается вместе с упавшим контроллером домена.
+    3. Логин, которого здесь нет вовсе, идёт в каталог: так входят первый раз.
+
+    Ответ при отказе один и тот же во всех трёх случаях — иначе по разнице в
+    сообщениях собирается список тех, кто в каталоге есть.
+    """
+    from ..ldap_auth import Настройки, войти  # noqa: PLC0415
+
+    каталог = Настройки.из_настроек(state.settings)
+    запись = accounts.by_username(username)
+
+    if запись is not None and not запись.from_directory:
+        return accounts.authenticate(username, password)
+
+    if not каталог.enabled:
+        # Записи из каталога остались, а каталог выключили: входить по ним
+        # нечем, и делать вид, что дело в пароле, нечестно.
+        if запись is not None and запись.from_directory:
+            raise AuthError(
+                "Эта учётная запись входит через каталог предприятия, "
+                "а он выключен.",
+                hint="Включите «Вход через каталог» в настройках или задайте "
+                     "этому человеку обычную учётную запись.")
+        return accounts.authenticate(username, password)
+
+    человек = войти(каталог, username, password)
+    if человек is None:
+        if запись is not None and запись.from_directory:
+            raise AuthError("Неверный логин или пароль.")
+        # Логина нет ни здесь, ни в каталоге — обычная проверка даст тот же
+        # отказ и тем же текстом, заодно посчитав неудачу.
+        return accounts.authenticate(username, password)
+
+    учётная = accounts.ensure_directory(
+        человек.username, role=человек.role, display_name=человек.display_name)
+    if not учётная.enabled:
+        raise ForbiddenError("Учётная запись отключена на сервере.")
+    accounts.note_login(учётная.id)
+    log.info("Вход через каталог: %s (роль %s)", учётная.username, учётная.role)
+    return учётная
+
+
 @router.post("/logout", summary="Выход")
 def logout(request: Request, response: Response) -> dict[str, Any]:
     accounts = _accounts(request)
-    accounts.close_session(request.cookies.get(SESSION_COOKIE, ""))
+    токен = request.cookies.get(SESSION_COOKIE, "")
+    ушедший = accounts.session_account(токен) if токен else None
+    if ушедший is not None:
+        request.state.audit_actor = ушедший.username
+    accounts.close_session(токен)
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"status": "ok"}
 
@@ -238,3 +301,35 @@ def delete_user(user_id: str, request: Request,
     accounts.delete(user_id)
     log.info("Удалена учётная запись «%s»", account.username)
     return {"status": "ok", "username": account.username}
+
+
+audit_router = APIRouter(prefix="/api/audit", tags=["Журнал доступа"])
+
+
+@audit_router.get("", summary="Журнал доступа: кто, когда и что сделал")
+def read_audit(request: Request,
+               limit: int = Query(default=200, ge=1, le=2000),
+               offset: int = Query(default=0, ge=0),
+               since: float = Query(default=0.0, ge=0),
+               until: float = Query(default=0.0, ge=0),
+               actor: str = Query(default="", max_length=128),
+               query: str = Query(default="", max_length=200),
+               failed_only: bool = Query(default=False),
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Строки журнала доступа с отбором, общим числом и списком участников.
+
+    Только администратору. Журнал — это свидетельство о действиях людей, и
+    открывать его тому, о ком он ведётся, значит подсказывать, что именно
+    записано и чего в записи нет.
+    """
+    require_admin(principal)
+    state = get_state(request)
+    итог = state.db.audit_list(limit=limit, offset=offset, since=since,
+                               until=until, actor=actor, query=query,
+                               failed_only=failed_only)
+    итог["actors"] = state.db.audit_actors()
+    итог["enabled"] = bool(state.settings.get("audit_enabled", True))
+    итог["reads"] = bool(state.settings.get("audit_reads", False))
+    итог["limit"] = limit
+    итог["offset"] = offset
+    return итог

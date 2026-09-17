@@ -503,6 +503,8 @@ def send_digest(digest: dict[str, Any], url: str) -> bool:
 
 #: Отметки суточных заходов здоровья распознавания.
 KV_REVIEW = "review_sampled_at"
+#: Когда в последний раз набирали проверки качества работы операторов.
+KV_QA = "qa_sampled_at"
 KV_CONTROL = "control_sampled_at"
 
 #: Когда последний раз обновляли справочник сотрудников.
@@ -580,6 +582,18 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
             сделано["control"] = review.sample_control(db, settings, queue)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Контрольные прогоны не поставлены: %s", exc)
+    # Контроль качества работы операторов — чаще, чем раз в сутки: порция
+    # считается скользящим окном, и заход раз в час держит поток проверок
+    # ровным. Пачка в двести проверок, поставленная в полночь, не делается
+    # никогда — а десять в час разбираются по ходу дня.
+    if settings.get("qa_enabled", False) and _пора(db, KV_QA, 1.0):
+        db.set_kv(KV_QA, time.time())
+        try:
+            from . import qa  # noqa: PLC0415
+
+            сделано["qa"] = len(qa.набрать(db, settings))
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Проверки качества не назначены: %s", exc)
     # Справочник сотрудников: раз в employees_sync_hours часов забрать
     # выгрузку по employees_url. Стоит до копии намеренно — чтобы свежий
     # справочник попал в неё же, а не оказался на сутки старше базы.

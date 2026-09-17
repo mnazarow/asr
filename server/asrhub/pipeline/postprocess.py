@@ -250,6 +250,137 @@ def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
 #: на сервере без доступа в интернет веса кладут рядом и указывают путь.
 RUPUNCT_ONNX = "ekhodzitsky/rupunct-small-onnx"
 
+#: Имена, под которыми лежит сама сеть в выгрузках ONNX. Порядок — от
+#: квантованной к обычной: int8 втрое меньше и быстрее на процессоре, а
+#: разметку знаков препинания квантование не портит.
+ФАЙЛЫ_ONNX = ("onnx/model_quantized.onnx", "onnx/model.onnx",
+              "model_quantized.onnx", "model.onnx")
+
+#: Сколько слов уходит в сеть за раз. Модель принимает 512 позиций токенизатора,
+#: а на русском одно слово — это в среднем два-три токена; сто восемьдесят слов
+#: не переполняют вход даже на словах, которые токенизатор дробит мелко.
+ОКНО_СЛОВ = 180
+
+
+def _файл_onnx(источник: str) -> str:
+    """Путь к файлу сети: рядом на диске или из хранилища моделей.
+
+    Локальный путь проверяется первым и без сети: на закрытом сервере веса
+    кладут рядом и указывают папку (или сразу файл) переменной окружения.
+    """
+    место = Path(источник)
+    if место.is_file():
+        return str(место)
+    if место.is_dir():
+        for имя in ФАЙЛЫ_ONNX:
+            if (место / имя).is_file():
+                return str(место / имя)
+        найденные = sorted(место.rglob("*.onnx"))
+        if найденные:
+            return str(найденные[0])
+        raise FileNotFoundError(
+            f"В папке «{место}» нет ни одного файла .onnx. "
+            f"Ожидались: {', '.join(ФАЙЛЫ_ONNX)}.")
+
+    from huggingface_hub import hf_hub_download  # type: ignore
+
+    последняя: Exception | None = None
+    for имя in ФАЙЛЫ_ONNX:
+        try:
+            return hf_hub_download(repo_id=источник, filename=имя)
+        except Exception as exc:                            # noqa: BLE001
+            последняя = exc
+    raise FileNotFoundError(
+        f"В «{источник}» не нашлось ни одного из файлов "
+        f"{', '.join(ФАЙЛЫ_ONNX)}.") from последняя
+
+
+class _ТрубаONNX:
+    """Разметка знаков препинания сетью ONNX без optimum.
+
+    Почему не optimum, для которого это три строки. Пакет `optimum-onnx`
+    прибит к `transformers` младше 4.58, а движкам распознавания нужен
+    свежий — на рабочем сервере это разошлось сразу же: «optimum-onnx 0.1.0
+    has requirement transformers<4.58.0, but you have transformers 5.17.0».
+    Несовместимость такого рода обычно не валит запуск, а всплывает потом
+    необъяснимой ошибкой загрузки модели, и ради удобства одной необязательной
+    настройки её держать нельзя. Здесь тот же результат получается на голом
+    onnxruntime: токенизатор — из transformers (он и так стоит), сеть —
+    сессией onnxruntime, а выбор метки на слово повторяет то, что у
+    transformers называется `aggregation_strategy="first"`: метка слова —
+    метка его первой частицы.
+
+    Возвращает то же, что вернула бы труба transformers: список словарей с
+    `word` и `entity_group`, чтобы разбор меток остался общим с RUPunct_big.
+    """
+
+    def __init__(self, токенизатор: Any, сессия: Any, метки: dict[int, str]) -> None:
+        self.токенизатор = токенизатор
+        self.сессия = сессия
+        self.метки = метки
+        self.ожидает = {вход.name for вход in сессия.get_inputs()}
+
+    def __call__(self, text: str) -> list[dict[str, Any]]:
+        слова = str(text or "").split()
+        if not слова:
+            return []
+        размеченные: list[dict[str, Any]] = []
+        for начало in range(0, len(слова), ОКНО_СЛОВ):
+            размеченные.extend(self._окно(слова[начало:начало + ОКНО_СЛОВ]))
+        return размеченные
+
+    def _окно(self, слова: list[str]) -> list[dict[str, Any]]:
+        import numpy as np  # type: ignore
+
+        кодировка = self.токенизатор(слова, is_split_into_words=True,
+                                     truncation=True, max_length=512,
+                                     return_tensors="np")
+        входы = {имя: значение for имя, значение in dict(кодировка).items()
+                 if имя in self.ожидает}
+        # Сети, выгруженные из BERT, требуют `token_type_ids`, которых
+        # токенизатор RoBERTa не отдаёт вовсе. Нули — ровно то, что подставил
+        # бы на этом месте сам transformers: один отрезок текста, не пара.
+        образец = входы.get("input_ids")
+        if образец is not None:
+            for имя in self.ожидает - set(входы):
+                входы[имя] = np.zeros_like(образец)
+        логиты = self.сессия.run(None, входы)[0][0]
+        лучшие = логиты.argmax(axis=-1)
+
+        # Метка слова — метка его первой частицы; остальные пропускаются.
+        # Это ровно то, что у transformers называется
+        # `aggregation_strategy="first"`.
+        #
+        # Слова заведомо получают метку «O»: те, что не поместились в 512
+        # позиций токенизатора, вернутся в текст без знаков, но целыми. Молча
+        # потерять хвост реплики хуже, чем оставить его неразмеченным.
+        метки_слов: list[str] = ["O"] * len(слова)
+        размечено: list[bool] = [False] * len(слова)
+        for позиция, номер in enumerate(self._номера_слов(кодировка)):
+            if номер is None or номер >= len(слова) or размечено[номер]:
+                continue
+            размечено[номер] = True
+            индекс = int(лучшие[позиция]) if позиция < len(лучшие) else 0
+            метки_слов[номер] = self.метки.get(индекс, "O")
+        return [{"word": слово, "entity_group": метка}
+                for слово, метка in zip(слова, метки_слов, strict=True)]
+
+    @staticmethod
+    def _номера_слов(кодировка: Any) -> list[int | None]:
+        """Какому слову принадлежит каждая частица.
+
+        У быстрого токенизатора это готовый `word_ids()`. У медленного его
+        нет вовсе, и тогда вариант ONNX просто недоступен — сказать об этом
+        прямо лучше, чем разметить текст наугад.
+        """
+        получить = getattr(кодировка, "word_ids", None)
+        if получить is None:
+            raise RuntimeError(
+                "Токенизатор модели пунктуации не быстрый: у него нет "
+                "word_ids(), без которого метку нельзя отнести к слову. "
+                "Поставьте «tokenizers» или выберите вариант «rupunct».")
+        return list(получить(0))
+
 
 def _рупункт_onnx() -> Callable[[str], str] | None:
     """RUPunct в виде ONNX: двадцать девять мегабайт вместо семисот.
@@ -265,15 +396,22 @@ def _рупункт_onnx() -> Callable[[str], str] | None:
     Разметка у моделей одна и та же, поэтому разбор меток общий с
     `_apply_rupunct` — расходиться им нельзя.
     """
-    from optimum.onnxruntime import ORTModelForTokenClassification  # type: ignore
-    from transformers import AutoTokenizer, pipeline  # type: ignore
+    import onnxruntime  # type: ignore
+    from transformers import AutoConfig, AutoTokenizer  # type: ignore
 
     источник = os.environ.get("ASRHUB_RUPUNCT_ONNX", RUPUNCT_ONNX)
     токенизатор = AutoTokenizer.from_pretrained(источник, strip_accents=False,
                                                 add_prefix_space=True)
-    модель = ORTModelForTokenClassification.from_pretrained(источник)
-    труба = pipeline("ner", model=модель, tokenizer=токенизатор,
-                     aggregation_strategy="first")
+    конфиг = AutoConfig.from_pretrained(источник)
+    метки = {int(ключ): str(значение)
+             for ключ, значение in dict(getattr(конфиг, "id2label", None) or {}).items()}
+    if not метки:
+        raise RuntimeError(
+            f"У модели «{источник}» в config.json нет id2label — "
+            "без него номер метки не превратить в знак препинания.")
+    сессия = onnxruntime.InferenceSession(_файл_onnx(источник),
+                                          providers=["CPUExecutionProvider"])
+    труба = _ТрубаONNX(токенизатор, сессия, метки)
 
     def применить(text: str) -> str:
         return _apply_rupunct(труба, text)

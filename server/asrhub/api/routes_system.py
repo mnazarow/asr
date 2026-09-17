@@ -725,7 +725,9 @@ a{{color:#4c8dff}}
 def cleanup(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    removed = state.db.cleanup(results_days=retention_days(state.settings))
+    removed = state.db.cleanup(
+        results_days=retention_days(state.settings),
+        audit_days=S.integer(state.settings, "audit_days", 365))
     state.db.vacuum()
     return {"removed": removed}
 
@@ -1011,3 +1013,72 @@ def system_problems(request: Request,
     if not principal.is_admin:
         ответ = selfcheck.спрятать_пути(ответ, state.settings)
     return ответ
+
+
+@router.post("/crm/test", summary="Проверить обратную запись в CRM")
+def crm_test(request: Request, job_id: str = Query(default="", max_length=64),
+             entity_id: str = Query(default="", max_length=64),
+             dry_run: bool = Query(default=True),
+             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Показывает, что именно уйдёт в CRM, и (по желанию) отправляет это.
+
+    По умолчанию ничего не отправляется: сначала человек должен увидеть адрес
+    и тело запроса. Комментарий, ушедший не в ту карточку, убирается руками, а
+    в ленте Bitrix24 он остаётся навсегда — в отличие от неудачной попытки.
+    """
+    from .. import crm as crm_mod  # noqa: PLC0415
+
+    state = get_state(request)
+    require_admin(principal)
+    настройки = crm_mod.Настройки.из_настроек(state.settings)
+    беда = настройки.проблема()
+    if беда and not настройки.enabled:
+        беда = "Обратная запись в CRM выключена настройкой «crm_enabled»."
+    if беда:
+        raise error_response(ConfigError(беда, hint="Раздел «Настройки» → «CRM»."))
+
+    задание = state.db.get_job(job_id) if job_id else None
+    звонок = state.db.call_for_job(job_id) if job_id else None
+    if job_id and not задание:
+        raise error_response(ConfigError(f"Задание {job_id} не найдено."))
+    if задание is None:
+        # Без записи собираем показательный пример: человеку нужно увидеть
+        # форму запроса, а не дожидаться подходящего разговора.
+        задание = {"id": "пример", "text": "Здравствуйте, я по поводу счёта.",
+                   "media_duration_s": 128}
+        разбор: dict[str, Any] = {
+            "sentiment": {"label": "нейтральная", "turn": {"shift": 0.1}},
+            "compliance": {"score": 0.9}, "scorecard": {"score": 82},
+            "categories": {"topics": [{"name": "оплата"}]},
+            "llm": {"summary": "Клиент просит выставить счёт на оплату.",
+                    "reason": "счёт", "outcome": "решено",
+                    "actions": [{"text": "выставить счёт"}]}}
+    else:
+        разбор = dict((state.db.get_content(job_id) or {}).get("detail") or {})
+        модель = state.db.llm_get(job_id)
+        if модель:
+            разбор["llm"] = dict(модель)
+
+    сделка = entity_id or crm_mod.сущность_из(задание, звонок)
+    данные = crm_mod.собрать(задание, разбор, звонок,
+                             base_url=str(state.settings.get("public_url") or ""),
+                             mask=настройки.mask_pii)
+    адрес, заголовки, тело = crm_mod.запрос(данные, настройки, entity_id=сделка or "1")
+    # Токен в показанном теле и заголовках не нужен: человек и так его знает,
+    # а ответ API уходит в журналы и на экран.
+    безопасные = {к: ("…" if к.lower() == "authorization" else з)
+                  for к, з in заголовки.items()}
+    итог: dict[str, Any] = {
+        "kind": настройки.kind, "entity_id": сделка,
+        "url": адрес, "headers": безопасные,
+        "body": тело.decode("utf-8", "replace"),
+        "note": crm_mod.примечание(данные, transcript=настройки.send_transcript),
+        "sent": False,
+    }
+    if not dry_run:
+        ответ = crm_mod.отправить(
+            данные, настройки, entity_id=сделка or "1",
+            allow_internal=bool(state.settings.get("webhook_allow_internal", False)))
+        итог["sent"] = True
+        итог["response"] = ответ
+    return итог

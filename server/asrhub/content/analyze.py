@@ -57,7 +57,10 @@ from .stemmer import sentences, stem, words
 #:
 #: 6 — обращение к клиенту по имени (словарь имён с формами склонения),
 #: пункт скрипта вида «по имени клиента».
-VERSION = 6
+#:
+#: 7 — пороги паузы, заметной тишины и перебивания стали настройками, а рядом
+#: с обычным счётом пауз появился отраслевой, по четырёхсекундной границе.
+VERSION = 7
 
 #: Обороты, после которых идёт собственное имя оператора: его обращением к
 #: клиенту не считаем.
@@ -362,7 +365,9 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             corpus_size: int = 0,
             profanity: bool = False,
             confidence: float | None = None,
-            categories: list[Any] | None = None) -> dict[str, Any]:
+            categories: list[Any] | None = None,
+            thresholds: speech.Пороги | None = None,
+            timed: bool = True) -> dict[str, Any]:
     """Разбор одной записи.
 
     `agent_speaker` — кто из говорящих оператор: по нему проверяется скрипт.
@@ -372,7 +377,8 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
     `categories` — набор категорий (сырые словари или уже разобранные);
     None — готовый набор, пустой список — не искать вовсе. `confidence` —
     уверенность распознавания 0…1, если движок её вернул: по плохо
-    расслышанной записи судить о точности речи нельзя.
+    расслышанной записи судить о точности речи нельзя. `thresholds` — границы
+    паузы, заметной тишины и перебивания; None — значения по умолчанию.
     """
     сегменты = list(segments or [])
     if not сегменты and text:
@@ -384,7 +390,7 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
     целиком = text or " ".join(str(с.get("text") or "") for с in сегменты)
     оценки = sentiment.score_segments(сегменты)
     общая = sentiment.score_text(целиком)
-    речь = speech.analyze(сегменты, duration_s)
+    речь = speech.analyze(сегменты, duration_s, thresholds, timed=timed)
     вопросы = _вопросы(сегменты)
     обещания = _обязательства(сегменты)
     тревога = _тревожные(сегменты)
@@ -522,6 +528,7 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
         "silence_share": речь.get("silence_share"),
         "interruptions": речь.get("interruptions"),
         "pauses": речь.get("pauses"),
+        "long_pauses": речь.get("long_pauses"),
         "longest_pause_s": речь.get("longest_pause_s"),
         "filler_rate": речь.get("filler_rate"),
         "questions": вопросы.get("count"),

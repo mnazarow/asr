@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -57,6 +57,13 @@ _CONTENT_SCHEMA = """
         silence_share     REAL,
         interruptions     INTEGER,
         pauses            INTEGER,
+        -- Версия 25: паузы по отраслевому порогу (четыре секунды) рядом со
+        -- своим (две). Два счётчика отвечают на разные вопросы: обычный —
+        -- «сколько раз собеседник задумался», длинный — «сколько раз он успел
+        -- решить, что связь оборвалась». Отчёт заказчика считает второй, и
+        -- без своей колонки его пришлось бы доставать из подробностей —
+        -- то есть поднимать килобайты JSON на каждую запись.
+        long_pauses       INTEGER,
         longest_pause_s   REAL,
         filler_rate       REAL,
         questions         INTEGER,
@@ -489,6 +496,59 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_metrics_model ON metrics(model, name, ts DESC)",
     """
+    CREATE TABLE IF NOT EXISTS qa_reviews (
+        -- Контроль качества работы оператора — не то же самое, что очередь
+        -- ручной проверки распознавания (`review_queue`). Там проверяют,
+        -- верно ли машина расслышала слова; здесь человек оценивает работу
+        -- другого человека, и цена ошибки другая: это попадает в разговор о
+        -- премии. Поэтому отдельная таблица, своя история и обязательная
+        -- оценка автомата рядом с оценкой человека — чтобы было видно, где
+        -- они расходятся.
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id      TEXT NOT NULL,
+        agent       TEXT DEFAULT '',
+        assigned_to TEXT DEFAULT '',
+        assigned_by TEXT DEFAULT '',
+        assigned_at REAL NOT NULL,
+        due_at      REAL,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        reviewer    TEXT DEFAULT '',
+        reviewed_at REAL,
+        -- Оценка автомата на момент назначения: если пересчитать разбор
+        -- позже, сравнение «человек против автомата» перестало бы иметь
+        -- смысл — автомат был бы уже другой.
+        auto_score  REAL,
+        score       REAL,
+        agree       INTEGER,
+        items       TEXT,
+        comment     TEXT,
+        reason      TEXT DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS audit (
+        -- Журнал доступа: кто, когда и что сделал. Отдельно от `events`,
+        -- потому что отвечает на другой вопрос. `events` — это история
+        -- задания («модель загружена», «распознавание началось»), и живёт
+        -- она вместе с заданием: удалили запись — ушли и её события. Журнал
+        -- доступа обязан пережить то, к чему относится: «кто удалил эту
+        -- запись» — вопрос, который задают уже после удаления.
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts        REAL NOT NULL,
+        -- Имя учётной записи или ключа. Хранится строкой, а не ссылкой:
+        -- учётную запись удаляют, а журнал должен остаться читаемым.
+        actor     TEXT DEFAULT '',
+        actor_id  TEXT DEFAULT '',
+        kind      TEXT DEFAULT '',
+        role      TEXT DEFAULT '',
+        action    TEXT DEFAULT '',
+        method    TEXT DEFAULT '',
+        path      TEXT DEFAULT '',
+        status    INTEGER DEFAULT 0,
+        ip        TEXT DEFAULT ''
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS api_keys (
         key         TEXT PRIMARY KEY,
         name        TEXT,
@@ -528,7 +588,12 @@ _SCHEMA = [
         updated_at      REAL,
         last_login      REAL,
         failed_attempts INTEGER DEFAULT 0,
-        locked_until    REAL DEFAULT 0
+        locked_until    REAL DEFAULT 0,
+        -- Версия 25: откуда взялась запись. «local» — заведена здесь и
+        -- проверяется по своему паролю; «ldap» — пришла из каталога
+        -- предприятия, пароля у неё нет, и роль ей переназначается при
+        -- каждом входе по группам каталога.
+        source          TEXT DEFAULT 'local'
     )
     """,
     # Хранится не токен, а его sha256: утёкшая база не даёт войти.
@@ -751,6 +816,15 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_agent ON calls(agent, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_queue ON calls(queue, started_at DESC)",
+    # Повторные обращения ищутся по номеру звонящего в окне в неделю: без
+    # этого индекса решение с первого обращения считается перебором всего
+    # архива на каждый звонок.
+    "CREATE INDEX IF NOT EXISTS idx_calls_src ON calls(src, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit(actor, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_qa_status ON qa_reviews(status, assigned_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_qa_job ON qa_reviews(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_qa_agent ON qa_reviews(agent, reviewed_at DESC)",
 ]
 
 
@@ -780,6 +854,7 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "last_login": "REAL",
         "failed_attempts": "INTEGER DEFAULT 0",
         "locked_until": "REAL DEFAULT 0",
+        "source": "TEXT DEFAULT 'local'",
     },
     "sessions": {
         "token_hash": "TEXT",
@@ -903,6 +978,7 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "silence_share": "REAL",
         "interruptions": "INTEGER",
         "pauses": "INTEGER",
+        "long_pauses": "INTEGER",
         "longest_pause_s": "REAL",
         "filler_rate": "REAL",
         "questions": "INTEGER",
@@ -1016,6 +1092,37 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "temperature_c": "REAL",
         "power_w": "REAL",
         "power_limit_w": "REAL",
+    },
+    "qa_reviews": {
+        "id": "INTEGER",
+        "job_id": "TEXT",
+        "agent": "TEXT DEFAULT ''",
+        "assigned_to": "TEXT DEFAULT ''",
+        "assigned_by": "TEXT DEFAULT ''",
+        "assigned_at": "REAL",
+        "due_at": "REAL",
+        "status": "TEXT NOT NULL DEFAULT 'pending'",
+        "reviewer": "TEXT DEFAULT ''",
+        "reviewed_at": "REAL",
+        "auto_score": "REAL",
+        "score": "REAL",
+        "agree": "INTEGER",
+        "items": "TEXT",
+        "comment": "TEXT",
+        "reason": "TEXT DEFAULT ''",
+    },
+    "audit": {
+        "id": "INTEGER",
+        "ts": "REAL",
+        "actor": "TEXT DEFAULT ''",
+        "actor_id": "TEXT DEFAULT ''",
+        "kind": "TEXT DEFAULT ''",
+        "role": "TEXT DEFAULT ''",
+        "action": "TEXT DEFAULT ''",
+        "method": "TEXT DEFAULT ''",
+        "path": "TEXT DEFAULT ''",
+        "status": "INTEGER DEFAULT 0",
+        "ip": "TEXT DEFAULT ''",
     },
     "events": {
         # Ключевые колонки объявлены как в CREATE TABLE. Прежнее
@@ -1953,7 +2060,8 @@ class Database:
     CONTENT_COLUMNS = (
         "job_id, version, computed_at, sentiment, sentiment_label, "
         "sentiment_shift, negative_segments, positive_segments, wpm, "
-        "silence_share, interruptions, pauses, longest_pause_s, filler_rate, "
+        "silence_share, interruptions, pauses, long_pauses, longest_pause_s, "
+        "filler_rate, "
         "questions, commitments, commitments_dated, alerts, compliance, "
         "money_max, speakers, agent_speaker, overlap_s, dead_air_s, switches, "
         "talk_share, monologue_s, customer_story_s, reply_delay_s, tempo_ratio, "
@@ -2069,7 +2177,10 @@ class Database:
         """
         rows = self.query(
             "SELECT j.id, j.text, j.media_duration_s, j.quality_flags, "
-            "       j.avg_confidence FROM jobs j "
+            # `source` нужен пересчёту архива: у переписки нет времени, и
+            # показатели в секундах для неё не считаются вовсе. Без этого
+            # поля пересчёт молча считал бы их по номерам реплик.
+            "       j.source, j.avg_confidence FROM jobs j "
             "LEFT JOIN content c ON c.job_id = j.id "
             "WHERE j.status='completed' AND j.text IS NOT NULL AND j.text != '' "
             # Контрольные прогоны второй моделью — та же запись второй раз:
@@ -2311,6 +2422,7 @@ class Database:
         "silence_share": "c.silence_share",
         "interruptions": "c.interruptions",
         "pauses": "c.pauses",
+        "long_pauses": "c.long_pauses",
         "longest_pause_s": "c.longest_pause_s",
         "filler_rate": "c.filler_rate",
         "questions": "c.questions",
@@ -2943,7 +3055,73 @@ class Database:
         rows = self.query(
             f"SELECT {поля} FROM content c JOIN jobs j ON j.id = c.job_id "
             f"WHERE {условие} ORDER BY j.created_at DESC LIMIT ?", [*args, limit])
-        return [tuple(r) for r in rows]
+        if len(безопасные) == len(columns):
+            return [tuple(r) for r in rows]
+        # Столбец, которого здесь нет, раньше просто выпадал из выборки — а
+        # тот, кто её заказал, продолжал считать по номерам запрошенного
+        # списка. Номера съезжали, и «паузы» молча начинали означать «самую
+        # долгую паузу»: не ошибка, не исключение, а неверные числа в отчёте.
+        # Теперь позиции сохраняются, а неизвестный столбец приходит пустым.
+        места = {к: н for н, к in enumerate(безопасные)}
+        порядок = [места.get(к) for к in columns]
+        return [tuple(None if н is None else r[н] for н in порядок) for r in rows]
+
+    def terms_matrix(self, *, since: float | None = None,
+                     until: float | None = None,
+                     owner: str | list[str] | None = None,
+                     limit: int = 5000,
+                     min_terms: int = 5) -> list[tuple[str, dict[str, int]]]:
+        """Основы каждой записи окна: готовая разрежённая матрица «запись × слово».
+
+        Берётся из `content_terms`, а не из текстов: таблица заполняется при
+        разборе, и повторно разбирать сто тысяч расшифровок ради кластеризации
+        незачем — это часы работы вместо секунд.
+
+        Записи короче `min_terms` основ выбрасываются: на трёх словах похожесть
+        считается, но означает случайность, и такие записи склеиваются в один
+        огромный кластер «здравствуйте — до свидания».
+        """
+        условие, args = self._content_where(since, until, owner)
+        строки = self.query(
+            "SELECT t.job_id AS job_id, t.stem AS stem, t.n AS n "
+            "FROM content_terms t "
+            "JOIN jobs j ON j.id = t.job_id "
+            "JOIN content c ON c.job_id = t.job_id "
+            f"WHERE {условие} "
+            "  AND t.job_id IN ("
+            "    SELECT c2.job_id FROM content c2 JOIN jobs j2 ON j2.id = c2.job_id "
+            f"    WHERE {условие.replace('j.', 'j2.').replace('c.', 'c2.')} "
+            "    ORDER BY j2.created_at DESC LIMIT ?)",
+            [*args, *args, max(1, int(limit))])
+        по_записям: dict[str, dict[str, int]] = {}
+        for строка in строки:
+            по_записям.setdefault(str(строка["job_id"]), {})[
+                str(строка["stem"])] = int(строка["n"] or 1)
+        return [(ид, основы) for ид, основы in по_записям.items()
+                if len(основы) >= max(1, int(min_terms))]
+
+    def hits_for_jobs(self, job_ids: list[str]) -> dict[str, list[str]]:
+        """Какие категории сработали у каждой из записей.
+
+        Нужно, чтобы отличить тему, под которую правило уже написано, от той,
+        которой никто не заметил. Вторая — единственное, ради чего стоит
+        кластеризовать: первую и так видно в отчёте по категориям.
+        """
+        if not job_ids:
+            return {}
+        итог: dict[str, list[str]] = {}
+        # Партиями: SQLite держит предел на число параметров запроса, и на
+        # выборке в пять тысяч записей запрос одним куском просто не собрался бы.
+        шаг = 400
+        for начало in range(0, len(job_ids), шаг):
+            кусок = [str(и) for и in job_ids[начало:начало + шаг]]
+            места = ",".join("?" for _ in кусок)
+            for строка in self.query(
+                    f"SELECT job_id, category FROM content_hits "
+                    f"WHERE job_id IN ({места})", кусок):
+                итог.setdefault(str(строка["job_id"]), []).append(
+                    str(строка["category"]))
+        return итог
 
     def top_terms(self, *, since: float | None = None,
                   until: float | None = None,
@@ -3686,6 +3864,120 @@ class Database:
             "GROUP BY skipped ORDER BY n DESC LIMIT 20", args)
         свод["reasons"] = {str(r["reason"]): int(r["n"]) for r in причины}
         return свод
+
+    def call_kpi(self, *, owner: str | list[str] | None = None,
+                 station: str = "", queue: str = "",
+                 since: float = 0.0, until: float = 0.0,
+                 service_level_s: float = 20.0,
+                 repeat_window_days: float = 7.0) -> dict[str, Any]:
+        """Показатели контакт-центра по журналу звонков.
+
+        Всё считается по CDR, который и так лежит в базе: время разговора,
+        признак ответа, очередь и номер звонящего. Отдельной интеграции ради
+        этих чисел не нужно, а спрашивают их первыми — это тот самый список,
+        по которому заказчик сравнивает системы между собой.
+
+        Что именно считается и чего в этих числах НЕТ:
+
+        * `aht_s` — среднее время РАЗГОВОРА по отвеченным. Настоящее «среднее
+          время обработки» включает ещё удержание и постобработку; ни того ни
+          другого в CDR нет, и называть эту величину полным AHT было бы
+          подлогом. Здесь она честно подписана как разговор.
+        * `abandoned_share` — доля входящих, на которые не ответили. Считается
+          от всех входящих, а не от попавших в очередь: клиенту всё равно,
+          дошёл ли его вызов до очереди.
+        * `service_level` — доля отвеченных входящих, взятых быстрее порога.
+          Ожидание считается как разница между общей длительностью вызова и
+          временем разговора: столько вызов звонил, пока его не сняли.
+        * `fcr` — доля обращений, после которых тот же номер не позвонил
+          снова в течение окна. Это ОЦЕНКА решения с первого раза, а не оно
+          само: повторный звонок бывает и по другому поводу. Зато считается
+          без единого опроса и по всему архиву сразу.
+
+        Звонки без номера звонящего (`src` пуст) в расчёт FCR не идут: у них
+        нет ключа, по которому узнают повторное обращение, и молча считать их
+        решёнными значит завышать показатель.
+
+        Повторный звонок ищется по всему архиву, а не внутри периода и не
+        внутри станции: клиент, позвонивший первого числа и перезвонивший
+        третьего, решённым не был — независимо от того, что отчёт запрошен по
+        одному дню и что перезвонил он в филиал.
+        """
+        условие, args = self._owner_clause(owner, "c")
+        части = [условие] if условие else []
+        if station:
+            части.append("c.station=?")
+            args = [*args, station]
+        if queue:
+            части.append("c.queue=?")
+            args = [*args, queue]
+        if since:
+            части.append("c.started_at>=?")
+            args = [*args, float(since)]
+        if until:
+            части.append("c.started_at<?")
+            args = [*args, float(until)]
+        условие = " AND ".join(части)
+        где = f" WHERE {условие}" if условие else ""
+        порог = max(0.0, float(service_level_s))
+
+        строка = self.query_one(
+            "SELECT COUNT(*) AS total,"
+            "       SUM(CASE WHEN c.direction='входящий' THEN 1 ELSE 0 END) AS inbound,"
+            "       SUM(CASE WHEN c.direction='входящий' AND COALESCE(c.answered,0)=1"
+            "                THEN 1 ELSE 0 END) AS inbound_answered,"
+            "       SUM(CASE WHEN COALESCE(c.answered,0)=1 THEN 1 ELSE 0 END) AS answered,"
+            "       SUM(CASE WHEN COALESCE(c.answered,0)=1"
+            "                THEN COALESCE(c.billsec,0) ELSE 0 END) AS talk_s,"
+            "       SUM(CASE WHEN c.direction='входящий' AND COALESCE(c.answered,0)=1"
+            "                THEN MAX(0, COALESCE(c.duration,0) - COALESCE(c.billsec,0))"
+            "                ELSE 0 END) AS wait_s,"
+            "       SUM(CASE WHEN c.direction='входящий' AND COALESCE(c.answered,0)=1"
+            "                AND MAX(0, COALESCE(c.duration,0) - COALESCE(c.billsec,0)) <= ?"
+            "                THEN 1 ELSE 0 END) AS in_time "
+            f"FROM calls c{где}", [порог, *args])
+        свод = {к: float(строка[к] or 0) if строка else 0.0
+                for к in ("total", "inbound", "inbound_answered", "answered",
+                          "talk_s", "wait_s", "in_time")}
+
+        окно = max(0.0, float(repeat_window_days)) * 86400.0
+        повтор = self.query_one(
+            "SELECT COUNT(*) AS base,"
+            "       SUM(CASE WHEN EXISTS ("
+            "             SELECT 1 FROM calls p"
+            "             WHERE p.src = c.src AND p.direction='входящий'"
+            "               AND p.started_at > c.started_at"
+            "               AND p.started_at <= c.started_at + ?"
+            "               AND p.uniqueid <> c.uniqueid)"
+            "           THEN 1 ELSE 0 END) AS repeated "
+            f"FROM calls c{где}{' AND' if где else ' WHERE'} "
+            "  c.direction='входящий' AND COALESCE(c.answered,0)=1"
+            "  AND COALESCE(c.src,'')<>''", [окно, *args]) if окно > 0 else None
+
+        основа = float((повтор["base"] if повтор else 0) or 0)
+        повторных = float((повтор["repeated"] if повтор else 0) or 0)
+        return {
+            "total": int(свод["total"]),
+            "inbound": int(свод["inbound"]),
+            "answered": int(свод["answered"]),
+            "inbound_answered": int(свод["inbound_answered"]),
+            "abandoned": int(свод["inbound"] - свод["inbound_answered"]),
+            "abandoned_share": (round((свод["inbound"] - свод["inbound_answered"])
+                                      / свод["inbound"], 4)
+                                if свод["inbound"] else None),
+            # Среднее время разговора — по отвеченным: делить на все вызовы
+            # значит смешивать разговор с гудками.
+            "aht_s": (round(свод["talk_s"] / свод["answered"], 1)
+                      if свод["answered"] else None),
+            "wait_avg_s": (round(свод["wait_s"] / свод["inbound_answered"], 1)
+                           if свод["inbound_answered"] else None),
+            "service_level": (round(свод["in_time"] / свод["inbound_answered"], 4)
+                              if свод["inbound_answered"] else None),
+            "service_level_s": порог,
+            "fcr": (round(1.0 - повторных / основа, 4) if основа else None),
+            "fcr_base": int(основа),
+            "repeat_window_days": round(float(repeat_window_days), 2),
+        }
 
     def list_calls(self, *, owner: str | list[str] | None = None,
                    direction: str = "", queue: str = "", agent: str = "",
@@ -4510,13 +4802,238 @@ class Database:
             (since, шаг, self.LLMQ_ОШИБКА, since, until))
         return buckets, [dict(r) for r in rows]
 
+    # --- контроль качества работы оператора -----------------------------
+
+    def qa_assign(self, job_id: str, *, assigned_to: str = "",
+                  assigned_by: str = "", due_at: float | None = None,
+                  agent: str = "", auto_score: float | None = None,
+                  reason: str = "") -> int | None:
+        """Ставит запись на проверку человеком. None — уже стоит.
+
+        Повторное назначение той же записи не заводит вторую строку: две
+        проверки одного разговора дают два балла, и дальше начинается спор о
+        том, какой из них настоящий.
+        """
+        существует = self.query_one(
+            "SELECT id FROM qa_reviews WHERE job_id=? AND status='pending'",
+            (str(job_id),))
+        if существует:
+            return None
+        with self.write() as conn:
+            курсор = conn.execute(
+                "INSERT INTO qa_reviews (job_id, agent, assigned_to, assigned_by, "
+                "assigned_at, due_at, status, auto_score, reason) "
+                "SELECT ?,?,?,?,?,?,'pending',?,? "
+                "WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?)",
+                (str(job_id), str(agent or ""), str(assigned_to or ""),
+                 str(assigned_by or ""), now(), due_at,
+                 auto_score, str(reason or ""), str(job_id)))
+            return int(курсор.lastrowid) if курсор.rowcount else None
+
+    def qa_submit(self, review_id: int, *, reviewer: str, score: float | None,
+                  agree: bool | None = None, items: Any = None,
+                  comment: str = "") -> bool:
+        """Записывает исход проверки. False — такой проверки нет или она закрыта."""
+        строка = self.query_one(
+            "SELECT auto_score FROM qa_reviews WHERE id=? AND status='pending'",
+            (int(review_id),))
+        if строка is None:
+            return False
+        авто = строка["auto_score"]
+        # Согласие считается само, когда о нём не сказали: расхождение
+        # больше десяти баллов из ста — это уже другая оценка, а не
+        # округление. Спрашивать об этом человека отдельно значит получать
+        # пустое поле в половине проверок.
+        своё = agree
+        if своё is None and авто is not None and score is not None:
+            своё = abs(float(авто) - float(score)) <= 10.0
+        self.execute(
+            "UPDATE qa_reviews SET status='done', reviewer=?, reviewed_at=?, "
+            "score=?, agree=?, items=?, comment=? WHERE id=?",
+            (str(reviewer or ""), now(),
+             None if score is None else float(score),
+             None if своё is None else int(bool(своё)),
+             json.dumps(items, ensure_ascii=False) if items is not None else None,
+             str(comment or ""), int(review_id)))
+        return True
+
+    def qa_list(self, *, status: str = "", assigned_to: str = "",
+                agent: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        """Проверки с отбором; свежие первыми."""
+        условия: list[str] = []
+        args: list[Any] = []
+        for поле, значение in (("status", status), ("assigned_to", assigned_to),
+                               ("agent", agent)):
+            if значение:
+                условия.append(f"q.{поле}=?")
+                args.append(str(значение))
+        где = f" WHERE {' AND '.join(условия)}" if условия else ""
+        строки = self.query(
+            "SELECT q.*, j.filename AS filename, j.media_duration_s AS duration_s "
+            f"FROM qa_reviews q LEFT JOIN jobs j ON j.id = q.job_id{где} "
+            "ORDER BY q.assigned_at DESC LIMIT ?",
+            [*args, max(1, min(1000, int(limit)))])
+        готово: list[dict[str, Any]] = []
+        for строка in строки:
+            запись = dict(строка)
+            if запись.get("items"):
+                try:
+                    запись["items"] = json.loads(запись["items"])
+                except (TypeError, ValueError):
+                    запись["items"] = None
+            готово.append(запись)
+        return готово
+
+    def qa_stats(self, *, since: float = 0.0) -> dict[str, Any]:
+        """Калибровка проверяющих: расходятся ли они с автоматом и между собой.
+
+        Главное число здесь — не средний балл, а СДВИГ: насколько
+        проверяющий систематически строже или мягче автомата. Средний балл
+        говорит о записях, сдвиг — о самом проверяющем, и именно он отвечает
+        на вопрос «можно ли сравнивать оценки двух руководителей».
+        """
+        условие = "status='done'" + (" AND reviewed_at>=?" if since else "")
+        args: list[Any] = [float(since)] if since else []
+        общее = self.query_one(
+            "SELECT COUNT(*) AS n,"
+            "       SUM(CASE WHEN agree=1 THEN 1 ELSE 0 END) AS agreed,"
+            "       AVG(score) AS avg_score,"
+            "       AVG(score - auto_score) AS bias,"
+            "       AVG(ABS(score - auto_score)) AS spread "
+            f"FROM qa_reviews WHERE {условие}", args)
+        по_людям = self.query(
+            "SELECT reviewer, COUNT(*) AS n, AVG(score) AS avg_score,"
+            "       AVG(score - auto_score) AS bias,"
+            "       AVG(ABS(score - auto_score)) AS spread,"
+            "       SUM(CASE WHEN agree=1 THEN 1 ELSE 0 END) AS agreed "
+            f"FROM qa_reviews WHERE {условие} AND COALESCE(reviewer,'')<>'' "
+            "GROUP BY reviewer ORDER BY n DESC LIMIT 50", args)
+        всего = int((общее["n"] if общее else 0) or 0)
+        return {
+            "done": всего,
+            "pending": int((self.query_one(
+                "SELECT COUNT(*) AS n FROM qa_reviews WHERE status='pending'"
+            ) or {"n": 0})["n"] or 0),
+            "agree_share": (round(float(общее["agreed"] or 0) / всего, 3)
+                            if всего else None),
+            "avg_score": (round(float(общее["avg_score"]), 1)
+                          if общее and общее["avg_score"] is not None else None),
+            "bias": (round(float(общее["bias"]), 1)
+                     if общее and общее["bias"] is not None else None),
+            "spread": (round(float(общее["spread"]), 1)
+                       if общее and общее["spread"] is not None else None),
+            "reviewers": [
+                {"reviewer": str(с["reviewer"]), "n": int(с["n"] or 0),
+                 "avg_score": (round(float(с["avg_score"]), 1)
+                               if с["avg_score"] is not None else None),
+                 "bias": round(float(с["bias"]), 1) if с["bias"] is not None else None,
+                 "spread": (round(float(с["spread"]), 1)
+                            if с["spread"] is not None else None),
+                 "agree_share": (round(float(с["agreed"] or 0) / int(с["n"]), 3)
+                                 if с["n"] else None)}
+                for с in по_людям],
+        }
+
+    def qa_candidates(self, *, since: float = 0.0, limit: int = 50,
+                      worst: bool = False,
+                      owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+        """Записи, которые можно поставить на проверку.
+
+        `worst=True` — самые слабые по баллу автомата; иначе случайные. Оба
+        набора нужны вместе, и это не прихоть: только случайные дают честную
+        картину по всем операторам, только слабые — быстро находят, кого
+        учить. Один без другого превращает контроль качества либо в лотерею,
+        либо в травлю одних и тех же людей.
+        """
+        условие, args = self._content_where(since or None, None, owner)
+        порядок = ("c.agent_score ASC" if worst
+                   else "RANDOM()")
+        строки = self.query(
+            "SELECT j.id AS job_id, j.filename AS filename, "
+            "       j.media_duration_s AS duration_s, c.agent_score AS auto_score, "
+            "       c.agent_speaker AS agent_speaker, "
+            "       (SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id) AS agent "
+            "FROM jobs j JOIN content c ON c.job_id = j.id "
+            f"WHERE {условие} AND c.agent_score IS NOT NULL "
+            "  AND NOT EXISTS (SELECT 1 FROM qa_reviews q WHERE q.job_id = j.id) "
+            f"ORDER BY {порядок} LIMIT ?",
+            [*args, max(1, int(limit))])
+        return [dict(с) for с in строки]
+
+    # --- журнал доступа -------------------------------------------------
+
+    def audit_add(self, *, action: str, actor: str = "", actor_id: str = "",
+                  kind: str = "", role: str = "", method: str = "",
+                  path: str = "", status: int = 0, ip: str = "") -> None:
+        """Заносит действие в журнал доступа.
+
+        Ошибка записи здесь не должна ронять сам запрос: журнал — это
+        свидетельство, а не часть работы. Сервер, вставший из-за того, что не
+        смог записать «посмотрел список записей», хуже отсутствующего
+        журнала.
+        """
+        try:
+            self.execute(
+                "INSERT INTO audit (ts, actor, actor_id, kind, role, action, "
+                "method, path, status, ip) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (now(), str(actor or "")[:128], str(actor_id or "")[:64],
+                 str(kind or "")[:16], str(role or "")[:32],
+                 str(action or "")[:200], str(method or "")[:8],
+                 str(path or "")[:500], int(status or 0), str(ip or "")[:64]))
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Журнал доступа не записан: %s", exc)
+
+    def audit_list(self, *, limit: int = 200, offset: int = 0,
+                   since: float = 0.0, until: float = 0.0,
+                   actor: str = "", query: str = "",
+                   failed_only: bool = False) -> dict[str, Any]:
+        """Строки журнала доступа с отбором и общим числом.
+
+        Общее число нужно вместе со страницей: раздел показывает «показаны
+        200 из 14 512», и без второго числа человек не знает, видит он весь
+        журнал или его начало.
+        """
+        условия: list[str] = []
+        args: list[Any] = []
+        if since:
+            условия.append("ts>=?")
+            args.append(float(since))
+        if until:
+            условия.append("ts<?")
+            args.append(float(until))
+        if actor:
+            условия.append("actor=?")
+            args.append(str(actor))
+        if query:
+            условия.append("(action LIKE ? OR path LIKE ? OR ip LIKE ?)")
+            args.extend([f"%{query}%"] * 3)
+        if failed_only:
+            # Отказы — то, ради чего журнал открывают чаще всего: чужой
+            # подбор пароля и попытки дотянуться туда, куда не положено.
+            условия.append("status>=400")
+        где = f" WHERE {' AND '.join(условия)}" if условия else ""
+        всего = self.query_one(f"SELECT COUNT(*) AS n FROM audit{где}", args)
+        строки = self.query(
+            f"SELECT * FROM audit{где} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+            [*args, max(1, min(2000, int(limit))), max(0, int(offset))])
+        return {"total": int((всего["n"] if всего else 0) or 0),
+                "items": [dict(с) for с in строки]}
+
+    def audit_actors(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Кто вообще есть в журнале — для выпадающего списка отбора."""
+        строки = self.query(
+            "SELECT actor, COUNT(*) AS n, MAX(ts) AS last FROM audit "
+            "WHERE COALESCE(actor,'')<>'' GROUP BY actor "
+            "ORDER BY n DESC LIMIT ?", (max(1, int(limit)),))
+        return [dict(с) for с in строки]
+
     # --- обслуживание ---------------------------------------------------
 
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
-                events_days: int = 90) -> dict[str, int]:
+                events_days: int = 90, audit_days: int = 365) -> dict[str, int]:
         removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0,
                    "gpu_samples": 0, "llm_cache": 0, "calls": 0,
-                   "orphans": 0, "bytes": 0}
+                   "audit": 0, "orphans": 0, "bytes": 0}
         ts = now()
         if results_days > 0:
             cutoff = ts - results_days * 86400
@@ -4560,6 +5077,13 @@ class Database:
         if events_days > 0:
             removed["events"] = self.execute(
                 "DELETE FROM events WHERE ts<?", (ts - events_days * 86400,))
+        # Журнал доступа живёт своим сроком, и по умолчанию он гораздо
+        # длиннее остальных: проверка, ради которой журнал и заводят,
+        # приходит через полгода после события, а не через неделю. Ноль —
+        # «хранить вечно», и это законный выбор, а не «не задано».
+        if audit_days > 0:
+            removed["audit"] = self.execute(
+                "DELETE FROM audit WHERE ts<?", (ts - audit_days * 86400,))
         # Кеш ответов языковой модели живёт по сроку хранения результатов, а
         # не вечно. Дело не только в размере (несколько килобайт на вызов,
         # до четырёх вызовов на запись — это гигабайты в год): ключ кеша —

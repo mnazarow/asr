@@ -1694,6 +1694,11 @@ RENDERERS.dictation = {
                   <span class="mono">examples/stream_microphone.py</span>.
                 </div>
               </div>`}
+            <!-- Подсказки оператору. Стоят НАД расшифровкой и над кнопками:
+                 текст читают потом, подсказку — сейчас, и место для неё должно
+                 быть там, куда человек смотрит в разговоре. Пусто, пока
+                 настройка «Подсказки оператору в разговоре» выключена. -->
+            <div id="dict-hints" style="display:none;margin-bottom:10px"></div>
             <div class="row" style="gap:12px;align-items:center">
               <button class="primary" id="dict-toggle" ${(secure && hasMic) ? '' : 'disabled'}>
                 Начать диктовку</button>
@@ -1916,6 +1921,9 @@ RENDERERS.dictation = {
           this.partial = '';
           this.paint();
           break;
+        case 'hint':
+          this.hint(message);
+          break;
         case 'done':
           this.setStatus('готово', 'ok');
           break;
@@ -1926,6 +1934,28 @@ RENDERERS.dictation = {
         default:
           break;
       }
+    };
+
+    // Подсказки живут отдельно от расшифровки и не смешиваются с ней: текст
+    // читают потом, подсказку — сейчас. Сортировка по важности та же, что на
+    // сервере: нарушение выше возражения, возражение выше скрипта.
+    this.hint = (сообщение) => {
+      const место = qs('#dict-hints');
+      if (!место) return;
+      this.hints = this.hints || [];
+      this.hints.unshift(сообщение);
+      this.hints = this.hints.slice(0, 5);
+      const цвет = { violation: 'err', objection: 'warn', tracker: 'accent',
+                     script: '' };
+      место.innerHTML = this.hints.map((п) => `
+        <div class="row" style="gap:8px;align-items:flex-start;margin-bottom:6px">
+          <span class="chip ${цвет[п.kind] || ''}">${esc({
+            violation: 'нарушение', objection: 'возражение',
+            tracker: 'важное', script: 'скрипт' }[п.kind] || п.kind)}</span>
+          <div><b>${esc(п.title || '')}</b>${
+            п.detail ? `<div class="small dim">${esc(п.detail)}</div>` : ''}</div>
+        </div>`).join('');
+      место.style.display = this.hints.length ? '' : 'none';
     };
 
     socket.onclose = (event) => {
@@ -2728,6 +2758,8 @@ const Player = {
         <option value="2">2×</option>
       </select>
       <button class="skip" type="button" title="Скачать исходную запись">↓</button>
+      <button class="skip redact" type="button"
+              title="Заглушить персональные данные в звуке и скачать копию">🔇</button>
       <span class="note"></span>`;
 
     const el = qs('audio', host);
@@ -2737,6 +2769,7 @@ const Player = {
     const note = qs('.note', host);
     const speed = qs('select', host);
     const [back, forward, save] = qsa('.skip', host);
+    const redact = qs('.redact', host);
 
     let dragging = false;
     const fail = (message) => {
@@ -2770,6 +2803,37 @@ const Player = {
     });
     speed.addEventListener('change', () => { el.playbackRate = Number(speed.value); });
     save.addEventListener('click', () => Player.save(id));
+    /* Редакция звука. Делается по нажатию, а не при каждом распознавании:
+     * это отдельный проход ffmpeg по всей записи, и нужен он далеко не
+     * всегда. Результат — отдельный файл рядом с оригиналом; сам оригинал
+     * не трогается. */
+    if (redact) {
+      redact.addEventListener('click', async () => {
+        const прежний = redact.textContent;
+        redact.disabled = true;
+        redact.textContent = '…';
+        try {
+          const итог = await API.post(`/api/jobs/${encodeURIComponent(id)}/redact`);
+          if (!итог.found) {
+            toast('Персональных данных в расшифровке не нашлось', 'ok',
+                  'Редактировать нечего — копия не создавалась');
+            return;
+          }
+          const виды = Object.entries(итог.counts || {})
+            .map(([вид, сколько]) => `${вид}: ${сколько}`).join(', ');
+          toast(`Заглушено ${num(итог.seconds, 1)} с`, 'ok',
+                `${виды}${итог.estimated
+                  ? ` · ${итог.estimated} по оценке (у слов нет таймкодов)` : ''}`);
+          window.open(итог.url, '_blank');
+        } catch (err) {
+          toast(err.message || 'Не удалось отредактировать запись', 'err',
+                err.hint || '');
+        } finally {
+          redact.disabled = false;
+          redact.textContent = прежний;
+        }
+      });
+    }
 
     // Ползунок ведём по вводу, а позицию ставим по отпусканию: иначе каждое
     // движение мыши превращается в запрос куска файла, и по сети уходит
@@ -3137,6 +3201,7 @@ async function drawReviewQueue() {
       try {
         await API.call(`/api/review/${кнопка.dataset.reviewSkip}`, { method: 'PUT', json: { status: 'skipped' } });
         drawReviewQueue();
+  drawQaQueue();
       } catch (err) { fail(err); кнопка.disabled = false; }
     };
   });
@@ -3151,6 +3216,94 @@ async function drawReviewQueue() {
       } catch (err) { fail(err); пополнить.disabled = false; }
     };
   }
+}
+
+/* Контроль качества работы операторов.
+ *
+ * Здесь важнее всего вторая таблица — калибровка. Средний балл проверяющего
+ * говорит о записях, которые ему достались; о нём самом говорит СДВИГ:
+ * насколько он систематически строже или мягче автомата. Пока сдвиг не
+ * измерен, сравнивать операторов из разных отделов нельзя вовсе, и именно
+ * поэтому он стоит отдельной колонкой, а не спрятан в подсказку.
+ */
+async function drawQaQueue() {
+  const тело = qs('#qa-body');
+  if (!тело) return;
+  let данные;
+  try {
+    данные = await API.latest('qa-queue', '/api/qa?limit=50');
+  } catch (err) {
+    if (err && err.silent) return;
+    тело.innerHTML = `<div class="empty small">Проверки недоступны: ${
+      esc(err.message || '')}</div>`;
+    return;
+  }
+  if (!тело.isConnected) return;
+  const с = данные.stats || {};
+  const строки = данные.items || [];
+  const админ = (state.me || {}).role === 'admin' || !(state.me || {}).role;
+  const знак = (з) => (з === null || з === undefined ? '—'
+    : `${з > 0 ? '+' : ''}${num(з, 1)}`);
+  тело.innerHTML = `
+    <div class="grid cols-4" style="margin-bottom:10px">
+      ${kpi('Ждут проверки', num(с.pending || 0, 0),
+            данные.overdue ? `просрочено ${данные.overdue}` : 'просроченных нет')}
+      ${kpi('Проверено', num(с.done || 0, 0),
+            данные.enabled ? `набор ${данные.daily} в сутки` : 'набор выключен')}
+      ${kpi('Согласие с автоматом', с.agree_share === null
+              || с.agree_share === undefined ? '—' : pct(с.agree_share, 0),
+            'расхождение до 10 баллов считается согласием')}
+      ${kpi('Сдвиг проверяющих', знак(с.bias),
+            'плюс — мягче автомата, минус — строже')}
+    </div>
+    ${(с.reviewers || []).length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Проверяющий</th><th>Проверок</th><th>Средний балл</th>
+        <th title="насколько систематически строже или мягче автомата">Сдвиг</th>
+        <th title="средний размер расхождения без учёта знака">Разброс</th>
+        <th>Согласие</th></tr></thead>
+      <tbody>${с.reviewers.map((ч) => `<tr>
+        <td>${esc(ч.reviewer)}</td>
+        <td class="mono">${num(ч.n, 0)}</td>
+        <td class="mono">${ч.avg_score === null ? '—' : num(ч.avg_score, 1)}</td>
+        <td class="mono ${Math.abs(ч.bias || 0) > 10 ? 'err' : ''}">${знак(ч.bias)}</td>
+        <td class="mono">${ч.spread === null ? '—' : num(ч.spread, 1)}</td>
+        <td class="mono">${ч.agree_share === null ? '—' : pct(ч.agree_share, 0)}</td>
+      </tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty small">Проверок пока не было — калибровать нечего</div>'}
+    ${строки.length ? `<div class="table-wrap" style="margin-top:10px"><table>
+      <thead><tr><th>Запись</th><th>Оператор</th><th>Автомат</th><th>Человек</th>
+        <th>Состояние</th><th></th></tr></thead>
+      <tbody>${строки.slice(0, 20).map((з) => `<tr>
+        <td class="small">${esc(з.filename || з.job_id)}</td>
+        <td class="small">${esc(з.agent || '—')}</td>
+        <td class="mono">${з.auto_score === null || з.auto_score === undefined
+          ? '—' : num(з.auto_score, 0)}</td>
+        <td class="mono">${з.score === null || з.score === undefined
+          ? '—' : num(з.score, 0)}</td>
+        <td>${з.status === 'done'
+          ? `<span class="chip ${з.agree ? 'ok' : 'warn'}">${
+              з.agree ? 'согласен' : 'разошлись'}</span>`
+          : `<span class="chip ${з.due_at && з.due_at * 1000 < Date.now()
+              ? 'err' : ''}">${з.due_at && з.due_at * 1000 < Date.now()
+              ? 'просрочено' : 'ждёт'}</span>`}</td>
+        <td><button class="ghost sm" data-qa-open="${esc(з.job_id)}">Открыть</button></td>
+      </tr>`).join('')}</tbody></table></div>` : ''}
+    ${админ ? `<div class="row" style="margin-top:10px">
+      <button class="ghost sm" id="qa-sample-now">Набрать проверки сейчас</button>
+    </div>` : ''}`;
+
+  qsa('[data-qa-open]', тело).forEach((кнопка) =>
+    кнопка.addEventListener('click', () => window.__asrhub.openJob(кнопка.dataset.qaOpen)));
+  const набрать = qs('#qa-sample-now', тело);
+  if (набрать) набрать.onclick = async () => {
+    набрать.disabled = true;
+    try {
+      const итог = await API.post('/api/qa/sample');
+      toast(`Поставлено на проверку: ${итог.assigned}`, итог.assigned ? 'ok' : 'warn',
+            итог.assigned ? '' : 'Свежих разобранных записей не нашлось');
+      drawQaQueue();
+    } catch (err) { fail(err); набрать.disabled = false; }
+  };
 }
 
 /* Вкладка «Эталон» в карточке задания.
@@ -3511,9 +3664,14 @@ async function loadJobAnalysis(backdrop, job) {
                    num(речь.overlap_s, 1)} с)</span>` : ''}</td></tr>
                <tr><td class="small dim">Смен говорящего</td><td class="mono">${num(речь.switches)}${
                  речь.switches_per_min ? ` <span class="faint">(${num(речь.switches_per_min, 1)} в минуту)</span>` : ''}</td></tr>
-               <tr><td class="small dim">Долгих пауз</td><td class="mono">${num(речь.pauses)}${
+               <tr><td class="small dim" title="${речь.pause_threshold_s
+                 ? `разрывы дольше ${речь.pause_threshold_s} с` : 'разрывы между репликами'}">Пауз</td><td class="mono">${num(речь.pauses)}${
                  речь.longest_pause_s ? ` <span class="faint">(дольше всего ${
                    num(речь.longest_pause_s, 1)} с)</span>` : ''}</td></tr>
+               ${речь.long_pauses === null || речь.long_pauses === undefined ? '' : `
+               <tr><td class="small dim" title="отраслевой счёт: паузы дольше ${
+                 речь.long_pause_threshold_s || 4} с">Из них длинных</td><td class="mono">${
+                 num(речь.long_pauses)}</td></tr>`}
                <tr><td class="small dim" title="сумма пауз от трёх секунд">Заметная тишина</td><td class="mono">${
                  речь.dead_air_s ? `${num(речь.dead_air_s, 0)} с${
                    речь.dead_air_share ? ` <span class="faint">(${pct(речь.dead_air_share, 0)} записи)</span>` : ''}` : '—'}</td></tr>
@@ -3916,6 +4074,10 @@ RENDERERS.analytics = {
       ${card('Точность по эталону',
              'записи с эталонной расшифровкой: WER, MER и WIL по моделям и длительности — сложением слов, а не усреднением записей',
              '<div id="accuracy-body"></div>')}
+
+      ${card('Контроль качества работы операторов',
+             'проверка человеком поверх балла автомата: выборка, сроки, оценка и калибровка проверяющих — насколько каждый строже или мягче машины',
+             '<div id="qa-body"><div class="empty small">Загрузка…</div></div>')}
 
       <div class="grid cols-2">
         ${card('Очередь ручной проверки',
@@ -5790,6 +5952,46 @@ RENDERERS.pbx = {
           ${kpi('Ожидание', fmtDur(за.answered ? (за.wait_s || 0) / за.answered : 0),
                 'среднее до ответа')}
           ${kpi('Пропущено', num(за.skipped || 0, 0), 'короткие, без ответа, без записи')}
+        </div>
+      </section>
+      ${this.kpiCard(д.kpi || {})}`;
+  },
+
+  /* Показатели контакт-центра — те, по которым заказчик сравнивает системы
+   * между собой. Считаются по журналу звонков, который и так лежит в базе.
+   * Каждое число подписано тем, чего в нём НЕТ: «AHT» без постобработки —
+   * это не полный AHT, а оценка решения с первого раза — не опрос. Молчать
+   * об этом нельзя: показатель с чужим названием и своим смыслом хуже
+   * отсутствующего. */
+  kpiCard(k) {
+    if (!k || !k.total) return '';
+    const доля = (з) => (з === null || з === undefined ? '—' : `${num(з * 100, 1)} %`);
+    return `
+      <section class="card" style="margin-bottom:12px">
+        <div class="card-head">
+          <h3>Показатели контакт-центра</h3>
+          <span class="spacer"></span>
+          <span class="small dim">по журналу звонков за период</span>
+        </div>
+        <div class="grid cols-4" style="padding:14px 16px">
+          ${kpi('Среднее время разговора', k.aht_s === null || k.aht_s === undefined
+                  ? '—' : fmtDur(k.aht_s),
+                `по ${num(k.answered || 0, 0)} ${plural(k.answered || 0,
+                  'отвеченному', 'отвеченным', 'отвеченным')}; удержание и
+                 постобработка в журнале не отражены`)}
+          ${kpi('Потерянные вызовы', доля(k.abandoned_share),
+                `${num(k.abandoned || 0, 0)} из ${num(k.inbound || 0, 0)} входящих`)}
+          ${kpi('Уровень обслуживания', доля(k.service_level),
+                `сняли быстрее ${num(k.service_level_s || 0, 0)} с; в среднем ждали ${
+                  k.wait_avg_s === null || k.wait_avg_s === undefined
+                    ? '—' : fmtDur(k.wait_avg_s)}`)}
+          ${kpi('Решение с первого раза', доля(k.fcr),
+                k.fcr === null || k.fcr === undefined
+                  ? 'нужен номер звонящего в журнале'
+                  : `оценка: по ${num(k.fcr_base || 0, 0)} ${plural(k.fcr_base || 0,
+                      'обращению', 'обращениям', 'обращениям')} без повторного
+                     звонка за ${num(k.repeat_window_days || 0, 0)} ${plural(
+                      k.repeat_window_days || 0, 'день', 'дня', 'дней')}`)}
         </div>
       </section>`;
   },
@@ -7987,6 +8189,8 @@ RENDERERS.content.tab_categories = async function (host) {
   ]);
   state.contentCategoriesOwn = !!перечни.categories_own;
   state.contentCategoriesReady = перечни.default_categories || [];
+  state.contentPresets = перечни.category_presets || [];
+  state.contentPreset = перечни.category_preset || '';
   // Черновик заводится один раз на заход в раздел: смена периода
   // перерисовывает вкладку, и терять при этом полчаса правки нельзя.
   if (!state.contentCategories) {
@@ -8002,6 +8206,59 @@ RENDERERS.content.tab_categories = async function (host) {
     (state.contentScriptJobs[0] || {}).id || '';
   this.drawCategories(host, свод, драйверы);
   if (state.contentScriptJob) this.checkCategories();
+  this.drawDiscovered(host);
+};
+
+/* «Темы без правил». Отдельной карточкой под редактором категорий и
+ * отдельным запросом: проход по архиву стоит секунд, а смотрят этот отчёт
+ * раз в неделю — грузить его вместе со вкладкой значит замедлить то, что
+ * открывают каждый день, ради того, что открывают изредка. */
+RENDERERS.content.drawDiscovered = function (host) {
+  const место = document.createElement('section');
+  место.className = 'card';
+  место.innerHTML = `
+    <div class="card-head"><h3>Темы без правил</h3>
+      <span class="hint">о чём говорят там, куда никто не написал правило</span>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="topics-go">Поискать</button></div>
+    <div class="params" style="padding:14px 16px" id="topics-body">
+      <p class="small dim">Категории показывают то, что уже искали. Новая
+        причина звонков — сбой в приложении, изменившийся тариф — не попадает
+        никуда. Здесь записи собираются в кучки по похожести слов, и видно те,
+        у которых не сработало ни одной категории.</p>
+    </div>`;
+  host.appendChild(место);
+  qs('#topics-go', место).addEventListener('click', async () => {
+    const тело = qs('#topics-body', место);
+    тело.innerHTML = '<div class="empty small">Смотрю архив…</div>';
+    try {
+      const итог = await API.get(
+        `/api/content/discover?period=${state.contentPeriod}`);
+      const темы = итог.topics || [];
+      тело.innerHTML = темы.length ? `
+        <p class="small dim">Разобрано записей: ${num(итог.records, 0)} ·
+          тем: ${темы.length} · без правил: <b>${итог.uncovered}</b>${
+          итог.named_by_model ? ' · названия дала языковая модель' : ''}</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Тема</th><th>Записей</th><th>Доля</th>
+            <th>Покрыта правилами</th><th>Ведущие слова</th></tr></thead>
+          <tbody>${темы.map((т) => `<tr>
+            <td>${т.uncovered ? '<span class="chip warn">без правил</span> ' : ''}${
+              esc(т.title)}</td>
+            <td class="mono">${num(т.size, 0)}</td>
+            <td class="mono">${pct(т.share, 1)}</td>
+            <td class="mono">${pct(т.covered_share, 0)}${
+              (т.categories || []).length
+                ? ` <span class="faint">${esc(т.categories.map(
+                    ([имя, сколько]) => `${имя}×${сколько}`).join(', '))}</span>`
+                : ''}</td>
+            <td class="small dim">${esc((т.stems || []).slice(0, 8).join(', '))}</td>
+          </tr>`).join('')}</tbody></table></div>`
+        : '<div class="empty small">Тем не нашлось: слишком мало разобранных записей за период.</div>';
+    } catch (err) {
+      тело.innerHTML = `<div class="empty small err">${esc(err.message || 'не вышло')}</div>`;
+    }
+  });
 };
 
 RENDERERS.content.drawCategories = function (host, свод, драйверы) {
@@ -8026,6 +8283,12 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
       <span class="spacer"></span>
       ${свой ? `<button class="ghost sm" id="cat-default"
         title="Вернуться к готовому набору из десяти категорий">Вернуть готовый набор</button>` : ''}
+      <select id="cat-preset" class="sm" style="width:220px"
+              title="Добавить сразу весь отраслевой набор">
+        <option value="">Добавить отраслевой набор…</option>
+        ${(state.contentPresets || []).map((н) => `<option value="${esc(н.id)}">${
+          esc(н.title)} (+${н.count})</option>`).join('')}
+      </select>
       <select id="cat-ready" class="sm" style="width:200px" title="Добавить готовую категорию в набор">
         <option value="">Добавить готовую…</option>
         ${(state.contentCategoriesReady || [])
@@ -8224,6 +8487,33 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
     e.target.querySelector(`option[value="${CSS.escape(готовая.id)}"]`).remove();
     тронуто();
     рисовать();
+  });
+  /* Отраслевой набор добавляется целиком, в черновик: человек видит все
+   * правила разом и правит их до сохранения. Молча включать набор настройкой
+   * тоже можно (`content_category_preset`), но тогда правила не видно, а
+   * править их всё равно придётся — слова у каждой отрасли свои. */
+  const отрасль = qs('#cat-preset');
+  if (отрасль) отрасль.addEventListener('change', async (e) => {
+    const имя = e.target.value;
+    e.target.value = '';
+    if (!имя) return;
+    try {
+      const перечни = await API.get(`/api/content/kinds?preset=${encodeURIComponent(имя)}`);
+      const добавка = (перечни.preset_categories || []);
+      const занятые = new Set(набор.map((к) => к.id));
+      let добавлено = 0;
+      добавка.forEach((к) => {
+        if (занятые.has(к.id)) return;
+        занятые.add(к.id);
+        набор.push(JSON.parse(JSON.stringify(к)));
+        добавлено += 1;
+      });
+      toast(`Добавлено правил: ${добавлено}`, добавлено ? 'ok' : 'warn',
+            добавлено ? 'Проверьте их на записи и сохраните набор'
+                      : 'Все правила этого набора уже есть');
+      тронуто();
+      рисовать();
+    } catch (err) { fail(err); }
   });
   const вернуть = qs('#cat-default');
   if (вернуть) вернуть.addEventListener('click', () => this.saveCategories([]));
@@ -9003,7 +9293,26 @@ async function renderAccessSection(host) {
       <div class="params" style="padding:14px 16px">
         <div id="access-hf"></div>
       </div>
-    </section>`;
+    </section>
+
+    ${isAdmin ? `<section class="card">
+      <div class="card-head"><h3>Журнал доступа</h3>
+        <span class="hint">кто, когда и что сделал</span>
+        <span class="spacer"></span>
+        <span class="small dim" id="audit-count"></span></div>
+      <div class="params" style="padding:14px 16px">
+        <div class="row wrap" style="gap:6px;margin-bottom:10px">
+          <input type="search" id="audit-search" placeholder="действие, адрес или путь"
+                 style="flex:1;min-width:180px">
+          <select id="audit-actor" style="min-width:150px">
+            <option value="">все участники</option></select>
+          <label class="row" style="gap:6px;align-items:center">
+            <input type="checkbox" id="audit-failed"><span class="small">только отказы</span></label>
+          <button class="ghost sm" id="audit-more">Показать ещё</button>
+        </div>
+        <div id="audit-rows"></div>
+      </div>
+    </section>` : ''}`;
 
   // --- ключ этого браузера ---
   const current = qs('#access-current');
@@ -9045,6 +9354,80 @@ async function renderAccessSection(host) {
 
   // --- токен Hugging Face ---
   await loadHfToken(isAdmin);
+
+  // --- журнал доступа ---
+  if (isAdmin) {
+    const обновить = () => loadAudit(true);
+    let ждём = null;
+    qs('#audit-search').addEventListener('input', () => {
+      // Отбор по вводу — с задержкой: иначе каждая буква уходит запросом.
+      clearTimeout(ждём);
+      ждём = setTimeout(обновить, 350);
+    });
+    qs('#audit-actor').addEventListener('change', обновить);
+    qs('#audit-failed').addEventListener('change', обновить);
+    qs('#audit-more').addEventListener('click', () => loadAudit(false));
+    await loadAudit(true);
+  }
+}
+
+/* Журнал доступа. Страницами, а не целиком: на сервере, работающем месяц,
+ * это десятки тысяч строк, и «показать всё» означает переслать браузеру
+ * мегабайты ради двадцати строк, которые человек прочитает. */
+const auditState = { offset: 0, total: 0, items: [] };
+
+async function loadAudit(reset) {
+  const box = qs('#audit-rows');
+  if (!box) return;
+  if (reset) { auditState.offset = 0; auditState.items = []; }
+  const пары = new URLSearchParams({ limit: '50', offset: String(auditState.offset) });
+  const поиск = (qs('#audit-search') || {}).value || '';
+  const участник = (qs('#audit-actor') || {}).value || '';
+  if (поиск) пары.set('query', поиск);
+  if (участник) пары.set('actor', участник);
+  if ((qs('#audit-failed') || {}).checked) пары.set('failed_only', 'true');
+  let данные;
+  try {
+    данные = await API.get(`/api/audit?${пары}`);
+  } catch (err) {
+    box.innerHTML = '<div class="empty small">Журнал доступен администратору</div>';
+    return;
+  }
+  auditState.total = данные.total || 0;
+  auditState.items = auditState.items.concat(данные.items || []);
+  auditState.offset = auditState.items.length;
+
+  const счётчик = qs('#audit-count');
+  if (счётчик) {
+    счётчик.textContent = данные.enabled
+      ? `показано ${auditState.items.length} из ${auditState.total}${
+          данные.reads ? '' : ' · чтения не записываются'}`
+      : 'журнал выключен настройкой «Вести журнал доступа»';
+  }
+  const выбор = qs('#audit-actor');
+  if (выбор && выбор.options.length <= 1) {
+    (данные.actors || []).forEach((у) => {
+      const опция = document.createElement('option');
+      опция.value = у.actor;
+      опция.textContent = `${у.actor} (${у.n})`;
+      выбор.appendChild(опция);
+    });
+  }
+  box.innerHTML = auditState.items.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Ответ</th><th>Откуда</th></tr></thead>
+    <tbody>${auditState.items.map((с) => `<tr>
+      <td class="small mono" title="${esc(с.path || '')}">${esc(fmtTime(с.ts))}</td>
+      <td class="small">${esc(с.actor || '—')}${с.role
+        ? ` <span class="faint">${esc(с.role)}</span>` : ''}</td>
+      <td class="small">${esc(с.action || '')}</td>
+      <td class="small"><span class="chip ${с.status >= 400 ? 'err'
+        : с.status >= 300 ? 'warn' : 'ok'}">${с.status || '—'}</span></td>
+      <td class="small mono">${esc(с.ip || '—')}</td>
+    </tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty small">Записей нет</div>';
+
+  const ещё = qs('#audit-more');
+  if (ещё) ещё.style.display = auditState.items.length < auditState.total ? '' : 'none';
 }
 
 async function loadAccessKeys() {
@@ -9418,6 +9801,29 @@ RENDERERS.settings = {
     const станции = (state.paramGroup === 'telephony' && !search)
       ? h('<section class="card" id="set-stations"><div class="empty">Смотрим станции…</div></section>')
       : null;
+    // «CRM» — третий случай, где нужно действие, а не параметр: увидеть
+    // ровно то тело запроса, которое уйдёт в чужую систему. Комментарий,
+    // попавший не в ту карточку, из ленты Bitrix24 уже не убрать, поэтому
+    // проверка всухую здесь важнее любой подсказки в описании параметра.
+    const проверкаCRM = (state.paramGroup === 'crm' && !search)
+      ? h(`<section class="card" id="set-crm">
+            <div class="card-head"><h3>Проверка</h3>
+              <span class="hint">что именно уйдёт в CRM</span></div>
+            <div class="params" style="padding:14px 16px">
+              <div class="row wrap" style="gap:6px">
+                <input type="text" id="crm-job" placeholder="запись (необязательно)"
+                       style="flex:1;min-width:160px">
+                <input type="text" id="crm-entity" placeholder="сделка"
+                       style="width:120px">
+                <button class="ghost sm" id="crm-dry">Показать запрос</button>
+                <button class="primary sm" id="crm-send">Отправить по-настоящему</button>
+              </div>
+              <div id="crm-out" class="small dim" style="margin-top:10px">
+                Без записи собирается показательный пример: форму запроса видно
+                сразу, ждать подходящего разговора не нужно.</div>
+            </div>
+          </section>`)
+      : null;
 
     let items = state.params;
     if (search) {
@@ -9433,6 +9839,7 @@ RENDERERS.settings = {
         'Возможно, стоит включить показ параметров для опытных.</div></div>';
       if (врезка) { host.prepend(врезка); drawLlmSetup(врезка); }
       if (станции) { host.prepend(станции); drawStationsBox(станции); }
+      if (проверкаCRM) { host.prepend(проверкаCRM); wireCrmTest(); }
       return;
     }
 
@@ -9459,8 +9866,41 @@ RENDERERS.settings = {
     });
     if (врезка) { host.prepend(врезка); drawLlmSetup(врезка); }
     if (станции) { host.prepend(станции); drawStationsBox(станции); }
+    if (проверкаCRM) { host.prepend(проверкаCRM); wireCrmTest(); }
   },
 };
+
+/* Проверка обратной записи в CRM. Два действия намеренно разведены: показать
+ * запрос и отправить его. Отправка — вторым нажатием и после того, как
+ * человек увидел адрес и тело: комментарий в чужой карточке отменить нельзя. */
+function wireCrmTest() {
+  const вывод = qs('#crm-out');
+  if (!вывод) return;
+  const спросить = async (насухо) => {
+    const пары = new URLSearchParams({ dry_run: насухо ? 'true' : 'false' });
+    const запись = (qs('#crm-job') || {}).value || '';
+    const сделка = (qs('#crm-entity') || {}).value || '';
+    if (запись) пары.set('job_id', запись);
+    if (сделка) пары.set('entity_id', сделка);
+    вывод.textContent = 'Собираю запрос…';
+    try {
+      const итог = await API.post(`/api/crm/test?${пары}`);
+      вывод.innerHTML = `
+        <div><b>${esc(итог.kind)}</b> → <span class="mono">${esc(итог.url)}</span></div>
+        <div style="margin-top:6px">Сделка: <span class="mono">${
+          esc(итог.entity_id || '— не определена')}</span></div>
+        <pre class="mono small" style="white-space:pre-wrap;margin-top:8px">${
+          esc(итог.body)}</pre>
+        ${итог.sent ? `<div class="chip ok" style="margin-top:6px">CRM ответила ${
+          esc(String((итог.response || {}).status || ''))}</div>` : ''}`;
+    } catch (err) {
+      вывод.innerHTML = `<span class="err">${esc(err.message || 'не получилось')}</span>${
+        err.hint ? ` <span class="dim">${esc(err.hint)}</span>` : ''}`;
+    }
+  };
+  qs('#crm-dry').addEventListener('click', () => спросить(true));
+  qs('#crm-send').addEventListener('click', () => спросить(false));
+}
 
 /**
  * Врезка со списком станций прямо в настройках телефонии.

@@ -221,6 +221,21 @@ class StreamSession:
 
         self.window_s = max(1.0, float(settings.get("stream_window_s") or DEFAULT_WINDOW_S))
 
+        #: Подсказки оператору прямо в разговоре. Собираются теми же
+        #: правилами, что и разбор после разговора: разойдись они — живая
+        #: подсказка и итоговый отчёт стали бы спорить об одном разговоре.
+        self.assist: Any = None
+        if settings.get("stream_assist"):
+            try:
+                from .liveassist import Помощник  # noqa: PLC0415
+
+                self.assist = Помощник.из_настроек(
+                    settings, agent=str(settings.get("stream_agent") or ""))
+            except Exception as exc:                        # noqa: BLE001
+                # Подсказки необязательны. Сессия распознавания из-за них
+                # падать не должна: человек в разговоре, и текст важнее.
+                log.warning("Подсказки в разговоре недоступны: %s", exc)
+
     # -- жизненный цикл -----------------------------------------------------
 
     def start(self) -> StreamEvent:
@@ -309,6 +324,35 @@ class StreamSession:
                                 start=self._committed_s, end=self.duration_s)]
         return []
 
+    def _подсказать(self, events: list[StreamEvent]) -> list[StreamEvent]:
+        """Добавляет к закреплённому тексту подсказки оператору.
+
+        Считаются ТОЛЬКО по `final`. Предварительная гипотеза переписывается
+        на каждом куске звука, и подсказка по ней мигает: появилась, исчезла,
+        появилась снова. В разговоре на такое не смотрят — его выключают.
+        """
+        # `getattr`, а не `self.assist`: сессию собирают и в обход
+        # конструктора (проверки делают так, чтобы не поднимать движок), и
+        # падать из-за необязательной надстройки в таком случае нельзя.
+        помощник = getattr(self, "assist", None)
+        if помощник is None:
+            return events
+        готово = list(events)
+        for событие in events:
+            if событие.type != "final" or not событие.text:
+                continue
+            try:
+                подсказки = помощник.добавить(
+                    событие.text,
+                    speaker=str(self.settings.get("stream_agent") or "оператор"),
+                    start=событие.start, end=событие.end)
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("Подсказки не посчитаны: %s", exc)
+                return готово
+            готово.extend(
+                StreamEvent("hint", extra=п.to_dict()) for п in подсказки)
+        return готово
+
     def _note_first_text(self) -> None:
         if self._first_text_at is None:
             self._first_text_at = time.time()
@@ -357,7 +401,8 @@ class StreamSession:
             return []
         self._note_first_text()
         self._final_text = (self._final_text + " " + text).strip()
-        return [StreamEvent("final", text=text, start=start, end=end)]
+        return self._подсказать(
+            [StreamEvent("final", text=text, start=start, end=end)])
 
     def finish(self) -> list[StreamEvent]:
         """Завершает сессию и отдаёт окончательный текст."""
@@ -380,8 +425,9 @@ class StreamSession:
             if text:
                 self._note_first_text()
                 self._final_text = (self._final_text + " " + text).strip()
-            events.append(StreamEvent("final", text=text, start=start,
-                                      end=self.duration_s))
+            events.extend(self._подсказать(
+                [StreamEvent("final", text=text, start=start,
+                             end=self.duration_s)]))
         events.append(StreamEvent("done", extra={
             "duration_s": round(self.duration_s, 3),
             "text": self._final_text,
@@ -430,7 +476,8 @@ class StreamSession:
         if kind == "final":
             self._final_text = (self._final_text + " " + text).strip()
             self._last_partial = ""
-            return [StreamEvent("final", text=text, start=0.0, end=self.duration_s)]
+            return self._подсказать(
+                [StreamEvent("final", text=text, start=0.0, end=self.duration_s)])
         self._last_partial = text
         return [StreamEvent("partial", text=text, start=0.0, end=self.duration_s)]
 
@@ -453,8 +500,9 @@ class StreamSession:
         # Возврат всего текста сессии заставлял клиента показать расшифровку
         # дважды: сначала приращениями, потом её же целиком. Итоговый текст
         # и так уходит следом в событии `done`.
-        return [StreamEvent("final", text=text, start=self._committed_s,
-                            end=self.duration_s)]
+        return self._подсказать(
+            [StreamEvent("final", text=text, start=self._committed_s,
+                         end=self.duration_s)])
 
     def _recognize(self, pcm: bytes) -> str:
         """Распознаёт накопленный звук целиком — путь скользящего окна."""

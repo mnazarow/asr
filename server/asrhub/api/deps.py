@@ -250,7 +250,21 @@ def token_of(request: Request) -> str:
 def authenticate(request: Request,
                  x_api_key: str | None = Header(default=None, alias="X-API-Key"),
                  authorization: str | None = Header(default=None)) -> Principal:
-    """Проверяет ключ доступа или сессию входа и лимит частоты запросов."""
+    """Проверяет ключ доступа или сессию входа и лимит частоты запросов.
+
+    Найденного участника кладёт в `request.state.principal`: журналу доступа
+    и middleware нужно знать, КТО пришёл, а разбирать заголовки второй раз
+    нельзя. Одна такая вторая копия разбора уже стоила дыры — она принимала
+    только «Bearer», и ключ с обезличиванием получал полные телефоны, стоило
+    передать ключ заголовком X-API-Key. Точка входа должна остаться одна.
+    """
+    участник = _проверить(request, x_api_key, authorization)
+    request.state.principal = участник
+    return участник
+
+
+def _проверить(request: Request, x_api_key: str | None,
+               authorization: str | None) -> Principal:
     state = get_state(request)
     if not state.settings.get("auth_enabled", True):
         return Principal(name="без аутентификации", role="admin")

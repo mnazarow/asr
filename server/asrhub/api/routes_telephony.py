@@ -17,6 +17,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request
 
+from .. import settings_access as S
 from ..errors import ASRHubError, ConfigError
 from ..telephony import stations as stations_mod
 from .deps import (
@@ -292,7 +293,8 @@ def overview(request: Request,
     восемь поводов увидеть на экране части картины от разных моментов
     времени.
     """
-    db = get_state(request).db
+    состояние = get_state(request)
+    db = состояние.db
     владелец = scope_owner(principal)
     начало = _период(period)
     корзина = bucket or _корзина(period)
@@ -321,6 +323,15 @@ def overview(request: Request,
         "durations": db.call_duration_histogram(owner=владелец, station=station,
                                                 since=начало),
         "tops": разрезы,
+        # Показатели, по которым заказчик сравнивает системы между собой:
+        # среднее время разговора, доля потерянных, уровень обслуживания,
+        # решение с первого обращения. Всё — из того же журнала звонков,
+        # который и так лежит в базе.
+        "kpi": db.call_kpi(
+            owner=владелец, station=station, since=начало,
+            service_level_s=S.num(состояние.settings, "telephony_service_level_s", 20.0),
+            repeat_window_days=S.num(состояние.settings,
+                                     "telephony_repeat_window_days", 7.0)),
     }
 
 

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from . import model_files
+from . import settings_access as S
 from .catalog import get_model
 from .db import SAMPLE_PERIOD_S, Database, new_id, now
 from .engines import EngineRegistry
@@ -1583,7 +1584,9 @@ class JobQueue:
                     from .maintenance import retention_days  # noqa: PLC0415
 
                     retention = retention_days(self.settings)
-                    removed = self.db.cleanup(results_days=retention)
+                    removed = self.db.cleanup(
+                        results_days=retention,
+                        audit_days=S.integer(self.settings, "audit_days", 365))
                     if any(removed.values()):
                         log.info("Очистка хранилища: %s", removed)
                     # Если уборка упёрлась в предел на заход, следующий

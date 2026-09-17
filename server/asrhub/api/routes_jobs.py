@@ -24,6 +24,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import catalog
+from .. import settings_access as S
 from ..config import parse_scalar
 from ..db import new_id
 from ..errors import (
@@ -972,6 +973,76 @@ def _source_audio(request: Request, job: dict[str, Any]) -> Path:
     return real
 
 
+def _отредактированный_путь(real: Path) -> Path:
+    """Куда кладётся отредактированная копия — рядом с исходником.
+
+    Отдельным именем, а не поверх оригинала: редакция — это производная,
+    и переписать ею запись значило бы уничтожить исходные данные по нажатию
+    кнопки, без возможности передумать.
+    """
+    return real.with_name(f"{real.stem}.redacted{real.suffix}")
+
+
+@router.post("/{job_id}/redact", summary="Заглушить персональные данные в записи")
+def redact_audio(request: Request, job_id: str,
+                 mode: str = Query(default="", pattern="^(|beep|silence)$"),
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Делает копию записи, в которой персональные данные заглушены.
+
+    Ищутся они там же, где и при обезличивании текста, — `masking.find` по
+    расшифровке, — а время берётся у слов, если выравнивание их проставило.
+    Без таймкодов границы оцениваются по месту знаков в реплике: это помечено
+    в ответе полем `estimated`, и запас по краям для таких кусков больше.
+    """
+    from ..pipeline import redact as redact_mod  # noqa: PLC0415
+
+    state = get_state(request)
+    require_write(principal)
+    job = _owned_job(request, job_id, principal)
+    real = _source_audio(request, job)
+    сегменты = state.db.get_segments(job_id)
+    if not сегменты:
+        raise error_response(ConfigError(
+            "У записи нет расшифровки — искать в ней нечего.",
+            hint="Дождитесь распознавания или запустите его заново."))
+    виды = state.settings.get("redact_kinds") or ""
+    выбранные = tuple(в.strip() for в in str(виды).replace(";", ",").split(",")
+                      if в.strip()) or None
+    итог = redact_mod.заглушить(
+        real, _отредактированный_путь(real), сегменты,
+        mode=mode or str(state.settings.get("redact_mode") or "beep"),
+        kinds=выбранные,
+        padding_ms=S.integer(state.settings, "redact_padding_ms",
+                             redact_mod.ЗАПАС_МС),
+        ffmpeg=str(state.settings.get("ffmpeg_path") or "ffmpeg"))
+    ответ = итог.to_dict()
+    ответ["found"] = bool(итог.path)
+    ответ["url"] = f"/api/jobs/{job_id}/redacted" if итог.path else None
+    return ответ
+
+
+@router.get("/{job_id}/redacted", summary="Отредактированная копия записи")
+def get_redacted(request: Request, job_id: str,
+                 principal: Principal = Depends(authenticate)):
+    """Отдаёт копию, в которой персональные данные заглушены."""
+    job = _owned_job(request, job_id, principal)
+    real = _source_audio(request, job)
+    копия = _отредактированный_путь(real)
+    if not копия.is_file():
+        raise error_response(ConfigError(
+            "Отредактированной копии нет.",
+            hint="Сначала нажмите «Заглушить персональные данные» — или "
+                 "вызовите POST /api/jobs/{id}/redact."))
+    media = _AUDIO_TYPES.get(копия.suffix.lower())
+    if media is None:
+        media, _ = mimetypes.guess_type(копия.name)
+    имя = str(job.get("filename") or "").strip() or копия.name
+    основа = Path(имя).stem
+    return FileResponse(str(копия), media_type=media or "application/octet-stream",
+                        filename=f"{основа}.отредактировано{копия.suffix}",
+                        content_disposition_type="inline")
+
+
 @router.get("/{job_id}/audio", summary="Исходная запись задания")
 def get_audio(request: Request, job_id: str,
               principal: Principal = Depends(authenticate)):
@@ -1432,3 +1503,56 @@ def set_reference(request: Request, job_id: str,
     # с именем того, кто проверял.
     state.db.review_update(job_id, "done", reviewer=principal.name)
     return {"job_id": job_id, **detail}
+
+
+@router.post("/text", summary="Разобрать переписку (чат, почта) без звука")
+def create_text_job(request: Request, данные: dict[str, Any] = Body(...),
+                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Принимает переписку и разбирает её тем же слоем, что и разговоры.
+
+    Распознавания здесь нет — оно переписке и не нужно, — поэтому задание
+    сразу создаётся завершённым и разбирается на месте: очередь ждать незачем.
+
+    Единственное, с чем нельзя смошенничать, — время. Между репликами в чате
+    проходит минута или час, и это не пауза в разговоре. Всё, что меряется
+    секундами, у таких заданий пустое: ноль пауз в переписке читался бы как
+    «отвечали мгновенно», хотя мерить там нечего.
+    """
+    from .. import textchat  # noqa: PLC0415
+
+    состояние = get_state(request)
+    require_write(principal)
+    try:
+        разобрано = textchat.задание(данные)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+
+    job_id = состояние.db.create_job({
+        "filename": разобрано["filename"],
+        "status": "completed",
+        "source": "text",
+        "owner": principal.name,
+        "text": разобрано["text"],
+        "language": str(данные.get("language") or "ru"),
+        "model": f"переписка:{разобрано['channel']}",
+        "engine": "text",
+        "finished_at": time.time(),
+        "params": {"channel": разобрано["channel"],
+                   "external_id": str(данные.get("external_id") or ""),
+                   **({"crm_entity_id": str(данные["crm_entity_id"])}
+                      if данные.get("crm_entity_id") else {})},
+    })
+    состояние.db.save_segments(job_id, разобрано["segments"])
+    разбор = None
+    if состояние.content is not None:
+        разбор = состояние.content.analyze_job(
+            job_id, segments=разобрано["segments"],
+            agent_speaker=разобрано["agent"])
+    return {
+        "id": job_id,
+        "channel": разобрано["channel"],
+        "known_channel": разобрано["known_channel"],
+        "messages": len(разобрано["segments"]),
+        "agent": разобрано["agent"],
+        "content": разбор,
+    }
