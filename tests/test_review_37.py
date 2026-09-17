@@ -266,7 +266,7 @@ def test_имена_требований_нормализуются_как_у_pi
 
 
 @нужен_bash
-def test_лишний_пакет_назван_вместе_с_командой_удаления(tmp_path: Path):
+def test_лишний_пакет_опознаётся(tmp_path: Path):
     """Ровно случай с рабочего сервера: optimum остался, требований на него нет."""
     (tmp_path / "req").mkdir()
     (tmp_path / "req" / "a.txt").write_text("onnxruntime>=1.18\n", encoding="utf-8")
@@ -275,10 +275,8 @@ def test_лишний_пакет_назван_вместе_с_командой_�
               "but you have transformers 5.17.0.")
     итог = _прогнать(
         f'source "{КОРЕНЬ}/scripts/lib/common.sh"; '
-        f'orphan_conflict_hint "{жалоба}" "{tmp_path}/req" "{pip}"')
-    вывод = итог.stdout + итог.stderr
-    assert "optimum-onnx" in вывод
-    assert "uninstall -y optimum-onnx" in вывод
+        f'orphan_packages_in "{жалоба}" "{tmp_path}/req" "{pip}"')
+    assert итог.stdout.strip() == "optimum-onnx"
 
 
 @нужен_bash
@@ -291,8 +289,8 @@ def test_спутник_нужного_пакета_лишним_не_счита
               "but you have protobuf 7.36.1.")
     итог = _прогнать(
         f'source "{КОРЕНЬ}/scripts/lib/common.sh"; '
-        f'orphan_conflict_hint "{жалоба}" "{tmp_path}/req" "{pip}"')
-    assert "uninstall" not in (итог.stdout + итог.stderr)
+        f'orphan_packages_in "{жалоба}" "{tmp_path}/req" "{pip}"')
+    assert итог.stdout.strip() == ""
 
 
 @нужен_bash
@@ -305,8 +303,8 @@ def test_пакет_за_которым_кто_то_стоит_не_предла
               "but you have huggingface-hub 1.2.0.")
     итог = _прогнать(
         f'source "{КОРЕНЬ}/scripts/lib/common.sh"; '
-        f'orphan_conflict_hint "{жалоба}" "{tmp_path}/req" "{pip}"')
-    assert "uninstall" not in (итог.stdout + итог.stderr)
+        f'orphan_packages_in "{жалоба}" "{tmp_path}/req" "{pip}"')
+    assert итог.stdout.strip() == ""
 
 
 @нужен_bash
@@ -1875,3 +1873,93 @@ def test_сессия_без_конструктора_не_падает_на_п�
     сессия = StreamSession.__new__(StreamSession)
     события = сессия._подсказать([StreamEvent("final", text="текст")])
     assert [с.type for с in события] == ["final"]
+
+
+@нужен_bash
+def test_команда_удаления_помещается_на_экран(tmp_path: Path):
+    """Чек-лист показывает шесть заметок на пункт — команда должна быть в них.
+
+    Первый же запуск на рабочем сервере обрезал ровно ту строку, ради которой
+    всё и писалось: подсказка стояла после трёх строк объяснения, и на экран
+    вышло «Лишнее от прежней версии — этих пакетов нет ни в одном списке», а
+    команда ушла в журнал. Теперь лекарство идёт первым, а объяснение — только
+    когда лекарства нет.
+    """
+    (tmp_path / "req").mkdir()
+    (tmp_path / "req" / "a.txt").write_text("onnxruntime>=1.18\n", encoding="utf-8")
+    pip = tmp_path / "pip"
+    pip.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "check" ]; then\n'
+        + "".join(
+            f'  echo "пакет{н} 1.0 has requirement transformers<4.58, '
+            f'but you have transformers 5.17.0."\n' for н in range(6))
+        + '  echo "optimum-onnx 0.1.0 has requirement transformers<4.58, '
+          'but you have transformers 5.17.0."\n'
+          "  exit 1\n"
+          "fi\n"
+          'if [ "$1" = "show" ]; then echo "Required-by:"; fi\n'
+          "exit 0\n", encoding="utf-8")
+    pip.chmod(0o755)
+
+    итог = _прогнать(
+        f'source "{КОРЕНЬ}/scripts/lib/common.sh"; '
+        f'check_dependency_health "{pip}" "{tmp_path}/req"')
+    вывод = (итог.stdout + итог.stderr).splitlines()
+    заметки = [с for с in вывод if с.strip()]
+    # Шесть — предел чек-листа на пункт; всё, что дальше, человек не увидит.
+    assert len(заметки) <= 6, "\n".join(заметки)
+    команда = [с for с in заметки if "uninstall -y" in с]
+    assert команда, "команда удаления не поместилась: " + "\n".join(заметки)
+    # И она не последняя из шести: строка «… и ещё N» идёт после неё.
+    assert заметки.index(команда[0]) <= 2
+
+
+@нужен_bash
+def test_без_лекарства_объяснение_остаётся(tmp_path: Path):
+    """Когда сделать нечего, человеку нужно объяснение, а не пустая жалоба."""
+    (tmp_path / "req").mkdir()
+    (tmp_path / "req" / "a.txt").write_text("transformers>=5\n", encoding="utf-8")
+    pip = tmp_path / "pip"
+    pip.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "check" ]; then\n'
+        '  echo "transformers-extra 1.0 has requirement protobuf~=5.29, '
+        'but you have protobuf 7.36.1."\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [ "$1" = "show" ]; then echo "Required-by: transformers"; fi\n'
+        "exit 0\n", encoding="utf-8")
+    pip.chmod(0o755)
+
+    вывод = _прогнать(
+        f'source "{КОРЕНЬ}/scripts/lib/common.sh"; '
+        f'check_dependency_health "{pip}" "{tmp_path}/req"')
+    текст = вывод.stdout + вывод.stderr
+    assert "Движки требуют несовместимых версий" in текст
+    assert "uninstall" not in текст
+
+
+@нужен_bash
+def test_рядом_с_командой_нет_неверного_диагноза(tmp_path: Path):
+    """«Движки требуют разных версий» — не про пакет от прежней версии."""
+    (tmp_path / "req").mkdir()
+    (tmp_path / "req" / "a.txt").write_text("onnxruntime>=1.18\n", encoding="utf-8")
+    pip = tmp_path / "pip"
+    pip.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "check" ]; then\n'
+        '  echo "optimum-onnx 0.1.0 has requirement transformers<4.58, '
+        'but you have transformers 5.17.0."\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [ "$1" = "show" ]; then echo "Required-by:"; fi\n'
+        "exit 0\n", encoding="utf-8")
+    pip.chmod(0o755)
+
+    итог = _прогнать(
+        f'source "{КОРЕНЬ}/scripts/lib/common.sh"; '
+        f'check_dependency_health "{pip}" "{tmp_path}/req"')
+    текст = итог.stdout + итог.stderr
+    assert "uninstall -y optimum-onnx" in текст
+    assert "Движки требуют" not in текст

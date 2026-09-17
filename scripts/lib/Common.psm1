@@ -18,7 +18,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.8'
+    $script:AsrHubVersion = '3.1.9'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
