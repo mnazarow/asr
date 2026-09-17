@@ -226,6 +226,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     report(0.04, "подготовка аудио")
     prepared_audio = audio_mod.prepare(source, workdir, settings)
     channels = prepared_audio.channels
+    outcome.warnings.extend(prepared_audio.warnings)
     levels = audio_mod.analyze_levels(source)
     if levels:
         outcome.stats["levels"] = levels
@@ -240,9 +241,16 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     report(0.12, "подготовка завершена")
 
     all_segments: list[Segment] = []
+    # Реплики порознь по каналам — для выравнивания. Оно сверяет слова со
+    # ЗВУКОМ, и звук у каждого канала свой: общий список тут не годится.
+    по_каналам: list[tuple[Path, list[Segment]]] = []
     engine_meta: dict[str, Any] = {}
     languages: list[str] = []
-    silent_channels: list[str] = []
+    # Канал, от которого после обработки не осталось звука, до поиска речи
+    # не доходит вовсе — он отсеивается ещё при подготовке. Но в отчёте он
+    # обязан оказаться там же, где молчащие по данным VAD: и сводка «речь
+    # не обнаружена в каналах», и отказ «молчат все» написаны для обоих.
+    silent_channels: list[str] = list(prepared_audio.silent)
     профили: list[dict[str, Any]] = []
 
     for channel_index, (label, prepared) in enumerate(channels):
@@ -308,6 +316,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         engine_meta = dict(result.meta)
         if result.language:
             languages.append(result.language)
+        свои: list[Segment] = []
         for segment in result.segments:
             if label:
                 # Канал побеждает догадку движка, а не наоборот. Раньше стояло
@@ -320,7 +329,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
                 # справочнике сказано «безошибочно для стереозаписей», молча
                 # не работало именно там, где оно и нужно.
                 segment.speaker = label
+            свои.append(segment)
             all_segments.append(segment)
+        по_каналам.append((prepared, свои))
 
     # Речи нет ни в одном канале — вот это уже отказ. Если молчал только
     # один, отмечаем это предупреждением и работаем с остальными.
@@ -341,16 +352,32 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         check_cancel()
         timer.start("alignment")
         report(0.80, "уточнение границ слов")
-        try:
-            from .pipeline.alignment import align_segments
+        # Каждый канал выравнивается по СВОЕМУ звуку. Раньше сюда уходил
+        # файл первого канала и реплики обоих: на стереозаписи звонка
+        # слова второго собеседника искались в чужом звуке. Совпасть им
+        # там не с чем, и выравнивание — этап, который должен УТОЧНЯТЬ
+        # границы, — растаскивало половину реплик по чужим местам, а те,
+        # что пришлись на конец разговора, оказывались за концом звука.
+        # Молча: выравнивание не жалуется, оно просто двигает метки.
+        выровненные: list[Segment] = []
+        for путь_канала, свои in по_каналам:
+            if not свои:
+                continue
+            try:
+                from .pipeline.alignment import align_segments
 
-            all_segments = align_segments(channels[0][1], all_segments, settings)
-        except ASRHubError as exc:
-            # Выравнивание — улучшение, а не обязательный этап: при неудаче
-            # остаются модельные таймкоды, а задание доводится до конца.
-            outcome.warnings.append(f"Выравнивание не выполнено: {exc.message}")
-        except Exception as exc:
-            outcome.warnings.append(f"Выравнивание не выполнено: {exc}")
+                выровненные.extend(align_segments(путь_канала, свои, settings))
+            except ASRHubError as exc:
+                # Выравнивание — улучшение, а не обязательный этап: при
+                # неудаче остаются модельные таймкоды, а задание доводится
+                # до конца. Отдельно по каналу: сбой на одном не лишает
+                # уточнения второй.
+                outcome.warnings.append(f"Выравнивание не выполнено: {exc.message}")
+                выровненные.extend(свои)
+            except Exception as exc:
+                outcome.warnings.append(f"Выравнивание не выполнено: {exc}")
+                выровненные.extend(свои)
+        all_segments = sorted(выровненные, key=lambda s: s.start)
         timer.stop()
 
     # ---- 5. Диаризация ---------------------------------------------------

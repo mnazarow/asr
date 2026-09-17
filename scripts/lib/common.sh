@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.5"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.6"
 ASRHUB_MIN_PYTHON="3.10"
 # Верхняя граница — не каприз, а состояние экосистемы. Движки распознавания
 # тянут за собой torch, onnxruntime, nemo и десяток библиотек с колёсами под
@@ -2012,6 +2012,36 @@ setup_logging() {
   : > "${ASRHUB_LOG_FILE}" 2>/dev/null || ASRHUB_LOG_FILE=""
   [[ -n "${ASRHUB_LOG_FILE}" ]] && debug "журнал: ${ASRHUB_LOG_FILE}"
   export ASRHUB_LOG_FILE
+}
+
+# Имя службы ЭТОЙ установки.
+#
+#   service_name_for ПУТЬ_УСТАНОВКИ
+#
+# Служб на машине бывает несколько: установщик принимает --name, и вторую
+# установку заводят именно так (`--prefix /opt/asrhub2 --name asrhub2`).
+# Обновление и удаление про этот ключ не знали вовсе и всегда работали со
+# службой «asrhub»: обслуживание второй установки гасило и сносило службу
+# ПЕРВОЙ, продолжая при этом бодро сообщать об успехе. Заметить это можно
+# было только по остановившемуся распознаванию на другом сервере.
+#
+# Имя ищется по юниту, чей ExecStart или WorkingDirectory указывает на этот
+# каталог установки, — так человеку не нужно помнить, как он назвал службу
+# полгода назад. Не нашли — «asrhub», как было.
+service_name_for() {
+  local prefix="${1:-}" unit name
+  [[ -n "${prefix}" ]] || { printf 'asrhub'; return 0; }
+  prefix="${prefix%/}"
+  for unit in /etc/systemd/system/asrhub*.service \
+              "${HOME}/.config/systemd/user/asrhub"*.service; do
+    [[ -f "${unit}" ]] || continue
+    if grep -qE "^(ExecStart|WorkingDirectory)=.*${prefix}(/|[[:space:]]|$)" "${unit}" 2>/dev/null; then
+      name="$(basename "${unit}" .service)"
+      printf '%s' "${name}"
+      return 0
+    fi
+  done
+  printf 'asrhub'
 }
 
 print_banner() {

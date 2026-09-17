@@ -435,7 +435,13 @@ def test_audio_profile_estimates_snr_peak_clipping_and_silence():
                        {"snr_db": 8, "clipping_share": 0.02, "loudness_lufs": -20,
                         "silence_share": 0.7, "peak_dbfs": -1}])
     assert слитый == {"snr_db": 8, "clipping_share": 0.02, "loudness_lufs": -20,
-                      "silence_share": 0.6, "peak_dbfs": -1}
+                      "silence_share": 0.6, "peak_dbfs": -1, "has_speech": True}
+    # Молчащий канал в оценку чистоты не входит: см. заход 35,
+    # `test_review_35_quality.py`. Без этого ноль децибел пустого канала
+    # объявлял плохой всю запись — вместе с каналом, где говорили чисто.
+    один_говорит = AP.merge([{"snr_db": 22, "has_speech": True, "silence_share": 0.4},
+                             {"snr_db": 0, "has_speech": False, "silence_share": 1.0}])
+    assert один_говорит["snr_db"] == 22, один_говорит
     assert AP.merge([{}, {"snr_db": 3}]) == {"snr_db": 3} and AP.merge([]) == {}
     assert AP.for_job({}) == {} and set(AP.for_job(слитый)) == {
         "snr_db", "peak_dbfs", "clipping_share", "loudness_lufs", "silence_share"}

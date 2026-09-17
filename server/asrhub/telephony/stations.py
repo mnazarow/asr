@@ -98,6 +98,7 @@ class Станция:
     skip_unanswered: bool = True
     settle_s: int = 30
     lookback_days: int = 7
+    match_window: int = 120
 
     # Куда класть
     owner: str = "telephony"
@@ -130,6 +131,7 @@ class Станция:
             "min_duration_s": self.min_duration_s,
             "skip_unanswered": self.skip_unanswered,
             "settle_s": self.settle_s, "lookback_days": self.lookback_days,
+            "match_window": self.match_window,
             "poll_s": self.poll_s, "tags": self.tags,
         }
         if for_admin:
@@ -175,6 +177,7 @@ def _станция_из(данные: dict[str, Any], номер: int) -> Ст�
         skip_unanswered=bool(данные.get("skip_unanswered", True)),
         settle_s=число("settle_s", 30),
         lookback_days=число("lookback_days", 7),
+        match_window=число("match_window", 120),
         owner=str(данные.get("owner") or "telephony").strip(),
         owner_map=dict(данные.get("owner_map") or {}),
         priority=число("priority", 40),
@@ -221,6 +224,7 @@ def _из_старых_ключей(settings: Any) -> list[dict[str, Any]]:
         "skip_unanswered": settings.get("telephony_skip_unanswered", True),
         "settle_s": settings.get("telephony_settle_s"),
         "lookback_days": settings.get("telephony_lookback_days"),
+        "match_window": settings.get("telephony_match_window"),
         "owner": settings.get("telephony_owner"),
         "owner_map": settings.get("telephony_owner_map"),
         "priority": settings.get("telephony_priority"),

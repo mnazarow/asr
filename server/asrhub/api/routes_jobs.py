@@ -429,6 +429,18 @@ def _сохранить_звонок(state: Any, job: dict[str, Any], principal:
     # ноль. Она известна уже сейчас: очередь измерила файл при постановке.
     длительность = int(float(job.get("media_duration_s") or 0.0))
 
+    # Чужую строку архива трогать нельзя. Ключ собирается из полей формы,
+    # а `save_call` обновляет строку с таким ключом молча — достаточно было
+    # назвать настоящее имя станции (оно видно в GET /api/telephony/stations)
+    # и угадать `uniqueid` вида «эпоха.счётчик», чтобы разговор филиала сменил
+    # владельца, потерял номера и оператора и пропал из его отчётов.
+    # Задвоения при этом не было: строка одна, прежней больше не существует.
+    чей = state.db.call_owner(ключ)
+    if чей is not None and not principal.is_admin and чей != principal.name:
+        беды.append("данные звонка не сохранены: строка архива принадлежит "
+                    "другому ключу доступа")
+        return {"saved": False, "warnings": беды}
+
     поля = {к: з for к, з in данные.items() if к != "call_id"}
     поля.update({"pbx_uid": название or идентификатор, "started_at": начало,
                  "duration": длительность, "billsec": длительность})
@@ -446,6 +458,23 @@ def _сохранить_звонок(state: Any, job: dict[str, Any], principal:
     return {"saved": True, "uniqueid": ключ, "pbx_uid": название or идентификатор,
             "station": станция, "direction": str(поля.get("direction") or ""),
             "started_at": начало, "warnings": беды}
+
+
+def _число(значение: Any, умолчание: float) -> float:
+    """Дробное из тела запроса — или понятный отказ вместо пятисотки.
+
+    Тело здесь — свободный словарь, схемой не описанный, и `float("вчера")`
+    доходил до общего обработчика: клиент получал «внутреннюю ошибку
+    сервера» и трассировку в журнале, хотя виноват был он сам. Соседние
+    маршруты того же файла на такую же ошибку отвечают 400 с объяснением.
+    """
+    if значение is None or значение == "":
+        return умолчание
+    try:
+        return float(значение)
+    except (TypeError, ValueError):
+        raise error_response(ConfigError(
+            f"Ожидается число, получено «{значение}».")) from None
 
 
 #: Описание полей звонка для OpenAPI — одно на оба маршрута, чтобы они не
@@ -1227,16 +1256,16 @@ def rescan(request: Request, данные: dict[str, Any] = Body(default={}),
         raise error_response(ConfigError("; ".join(ошибки)))
 
     ids = [str(и) for и in (данные.get("ids") or []) if str(и).strip()]
-    предел = max(1, min(int(данные.get("limit") or 500), 5000))
+    предел = max(1, min(int(_число(данные.get("limit"), 500.0)), 5000))
     if not ids:
         отбор = dict(данные.get("filter") or {})
         задания = state.db.list_jobs(
             status=отбор.get("status") or ["completed", "failed"],
             model=отбор.get("model") or None,
             search=отбор.get("search") or None,
-            since=float(отбор["since"]) if отбор.get("since") else None,
+            since=_число(отбор.get("since"), 0.0) or None,
             owner=scope_owner(principal), limit=предел, light=True)
-        до = float(отбор["until"]) if отбор.get("until") else None
+        до = _число(отбор.get("until"), 0.0) or None
         ids = [str(з["id"]) for з in задания
                if до is None or float(з.get("created_at") or 0) <= до]
     if not ids:

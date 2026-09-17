@@ -15,7 +15,7 @@ import shutil
 import struct
 import subprocess
 import wave
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -423,13 +423,18 @@ def _пустой_результат(src: Path, settings: dict[str, Any],
             hint="Файл создан, но звук в него не попал. Это вопрос к тому, кто "
                  "его записал: на Asterisk — MixMonitor без ${UNIQUEID} или "
                  "права на каталог записей.",
-            details={"duration_s": длительность})
+            details={"duration_s": длительность, "empty_output": True})
 
     # Дальше догадка была бы дешёвой и неверной: «включена обрезка тишины —
     # значит, тишина». Обрезка убирает и то, что выхолостили фильтры, и
     # громкая запись выглядит тогда молчаливой. Поэтому исходник меряется.
     пик = peak_db(src)
-    подробности = {"duration_s": длительность, "peak_db": пик}
+    # Пометка «на выходе пусто» отличает этот отказ от настоящего сбоя
+    # ffmpeg. Разница важна для стереозаписи: пустой канал — это факт о
+    # записи, и терять из-за него второго собеседника нельзя, а вот битый
+    # файл обязан остаться отказом.
+    подробности: dict[str, Any] = {"duration_s": длительность, "peak_db": пик,
+                                   "empty_output": True}
     if start_s is not None:
         подробности["start_s"] = start_s
 
@@ -515,6 +520,12 @@ class Prepared:
     channels: list[tuple[str, Path]]
     offset_s: float = 0.0
     speed: float = 1.0
+    #: Каналы, от которых после обработки не осталось звука. Не отказ:
+    #: в телефонной стереозаписи молчащий канал — обычное дело, а второй
+    #: собеседник при этом говорит и должен быть распознан.
+    silent: list[str] = field(default_factory=list)
+    #: Что стоит сказать человеку о подготовке. Едет в предупреждения задания.
+    warnings: list[str] = field(default_factory=list)
 
     def to_source_time(self, value: float) -> float:
         """Время подготовленного файла -> время исходной записи."""
@@ -560,17 +571,55 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
     speed = float(settings.get("audio_speed") or 1.0)
 
     mode = str(settings.get("audio_channels") or "mono")
+    замечания: list[str] = []
+    if mode in ("left", "right") and info.channels < 2:
+        # Второго канала нет. `pan=mono|c0=c1` на одноканальном файле даёт
+        # тишину, и отказ винил бы фильтры — при исправной записи и
+        # безобидной настройке. Настройка «взять правый канал» на моно
+        # означает ровно одно: брать то, что есть.
+        замечания.append(
+            f"Запись одноканальная, а в настройках выбран "
+            f"{'левый' if mode == 'left' else 'правый'} канал — взят "
+            f"единственный.")
+        mode = "mono"
+
     if mode == "split" and info.channels >= 2:
         outputs: list[tuple[str, Path]] = []
+        молчат: list[str] = []
+        первый_отказ: ASRHubError | None = None
         for label, channel in (("Канал 1", "left"), ("Канал 2", "right")):
             dst = workdir / f"{src.stem}.{channel}.wav"
-            convert(src, dst, settings, channel=channel, start_s=offset or None)
+            try:
+                convert(src, dst, settings, channel=channel, start_s=offset or None)
+            except ASRHubError as сбой:
+                # Пустой канал — не отказ задания. В телефонной записи
+                # молчит то клиент, то оператор, и раньше такой канал
+                # уносил с собой уже готовую расшифровку второго: задание
+                # падало целиком с «после обработки звука не осталось».
+                # Настоящий сбой ffmpeg (битый файл) пометки не несёт и
+                # по-прежнему останавливает всё.
+                if not (getattr(сбой, "details", None) or {}).get("empty_output"):
+                    raise
+                первый_отказ = первый_отказ or сбой
+                молчат.append(label)
+                continue
             outputs.append((label, dst))
-        return Prepared(outputs, offset_s=offset, speed=speed)
+        if not outputs:
+            # Молчат оба — вот это уже отказ, и текст у него точный.
+            raise первый_отказ or AudioError(
+                f"В записи «{src.name}» не осталось звука ни в одном канале.")
+        if молчат:
+            замечания.append("После обработки не осталось звука в каналах: "
+                             + ", ".join(молчат))
+        return Prepared(outputs, offset_s=offset, speed=speed,
+                        silent=молчат, warnings=замечания)
 
     dst = workdir / f"{src.stem}.prepared.wav"
-    convert(src, dst, settings, start_s=offset or None)
-    return Prepared([("", dst)], offset_s=offset, speed=speed)
+    # Канал передаётся явно: `convert` без него перечитывает настройку, а
+    # настройка могла быть «right» на одноканальном файле — её мы уже
+    # заменили на «mono» выше, и подменять обратно незачем.
+    convert(src, dst, settings, channel=mode, start_s=offset or None)
+    return Prepared([("", dst)], offset_s=offset, speed=speed, warnings=замечания)
 
 
 def read_wav_mono(path: Path) -> tuple[list[float], int]:

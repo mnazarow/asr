@@ -194,6 +194,31 @@ class Paths:
         return paths
 
 
+def _станции_наружу(значение: Any, for_admin: bool) -> Any:
+    """Прячет учётные данные станций в значении telephony_stations.
+
+    Пароль маскируется всегда, адреса и пути — всем, кроме администратора.
+    Список станций разбирается здесь, а не в telephony.stations, чтобы
+    настройки не тянули за собой телефонию: config.py грузится раньше.
+    """
+    if not isinstance(значение, list):
+        return значение
+    наружу = []
+    for станция in значение:
+        if not isinstance(станция, dict):
+            наружу.append(станция)
+            continue
+        копия = dict(станция)
+        for поле in ("secret", "пароль"):
+            if копия.get(поле):
+                копия[поле] = "***"
+        if not for_admin:
+            for поле in Settings.ПОЛЯ_СТАНЦИИ_АДМИНУ:
+                копия.pop(поле, None)
+        наружу.append(копия)
+    return наружу
+
+
 @dataclass
 class Settings:
     """Итоговая конфигурация сервера."""
@@ -258,8 +283,19 @@ class Settings:
     #: Пароль AMI сюда же: он открывает интерфейс управления телефонной
     #: станцией, а это не «одна из настроек», а вход в телефонию
     #: организации.
+    #: Адрес трекера — третий адрес того же рода, что webhook_url и
+    #: digest_url: рекомендация каталога прямо советует направить его во
+    #: входящий адрес рабочего чата, то есть токен снова лежит в строке.
     SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token",
-                   "llm_api_key", "telephony_secret")
+                   "llm_api_key", "telephony_secret", "tracker_url")
+
+    #: Поля станции, которые не отдаются никому, кроме администратора, —
+    #: тот же перечень, что прячет Станция.to_dict. Пароль станции не
+    #: отдаётся и администратору: он открывает интерфейс управления
+    #: телефонией организации, а «показать пароль» не нужно тому, кто его
+    #: и так задал.
+    ПОЛЯ_СТАНЦИИ_АДМИНУ = ("host", "port", "username", "cdr_file",
+                           "recordings_dir", "filename", "owner_map")
 
     def to_dict(self, for_admin: bool = False) -> dict[str, Any]:
         """Настройки для выдачи наружу.
@@ -275,10 +311,23 @@ class Settings:
             for key in self.SECRET_KEYS:
                 if values.get(key):
                     values[key] = "***"
+        # Секреты станций лежат не отдельным ключом, а внутри значения
+        # telephony_stations, и перечень SECRET_KEYS до них не доставал:
+        # пароль AMI уходил ключу «только чтение» открытым текстом, притом
+        # что соседний GET /api/telephony/stations прячет его даже от
+        # администратора.
+        if values.get("telephony_stations"):
+            values["telephony_stations"] = _станции_наружу(
+                values["telephony_stations"], for_admin)
         data = {
             "values": values,
             "sources": dict(self.sources),
-            "config_file": str(self.config_file) if self.config_file else None,
+            # Путь к файлу настроек — путь к файлу, в котором лежат ключи
+            # доступа и токен Hugging Face. Соседний GET /api/system прячет
+            # его за правами администратора; здесь он уходил любому ключу,
+            # что делало ту защиту бессмысленной.
+            "config_file": (str(self.config_file)
+                            if (self.config_file and for_admin) else None),
             # Раскладка файловой системы — разведка перед атакой, и соседний
             # GET /api/system прячет её за правами администратора с этой же
             # мыслью. Здесь она уходила любому ключу, что делало ту защиту

@@ -14,6 +14,7 @@ from fastapi.responses import (
 )
 
 from .. import catalog, selfcheck
+from .. import settings_access as S
 from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
@@ -236,8 +237,11 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
     if "max_concurrent_jobs" in applied:
         state.queue.set_concurrency(int(applied["max_concurrent_jobs"]))
     if "model_cache_size" in applied or "model_idle_unload_s" in applied:
-        state.registry.configure(int(state.settings.get("model_cache_size") or 2),
-                                 int(state.settings.get("model_idle_unload_s") or 900))
+        # Ноль у `model_idle_unload_s` — «не выгружать никогда», и `or 900`
+        # его терял: сохранение настроек включало автовыгрузку обратно.
+        state.registry.configure(
+            max(1, S.integer(state.settings, "model_cache_size", 2)),
+            S.integer(state.settings, "model_idle_unload_s", 900))
     state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
     RUNTIME.inc("asrhub_config_reloads_total")
     return {"applied": applied}

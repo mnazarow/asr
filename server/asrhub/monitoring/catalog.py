@@ -33,11 +33,21 @@ class Threshold:
     critical: float | None = None
     for_seconds: int = 300
     note: str = ""
+    #: Сравнивать включительно: «не меньше порога» вместо «больше порога».
+    #:
+    #: Нужно там, где порог стоит НА КРАЮ шкалы метрики. Уровень дрейфа
+    #: уверенности принимает три значения — 0, 1, 2, — и критический порог
+    #: у него 2: строгое «больше двух» не срабатывало никогда, то есть
+    #: критическая тревога по дрейфу была нарисована в справочнике,
+    #: показана в разделе и не могла подняться ни при каких данных. Правило
+    #: для Prometheus выкладывалось с тем же строгим знаком, так что и
+    #: внешнее наблюдение молчало ровно так же.
+    inclusive: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"direction": self.direction, "warning": self.warning,
                 "critical": self.critical, "for_seconds": self.for_seconds,
-                "note": self.note}
+                "note": self.note, "inclusive": self.inclusive}
 
 
 @dataclass(frozen=True)
@@ -800,7 +810,10 @@ _m(MetricSpec(
     ),
     normal="0",
     threshold=Threshold("above", warning=1.0, critical=2.0, for_seconds=3600,
-                        note="Уровень — уже вердикт; пороги повторяют его"),
+                        inclusive=True,
+                        note="Уровень — уже вердикт; пороги повторяют его. "
+                             "Сравнение включительно: двойка — максимум шкалы, "
+                             "и «больше двух» не бывает"),
     troubleshooting="Раздел «Аналитика» → «Дрейф уверенности»",
 ))
 

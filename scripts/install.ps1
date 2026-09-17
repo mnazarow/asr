@@ -555,7 +555,12 @@ if ($Mode -eq 'docker') {
         }
         try {
             Invoke-WithRetry -Attempts 2 -Description $engine -Action {
-                Invoke-Checked -Command $venvPip -Arguments (@('install') + $pipFlags + @('-r', $req))
+                # Не просто «pip install -r файл»: рядом лежат спутники
+                # no-deps и optional, без которых часть движков ставится
+                # неполностью, а GigaAM — не ставится вовсе (его пакет
+                # только в no-deps\gigaam.txt). Раньше их здесь не знали,
+                # и скрипт печатал «установлен» про движок, которого нет.
+                Install-EngineRequirements -Pip $venvPip -Requirements $req -PipFlags $pipFlags
             } | Out-Null
             Write-Ok "  $engine установлен"
         } catch {
@@ -563,6 +568,10 @@ if ($Mode -eq 'docker') {
             Write-Warn "  $engine — установка не удалась, сервер запустится без него"
         }
     }
+
+    # Версии, которые мы выбрали сами вопреки требованиям чужих пакетов.
+    # Ставится последним и с --no-deps — иначе смысла нет.
+    Install-Overrides -Pip $venvPip -RequirementsDir (Join-Path $Prefix 'requirements')
 }
 
 # ---------------------------------------------------------------------------

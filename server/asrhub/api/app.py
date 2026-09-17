@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import __version__
+from .. import settings_access as S
 from ..accounts import Accounts
 from ..analytics import Analytics
 from ..config import Settings, load
@@ -326,8 +327,13 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     setup(str(settings.get("log_level") or "INFO"), settings.paths.logs)
 
     db = Database(settings.paths.db)
-    registry = EngineRegistry(int(settings.get("model_cache_size") or 2),
-                              int(settings.get("model_idle_unload_s") or 900))
+    # Через `S`, а не через `or`: у `model_idle_unload_s` ноль означает
+    # «не выгружать модели никогда», и `int(значение or 900)` включал
+    # автовыгрузку через пятнадцать минут — при том что в интерфейсе стоял
+    # ноль. Заметить это можно было только по внезапной паузе на первой
+    # записи после затишья: веса грузятся заново полторы минуты.
+    registry = EngineRegistry(max(1, S.integer(settings, "model_cache_size", 2)),
+                              S.integer(settings, "model_idle_unload_s", 900))
     hub = EventHub()
     queue = JobQueue(db, settings, registry, on_event=hub.publish)
     analytics = Analytics(db)

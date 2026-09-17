@@ -40,6 +40,8 @@ class Rule:
     labels: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
     summary: str = ""
+    #: Сравнивать включительно — когда порог стоит на краю шкалы метрики.
+    inclusive: bool = False
 
     @property
     def id(self) -> str:
@@ -55,17 +57,27 @@ class Rule:
         """Нарушен ли порог.
 
         Для признаков со значениями 0 и 1 строгое «больше единицы» не
-        сработает никогда, поэтому единица сравнивается на равенство.
+        сработает никогда, поэтому единица сравнивается на равенство. То же
+        самое, но не так заметно, бывает с любым порогом НА КРАЮ шкалы:
+        уровень дрейфа уверенности принимает значения 0, 1 и 2, а
+        критический порог у него — 2, и «больше двух» не бывает. Такие
+        пороги помечены в каталоге как включительные.
         """
+        включительно = self.inclusive
         if self.direction == "above":
-            return value >= self.threshold if self.threshold == 1 else value > self.threshold
-        return value <= self.threshold if self.threshold == 0 else value < self.threshold
+            if включительно or self.threshold == 1:
+                return value >= self.threshold
+            return value > self.threshold
+        if включительно or self.threshold == 0:
+            return value <= self.threshold
+        return value < self.threshold
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "metric": self.metric, "direction": self.direction,
                 "threshold": self.threshold, "severity": self.severity,
                 "for_seconds": self.for_seconds, "labels": self.labels,
-                "enabled": self.enabled, "summary": self.summary}
+                "enabled": self.enabled, "summary": self.summary,
+                "inclusive": self.inclusive}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Rule:
@@ -81,6 +93,16 @@ class Rule:
         )
 
 
+#: Сколько снимков подряд метрика должна отсутствовать, чтобы это считалось
+#: отказом источника, а не заминкой сбора.
+ПРОПАЖА_СНИМКОВ = 3
+
+#: И сколько времени при этом должно пройти. Условия действуют вместе: три
+#: снимка при опросе раз в полчаса — это полтора часа, а пять минут при
+#: опросе раз в пять секунд — шестьдесят снимков.
+ПРОПАЖА_СЕКУНД = 300.0
+
+
 @dataclass
 class AlertState:
     """Текущее состояние одного правила."""
@@ -92,6 +114,10 @@ class AlertState:
     fired_at: float = 0.0
     resolved_at: float = 0.0
     breaches: int = 0
+    #: Когда метрика впервые не пришла в снимок, и сколько снимков подряд.
+    #: Пропажа на один-два снимка — не отказ источника, а заминка сбора.
+    missing_since: float = 0.0
+    missing: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         spec = METRICS_BY_NAME.get(self.rule.metric)
@@ -141,6 +167,7 @@ def default_rules() -> list[Rule]:
             rules.append(Rule(
                 metric=spec.name, direction=threshold.direction, threshold=float(value),
                 severity=severity, for_seconds=threshold.for_seconds, labels=labels,
+                inclusive=bool(getattr(threshold, "inclusive", False)),
                 summary=f"{spec.label}: {'выше' if threshold.direction == 'above' else 'ниже'} "
                         f"{value}{(' ' + spec.unit) if spec.unit else ''}",
             ))
@@ -199,9 +226,20 @@ class AlertEngine:
             candidates = [s for s in by_name.get(rule.metric, []) if rule.matches(s)]
             if not candidates:
                 # Метрика пропала из снимка — источник мог отказать. Держать
-                # тревогу вечно нельзя: снимаем её, отметив в журнале.
+                # тревогу вечно нельзя: снимаем её, отметив в журнале. Но и
+                # снимать по первой же пропаже нельзя, и это оказалось важнее.
+                #
+                # Один неудачный опрос источника (база занята, разбор
+                # качества не сошёлся) сбрасывал выдержку в ноль, и отсчёт
+                # начинался заново. У тревог с выдержкой в час — уверенность
+                # модели, дрейф, доля отказов — это означало, что достаточно
+                # ОДНОЙ осечки сбора в час, чтобы тревога не сработала
+                # никогда. В пробе: уверенность двое суток держалась на 0,3
+                # при пороге 0,6, источник отказывал раз в десять минут —
+                # тревога не поднялась ни разу.
                 self._forget(rule, now)
                 continue
+            self._вернулась(rule)
             # Берём худшее значение среди подходящих меток: если хоть одна
             # видеокарта перегрелась, тревога должна подняться.
             value = (max(s.value for s in candidates) if rule.direction == "above"
@@ -211,18 +249,41 @@ class AlertEngine:
         with self._lock:
             return sorted(self._states.values(), key=_state_order)
 
+    def _вернулась(self, rule: Rule) -> None:
+        """Метрика снова в снимке — счётчик пропаж обнуляется."""
+        with self._lock:
+            state = self._states.get(rule.id)
+            if state is not None and (state.missing or state.missing_since):
+                state.missing = 0
+                state.missing_since = 0.0
+
     def _forget(self, rule: Rule, now: float) -> None:
-        """Снимает тревогу, если метрика исчезла из снимка."""
+        """Снимает тревогу, если метрика надолго исчезла из снимка.
+
+        «Надолго» — это и несколько снимков подряд, и заметное время: одно
+        без другого ничего не значит. Три снимка при опросе раз в полчаса —
+        полтора часа молчания, а пять минут при опросе раз в пять секунд —
+        шестьдесят снимков. Поэтому оба условия сразу.
+        """
         with self._lock:
             state = self._states.get(rule.id)
             if state is None or state.state == STATE_OK:
+                return
+            state.missing += 1
+            if not state.missing_since:
+                state.missing_since = now
+            если_давно = now - state.missing_since >= ПРОПАЖА_СЕКУНД
+            if state.missing < ПРОПАЖА_СНИМКОВ or not если_давно:
                 return
             previous = state.state
             state.state = STATE_OK
             state.resolved_at = now
             state.since = 0.0
+            state.missing = 0
+            state.missing_since = 0.0
             snapshot = state.to_dict()
-        log.info("Тревога снята: метрика «%s» исчезла из снимка", rule.metric)
+        log.info("Тревога снята: метрика «%s» не приходит в снимок дольше %d с",
+                 rule.metric, ПРОПАЖА_СЕКУНД)
         self._record(snapshot, previous)
 
     def _advance(self, rule: Rule, value: float, now: float) -> None:

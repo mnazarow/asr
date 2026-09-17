@@ -51,6 +51,11 @@ from typing import Any
 #: Верхняя граница оценки SNR: выше — цифровая тишина, а не чистота.
 ПРЕДЕЛ_SNR = 60.0
 
+#: Ниже этого уровня «речь» в канале — не речь. Канал телефонной
+#: стереозаписи, где собеседник молчал, даёт около −90 dBFS и отношение
+#: сигнал/шум около нуля: считать по нему качество ЗАПИСИ нельзя.
+ПОРОГ_ГОЛОСА_ДБ = -50.0
+
 #: Сколько секунд записи мерить.
 МАКС_СЕКУНД = 1200.0
 
@@ -264,8 +269,16 @@ def profile(samples: Any, rate: int, *,
     else:
         тишина = sum(1 for у in уровни if у < ПОРОГ_ТИШИНЫ_ДБ) / len(уровни)
 
+    речь_дб = 10.0 * math.log10(max(p_речь, 1e-12))
     return {
         "snr_db": round(snr, 1),
+        # Есть ли в канале что мерить. Пустой канал стереозаписи давал
+        # честный ноль децибел, и `merge`, берущий ХУДШИЙ SNR по каналам,
+        # объявлял плохой всю запись — вместе с каналом, где оператор
+        # говорил чисто. Запись уезжала в корзину «плохой звук» в
+        # аналитике, а человек получал совет «включите нормализацию» к
+        # разговору, с которым всё в порядке.
+        "has_speech": bool(речь_дб > ПОРОГ_ГОЛОСА_ДБ),
         "peak_dbfs": round(_db(пик), 1),
         "clipping_share": round(клип, 5),
         "loudness_lufs": loudness_lufs(samples, rate),
@@ -300,11 +313,16 @@ def merge(профили: list[dict[str, Any]]) -> dict[str, Any]:
     if len(профили) == 1:
         return dict(профили[0])
     значения = lambda к: [п[к] for п in профили if п.get(к) is not None]  # noqa: E731
-    out = dict(профили[0])
-    out["snr_db"] = min(значения("snr_db"), default=None)
+    # Молчащие каналы в оценку чистоты не входят. Если молчат все — считаем
+    # по всем: пусть цифра будет плохой, но не выдуманной.
+    говорящие = [п for п in профили if п.get("has_speech", True)] or профили
+    свои = lambda к: [п[к] for п in говорящие if п.get(к) is not None]  # noqa: E731
+    out = dict(говорящие[0])
+    out["snr_db"] = min(свои("snr_db"), default=None)
     out["peak_dbfs"] = max(значения("peak_dbfs"), default=None)
     out["clipping_share"] = max(значения("clipping_share"), default=None)
-    out["loudness_lufs"] = max(значения("loudness_lufs"), default=None)
+    out["loudness_lufs"] = max(свои("loudness_lufs"), default=None)
+    out["has_speech"] = any(п.get("has_speech", True) for п in профили)
     тишина = значения("silence_share")
     out["silence_share"] = round(sum(тишина) / len(тишина), 4) if тишина else None
     return out

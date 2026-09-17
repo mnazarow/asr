@@ -18,7 +18,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.5'
+    $script:AsrHubVersion = '3.1.6'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
@@ -196,6 +196,86 @@ function Invoke-WithRetry {
             Start-Sleep -Seconds $delay
             $delay *= 2
         }
+    }
+}
+
+function Install-EngineRequirements {
+    <#
+    .SYNOPSIS
+        Ставит зависимости движка так же, как это делает установщик для Linux.
+    .DESCRIPTION
+        Рядом с обычным файлом требований может лежать три спутника, и без
+        них движок ставится НЕ ПОЛНОСТЬЮ либо не ставится вовсе:
+
+        * engines\no-deps\<движок>.txt — пакеты, которые ставятся с
+          --no-deps. У GigaAM это сам GigaAM: его собственный pyproject
+          требует onnxruntime==1.23.*, колёс под свежий Python у этой версии
+          нет, и обычная установка обрывается с ResolutionImpossible;
+        * engines\optional\<движок>.txt — необязательная часть: её отказ
+          не должен ронять весь движок;
+        * engines\optional\no-deps\<движок>.txt — то же, но с --no-deps.
+
+        Установщик PowerShell не знал ни об одном из них и ставил только
+        обычный файл. Для GigaAM это означало, что сам пакет на Windows не
+        ставился НИКОГДА — а скрипт при этом печатал «gigaam установлен»:
+        человек получал сервер без движка и сообщение об успехе.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Pip,
+        [Parameter(Mandatory)][string]$Requirements,
+        [string[]]$PipFlags = @()
+    )
+    $dir = Split-Path -Parent $Requirements
+    $name = Split-Path -Leaf $Requirements
+    Invoke-Checked -Command $Pip -Arguments (@('install') + $PipFlags + @('-r', $Requirements)) | Out-Null
+
+    $nodeps = Join-Path (Join-Path $dir 'no-deps') $name
+    if (Test-Path $nodeps) {
+        Write-Debug2 "спутник --no-deps: $nodeps"
+        Invoke-Checked -Command $Pip -Arguments (
+            @('install') + $PipFlags + @('--no-deps', '-r', $nodeps)) | Out-Null
+    }
+
+    $optional = Join-Path (Join-Path $dir 'optional') $name
+    if (Test-Path $optional) {
+        $optNodeps = Join-Path (Join-Path (Join-Path $dir 'optional') 'no-deps') $name
+        try {
+            Invoke-Checked -Command $Pip -Arguments (
+                @('install') + $PipFlags + @('-r', $optional)) | Out-Null
+            if (Test-Path $optNodeps) {
+                Invoke-Checked -Command $Pip -Arguments (
+                    @('install') + $PipFlags + @('--no-deps', '-r', $optNodeps)) | Out-Null
+            }
+        } catch {
+            # Движок работает и без необязательной части, просто беднее.
+            Write-Warn "  необязательная часть движка не установилась ($name)"
+            Write-Hint "  поставить позже: $Pip install -r $optional"
+        }
+    }
+}
+
+function Install-Overrides {
+    <#
+    .SYNOPSIS
+        Возвращает версии пакетов, задавленные зависимостями движков.
+    .DESCRIPTION
+        requirements\overrides.txt ставится последним и обязательно с
+        --no-deps: строки в нём — это версии, которые мы выбрали сами
+        вопреки требованиям чужих пакетов. Установщик PowerShell его не
+        применял вовсе, и Windows-установка молча оставалась с версиями,
+        которые в Linux считаются негодными.
+    #>
+    param([Parameter(Mandatory)][string]$Pip,
+          [Parameter(Mandatory)][string]$RequirementsDir)
+    $file = Join-Path $RequirementsDir 'overrides.txt'
+    if (-not (Test-Path $file)) { return }
+    Write-Debug2 "восстановление версий: $file"
+    try {
+        Invoke-Checked -Command $Pip -Arguments @(
+            'install', '--no-deps', '--upgrade', '-r', $file) | Out-Null
+    } catch {
+        Write-Warn 'Не удалось вернуть версии из overrides.txt.'
+        Write-Hint "Проверьте вручную: $Pip install --no-deps -r $file"
     }
 }
 

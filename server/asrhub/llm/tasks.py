@@ -175,6 +175,23 @@ def _строка(значение: Any, предел: int = 600) -> str:
     return str(значение or "").strip()[:предел]
 
 
+def _список(значение: Any) -> list[Any]:
+    """Список из ответа модели — или пустой, если пришло что-то другое.
+
+    Ответ модели — чужие данные, и форма у них любая. Поле `trackers`,
+    описанное в подсказке как список объектов, приезжало числом: `or []`
+    такое пропускает (число истинно), а перебор по нему падает с
+    `TypeError: 'int' object is not iterable`.
+
+    Дальше это исключение никто не ждал. Разбор по кнопке отдавал человеку
+    пятисотку без объяснений, строка очереди оставалась «идёт» навсегда, а
+    фоновый разбор помечал запись сбойной и шёл дальше — то есть одна
+    неудачная генерация модели стоила записи навсегда. Достаточно было
+    модели «поторопиться» с форматом ответа один раз.
+    """
+    return значение if isinstance(значение, list) else []
+
+
 def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
             settings: Any, agent_speaker: str = "",
             script: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -204,12 +221,33 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
     куски = chunks_of(разговор, предел)
     if len(куски) > 1:
         пересказы = []
+        пустых = 0
         for n, кусок in enumerate(куски, 1):
             ответ = client.chat(МЕТКА.format(kind="chunk") + _СИСТЕМА,
                                 _ПЕРЕСКАЗ.format(n=n, total=len(куски), chunk=кусок),
                                 kind="chunk", validate=parse_json)
             итог["calls"] += 1
-            пересказы.append(f"Часть {n}: {_строка(parse_json(ответ).get('summary'), 2000)}")
+            пересказ = _строка(parse_json(ответ).get("summary"), 2000)
+            if not пересказ:
+                пустых += 1
+                continue
+            пересказы.append(f"Часть {n}: {пересказ}")
+        # Пустой пересказ — не пустяк. Склейка «Часть 1: \nЧасть 2: \n…» шла
+        # в основной вызов как расшифровка разговора, и модель честно
+        # отвечала на пустоту: «ничего конкретного не обсуждалось». Этот
+        # ответ ложился в базу обычным разбором, с пустым полем `error` — то
+        # есть длинный разговор, которого разбор не увидел вовсе, выглядел
+        # разобранным и попадал в отчёты как «без содержания». Часовые
+        # разговоры режутся на части всегда, так что это про них.
+        if пустых:
+            итог["warnings"].append(
+                f"без пересказа осталось частей: {пустых} из {len(куски)}")
+        if not пересказы:
+            итог["warnings"].append(
+                "модель не пересказала ни одной части — разбирать нечего")
+            итог["chunks"] = len(куски)
+            итог["latency_ms"] = round((time.perf_counter() - начало) * 1000, 1)
+            return итог
         разговор = "\n".join(пересказы)
         итог["chunks"] = len(куски)
         итог["warnings"].append(f"разбор по пересказам {len(куски)} частей")
@@ -267,7 +305,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
             итог["actions"] = [
                 {"what": _строка(д.get("what")), "who": _строка(д.get("who"), 40) or "сотрудник",
                  "when": _строка(д.get("when"), 120) or None, "quote": _строка(д.get("quote"))}
-                for д in (действия if isinstance(действия, list) else [])
+                for д in _список(действия)
                 if isinstance(д, dict) and _строка(д.get("what"))][:20]
 
     if "trackers" in задачи and трекеры:
@@ -279,7 +317,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
                             kind="trackers", validate=parse_json)
         итог["calls"] += 1
         данные = parse_json(ответ)
-        ответы = {str(o.get("id")): o for o in (данные.get("trackers") or [])
+        ответы = {str(o.get("id")): o for o in _список(данные.get("trackers"))
                   if isinstance(o, dict)}
         итог["trackers"] = [
             {"id": str(т.get("id")), "label": str(т.get("label") or т.get("id")),
@@ -295,7 +333,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
                             kind="scorecard", validate=parse_json)
         итог["calls"] += 1
         данные = parse_json(ответ)
-        ответы = {str(o.get("id")): o for o in (данные.get("answers") or [])
+        ответы = {str(o.get("id")): o for o in _список(данные.get("answers"))
                   if isinstance(o, dict)}
         итог["scorecard"] = []
         for в in вопросы:
@@ -333,7 +371,7 @@ def summarize_for_digest(результаты: list[dict[str, Any]]) -> dict[str
         return [{"key": k, "records": v, "share": round(100.0 * v / всего, 1)}
                 for k, v in sorted(счёт.items(), key=lambda kv: -kv[1])]
     решено = [р.get("resolved") for р in результаты if р.get("resolved") is not None]
-    действий = sum(len(р.get("actions") or []) for р in результаты)
+    действий = sum(len(_список(р.get("actions"))) for р in результаты)
     return {
         "outcomes": доли("outcome"), "reasons": доли("reason"),
         "resolved_share": round(100.0 * sum(1 for x in решено if x) / len(решено), 1)

@@ -243,7 +243,14 @@ def создать(db: Any, settings: Any, *, kind: str = "full", comment: str =
         (временный / "settings.json").write_text(
             json.dumps(_настройки_наружу(settings), ensure_ascii=False, indent=2),
             encoding="utf-8")
-        файл_настроек = getattr(settings, "config_path", None)
+        # Поле называется `config_file`. Здесь стояло `config_path`, и
+        # `getattr` честно возвращал None: копия НИКОГДА не содержала файла
+        # настроек. Вместе с ним не копировались ключи доступа и токен
+        # Hugging Face — то есть восстановление из полной копии поднимало
+        # сервер, в который нельзя войти. Подставные настройки в проверке
+        # были объявлены под тем же неверным именем, поэтому она это и не
+        # ловила.
+        файл_настроек = getattr(settings, "config_file", None)
         if файл_настроек and Path(файл_настроек).is_file():
             shutil.copy2(файл_настроек, временный / "asrhub.yaml")
             состав.append("asrhub.yaml")

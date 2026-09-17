@@ -684,7 +684,14 @@ class JobQueue:
             # разгребётся всё, что стоит выше.
             preselect = {
                 "shortest_first": "media_duration_s ASC",
-                "deadline": "created_at ASC",
+                # «По сроку» выбирает предварительно ПО СРОКУ, а не по
+                # времени создания. Раньше стояло `created_at ASC`, и
+                # срочное задание, поставленное последним, в окно выборки
+                # не попадало: на очереди из шестисот заданий при окне в
+                # пятьсот политика «по сроку» молча вырождалась в «по
+                # очереди» — то есть не работала ровно в том случае, ради
+                # которого её включают.
+                "deadline": "deadline ASC",
                 "fair_share": "created_at ASC",
             }.get(policy, "priority DESC")
             window = int(self.settings.get("scheduling_window") or 500)

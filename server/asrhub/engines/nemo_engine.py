@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import DependencyMissing, classify_exception
-from ..pipeline import vad
+from ..pipeline import stitch, vad
 from ..pipeline.audio import probe, slice_wav
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
@@ -123,6 +123,13 @@ class NeMoEngine(Engine):
         finally:
             if tmpdir is not None:
                 tmpdir.cleanup()
+
+        # Перекрытие фрагментов существует ради слова на разрезе, но речь
+        # в зоне перекрытия распозналась дважды, и обе копии попадали в
+        # расшифровку. Сшивка убирает повтор.
+        if need_chunking:
+            segments = stitch.убрать_повторы(
+                segments, float(settings.get("chunk_overlap_s") or 0.0))
 
         if not segments:
             self.log.warning("NeMo не вернула сегментов для %s", audio_path.name)

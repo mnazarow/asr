@@ -26,7 +26,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -1151,6 +1151,24 @@ def _нижний(значение: Any) -> Any:
     return значение.lower() if isinstance(значение, str) else значение
 
 
+def _порядок_заданий(order: str, соединение: bool) -> str:
+    """Порядок выборки заданий в виде SQL.
+
+    Отдельно стоит «по сроку». В SQLite `ORDER BY deadline ASC` ставит NULL
+    ПЕРВЫМИ, то есть задания без срока — впереди срочных: ровно наоборот
+    смыслу. Поэтому сначала «срок есть», потом сам срок, и только потом
+    время постановки. Без этого предварительная выборка политики «по сроку»
+    шла по времени создания, и срочное задание, поставленное последним, в
+    окно выборки не попадало вовсе: на очереди из шестисот заданий при окне
+    в пятьсот его не выбирали, пока не разгребётся всё остальное — то есть
+    политика «по сроку» не работала именно там, где она нужна.
+    """
+    п = "jobs." if соединение else ""
+    if order == "deadline ASC":
+        return (f"({п}deadline IS NULL), {п}deadline ASC, {п}created_at ASC")
+    return f"{п}{order}" if соединение and not order.startswith("jobs.") else order
+
+
 class Database:
     """Тонкая обёртка над SQLite с пулом соединений по потокам."""
 
@@ -1267,11 +1285,72 @@ class Database:
                 self._add_missing_columns(conn)
                 for statement in _SCHEMA:
                     conn.execute(statement)
+                # Починки данных — после колонок и схемы: им нужны и новые
+                # поля, и новые указатели. Каждая идёт один раз, при
+                # переходе через свою версию.
+                if current < 24:
+                    self._починка_ключей_звонков(conn)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:
                 conn.execute("ROLLBACK")
                 raise StorageError(f"Не удалось применить миграции: {exc}") from exc
+
+    def _починка_ключей_звонков(self, conn: sqlite3.Connection) -> None:
+        """Ключ звонка в архиве приводится к виду «станция:идентификатор».
+
+        Версия 22 завела вторую АТС и вместе с ней составной ключ: у
+        Asterisk `uniqueid` уникален только внутри одной станции, и две
+        станции в одну секунду дают одинаковый. Настоящий идентификатор
+        уехал в колонку `pbx_uid`, а ключом стало «станция:идентификатор».
+
+        Миграция тогда заполнила `pbx_uid`, но сам ключ оставила старым — и
+        после обновления импортёр не узнавал НИ ОДНОГО прежнего звонка:
+        `call_exists("pbx:1789145000.1")` отвечал «нет», потому что в
+        таблице лежал «1789145000.1». Весь накопленный архив заезжал
+        заново — второй строкой на тот же разговор, вторым заданием на ту
+        же запись, вторым проходом видеокарты по всему прошлому. На архиве
+        в сорок тысяч звонков это неделя работы сервера впустую и удвоенная
+        аналитика за весь прошлый период.
+
+        Починка идёт ровно один раз, при переходе на версию 24, и делает
+        две вещи. Строку, чей ключ свободен, просто переименовывает. Если
+        ключ уже занят — значит сервер успел завести дубль, — из двух строк
+        остаётся составная, и в неё переносится задание прежней: именно та
+        расшифровка лежит в отчётах и по ней стоят ссылки. Дубль после
+        этого удаляется: две строки на один разговор удваивают его в каждом
+        подсчёте.
+
+        Строки без станции (архив ещё более ранних версий) не трогаются:
+        составить ключ не из чего, а выдумывать станцию значит спрятать
+        звонки из раздела той АТС, к которой они на самом деле не
+        относятся.
+        """
+        условие = ("station IS NOT NULL AND station <> '' "
+                   "AND pbx_uid IS NOT NULL AND pbx_uid <> '' "
+                   "AND uniqueid <> station || ':' || pbx_uid")
+        всего = conn.execute(f"SELECT COUNT(*) FROM calls WHERE {условие}").fetchone()[0]
+        if not всего:
+            return
+
+        # Сначала дубли: перенести задание и убрать старую строку.
+        conn.execute(
+            "UPDATE calls SET job_id = COALESCE("
+            "  (SELECT c.job_id FROM calls c"
+            f"   WHERE {условие.replace('station', 'c.station').replace('pbx_uid', 'c.pbx_uid').replace('uniqueid', 'c.uniqueid')}"
+            "     AND c.station = calls.station AND c.pbx_uid = calls.pbx_uid),"
+            "  job_id) "
+            "WHERE job_id IS NULL AND uniqueid = station || ':' || pbx_uid")
+        дублей = conn.execute(
+            f"DELETE FROM calls WHERE {условие} AND EXISTS ("
+            "  SELECT 1 FROM calls c WHERE c.uniqueid = calls.station || ':' || calls.pbx_uid)"
+        ).rowcount
+        переименовано = conn.execute(
+            f"UPDATE calls SET uniqueid = station || ':' || pbx_uid WHERE {условие}"
+        ).rowcount
+        log.info("Миграция: ключи звонков приведены к виду «станция:идентификатор» — "
+                 "переименовано %s, дублей убрано %s", переименовано, дублей)
+
 
     def _setup_fts(self) -> None:
         """Заводит полнотекстовый указатель — если сборка SQLite его умеет.
@@ -1721,8 +1800,7 @@ class Database:
                        if соединение else self.LIGHT_COLUMNS)
         else:
             columns = "jobs.*" if соединение else "*"
-        порядок = (f"jobs.{order}" if соединение and not order.startswith("jobs.")
-                   else order)
+        порядок = _порядок_заданий(order, bool(соединение))
         rows = self.query(
             f"SELECT {columns} FROM jobs{соединение} {clause} "
             f"ORDER BY {порядок} LIMIT ? OFFSET ?",
@@ -3048,6 +3126,13 @@ class Database:
             conn.execute("DELETE FROM content_marks WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM review_queue WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM llm_results WHERE job_id=?", (job_id,))
+            # И строку очереди разбора. Без неё удаление записи оставляло в
+            # очереди сироту: в состоянии «идёт» её не брала ни одна уборка
+            # (`llmq_prune` ходит по завершённым), кнопка «Очистить» её
+            # пропускала намеренно, а раздел показывал вечный текущий
+            # запрос к модели по записи, которой больше нет. Заодно это
+            # требование 152-ФЗ: строка очереди хранит имя файла и владельца.
+            conn.execute("DELETE FROM llm_queue WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM model_checks WHERE job_id=? OR check_job_id=?",
                          (job_id, job_id))
             # content_vocab не трогаем: это словарь форм на весь сервер, а не
@@ -3099,12 +3184,31 @@ class Database:
     # --- сегменты -------------------------------------------------------
 
     def save_segments(self, job_id: str, segments: list[dict[str, Any]]) -> None:
+        """Реплики задания. Принимает и вид движка, и вид из базы.
+
+        У двух полей два написания: движок отдаёт `no_speech_prob` и
+        `compression_ratio`, а колонки в таблице зовутся `no_speech` и
+        `compression` — и `get_segments` возвращает их именно так. Здесь
+        читались только имена движка, поэтому круг «прочитать и записать»
+        обе величины терял. Ходит этим кругом клонирование результата из
+        кеша: повторная загрузка того же файла копирует реплики прежнего
+        задания — и у копии пропадали признаки галлюцинации. Запись, которую
+        разбор пометил «сжимаемый текст, тишина», у клона выглядела чистой,
+        и в сводке качества таких записей становилось меньше, чем есть.
+        """
+        def взять(seg: dict[str, Any], *имена: str) -> Any:
+            for имя in имена:
+                if seg.get(имя) is not None:
+                    return seg[имя]
+            return None
+
         rows = []
         for idx, seg in enumerate(segments):
             rows.append((
                 job_id, idx, float(seg.get("start", 0.0)), float(seg.get("end", 0.0)),
                 seg.get("text", ""), seg.get("speaker"), seg.get("confidence"),
-                seg.get("no_speech_prob"), seg.get("compression_ratio"),
+                взять(seg, "no_speech_prob", "no_speech"),
+                взять(seg, "compression_ratio", "compression"),
                 seg.get("temperature"), seg.get("language"),
                 json.dumps(seg.get("words"), ensure_ascii=False) if seg.get("words") else None,
             ))
@@ -3485,6 +3589,14 @@ class Database:
         `older_than` отсекает безнадёжных: звонок, чья запись не появится
         уже никогда, иначе навечно занимает место в очереди отложенных, и
         импорт по станции встаёт целиком после одного сбоя записи.
+
+        Срок считается от времени откладывания (`imported_at` — когда строку
+        последний раз писали), а не от времени разговора. По времени
+        разговора любой архивный звонок выпадал из очереди в тот же миг, как
+        туда попадал: сбор архива десятидневной давности, одна переполненная
+        очередь — и разговор навсегда оставался с пометкой «отложен» и без
+        задания, а повторное чтение журнала его не спасало, потому что
+        `call_exists` отвечал «уже импортирован».
         """
         условия = ["skipped LIKE ? ESCAPE '\\'"]
         args: list[Any] = [f"{_экранировать_like(self.ОТЛОЖЕН)}%"]
@@ -3492,18 +3604,32 @@ class Database:
             условия.append("COALESCE(station,'')=?")
             args.append(str(station))
         if older_than is not None:
-            условия.append("COALESCE(started_at,0) >= ?")
+            условия.append("COALESCE(imported_at, started_at, 0) >= ?")
             args.append(float(older_than))
         args.append(max(1, int(limit)))
         rows = self.query(
             f"SELECT * FROM calls WHERE {' AND '.join(условия)} "
-            "ORDER BY started_at LIMIT ?", args)
+            "ORDER BY COALESCE(imported_at, started_at, 0) LIMIT ?", args)
         звонки = []
         for r in rows:
             звонок = dict(r)
             звонок["answered"] = bool(звонок.get("answered"))
             звонки.append(звонок)
         return звонки
+
+    def call_owner(self, uniqueid: str) -> str | None:
+        """Кому принадлежит строка архива. None — строки нет вовсе.
+
+        Нужно ровно одному вызывающему: маршрут постановки задания собирает
+        ключ архива из полей формы, а `save_call` обновляет строку с таким
+        ключом, не спрашивая, чья она. Без этой проверки чужой звонок менял
+        владельца и пропадал из отчётов того, кому принадлежал.
+        """
+        if not uniqueid:
+            return None
+        строка = self.query_one("SELECT owner FROM calls WHERE uniqueid=?",
+                                (str(uniqueid),))
+        return None if строка is None else (строка["owner"] or "")
 
     def call_exists(self, uniqueid: str) -> bool:
         """Был ли звонок уже разобран — главный предохранитель импортёра."""
@@ -4109,11 +4235,22 @@ class Database:
                             (команда, now(), str(id))) > 0
 
     def agent_command_take(self, id: str) -> str:                     # noqa: A002
-        """Отдаёт задание агенту и тут же его снимает — чтобы не повторялось."""
-        строка = self.agent_get(id)
-        команда = str((строка or {}).get("command") or "")
-        if команда:
-            self.execute("UPDATE agents SET command='' WHERE id=?", (str(id),))
+        """Отдаёт команду агенту и тут же её снимает — чтобы не повторялась.
+
+        Чтение и снятие — одним действием под замком записи. Раньше это
+        были два шага, и между ними успевал вклиниться второй заход того же
+        агента: агент опрашивает сервер по расписанию, а сеть иногда
+        задваивает запрос — обе стороны читали «собрать всё» и обе его
+        выполняли. Сбор архива запускался дважды, шёл по журналу с одной
+        позиции и грузил станцию вдвое. Проба на восьми одновременных
+        обращениях ловила повтор примерно в каждом двадцатом заходе.
+        """
+        with self.write() as conn:
+            строка = conn.execute(
+                "SELECT command FROM agents WHERE id=?", (str(id),)).fetchone()
+            команда = str((строка["command"] if строка else "") or "")
+            if команда:
+                conn.execute("UPDATE agents SET command='' WHERE id=?", (str(id),))
         return команда
 
     # --- очередь запросов к языковой модели --------------------------------
@@ -4173,18 +4310,44 @@ class Database:
         return данные
 
     def llmq_begin(self, job_id: str, *, kind: str = "вручную",
-                   priority: int = 70) -> None:
+                   priority: int = 70) -> bool:
         """Отмечает, что к записи пошли прямо сейчас, мимо очереди.
 
         Разбор по кнопке «Разобрать сейчас» идёт в потоке запроса, а не в
         фоновом: человек ждёт ответа. Но в разделе очереди он обязан быть
         виден — иначе «сейчас ничего не идёт» соседствует с работающей
         видеокартой, и понять, кто её занял, нельзя.
+
+        Возвращает False, если запись УЖЕ разбирают. Раньше пометка ставилась
+        безусловно, и кнопка по записи, которую в этот момент жевал фоновый
+        поток, отправляла к модели второй запрос о том же самом: две оплаты
+        времени видеокарты за один ответ, два ответа поверх друг друга в
+        базе — и предел `llm_max_concurrent` тут не спасает, он про
+        одновременность, а не про повтор.
+
+        Отметка ставится одним действием под замком записи: две кнопки,
+        нажатые разом, иначе обе прочитали бы «свободно».
         """
-        self.llmq_put(job_id, kind=kind, priority=priority)
-        self.execute(
-            "UPDATE llm_queue SET state=?, started_at=?, attempts=attempts+1 "
-            "WHERE job_id=?", (self.LLMQ_ИДЁТ, now(), str(job_id)))
+        мгновение = now()
+        with self.write() as conn:
+            строка = conn.execute(
+                "SELECT state FROM llm_queue WHERE job_id=?", (str(job_id),)).fetchone()
+            if строка is not None and str(строка["state"]) == self.LLMQ_ИДЁТ:
+                return False
+            if строка is None:
+                conn.execute(
+                    "INSERT INTO llm_queue (job_id, kind, state, priority, enqueued_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (str(job_id), kind, self.LLMQ_ИДЁТ, int(priority), мгновение))
+                conn.execute("UPDATE llm_queue SET started_at=?, attempts=attempts+1 "
+                             "WHERE job_id=?", (мгновение, str(job_id)))
+                return True
+            conn.execute(
+                "UPDATE llm_queue SET state=?, kind=?, priority=MAX(priority, ?), "
+                "started_at=?, attempts=attempts+1, error='', finished_at=NULL "
+                "WHERE job_id=?",
+                (self.LLMQ_ИДЁТ, kind, int(priority), мгновение, str(job_id)))
+            return True
 
     def llmq_prune(self, keep_days: int = 14, *, limit: int = 20000) -> int:
         """Убирает старые завершённые записи очереди.
@@ -4208,6 +4371,40 @@ class Database:
             "calls=?, chunks=? WHERE job_id=?",
             (self.LLMQ_ОШИБКА if error else self.LLMQ_ГОТОВО, now(), error,
              latency_ms, int(calls), int(chunks), str(job_id)))
+
+    def llmq_release(self, job_id: str, *, error: str = "",
+                     attempts_max: int = 3) -> bool:
+        """Возвращает взятую запись в очередь — сходим к модели ещё раз.
+
+        Сбой сбою рознь. Сервер модели не отвечает, видеокарта занята,
+        ответ не дочитался — это про сейчас, а не про запись: через минуту
+        всё получится. Раньше такая запись оставалась в состоянии «идёт»
+        навсегда: `llmq_take` берёт только ждущих, уборка по сроку ходит по
+        завершённым, кнопка «Очистить» идущих не трогает намеренно — и
+        строка занимала раздел вечным «сейчас разбирается», а сама запись
+        не разбиралась больше никогда.
+
+        Но и возвращать бесконечно нельзя: запись, на которой модель падает
+        сама по себе, крутилась бы в очереди до скончания века. Поэтому
+        считаются заходы (`attempts` растёт в `llmq_take`), и после
+        `attempts_max` запись честно уходит в «ошибку» — оттуда её поднимет
+        кнопка «Повторить неудачные», когда причину устранят.
+
+        Returns:
+            True, если запись вернулась в очередь; False — если ушла в «ошибку».
+        """
+        строка = self.query_one("SELECT attempts FROM llm_queue WHERE job_id=?",
+                                (str(job_id),))
+        if строка is None:
+            return False
+        заходов = int(строка["attempts"] or 0)
+        if заходов >= max(1, int(attempts_max)):
+            self.llmq_finish(job_id, error=error or "разбор не удался")
+            return False
+        self.execute(
+            "UPDATE llm_queue SET state=?, started_at=NULL, error=? WHERE job_id=?",
+            (self.LLMQ_ЖДЁТ, error, str(job_id)))
+        return True
 
     def llmq_reset_running(self) -> int:
         """Возвращает в очередь то, что «шло» в момент остановки сервера.
@@ -4247,18 +4444,32 @@ class Database:
         return свод
 
     def llmq_list(self, *, state: str = "", limit: int = 100,
-                  offset: int = 0) -> dict[str, Any]:
+                  offset: int = 0,
+                  owner: str | list[str] | None = None) -> dict[str, Any]:
         """Очередь с именем файла рядом: по идентификатору задания человек
-        ничего не узнаёт, а раздел показывает именно список записей."""
-        условие, параметры = "", []
+        ничего не узнаёт, а раздел показывает именно список записей.
+
+        Разрез по владельцу обязателен: имя файла — это в колл-центре номер
+        клиента, и соседние списки заданий и очереди распознавания его
+        прячут. Здесь он уходил любому ключу с правом записи.
+        """
+        куски, параметры = [], []
         if state:
-            условие = " WHERE q.state=?"
+            куски.append("q.state=?")
             параметры.append(state)
+        разрез, свои = self._owner_clause(owner, "j")
+        if разрез:
+            куски.append(разрез)
+            параметры.extend(свои)
+        условие = (" WHERE " + " AND ".join(куски)) if куски else ""
+        соединение = ("FROM llm_queue q LEFT JOIN jobs j ON j.id=q.job_id"
+                      if not разрез else
+                      "FROM llm_queue q JOIN jobs j ON j.id=q.job_id")
         всего = self.query_one(
-            f"SELECT COUNT(*) AS n FROM llm_queue q{условие}", параметры)
+            f"SELECT COUNT(*) AS n {соединение}{условие}", параметры)
         rows = self.query(
             "SELECT q.*, j.filename, j.media_duration_s, j.model, j.created_at AS job_at "
-            "FROM llm_queue q LEFT JOIN jobs j ON j.id=q.job_id"
+            f"{соединение}"
             f"{условие} ORDER BY "
             "CASE q.state WHEN 'идёт' THEN 0 WHEN 'ждёт' THEN 1 ELSE 2 END, "
             "q.priority DESC, COALESCE(q.finished_at, q.enqueued_at) DESC "
@@ -4369,7 +4580,7 @@ class Database:
         осиротевшие = 0
         for таблица in ("content", "content_terms", "content_hits",
                         "content_marks", "review_queue", "llm_results",
-                        "segments", "events"):
+                        "llm_queue", "segments", "events"):
             осиротевшие += self.execute(
                 f"DELETE FROM {таблица} WHERE job_id IS NOT NULL "
                 "AND job_id NOT IN (SELECT id FROM jobs)")

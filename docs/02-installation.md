@@ -292,7 +292,7 @@ docker build -t asrhub:свой --build-arg ENGINES=gigaam,vosk -f docker/Docker
 Что именно попало в конкретный образ, контейнер сообщает первой же строкой при запуске:
 
 ```
-ASR Hub 3.1.5 — запуск контейнера
+ASR Hub 3.1.6 — запуск контейнера
 Сборка: профиль russian, ускоритель cpu
 Движки в образе: gigaam,tone,vosk,vad,postprocess
 ```

@@ -113,7 +113,17 @@ def fingerprint(models_dir: Path | str, source: str) -> str:
     if local is not None:
         digest = hashlib.blake2b(digest_size=8)
         entries: list[tuple[str, int, int]] = []
-        for item in sorted(local.rglob("*")):
+        # Веса GigaAM — ОДИН ФАЙЛ `<вариант>.ckpt`, а не каталог: качаются
+        # они не с Hugging Face, а со своего CDN. `rglob` по файлу не даёт
+        # ничего, поэтому отпечаток у всех девяти моделей GigaAM — включая
+        # ту, что стоит в каталоге умолчанием, — был пуст ВСЕГДА. Пустой
+        # отпечаток означает «весов на диске нет», и кеш результатов
+        # переставал различать версии модели: обновили веса, попросили ту
+        # же запись заново — и в ответ приезжала расшифровка, сделанная
+        # прежней версией. Ровно от этого отпечаток и придуман. Та же
+        # ошибка была в `directory_size`, и там её уже чинили.
+        обход = [local] if local.is_file() else sorted(local.rglob("*"))
+        for item in обход:
             try:
                 if not item.is_file():
                     continue
@@ -122,7 +132,8 @@ def fingerprint(models_dir: Path | str, source: str) -> str:
                 continue
             # Ссылки внутри кеша Hugging Face ведут на blobs; там и размер,
             # и время изменения настоящие, поэтому обходим как есть.
-            entries.append((str(item.relative_to(local)), stat.st_size, stat.st_mtime_ns))
+            имя = item.name if item == local else str(item.relative_to(local))
+            entries.append((имя, stat.st_size, stat.st_mtime_ns))
         for name, size, mtime in entries:
             digest.update(f"{name}|{size}|{mtime}\n".encode())
         if entries:

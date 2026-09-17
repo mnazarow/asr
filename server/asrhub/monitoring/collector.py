@@ -20,6 +20,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .. import __version__
@@ -205,8 +206,36 @@ class Collector:
         ):
             self._safe(source, fn, out, errors)
         self._safe("storage_size", lambda acc: acc.extend(self._expensive()), out, errors)
+        out = self._без_повторов(out)
         out.extend(self._deprecated_aliases(out))
         return out, errors
+
+    @staticmethod
+    def _без_повторов(samples: list[Sample]) -> list[Sample]:
+        """Одна серия — одно значение в снимке. Остаётся первое.
+
+        Выгрузка, где одна и та же пара «имя + метки» встречается дважды, для
+        Prometheus не просто некрасива — она неверна: при разборе побеждает
+        произвольная из двух, а `promtool check metrics` называет это
+        ошибкой. Так и вышло с гистограммами длительности: их выкладывал и
+        разбор заданий по базе, и накопитель в памяти, — двадцать семь
+        задвоенных серий на каждый ответ `/api/monitoring/metrics`.
+
+        Первым идёт разбор по базе, и это правильный порядок: та гистограмма
+        переживает перезапуск сервиса — ровно то, что обещано в справочнике
+        метрики. Накопитель в памяти остаётся запасным: если разбор по базе
+        сорвался (база занята, файл недоступен), его значения в снимке
+        единственные, и метрика не пропадает вовсе.
+        """
+        видели: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        итог: list[Sample] = []
+        for проба in samples:
+            ключ = (проба.name, tuple(sorted((проба.labels or {}).items())))
+            if ключ in видели:
+                continue
+            видели.add(ключ)
+            итог.append(проба)
+        return итог
 
     @staticmethod
     def _deprecated_aliases(samples: list[Sample]) -> list[Sample]:
@@ -730,6 +759,18 @@ class Collector:
         paths = self.state.settings.paths
         for kind in ("uploads", "results", "models", "logs"):
             directory = getattr(paths, kind, None)
+            if kind == "models":
+                # Веса лежат там, куда указывает настройка `models_dir`, а
+                # `paths.models` — это каталог данных сервера. На сервере,
+                # где модели вынесены на отдельный диск (а их выносят почти
+                # всегда: девяносто гигабайт), метрика показывала ноль, и
+                # «место под модели» в наблюдении было нулём при полном
+                # диске. Самопроверка при этом считает по `models_dir` и
+                # видит настоящий размер — две цифры об одном и том же
+                # расходились в разы.
+                задан = str(self.state.settings.get("models_dir") or "").strip()
+                if задан:
+                    directory = Path(задан)
             if directory is None:
                 continue
             try:

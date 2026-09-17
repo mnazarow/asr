@@ -150,11 +150,34 @@ const API = {
         message: detail.message || `Ошибка ${response.status}`,
         hint: detail.hint || '',
         status: response.status,
+        // Тело ответа целиком — для тех, кому «плохой» код не помеха
+        // (см. API.lenient): проверки состояния отдают 503 с полными
+        // данными, и терять их из-за кода нельзя.
+        body: data,
       };
     }
     return data;
   },
   get(path) { return this.call(path); },
+  /**
+   * Запрос, у которого «плохой» код ответа — часть ответа, а не сбой.
+   *
+   * Так устроены проверки состояния: `/api/monitoring/health` намеренно
+   * отвечает 503, когда со здоровьем сервера что-то не так, и тело при этом
+   * полное — со списком проверок и причин. Раздел наблюдения читал его
+   * обычным `get`, получал исключение и показывал «Раздел не загрузился»:
+   * то есть становился недоступен ровно в тот момент, ради которого он и
+   * нужен. Здесь 4xx/5xx с разобранным телом возвращаются как данные;
+   * ответ без тела остаётся сбоем.
+   */
+  async lenient(path) {
+    try {
+      return await this.call(path);
+    } catch (err) {
+      if (err && err.status && err.body !== undefined && err.body !== null) return err.body;
+      throw err;
+    }
+  },
   /** Запрос вне разделов: смена раздела его не отменяет. */
   background(path) { return this.call(path, { background: true }); },
   post(path, body) { return this.call(path, { method: 'POST', json: body === undefined ? {} : body }); },
@@ -5590,6 +5613,17 @@ const ПАТС_ПОЛЯ = [
     rec: '7 дней: свежий архив приедет сразу, а годовой не забьёт очередь в '
        + 'первый же час. Увеличьте разово, если нужен весь архив.',
     examples: ['7 — обычное значение', '90 — разовый перенос архива'] },
+  { key: 'match_window', label: 'Окно подбора по номерам, мин', type: 'number',
+    desc: 'Насколько далеко от начала разговора — в обе стороны — может лежать '
+        + 'запись, которую подбирают по паре номеров. Запасной способ: он '
+        + 'работает, когда в имени файла нет идентификатора звонка. На поиск '
+        + 'по идентификатору и по шаблону имени окно не влияет.',
+    rec: '120 минут. Пара номеров повторяется у каждого их разговора, и без '
+       + 'окна звонку достанется ближайший по времени файл — хоть вчерашний. '
+       + 'Уменьшите, если одни и те же абоненты созваниваются помногу раз в '
+       + 'день; 0 снимает ограничение вовсе.',
+    examples: ['120 — обычное значение', '15 — плотный поток звонков',
+               '0 — без ограничения (не рекомендуется)'] },
   { key: 'poll_s', label: 'Интервал опроса, с', type: 'number',
     desc: 'Как часто заглядывать на станцию за новыми звонками.',
     rec: '60 секунд. Чаще имеет смысл только при AMI и требовании «расшифровка '
@@ -5927,14 +5961,21 @@ RENDERERS.pbx = {
 
   async drawAgents(тело) {
     тело.innerHTML = '<div class="empty">Загрузка…</div>';
+    // Вкладка на момент запроса. За время ответа человек успевает уйти на
+    // соседнюю, и без этой сверки список агентов рисовался ПОВЕРХ выбранной:
+    // выбрал «Нагрузку», увидел агентов. Заметнее всего на медленной сети —
+    // то есть там, где раздел и так неудобен.
+    const своя = state.pbxTab;
     let данные;
     try {
       данные = await API.latest('pbx-agents', '/api/telephony/agents');
     } catch (err) {
+      if (state.pbxTab !== своя) return;
       тело.innerHTML = `<div class="empty">Список агентов недоступен: ${
         esc(err.message || '')}</div>`;
       return;
     }
+    if (state.pbxTab !== своя) return;
     const агенты = (данные || {}).agents || [];
     const адрес = `${location.protocol}//${location.host}`;
     const команда = `curl -fsSL '${адрес}/api/telephony/agent/install.sh' \\
@@ -6720,7 +6761,7 @@ function ПАТС_ПО_УМОЛЧАНИЮ() {
     recordings_dir: '/var/spool/asterisk/monitor', filename: '',
     internal_digits: '3, 4', contexts: 'from-trunk=входящий, from-internal=исходящий',
     min_duration_s: 10, skip_unanswered: true, settle_s: 30, lookback_days: 7,
-    poll_s: 60, owner: 'telephony', priority: 40, tags: '',
+    match_window: 120, poll_s: 60, owner: 'telephony', priority: 40, tags: '',
   };
 }
 
@@ -10482,10 +10523,12 @@ RENDERERS.monitoring = {
     // Ошибку пробрасываем: её покажет renderView карточкой с кнопкой
     // «Повторить», а не оставит раздел на «Опрос метрик…» насовсем.
     [health, info, alerts, targets] = await Promise.all([
-      API.get('/api/monitoring/health'),
+      // Состояние — снисходительным запросом: 503 здесь означает «плохо со
+      // здоровьем», а не «нет ответа», и тело при этом полное.
+      API.lenient('/api/monitoring/health'),
       API.get('/api/monitoring/info'),
-      API.get('/api/monitoring/alerts'),
-      API.get('/api/monitoring/targets'),
+      API.lenient('/api/monitoring/alerts'),
+      API.lenient('/api/monitoring/targets'),
     ]);
 
     state.monitoring = { health, info, alerts, targets };
@@ -12280,7 +12323,7 @@ RENDERERS.voice = {
           <td class="small">${esc(в)}</td>
           <td class="num mono">${num(да)}</td>
           <td class="num mono">${num(нет)}</td>
-          <td>${полоса(доля, доля > 0.8 ? 'ok' : (доля > 0.5 ? 'warn' : 'err'))}</td>
+          <td>${полоса_доли(доля, доля > 0.8 ? 'ok' : (доля > 0.5 ? 'warn' : 'err'))}</td>
         </tr>`).join('')}</tbody></table></div>`
         : `<div class="empty">Скоркарта не настроена.
              <div class="small dim" style="margin-top:6px">Вопросы задаются настройкой
@@ -12346,8 +12389,14 @@ function свести(строки, поле) {
 /** Есть ли что показывать в скоркарте. Отдельной функцией ради читаемости. */
 function пари(пары) { return пары && пары.length > 0; }
 
-/** Горизонтальная полоса доли в ячейке таблицы. */
-function полоса(доля, вид) {
+/** Горизонтальная полоса доли в ячейке таблицы.
+ *
+ * Звалась «полоса» — как и функция строкой 4627, у которой четыре довода и
+ * совсем другой вид. Объявления функций поднимаются наверх, поэтому побеждало
+ * ЭТО, второе: обе вкладки «Аналитика записей» рисовали по шесть и четыре
+ * безымянные полосы «0 %» вместо своих чисел. Ни ошибки в консоли, ни следа в
+ * журнале — просто раздел показывал нули, и объяснить их было нечем. */
+function полоса_доли(доля, вид) {
   const п = Math.max(0, Math.min(1, Number(доля) || 0));
   return `<div class="row" style="gap:8px;align-items:center">
     <div class="progress ${вид || ''}" style="flex:1"><span style="width:${(п * 100).toFixed(1)}%"></span></div>

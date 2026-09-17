@@ -104,7 +104,12 @@ def metrics_json(request: Request,
     _guard(request)
     service = _monitoring(request)
     samples, errors = service.samples()
-    payload = exporters.json_snapshot(samples, errors)
+    # Ошибки сбора — это тексты исключений, а в них абсолютные пути: путь к
+    # базе и каталог данных. Маршрут по умолчанию открыт без ключа вовсе
+    # (monitoring_public), то есть раскладка файловой системы уезжала
+    # анониму — ровно та разведка, которую прячут GET /api/system и
+    # GET /api/settings.
+    payload = exporters.json_snapshot(samples, _без_путей(request, errors))
     if group:
         payload["metrics"] = [m for m in payload["metrics"] if m.get("group") == group]
     return payload
@@ -363,6 +368,30 @@ def targets(request: Request,
     return {"kinds": list(KINDS), "targets": список}
 
 
+def _скрыть_пути(request: Request, строки: list[str] | None) -> list[str]:
+    """Прячет пути и адреса в текстах ошибок сбора.
+
+    Разбор один на всю диагностику: `selfcheck.спрятать_пути` уже умеет
+    выбрасывать каталог данных и всё, похожее на адрес, и заводить второй
+    такой же было бы способом получить два разных ответа на один вопрос.
+    """
+    from ..selfcheck import спрятать_пути  # noqa: PLC0415
+
+    if not строки:
+        return list(строки or [])
+    настройки = getattr(get_state(request), "settings", None)
+    свод = спрятать_пути({"components": [{"id": "errors", "checks": [
+        {"id": str(н), "title": "", "state": "fail", "value": текст,
+         "hint": "", "metrics": {}} for н, текст in enumerate(строки)]}]},
+        настройки)
+    return [п["value"] for п in свод["components"][0]["checks"]]
+
+
+def _без_путей(request: Request, строки: list[str] | None) -> list[str]:
+    """То же, но для маршрута без аутентификации: прячем всегда."""
+    return _скрыть_пути(request, строки)
+
+
 def _hide_url(url: str) -> str:
     """Оставляет от адреса схему и узел — по ним видно, куда идёт отправка.
 
@@ -489,7 +518,14 @@ def info(request: Request, principal: Principal = Depends(authenticate)) -> dict
     учётными данными и входящий адрес чата вместе с токеном.
     """
     свод = _monitoring(request).info()
-    if not principal.is_admin and isinstance(свод.get("targets"), list):
-        свод = {**свод, "targets": [{**t, "url": _hide_url(str(t.get("url") or ""))}
-                                    for t in свод["targets"]]}
+    if not principal.is_admin:
+        if isinstance(свод.get("targets"), list):
+            свод = {**свод, "targets": [{**t, "url": _hide_url(str(t.get("url") or ""))}
+                                        for t in свод["targets"]]}
+        # Адреса приёмников обрезались, а ошибки сбора пропускались, хотя
+        # несут те же сведения в открытом виде.
+        if свод.get("collection_errors"):
+            свод = {**свод,
+                    "collection_errors": _скрыть_пути(request,
+                                                      свод["collection_errors"])}
     return свод

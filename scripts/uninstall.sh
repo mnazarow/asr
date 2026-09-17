@@ -15,6 +15,7 @@ source "${SCRIPT_DIR}/lib/detect.sh"
 
 PREFIX=""
 DATA_DIR=""
+SERVICE_NAME=""
 PURGE=0
 KEEP_MODELS=0
 MODE="auto"
@@ -27,6 +28,7 @@ usage() {
 
   --prefix ПУТЬ    Каталог установки (определяется автоматически)
   --data ПУТЬ      Каталог данных (определяется автоматически)
+  --name ИМЯ       Имя службы этой установки (по умолчанию определяется по каталогу)
   --purge          Удалить и данные: результаты, модели, базу, журналы
   --keep-models    При --purge сохранить загруженные веса моделей
   --mode native|docker   Что удалять (по умолчанию определяется)
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix) PREFIX="${2:?}"; shift 2 ;;
     --data)   DATA_DIR="${2:?}"; shift 2 ;;
+    --name)   SERVICE_NAME="${2:?}"; shift 2 ;;
     --mode)   MODE="${2:?}"; shift 2 ;;
     --purge)  PURGE=1; shift ;;
     --keep-models) KEEP_MODELS=1; shift ;;
@@ -139,7 +142,11 @@ fi
 # --- 2. Остановка службы ----------------------------------------------------
 
 step "Остановка службы"
-bash "${SCRIPT_DIR}/service.sh" uninstall --prefix "${PREFIX}" 2>/dev/null || \
+# Имя службы — этой установки, а не «asrhub» вслепую: вторая установка
+# заводится ключом --name, и удаление её службы сносило службу первой.
+[[ -z "${SERVICE_NAME}" ]] && SERVICE_NAME="$(service_name_for "${PREFIX}")"
+bash "${SCRIPT_DIR}/service.sh" uninstall --prefix "${PREFIX}" \
+  --name "${SERVICE_NAME}" 2>/dev/null || \
   info "Служба не найдена или уже удалена."
 
 # Останавливаем процессы ЭТОЙ установки, запущенные вручную.

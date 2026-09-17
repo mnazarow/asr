@@ -20,6 +20,7 @@ source "${SCRIPT_DIR}/lib/gpu.sh"
 
 PREFIX=""
 DATA_DIR=""
+SERVICE_NAME=""
 SOURCE_DIR="${REPO_DIR}"
 ENGINES_ONLY=0
 CHECK_ONLY=0
@@ -36,6 +37,7 @@ usage() {
   --prefix ПУТЬ     Каталог установки (определяется автоматически)
   --data ПУТЬ       Каталог данных
   --source ПУТЬ     Откуда брать новую версию (по умолчанию текущий репозиторий)
+  --name ИМЯ        Имя службы этой установки (по умолчанию определяется по каталогу)
   --engines-only    Обновить только пакеты движков, не трогая код сервера
   --check           Только показать, что изменится
   --rollback        Вернуть предыдущую версию из снимка
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --prefix) PREFIX="${2:?}"; shift 2 ;;
     --data)   DATA_DIR="${2:?}"; shift 2 ;;
     --source) SOURCE_DIR="${2:?}"; shift 2 ;;
+    --name)   SERVICE_NAME="${2:?}"; shift 2 ;;
     --engines-only) ENGINES_ONLY=1; shift ;;
     --check)  CHECK_ONLY=1; shift ;;
     --rollback) DO_ROLLBACK=1; shift ;;
@@ -85,6 +88,11 @@ print_banner
 
 [[ -z "${PREFIX}" ]] && { error "Установка не найдена. Укажите --prefix."; exit 2; }
 
+# Имя службы ИМЕННО ЭТОЙ установки. Раньше здесь ничего не определялось, и
+# все вызовы service.sh шли с именем по умолчанию: обновление второй
+# установки останавливало и запускало службу первой.
+[[ -z "${SERVICE_NAME}" ]] && SERVICE_NAME="$(service_name_for "${PREFIX}")"
+
 VENV="${PREFIX}/venv"
 # Разбору внутри библиотеки нужны и pip, и каталог требований: по спутникам
 # --no-deps он отличает наши намеренные отступления от настоящих находок.
@@ -92,7 +100,15 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
 VPIP="${VENV}/bin/pip"
 export ASRHUB_VPIP="${VPIP}"
 VPY="${VENV}/bin/python"
-SNAPSHOT_DIR="${PREFIX}/../asrhub-snapshot"
+# Снимок — СВОЙ у каждой установки. Прежний путь «рядом с prefix, имя
+# общее» совпадал у всех установок под одним родителем: /opt/asrhub и
+# /opt/asrhub2 писали снимок в один и тот же /opt/asrhub-snapshot. Откат
+# второй установки возвращал код и config.yaml ПЕРВОЙ — то есть чинил одно
+# и ломал другое, молча и до неузнаваемости.
+SNAPSHOT_DIR="${PREFIX%/}.snapshot"
+#: Прежний общий путь. Нужен ровно один раз: снимок перед этим обновлением
+#: сделан ещё старым скриптом и лежит там.
+SNAPSHOT_LEGACY="${PREFIX}/../asrhub-snapshot"
 CURRENT_VERSION="$(cat "${PREFIX}/VERSION" 2>/dev/null || echo 'неизвестна')"
 NEW_VERSION="$(cat "${SOURCE_DIR}/VERSION" 2>/dev/null || echo 'неизвестна')"
 
@@ -101,12 +117,21 @@ NEW_VERSION="$(cat "${SOURCE_DIR}/VERSION" 2>/dev/null || echo 'неизвест
 if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
   heading "Откат к предыдущей версии"
   if [[ ! -d "${SNAPSHOT_DIR}" ]]; then
-    error "Снимок предыдущей версии не найден: ${SNAPSHOT_DIR}"
-    exit 2
+    if [[ -d "${SNAPSHOT_LEGACY}" ]]; then
+      warn "Снимка по своему пути нет, но есть по прежнему общему:"
+      warn "  ${SNAPSHOT_LEGACY}"
+      hint "Он мог быть сделан другой установкой под тем же родительским"
+      hint "каталогом — сверьте версию в ${SNAPSHOT_LEGACY}/VERSION."
+      confirm "Откатиться из него?" n || exit 0
+      SNAPSHOT_DIR="${SNAPSHOT_LEGACY}"
+    else
+      error "Снимок предыдущей версии не найден: ${SNAPSHOT_DIR}"
+      exit 2
+    fi
   fi
   info "Снимок от $(date -r "${SNAPSHOT_DIR}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
   confirm "Восстановить предыдущую версию?" || exit 0
-  bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" 2>/dev/null || true
+  bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" --name "${SERVICE_NAME}" 2>/dev/null || true
   # Только поверх: в снимке лежит код, а --delete снёс бы venv, а на macOS
   # ещё и каталог данных внутри prefix.
   # Файл конфигурации лежит не в prefix, поэтому переносится отдельно — и
@@ -124,7 +149,7 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
     run cp -a "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"
     ok "Конфигурация возвращена к виду до обновления"
   fi
-  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" 2>/dev/null || true
+  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" --name "${SERVICE_NAME}" 2>/dev/null || true
   ok "Откат выполнен: версия $(cat "${PREFIX}/VERSION" 2>/dev/null || echo '?')"
   exit 0
 fi
@@ -292,9 +317,9 @@ if [[ "${DOCKER_MODE}" -eq 1 ]]; then
   info "Установка в контейнере: остановка произойдёт при пересборке."
   ok "Готово"
 else
-  if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" >/dev/null 2>&1; then
+  if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" --name "${SERVICE_NAME}" >/dev/null 2>&1; then
     WAS_RUNNING=1
-    bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" || warn "Не удалось остановить службу."
+    bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" --name "${SERVICE_NAME}" || warn "Не удалось остановить службу."
   fi
   ok "Служба остановлена"
 fi
@@ -450,7 +475,7 @@ if [[ "${DOCKER_MODE}" -eq 1 ]]; then
   # shellcheck disable=SC2086
   ( cd "${PREFIX}/docker" && run ${COMPOSE_LINE} --env-file .env up -d )
 elif [[ "${WAS_RUNNING}" -eq 1 ]]; then
-  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" || true
+  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" --name "${SERVICE_NAME}" || true
 else
   info "До обновления служба не работала — не запускаем."
   checklist_skip "до обновления служба не работала"
@@ -519,8 +544,14 @@ else
   diagnose_server_down "${PORT}" "${PREFIX}" "${DATA_DIR}" \
     "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" asrhub "${PROBE_HOST}"
   if confirm "Откатиться к предыдущей версии?"; then
-    exec bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" --yes
+    # Каталог данных и имя службы передаются дальше: без них откат искал
+    # config.yaml в каталоге по умолчанию и возвращал конфигурацию ЧУЖОЙ
+    # установки, а службу дёргал вообще не ту. Оба значения здесь уже
+    # определены — своими ключами или разбором.
+    exec bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" \
+      --data "${DATA_DIR}" --name "${SERVICE_NAME}" --yes
   fi
-  hint "Откатиться позже: bash ${PREFIX}/scripts/update.sh --rollback"
+  hint "Откатиться позже: bash ${PREFIX}/scripts/update.sh --rollback \
+    --prefix ${PREFIX} --data ${DATA_DIR}"
   exit 1
 fi

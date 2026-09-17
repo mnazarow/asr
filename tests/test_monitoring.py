@@ -414,15 +414,40 @@ def test_route_label_cardinality_is_bounded(client):
     assert _route_fallback("/api/health") == "/api/health"
 
 
-def test_alert_is_cleared_when_metric_disappears():
-    """Исчезнувшая метрика снимает тревогу, а не замораживает её навсегда."""
+def test_alert_is_cleared_when_metric_disappears(monkeypatch):
+    """Исчезнувшая метрика снимает тревогу, а не замораживает её навсегда.
+
+    Но не с первого же снимка: одна осечка сбора — не отказ источника. Заход
+    35 показал, что мгновенное снятие обнуляло выдержку, и тревога с
+    выдержкой в час не срабатывала никогда, если сбор спотыкался раз в час
+    (см. `test_review_35_silence.py`). Поэтому пропажа должна длиться и
+    несколько снимков подряд, и заметное время — здесь время двигается
+    заглушкой, чтобы проверка не зависела от скорости машины.
+    """
+    from asrhub.monitoring import alerts as модуль_тревог
+
+    class Часы:
+        t = 1_700_000_000.0
+
+        def time(self):
+            return self.t
+
+    часы = Часы()
+    monkeypatch.setattr(модуль_тревог, "time", часы)
+
     rule = Rule(metric="asrhub_disk_free_gb", direction="below", threshold=10,
                 for_seconds=0)
     engine = AlertEngine(rules=[rule])
     for _ in range(2):
         engine.evaluate([Sample("asrhub_disk_free_gb", 1)])
+        часы.t += 30
     assert engine.states()[0]["state"] == STATE_FIRING
     engine.evaluate([])
+    часы.t += 30
+    assert engine.states()[0]["state"] == STATE_FIRING, "одна осечка сбора сняла тревогу"
+    for _ in range(20):
+        engine.evaluate([])
+        часы.t += 30
     assert engine.states()[0]["state"] == STATE_OK
 
 

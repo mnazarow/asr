@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request
 
 from ..analytics import PERIODS
-from ..errors import ASRHubError, ConfigError
+from ..errors import ASRHubError, ConfigError, JobNotFound
 from ..llm import LLMError, provision, tasks
 from .deps import (
     Principal,
@@ -25,6 +25,7 @@ from .deps import (
     require_admin,
     require_owner,
     require_write,
+    same_scope,
     scope_owner,
 )
 
@@ -178,13 +179,18 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
     состояние = поток.status()
     # Текущая запись — с именем файла: по идентификатору задания человек не
     # узнаёт ничего, а в разделе он смотрит именно на «какую запись жуют».
+    # Имя файла — это в колл-центре номер клиента, и соседние списки
+    # заданий его прячут. Чужую запись показываем без имени: то, что
+    # видеокарта сейчас занята, не секрет, а чем именно — секрет.
+    свой = scope_owner(principal)
     текущее = None
     if состояние.get("current"):
-        задание = state.db.get_job(str(состояние["current"]))
+        задание = state.db.get_job(str(состояние["current"])) or {}
+        наше = not свой or same_scope(principal, str(задание.get("owner") or ""))
         текущее = {
-            "job_id": состояние["current"],
-            "filename": (задание or {}).get("filename") or "",
-            "duration_s": (задание or {}).get("media_duration_s") or 0,
+            "job_id": состояние["current"] if наше else "",
+            "filename": (задание.get("filename") or "") if наше else "чужая запись",
+            "duration_s": (задание.get("media_duration_s") or 0) if наше else 0,
             "since": состояние.get("current_since"),
         }
     return {
@@ -193,7 +199,8 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
         "counts": state.db.llmq_counts(),
         "stats": state.db.llmq_stats(с_какого),
         "series": {"buckets": корзин, "since": с_какого, "rows": ряд},
-        "queue": state.db.llmq_list(state=state_filter, limit=limit, offset=offset),
+        "queue": state.db.llmq_list(state=state_filter, limit=limit,
+                                    offset=offset, owner=свой),
         "client": клиент.status(),
         "settings": {
             "paused": bool(state.settings.get("llm_queue_paused", False)),
@@ -236,7 +243,12 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
             "Языковая модель выключена.",
             hint="Включите её в настройках: «Языковая модель» → «Как подключена»."))
     ids = [str(и) for и in (данные.get("job_ids") or []) if str(и).strip()]
-    предел = max(1, min(int(данные.get("limit") or 1000), 50000))
+    # Явный список приходит из «Результатов», где человек отметил свои
+    # записи. Чужие сюда попадают только подбором номеров — и раньше
+    # проходили: список уезжал в очередь, не читая заданий.
+    for номер in ids:
+        _своё_задание(state, principal, номер)
+    предел = _целое(данные.get("limit"), 1000, 1, 50000)
     if not ids:
         отбор = str(данные.get("scope") or "pending")
         if отбор == "pending":
@@ -245,8 +257,8 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
             повторено = state.db.llmq_retry_failed(limit=предел)
             return {"queued": повторено, "scope": отбор, "worker": поток.status()}
         elif отбор == "period":
-            начало = float(данные.get("since") or 0)
-            конец = float(данные.get("until") or time.time())
+            начало = _число(данные.get("since"), 0.0)
+            конец = _число(данные.get("until"), time.time())
             if not начало or конец <= начало:
                 raise error_response(ConfigError(
                     "Для отбора за период нужны начало и конец промежутка."))
@@ -266,11 +278,47 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
     return {"queued": поставлено, "asked": len(ids), "worker": поток.status()}
 
 
+def _число(значение: Any, умолчание: float) -> float:
+    """Дробное из тела запроса — или понятный отказ вместо пятисотки.
+
+    Тело здесь — свободный словарь, схемой не описанный, и `float("вчера")`
+    доходил до общего обработчика: клиент получал «внутреннюю ошибку
+    сервера» и трассировку в журнале, хотя виноват был он сам.
+    """
+    if значение is None or значение == "":
+        return умолчание
+    try:
+        return float(значение)
+    except (TypeError, ValueError):
+        raise error_response(ConfigError(
+            f"Ожидается число, получено «{значение}».")) from None
+
+
+def _целое(значение: Any, умолчание: int, наименьшее: int, наибольшее: int) -> int:
+    """Целое из тела запроса, зажатое в допустимые пределы."""
+    return max(наименьшее, min(int(_число(значение, умолчание)), наибольшее))
+
+
+def _своё_задание(state: Any, principal: Principal, job_id: str) -> dict[str, Any]:
+    """Задание по номеру — или отказ, если оно чужое.
+
+    Маршруты очереди принимали номер задания из пути и несли его прямо в
+    базу, не читая само задание: проверить владельца было негде, и ключ с
+    правом записи снимал чужой разбор или поднимал его на видеокарту.
+    """
+    задание = state.db.get_job(str(job_id))
+    if not задание:
+        raise error_response(JobNotFound(str(job_id)))
+    require_owner(principal, задание)
+    return задание
+
+
 @router.post("/llm/queue/{job_id}/top", summary="Поднять запись в начало очереди")
 def llm_queue_top(request: Request, job_id: str,
                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state, _клиент, поток = _slot(request)
     require_write(principal)
+    _своё_задание(state, principal, job_id)
     state.db.llmq_put(job_id, kind="срочно", priority=100)
     return {"ok": True, "job_id": job_id, "worker": поток.status()}
 
@@ -282,6 +330,7 @@ def llm_queue_cancel(request: Request, job_id: str,
     уже оплачен временем видеокарты, и бросать его на полпути незачем."""
     state, _клиент, _поток = _slot(request)
     require_write(principal)
+    _своё_задание(state, principal, job_id)
     if not state.db.llmq_cancel(job_id):
         raise error_response(ConfigError(
             f"Запись «{job_id}» в очереди не ждёт.",

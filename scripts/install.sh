@@ -571,15 +571,36 @@ check_disk_space "${DATA_DIR}" "$(profile_disk_gb "${PROFILE}")"
 check_memory 8
 
 if ! check_port_free "${PORT}"; then
-  warn "Порт ${PORT} занят."
-  NEW_PORT="$(find_free_port "$((PORT + 1))")"
-  if confirm "Использовать свободный порт ${NEW_PORT}?"; then
-    PORT="${NEW_PORT}"
-    ok "Выбран порт ${PORT}"
-  else
-    error "Освободите порт ${PORT} и повторите установку."
-    exit 1
+  # Чаще всего порт занят НАШЕЙ ЖЕ службой: установщик запускают повторно,
+  # чтобы доставить движок или обновить зависимости, и сервер при этом
+  # работает. Прежде это считалось поводом переехать на соседний порт, а с
+  # ключом --yes переезд происходил вообще молча: служба поднималась на
+  # 8081, config.yaml оставался с 8080, и сервер после перезапуска отвечал
+  # не там, где его ищут все настроенные клиенты и агенты на станциях.
+  #
+  # Спрашиваем сам порт: если там отвечает ASR Hub и установка идёт в тот же
+  # каталог — это мы, и порт менять не нужно.
+  PORT_IS_OURS=0
+  if [[ -d "${PREFIX}" ]] && http_probe "http://127.0.0.1:${PORT}/api/health" 3; then
+    case "${HTTP_BODY}" in
+      *asrhub*|*ASR*|*'"status"'*) PORT_IS_OURS=1 ;;
+    esac
   fi
+  if [[ "${PORT_IS_OURS}" -eq 1 ]]; then
+    info "Порт ${PORT} занят уже установленным ASR Hub — так и должно быть."
+    hint "Служба будет перезапущена на том же порту в конце установки."
+  else
+    warn "Порт ${PORT} занят."
+    NEW_PORT="$(find_free_port "$((PORT + 1))")"
+    if confirm "Использовать свободный порт ${NEW_PORT}?"; then
+      PORT="${NEW_PORT}"
+      ok "Выбран порт ${PORT}"
+    else
+      error "Освободите порт ${PORT} и повторите установку."
+      exit 1
+    fi
+  fi
+  unset PORT_IS_OURS
 fi
 
 if [[ "${OFFLINE}" -eq 0 ]]; then

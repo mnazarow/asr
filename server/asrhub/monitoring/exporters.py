@@ -342,7 +342,12 @@ def _summary(spec: MetricSpec, direction: str, value: float) -> str:
 
 def _rule_expression(spec: MetricSpec, direction: str, value: float) -> str:
     """Собирает выражение правила с учётом особенностей конкретной метрики."""
-    operator = ">" if direction == "above" else "<"
+    # Порог на краю шкалы сравнивается включительно — иначе правило не
+    # срабатывает никогда. Знак обязан совпадать со встроенным движком
+    # тревог: две системы наблюдения, показывающие разное по одной метрике,
+    # хуже одной.
+    включительно = bool(getattr(spec.threshold, "inclusive", False))
+    operator = (">" if direction == "above" else "<") + ("=" if включительно else "")
 
     # Метрики, значение которых 0 или 1: строгое сравнение с единицей никогда
     # не сработает, поэтому проверяем равенство.

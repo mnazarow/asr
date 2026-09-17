@@ -18,7 +18,7 @@ from typing import Any
 
 from ..errors import DependencyMissing, EngineError, ModelLoadError
 from ..logging_setup import get_logger
-from ..pipeline import vad
+from ..pipeline import stitch, vad
 from ..pipeline.audio import probe, slice_wav
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
@@ -349,6 +349,12 @@ class GigaAMEngine(Engine):
                     language="ru",
                     words=shifted,
                 ))
+
+        # Механическая нарезка идёт с перекрытием, и речь в зоне
+        # перекрытия распозналась дважды. Справочник обещает, что дубликаты
+        # убираются при сшивке, — вот здесь это и делается.
+        segments = stitch.убрать_повторы(
+            segments, float(settings.get("chunk_overlap_s") or 0.0))
 
         self.report(progress, 0.98, "сборка результата")
         return TranscriptionResult(
