@@ -56,6 +56,13 @@ from fastapi.responses import StreamingResponse
 
 from ..errors import ASRHubError, ConfigError, FileTooLarge, ForbiddenError
 from ..llm import LLMError
+from ..llm.client import (
+    ЗНАКОВ_НА_ТОКЕН,
+    ОКНО_НАИБОЛЬШЕЕ,
+    без_рассуждения,
+    всегда_рассуждает,
+    окно_контекста,
+)
 from ..logging_setup import get_logger
 from .deps import Principal, authenticate, get_state, require_write
 
@@ -458,10 +465,54 @@ def _подсказки(сообщения: list[dict[str, str]]) -> tuple[str, 
     return system, прочее
 
 
-def _тело_ollama(запрос: dict[str, Any], поток: bool) -> dict[str, Any]:
+#: Как OpenAI называет глубину рассуждения — и что это значит для Ollama.
+#: «none» и «minimal» — не рассуждать; у моделей, которые рассуждают всегда,
+#: это превращается в «low»: выключить у них нельзя, можно только ослабить.
+_РАССУЖДЕНИЕ = {"none": "off", "minimal": "off", "low": "low",
+                "medium": "medium", "high": "high"}
+
+
+def _think_из_запроса(сырое: dict[str, Any], модель: str) -> bool | str | None:
+    """Поле think по просьбе клиента; None — клиент не просил, решает модель.
+
+    Чужому клиенту настройка сервера «Рассуждение модели» не навязывается:
+    она про разбор записей, а клиенту шлюза может быть нужно рассуждение.
+    Просит он его на языке OpenAI — полем reasoning_effort, — и без перевода
+    просьба просто терялась бы.
+    """
+    уровень = _РАССУЖДЕНИЕ.get(str(сырое.get("reasoning_effort") or "").strip().lower())
+    if уровень is None:
+        return None
+    if всегда_рассуждает(модель):
+        return "low" if уровень == "off" else уровень
+    return уровень != "off"
+
+
+def _окно_для(клиент: Any, запрос: dict[str, Any]) -> int:
+    """Окно контекста для запроса шлюза: общее с разбором, пока хватает.
+
+    Общее — чтобы шлюз и очередь к модели не гоняли её туда-сюда: Ollama
+    держит модель с тем окном, с каким её подняли, и запрос с другим
+    заставляет выгрузить и загрузить веса заново. Не хватает — окно
+    удваивается до того, в которое запрос помещается: перезагрузка раз в
+    долгий запрос дешевле молча обрезанной подсказки.
+    """
+    окно = окно_контекста(getattr(клиент, "settings", None) or {}, запрос["model"])
+    знаков = sum(len(str(м.get("content") or "")) for м in запрос["messages"])
+    ответ = int(запрос["сырое"].get("max_tokens") or 0) or 1200
+    нужно = знаков / ЗНАКОВ_НА_ТОКЕН + ответ
+    while окно < нужно and окно < ОКНО_НАИБОЛЬШЕЕ:
+        окно *= 2
+    return min(окно, ОКНО_НАИБОЛЬШЕЕ)
+
+
+def _тело_ollama(запрос: dict[str, Any], поток: bool,
+                 клиент: Any = None) -> dict[str, Any]:
     """Запрос в том виде, в каком его ждёт /api/chat Ollama."""
     сырое = запрос["сырое"]
     options: dict[str, Any] = {}
+    if клиент is not None:
+        options["num_ctx"] = _окно_для(клиент, запрос)
     if сырое.get("temperature") is not None:
         options["temperature"] = float(сырое["temperature"])
     if сырое.get("top_p") is not None:
@@ -487,6 +538,9 @@ def _тело_ollama(запрос: dict[str, Any], поток: bool) -> dict[str
     }
     if options:
         тело["options"] = options
+    think = _think_из_запроса(сырое, запрос["model"])
+    if think is not None:
+        тело["think"] = think
     # Формат ответа не навязываем: внутренний разбор просит JSON, потому
     # что сам его и читает, а чужому клиенту нужен обычный текст. Но если
     # клиент попросил JSON сам — просьбу передаём: у Ollama это не поле
@@ -515,9 +569,16 @@ def _тело_openai(запрос: dict[str, Any], поток: bool) -> dict[str
 
 
 def _ответ_openai(текст: str, запрос: dict[str, Any], usage: dict[str, Any] | None,
-                  finish: str = "stop") -> dict[str, Any]:
-    """Обычный (не потоковый) ответ в формате OpenAI."""
+                  finish: str = "stop", рассуждение: str = "") -> dict[str, Any]:
+    """Обычный (не потоковый) ответ в формате OpenAI.
+
+    Рассуждение модели — полем reasoning_content, как у DeepSeek и vLLM:
+    клиенты, которые его понимают, покажут, остальные пропустят молча.
+    """
     свод = usage or {}
+    сообщение: dict[str, Any] = {"role": "assistant", "content": текст}
+    if рассуждение:
+        сообщение["reasoning_content"] = рассуждение
     вход = int(свод.get("prompt_tokens") or 0)
     выход = int(свод.get("completion_tokens") or 0)
     return {
@@ -525,8 +586,7 @@ def _ответ_openai(текст: str, запрос: dict[str, Any], usage: dic
         "object": "chat.completion",
         "created": int(time.time()),
         "model": запрос["model"],
-        "choices": [{"index": 0, "finish_reason": finish,
-                     "message": {"role": "assistant", "content": текст}}],
+        "choices": [{"index": 0, "finish_reason": finish, "message": сообщение}],
         "usage": {"prompt_tokens": вход, "completion_tokens": выход,
                   "total_tokens": вход + выход},
     }
@@ -635,28 +695,45 @@ def _не_поток(ответ: Any) -> bool:
 # Обычный ответ
 # ---------------------------------------------------------------------------
 
-def _спросить(клиент: Any, запрос: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str]:
-    """Один вызов модели без потока: текст, токены, причина остановки."""
+def _спросить(клиент: Any, запрос: dict[str, Any]
+              ) -> tuple[str, dict[str, Any] | None, str, str]:
+    """Один вызов модели без потока: текст, токены, причина остановки, рассуждение.
+
+    Пустой ответ с рассуждением — не ошибка шлюза. Так отвечает и сам
+    OpenAI, когда рассуждение съело предел: пустой content и finish_reason
+    «length». Клиент это понимает и сам решает, что делать; ответ 502 на
+    такой случай выдавал бы за сбой сервера то, что сервер сделал верно.
+    Ошибка — только когда модель не сказала вообще ничего.
+    """
     if клиент.backend == "stub":
         from ..llm import stub  # noqa: PLC0415
 
         system, прочее = _подсказки(запрос["messages"])
-        return stub.reply(system, прочее), None, "stop"
+        return stub.reply(system, прочее), None, "stop", ""
     if клиент.backend == "ollama":
         данные = клиент._http("POST", f"{клиент.url}/api/chat",   # noqa: SLF001
-                              _тело_ollama(запрос, поток=False), timeout=клиент.timeout)
-        текст = str((данные.get("message") or {}).get("content") or "")
-        if not текст:
-            raise LLMError("Ollama вернул пустой ответ.")
-        return текст, _usage_ollama(данные), str(данные.get("done_reason") or "stop")
+                              _тело_ollama(запрос, поток=False, клиент=клиент),
+                              timeout=клиент.timeout)
+        сообщение = данные.get("message") or {}
+        текст, внутри = без_рассуждения(str(сообщение.get("content") or ""))
+        мысли = str(сообщение.get("thinking") or "") or внутри
+        причина = str(данные.get("done_reason") or "stop")
+        if not текст.strip() and not мысли and причина != "length":
+            raise LLMError("Ollama вернул пустой ответ: модель закончила, не сказав "
+                           "ни слова.")
+        return текст.strip(), _usage_ollama(данные), причина, мысли
     данные = клиент._http("POST", f"{клиент.url}/v1/chat/completions",  # noqa: SLF001
                           _тело_openai(запрос, поток=False), timeout=клиент.timeout)
     выборы = данные.get("choices") or []
     первый = выборы[0] if выборы else {}
-    текст = str((первый.get("message") or {}).get("content") or "")
-    if not текст:
+    сообщение = первый.get("message") or {}
+    текст, внутри = без_рассуждения(str(сообщение.get("content") or ""))
+    мысли = (str(сообщение.get("reasoning_content") or "")
+             or str(сообщение.get("reasoning") or "") or внутри)
+    причина = str(первый.get("finish_reason") or "stop")
+    if not текст.strip() and not мысли and причина != "length":
         raise LLMError("Сервер модели вернул пустой ответ.")
-    return текст, данные.get("usage"), str(первый.get("finish_reason") or "stop")
+    return текст.strip(), данные.get("usage"), причина, мысли
 
 
 def _одним_ответом(state: Any, клиент: Any, счёт: _Учёт,
@@ -664,7 +741,7 @@ def _одним_ответом(state: Any, клиент: Any, счёт: _Учё�
     начало = time.perf_counter()
     try:
         with _слот(клиент):
-            текст, usage, finish = _спросить(клиент, запрос)
+            текст, usage, finish, мысли = _спросить(клиент, запрос)
     except ШлюзЗанят as exc:
         # Занятая очередь — не сбой модели: в счётчик ошибок слоя он не
         # идёт, иначе «Состояние языковой модели» показывало бы неполадку
@@ -679,7 +756,8 @@ def _одним_ответом(state: Any, клиент: Any, счёт: _Учё�
                  f"состояние — GET /api/llm/status.")) from exc
     прошло = (time.perf_counter() - начало) * 1000
     _записать(state, клиент, счёт, прошло, usage=usage)
-    return _ответ_openai(текст, запрос, usage, finish=finish or "stop")
+    return _ответ_openai(текст, запрос, usage, finish=finish or "stop",
+                         рассуждение=мысли)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +780,15 @@ def _чанки_ollama(источник: Any, ид: str, создано: int,
             continue
         if данные.get("error"):
             raise LLMError(f"Ollama ответил ошибкой: {данные['error']}")
-        кусок = str((данные.get("message") or {}).get("content") or "")
+        сообщение = данные.get("message") or {}
+        # Рассуждение идёт своими кусками и раньше ответа. Без этого клиент
+        # рассуждающей модели минуту смотрел на пустой поток — и чаще всего
+        # решал, что соединение умерло.
+        мысль = str(сообщение.get("thinking") or "")
+        if мысль:
+            yield _строка_чанка(ид, создано, модель,
+                                {"reasoning_content": мысль}, None), None
+        кусок = str(сообщение.get("content") or "")
         if кусок:
             yield _строка_чанка(ид, создано, модель, {"content": кусок}, None), None
         if данные.get("done"):
@@ -842,7 +928,7 @@ def _потоком(state: Any, клиент: Any, счёт: _Учёт,
             источник = None
         elif клиент.backend == "ollama":
             источник = _открыть_поток(клиент, f"{клиент.url}/api/chat",
-                                      _тело_ollama(запрос, поток=True))
+                                      _тело_ollama(запрос, поток=True, клиент=клиент))
         else:
             источник = _открыть_поток(клиент, f"{клиент.url}/v1/chat/completions",
                                       _тело_openai(запрос, поток=True))

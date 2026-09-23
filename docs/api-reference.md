@@ -888,7 +888,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:23772",
+  "instance": "vm:16754",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1466,7 +1466,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1789639718.3432887,
+    "generated_at": 1790171640.2869325,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1633,8 +1633,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.9",
-  "uptime_s": 109.6,
+  "version": "3.1.10",
+  "uptime_s": 109.0,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1713,18 +1713,18 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.9",
-  "uptime_s": 109.6,
+  "version": "3.1.10",
+  "uptime_s": 109.1,
   "hardware": {
     "os_name": "Linux",
-    "os_version": "6.18.44-fc-v33",
+    "os_version": "6.18.44-fc-v37",
     "arch": "x86_64",
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 7.0,
-    "disk_free_gb": 15.8,
+    "disk_free_gb": 15.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1735,7 +1735,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 15.8 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 15.9 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -2911,6 +2911,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/status
     "outcome",
     "actions"
   ],
+  "think": "off",
+  "num_ctx": null,
+  "max_tokens": 1200,
   "available": true,
   "reason": "заглушка отвечает без модели",
   "worker": {

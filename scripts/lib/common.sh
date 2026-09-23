@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.9"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.10"
 ASRHUB_MIN_PYTHON="3.10"
 # Верхняя граница — не каприз, а состояние экосистемы. Движки распознавания
 # тянут за собой torch, onnxruntime, nemo и десяток библиотек с колёсами под
