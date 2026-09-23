@@ -322,8 +322,17 @@ print()
 
     Write-Info "Установка движка «$Engine»…"
     Invoke-WithRetry -Attempts 2 -Description $Engine -Action {
-        Invoke-Checked -Command $venvPip -Arguments @('install', '--disable-pip-version-check', '-r', $req)
+        # Та же функция, что у установщика: голый «pip install -r» не знал
+        # про спутники no-deps и optional, и «models.ps1 install-engine
+        # gigaam» печатал «установлен», не поставив сам gigaam — его пакет
+        # только в no-deps\gigaam.txt.
+        Install-EngineRequirements -Pip $venvPip -Requirements $req `
+            -PipFlags @('--disable-pip-version-check')
     } | Out-Null
+    # Движок мог утащить общий пакет под свой пин — возвращаем заданное нами.
+    $requirementsDir = Join-Path $Prefix 'requirements'
+    Install-Overrides -Pip $venvPip -RequirementsDir $requirementsDir
+    Remove-RetiredPackages -Pip $venvPip -RequirementsDir $requirementsDir
     Write-Ok "Движок «$Engine» установлен"
 }
 
@@ -331,13 +340,17 @@ print()
     if (-not $Engine) { Write-Err 'Укажите движок.'; exit 2 }
     $req = Join-Path $Prefix ("requirements\engines\" + ($Engine -replace '_', '-') + '.txt')
     if (-not (Test-Path $req)) { Write-Err "Нет файла зависимостей."; exit 2 }
-    $packages = Get-Content $req | Where-Object { $_ -and $_ -notmatch '^\s*(#|--)' } |
-        ForEach-Object { ($_ -split '[<>=!@]')[0].Trim() } | Where-Object { $_ }
+    # Вместе со спутниками no-deps и optional: движок снимается тем же
+    # набором, каким ставился. Раньше читался один файл, и «remove-engine
+    # gigaam» оставлял сам gigaam на месте.
+    $packages = @(Get-EnginePackages -Requirements $req)
     Write-Info "Будут удалены пакеты: $($packages -join ', ')"
     Write-Warn 'Некоторые пакеты могут использоваться другими движками.'
     if (-not (Confirm-Action 'Продолжить?' 'n')) { exit 0 }
-    & (Join-Path $Prefix 'venv\Scripts\pip.exe') uninstall -y @packages
+    $venvPip = Join-Path $Prefix 'venv\Scripts\pip.exe'
+    & $venvPip uninstall -y @packages
     Write-Ok "Движок «$Engine» удалён"
+    Remove-RetiredPackages -Pip $venvPip -RequirementsDir (Join-Path $Prefix 'requirements')
 }
 
 'disk' {

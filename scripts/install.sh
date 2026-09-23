@@ -1111,6 +1111,9 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
   # мы задали сами, — до проверки, иначе она отчитается о состоянии, которое
   # мы сами же собираемся исправить.
   apply_overrides "${VPIP}" "${PREFIX}/requirements"
+  # Установка поверх прежней оставляет её окружение — вместе с тем, что
+  # прежние версии ставили и потом перестали. Убираем до проверки.
+  remove_retired_packages "${VPIP}" "${PREFIX}/requirements"
   check_dependency_health "${VPIP}" "${PREFIX}/requirements"
 
   if [[ "${ENGINES}" == *whisper_cpp* ]]; then

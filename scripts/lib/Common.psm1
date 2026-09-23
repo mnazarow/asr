@@ -18,7 +18,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.10'
+    $script:AsrHubVersion = '3.1.11'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
@@ -167,6 +167,9 @@ function Invoke-Checked {
     # Решение принимаем по коду возврата, как и задумано.
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # Сброс, о котором говорит комментарий ниже, — раньше он был только в
+    # комментарии: код возврата оставался от прежней внешней программы.
+    $global:LASTEXITCODE = 0
     try {
         $output = & $Command @Arguments 2>&1
     } finally {
@@ -277,6 +280,218 @@ function Install-Overrides {
         Write-Warn 'Не удалось вернуть версии из overrides.txt.'
         Write-Hint "Проверьте вручную: $Pip install --no-deps -r $file"
     }
+}
+
+# ---------------------------------------------------------------------------
+# Пакеты окружения: чьи они и нужны ли ещё
+# ---------------------------------------------------------------------------
+#
+# Двойники функций из common.sh (_pip_name, required_packages,
+# engine_package, remove_retired_packages). Скрипты для Linux и Windows —
+# пара, и расхождение между ними видно только на чужой машине: на сервере
+# лишний пакет убрался, на ноутбуке остался и жалуется до сих пор.
+
+function ConvertTo-PipName {
+    <# Имя пакета в том виде, в каком его сравнивает pip: «Nemo_Toolkit» и
+       «nemo-toolkit» — одно имя. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+    return ($Name.Trim().ToLowerInvariant() -replace '[_.]', '-')
+}
+
+function Get-RequirementName {
+    <# Имя пакета из строки требований; пустая строка — если это не пакет
+       (комментарий, ключ pip вроде --extra-index-url). #>
+    param([AllowEmptyString()][string]$Line)
+    $line = ($Line -split '#')[0]
+    # Прямая ссылка PEP 508 — «пакет @ git+https://…»: имя до «@».
+    $line = ($line -split '@')[0]
+    $name = ($line -split '[<>=!~;\[]')[0].Trim()
+    if (-not $name -or $name.StartsWith('-')) { return '' }
+    return $name
+}
+
+function Get-RequirementNames {
+    <# Имена всех пакетов, которые ещё перечислены хоть в одном списке
+       требований под каталогом, — в написании pip. #>
+    param([Parameter(Mandatory)][string]$RequirementsDir)
+    if (-not (Test-Path $RequirementsDir)) { return @() }
+    $names = foreach ($file in (Get-ChildItem $RequirementsDir -Recurse -Filter '*.txt' -File)) {
+        foreach ($line in (Get-Content $file.FullName)) {
+            $name = Get-RequirementName $line
+            if ($name) { ConvertTo-PipName $name }
+        }
+    }
+    return @($names | Sort-Object -Unique)
+}
+
+function Test-PackageInFamily {
+    <# То же имя или спутник через дефис: «nemo-toolkit-asr» при требуемом
+       «nemo_toolkit» — семья требуемого, а не чужой пакет. #>
+    param([string]$Name, [string[]]$Family = @())
+    foreach ($want in $Family) {
+        if (-not $want) { continue }
+        if ($Name -eq $want -or $Name.StartsWith("$want-")) { return $true }
+    }
+    return $false
+}
+
+function Get-PipPackageUsers {
+    <#
+    .SYNOPSIS
+        Установлен ли пакет и кто из установленных на него опирается.
+    .OUTPUTS
+        Объект с полями Installed и Users. Объект, а не массив: пустой
+        массив, возвращённый из функции, PowerShell превращает в $null, и
+        «никто не опирается» стало бы неотличимо от «не установлен».
+    #>
+    param([Parameter(Mandatory)][string]$Pip, [Parameter(Mandatory)][string]$Name)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    try { $shown = @(& $Pip show $Name 2>$null) } finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Installed = $false; Users = @() } }
+    $users = @()
+    foreach ($line in $shown) {
+        if ("$line" -match '^Required-by:\s*(.*)$') {
+            $users = @($Matches[1] -split ',' | ForEach-Object { $_.Trim() } |
+                Where-Object { $_ } | ForEach-Object { ConvertTo-PipName $_ })
+        }
+    }
+    return [pscustomobject]@{ Installed = $true; Users = $users }
+}
+
+function Get-RetiredPackages {
+    <# Имена из списка снятых пакетов, в написании pip. #>
+    param([string]$ListFile = (Join-Path $PSScriptRoot 'retired-packages.txt'))
+    if (-not (Test-Path $ListFile)) { return @() }
+    $names = foreach ($line in (Get-Content $ListFile)) {
+        $name = ($line -split '#')[0].Trim()
+        if ($name) { ConvertTo-PipName $name }
+    }
+    return @($names | Sort-Object -Unique)
+}
+
+function Remove-RetiredPackages {
+    <#
+    .SYNOPSIS
+        Снимает пакеты, которые ставили прежние версии и которые больше не нужны.
+    .DESCRIPTION
+        Двойник remove_retired_packages из common.sh; условия и их смысл —
+        в самом списке, lib\retired-packages.txt. Снимается только то, чего
+        нет в требованиях и на чём не держится ничего, кроме снимаемого же.
+        Вызывать после Install-Overrides: итог должен описывать окружение
+        уже без них.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Pip,
+        [Parameter(Mandatory)][string]$RequirementsDir,
+        [string]$ListFile = (Join-Path $PSScriptRoot 'retired-packages.txt')
+    )
+    if (-not (Test-Path $Pip)) { return }
+    $retired = @(Get-RetiredPackages -ListFile $ListFile)
+    if ($retired.Count -eq 0) { return }
+    $required = @(Get-RequirementNames -RequirementsDir $RequirementsDir)
+
+    $usersOf = @{}
+    foreach ($name in $retired) {
+        if (Test-PackageInFamily -Name $name -Family $required) {
+            Write-Debug2 "$name снова в требованиях — строку в retired-packages.txt пора убрать"
+            continue
+        }
+        $info = Get-PipPackageUsers -Pip $Pip -Name $name
+        if ($info.Installed) { $usersOf[$name] = @($info.Users) }
+    }
+    $doomed = [System.Collections.Generic.List[string]]::new()
+    # По алфавиту, как и в common.sh: порядок хеш-таблицы случаен, а журнал
+    # двух прогонов на одном окружении должен совпадать.
+    foreach ($name in @($usersOf.Keys | Sort-Object)) { $doomed.Add($name) }
+
+    # По кругу: оставленный пакет сам становится опорой для других.
+    do {
+        $changed = $false
+        foreach ($name in @($doomed)) {
+            foreach ($user in $usersOf[$name]) {
+                if (-not $doomed.Contains($user)) {
+                    Write-Debug2 "$name не снимаем: на нём держится $user"
+                    [void]$doomed.Remove($name)
+                    $changed = $true
+                    break
+                }
+            }
+        }
+    } while ($changed)
+    if ($doomed.Count -eq 0) { return }
+
+    $names = @($doomed | Sort-Object)
+    if (Get-DryRun) {
+        Write-Info "Пробный запуск: сняли бы оставшееся от прежних версий — $($names -join ', ')"
+        return
+    }
+    try {
+        Invoke-Checked -Command $Pip -Arguments (@('uninstall', '-y') + $names) | Out-Null
+        Write-Ok "Убрано оставшееся от прежних версий: $($names -join ', ')"
+    } catch {
+        Write-Warn "Не удалось убрать оставшееся от прежних версий: $($names -join ', ')"
+        Write-Hint "  $Pip uninstall -y $($names -join ' ')"
+    }
+}
+
+function Get-EnginePackage {
+    <#
+    .SYNOPSIS
+        Собственный пакет движка — по нему судят, установлен ли движок.
+    .DESCRIPTION
+        Первая настоящая строка файла-спутника no-deps, а без него — самого
+        файла требований: файлы так и написаны, сначала движок, потом его
+        окружение. Любая строка не годится: pyannote.audio стоит ради
+        диаризации, и по нему whisperx «оказывался» установленным.
+    #>
+    param([Parameter(Mandatory)][string]$Requirements)
+    $dir = Split-Path -Parent $Requirements
+    $leaf = Split-Path -Leaf $Requirements
+    $file = Join-Path (Join-Path $dir 'no-deps') $leaf
+    if (-not (Test-Path $file)) { $file = $Requirements }
+    if (-not (Test-Path $file)) { return '' }
+    foreach ($line in (Get-Content $file)) {
+        $name = Get-RequirementName $line
+        if ($name) { return $name }
+    }
+    return ''
+}
+
+function Test-EngineInstalled {
+    <# Установлен ли движок — по его собственному пакету. #>
+    param([Parameter(Mandatory)][string]$Pip, [Parameter(Mandatory)][string]$Requirements)
+    $name = Get-EnginePackage -Requirements $Requirements
+    if (-not $name) { return $false }
+    return [bool](Get-PipPackageUsers -Pip $Pip -Name $name).Installed
+}
+
+function Get-EnginePackages {
+    <#
+    .SYNOPSIS
+        Все пакеты движка: его файл, спутник no-deps и необязательная часть.
+    .DESCRIPTION
+        Снимается движок тем же набором, каким ставился. Без спутников
+        «remove-engine gigaam» снимал окружение GigaAM, а сам gigaam
+        (он только в no-deps\gigaam.txt) оставлял на месте.
+    #>
+    param([Parameter(Mandatory)][string]$Requirements)
+    $dir = Split-Path -Parent $Requirements
+    $leaf = Split-Path -Leaf $Requirements
+    $optional = Join-Path $dir 'optional'
+    $files = @($Requirements,
+               (Join-Path (Join-Path $dir 'no-deps') $leaf),
+               (Join-Path $optional $leaf),
+               (Join-Path (Join-Path $optional 'no-deps') $leaf))
+    $names = foreach ($file in $files) {
+        if (-not (Test-Path $file)) { continue }
+        foreach ($line in (Get-Content $file)) {
+            $name = Get-RequirementName $line
+            if ($name) { $name }
+        }
+    }
+    return @($names | Select-Object -Unique)
 }
 
 function Confirm-Action {

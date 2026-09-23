@@ -572,6 +572,9 @@ if ($Mode -eq 'docker') {
     # Версии, которые мы выбрали сами вопреки требованиям чужих пакетов.
     # Ставится последним и с --no-deps — иначе смысла нет.
     Install-Overrides -Pip $venvPip -RequirementsDir (Join-Path $Prefix 'requirements')
+    # Установка поверх прежней оставляет её окружение — вместе с тем, что
+    # прежние версии ставили и потом перестали.
+    Remove-RetiredPackages -Pip $venvPip -RequirementsDir (Join-Path $Prefix 'requirements')
 }
 
 # ---------------------------------------------------------------------------

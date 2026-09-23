@@ -198,26 +198,29 @@ if ($dockerMode) {
             '--disable-pip-version-check', '-r', (Join-Path $Prefix 'requirements\base.txt'))
     } | Out-Null
     foreach ($req in (Get-ChildItem (Join-Path $Prefix 'requirements\engines') -Filter '*.txt')) {
-        # Имя файла требований не равно имени модуля: у diarization, vad,
-        # postprocess, mfa, qwen3-asr и ещё нескольких такого модуля нет
-        # вовсе, и проверка молча не срабатывала — эти движки не
-        # обновлялись никогда. Спрашиваем pip про сами пакеты из файла.
-        $installed = $false
-        foreach ($line in (Get-Content $req.FullName)) {
-            $name = ($line -split '#')[0]
-            $name = ($name -split '[<>=!;\[]')[0].Trim()
-            if (-not $name) { continue }
-            & $venvPip show $name *> $null
-            if ($LASTEXITCODE -eq 0) { $installed = $true; break }
-        }
-        if ($installed) {
+        # Установлен ли движок — по его собственному пакету, как в update.sh.
+        # Раньше годилась любая строка файла: whisperx считался установленным
+        # из-за pyannote.audio, который стоит ради диаризации, и обновление
+        # ставило движок, которого никто не выбирал. А GigaAM, наоборот,
+        # узнавался по чужому hydra-core — его собственный пакет лежит только
+        # в no-deps\gigaam.txt, и этот файл здесь не читался вовсе.
+        if (Test-EngineInstalled -Pip $venvPip -Requirements $req.FullName) {
             Write-Info "Движок $($req.BaseName) установлен — обновляем"
             try {
-                Invoke-Checked -Command $venvPip -Arguments @('install', '--upgrade',
-                    '--disable-pip-version-check', '-r', $req.FullName) | Out-Null
-            } catch { Write-Warn "  $($req.BaseName): обновление не удалось" }
+                # Не голый «pip install -r»: без спутников no-deps и optional
+                # сам GigaAM не обновлялся никогда, а необязательная часть
+                # движка — тоже. Та же функция, что и у установщика.
+                Install-EngineRequirements -Pip $venvPip -Requirements $req.FullName `
+                    -PipFlags @('--upgrade', '--disable-pip-version-check')
+            } catch { Write-Warn "  $($req.BaseName): обновление не удалось, остаётся прежняя версия" }
         }
     }
+    # Движки перетянули общие пакеты под свои пины — возвращаем заданное нами,
+    # как это делает update.sh. Здесь этого не было вовсе, и Windows после
+    # обновления оставалась с версиями, которые на Linux считаются негодными.
+    Install-Overrides -Pip $venvPip -RequirementsDir (Join-Path $Prefix 'requirements')
+    # Пакеты, которые ставили прежние версии и которые больше не нужны.
+    Remove-RetiredPackages -Pip $venvPip -RequirementsDir (Join-Path $Prefix 'requirements')
     Write-Ok 'Зависимости обновлены'
 } else { Write-Warn 'Виртуальное окружение не найдено.' }
 

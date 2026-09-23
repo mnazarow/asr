@@ -489,6 +489,7 @@ print('Проверка:', cls.check_available() if cls else 'движок не�
     # здесь, а не через неделю по необъяснимому отказу загрузки.
     # Движок мог утащить общий пакет под свой пин — возвращаем заданное нами.
     apply_overrides "${VPIP}" "${REQ_ROOT}"
+    remove_retired_packages "${VPIP}" "${REQ_ROOT}"
     check_dependency_health "${VPIP}" "${REQ_ROOT}"
   else
     error "Установка не удалась."
@@ -530,9 +531,13 @@ remove-engine)
   # снимается вместе с ним — иначе в окружении оставался бы пакет, которого
   # в списке движка уже нет.
   OPTIONAL="$(dirname "${REQ}")/optional/$(basename "${REQ}")"
-  PACKAGES="$(cat "${REQ}" "${NODEPS}" "${OPTIONAL}" 2>/dev/null \
-    | grep -vE '^\s*(#|$|--)' \
-    | sed -e 's/[[:space:]]*@.*//' -e 's/[<>=!].*//' \
+  # И её спутник с --no-deps: у postprocess там nemo-text-processing, и без
+  # этой строки движок снимался без собственной нормализации чисел — её
+  # пакет оставался в окружении сиротой.
+  OPTIONAL_NODEPS="$(dirname "${REQ}")/optional/no-deps/$(basename "${REQ}")"
+  PACKAGES="$(cat "${REQ}" "${NODEPS}" "${OPTIONAL}" "${OPTIONAL_NODEPS}" 2>/dev/null \
+    | grep -vE '^\s*(#|$|-)' \
+    | sed -e 's/#.*//' -e 's/[[:space:]]*@.*//' -e 's/[[<>=!~;].*//' -e 's/[[:space:]]*$//' \
     | tr '\n' ' ' || true)"
   info "Будут удалены пакеты: ${PACKAGES}"
   warn "Некоторые пакеты могут использоваться другими движками."
@@ -542,7 +547,9 @@ remove-engine)
   # Удаление ломает окружение не реже установки: предупреждение выше говорит
   # «могут использоваться другими движками», но кем именно — не говорит.
   # Проверка отвечает на это прямо, и сразу, пока понятно, из-за чего.
-  check_dependency_health "${VPIP}" "$(cd "$(dirname "${REQ}")/.." && pwd)"
+  REQ_ROOT="$(cd "$(dirname "${REQ}")/.." && pwd)"
+  remove_retired_packages "${VPIP}" "${REQ_ROOT}"
+  check_dependency_health "${VPIP}" "${REQ_ROOT}"
   ;;
 
 disk)

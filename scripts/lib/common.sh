@@ -49,7 +49,14 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.10"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.11"
+# Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
+# пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
+# сменить каталог, и относительный путь указывал бы в никуда. Те же
+# ограничения, что и выше: cd и pwd — встроенные команды.
+_ASRHUB_LIB_DIR="${BASH_SOURCE[0]%/*}"
+[[ "${_ASRHUB_LIB_DIR}" == "${BASH_SOURCE[0]}" ]] && _ASRHUB_LIB_DIR="."
+_ASRHUB_LIB_DIR="$(cd "${_ASRHUB_LIB_DIR}" 2>/dev/null && pwd)" || _ASRHUB_LIB_DIR=""
 ASRHUB_MIN_PYTHON="3.10"
 # Верхняя граница — не каприз, а состояние экосистемы. Движки распознавания
 # тянут за собой torch, onnxruntime, nemo и десяток библиотек с колёсами под
@@ -946,12 +953,136 @@ required_packages() {
     while IFS= read -r line; do
       line="${line%%#*}"
       line="${line%%@*}"
-      line="${line%%[<>=!;[]*}"
+      line="${line%%[<>=!~;[]*}"
       name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+      # «-r base.txt» и «--extra-index-url …» — ключи pip, а не пакеты.
+      [[ "${name}" == -* ]] && continue
       [[ -n "${name}" ]] && names="${names}${name}"$'\n'
     done < "${file}"
   done < <(find "${root}" -name '*.txt' 2>/dev/null)
   printf '%s' "${names}" | tr '_.' '--' | tr '[:upper:]' '[:lower:]' | sort -u
+}
+
+# Имя пакета в том виде, в каком его сравнивает pip.
+#
+#   _pip_name ИМЯ
+_pip_name() {
+  printf '%s' "$1" | tr '_.' '--' | tr '[:upper:]' '[:lower:]'
+}
+
+# Принадлежит ли пакет семье одного из перечисленных: то же имя или его
+# спутник через дефис — «nemo-toolkit-asr» при требуемом «nemo_toolkit».
+#
+#   _package_in_family ИМЯ СПИСОК_ИМЁН
+_package_in_family() {
+  local subject="$1" want
+  while IFS= read -r want; do
+    [[ -n "${want}" ]] || continue
+    if [[ "${subject}" == "${want}" || "${subject}" == "${want}-"* ]]; then
+      return 0
+    fi
+  done <<< "$2"
+  return 1
+}
+
+# Имена из списка снятых пакетов — по одному на строку, в написании pip.
+#
+#   retired_packages [ФАЙЛ]
+retired_packages() {
+  local file="${1:-${_ASRHUB_LIB_DIR}/retired-packages.txt}" line name names=""
+  [[ -f "${file}" ]] || return 0
+  # `|| [[ -n … ]]` — последняя строка без перевода строки тоже строка:
+  # файл, поправленный в редакторе, который его не ставит, иначе терял бы
+  # ровно последний добавленный пакет.
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%%#*}"
+    name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+    [[ -n "${name}" ]] && names="${names}$(_pip_name "${name}")"$'\n'
+  done < "${file}"
+  printf '%s' "${names}" | sort -u
+}
+
+# Снимает пакеты, которые ставили прежние версии и которые больше не нужны.
+#
+#   remove_retired_packages ПУТЬ_К_PIP КАТАЛОГ_ТРЕБОВАНИЙ [СПИСОК_СНЯТЫХ]
+#
+# Подсказка из версии 3.1.9 называла лишний пакет и печатала команду
+# удаления — и на рабочем сервере так подсказкой и осталась: обновление за
+# обновлением пункт «Обновление зависимостей» выходил с «!», а optimum-onnx
+# продолжал жаловаться на transformers. Поставили его туда мы сами, и знаем
+# об этом мы, а не человек, — значит, и убирать нам.
+#
+# Условия, при которых пакет снимается, и их смысл — в самом списке,
+# scripts/lib/retired-packages.txt. Вызывать до check_dependency_health:
+# итог должен описывать окружение уже без них, иначе проверка отчитается о
+# том, что мы тут же и исправили.
+remove_retired_packages() {
+  local pip="$1" root="${2:-}" list="${3:-${_ASRHUB_LIB_DIR}/retired-packages.txt}"
+  local retired required name shown users user entry doomed="" graph="" changed=1
+  [[ -x "${pip}" ]] || return 0
+  retired="$(retired_packages "${list}")"
+  [[ -n "${retired}" ]] || return 0
+  required="$(required_packages "${root}")"
+
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    if _package_in_family "${name}" "${required}"; then
+      # Снова в требованиях — пакет опять наш, а строка списка устарела.
+      debug "${name} снова в требованиях — строку в retired-packages.txt пора убрать"
+      continue
+    fi
+    # Код возврата pip show и есть ответ «установлен ли»: на отсутствующий
+    # пакет он отвечает единицей и предупреждением.
+    shown="$("${pip}" show "${name}" 2>/dev/null)" || continue
+    users="$(sed -n 's/^Required-by:[[:space:]]*//p' <<<"${shown}" | tr ',' ' ')"
+    entry="${name}"
+    for user in ${users}; do
+      entry="${entry} $(_pip_name "${user}")"
+    done
+    doomed="${doomed}${name}"$'\n'
+    graph="${graph}${entry}"$'\n'
+  done <<< "${retired}"
+  [[ -n "${doomed}" ]] || return 0
+
+  # Снимаем только то, на чём не держится ничего, кроме снимаемого же:
+  # optimum держится за optimum-onnx — оба уходят вместе. По кругу — потому
+  # что оставленный пакет сам становится опорой: если optimum-onnx нужен
+  # чужому пакету, остаётся и он, и optimum, на котором он стоит.
+  while [[ ${changed} -eq 1 ]]; do
+    changed=0
+    while IFS= read -r entry; do
+      [[ -n "${entry}" ]] || continue
+      name="${entry%% *}"
+      grep -qxF "${name}" <<<"${doomed}" || continue
+      for user in ${entry#"${name}"}; do
+        if ! grep -qxF "${user}" <<<"${doomed}"; then
+          debug "${name} не снимаем: на нём держится ${user}"
+          doomed="$(grep -vxF "${name}" <<<"${doomed}" || true)"
+          [[ -n "${doomed}" ]] && doomed="${doomed}"$'\n'
+          changed=1
+          break
+        fi
+      done
+    done <<< "${graph}"
+  done
+  doomed="$(printf '%s' "${doomed}" | tr '\n' ' ')"
+  doomed="${doomed% }"
+  [[ -n "${doomed}" ]] || return 0
+
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    info "Пробный запуск: сняли бы оставшееся от прежних версий — ${doomed// /, }"
+    return 0
+  fi
+  # shellcheck disable=SC2086  # имена пакетов — отдельными доводами
+  if run "${pip}" uninstall -y ${doomed}; then
+    ok "Убрано оставшееся от прежних версий: ${doomed// /, }"
+    # В чек-лист — заметкой, не предупреждением: это сделано, а не случилось.
+    checklist_note "·" keep "Убрано оставшееся от прежних версий: ${doomed// /, }"
+  else
+    warn "Не удалось убрать оставшееся от прежних версий: ${doomed// /, }"
+    hint "  ${pip} uninstall -y ${doomed}"
+  fi
+  return 0
 }
 
 # Пакеты, оставшиеся от прежней версии сервера: их имена одной строкой.
@@ -973,7 +1104,7 @@ required_packages() {
 # Возвращает имена через пробел; печатает пусть вызывающий — ему виднее,
 # сколько строк у него осталось на экране.
 orphan_packages_in() {
-  local text="$1" root="${2:-}" pip="${3:-}" required="" line subject want mine
+  local text="$1" root="${2:-}" pip="${3:-}" required="" line subject
   local needed orphans="" checked=0
   [[ -x "${pip}" ]] || return 0
   required="$(required_packages "${root}")"
@@ -981,19 +1112,10 @@ orphan_packages_in() {
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     [[ ${checked} -ge 10 ]] && break
-    subject="$(printf '%s' "${line}" | awk '{print $1}' \
-      | tr '_.' '--' | tr '[:upper:]' '[:lower:]')"
+    subject="$(_pip_name "$(printf '%s' "${line}" | awk '{print $1}')")"
     [[ -n "${subject}" ]] || continue
     grep -qxF "${subject}" <<<"${orphans}" && continue
-    mine=0
-    while IFS= read -r want; do
-      [[ -n "${want}" ]] || continue
-      if [[ "${subject}" == "${want}" || "${subject}" == "${want}-"* ]]; then
-        mine=1
-        break
-      fi
-    done <<< "${required}"
-    [[ ${mine} -eq 1 ]] && continue
+    _package_in_family "${subject}" "${required}" && continue
     checked=$((checked + 1))
     needed="$("${pip}" show "${subject}" 2>/dev/null \
       | sed -n 's/^Required-by:[[:space:]]*//p' | tr -d '[:space:]')"
@@ -1088,7 +1210,11 @@ check_dependency_health() {
   local remedy
   remedy="$(orphan_packages_in "${out}" "${root}" "${pip}")"
   if [[ -n "${remedy}" ]]; then
-    hint "Лишнее от прежней версии (в требованиях их нет, никто не тянет):"
+    # Своё, снятое в прежних версиях, к этому месту уже убрано само —
+    # remove_retired_packages. Остаётся то, происхождения чего мы не знаем:
+    # руками в окружение сервера ставят и своё. Поэтому не «лишнее от
+    # прежней версии», а «не из наших списков», и решает человек.
+    hint "Не из наших требований, и никто их не тянет — если ставили не вы:"
     hint "  ${pip} uninstall -y ${remedy}"
   fi
   # Это итог после всех установок, поэтому он и заменяет промежуточные
