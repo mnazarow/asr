@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -64,6 +65,33 @@ def backup_dir(settings: Any) -> Path:
     return Path(задан) if задан else Path(settings.paths.data) / "backups"
 
 
+def как_у_каталога(каталог: Path, *пути: Path) -> None:
+    """Отдаёт файлы владельцу каталога данных, если работаем от root.
+
+    Резервную копию и восстановление из командной строки запускают через
+    sudo: каталог данных (0750) принадлежит пользователю службы, и `stop`
+    требует root. Всё, что при этом создавал Python, оставалось root:
+    восстановленная база открывалась службой только на чтение («attempt to
+    write a readonly database» на первом же задании, хотя /health отвечал),
+    а каталог копий, созданный первым `service.sh backup`, закрывал дорогу
+    всем следующим копиям по расписанию. Пути, которых нет, пропускаются.
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    try:
+        свой = каталог.stat()
+    except OSError:
+        return
+    if свой.st_uid == 0:
+        return
+    for путь in пути:
+        try:
+            if путь.exists():
+                os.chown(путь, свой.st_uid, свой.st_gid)
+        except OSError as exc:
+            log.warning("Не удалось вернуть владельца %s: %s", путь, exc)
+
+
 def make_backup(db: Any, settings: Any) -> Path | None:
     """Снимает копию базы и убирает лишние.
 
@@ -74,11 +102,14 @@ def make_backup(db: Any, settings: Any) -> Path | None:
     делать так же, как советует человеку.
     """
     каталог = backup_dir(settings)
+    новый = not каталог.exists()
     try:
         каталог.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         log.warning("Каталог для резервных копий недоступен (%s): %s", каталог, exc)
         return None
+    if новый:
+        как_у_каталога(Path(settings.paths.data), каталог)
 
     # Подчистка ДО копирования, а не после. Каталог копий по умолчанию лежит
     # на той же файловой системе, что и база: если места хватает ровно на
@@ -100,6 +131,9 @@ def make_backup(db: Any, settings: Any) -> Path | None:
     цель = каталог / f"asrhub-{метка}-{_кто()}.db"
     начало = time.time()
     try:
+        # Копия базы — вся база разговоров: 0600, как и архивы копий.
+        цель.touch(mode=0o600, exist_ok=True)
+        os.chmod(цель, 0o600)
         приёмник = sqlite3.connect(str(цель))
         try:
             with приёмник:
@@ -111,6 +145,7 @@ def make_backup(db: Any, settings: Any) -> Path | None:
         цель.unlink(missing_ok=True)
         return None
 
+    как_у_каталога(Path(settings.paths.data), цель)
     размер = цель.stat().st_size
     log.info("Резервная копия: %s, %.1f МБ, за %.1f с",
              цель, размер / 1024 / 1024, time.time() - начало)
@@ -674,6 +709,7 @@ def restore(path: Path, target: Path) -> None:
         if спутник.exists():
             спутник.rename(Path(str(спутник) + f".before-restore-{метка}"))
     shutil.copy2(path, target)
+    как_у_каталога(target.parent, target)
     log.info("База восстановлена из %s", path)
 
 

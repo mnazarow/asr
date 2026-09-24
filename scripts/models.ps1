@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Менеджер моделей и движков ASR Hub для Windows.
 .EXAMPLE
@@ -20,12 +20,23 @@ param(
     [string]$Language = '',
     [switch]$Installed,
     [switch]$Force,
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1') -Force
-Set-AssumeYes $Yes.IsPresent
+# Из install.ps1 этот скрипт зовут в том же процессе, и модуль там уже
+# загружен. Повторный Import-Module -Force пересоздавал его и сбрасывал у
+# ВЫЗЫВАЮЩЕГО пробный запуск, список отката и журнал: `install.ps1 -DryRun`
+# поверх установки качал модели и пересоздавал службу по-настоящему, а
+# обычная установка после загрузки моделей теряла откат.
+if (-not (Get-Module -Name Common)) {
+    Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1')
+}
+# Только включаем, но не выключаем: вызов без -Yes из установщика, запущенного
+# с -Yes, раньше снимал согласие и у самого установщика.
+if ($Yes) { Set-AssumeYes $true }
+if ($DryRun) { Set-DryRun $true }
 
 if (-not $Prefix) {
     foreach ($c in @('C:\Program Files\ASRHub', (Join-Path $env:LOCALAPPDATA 'ASRHub'),
@@ -41,6 +52,14 @@ if (-not $DataDir) {
 }
 
 $modelsDir = Join-Path $DataDir 'models'
+
+# Пробный запуск ничего не качает, не удаляет и не ставит. Смотреть список,
+# карточку модели и занятое место можно как обычно.
+if ((Get-DryRun) -and $Action -in @('download', 'remove', 'install-engine', 'remove-engine')) {
+    $what = if ($Model) { $Model } else { $Engine }
+    Write-Host "[пробный запуск] models.ps1 -Action $Action $what" -ForegroundColor Yellow
+    return
+}
 $venvPython = Join-Path $Prefix 'venv\Scripts\python.exe'
 $python = if (Test-Path $venvPython) { $venvPython } else { Find-Python }
 if (-not $python) { Write-Err 'Не найден Python.'; exit 1 }

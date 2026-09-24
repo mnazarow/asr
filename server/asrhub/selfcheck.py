@@ -1104,6 +1104,7 @@ def _очередь(state: Any, глубоко: bool) -> dict[str, Any]:
 
 def _движки(state: Any, глубоко: bool) -> dict[str, Any]:
     """Какие движки установлены и доступен ли выбранный."""
+    from .catalog import get_model  # noqa: PLC0415
     from .engines import engine_status  # noqa: PLC0415
 
     список = engine_status()
@@ -1111,8 +1112,32 @@ def _движки(state: Any, глубоко: bool) -> dict[str, Any]:
     выбран = str(state.settings.get("engine") or "").strip()
     проверки: list[dict[str, Any]] = []
 
+    # «auto» (его пишет установщик) и пустое значение — не движок, а «движок
+    # модели по умолчанию»: так их понимает и реестр при каждом задании.
+    # Раньше «auto» искался среди движков, не находился, и самопроверка
+    # объявляла неисправность на каждой штатной установке — с советом
+    # сменить параметр, который как раз задан правильно.
+    по_модели = ""
+    if выбран.lower() in ("", "auto"):
+        модель = get_model(str(state.settings.get("model") or ""))
+        if модель is None:
+            проверки.append(_проверка(
+                "selected", "Выбранный движок", "fail",
+                f"движок берётся по модели, а модели «{state.settings.get('model') or ''}» "
+                "в каталоге нет",
+                "Задайте существующую модель параметром model — список: "
+                "bash scripts/models.sh list.",
+                engine=выбран or "auto"))
+            выбран = ""
+        else:
+            по_модели = модель.id
+            выбран = модель.engine
+
     свой = next((д for д in список if д.get("id") == выбран), None)
-    if свой is None:
+    if проверки:
+        # Модели нет — о движке сказать нечего, беда уже записана выше.
+        свой = None
+    elif свой is None:
         проверки.append(_проверка(
             "selected", "Выбранный движок", "fail",
             f"«{выбран or 'не задан'}» серверу неизвестен",
@@ -1131,7 +1156,8 @@ def _движки(state: Any, глубоко: bool) -> dict[str, Any]:
     else:
         проверки.append(_проверка(
             "selected", "Выбранный движок", "ok",
-            str(свой.get("name") or выбран), engine=выбран))
+            str(свой.get("name") or выбран)
+            + (f" — по модели {по_модели}" if по_модели else ""), engine=выбран))
 
     проверки.append(_проверка(
         "installed", "Установлено движков",

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Обновление ASR Hub на Windows.
 .DESCRIPTION

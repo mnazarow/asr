@@ -335,6 +335,14 @@ def set_alert_rules(request: Request, rules: list[dict[str, Any]] = Body(...),
             hint='Каждое правило: {"metric": "...", "direction": "above|below", '
                  '"threshold": число, "severity": "warning|critical", "for_seconds": 300}')
         ) from exc
+    # Опечатка в имени метрики давала правило, которое молчит всегда: такой
+    # метрики нет, и порог не с чем сравнивать.
+    неизвестные = sorted({п.metric for п in parsed
+                          if п.metric not in metric_catalog.METRICS_BY_NAME})
+    if неизвестные:
+        raise error_response(ConfigError(
+            f"Метрик нет в каталоге: {', '.join(неизвестные)}.",
+            hint="Список метрик: GET /api/monitoring/catalog"))
     service.alerts.set_rules(parsed)
     return {"rules": len(parsed)}
 
@@ -443,7 +451,7 @@ def test_target(request: Request, target: dict[str, Any] = Body(...),
         parsed = Target.from_dict(target)
     except (KeyError, ValueError, TypeError) as exc:
         raise error_response(ConfigError(f"Неверное описание приёмника: {exc}")) from exc
-    return service.push.push_once(parsed)
+    return service.push.push_once(parsed, проба=True)
 
 
 # ---------------------------------------------------------------------------

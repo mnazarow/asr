@@ -40,6 +40,14 @@ CREATE_SERVICE=1
 SERVICE_USER=""
 OFFLINE=0
 FORCE=0
+# Сбросить config.yaml к шаблону. Отдельным ключом, а не вместе с --force:
+# --force советуют для починки окружения, и он стирал ключи интеграций,
+# токен и настройки, а «хранить бессрочно» превращал в тридцать дней.
+RESET_CONFIG=0
+# Заданы ли адрес, порт и пользователь ключами. Не заданные при повторной
+# установке берутся у стоящей службы, а не из умолчаний.
+PORT_EXPLICIT=""
+HOST_EXPLICIT=""
 SKIP_MODELS=0
 # Заполняется только в нативном режиме, а читается в самом конце для обоих.
 # Без этой строки docker-режим падал под `set -o nounset` уже после слов
@@ -109,7 +117,12 @@ usage() {
 
 Прочее
   --offline             Не обращаться в интернет (пакеты из локального кеша)
-  --force               Переустановить поверх существующей установки
+  --force               Переустановить поверх существующей установки: код,
+                        зависимости и окружение Python собираются заново.
+                        config.yaml, ключи и данные не трогаются
+  --reset-config        Заменить config.yaml шаблоном (прежний остаётся рядом
+                        копией config.yaml.bak.*): пропадут ключи интеграций,
+                        токен Hugging Face и все настройки
   --dry-run             Показать план действий, ничего не меняя
   --yes                 Не задавать вопросов
   --quiet               Минимум вывода
@@ -159,8 +172,8 @@ while [[ $# -gt 0 ]]; do
     --python)      ASRHUB_PYTHON="${2:?нужен путь к интерпретатору}"; export ASRHUB_PYTHON; shift 2 ;;
     --prefix)      PREFIX="${2:?нужен путь}"; shift 2 ;;
     --data)        DATA_DIR="${2:?нужен путь}"; shift 2 ;;
-    --port)        PORT="${2:?нужен номер порта}"; shift 2 ;;
-    --host)        HOST="${2:?нужен адрес}"; shift 2 ;;
+    --port)        PORT="${2:?нужен номер порта}"; PORT_EXPLICIT=1; shift 2 ;;
+    --host)        HOST="${2:?нужен адрес}"; HOST_EXPLICIT=1; shift 2 ;;
     --mode)        MODE="${2:?native или docker}"; shift 2 ;;
     --profile)     PROFILE="${2:?имя профиля}"; shift 2 ;;
     --engines)     ENGINES="${2:?список движков}"; ENGINES_EXPLICIT=1; shift 2 ;;
@@ -176,6 +189,7 @@ while [[ $# -gt 0 ]]; do
     --no-service)  CREATE_SERVICE=0; shift ;;
     --offline)     OFFLINE=1; shift ;;
     --force)       FORCE=1; shift ;;
+    --reset-config) RESET_CONFIG=1; shift ;;
     --dry-run)     ASRHUB_DRY_RUN=1; shift ;;
     # Имя службы. Нужно, когда на машине больше одной установки: без него
     # вторая переписывала юнит первой (/etc/systemd/system/asrhub.service).
@@ -282,6 +296,37 @@ fi
 # ключом --name, иначе она перезаписала бы юнит первой.
 SERVICE_NAME="${SERVICE_NAME:-asrhub}"
 
+# Повторная установка поверх стоящей: адрес, порт и пользователь службы, не
+# заданные ключами, — у неё, а не из умолчаний. Флаги в строке запуска юнита
+# перекрывают config.yaml, и умолчания установщика молча переписывали их:
+# `install.sh --force` (его советуют подсказки для починки окружения) на
+# сервере с портом 8081 переносил службу на 8080, а установка с
+# `--host 127.0.0.1` после повторного запуска открывалась в сеть.
+if [[ -z "${PORT_EXPLICIT}" ]]; then
+  _EXISTING="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" port || true)"
+  [[ -z "${_EXISTING}" ]] && _EXISTING="$(config_yaml_value "${DATA_DIR}/config.yaml" server_port || true)"
+  if [[ "${_EXISTING}" =~ ^[0-9]{1,5}$ && "${_EXISTING}" != "${PORT}" ]]; then
+    PORT="${_EXISTING}"
+    info "Порт взят у стоящей установки: ${PORT} (другой — ключом --port)"
+  fi
+fi
+if [[ -z "${HOST_EXPLICIT}" ]]; then
+  _EXISTING="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" host || true)"
+  [[ -z "${_EXISTING}" ]] && _EXISTING="$(config_yaml_value "${DATA_DIR}/config.yaml" server_host || true)"
+  if [[ -n "${_EXISTING}" && "${_EXISTING}" != "${HOST}" ]]; then
+    HOST="${_EXISTING}"
+    info "Адрес взят у стоящей установки: ${HOST} (другой — ключом --host)"
+  fi
+fi
+if [[ -z "${SERVICE_USER}" ]]; then
+  _EXISTING="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" user || true)"
+  if [[ -n "${_EXISTING}" ]]; then
+    SERVICE_USER="${_EXISTING}"
+    info "Пользователь службы взят у стоящей установки: ${SERVICE_USER}"
+  fi
+fi
+unset _EXISTING
+
 run_wizard() {
   local ram_gb disk_gb accel_label
 
@@ -382,7 +427,11 @@ run_wizard() {
 
   # --- 3. Сеть ------------------------------------------------------------
   local suggested_port="${PORT}"
-  check_port_free "${PORT}" || suggested_port="$(find_free_port "${PORT}")"
+  # Порт, занятый нашим же сервером, — не повод предлагать соседний: Enter
+  # переносил повторно устанавливаемый сервер на другой порт, мимо всех
+  # настроенных клиентов и агентов на станциях.
+  check_port_free "${PORT}" || port_is_ours "${PORT}" "${PREFIX}" \
+    || suggested_port="$(find_free_port "${PORT}")"
   wizard_ask PORT "Порт сервера" "${suggested_port}" wizard_valid_port
 
   # Умолчание подстраивается под то, что задано ключом: --host 127.0.0.1
@@ -581,11 +630,9 @@ if ! check_port_free "${PORT}"; then
   # Спрашиваем сам порт: если там отвечает ASR Hub и установка идёт в тот же
   # каталог — это мы, и порт менять не нужно.
   PORT_IS_OURS=0
-  if [[ -d "${PREFIX}" ]] && http_probe "http://127.0.0.1:${PORT}/api/health" 3; then
-    case "${HTTP_BODY}" in
-      *asrhub*|*ASR*|*'"status"'*) PORT_IS_OURS=1 ;;
-    esac
-  fi
+  # Спрашиваем сам порт (http_probe внутри port_is_ours): если там отвечает
+  # ASR Hub и установка идёт в тот же каталог — это мы.
+  port_is_ours "${PORT}" "${PREFIX}" && PORT_IS_OURS=1
   if [[ "${PORT_IS_OURS}" -eq 1 ]]; then
     info "Порт ${PORT} занят уже установленным ASR Hub — так и должно быть."
     hint "Служба будет перезапущена на том же порту в конце установки."
@@ -992,6 +1039,19 @@ else
         warn "Оставляем окружение на Python ${VENV_PY_VERSION}."
         hint "Движки, которых нет под эту версию, так и не установятся."
       fi
+    elif [[ "${FORCE}" -eq 1 ]]; then
+      # --force советуют именно для починки окружения («undefined symbol»,
+      # «No module named …»), а при той же версии Python оно раньше
+      # переиспользовалось как есть: pip отвечал «already satisfied», и
+      # сломанный пакет оставался на месте. Прежнее окружение не удаляется
+      # сразу, а откладывается до конца установки: сорвётся новая сборка —
+      # откат вернёт его на место.
+      info "Ключ --force: окружение Python собирается заново."
+      hint "Прежнее отложено в ${VENV}.before-force и удалится в конце установки."
+      VENV_OLD="${VENV}.before-force"
+      run rm -rf "${VENV_OLD}"
+      run mv "${VENV}" "${VENV_OLD}"
+      add_rollback "rm -rf '${VENV}' && mv '${VENV_OLD}' '${VENV}'"
     else
       debug "окружение уже собрано на Python ${VENV_PY_VERSION} — переиспользуем"
     fi
@@ -1129,10 +1189,17 @@ fi
 step "Создание конфигурации"
 
 CONFIG_FILE="${DATA_DIR}/config.yaml"
-if [[ -f "${CONFIG_FILE}" && "${FORCE}" -eq 0 ]]; then
+if [[ -f "${CONFIG_FILE}" && "${RESET_CONFIG}" -eq 0 ]]; then
   info "Конфигурация уже существует — оставляем без изменений."
   info "Полный пример со всеми параметрами: ${DATA_DIR}/config.example.yaml"
+  [[ "${FORCE}" -eq 1 ]] && \
+    hint "--force конфигурацию не трогает. Заменить её шаблоном — ключ --reset-config."
 else
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    warn "Ключ --reset-config: config.yaml заменяется шаблоном."
+    hint "Пропадут ключи интеграций и агентов, токен Hugging Face и все настройки."
+    hint "Прежний файл останется рядом: ${CONFIG_FILE}.bak.<дата>."
+  fi
   if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
     RECOMMENDED_MODEL="$(printf '%s' "${MODELS}" | cut -d, -f1)"
     [[ -z "${RECOMMENDED_MODEL}" ]] && RECOMMENDED_MODEL="demo-simulator"
@@ -1445,6 +1512,10 @@ elif [[ "${HEALTH_RC}" -ne 3 ]]; then
 fi
 
 clear_rollback
+# Новое окружение собрано и сервер проверен — отложенное прежнее больше не нужно.
+if [[ -n "${VENV_OLD:-}" && -d "${VENV_OLD}" ]]; then
+  run rm -rf "${VENV_OLD}" || warn "Не удалось удалить ${VENV_OLD} — удалите вручную."
+fi
 
 API_KEY="$(cat "${DATA_DIR}/api-key.txt" 2>/dev/null || echo '')"
 

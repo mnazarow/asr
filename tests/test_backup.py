@@ -152,11 +152,17 @@ def test_из_копии_настроек_нельзя_вернуть_данны
 
 
 def test_прежняя_база_остаётся_рядом(стенд):
-    """Восстановление не из той копии — обычная ошибка, и она обратима."""
+    """Восстановление не из той копии — обычная ошибка, и она обратима.
+
+    С захода 40 база подменяется при запуске, а не под работающим сервером
+    (см. test_review_40): восстановление готовит копию, запуск её ставит.
+    """
     db, настройки, каталог = стенд
     копия = backup.создать(db, настройки, kind="full")
     итог = backup.восстановить(db, настройки, копия["name"], what="full")
     assert итог["database"] and итог["restart_required"]
+    db.close()
+    assert backup.применить_отложенное(каталог / "asrhub.db")
     сохранённые = list(каталог.glob("asrhub.db.before-restore-*"))
     assert сохранённые, "прежняя база исчезла без следа"
     assert (каталог / "asrhub.db").is_file()
@@ -516,12 +522,13 @@ def test_рабочая_база_не_теряется_при_нехватке_�
     def нет_места(*_а, **_к):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(backup.shutil, "copy2", нет_места)
+    monkeypatch.setattr(backup.shutil, "copyfile", нет_места)
     with pytest.raises(StorageError) as сбой:
         backup.восстановить(db, настройки, копия["name"], what="full")
     monkeypatch.undo()
-    assert "не восстановлена" in сбой.value.message
+    assert "не подготовлена" in сбой.value.message
     assert (каталог / "asrhub.db").read_bytes() == было, "рабочая база потеряна"
+    assert not list(каталог.glob("*.restore-pending*")), "остался обрезок копии"
 
 
 def test_рабочая_база_в_каталоге_копий_не_удаляется_как_копия(стенд):

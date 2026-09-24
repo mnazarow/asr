@@ -38,6 +38,10 @@ MEDIA_DURATION_BUCKETS = (10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400)
 HTTP_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
 
 
+#: С какого числа завершённых заданий модели её доля успеха идёт в метрику.
+МИН_ЗАВЕРШЁННЫХ = 5
+
+
 @dataclass
 class Sample:
     """Одно измерение: имя, метки, значение."""
@@ -562,7 +566,10 @@ class Collector:
         out.append(Sample("asrhub_engines_available", float(available)))
 
         for row in self._by_model()[:40]:
-            if row.get("success_rate") is not None:
+            # Доля по двум-трём заданиям — не показатель, а шум: одно
+            # неудачное из двух уже «50 %» и критическая тревога.
+            if row.get("success_rate") is not None \
+                    and int(row.get("finished") or 0) >= МИН_ЗАВЕРШЁННЫХ:
                 out.append(Sample("asrhub_model_success_rate", float(row["success_rate"]),
                                   {"model": str(row.get("model") or "")}))
 

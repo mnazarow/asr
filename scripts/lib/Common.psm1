@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Общая библиотека скриптов ASR Hub для Windows.
 .DESCRIPTION
@@ -18,7 +18,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.11'
+    $script:AsrHubVersion = '3.1.12'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
@@ -1048,7 +1048,6 @@ function Show-WizardSummary {
     Write-Host ''
 }
 
-Export-ModuleMember -Function *
 
 # ---------------------------------------------------------------------------
 # Видит ли карту процесс, который будет распознавать
@@ -1187,3 +1186,15 @@ function Show-GpuRuntimeDiagnosis {
         Write-Warn 'nvidia-smi не найдена — драйвер NVIDIA не установлен.'
     }
 }
+
+# ---------------------------------------------------------------------------
+# Экспорт — последней строкой файла
+# ---------------------------------------------------------------------------
+#
+# `Export-ModuleMember -Function *` видит только функции, определённые ДО
+# него. Стоял он раньше проверки видеокарты, и `Test-GpuRuntime` с
+# `Show-GpuRuntimeDiagnosis` наружу не выходили: update.ps1 падал с «The term
+# 'Test-GpuRuntime' is not recognized», а install.ps1 — на последнем шаге,
+# уже после установки, и откатывал её. Всё новое — выше этой строки.
+
+Export-ModuleMember -Function *

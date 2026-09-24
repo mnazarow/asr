@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Управление автозапуском ASR Hub на Windows.
 .DESCRIPTION
@@ -19,11 +19,21 @@ param(
     [int]$Port = 8080,
     [string]$BindHost = '0.0.0.0',
     [int]$Lines = 100,
-    [switch]$Follow
+    [switch]$Follow,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1') -Force
+# Из install.ps1, update.ps1 и uninstall.ps1 этот скрипт зовут в том же
+# процессе, и модуль у них уже загружен. Повторный Import-Module -Force
+# пересоздавал его и сбрасывал у ВЫЗЫВАЮЩЕГО пробный запуск, список отката и
+# журнал: `uninstall.ps1 -Purge -DryRun` после остановки службы удалял
+# каталоги программы и данных по-настоящему, а `update.ps1 -DryRun` менял
+# файлы и ставил пакеты. Грузим модуль, только если его ещё нет.
+if (-not (Get-Module -Name Common)) {
+    Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1')
+}
+if ($DryRun) { Set-DryRun $true }
 
 if (-not $DataDir) {
     $DataDir = if (Test-Administrator) { Join-Path $env:ProgramData 'ASRHub' }
@@ -35,6 +45,7 @@ $taskName = 'ASRHub Server'
 $python = Join-Path $Prefix 'venv\Scripts\python.exe'
 $workDir = Join-Path $Prefix 'server'
 $logDir = Join-Path $DataDir 'logs'
+$configFile = Join-Path $DataDir 'config.yaml'
 
 function Test-ServiceExists {
     return [bool](Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
@@ -79,8 +90,16 @@ function Install-AsService {
 
 function Install-AsTask {
     Write-Info 'Создание задачи планировщика (запуск при входе пользователя)'
+    # Каталог данных задаче передаётся через --config: переменную окружения
+    # задаче планировщика не задать, а своей у сервера на Windows по
+    # умолчанию %PROGRAMDATA%\ASRHub. Установка без прав администратора
+    # кладёт данные в %LOCALAPPDATA%\ASRHub\data, и сервер из задачи
+    # работал мимо них: новая пустая база, новый ключ, config.yaml, токен и
+    # скачанные модели не видны. В config.yaml установщик пишет data_dir.
+    $arguments = "-m asrhub --host $BindHost --port $Port"
+    if (Test-Path $configFile) { $arguments = "-m asrhub --config `"$configFile`" --host $BindHost --port $Port" }
     $action = New-ScheduledTaskAction -Execute $python `
-        -Argument "-m asrhub --host $BindHost --port $Port" -WorkingDirectory $workDir
+        -Argument $arguments -WorkingDirectory $workDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -StartWhenAvailable `
@@ -91,6 +110,13 @@ function Install-AsTask {
     Start-ScheduledTask -TaskName $taskName
     Write-Ok "Задача «$taskName» создана и запущена"
     Write-Hint 'Задача стартует при входе пользователя. Для запуска без входа нужны права администратора.'
+}
+
+# Пробный запуск ничего не меняет: ни службу, ни задачу. Проверка состояния
+# и журнал ничего и не меняют — они работают как обычно.
+if ((Get-DryRun) -and $Action -notin @('status', 'logs')) {
+    Write-Host "[пробный запуск] автозапуск ${serviceName}: $Action" -ForegroundColor Yellow
+    return
 }
 
 switch ($Action) {

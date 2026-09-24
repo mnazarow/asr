@@ -16,7 +16,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request
 
 from .. import review
-from ..errors import ASRHubError, ConfigError, JobNotFound
+from ..errors import ASRHubError, ConfigError, ForbiddenError, JobNotFound
 from .deps import (
     Principal,
     authenticate,
@@ -25,6 +25,7 @@ from .deps import (
     require_admin,
     require_owner,
     require_write,
+    same_scope,
     scope_owner,
 )
 
@@ -148,11 +149,12 @@ def qa_list(request: Request,
 
     состояние = get_state(request)
     свои = qa_mod.настройки(состояние.settings)
+    владелец = scope_owner(principal)
     return {
         "items": состояние.db.qa_list(status=status, assigned_to=assigned_to,
-                                      agent=agent, limit=limit),
-        "stats": состояние.db.qa_stats(),
-        "overdue": len(qa_mod.просроченные(состояние.db)),
+                                      agent=agent, limit=limit, owner=владелец),
+        "stats": состояние.db.qa_stats(owner=владелец),
+        "overdue": len(qa_mod.просроченные(состояние.db, owner=владелец)),
         "enabled": свои["enabled"],
         "daily": свои["daily"],
     }
@@ -171,6 +173,11 @@ def qa_assign(request: Request, job_id: str = Query(..., max_length=64),
     задание = состояние.db.get_job(job_id)
     if not задание:
         raise error_response(ConfigError(f"Запись {job_id} не найдена."))
+    # Ставить на проверку можно только то, что ключ вправе видеть.
+    try:
+        require_owner(principal, задание)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
     разбор = состояние.db.get_content(job_id) or {}
     звонок = состояние.db.call_for_job(job_id) or {}
     свои = qa_mod.настройки(состояние.settings)
@@ -212,6 +219,19 @@ def qa_submit(review_id: int, request: Request,
     """
     состояние = get_state(request)
     require_write(principal)
+    # Закрыть можно только проверку своей записи, и только от своего имени.
+    # Раньше чужую проверку закрывал любой ключ с правом записи, подписывая
+    # её любым именем из тела запроса, — и это попадало в калибровку
+    # проверяющих, ради которой всё затевалось.
+    проверка = состояние.db.qa_get(int(review_id))
+    if проверка is None:
+        raise error_response(ConfigError(f"Проверка {review_id} не найдена."))
+    if not same_scope(principal, str(проверка.get("job_owner") or "")):
+        raise error_response(ForbiddenError(
+            "Эта проверка относится к чужой записи.",
+            hint="Закрывать чужие проверки может только администратор."))
+    проверяющий = (str(данные.get("reviewer") or principal.name)
+                   if principal.is_admin else principal.name)
     балл = данные.get("score")
     if балл is not None:
         try:
@@ -221,7 +241,7 @@ def qa_submit(review_id: int, request: Request,
         if not 0.0 <= балл <= 100.0:
             raise error_response(ConfigError("Балл — от нуля до ста."))
     записано = состояние.db.qa_submit(
-        int(review_id), reviewer=str(данные.get("reviewer") or principal.name),
+        int(review_id), reviewer=проверяющий,
         score=балл, agree=данные.get("agree"), items=данные.get("items"),
         comment=str(данные.get("comment") or ""))
     if not записано:

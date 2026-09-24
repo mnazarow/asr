@@ -21,12 +21,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .config import Settings
 from .errors import StorageError
 from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -451,6 +452,9 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_jobs_model ON jobs(model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_hash ON jobs(file_hash)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_group ON jobs(group_id)",
+    # Общий файл записи: контрольный прогон идёт по записи исходного задания,
+    # и удаление одного из двух не должно уносить звук второго.
+    "CREATE INDEX IF NOT EXISTS idx_jobs_file ON jobs(file_path)",
     """
     CREATE TABLE IF NOT EXISTS segments (
         job_id        TEXT NOT NULL,
@@ -787,7 +791,8 @@ _SCHEMA = [
         -- раздела «АТС», забирается агентом на следующем обращении.
         command      TEXT DEFAULT '',
         command_at   REAL,
-        enabled      INTEGER DEFAULT 1
+        enabled      INTEGER DEFAULT 1,
+        owner        TEXT DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_agents_seen ON agents(last_seen DESC)",
@@ -1226,6 +1231,13 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "station": "TEXT DEFAULT ''",
         "pbx_uid": "TEXT DEFAULT ''",
     },
+    # Владелец агента — ключ, которым агент поздоровался впервые. Без него
+    # личность агента задавалась телом запроса, и любой ключ с правом
+    # записи выдавал себя за чужого агента: забирал его задание и заранее
+    # «занимал» идентификаторы его звонков.
+    "agents": {
+        "owner": "TEXT DEFAULT ''",
+    },
 }
 
 def fts_query(text: str) -> str:
@@ -1397,6 +1409,8 @@ class Database:
                 # переходе через свою версию.
                 if current < 24:
                     self._починка_ключей_звонков(conn)
+                if current < 26:
+                    self._вычистить_секреты_заданий(conn)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:
@@ -1458,6 +1472,37 @@ class Database:
         log.info("Миграция: ключи звонков приведены к виду «станция:идентификатор» — "
                  "переименовано %s, дублей убрано %s", переименовано, дублей)
 
+
+    def _вычистить_секреты_заданий(self, conn: sqlite3.Connection) -> None:
+        """Убирает секреты сервера из параметров уже созданных заданий.
+
+        До версии 26 в параметры каждого задания ложился полный снимок
+        настроек — вместе с ключом модели, секретом подписи уведомлений,
+        токеном CRM и паролями станций, — и отдавался владельцу задания.
+        Выдача теперь чистит параметры сама (`_row_to_job`), а здесь они
+        вычищаются и в самой базе: копии базы уходят за пределы сервера.
+
+        Переписываются только строки, где секрет действительно задан, —
+        остальные не трогаются: у заданий с длинной расшифровкой перезапись
+        строки обходится дорого, а пустой ключ секретом не является.
+        """
+        ключи = Settings.НЕ_В_ЗАДАНИИ
+        try:
+            пути = ", ".join(f"'$.{к}'" for к in ключи)
+            условие = " OR ".join(
+                f"(json_type(params, '$.{к}') IS NOT NULL AND "
+                f"json_extract(params, '$.{к}') NOT IN ('', '[]', 0))"
+                for к in ключи)
+            вычищено = conn.execute(
+                f"UPDATE jobs SET params = json_remove(params, {пути}) "
+                f"WHERE json_valid(params) AND ({условие})").rowcount
+        except sqlite3.OperationalError as exc:
+            # Сборка SQLite без JSON1 — редкость, но сервер из-за этого не
+            # должен отказываться стартовать: выдача и так чистит параметры.
+            log.warning("Параметры заданий не вычищены (%s) — выдача чистит их сама", exc)
+            return
+        if вычищено:
+            log.info("Миграция: из параметров %s заданий убраны секреты сервера", вычищено)
 
     def _setup_fts(self) -> None:
         """Заводит полнотекстовый указатель — если сборка SQLite его умеет.
@@ -2762,8 +2807,8 @@ class Database:
         row = self.query_one("SELECT * FROM llm_results WHERE job_id=?", (job_id,))
         return _row_to_llm(row) if row else None
 
-    def llm_pending(self, version: int, limit: int = 50, *, since: float | None = None
-                    ) -> list[dict[str, Any]]:
+    def llm_pending(self, version: int, limit: int = 50, *, since: float | None = None,
+                    owner: str | list[str] | None = None) -> list[dict[str, Any]]:
         """Завершённые записи без ответа модели текущей версии — новые первыми.
 
         Контрольные прогоны мимо: это та же запись второй раз. Записи из
@@ -2778,6 +2823,13 @@ class Database:
         if since is not None:
             where.append("j.created_at >= ?")
             args.append(since)
+        # Разрез по владельцу: «разобрать всё неразобранное» от обычного ключа
+        # ставило в очередь весь архив сервера, хотя тот же отбор через
+        # /llm/backfill доступен только администратору.
+        своё, своё_args = self._owner_clause(owner, "j")
+        if своё:
+            where.append(своё)
+            args.extend(своё_args)
         rows = self.query(
             "SELECT j.id, j.text, j.media_duration_s, j.model, j.owner FROM jobs j "
             "LEFT JOIN llm_results l ON l.job_id = j.id "
@@ -2801,7 +2853,8 @@ class Database:
         условие = " AND ".join(where)
         всего = int(self.query_one(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args)["n"])
         rows = self.query(
-            "SELECT l.job_id, l.version, l.reason, l.outcome, l.resolved, l.actions, l.trackers, "
+            "SELECT l.job_id, l.version, l.summary, l.reason, l.reason_quote, l.outcome, "
+            "       l.outcome_quote, l.resolved, l.actions, l.trackers, "
             "       l.scorecard, l.latency_ms, l.error, l.calls, l.chunks, l.warnings, j.filename, "
             "       j.created_at, j.owner "
             f"FROM llm_results l JOIN jobs j ON j.id = l.job_id WHERE {условие}", args)
@@ -3289,6 +3342,20 @@ class Database:
         row = self.query_one(
             f"SELECT COUNT(*) AS n FROM jobs{соединение} {clause}", args)
         return int(row["n"]) if row else 0
+
+    def file_used_elsewhere(self, file_path: str, except_id: str) -> bool:
+        """Ссылается ли на этот файл записи другое задание.
+
+        Контрольный прогон второй моделью ставится на запись исходного
+        задания, а не на её копию. Удаление контрольного — кнопкой, пакетом,
+        уборкой — уносило звук исходного: прослушивание отвечало 404,
+        перераспознать было нечего.
+        """
+        if not file_path:
+            return False
+        return self.query_one(
+            "SELECT 1 FROM jobs WHERE file_path=? AND id<>? LIMIT 1",
+            (file_path, except_id)) is not None
 
     def delete_job(self, job_id: str) -> None:
         with self.write() as conn:
@@ -4474,7 +4541,7 @@ class Database:
     # --- агенты на станциях ------------------------------------------------
 
     ПОЛЯ_АГЕНТА = ("name", "host", "station", "version", "asterisk", "os",
-                   "source", "state", "enabled")
+                   "source", "state", "enabled", "owner")
 
     def agent_save(self, id: str, данные: dict[str, Any] | None = None,  # noqa: A002
                    *, seen: bool = True) -> dict[str, Any]:
@@ -4719,16 +4786,29 @@ class Database:
             return self.execute("DELETE FROM llm_queue WHERE state=?", (state,))
         return self.execute("DELETE FROM llm_queue WHERE state<>?", (self.LLMQ_ИДЁТ,))
 
-    def llmq_retry_failed(self, limit: int = 500) -> int:
+    def _llmq_откуда(self, owner: str | list[str] | None) -> tuple[str, str, list[Any]]:
+        """FROM и условие для сводок очереди разбора — с разрезом по владельцу."""
+        своё, своё_args = self._owner_clause(owner, "j")
+        if not своё:
+            return "FROM llm_queue q", "1=1", []
+        return "FROM llm_queue q JOIN jobs j ON j.id=q.job_id", своё, своё_args
+
+    def llmq_retry_failed(self, limit: int = 500, *,
+                          owner: str | list[str] | None = None) -> int:
+        откуда, своё, своё_args = self._llmq_откуда(owner)
         строки = self.query(
-            "SELECT job_id FROM llm_queue WHERE state=? ORDER BY finished_at DESC LIMIT ?",
-            (self.LLMQ_ОШИБКА, max(1, int(limit))))
+            f"SELECT q.job_id AS job_id {откуда} WHERE q.state=? AND {своё} "
+            "ORDER BY q.finished_at DESC LIMIT ?",
+            (self.LLMQ_ОШИБКА, *своё_args, max(1, int(limit))))
         for строка in строки:
             self.llmq_put(str(строка["job_id"]), kind="повтор", priority=60)
         return len(строки)
 
-    def llmq_counts(self) -> dict[str, int]:
-        строки = self.query("SELECT state, COUNT(*) AS n FROM llm_queue GROUP BY state")
+    def llmq_counts(self, *, owner: str | list[str] | None = None) -> dict[str, int]:
+        откуда, своё, своё_args = self._llmq_откуда(owner)
+        строки = self.query(
+            f"SELECT q.state AS state, COUNT(*) AS n {откуда} WHERE {своё} GROUP BY q.state",
+            своё_args)
         свод = {str(с["state"]): int(с["n"]) for с in строки}
         for состояние in (self.LLMQ_ЖДЁТ, self.LLMQ_ИДЁТ, self.LLMQ_ГОТОВО,
                           self.LLMQ_ОШИБКА, self.LLMQ_ОТМЕНЁН):
@@ -4769,37 +4849,40 @@ class Database:
         return {"total": int(всего["n"]) if всего else 0,
                 "items": [dict(r) for r in rows]}
 
-    def llmq_stats(self, since: float) -> dict[str, Any]:
+    def llmq_stats(self, since: float, *,
+                   owner: str | list[str] | None = None) -> dict[str, Any]:
         """Сводка по завершённым запросам за окно: сколько, как долго, как часто ошибались."""
+        откуда, своё, своё_args = self._llmq_откуда(owner)
         строка = self.query_one(
             "SELECT COUNT(*) AS n, "
-            "       SUM(CASE WHEN state=? THEN 1 ELSE 0 END) AS ok, "
-            "       SUM(CASE WHEN state=? THEN 1 ELSE 0 END) AS failed, "
-            "       AVG(latency_ms) AS avg_ms, MAX(latency_ms) AS max_ms, "
-            "       SUM(calls) AS calls, "
-            "       AVG(CASE WHEN started_at IS NOT NULL AND enqueued_at IS NOT NULL "
-            "                THEN started_at-enqueued_at END) AS wait_s "
-            "FROM llm_queue WHERE finished_at>=?",
-            (self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, float(since)))
+            "       SUM(CASE WHEN q.state=? THEN 1 ELSE 0 END) AS ok, "
+            "       SUM(CASE WHEN q.state=? THEN 1 ELSE 0 END) AS failed, "
+            "       AVG(q.latency_ms) AS avg_ms, MAX(q.latency_ms) AS max_ms, "
+            "       SUM(q.calls) AS calls, "
+            "       AVG(CASE WHEN q.started_at IS NOT NULL AND q.enqueued_at IS NOT NULL "
+            "                THEN q.started_at-q.enqueued_at END) AS wait_s "
+            f"{откуда} WHERE q.finished_at>=? AND {своё}",
+            (self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, float(since), *своё_args))
         свод = dict(строка) if строка else {}
         свод["since"] = float(since)
         return свод
 
-    def llmq_series(self, since: float, until: float,
-                    buckets: int) -> tuple[int, list[dict[str, Any]]]:
+    def llmq_series(self, since: float, until: float, buckets: int, *,
+                    owner: str | list[str] | None = None) -> tuple[int, list[dict[str, Any]]]:
         """Ряд «сколько разобрано и за сколько» — для графика раздела."""
         buckets = max(1, min(int(buckets), SERIES_MAX_BUCKETS))
         шаг = max(1e-6, (float(until) - float(since)) / buckets)
+        откуда, своё, своё_args = self._llmq_откуда(owner)
         rows = self.query(
-            "SELECT CAST((finished_at-?)/? AS INTEGER) AS bucket, "
+            "SELECT CAST((q.finished_at-?)/? AS INTEGER) AS bucket, "
             "       COUNT(*) AS n, "
-            "       SUM(CASE WHEN state=? THEN 1 ELSE 0 END) AS failed, "
-            "       AVG(latency_ms) AS avg_ms, "
-            "       AVG(CASE WHEN started_at IS NOT NULL AND enqueued_at IS NOT NULL "
-            "                THEN started_at-enqueued_at END) AS wait_s "
-            "FROM llm_queue WHERE finished_at>=? AND finished_at<? "
+            "       SUM(CASE WHEN q.state=? THEN 1 ELSE 0 END) AS failed, "
+            "       AVG(q.latency_ms) AS avg_ms, "
+            "       AVG(CASE WHEN q.started_at IS NOT NULL AND q.enqueued_at IS NOT NULL "
+            "                THEN q.started_at-q.enqueued_at END) AS wait_s "
+            f"{откуда} WHERE q.finished_at>=? AND q.finished_at<? AND {своё} "
             "GROUP BY bucket ORDER BY bucket",
-            (since, шаг, self.LLMQ_ОШИБКА, since, until))
+            (since, шаг, self.LLMQ_ОШИБКА, since, until, *своё_args))
         return buckets, [dict(r) for r in rows]
 
     # --- контроль качества работы оператора -----------------------------
@@ -4857,9 +4940,22 @@ class Database:
              str(comment or ""), int(review_id)))
         return True
 
+    def qa_get(self, review_id: int) -> dict[str, Any] | None:
+        """Одна проверка вместе с владельцем записи — для проверки прав."""
+        строка = self.query_one(
+            "SELECT q.*, j.owner AS job_owner FROM qa_reviews q "
+            "LEFT JOIN jobs j ON j.id = q.job_id WHERE q.id=?", (int(review_id),))
+        return dict(строка) if строка else None
+
     def qa_list(self, *, status: str = "", assigned_to: str = "",
-                agent: str = "", limit: int = 100) -> list[dict[str, Any]]:
-        """Проверки с отбором; свежие первыми."""
+                agent: str = "", limit: int = 100,
+                owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+        """Проверки с отбором; свежие первыми.
+
+        `owner` — разрез по владельцу записи, как у соседних отчётов: без
+        него ключ «только чтение» видел проверки всех — с именем файла, а в
+        колл-центре это номер клиента, — и с оператором.
+        """
         условия: list[str] = []
         args: list[Any] = []
         for поле, значение in (("status", status), ("assigned_to", assigned_to),
@@ -4867,6 +4963,10 @@ class Database:
             if значение:
                 условия.append(f"q.{поле}=?")
                 args.append(str(значение))
+        своё, своё_args = self._owner_clause(owner, "j")
+        if своё:
+            условия.append(своё)
+            args.extend(своё_args)
         где = f" WHERE {' AND '.join(условия)}" if условия else ""
         строки = self.query(
             "SELECT q.*, j.filename AS filename, j.media_duration_s AS duration_s "
@@ -4884,38 +4984,52 @@ class Database:
             готово.append(запись)
         return готово
 
-    def qa_stats(self, *, since: float = 0.0) -> dict[str, Any]:
+    def qa_stats(self, *, since: float = 0.0,
+                 owner: str | list[str] | None = None) -> dict[str, Any]:
         """Калибровка проверяющих: расходятся ли они с автоматом и между собой.
 
         Главное число здесь — не средний балл, а СДВИГ: насколько
         проверяющий систематически строже или мягче автомата. Средний балл
         говорит о записях, сдвиг — о самом проверяющем, и именно он отвечает
         на вопрос «можно ли сравнивать оценки двух руководителей».
+
+        Доля согласия считается по проверкам, где согласие вообще известно:
+        проверка без балла согласия не выражает, и деление на неё занижало
+        долю.
         """
-        условие = "status='done'" + (" AND reviewed_at>=?" if since else "")
+        своё, своё_args = self._owner_clause(owner, "j")
+        откуда = "FROM qa_reviews q LEFT JOIN jobs j ON j.id = q.job_id"
+        условие = "q.status='done'" + (" AND q.reviewed_at>=?" if since else "")
         args: list[Any] = [float(since)] if since else []
+        if своё:
+            условие += f" AND {своё}"
+            args.extend(своё_args)
         общее = self.query_one(
             "SELECT COUNT(*) AS n,"
-            "       SUM(CASE WHEN agree=1 THEN 1 ELSE 0 END) AS agreed,"
-            "       AVG(score) AS avg_score,"
-            "       AVG(score - auto_score) AS bias,"
-            "       AVG(ABS(score - auto_score)) AS spread "
-            f"FROM qa_reviews WHERE {условие}", args)
+            "       SUM(CASE WHEN q.agree=1 THEN 1 ELSE 0 END) AS agreed,"
+            "       SUM(CASE WHEN q.agree IS NOT NULL THEN 1 ELSE 0 END) AS rated,"
+            "       AVG(q.score) AS avg_score,"
+            "       AVG(q.score - q.auto_score) AS bias,"
+            "       AVG(ABS(q.score - q.auto_score)) AS spread "
+            f"{откуда} WHERE {условие}", args)
         по_людям = self.query(
-            "SELECT reviewer, COUNT(*) AS n, AVG(score) AS avg_score,"
-            "       AVG(score - auto_score) AS bias,"
-            "       AVG(ABS(score - auto_score)) AS spread,"
-            "       SUM(CASE WHEN agree=1 THEN 1 ELSE 0 END) AS agreed "
-            f"FROM qa_reviews WHERE {условие} AND COALESCE(reviewer,'')<>'' "
-            "GROUP BY reviewer ORDER BY n DESC LIMIT 50", args)
+            "SELECT q.reviewer AS reviewer, COUNT(*) AS n, AVG(q.score) AS avg_score,"
+            "       AVG(q.score - q.auto_score) AS bias,"
+            "       AVG(ABS(q.score - q.auto_score)) AS spread,"
+            "       SUM(CASE WHEN q.agree=1 THEN 1 ELSE 0 END) AS agreed,"
+            "       SUM(CASE WHEN q.agree IS NOT NULL THEN 1 ELSE 0 END) AS rated "
+            f"{откуда} WHERE {условие} AND COALESCE(q.reviewer,'')<>'' "
+            "GROUP BY q.reviewer ORDER BY n DESC LIMIT 50", args)
         всего = int((общее["n"] if общее else 0) or 0)
+        оценено = int((общее["rated"] if общее else 0) or 0)
+        ждут_условие = "q.status='pending'" + (f" AND {своё}" if своё else "")
         return {
             "done": всего,
             "pending": int((self.query_one(
-                "SELECT COUNT(*) AS n FROM qa_reviews WHERE status='pending'"
+                f"SELECT COUNT(*) AS n {откуда} WHERE {ждут_условие}", своё_args
             ) or {"n": 0})["n"] or 0),
-            "agree_share": (round(float(общее["agreed"] or 0) / всего, 3)
-                            if всего else None),
+            "agree_share": (round(float(общее["agreed"] or 0) / оценено, 3)
+                            if оценено else None),
             "avg_score": (round(float(общее["avg_score"]), 1)
                           if общее and общее["avg_score"] is not None else None),
             "bias": (round(float(общее["bias"]), 1)
@@ -4929,8 +5043,8 @@ class Database:
                  "bias": round(float(с["bias"]), 1) if с["bias"] is not None else None,
                  "spread": (round(float(с["spread"]), 1)
                             if с["spread"] is not None else None),
-                 "agree_share": (round(float(с["agreed"] or 0) / int(с["n"]), 3)
-                                 if с["n"] else None)}
+                 "agree_share": (round(float(с["agreed"] or 0) / int(с["rated"]), 3)
+                                 if с["rated"] else None)}
                 for с in по_людям],
         }
 
@@ -5057,8 +5171,11 @@ class Database:
             for row in stale:
                 # Сначала файлы, потом запись: если удаление файлов упадёт,
                 # задание останется в базе и попадёт в следующую уборку.
+                строка = dict(row)
+                строка["_file_shared"] = self.file_used_elsewhere(
+                    str(row["file_path"] or ""), row["id"])
                 removed["bytes"] = removed.get("bytes", 0) + _remove_job_files(
-                    dict(row), self.path.parent)
+                    строка, self.path.parent)
                 self.delete_job(row["id"])
             removed["jobs"] = len(stale)
             removed["more"] = 1 if len(stale) >= CLEANUP_BATCH else 0
@@ -5198,7 +5315,12 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
             shutil.rmtree(directory, ignore_errors=True)
         except OSError as exc:
             log.warning("Не удалось удалить результаты %s: %s", directory, exc)
+    # Отложенный на время повтора прежний результат — туда же.
+    if directory is not None:
+        shutil.rmtree(directory.with_name(directory.name + ".prev"), ignore_errors=True)
     path = _within(base, str(job.get("file_path") or ""))
+    if path is not None and job.get("_file_shared"):
+        path = None
     if path is not None:
         try:
             if path.is_file():
@@ -5248,6 +5370,10 @@ def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
                 job[column] = empty
         elif raw is None and column == "waveform":
             job[column] = []
+    # Секреты сервера в параметрах задания не отдаются никому и нигде —
+    # даже если строка создана до того, как их перестали туда класть.
+    if isinstance(job.get("params"), dict):
+        job["params"] = Settings.для_задания(job["params"])
     if isinstance(job.get("quality_flags"), str):
         job["quality_flags"] = [ф for ф in job["quality_flags"].split(",") if ф]
     return job

@@ -34,7 +34,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 
 from ..db import new_id
-from ..errors import ASRHubError, ConfigError, StorageError
+from ..errors import ASRHubError, ConfigError, ForbiddenError, StorageError
 from ..logging_setup import get_logger
 from .deps import (
     Principal,
@@ -94,6 +94,35 @@ def _проверить_id(agent_id: str) -> str:
     return agent_id
 
 
+def _свой_агент(state: Any, agent_id: str, principal: Principal) -> dict[str, Any]:
+    """Агент, которым этот ключ вправе распоряжаться.
+
+    Агент принадлежит ключу, которым он впервые поздоровался. Раньше
+    личность агента задавалась одним телом запроса: посторонний ключ с
+    правом записи называл чужой agent_id (или хост с именем) — и забирал
+    задание администратора («собрать архив»), которого настоящий агент
+    после этого уже не видел, а через /ask и /call заранее вписывал
+    идентификаторы звонков чужой станции, чтобы настоящие пропускались как
+    «уже импортированные». Агент без владельца (заведён до этой проверки)
+    закрепляется за первым, кто к нему обратится.
+    """
+    запись = state.db.agent_get(agent_id)
+    if запись is None:
+        raise error_response(ConfigError(
+            f"Агент «{agent_id}» серверу неизвестен.",
+            hint="Вызовите POST /api/telephony/agent/hello."))
+    владелец = str(запись.get("owner") or "")
+    if not владелец:
+        state.db.agent_save(agent_id, {"owner": principal.name}, seen=False)
+        запись["owner"] = principal.name
+    elif владелец != principal.name and not principal.is_admin:
+        raise error_response(ForbiddenError(
+            f"Агент «{agent_id}» работает под другим ключом доступа.",
+            hint="Каждый агент ходит своим ключом — тем, с которым он был "
+                 "установлен. Переустановите агента с нужным ключом."))
+    return запись
+
+
 def _число(значение: Any, по_умолчанию: float = 0.0) -> float:
     """Число из того, что прислал агент. Мусор — это `по_умолчанию`.
 
@@ -122,9 +151,16 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         # архив получил бы вторую станцию «agent:…» с теми же разговорами, и
         # весь архив заехал бы по сети заново. Поэтому сначала ищем среди
         # известных агента с тем же хостом и именем.
+        #
+        # Узнаём только своих: агента того же ключа (или ещё ничейного).
+        # Иначе посторонний ключ, назвав хост и имя станции, получал в ответ
+        # чужой идентификатор — а с ним и чужое задание.
         хост = str(данные.get("host") or "").strip()
         имя = str(данные.get("name") or "").strip()
         for прежний in state.db.agent_list():
+            чей = str(прежний.get("owner") or "")
+            if чей and чей != principal.name:
+                continue
             if хост and str(прежний.get("host") or "") == хост \
                     and (not имя or str(прежний.get("name") or "") == имя):
                 agent_id = str(прежний["id"])
@@ -135,8 +171,15 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
                         str(данные.get("host") or "pbx")).strip("-") or "pbx"
         agent_id = f"{основа[:32]}-{new_id('a')[2:8]}"
     agent_id = _проверить_id(agent_id)
+    новый = state.db.agent_get(agent_id) is None
+    if not новый:
+        _свой_агент(state, agent_id, principal)
 
     запись = state.db.agent_save(agent_id, {
+        # Владелец ставится один раз — при первом приветствии. Иначе
+        # администратор, поздоровавшийся за агента (проверка руками),
+        # перехватывал его, и настоящий агент получал отказ.
+        **({"owner": principal.name} if новый else {}),
         "name": str(данные.get("name") or данные.get("host") or agent_id)[:120],
         "host": str(данные.get("host") or "")[:120],
         "os": str(данные.get("os") or "")[:120],
@@ -169,10 +212,7 @@ def command(request: Request, agent_id: str = Query(...),
     state = get_state(request)
     require_write(principal)
     agent_id = _проверить_id(agent_id)
-    if state.db.agent_get(agent_id) is None:
-        raise error_response(ConfigError(
-            f"Агент «{agent_id}» серверу неизвестен.",
-            hint="Вызовите POST /api/telephony/agent/hello."))
+    _свой_агент(state, agent_id, principal)
     return {"command": state.db.agent_command_take(agent_id),
             "server_time": time.time()}
 
@@ -188,6 +228,7 @@ def ask(request: Request, данные: dict[str, Any],
     state = get_state(request)
     require_write(principal)
     agent_id = _проверить_id(str(данные.get("agent_id") or ""))
+    _свой_агент(state, agent_id, principal)
     станция = _агентская_станция(agent_id)
     ids = [str(и) for и in (данные.get("ids") or []) if str(и).strip()]
     if len(ids) > 5000:
@@ -214,11 +255,7 @@ async def call(request: Request,
         raise error_response(ConfigError("Поля звонка должны быть объектом JSON."))
 
     agent_id = _проверить_id(str(поля.get("agent_id") or ""))
-    запись_агента = state.db.agent_get(agent_id)
-    if запись_агента is None:
-        raise error_response(ConfigError(
-            f"Агент «{agent_id}» серверу неизвестен.",
-            hint="Вызовите POST /api/telephony/agent/hello."))
+    запись_агента = _свой_агент(state, agent_id, principal)
     if not int(запись_агента.get("enabled") or 0):
         raise error_response(ConfigError(
             f"Агент «{agent_id}» выключен на сервере.",

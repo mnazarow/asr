@@ -425,25 +425,34 @@ def test_unknown_stream_format_names_the_allowed_ones(tmp_path: Path):
     assert "pcm_s16le" in (info.value.hint or ""), "в подсказке нет допустимых форматов"
 
 
-def test_stream_route_refuses_readonly_and_honours_the_switch(keys_client):
-    """Поток — это работа, а не чтение; и выключатель обязан выключать."""
+def код_отказа_потока(client, адрес: str, **kwargs) -> int:
+    """Код, которым сервер закрыл поток.
+
+    Сервер сначала принимает соединение и только потом отказывает кодом:
+    закрытие до accept() uvicorn превращает в HTTP 403 на рукопожатии, и
+    браузер видит 1006 вместо 4401 или 4403 — интерфейс не мог объяснить
+    отказ.
+    """
     from starlette.websockets import WebSocketDisconnect
 
+    with client.websocket_connect(адрес, **kwargs) as сокет, \
+            pytest.raises(WebSocketDisconnect) as отказ:
+        сокет.send_text(json.dumps({"type": "config", "format": "pcm_s16le"}))
+        сокет.receive_text()
+    return отказ.value.code
+
+
+def test_stream_route_refuses_readonly_and_honours_the_switch(keys_client):
+    """Поток — это работа, а не чтение; и выключатель обязан выключать."""
     readonly = keys_client.post("/api/keys",
                                 json={"name": "только-чтение", "role": "readonly"})
     key = readonly.json()["key"]
-    with pytest.raises(WebSocketDisconnect) as refusal, \
-            keys_client.websocket_connect(f"/api/stream?api_key={key}"):
-        pass
-    assert refusal.value.code == 4403
+    assert код_отказа_потока(keys_client, f"/api/stream?api_key={key}") == 4403
 
     state = keys_client.app.state.hub
     state.settings.set("stream_enabled", False)
     admin = keys_client.headers["X-API-Key"]
-    with pytest.raises(WebSocketDisconnect) as switched_off, \
-            keys_client.websocket_connect(f"/api/stream?api_key={admin}"):
-        pass
-    assert switched_off.value.code == 4404
+    assert код_отказа_потока(keys_client, f"/api/stream?api_key={admin}") == 4404
     state.settings.set("stream_enabled", True)
 
 
@@ -481,14 +490,9 @@ def test_ticket_is_spent_once(keys_client):
         socket.send_text(json.dumps({"type": "config"}))
         assert json.loads(socket.receive_text())["type"] == "ready"
 
-    from starlette.websockets import WebSocketDisconnect
-
     # Заголовок с ключом снимаем: иначе проверялся бы он, а не билет.
-    with pytest.raises(WebSocketDisconnect) as reused, \
-            keys_client.websocket_connect(f"/api/stream?ticket={ticket}",
-                                          headers={"X-API-Key": ""}):
-        pass
-    assert reused.value.code == 4401
+    assert код_отказа_потока(keys_client, f"/api/stream?ticket={ticket}",
+                             headers={"X-API-Key": ""}) == 4401
     assert admin
 
 

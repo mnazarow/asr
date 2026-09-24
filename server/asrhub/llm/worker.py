@@ -157,7 +157,16 @@ class LLMWorker:
             self.db.llmq_finish(job_id, error=str(exc))
             raise
         замечания = [str(з) for з in (итог.get("warnings") or []) if str(з).strip()]
-        пусто = not итог.get("summary") and not итог.get("outcome")
+        # Пустой разбор — тот, в котором нет ответа ни на одну заказанную
+        # задачу. Раньше пустым считался любой без резюме и исхода: сервер,
+        # настроенный на одни трекеры или скоркарту (`llm_tasks`), получал на
+        # каждой длинной записи «ошибку» из информационного замечания
+        # «разбор по пересказам N частей», и свод такую запись выбрасывал.
+        # Список действий, трекеров и ответов скоркарты — ответ, даже пустой:
+        # «договорённостей нет» — тоже результат.
+        пусто = not (итог.get("summary") or итог.get("outcome") or итог.get("reason")
+                     or any(итог.get(п) is not None
+                            for п in ("actions", "trackers", "scorecard")))
         self.db.llm_save(
             job_id, tasks.VERSION, model=self.client.model,
             summary=итог.get("summary"), reason=итог.get("reason"),

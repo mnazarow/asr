@@ -118,8 +118,9 @@ def набрать(db: Any, settings: Any, *, now: float | None = None,
     return назначено
 
 
-def просроченные(db: Any, *, now: float | None = None) -> list[dict[str, Any]]:
-    """Проверки, срок которых прошёл, а исхода нет."""
+def просроченные(db: Any, *, now: float | None = None,
+                 owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+    """Проверки, срок которых прошёл, а исхода нет. `owner` — только свои."""
     сейчас = float(now if now is not None else time.time())
-    return [з for з in db.qa_list(status="pending", limit=500)
+    return [з for з in db.qa_list(status="pending", limit=500, owner=owner)
             if з.get("due_at") and float(з["due_at"]) < сейчас]

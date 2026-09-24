@@ -87,8 +87,21 @@ class WhisperXEngine(Engine):
                     "pyannote/speaker-diarization-community-1",
                     "https://huggingface.co/pyannote/speaker-diarization-community-1")
             try:
-                diarize = whisperx.diarize.DiarizationPipeline(
-                    use_auth_token=token, device=device)
+                # whisperx 3.8 (он тянет pyannote.audio 4) принимает `token`,
+                # прежние — `use_auth_token`. Вызов по старому имени падал с
+                # TypeError, и диаризация WhisperX не работала вовсе — лишь
+                # строка ошибки в журнале сервера.
+                import inspect  # noqa: PLC0415
+
+                конвейер = whisperx.diarize.DiarizationPipeline
+                try:
+                    параметры = inspect.signature(конвейер).parameters
+                except (TypeError, ValueError):
+                    параметры = {}
+                if "use_auth_token" in параметры and "token" not in параметры:
+                    diarize = конвейер(use_auth_token=token, device=device)
+                else:
+                    diarize = конвейер(token=token, device=device)
                 kwargs: dict[str, Any] = {}
                 num = S.integer(settings, "diarization_num_speakers", 0)
                 if num:

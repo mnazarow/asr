@@ -437,6 +437,27 @@ def _разобрать_чат(данные: dict[str, Any], клиент: Any) 
         raise _отказ(ConfigError(
             "Все реплики пусты — модели нечего отвечать.",
             hint="Проверьте поле content: оно передаётся строкой или списком частей с text."))
+    # Числа проверяются здесь, при разборе, а не там, где их переводят в
+    # параметры Ollama: `float("hot")` оттуда доходил до общего обработчика,
+    # и сторонний клиент получал «внутреннюю ошибку сервера» — а в потоковом
+    # режиме сбой случался уже внутри потока.
+    for поле, вид in (("temperature", float), ("top_p", float),
+                      ("max_tokens", int), ("seed", int)):
+        значение = данные.get(поле)
+        if значение is None:
+            continue
+        try:
+            if isinstance(значение, bool):
+                raise ValueError
+            число = вид(значение)
+            if вид is int and float(значение) != число:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise _отказ(ConfigError(
+                f"Поле {поле} должно быть числом{' целым' if вид is int else ''}, "
+                f"получено «{str(значение)[:40]}».")) from None
+        if поле == "max_tokens" and число < 1:
+            raise _отказ(ConfigError("Поле max_tokens должно быть больше нуля."))
     return {
         "model": str(данные.get("model") or "").strip() or клиент.model,
         "messages": разобранные,

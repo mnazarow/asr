@@ -292,14 +292,14 @@ def отправить(данные: dict[str, Any], настройки: Нас�
     import urllib.error
     import urllib.request
 
-    from .job_queue import check_outbound_url
+    from .job_queue import check_outbound_url, открыватель_наружу
 
     адрес, заголовки, тело = запрос(данные, настройки, entity_id=entity_id)
     проверенный = check_outbound_url(адрес, allow_internal)
     запрос_http = urllib.request.Request(проверенный, data=тело,
                                          headers=заголовки, method="POST")
     try:
-        with urllib.request.urlopen(
+        with открыватель_наружу(allow_internal).open(
                 запрос_http, timeout=max(1.0, настройки.timeout_s)) as ответ:
             кусок = ответ.read(2048).decode("utf-8", "replace")
             return {"status": int(ответ.status), "body": кусок}

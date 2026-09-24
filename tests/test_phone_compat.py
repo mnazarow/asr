@@ -532,10 +532,16 @@ def test_callback_url_with_cyrillic_is_delivered(tmp_path, monkeypatch):
 
 
 class _FakeSettings:
-    """Минимум, который нужен доставке уведомления."""
+    """Минимум, который нужен доставке уведомления.
+
+    Приёмник в проверке слушает 127.0.0.1, а с захода 40 адрес уведомления
+    проверяется ещё раз перед отправкой — внутренние адреса разрешаем явно,
+    как это делает администратор настройкой webhook_allow_internal.
+    """
 
     def get(self, key, default=None):
-        return {"webhook_secret": "", "webhook_workers": 1}.get(key, default)
+        return {"webhook_secret": "", "webhook_workers": 1,
+                "webhook_allow_internal": True}.get(key, default)
 
 
 @pytest.mark.parametrize("адрес, ожидание", [

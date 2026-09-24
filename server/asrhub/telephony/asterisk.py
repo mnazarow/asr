@@ -92,6 +92,10 @@ class Звонок:
     queue: str = ""
     agent: str = ""
     raw: dict[str, str] = field(default_factory=dict)
+    #: Смещение конца строки журнала CDR, из которой взят звонок (−1 — не из
+    #: журнала). По нему позиция чтения двигается за каждым обработанным
+    #: звонком, а не за всей порцией сразу.
+    конец_строки: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         данные = {
@@ -659,6 +663,7 @@ def читать_csv(path: Path, *, offset: int = 0, limit: int = 500
             offset += len(сырая)
             звонок = разобрать_cdr_строку(сырая.decode("utf-8", "replace"))
             if звонок is not None:
+                звонок.конец_строки = offset
                 звонки.append(звонок)
             if len(звонки) >= limit:
                 break

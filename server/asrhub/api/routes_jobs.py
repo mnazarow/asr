@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import catalog
 from .. import settings_access as S
-from ..config import parse_scalar
+from ..config import Settings, parse_scalar
 from ..db import new_id
 from ..errors import (
     ASRHubError,
@@ -178,6 +178,16 @@ def _probe_duration(path: Path) -> float:
 
 def check_quota(request: Request, principal: Principal, *,
                 incoming_bytes: int = 0, incoming_audio_s: float = 0.0) -> None:
+    """Проверяет суточные квоты ключа перед приёмом задания (см. `проверить_квоту`)."""
+    try:
+        проверить_квоту(get_state(request), principal, incoming_bytes=incoming_bytes,
+                        incoming_audio_s=incoming_audio_s)
+    except QuotaExceeded as exc:
+        raise error_response(exc) from exc
+
+
+def проверить_квоту(state: Any, principal: Principal, *,
+                    incoming_bytes: int = 0, incoming_audio_s: float = 0.0) -> None:
     """Проверяет суточные квоты ключа перед приёмом задания.
 
     Три роли давали ответ на вопрос «что можно делать», но не на вопрос
@@ -198,7 +208,6 @@ def check_quota(request: Request, principal: Principal, *,
     if not any(limits.values()):
         return
 
-    state = get_state(request)
     scope = scope_owner(principal) or principal.name
     used = state.db.owner_usage(scope, time.time() - 86400)
     # Учитываем и то, что принимаем прямо сейчас: иначе одна загрузка на
@@ -210,7 +219,7 @@ def check_quota(request: Request, principal: Principal, *,
     }
     for kind, limit in limits.items():
         if limit and pending[kind] > limit:
-            raise error_response(QuotaExceeded(kind, round(pending[kind], 3), limit))
+            raise QuotaExceeded(kind, round(pending[kind], 3), limit)
 
 
 # ---------------------------------------------------------------------------
@@ -1037,6 +1046,12 @@ def get_redacted(request: Request, job_id: str,
     if media is None:
         media, _ = mimetypes.guess_type(копия.name)
     имя = str(job.get("filename") or "").strip() or копия.name
+    # Как у /audio и /download: ключу с mask_pii имя обезличивается. Тело
+    # копии заглушено, а в заголовке скачивания стоял номер клиента.
+    if getattr(principal, "mask_pii", False):
+        from ..content import masking  # noqa: PLC0415
+
+        имя = masking.mask_text(имя)
     основа = Path(имя).stem
     return FileResponse(str(копия), media_type=media or "application/octet-stream",
                         filename=f"{основа}.отредактировано{копия.suffix}",
@@ -1203,6 +1218,40 @@ def cancel(request: Request, job_id: str,
     return state.queue.cancel(job_id, by=principal.name)
 
 
+def _проверенные_переопределения(сырые: Any, *, разрешённые: tuple[str, ...] | None = None,
+                                 строго: bool = True) -> dict[str, Any]:
+    """Параметры повтора: только из каталога, приведённые и проверенные.
+
+    /retry клал в задание всё, что пришло в теле, как есть. Соседний /rescan
+    проверял и приводил значения, а /retry — нет: `{"beam_size": "мусор"}`
+    принималось с ответом 200 и роняло задание уже в очереди, а служебный
+    ключ `control_of` с чужим идентификатором записывал «контрольный
+    прогон» в журнал ЧУЖОГО задания. Теперь на обоих путях одно и то же:
+    ключи каталога, без секретов сервера, приведение, проверка.
+    """
+    if not сырые:
+        return {}
+    if not isinstance(сырые, dict):
+        raise error_response(ConfigError(
+            "Переопределения передаются объектом JSON: {\"model\": \"…\"}."))
+    if строго:
+        чужие = sorted(str(к) for к in сырые if к not in catalog.PARAMS_BY_KEY)
+        if чужие:
+            raise error_response(ConfigError(
+                f"Неизвестные параметры: {', '.join(чужие)}.",
+                hint="Список допустимых параметров: GET /api/params."))
+    свои = {к: з for к, з in сырые.items()
+            if к in catalog.PARAMS_BY_KEY and з not in (None, "")
+            and (разрешённые is None or к in разрешённые)
+            and not Settings.чужое_заданию(к, з)}
+    # Приведение ПЕРЕД проверкой — как в `Settings.merged` и `Settings.set`.
+    свои = catalog.coerce_all(свои)
+    ошибки = catalog.validate_all(свои)
+    if ошибки:
+        raise error_response(ConfigError("; ".join(ошибки)))
+    return свои
+
+
 @router.post("/{job_id}/retry", summary="Повторить задание")
 def retry(request: Request, job_id: str,
           overrides: dict[str, Any] | None = Body(default=None),
@@ -1210,7 +1259,7 @@ def retry(request: Request, job_id: str,
     state = get_state(request)
     _owned_job(request, job_id, principal)
     require_write(principal)
-    return state.queue.retry(job_id, overrides)
+    return state.queue.retry(job_id, _проверенные_переопределения(overrides) or None)
 
 
 @router.post("/{job_id}/priority", summary="Изменить приоритет")
@@ -1314,17 +1363,12 @@ def rescan(request: Request, данные: dict[str, Any] = Body(default={}),
     # `punctuation`, `num_speakers` и `align_words` в нём числятся, а
     # параметрами каталога не являются, и проверять их было нечем. Такой
     # ключ уезжал в параметры задания с любым значением.
-    переопределения = {к: з for к, з in (данные.get("overrides") or {}).items()
-                       if к in ПОЛЯ_ПЕРЕРАСПОЗНАВАНИЯ and к in catalog.PARAMS_BY_KEY
-                       and з not in (None, "")}
     # Приведение ПЕРЕД проверкой — как в `Settings.merged` и `Settings.set`.
     # Наоборот было ошибкой: интерфейс присылает переключатели строками, и
     # «да» для детектора речи сервер принимал при загрузке записи и отвергал
     # при её перераспознавании — одно и то же значение на двух путях.
-    переопределения = catalog.coerce_all(переопределения)
-    ошибки = catalog.validate_all(переопределения)
-    if ошибки:
-        raise error_response(ConfigError("; ".join(ошибки)))
+    переопределения = _проверенные_переопределения(
+        данные.get("overrides") or {}, разрешённые=ПОЛЯ_ПЕРЕРАСПОЗНАВАНИЯ, строго=False)
 
     ids = [str(и) for и in (данные.get("ids") or []) if str(и).strip()]
     предел = max(1, min(int(_число(данные.get("limit"), 500.0)), 5000))
@@ -1471,9 +1515,14 @@ def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
                       str(job.get("result_path") or ""))
     if каталог is not None:
         shutil.rmtree(каталог, ignore_errors=True)
+        # И отложенный на время повтора прежний результат.
+        shutil.rmtree(каталог.with_name(каталог.name + ".prev"), ignore_errors=True)
     файл = _inside(Path(state.settings.paths.uploads),
                    str(job.get("file_path") or ""))
-    if файл is not None:
+    # Запись бывает общей: контрольный прогон второй моделью идёт по файлу
+    # исходного задания, и удаление контрольного уносило звук исходного.
+    if файл is not None and not state.db.file_used_elsewhere(
+            str(job.get("file_path") or ""), job_id):
         файл.unlink(missing_ok=True)
     state.db.delete_job(job_id)
 
@@ -1526,6 +1575,11 @@ def create_text_job(request: Request, данные: dict[str, Any] = Body(...),
         разобрано = textchat.задание(данные)
     except ASRHubError as exc:
         raise error_response(exc) from exc
+    # Переписка — такое же задание, как и разговор, и в суточную квоту
+    # входит так же: без проверки ключ с квотой в одно задание в сутки
+    # создавал их сколько угодно, лишь бы текстом.
+    check_quota(request, principal,
+                incoming_bytes=len(str(разобрано["text"] or "").encode("utf-8")))
 
     job_id = состояние.db.create_job({
         "filename": разобрано["filename"],
@@ -1548,6 +1602,14 @@ def create_text_job(request: Request, данные: dict[str, Any] = Body(...),
         разбор = состояние.content.analyze_job(
             job_id, segments=разобрано["segments"],
             agent_speaker=разобрано["agent"])
+    # И в очередь смыслового разбора — как свежий разговор: переписка ради
+    # того и приходит, чтобы её разобрали теми же задачами модели.
+    поток = getattr(состояние, "llm_worker", None)
+    if поток is not None:
+        try:
+            поток.enqueue(job_id)
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Переписка %s не поставлена на смысловой разбор: %s", job_id, exc)
     return {
         "id": job_id,
         "channel": разобрано["channel"],

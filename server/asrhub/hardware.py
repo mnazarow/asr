@@ -598,7 +598,13 @@ def проверить_драйвер(*, proc: str = "", корень: str = "")
         with open(proc, encoding="utf-8", errors="replace") as файл:
             import re  # noqa: PLC0415
 
-            совпало = re.search(r"Kernel Module\s+([0-9][0-9.]*)", файл.read())
+            # Открытый модуль (по умолчанию у Turing и новее с R560, а у
+            # Blackwell — единственный) пишет «Open Kernel Module for x86_64
+            # 575.57.08»: прежний шаблон его не разбирал, версия выходила
+            # пустой, и разбор «поможет ли перезагрузка» молчал ровно там,
+            # где он нужен.
+            совпало = re.search(r"Kernel Module(?:\s+for\s+\S+)?\s+([0-9][0-9.]*)",
+                                файл.read())
             загружен = совпало.group(1) if совпало else ""
     except OSError:
         загружен = ""

@@ -677,7 +677,9 @@ nvidia_loaded_version() {
   # nvidia-smi: в том самом случае, ради которого всё это написано,
   # nvidia-smi уже не отвечает, а /proc отвечает по-прежнему.
   [[ -r "${ASRHUB_NVIDIA_PROC}" ]] || { printf ''; return 0; }
-  sed -n 's/.*Kernel Module *\([0-9][0-9.]*\).*/\1/p' \
+  # Открытый модуль пишет «Open Kernel Module for x86_64  575.57.08»: без
+  # необязательного «for АРХИТЕКТУРА» версия выходила пустой.
+  sed -n 's/.*Kernel Module\( for [^ ]*\)\{0,1\} *\([0-9][0-9.]*\).*/\2/p' \
     "${ASRHUB_NVIDIA_PROC}" 2>/dev/null | head -1
 }
 

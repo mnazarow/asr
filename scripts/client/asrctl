@@ -15,7 +15,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="3.1.11"
+VERSION="3.1.12"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
 CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"
@@ -327,13 +327,29 @@ cmd_send_dir() {
   return 0
 }
 
+# Доля выполнения из ответа сервера — в проценты, и только если это число.
+#
+# Значение подставлялось прямо в текст программы — `python3 -c "…'${x}'…"` и
+# `awk "BEGIN{… ${x}*100}"`. Подставной сервер (или перехват по http, а адрес
+# по умолчанию — http) выполнял так свой код на машине клиента при
+# `asrctl status` и `wait`. Теперь значение сверяется с видом числа и уходит в
+# awk переменной, а не текстом программы.
+percent_of() {
+  local value="${1:-}"
+  if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+    printf '0'
+    return 0
+  fi
+  awk -v p="${value}" 'BEGIN { printf "%d", p * 100 }' 2>/dev/null || printf '0'
+}
+
 cmd_status() {
   local job_id="${1:?Укажите идентификатор задания}"
   local response
   response="$(api GET "/api/jobs/${job_id}")"
   printf '%s%s%s\n' "${C_BOLD}" "$(json_get "${response}" filename)" "${C_RESET}"
   printf '  Состояние    %s (%s %%)\n' "$(json_get "${response}" status)" \
-    "$(python3 -c "print(round(float('$(json_get "${response}" progress)' or 0)*100))" 2>/dev/null || echo 0)"
+    "$(percent_of "$(json_get "${response}" progress)")"
   printf '  Этап         %s\n' "$(json_get "${response}" stage)"
   printf '  Модель       %s\n' "$(json_get "${response}" model)"
   printf '  Длительность %s с\n' "$(json_get "${response}" media_duration_s)"
@@ -406,10 +422,8 @@ cmd_wait() {
         sleep 2 ;;
       *)
         i=$(( (i + 1) % 4 ))
-        local percent=0
-        if [[ -n "${progress}" ]]; then
-          percent="$(awk "BEGIN{printf \"%d\", ${progress}*100}" 2>/dev/null || echo 0)"
-        fi
+        local percent
+        percent="$(percent_of "${progress}")"
         printf '\r%s %s %s%%  %s        ' "${spin:i:1}" "${status}" "${percent}" "${stage}"
         sleep 2 ;;
     esac

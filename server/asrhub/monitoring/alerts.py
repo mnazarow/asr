@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -81,15 +82,38 @@ class Rule:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Rule:
+        """Правило из настроек или запроса.
+
+        Направление и важность — без учёта регистра и только из известных:
+        «Above» раньше читалось как «below» (тревога при глубине очереди 3 и
+        тишина при 900), а «Critical» не считалось ни критической тревогой, ни
+        предупреждением. `inclusive` терялся на круге GET → PUT, и
+        критическое правило с порогом на краю шкалы не срабатывало никогда.
+        """
+        if not isinstance(data, dict):
+            raise TypeError("правило — объект с полями metric, direction, threshold")
+        направление = str(data.get("direction", "above")).strip().lower()
+        if направление not in ("above", "below"):
+            raise ValueError(f"direction «{data.get('direction')}»: допустимо above или below")
+        важность = str(data.get("severity", "warning")).strip().lower()
+        if важность not in ("warning", "critical"):
+            raise ValueError(f"severity «{data.get('severity')}»: допустимо warning или critical")
+        порог = float(data["threshold"])
+        if not math.isfinite(порог):
+            raise ValueError("threshold должен быть конечным числом")
+        метки = data.get("labels") or {}
+        if not isinstance(метки, dict):
+            raise TypeError("labels — объект «метка: значение»")
         return cls(
             metric=str(data["metric"]),
-            direction=str(data.get("direction", "above")),
-            threshold=float(data["threshold"]),
-            severity=str(data.get("severity", "warning")),
-            for_seconds=int(data.get("for_seconds", 300)),
-            labels={str(k): str(v) for k, v in (data.get("labels") or {}).items()},
+            direction=направление,
+            threshold=порог,
+            severity=важность,
+            for_seconds=max(0, int(float(data.get("for_seconds", 300)))),
+            labels={str(k): str(v) for k, v in метки.items()},
             enabled=bool(data.get("enabled", True)),
             summary=str(data.get("summary", "")),
+            inclusive=bool(data.get("inclusive", False)),
         )
 
 

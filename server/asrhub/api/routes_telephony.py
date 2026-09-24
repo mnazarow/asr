@@ -246,11 +246,19 @@ def collect(request: Request, данные: dict[str, Any] = Body(default={}),
         raise error_response(ConfigError(
             f"Неизвестный режим сбора: «{режим}».",
             hint="Ожидается all или period."))
+    # Границы периода — числа (секунды эпохи). «Вчера» вместо числа давало
+    # внутреннюю ошибку сервера вместо внятного отказа.
+    границы = {}
+    for поле in ("since", "until"):
+        try:
+            границы[поле] = float(данные.get(поле) or 0)
+        except (TypeError, ValueError):
+            raise error_response(ConfigError(
+                f"Поле {поле} — время в секундах эпохи, получено «{данные.get(поле)}».")) from None
     try:
         итоги = _телефония(request).собрать(
             station_id=str(данные.get("station") or ""), режим=режим,
-            since=float(данные.get("since") or 0),
-            until=float(данные.get("until") or 0))
+            since=границы["since"], until=границы["until"])
     except ASRHubError as exc:
         raise error_response(exc) from exc
     return {"runs": итоги, "at": time.time()}

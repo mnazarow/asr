@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import socket
 import threading
 import time
@@ -62,6 +63,10 @@ class Target:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Target:
+        if not isinstance(data, dict):
+            raise TypeError("приёмник — объект с полями kind и url")
+        if data.get("headers") is not None and not isinstance(data["headers"], dict):
+            raise TypeError("headers — объект «заголовок: значение»")
         kind = str(data.get("kind") or "")
         if kind not in KINDS:
             raise ValueError(f"Неизвестный приёмник «{kind}». Доступны: {', '.join(KINDS)}")
@@ -110,13 +115,66 @@ class TargetState:
         }
 
 
+class _БезПеренаправлений(urllib.request.HTTPRedirectHandler):
+    """Перенаправление — это ошибка доставки, а не повод идти дальше.
+
+    urllib на 301/302/303 превращает POST в GET без тела и идёт по новому
+    адресу. Приёмник за прокси с перенаправлением http→https «принимал»
+    отправку: ответ 200 на GET, приёмник здоров, счётчик отправленного
+    растёт — а данных нет. Проверка `status >= 300` при этом не
+    срабатывала никогда: до неё доходил уже ответ второго запроса.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+_ОТКРЫВАТЕЛЬ = urllib.request.build_opener(_БезПеренаправлений)
+
+
 def _post(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
     request = urllib.request.Request(url, data=body, method="POST")
     for key, value in headers.items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        if response.status >= 300:
-            raise RuntimeError(f"HTTP {response.status}")
+    try:
+        with _ОТКРЫВАТЕЛЬ.open(request, timeout=timeout) as response:
+            if response.status >= 300:
+                raise RuntimeError(f"HTTP {response.status}")
+    except urllib.error.HTTPError as exc:
+        куда = exc.headers.get("Location") if exc.headers else ""
+        if 300 <= exc.code < 400:
+            raise RuntimeError(
+                f"HTTP {exc.code}: приёмник перенаправляет"
+                + (f" на {скрыть_адрес(куда)}" if куда else "")
+                + " — укажите конечный адрес") from exc
+        raise
+
+
+#: Параметры адреса, в которых приёмники обычно носят учётные данные:
+#: InfluxDB 1.x — u и p, Pushgateway и прочие — token, key, password.
+_СЕКРЕТЫ_В_АДРЕСЕ = re.compile(
+    r"(?i)([?&](?:u|p|user|pass|password|pwd|token|key|apikey|api_key|"
+    r"access_token|auth|secret)=)[^&#\s]+")
+
+
+def скрыть_адрес(адрес: str) -> str:
+    """Адрес без учётных данных: в запросе и перед «@»."""
+    текст = _СЕКРЕТЫ_В_АДРЕСЕ.sub(r"\1***", str(адрес or ""))
+    return re.sub(r"(//)[^/@\s]+@", r"\1***@", текст)
+
+
+def _без_секретов(текст: str, target: Target) -> str:
+    """Текст ошибки без учётных данных приёмника.
+
+    urllib кладёт в сообщение об ошибке весь адрес — вместе с `?p=пароль`.
+    Оно уходило и в журнал, и в last_error, а last_error отдаётся ключу
+    «только чтение»: адрес ему прятали, а текст ошибки с тем же адресом —
+    нет.
+    """
+    итог = str(текст or "")
+    if target.url:
+        итог = итог.replace(target.url, скрыть_адрес(target.url))
+    return скрыть_адрес(итог)
 
 
 def _base_metric_name(name: str) -> str:
@@ -308,20 +366,35 @@ class PushManager:
             threading.Thread(target=self.push_once, args=(target, samples),
                              name=f"asrhub-push-{target.name}", daemon=True).start()
 
-    def push_once(self, target: Target, samples: list[Sample] | None = None) -> dict[str, Any]:
-        """Одна отправка. Используется и циклом, и кнопкой «проверить»."""
+    def push_once(self, target: Target, samples: list[Sample] | None = None,
+                  *, проба: bool = False) -> dict[str, Any]:
+        """Одна отправка. Используется и циклом, и кнопкой «проверить».
+
+        `проба` — разовая проверка несохранённого приёмника: его состояние
+        не заводится в общем списке. Раньше кнопка «Проверить» ставила
+        проверяемый приёмник в работу: цикл слал туда по расписанию, а
+        неудачная проверка через четверть часа поднимала тревогу — при том
+        что справочник обещает «ничего не сохраняет».
+        """
         payload = samples if samples is not None else self._collect()
         with self._lock:
-            state = self._states.get(target.name) or TargetState(target=target)
-            self._states[target.name] = state
+            if проба:
+                state = TargetState(target=target)
+            else:
+                state = self._states.get(target.name) or TargetState(target=target)
+                self._states[target.name] = state
             state.last_attempt = time.time()
         try:
             send(target, payload)
-        except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:                             # noqa: BLE001
+            # Любое исключение, а не только сетевые: http.client.InvalidURL
+            # (опечатка в порту) и BadStatusLine (приёмник отвечает не по
+            # HTTP) пролетали мимо, поток отправки падал с трассой в stderr на
+            # каждом интервале, а last_error оставался пустым.
             now = time.time()
             with self._lock:
                 state.failed += 1
-                state.last_error = f"{type(exc).__name__}: {exc}"
+                state.last_error = _без_секретов(f"{type(exc).__name__}: {exc}", target)
                 # Первая неудача — вслух, дальше не чаще раза в час. Само
                 # состояние никуда не девается: оно целиком видно в
                 # /api/monitoring/push и в разделе наблюдения.
@@ -330,7 +403,8 @@ class PushManager:
                     state.last_complaint = now
                     failures = state.failed
             if complain:
-                log.warning("Не удалось отправить метрики в «%s»: %s", target.name, exc)
+                log.warning("Не удалось отправить метрики в «%s»: %s", target.name,
+                            state.last_error)
                 if failures > 1:
                     log.warning("Это %s-я неудача подряд; следующая жалоба — не раньше "
                                 "чем через час. Состояние: /api/monitoring/push",

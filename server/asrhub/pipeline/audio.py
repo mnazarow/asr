@@ -226,40 +226,67 @@ def analyze_levels(path: Path, max_seconds: float = 600.0) -> dict[str, float]:
     return out
 
 
-def lead_silence_s(src: Path, settings: dict[str, Any]) -> float:
-    """Сколько секунд тишины в начале записи — теми же порогами, что и обрезка.
+def silence_bounds(src: Path, settings: dict[str, Any],
+                   duration_s: float | None = None) -> tuple[float, float | None]:
+    """Тишина по краям записи: (сколько секунд её в начале, где начинается
+    тишина в конце — или None, если запись не кончается тишиной).
 
-    Нужна не сама обрезка, а её величина: на неё потом сдвигаются обратно
-    все таймкоды. Пороги (-45 дБ, 0.1 с) совпадают с теми, что стоят в
-    цепочке фильтров, иначе замер и обрезка разошлись бы.
+    Один проход `silencedetect`, который читает звук потоком. Раньше конец
+    обрезался цепочкой `areverse,silenceremove,areverse`, а `areverse`
+    держит в памяти всю запись: 210 МБ на минуту стерео 48 кГц, двухчасовое
+    совещание — около 25 ГБ, запись на четыре часа (предел по умолчанию) —
+    около 50 ГБ на каждое задание. Ядро убивало ffmpeg, и задание падало с
+    ложным «проверьте целостность файла», а то и весь сервер.
+
+    Начало нужно величиной — на неё потом сдвигаются обратно все таймкоды;
+    конец — точкой, до которой читать (`-t`). Пороги (-45 дБ, 0.1 с) те же,
+    что были у обрезки фильтрами.
     """
     if not settings.get("audio_trim_silence"):
-        return 0.0
+        return 0.0, None
     exe = _ffmpeg()
     cmd = [exe, "-hide_banner", "-nostdin", "-i", str(src),
            "-af", "silencedetect=noise=-45dB:d=0.1", "-f", "null", "-"]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     except (OSError, subprocess.SubprocessError):
-        return 0.0
-    start_at_zero = False
+        return 0.0, None
+    отрезки: list[list[float | None]] = []
+    длительность = duration_s
     for line in (res.stderr or "").splitlines():
-        if "silence_start:" in line:
-            try:
-                value = float(line.split("silence_start:")[1].strip().split(" ")[0])
-            except (ValueError, IndexError):
-                continue
-            # Интересует только тишина, с которой запись начинается.
-            if value <= 0.05:
-                start_at_zero = True
-            elif not start_at_zero:
-                return 0.0
-        elif "silence_end:" in line and start_at_zero:
-            try:
-                return max(0.0, float(line.split("silence_end:")[1].strip().split(" ")[0]))
-            except (ValueError, IndexError):
-                return 0.0
-    return 0.0
+        try:
+            if "silence_start:" in line:
+                отрезки.append(
+                    [float(line.split("silence_start:")[1].strip().split(" ")[0]), None])
+            elif "silence_end:" in line and отрезки:
+                отрезки[-1][1] = float(line.split("silence_end:")[1].strip().split(" ")[0])
+            elif длительность is None and "time=" in line:
+                # Итог прохода: «… time=00:02:05.12 …» — длина, если её не дали.
+                часы, минуты, секунды = line.split("time=")[1].split(" ")[0].split(":")
+                длительность = int(часы) * 3600 + int(минуты) * 60 + float(секунды)
+        except (ValueError, IndexError):
+            continue
+    начало = 0.0
+    if отрезки and (отрезки[0][0] or 0.0) <= 0.05:
+        # Интересует только тишина, с которой запись начинается.
+        начало = max(0.0, float(отрезки[0][1] if отрезки[0][1] is not None
+                                 else (длительность or 0.0)))
+    конец: float | None = None
+    if отрезки:
+        последний_старт, последний_конец = отрезки[-1]
+        # Тишина идёт до самого конца: у последнего отрезка нет окончания
+        # (так пишут старые ffmpeg) или окончание совпадает с концом файла
+        # (так пишут новые).
+        до_конца = последний_конец is None or (
+            длительность is not None and последний_конец >= длительность - 0.05)
+        if до_конца and последний_старт is not None and последний_старт > начало + 0.05:
+            конец = float(последний_старт)
+    return начало, конец
+
+
+def lead_silence_s(src: Path, settings: dict[str, Any]) -> float:
+    """Сколько секунд тишины в начале записи (см. `silence_bounds`)."""
+    return silence_bounds(src, settings)[0]
 
 
 def deepfilter_путь() -> str | None:
@@ -396,16 +423,11 @@ def build_filter_chain(settings: dict[str, Any]) -> str:
     # проходом до неё (см. `очистить_deepfilter`). Причина в частоте: модель
     # работает на 48 кГц и требует своего ресемплинга туда и обратно.
 
-    if settings.get("audio_trim_silence"):
-        # Режем только тишину в КОНЦЕ. Начальную здесь трогать нельзя: она
-        # сдвигает все таймкоды, а сдвиг никуда не записывается — субтитры
-        # уезжали ровно на длину тишины в начале записи. Начало обрезается
-        # через -ss на известную величину (см. lead_silence_s), и эта
-        # величина потом возвращается ко всем таймкодам.
-        filters.append(
-            "areverse,"
-            "silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:"
-            "detection=peak,areverse")
+    # Тишина по краям (`audio_trim_silence`) фильтрами не режется: начало
+    # снимается через -ss на отмеренную величину — она потом возвращается
+    # ко всем таймкодам, — а конец через -t по отмеренной точке (см.
+    # `silence_bounds`). Прежняя цепочка `areverse,…,areverse` держала в
+    # памяти всю запись целиком.
 
     speed = float(settings.get("audio_speed") or 1.0)
     if abs(speed - 1.0) > 1e-3:
@@ -439,9 +461,11 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if start_s is not None:
         cmd += ["-ss", f"{start_s:.3f}"]
-    cmd += ["-i", str(src)]
+    # Длина — ключом ВХОДА, до -i: она считается по исходному файлу, а не по
+    # выходу, который после atempo короче или длиннее.
     if duration_s is not None:
         cmd += ["-t", f"{duration_s:.3f}"]
+    cmd += ["-i", str(src)]
 
     chain = build_filter_chain(settings)
     if mode == "left":
@@ -475,6 +499,18 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     # исправный файл. Отличаются они кодом возврата: при успехе ffmpeg
     # молчит, и в сообщении не оказывалось даже его слов.
     if res.returncode == 0 and размер < ПУСТОЙ_WAV:
+        отказ = _пустой_результат(src, settings, start_s)
+        отказ.details.update(источник)
+        raise отказ
+    # Обрезка тишины раньше шла фильтром ПОСЛЕ остальных, и запись, из
+    # которой фильтры (или сама станция) не оставили ни одного громкого
+    # отсчёта, выходила пустой — с объяснением, что виновато: тишина в
+    # записи или фильтр. Теперь тишина по краям меряется до фильтров
+    # (`silence_bounds`), и ту же проверку делаем явно: выход без единого
+    # громкого отсчёта — тот же «пустой результат». Замер по готовому WAV
+    # 16 кГц — быстрый проход без памяти под всю запись.
+    if res.returncode == 0 and settings.get("audio_trim_silence") \
+            and peak_db(dst) <= ТИШИНА_ДБ:
         отказ = _пустой_результат(src, settings, start_s)
         отказ.details.update(источник)
         raise отказ
@@ -708,10 +744,11 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
                 замечания.append(беда)
     settings = настройки
 
-    # Начальная тишина отмеряется один раз на исходном файле и одинаково
+    # Тишина по краям отмеряется один раз на исходном файле и одинаково
     # применяется ко всем каналам: иначе левый и правый разъехались бы во
     # времени между собой.
-    offset = lead_silence_s(src, settings)
+    offset, конец_речи = silence_bounds(src, settings, info.duration_s or None)
+    длина = (конец_речи - offset) if конец_речи is not None and конец_речи > offset else None
     speed = float(settings.get("audio_speed") or 1.0)
 
     mode = str(settings.get("audio_channels") or "mono")
@@ -734,7 +771,8 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
         for label, channel in (("Канал 1", "left"), ("Канал 2", "right")):
             dst = workdir / f"{src.stem}.{channel}.wav"
             try:
-                convert(src, dst, settings, channel=channel, start_s=offset or None)
+                convert(src, dst, settings, channel=channel, start_s=offset or None,
+                        duration_s=длина)
             except ASRHubError as сбой:
                 # Пустой канал — не отказ задания. В телефонной записи
                 # молчит то клиент, то оператор, и раньше такой канал
@@ -762,7 +800,7 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
     # Канал передаётся явно: `convert` без него перечитывает настройку, а
     # настройка могла быть «right» на одноканальном файле — её мы уже
     # заменили на «mono» выше, и подменять обратно незачем.
-    convert(src, dst, settings, channel=mode, start_s=offset or None)
+    convert(src, dst, settings, channel=mode, start_s=offset or None, duration_s=длина)
     return Prepared([("", dst)], offset_s=offset, speed=speed, warnings=замечания)
 
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Диагностика установки ASR Hub на Windows.
 .EXAMPLE

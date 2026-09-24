@@ -245,20 +245,40 @@ check_writable() {
 
 # Скачивание с ключом в заголовке. Ключ в заголовке, а не в адресе,
 # намеренно: адрес попадает в журнал обратного прокси и в историю команд.
+#
+# Ключ идёт в curl файлом настроек (-K), а не аргументом -H: аргументы любой
+# программы видны каждому пользователю станции в `ps` и /proc/*/cmdline, и
+# ключ с правом записи утекал бы любому, кто зайдёт на станцию. Файл лежит
+# во временном каталоге установщика (mktemp -d — права 0700) и удаляется
+# вместе с ним. У GNU wget то же делает --config; у wget из busybox его нет,
+# и там ключ, увы, идёт аргументом — curl на станциях встречается чаще.
 download() {
   local address="$1" dest="$2" code=""
   if have curl; then
-    code="$(curl -sS --connect-timeout 10 --max-time 300 \
-             -H "X-API-Key: ${KEY}" -o "${dest}" -w '%{http_code}' "${address}" \
-             2>"${TMP_DIR}/curl.err" || printf '000')"
+    ( umask 077; printf 'header = "X-API-Key: %s"\n' "${KEY}" >"${TMP_DIR}/curl.cfg" )
+    # Код ответа — только то, что напечатал сам curl. Прежнее
+    # «… -w '%{http_code}' … || printf '000'» при недоступном сервере
+    # давало «000000»: curl печатает 000 и выходит с ошибкой, и к его
+    # ответу дописывался ещё один.
+    code="$(curl -sS --connect-timeout 10 --max-time 300 -K "${TMP_DIR}/curl.cfg" \
+             -o "${dest}" -w '%{http_code}' "${address}" \
+             2>"${TMP_DIR}/curl.err")" || true
   else
-    if wget -q --timeout=30 --tries=2 --header="X-API-Key: ${KEY}" \
+    local key_option="--header=X-API-Key: ${KEY}"
+    if wget --help 2>&1 | grep -q -- '--config'; then
+      ( umask 077; printf 'header = X-API-Key: %s\n' "${KEY}" >"${TMP_DIR}/wgetrc" )
+      key_option="--config=${TMP_DIR}/wgetrc"
+    fi
+    if wget -q --timeout=30 --tries=2 "${key_option}" \
             -O "${dest}" "${address}" 2>"${TMP_DIR}/wget.err"; then
       code="200"
     else
       code="000"
     fi
   fi
+  case "${code}" in
+    ''|000*) code="000" ;;
+  esac
   case "${code}" in
     200) return 0 ;;
     401|403)
@@ -285,7 +305,10 @@ check_server() {
   local code=""
   if have curl; then
     code="$(curl -sS --connect-timeout 10 --max-time 30 -o /dev/null \
-            -w '%{http_code}' "${URL}/api/health" 2>/dev/null || printf '000')"
+            -w '%{http_code}' "${URL}/api/health" 2>/dev/null)" || true
+    case "${code}" in
+      ''|000*) code="000" ;;
+    esac
   else
     if wget -q --timeout=15 --tries=1 -O /dev/null "${URL}/api/health" 2>/dev/null; then
       code="200"
@@ -321,6 +344,10 @@ set_option() {
   if [ -z "${value}" ]; then return 0; fi
   if grep -qE "^[[:space:]]*${name}[[:space:]]*=" "${file}" 2>/dev/null; then
     local tmp="${file}.tmp$$"
+    # Временный файл — с правами 0600 с самого начала: в нём весь файл
+    # настроек вместе с ключом доступа, а по умолчанию он создавался 0644
+    # в /etc и был виден любому пользователю станции.
+    ( umask 077; : >"${tmp}" )
     # Значение идёт в awk окружением, а не подстановкой в текст
     # программы: в ключе доступа и в пути встречаются косые и кавычки,
     # и одна такая превратила бы правку настроек в синтаксическую

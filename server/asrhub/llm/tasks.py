@@ -153,8 +153,12 @@ def _из_списка(значение: Any, варианты: list[str],
     """
     if not варианты:
         return None, False
-    текст = str(значение or "").strip().lower()
-    пункты = [(в, str(в).strip().lower()) for в in варианты if str(в).strip()]
+    # Сравниваем записи, приведённые к одному виду: без регистра, «ё» и
+    # знаков. Модель вправе ответить «Вопрос решен.» на пункт «вопрос
+    # решён» — раньше это был исход «неясно» с пометкой «вне списка», и доля
+    # решённых в отчётах занижалась ровно на такие ответы.
+    текст = _для_сравнения(значение)
+    пункты = [(в, _для_сравнения(в)) for в in варианты if _для_сравнения(в)]
     for в, нижний in пункты:
         if текст == нижний:
             return str(в), True
@@ -171,8 +175,46 @@ def _из_списка(значение: Any, варианты: list[str],
     return None, False
 
 
+def _для_сравнения(значение: Any) -> str:
+    """Запись для сравнения с пунктом списка: регистр, «ё», знаки, пробелы."""
+    низ = str(значение or "").lower().replace("ё", "е")
+    низ = re.sub(r"[^\w\s-]", " ", низ)
+    return " ".join(низ.split())
+
+
 def _строка(значение: Any, предел: int = 600) -> str:
+    """Строка из ответа модели. Список склеивается, а не превращается в
+    `"['…', '…']"` — так резюме, присланное пунктами, и попадало в отчёт."""
+    if isinstance(значение, (list, tuple)):
+        значение = "; ".join(str(ч).strip() for ч in значение if str(ч or "").strip())
+    elif isinstance(значение, dict):
+        значение = ""
     return str(значение or "").strip()[:предел]
+
+
+#: Как модель пишет «да» и «нет», если не булевым значением.
+_ДА = frozenset({"да", "yes", "true", "1", "истина", "верно"})
+_НЕТ = frozenset({"нет", "no", "false", "0", "ложь", "неверно"})
+
+
+def _да_нет(значение: Any) -> bool | None:
+    """Да/нет из ответа модели — или None, если ответ не читается.
+
+    `bool("false")` истинно: трекер, на который модель ответила строкой
+    «false», считался сработавшим, и в своде копились ложные срабатывания.
+    А `"resolved": "true"` превращалось в «не известно».
+    """
+    if isinstance(значение, bool):
+        return значение
+    if isinstance(значение, (int, float)) and значение in (0, 1):
+        return bool(значение)
+    if isinstance(значение, str):
+        низ = значение.strip().lower().rstrip(".!")
+        if низ in _ДА:
+            return True
+        if низ in _НЕТ:
+            return False
+    return None
 
 
 def _список(значение: Any) -> list[Any]:
@@ -285,8 +327,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
         данные = parse_json(ответ)
         if "summary" in задачи:
             итог["summary"] = _строка(данные.get("summary"), 2000) or None
-            решено = данные.get("resolved")
-            итог["resolved"] = решено if isinstance(решено, bool) else None
+            итог["resolved"] = _да_нет(данные.get("resolved"))
         if "outcome" in задачи:
             if причины:
                 итог["reason"], попала = _из_списка(данные.get("reason"), причины,
@@ -321,7 +362,7 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
                   if isinstance(o, dict)}
         итог["trackers"] = [
             {"id": str(т.get("id")), "label": str(т.get("label") or т.get("id")),
-             "fired": bool((ответы.get(str(т.get("id"))) or {}).get("fired")),
+             "fired": bool(_да_нет((ответы.get(str(т.get("id"))) or {}).get("fired"))),
              "quote": _строка((ответы.get(str(т.get("id"))) or {}).get("quote"))}
             for т in трекеры if т.get("id")]
 

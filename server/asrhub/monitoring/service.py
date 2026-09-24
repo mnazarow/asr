@@ -117,22 +117,33 @@ class MonitoringService:
 
     def apply_settings(self, settings: Any) -> None:
         """Читает приёмники и пороги из настроек сервера."""
+        # Ни одна запись здесь не валит запуск: строка вместо списка (так её
+        # сохранял интерфейс, пока тип был неизвестным «list») раньше давала
+        # AttributeError посреди запуска, и сервер не поднимался.
         raw_targets = settings.get("monitoring_targets") or []
+        if not isinstance(raw_targets, list):
+            log.warning("Приёмники метрик пропущены: ожидается список, записано %s",
+                        type(raw_targets).__name__)
+            raw_targets = []
         targets: list[Target] = []
         for item in raw_targets:
             try:
                 targets.append(Target.from_dict(item))
-            except (ValueError, KeyError, TypeError) as exc:
+            except Exception as exc:                         # noqa: BLE001
                 log.warning("Приёмник метрик пропущен: %s", exc)
         self.push.set_targets(targets)
 
         raw_rules = settings.get("monitoring_rules") or []
+        if not isinstance(raw_rules, list):
+            log.warning("Правила оповещения пропущены: ожидается список, записано %s",
+                        type(raw_rules).__name__)
+            raw_rules = []
         if raw_rules:
             rules: list[Rule] = []
             for item in raw_rules:
                 try:
                     rules.append(Rule.from_dict(item))
-                except (ValueError, KeyError, TypeError) as exc:
+                except Exception as exc:                     # noqa: BLE001
                     log.warning("Правило оповещения пропущено: %s", exc)
             if rules:
                 self.alerts.set_rules(rules)

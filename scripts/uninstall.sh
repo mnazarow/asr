@@ -272,20 +272,37 @@ step "Проверка остатков"
 LEFTOVERS=()
 # Снимок перед обновлением кладётся рядом с каталогом программы и весит
 # столько же, сколько сама установка: без него список остатков врал.
+# Снимков два вида: нынешний `<каталог>.snapshot` (с 3.1.3, у каждой
+# установки свой) и прежний общий `asrhub-snapshot`. В нынешнем лежит
+# config.yaml.snapshot — ключи доступа и токен Hugging Face, — и после
+# `--purge` он оставался на диске, а скрипт писал «Остатков не найдено».
+#
+# Юнит — только своей службы: у второй установки своё имя, и удаление её
+# остатков сносило юнит первой.
 for path in /etc/asrhub /usr/local/bin/asrctl "${HOME}/.config/asrhub" \
-            /etc/systemd/system/asrhub.service "${HOME}/Library/LaunchAgents/com.asrhub.server.plist" \
-            "${PREFIX}/whisper.cpp" "$(dirname "${PREFIX}")/asrhub-snapshot"; do
+            "/etc/systemd/system/${SERVICE_NAME:-asrhub}.service" \
+            "${HOME}/Library/LaunchAgents/com.asrhub.server.plist" \
+            "${PREFIX}/whisper.cpp" "${PREFIX%/}.snapshot" \
+            "$(dirname "${PREFIX}")/asrhub-snapshot"; do
   [[ -e "${path}" ]] && LEFTOVERS+=("${path}")
 done
 if [[ ${#LEFTOVERS[@]} -gt 0 ]]; then
   warn "Найдены остатки:"
   for path in "${LEFTOVERS[@]}"; do printf '    %s\n' "${path}"; done
-  if confirm "Удалить их?"; then
+  if [[ -e "${PREFIX%/}.snapshot/config.yaml.snapshot" ]]; then
+    hint "В снимке ${PREFIX%/}.snapshot лежит копия config.yaml — с ключами доступа и токеном."
+  fi
+  # Пробный запуск только перечисляет. Раньше удаление шло голым rm мимо
+  # `run`, и `--dry-run --yes` по-настоящему сносил сборку whisper.cpp на
+  # несколько гигабайт, снимок отката, настройки клиента и LaunchAgent.
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    info "Пробный запуск: остатки не удаляются."
+  elif confirm "Удалить их?"; then
     for path in "${LEFTOVERS[@]}"; do
       if [[ "${path}" == /etc/* || "${path}" == /usr/* ]]; then
         as_root rm -rf "${path}" 2>/dev/null || warn "  не удалось: ${path}"
       else
-        rm -rf "${path}" 2>/dev/null || warn "  не удалось: ${path}"
+        run rm -rf "${path}" 2>/dev/null || warn "  не удалось: ${path}"
       fi
     done
   fi
@@ -294,6 +311,11 @@ else
 fi
 
 clear_rollback
+if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+  printf '\n%s%sПробный запуск завершён — ничего не удалено.%s\n\n' \
+    "${C_BOLD}" "${C_GREEN}" "${C_RESET}"
+  exit 0
+fi
 printf '\n%s%sASR Hub удалён%s\n\n' "${C_BOLD}" "${C_GREEN}" "${C_RESET}"
 [[ -d "${BACKUP_DIR}" ]] && printf '  Резервная копия конфигурации и базы: %s\n' "${BACKUP_DIR}"
 [[ "${PURGE}" -eq 0 && -n "${DATA_DIR}" ]] && \

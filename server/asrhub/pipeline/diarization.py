@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import settings_access as S
-from ..engines.base import Segment
+from ..engines.base import Segment, device_for
 from ..errors import DependencyMissing, GatedModelError
 from ..logging_setup import get_logger
 from ..monitoring.collector import RUNTIME
@@ -90,16 +90,21 @@ def _pyannote(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, f
 
     model_name = str(settings.get("diarization_model")
                      or "pyannote/speaker-diarization-community-1")
-    pipeline = Pipeline.from_pretrained(model_name, use_auth_token=token)
+    pipeline = _из_хаба(Pipeline, model_name, token)
+    if pipeline is None:
+        raise GatedModelError(model_name, f"https://huggingface.co/{model_name}")
 
-    device = str(settings.get("device") or "auto")
+    # «auto» — это видеокарта, если она есть. Раньше на карту переносили
+    # только при явном «cuda», а умолчание «auto» оставляло pyannote считать
+    # на процессоре — в разы дольше самого распознавания.
+    device = device_for(settings)
     if device.startswith("cuda"):
         try:
             import torch  # type: ignore
 
             pipeline.to(torch.device(device))
-        except Exception:
-            pass
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Диаризация остаётся на процессоре: %s", exc)
 
     kwargs: dict[str, Any] = {}
     num = S.integer(settings, "diarization_num_speakers", 0)
@@ -109,9 +114,38 @@ def _pyannote(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, f
         kwargs["min_speakers"] = int(settings.get("diarization_min_speakers") or 1)
         kwargs["max_speakers"] = int(settings.get("diarization_max_speakers") or 8)
 
-    annotation = pipeline(str(audio_path), **kwargs)
+    итог = pipeline(str(audio_path), **kwargs)
+    # pyannote.audio 4 отдаёт не разметку, а набор разметок. Для расшифровки
+    # нужна «исключающая» — без наложенных реплик: каждому слову один
+    # говорящий. В 3.x ответ — сама разметка.
+    annotation = (getattr(итог, "exclusive_speaker_diarization", None)
+                  or getattr(итог, "speaker_diarization", None) or итог)
     return [(float(turn.start), float(turn.end), str(speaker))
             for turn, _, speaker in annotation.itertracks(yield_label=True)]
+
+
+def _из_хаба(Pipeline: Any, model_name: str, token: str) -> Any:
+    """`Pipeline.from_pretrained` с токеном — под обе ветки pyannote.audio.
+
+    В 4.x параметр называется `token`, а `use_auth_token` убран: вызов
+    падал с TypeError, и диаризация через pyannote не работала никогда —
+    конвейер уходил к Sortformer или к разбивке по паузам. Ставится же по
+    требованию «pyannote.audio>=3.1» именно 4.x, а модель по умолчанию
+    speaker-diarization-community-1 без неё и не грузится. В 3.x — наоборот.
+    """
+    import inspect  # noqa: PLC0415
+
+    try:
+        параметры = inspect.signature(Pipeline.from_pretrained).parameters
+    except (TypeError, ValueError):
+        параметры = {}
+    if "token" in параметры or not параметры:
+        try:
+            return Pipeline.from_pretrained(model_name, token=token)
+        except TypeError as exc:
+            if "token" not in str(exc):
+                raise
+    return Pipeline.from_pretrained(model_name, use_auth_token=token)
 
 
 def _sortformer(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, float, str]]:

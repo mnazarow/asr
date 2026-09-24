@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from ..logging_setup import get_logger
@@ -2060,11 +2061,15 @@ _p(P(
     default="",
     description=(
         "Список имён через запятую, подставляемых вместо меток «Говорящий 1», "
-        "«Говорящий 2» в порядке первого появления в записи."
+        "«Говорящий 2» в порядке первого появления в записи. При разделении "
+        "стереозаписи по каналам имена идут по номеру канала: первое — первому "
+        "каналу, второе — второму, кто бы ни заговорил первым."
     ),
     recommendation=(
         "Заполняйте после первого прогона, когда видно, кто под каким номером. "
-        "Порядок определяется моментом первой реплики, а не громкостью или длительностью."
+        "Порядок определяется моментом первой реплики, а не громкостью или длительностью. "
+        "Для звонков, разведённых по каналам, порядок задаёт станция: обычно в первом "
+        "канале звонящий, во втором — принявший."
     ),
     examples=[
         Ex("Интервью", "Ведущий, Гость", ""),
@@ -2956,7 +2961,7 @@ _p(P(
     key="webhook_secret",
     label="Секрет для подписи webhook",
     group="server",
-    type="string",
+    type="str",
     default="",
     description=(
         "Общий секрет, которым подписывается тело уведомления о завершении задания. "
@@ -3478,7 +3483,7 @@ _p(P(
     key="digest_period",
     label="Период сводки",
     group="monitoring",
-    type="str",
+    type="enum",
     default="week",
     options=[
         {"value": "day", "label": "Сутки"},
@@ -3939,7 +3944,7 @@ _p(P(
     key="monitoring_targets",
     label="Приёмники метрик",
     group="monitoring",
-    type="list",
+    type="json",
     default=[],
     description=(
         "Куда сервер отправляет метрики сам. Каждый приёмник описывается объектом "
@@ -3975,7 +3980,7 @@ _p(P(
     key="monitoring_rules",
     label="Правила оповещения",
     group="monitoring",
-    type="list",
+    type="json",
     default=[],
     description=(
         "Собственные пороги тревог. Пустой список означает пороги из каталога "
@@ -7256,8 +7261,85 @@ def _проверить_категории(value: object) -> list[str]:
     return validate(value)
 
 
+def _конечное(значение: object) -> bool:
+    """Число, и не бесконечность и не NaN."""
+    if isinstance(значение, bool):
+        return False
+    try:
+        return math.isfinite(float(значение))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _проверить_приёмники(value: object) -> list[str]:
+    """Приёмники метрик: список объектов с известным kind и адресом.
+
+    Раньше тип был «list», которого не знали ни приведение, ни проверка, —
+    проходило что угодно. Строка в config.yaml (а интерфейс рисовал поле
+    простым текстом) доходила до разбора приёмников, и сервер не поднимался:
+    AttributeError в `Target.from_dict` посреди запуска.
+    """
+    from ..monitoring.pushers import KINDS  # noqa: PLC0415
+
+    if not isinstance(value, list):
+        return ['ожидается список приёмников: [{"kind": "influxdb", "url": "http://…"}]']
+    ошибки: list[str] = []
+    for номер, приёмник in enumerate(value, 1):
+        if not isinstance(приёмник, dict):
+            ошибки.append(f"приёмник {номер}: ожидается объект с полями kind и url")
+            continue
+        вид = str(приёмник.get("kind") or "")
+        if вид not in KINDS:
+            ошибки.append(f"приёмник {номер}: неизвестный kind «{вид}» — "
+                          f"допустимы {', '.join(KINDS)}")
+        if not str(приёмник.get("url") or "").strip():
+            ошибки.append(f"приёмник {номер}: не задан url")
+        for поле in ("interval_s", "timeout_s"):
+            if поле in приёмник and not _конечное(приёмник[поле]):
+                ошибки.append(f"приёмник {номер}: {поле} должно быть числом")
+        if приёмник.get("headers") is not None and not isinstance(приёмник["headers"], dict):
+            ошибки.append(f"приёмник {номер}: headers — объект «заголовок: значение»")
+    return ошибки
+
+
+def _проверить_правила(value: object) -> list[str]:
+    """Правила оповещения: метрика из каталога, направление, порог, важность.
+
+    Без проверки опечатка давала правило, которое молчит всегда (метрики с
+    таким именем нет), «Above» читалось как «below», а «Critical» не
+    считалось ни критической тревогой, ни предупреждением.
+    """
+    from ..monitoring.catalog import METRICS_BY_NAME  # noqa: PLC0415
+
+    if not isinstance(value, list):
+        return ['ожидается список правил: [{"metric": …, "direction": "above", "threshold": …}]']
+    ошибки: list[str] = []
+    for номер, правило in enumerate(value, 1):
+        if not isinstance(правило, dict):
+            ошибки.append(f"правило {номер}: ожидается объект с полями metric и threshold")
+            continue
+        метрика = str(правило.get("metric") or "").strip()
+        if not метрика:
+            ошибки.append(f"правило {номер}: не задана metric")
+        elif метрика not in METRICS_BY_NAME:
+            ошибки.append(f"правило {номер}: метрики «{метрика}» нет в каталоге — "
+                          "список: GET /api/monitoring/catalog")
+        if str(правило.get("direction", "above")).strip().lower() not in ("above", "below"):
+            ошибки.append(f"правило {номер}: direction — above или below")
+        if str(правило.get("severity", "warning")).strip().lower() not in ("warning", "critical"):
+            ошибки.append(f"правило {номер}: severity — warning или critical")
+        if not _конечное(правило.get("threshold")):
+            ошибки.append(f"правило {номер}: threshold должен быть числом")
+        if "for_seconds" in правило and not (
+                _конечное(правило["for_seconds"]) and float(правило["for_seconds"]) >= 0):
+            ошибки.append(f"правило {номер}: for_seconds — неотрицательное число секунд")
+    return ошибки
+
+
 #: Проверки значений сверх типа — по ключу параметра.
-_ПРОВЕРКИ = {"content_categories": _проверить_категории}
+_ПРОВЕРКИ = {"content_categories": _проверить_категории,
+             "monitoring_targets": _проверить_приёмники,
+             "monitoring_rules": _проверить_правила}
 
 
 #: Как записывают «да» и «нет» руками и в переменных окружения.
@@ -7466,13 +7548,25 @@ def validate_value(key: str, value: object) -> tuple[bool, str]:
             if not isinstance(value, bool):
                 return False, f"«{spec.label}»: ожидается да/нет"
         elif t == "int":
+            # «да» — не единица, 2.5 — не целое: приведение оставляет такие
+            # записи как есть именно затем, чтобы здесь о них сказали. А
+            # int(2.5) молча давал 2, и бесконечность роняла запуск целиком
+            # OverflowError, которую не ловили.
+            if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+                return False, f"«{spec.label}»: ожидается целое число"
             iv = int(value)  # type: ignore[arg-type]
             if spec.minimum is not None and iv < spec.minimum:
                 return False, f"«{spec.label}»: минимум {int(spec.minimum)}"
             if spec.maximum is not None and iv > spec.maximum:
                 return False, f"«{spec.label}»: максимум {int(spec.maximum)}"
         elif t == "float":
+            if isinstance(value, bool):
+                return False, f"«{spec.label}»: ожидается число"
             fv = float(value)  # type: ignore[arg-type]
+            # NaN проходит любые границы — сравнение с ним всегда ложно, — и
+            # проверки места и готовности с ним вечно «в норме».
+            if not math.isfinite(fv):
+                return False, f"«{spec.label}»: ожидается конечное число"
             if spec.minimum is not None and fv < spec.minimum:
                 return False, f"«{spec.label}»: минимум {spec.minimum}"
             if spec.maximum is not None and fv > spec.maximum:
@@ -7502,7 +7596,7 @@ def validate_value(key: str, value: object) -> tuple[bool, str]:
         elif t in ("str", "text"):
             if not isinstance(value, str):
                 return False, f"«{spec.label}»: ожидается строка"
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False, f"«{spec.label}»: значение «{value}» неверного типа"
     return True, ""
 

@@ -294,6 +294,12 @@ class Analytics:
         rows: list[dict[str, Any]] = []
         for model, items in grouped.items():
             done = [j for j in items if j["status"] == "completed"]
+            отказов = sum(1 for j in items if j["status"] == "failed")
+            # Доля успеха — среди ЗАВЕРШЁННЫХ: задания в очереди, в работе и
+            # отменённые — не неудачи. Раньше знаменателем были все задания
+            # окна, и очередь на паузе или ночной пакет давали «0 % успеха»
+            # и критическую тревогу при нуле отказов.
+            завершено = len(done) + отказов
             rtf = [float(j["rtf"]) for j in done if j.get("rtf")]
             conf = [float(j["avg_confidence"]) for j in done if j.get("avg_confidence")]
             wer = [float(j["wer"]) for j in done if j.get("wer") is not None]
@@ -308,8 +314,9 @@ class Analytics:
                 "license": spec.license if spec else "",
                 "jobs": len(items),
                 "completed": len(done),
-                "failed": sum(1 for j in items if j["status"] == "failed"),
-                "success_rate": round(len(done) / len(items), 4) if items else None,
+                "failed": отказов,
+                "finished": завершено,
+                "success_rate": round(len(done) / завершено, 4) if завершено else None,
                 "audio_hours": round(audio / 3600, 3),
                 "processing_hours": round(proc / 3600, 3),
                 "speedup": round(audio / proc, 2) if proc else None,

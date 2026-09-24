@@ -26,6 +26,7 @@ from typing import Any
 from . import model_files
 from . import settings_access as S
 from .catalog import get_model
+from .config import Settings
 from .db import SAMPLE_PERIOD_S, Database, new_id, now
 from .engines import EngineRegistry
 from .errors import (
@@ -80,9 +81,16 @@ def check_outbound_url(url: str, allow_internal: bool = False) -> str:
     проверки сервер становится инструментом обращения к внутренней сети от
     своего имени: file:// читает диск, а http://169.254.169.254 достаёт
     учётные данные облака. Пропускаем только http и https и запрещаем
-    адреса, которые заведомо указывают внутрь.
+    адреса, которые указывают внутрь.
+
+    Узел проверяется по тем адресам, в которые он на самом деле
+    превращается. Раньше проверка смотрела только на запись вида
+    «10.0.0.1»: `ipaddress` не понимает «127.1», «2130706433», «0x7f000001»
+    и «017700000001», считал их доменными именами «проверять некому» — а
+    сокет затем честно превращал их в 127.0.0.1. Доменное имя тоже
+    превращается в адреса здесь же: имя, указывающее на 127.0.0.1, ничем
+    не лучше самого 127.0.0.1.
     """
-    import ipaddress
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
@@ -104,16 +112,87 @@ def check_outbound_url(url: str, allow_internal: bool = False) -> str:
         raise ConfigError(
             "Адрес уведомления указывает на сам сервер.",
             hint="Если это намеренно, включите webhook_allow_internal.")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return url                      # доменное имя — проверять некому
-    if (address.is_loopback or address.is_private or address.is_link_local
-            or address.is_reserved or address.is_multicast):
-        raise ConfigError(
-            f"Адрес уведомления {host} находится во внутренней сети.",
-            hint="Если это намеренно, включите webhook_allow_internal.")
+    for address in _адреса_узла(host):
+        if _внутренний(address):
+            raise ConfigError(
+                f"Адрес уведомления {host} находится во внутренней сети ({address}).",
+                hint="Если это намеренно, включите webhook_allow_internal.")
     return url
+
+
+def _адреса_узла(host: str) -> list[Any]:
+    """Во что превращается узел: запись адреса или имя, которое ещё надо узнать."""
+    import ipaddress
+    import socket
+
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+    # Старые записи IPv4, которые понимает сокет, но не `ipaddress`.
+    try:
+        return [ipaddress.IPv4Address(socket.inet_aton(host))]
+    except (OSError, ValueError):
+        pass
+    try:
+        ответы = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        # Имя не узнаётся сейчас — не узнается и при отправке: запрос не
+        # уйдёт никуда, и запрещать тут нечего.
+        return []
+    адреса = []
+    for ответ in ответы:
+        try:
+            адреса.append(ipaddress.ip_address(str(ответ[4][0]).split("%", 1)[0]))
+        except ValueError:
+            continue
+    return адреса
+
+
+def _внутренний(address: Any) -> bool:
+    """Адрес смотрит внутрь: сам сервер, локальная сеть, служебные диапазоны."""
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return bool(address.is_loopback or address.is_private or address.is_link_local
+                or address.is_reserved or address.is_multicast or address.is_unspecified)
+
+
+def открыватель_наружу(allow_internal: bool = False,
+                       проверка: Callable[[str], Any] | None = None) -> Any:
+    """urllib-открыватель, который проверяет и каждое перенаправление.
+
+    Обычный urlopen идёт по 301/302 куда скажут, превращая POST в GET: внешний
+    приёмник, ответивший «302 → http://169.254.169.254/…», заставлял сервер
+    сходить туда самому, а поле webhook_status работало оракулом. `проверка`
+    заменяет проверку по умолчанию — у маршрута /process-call она своя.
+    """
+    import urllib.request
+
+    def проверить(адрес: str) -> None:
+        if проверка is not None:
+            проверка(адрес)
+        else:
+            check_outbound_url(адрес, allow_internal)
+
+    class Проверенные(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+            проверить(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return urllib.request.build_opener(Проверенные)
+
+
+def _внутри(корень: Path, путь: str) -> Path | None:
+    """Путь, если он лежит внутри каталога `корень`, иначе None."""
+    if not путь:
+        return None
+    try:
+        база = корень.resolve(strict=True)
+        итог = Path(путь).resolve(strict=True)
+    except OSError:
+        return None
+    return итог if база in итог.parents else None
 
 
 @dataclass
@@ -339,7 +418,10 @@ class JobQueue:
                     self._send_webhook(job_id)
                 return self.get(job_id)
 
-        payload = dict(settings)
+        # Секреты сервера в параметры задания не уносятся: параметры видит
+        # владелец задания, а секреты при обработке берутся из настроек
+        # сервера (см. Settings.НЕ_В_ЗАДАНИИ).
+        payload = Settings.для_задания(settings)
         payload["_hash"] = params_digest
 
         job_id = self.db.create_job({
@@ -354,8 +436,11 @@ class JobQueue:
             "model": str(settings.get("model") or ""),
             "language": str(settings.get("language") or ""),
             "params": payload,
-            "priority": int(priority if priority is not None
-                            else settings.get("priority", 50)),
+            # Тот же предел 0–100, что у POST /{id}/priority: без него поле
+            # формы priority=1000000 при политике priority_fifo ставило
+            # задание впереди всех чужих, а отрицательное — позади навсегда.
+            "priority": max(0, min(100, int(priority if priority is not None
+                                            else settings.get("priority", 50)))),
             "owner": owner,
             "api_key_name": api_key_name,
             "source": source,
@@ -408,7 +493,8 @@ class JobQueue:
             "engine": cached.get("engine"),
             "model": cached.get("model"),
             "language": cached.get("language"),
-            "params": {**settings, "_hash": (cached.get("params") or {}).get("_hash")},
+            "params": {**Settings.для_задания(settings),
+                       "_hash": (cached.get("params") or {}).get("_hash")},
             "owner": owner,
             "status": STATUS_COMPLETED,
             "cached_from": cached["id"],
@@ -518,6 +604,11 @@ class JobQueue:
         if changed:
             self.db.add_event(job_id, "cancelled", f"Отменено ({by})")
             self._emit("job.cancelled", {"id": job_id})
+            # Отменили повтор, который ещё не начался, — прежний результат
+            # возвращается сразу. Идущий вернёт воркер, когда остановится.
+            if job["status"] != STATUS_RUNNING:
+                self._вернуть_прежний(job_id, "Повторное распознавание отменено",
+                                      ожидаемые=[STATUS_CANCELLED])
             with self._lock:
                 # Задание в очереди или на паузе отменяется без участия
                 # воркера, поэтому пометку об отмене снимаем сразу. Иначе она
@@ -545,16 +636,37 @@ class JobQueue:
         return len(jobs)
 
     def retry(self, job_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Ставит задание в очередь заново — после сбоя или ради новой модели.
+
+        Переопределения приходят уже проверенными (см. маршруты /retry и
+        /rescan): здесь они только ложатся поверх прежних параметров.
+
+        Готовый результат не выбрасывается заранее. Повтор переделывает то же
+        задание на месте, и раньше неудачный прогон — АТС успела удалить
+        запись по сроку хранения, выбранного движка нет на сервере —
+        сносил каталог прежнего удачного результата: задание уходило в
+        «ошибку», а выгрузка отвечала 400, хотя расшифровка ещё вчера была.
+        Теперь прежний каталог откладывается в сторону и возвращается на
+        место, если новый прогон не удался или его отменили.
+        """
         job = self.get(job_id)
-        params = dict(job.get("params") or {})
+        if job["status"] == STATUS_RUNNING:
+            raise ConfigError(
+                "Задание ещё распознаётся — повторять его сейчас незачем.",
+                hint="Дождитесь окончания или отмените задание, потом повторите.")
+        params = Settings.для_задания(job.get("params"))
         if overrides:
             params.update(overrides)
         params.pop("_hash", None)
         params["_hash"] = settings_digest(params)
+        self._отложить_прежний(job)
+        # Счётчик повторов — заново: ручной повтор начинает новую попытку.
+        # Без сброса первая же нехватка памяти после ручного повтора давала
+        # «ошибку» сразу — без автоповтора и без уменьшения пакета.
         self.db.update_job(job_id, status=STATUS_QUEUED, error_code=None,
                            error_message=None, error_hint=None, progress=0.0,
                            stage="", started_at=None, finished_at=None,
-                           params=params, queued_at=now())
+                           retries=0, params=params, queued_at=now())
         self.db.add_event(job_id, "retry", "Задание поставлено в очередь повторно")
         with self._lock:
             self._cancelled.discard(job_id)
@@ -1104,11 +1216,90 @@ class JobQueue:
                                      "duration_s": elapsed})
         self._send_webhook(job_id)
 
+        # Повтор удался — отложенный прежний результат больше не нужен.
+        прежний = self._прежний_путь(job_id)
+        if прежний.is_dir():
+            shutil.rmtree(прежний, ignore_errors=True)
+
         if merged.get("delete_source_after"):
-            try:
-                Path(job["file_path"]).unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._удалить_исходник(job)
+
+    def _удалить_исходник(self, job: dict[str, Any]) -> None:
+        """Удаляет загруженный файл после обработки — только из uploads.
+
+        Настройка обещает удалять «загруженный аудиофайл», а удаляла любой
+        путь задания. Импорт с АТС ставит в очередь оригинал записи прямо в
+        архиве станции, и с включённой настройкой каждое распознанное
+        задание стирало разговор из архива Asterisk. Тот же файл бывает
+        общим у нескольких заданий (контрольный прогон второй моделью идёт
+        по записи исходного задания) — такой не трогаем, пока он нужен
+        другому.
+        """
+        путь = _внутри(Path(self.settings.paths.uploads), str(job.get("file_path") or ""))
+        if путь is None:
+            return
+        try:
+            if self.db.file_used_elsewhere(str(job.get("file_path") or ""), job["id"]):
+                return
+            путь.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # --- прежний результат при повторе --------------------------------------
+
+    def _прежний_путь(self, job_id: str) -> Path:
+        return Path(self.settings.paths.results) / f"{job_id}.prev"
+
+    def _отложить_прежний(self, job: dict[str, Any]) -> None:
+        """Откладывает каталог готового результата на время повтора."""
+        if job.get("status") != STATUS_COMPLETED:
+            return
+        текущий = Path(self.settings.paths.results) / str(job["id"])
+        if not текущий.is_dir():
+            return
+        прежний = self._прежний_путь(str(job["id"]))
+        try:
+            if прежний.exists():
+                shutil.rmtree(прежний, ignore_errors=True)
+            текущий.rename(прежний)
+        except OSError as exc:
+            log.warning("Прежний результат %s не отложен: %s", job["id"], exc,
+                        extra={"job_id": job["id"]})
+
+    def _вернуть_прежний(self, job_id: str, причина: str, *,
+                         ожидаемые: list[str] | None = None) -> bool:
+        """Возвращает отложенный результат, если повтор не удался.
+
+        Без `ожидаемые` запись идёт как у собственного исхода — только пока
+        задание за нами (см. `_write_own`); с ними — условным запросом по
+        статусу, для заданий, которые уже никто не считает.
+        """
+        прежний = self._прежний_путь(job_id)
+        if not прежний.is_dir():
+            return False
+        текущий = Path(self.settings.paths.results) / job_id
+        поля: dict[str, Any] = {
+            "status": STATUS_COMPLETED, "finished_at": now(), "progress": 1.0,
+            "stage": "готово", "error_code": None, "error_message": None,
+            "error_hint": None, "instance_id": None, "heartbeat_at": None,
+            "result_path": str(текущий)}
+        if ожидаемые is None:
+            записалось = self._write_own(job_id, **поля)
+        else:
+            записалось = self.db.update_job_if_status(job_id, ожидаемые, **поля)
+        if not записалось:
+            return False
+        try:
+            if текущий.exists():
+                shutil.rmtree(текущий, ignore_errors=True)
+            прежний.rename(текущий)
+        except OSError as exc:
+            log.warning("Прежний результат %s не возвращён на место: %s", job_id, exc,
+                        extra={"job_id": job_id})
+        self.db.add_event(job_id, "rescan_reverted",
+                          f"{причина} — оставлен прежний результат")
+        self._emit("job.completed", {"id": job_id, "reverted": True})
+        return True
 
     def _write_own(self, job_id: str, **fields: Any) -> bool:
         """Записывает исход задания, только если оно всё ещё за нами.
@@ -1168,9 +1359,13 @@ class JobQueue:
                                    stage="отменено", instance_id=None,
                                    heartbeat_at=None):
                 self._discard_unless_taken(outdir, job_id)
+                self._вернуть_прежний(job_id, "Повторное распознавание отменено",
+                                      ожидаемые=[STATUS_CANCELLED])
                 return
             RUNTIME.inc("asrhub_jobs_total", {"status": "cancelled"})
             self._discard_results(outdir)
+            self._вернуть_прежний(job_id, "Повторное распознавание отменено",
+                                  ожидаемые=[STATUS_CANCELLED])
             return
 
         retries = int(job.get("retries") or 0)
@@ -1207,6 +1402,16 @@ class JobQueue:
                                      "delay_s": round(delay, 1), "error": error.message})
             return
 
+        # Не удался повтор уже готового задания — возвращаем прежний
+        # результат, а не превращаем готовую расшифровку в «ошибку».
+        if self._вернуть_прежний(job_id, f"Повторное распознавание не удалось: {error.message}"):
+            self.db.bump_model_stats(str(job.get("model") or ""),
+                                     str(job.get("engine") or ""), ok=False)
+            RUNTIME.inc("asrhub_jobs_total", {"status": "failed"})
+            RUNTIME.note_error(error.code, error.retryable)
+            log.warning("Задание %s: повтор не удался (%s) — оставлен прежний результат",
+                        job_id, error.message, extra={"job_id": job_id, "error_code": error.code})
+            return
         if not self._write_own(
                 job_id, status=STATUS_FAILED, finished_at=now(), progress=0.0,
                 stage="ошибка", error_code=error.code, error_message=error.message,
@@ -1393,6 +1598,18 @@ class JobQueue:
         from .phone_compat import encode_url
 
         target = encode_url(str(job["webhook_url"]))
+        # Адрес проверяется ещё раз — перед отправкой: имя, которое при приёме
+        # указывало наружу, к этому времени могло начать указывать внутрь.
+        allow_internal = bool(self.settings.get("webhook_allow_internal", False))
+        try:
+            check_outbound_url(target, allow_internal)
+        except ConfigError as exc:
+            log.warning("Уведомление для %s не отправлено: %s", job["id"], exc.message,
+                        extra={"job_id": job["id"]})
+            self.db.update_job(job["id"], webhook_status="blocked")
+            RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
+            return
+        opener = открыватель_наружу(allow_internal)
 
         attempts = 5
         for attempt in range(attempts):
@@ -1403,11 +1620,18 @@ class JobQueue:
             try:
                 request = urllib.request.Request(target, data=payload,
                                                  headers=headers, method="POST")
-                with urllib.request.urlopen(request, timeout=15) as response:
+                with opener.open(request, timeout=15) as response:
                     if 200 <= response.status < 300:
                         self.db.update_job(job["id"], webhook_status=f"ok:{response.status}")
                         RUNTIME.inc("asrhub_webhooks_total", {"result": "ok"})
                         return
+            except ConfigError as exc:
+                # Перенаправление внутрь сети — повторять незачем.
+                log.warning("Уведомление для %s не отправлено: %s", job["id"], exc.message,
+                            extra={"job_id": job["id"]})
+                self.db.update_job(job["id"], webhook_status="blocked")
+                RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
+                return
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 log.info("Уведомление для %s не доставлено (попытка %d из %d): %s",
                          job["id"], attempt + 1, attempts, exc)

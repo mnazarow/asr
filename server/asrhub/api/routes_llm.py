@@ -147,7 +147,9 @@ def llm_backfill(request: Request, limit: int = Body(default=100, embed=True),
     if not клиент.enabled:
         raise error_response(ConfigError("Языковая модель выключена."))
     ожидают = state.db.llm_pending(tasks.VERSION, limit=max(1, min(int(limit), 10000)))
-    поставлено = поток.enqueue_many(з["id"] for з in ожидают)
+    поставлено = поток.enqueue_many(
+        (з["id"] for з in ожидают), kind="архив",
+        priority=_целое_настройки(state.settings, "llm_queue_priority_backfill", 30))
     return {"queued": поставлено, "worker": поток.status()}
 
 
@@ -175,14 +177,16 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
     state, клиент, поток = _slot(request)
     require_write(principal)
     с_какого = time.time() - hours * 3600
-    корзин, ряд = state.db.llmq_series(с_какого, time.time(), КОРЗИН)
+    # Счётчики, сводка и график — по своим записям, как и список: иначе
+    # «список пуст, ждут четыре» рассказывало обычному ключу о чужой работе.
+    свой = scope_owner(principal)
+    корзин, ряд = state.db.llmq_series(с_какого, time.time(), КОРЗИН, owner=свой)
     состояние = поток.status()
     # Текущая запись — с именем файла: по идентификатору задания человек не
     # узнаёт ничего, а в разделе он смотрит именно на «какую запись жуют».
     # Имя файла — это в колл-центре номер клиента, и соседние списки
     # заданий его прячут. Чужую запись показываем без имени: то, что
     # видеокарта сейчас занята, не секрет, а чем именно — секрет.
-    свой = scope_owner(principal)
     текущее = None
     if состояние.get("current"):
         задание = state.db.get_job(str(состояние["current"])) or {}
@@ -196,8 +200,8 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
     return {
         "worker": состояние,
         "current": текущее,
-        "counts": state.db.llmq_counts(),
-        "stats": state.db.llmq_stats(с_какого),
+        "counts": state.db.llmq_counts(owner=свой),
+        "stats": state.db.llmq_stats(с_какого, owner=свой),
         "series": {"buckets": корзин, "since": с_какого, "rows": ряд},
         "queue": state.db.llmq_list(state=state_filter, limit=limit,
                                     offset=offset, owner=свой),
@@ -249,12 +253,22 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
     for номер in ids:
         _своё_задание(state, principal, номер)
     предел = _целое(данные.get("limit"), 1000, 1, 50000)
+    # Отбор целиком (не явный список) — это архив, а не просьба об одной
+    # записи: такие ставятся с важностью архива, иначе свежие звонки ждали
+    # бы, пока переварится весь отбор.
+    вид = str(данные.get("kind") or "по просьбе")
+    важность = None
     if not ids:
         отбор = str(данные.get("scope") or "pending")
+        важность = _целое_настройки(state.settings, "llm_queue_priority_backfill", 30)
+        if not данные.get("kind"):
+            вид = "архив"
         if отбор == "pending":
-            ids = [str(з["id"]) for з in state.db.llm_pending(tasks.VERSION, limit=предел)]
+            ids = [str(з["id"]) for з in state.db.llm_pending(
+                tasks.VERSION, limit=предел, owner=scope_owner(principal))]
         elif отбор == "failed":
-            повторено = state.db.llmq_retry_failed(limit=предел)
+            повторено = state.db.llmq_retry_failed(limit=предел,
+                                                   owner=scope_owner(principal))
             return {"queued": повторено, "scope": отбор, "worker": поток.status()}
         elif отбор == "period":
             начало = _число(данные.get("since"), 0.0)
@@ -274,8 +288,16 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
             raise error_response(ConfigError(
                 f"Неизвестный отбор: «{отбор}».",
                 hint="Ожидается pending, failed, period или явный список job_ids."))
-    поставлено = поток.enqueue_many(ids, kind=str(данные.get("kind") or "по просьбе"))
+    поставлено = поток.enqueue_many(ids, kind=вид, priority=важность)
     return {"queued": поставлено, "asked": len(ids), "worker": поток.status()}
+
+
+def _целое_настройки(settings: Any, ключ: str, умолчание: int) -> int:
+    """Целое из настроек; кривое значение — умолчание."""
+    try:
+        return int(settings.get(ключ, умолчание))
+    except (TypeError, ValueError):
+        return умолчание
 
 
 def _число(значение: Any, умолчание: float) -> float:
@@ -350,6 +372,14 @@ def llm_queue_clear(request: Request, state_filter: str = Body(default="", embed
     return {"removed": убрано, "worker": поток.status()}
 
 
+#: Сколько записей идёт в построчный список раздела «Голосовая аналитика» и
+#: сколько обязательств — в список действий: свод за год — это десятки тысяч
+#: разборов, и отдавать их страницей незачем. Распределения и перекрёстная
+#: таблица считаются по всем записям периода.
+СТРОК_В_СВОДЕ = 300
+ДЕЙСТВИЙ_В_СВОДЕ = 200
+
+
 @router.get("/content/llm", summary="Свод ответов модели за период")
 def llm_report(request: Request, period: str = ПЕРИОД,
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
@@ -377,15 +407,38 @@ def llm_report(request: Request, period: str = ПЕРИОД,
                                                              "question": о.get("question"),
                                                              "да": 0, "нет": 0, "н/п": 0})
             запись[о.get("answer") if о.get("answer") in ("да", "нет", "н/п") else "н/п"] += 1
+    свежие = sorted(свод["rows"], key=lambda x: -float(x.get("created_at") or 0))
     действия = []
-    for р in sorted(строки, key=lambda x: -float(x.get("created_at") or 0)):
+    for р in свежие:
+        if р.get("error"):
+            continue
         for д in р.get("actions") or []:
+            if not isinstance(д, dict):
+                д = {"what": str(д)}
             действия.append({**д, "job_id": р["job_id"], "filename": р.get("filename"),
                              "created_at": р.get("created_at")})
-            if len(действия) >= 50:
+            if len(действия) >= ДЕЙСТВИЙ_В_СВОДЕ:
                 break
-        if len(действия) >= 50:
+        if len(действия) >= ДЕЙСТВИЙ_В_СВОДЕ:
             break
+    # «Причина × исход» — по всем записям периода, а не по построчному
+    # списку ниже: тот обрезан, и клетки считались бы по его части.
+    пары: dict[tuple[str, str], int] = {}
+    for р in строки:
+        ключ = (str(р.get("reason") or "—"), str(р.get("outcome") or "—"))
+        пары[ключ] = пары.get(ключ, 0) + 1
+    # Построчный список для раздела «Голосовая аналитика»: он рисовал
+    # таблицы и цитаты по полю `rows`, которого в ответе не было вовсе, и
+    # показывал «модель ничего не разобрала» при разобранном архиве.
+    построчно = [{
+        "job_id": р["job_id"], "filename": р.get("filename"),
+        "created_at": р.get("created_at"), "summary": р.get("summary") or "",
+        "reason": р.get("reason"), "reason_quote": р.get("reason_quote") or "",
+        "outcome": р.get("outcome"), "outcome_quote": р.get("outcome_quote") or "",
+        "resolved": р.get("resolved"), "actions": р.get("actions") or [],
+        "trackers": р.get("trackers") or [], "scorecard": р.get("scorecard") or [],
+        "error": р.get("error") or "",
+    } for р in свежие[:СТРОК_В_СВОДЕ]]
     return {
         "period": period, "enabled": клиент.enabled, "model": клиент.model,
         "records": свод["total"], "analyzed": len(строки),
@@ -400,6 +453,10 @@ def llm_report(request: Request, period: str = ПЕРИОД,
         "trackers": sorted(трекеры.values(), key=lambda т: -т["fired"]),
         "scorecard": list(скоркарта.values()),
         "action_items": действия,
+        "pairs": [{"reason": п, "outcome": и, "records": n}
+                  for (п, и), n in sorted(пары.items(), key=lambda kv: -kv[1])],
+        "rows": построчно,
+        "rows_total": len(свод["rows"]),
         "worker": поток.status(),
     }
 

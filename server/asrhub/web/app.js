@@ -50,6 +50,16 @@ const state = {
   resultsContent: '',
   period: 'week',
   jobSettings: {},
+  // Что человек поменял сам — в быстрой настройке, пресетом или выбором
+  // модели. С заданием уходят только эти параметры: весь снимок настроек
+  // сервера переопределял бы свежие значения устаревшими, а неадминистратору
+  // секреты приходят замаскированными «***», и загрузка из интерфейса
+  // отклонялась: «Адрес уведомления должен начинаться с http://».
+  jobChanged: new Set(),
+  // То же для раздела «Настройки»: «Применить» и «Сохранить» отправляют
+  // только изменённые параметры. Снимок всей страницы откатывал станции АТС
+  // и наборы категорий, заведённые в других разделах после её загрузки.
+  settingsChanged: new Set(),
   selectedJob: null,
   files: [],
   paramGroup: 'model',
@@ -347,6 +357,8 @@ async function bootstrap() {
     state.presets = catalog.presets;
     state.settings = settings.values || {};
     state.jobSettings = Object.assign({}, state.settings);
+    state.jobChanged.clear();
+    state.settingsChanged.clear();
     renderConfigProblems(settings);
     qs('#badge-models').textContent = catalog.models.length;
     qs('#badge-params').textContent = catalog.params.length;
@@ -1433,6 +1445,7 @@ RENDERERS.transcribe = {
       host.innerHTML = '';
       host.appendChild(paramControl(spec, s[key], (v) => {
         s[key] = v;
+        state.jobChanged.add(key);
         if (key === 'model') { RENDERERS.transcribe.renderModelCard(); updateModelHint(); }
       }, true));
     };
@@ -1449,6 +1462,7 @@ RENDERERS.transcribe = {
       const preset = state.presets.find((p) => p.id === select.value);
       if (!preset) { qs('#preset-desc').textContent = ''; return; }
       Object.assign(state.jobSettings, preset.values);
+      Object.keys(preset.values || {}).forEach((k) => state.jobChanged.add(k));
       qs('#preset-desc').innerHTML =
         `${esc(preset.description)}<br><b>Сценарий:</b> ${esc(preset.scenario)}` +
         `<br><b>Железо:</b> ${esc(preset.hardware_hint)}` +
@@ -1590,13 +1604,24 @@ function renderFileList() {
   }
 }
 
+/** Параметры задания, которые человек задал сам (см. `state.jobChanged`). */
+function jobOverrides() {
+  const итог = {};
+  state.jobChanged.forEach((k) => {
+    const v = state.jobSettings[k];
+    // Заглушку секрета не отправляем никогда: это не значение, а «скрыто».
+    if (v !== undefined && v !== '***') итог[k] = v;
+  });
+  return итог;
+}
+
 async function submitFiles() {
   if (!state.files.length) return;
   const btn = qs('#btn-submit');
   btn.disabled = true;
   btn.textContent = 'Отправка…';
   const priority = parseInt(qs('#job-priority').value, 10) || 50;
-  const settings = JSON.stringify(state.jobSettings);
+  const settings = JSON.stringify(jobOverrides());
   // Отправляем ровно тот набор, что был на момент нажатия. Список очищался
   // целиком, поэтому файлы, перетащенные во время загрузки — а на сотнях
   // мегабайт это минуты, — пропадали из списка, не попав в очередь, и без
@@ -1807,6 +1832,17 @@ RENDERERS.dictation = {
   /** Уход из раздела обязан отпустить микрофон: индикатор записи не должен гореть. */
   leave() { this.stop(true); },
 
+  /**
+   * Жива ли ещё эта попытка начать запись. Между нажатием и открытием
+   * сокета три ожидания — разрешение на микрофон, билет, рукопожатие, — и
+   * за любое из них человек успевает уйти из раздела или нажать кнопку ещё
+   * раз. Раньше запись всё равно начиналась: микрофон горел в чужом
+   * разделе, сокет висел открытым, а `onopen` падал на пустом поле модели.
+   */
+  alive(attempt) {
+    return this.attempt === attempt && Boolean(qs('#dict-toggle'));
+  },
+
   finalText() {
     return (this.final || []).join(' ').replace(/\s+/g, ' ').trim();
   },
@@ -1834,12 +1870,16 @@ RENDERERS.dictation = {
     const button = qs('#dict-toggle');
     button.disabled = true;
     this.setStatus('запрашиваем микрофон…');
+    const attempt = {};
+    this.attempt = attempt;
+    const release = (stream) => { if (stream) stream.getTracks().forEach((t) => t.stop()); };
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
     } catch (err) {
+      if (!this.alive(attempt)) return;
       button.disabled = false;
       // Отказ в доступе — самая частая причина, и звучит она в браузере
       // одинаково невнятно. Говорим, что именно произошло и что делать.
@@ -1852,11 +1892,15 @@ RENDERERS.dictation = {
 
     // Ключ в адресе оседает в журналах прокси — берём одноразовый билет,
     // как и лента событий.
+    if (!this.alive(attempt)) { release(stream); return; }
     let ticket = '';
     try {
       const issued = await API.post('/api/auth/ticket', {});
       ticket = (issued && issued.ticket) || '';
     } catch (e) { ticket = ''; }
+    // Вошедшему паролем билет не выдаётся (ключа у сессии нет) — сервер
+    // узнает его по куке, как и в ленте событий.
+    if (!this.alive(attempt)) { release(stream); return; }
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${proto}://${location.host}/api/stream${ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''}`;
@@ -1872,11 +1916,21 @@ RENDERERS.dictation = {
     socket.binaryType = 'arraybuffer';
 
     const recorder = new MediaRecorder(stream, pickMime());
-    this.session = { stream, socket, recorder, started: Date.now() };
+    const session = { stream, socket, recorder, started: Date.now(), opened: false };
+    this.session = session;
     this.partial = '';
     this.watchLevel(stream);
+    // Обработчики сверяются со своей сессией: «Остановить» и сразу «Начать»
+    // — и `onclose` старого сокета гасил уже новую запись.
+    const mine = () => this.session === session;
 
     socket.onopen = () => {
+      session.opened = true;
+      if (!mine() || !qs('#dict-model')) {
+        try { socket.close(); } catch (e) { /* уже */ }
+        release(stream);
+        return;
+      }
       const model = qs('#dict-model').value;
       const window_s = parseFloat(qs('#dict-window').value) || 3;
       const config = { type: 'config', format: 'auto', stream_window_s: window_s };
@@ -1904,6 +1958,11 @@ RENDERERS.dictation = {
     socket.onmessage = (event) => {
       let message;
       try { message = JSON.parse(event.data); } catch (e) { return; }
+      // После «Остановить» сокет ещё досылает окончательный текст — его
+      // берём всегда, это конец той же записи. Статус и гипотезы старого
+      // сокета нужны, только пока новая запись не начата.
+      const idle = this.session === null && !this.attempt;
+      if (!mine() && !idle && message.type !== 'final') return;
       switch (message.type) {
         case 'ready': {
           const hint = qs('#dict-mode');
@@ -1959,15 +2018,27 @@ RENDERERS.dictation = {
     };
 
     socket.onclose = (event) => {
+      if (!mine()) return;
       // Отказ приходит кодом закрытия — без разбора он выглядит как обрыв сети.
       const reasons = {
-        4401: 'Ключ доступа не принят.',
-        4403: 'Ключу доступа разрешено только чтение — диктовка ему закрыта.',
+        4401: 'Ключ доступа не принят — войдите заново.',
+        4403: event.reason && event.reason.includes('пароль')
+          ? 'Сначала смените пароль по умолчанию — диктовка откроется после этого.'
+          : 'Ключу доступа разрешено только чтение — диктовка ему закрыта.',
         4404: 'Потоковое распознавание выключено параметром stream_enabled.',
       };
       if (reasons[event.code]) {
         this.setStatus('отказано', 'err');
         toast(reasons[event.code], 'err');
+      } else if (!session.opened) {
+        // Закрыли, не открыв: так выглядят отказ старого сервера на
+        // рукопожатии и прокси, который не пропускает WebSocket. Молча
+        // вернуть кнопку значило оставить человека с «запрашиваем
+        // микрофон…» навсегда.
+        this.setStatus('соединение не открылось', 'err');
+        toast('Сервер не принял соединение для диктовки.', 'err',
+              'Если сервер за прокси, для /api/stream нужен проброс WebSocket ' +
+              '(Upgrade и Connection), как для /ws.');
       }
       this.stop(true);
     };
@@ -2024,6 +2095,9 @@ RENDERERS.dictation = {
   stop(silent) {
     const session = this.session;
     this.session = null;
+    // Идущая попытка начать запись тоже отменяется: она проверяет это после
+    // каждого ожидания и отпускает микрофон сама.
+    this.attempt = null;
     if (this.tick) { clearInterval(this.tick); this.tick = null; }
     this.releaseLevel();
     if (!session) { if (!silent) this.resetButton(); return; }
@@ -8976,8 +9050,9 @@ RENDERERS.models = {
 
 window.__asrhub.useModel = (id) => {
   state.jobSettings.model = id;
+  state.jobChanged.add('model');
   const model = modelById(id);
-  if (model) state.jobSettings.engine = model.engine;
+  if (model) { state.jobSettings.engine = model.engine; state.jobChanged.add('engine'); }
   toast(`Выбрана модель ${model ? model.name : id}`, 'ok');
   go('transcribe');
 };
@@ -9676,6 +9751,7 @@ async function drawLlmSetup(host) {
       try {
         const свежие = await API.get('/api/settings');
         state.settings = свежие.values;
+        state.settingsChanged.clear();
       } catch (err) { /* не беда: значения обновятся при следующем открытии */ }
       toast(у.error ? 'Установка не удалась' : у.cancelled ? 'Установка отменена'
         : 'Модель установлена и включена', у.error ? 'err' : 'ok');
@@ -9751,15 +9827,35 @@ RENDERERS.settings = {
       state.showAdvanced = e.target.checked;
       this.list();
     });
+    // Только изменённое на этой странице: снимок всех настроек, сделанный при
+    // её загрузке, откатывал то, что поменяли после — станцию АТС, набор
+    // категорий, — а пароль станции, пришедший «***», записывал поверх
+    // настоящего.
+    const изменённые = () => {
+      const итог = {};
+      state.settingsChanged.forEach((k) => { итог[k] = state.settings[k]; });
+      return итог;
+    };
     qs('#p-apply').onclick = async () => {
+      const тело = изменённые();
+      if (!Object.keys(тело).length) {
+        toast('Изменений нет — применять нечего', 'warn',
+              'Поменяйте параметр ниже, и кнопка отправит только его');
+        return;
+      }
       try {
-        const result = await API.put('/api/settings', state.settings);
+        const result = await API.put('/api/settings', тело);
+        state.settingsChanged.clear();
         toast(`Применено параметров: ${Object.keys(result.applied).length}`, 'ok');
       } catch (err) { fail(err); }
     };
     qs('#p-save').onclick = async () => {
       try {
-        await API.put('/api/settings', state.settings);
+        const тело = изменённые();
+        if (Object.keys(тело).length) {
+          await API.put('/api/settings', тело);
+          state.settingsChanged.clear();
+        }
         const result = await API.post('/api/settings/save');
         toast('Конфигурация сохранена', 'ok', result.saved);
       } catch (err) { fail(err); }
@@ -9770,6 +9866,7 @@ RENDERERS.settings = {
         await API.post('/api/settings/reset');
         const fresh = await API.get('/api/settings');
         state.settings = fresh.values;
+        state.settingsChanged.clear();
         toast('Настройки сброшены', 'warn');
         renderView();
       } catch (err) { fail(err); }
@@ -9860,6 +9957,7 @@ RENDERERS.settings = {
         box.appendChild(paramCard(spec, state.settings[spec.key], (value) => {
           state.settings[spec.key] = value;
           state.jobSettings[spec.key] = value;
+          state.settingsChanged.add(spec.key);
         }));
       });
       host.appendChild(section);
@@ -10175,7 +10273,8 @@ RENDERERS.backup = {
         + 'База будет заменена целиком: всё, что появилось после этой копии, '
         + 'из рабочей базы исчезнет. Прежняя база останется рядом под именем '
         + '«asrhub.db.before-restore-…», и вернуть её можно.\n\n'
-        + 'После восстановления сервер нужно перезапустить.';
+        + 'Подмена базы происходит при перезапуске сервера: до него сервер '
+        + 'работает с прежними данными.';
     if (!confirm(вопрос)) return;
     const прежний = кнопка.textContent;
     кнопка.disabled = true;
@@ -10183,8 +10282,9 @@ RENDERERS.backup = {
     try {
       const итог = await API.post('/api/backup/restore', { name: имя, what: что });
       if (итог.restart_required) {
-        toast('Данные восстановлены — перезапустите сервер', 'warn',
-              `Прежняя база сохранена: ${итог.previous || 'рядом с рабочей'}`);
+        toast('Копия подготовлена — перезапустите сервер', 'warn',
+              'База подменится при запуске; прежняя останется рядом как '
+              + '«asrhub.db.before-restore-…»');
       } else {
         toast(`Настройки восстановлены: параметров ${num(итог.applied || 0, 0)}`, 'ok',
               'Значения применены на ходу, перезапуск не нужен');
@@ -10196,6 +10296,8 @@ RENDERERS.backup = {
         const свежие = await API.get('/api/settings');
         state.settings = свежие.values || state.settings;
         state.jobSettings = Object.assign({}, state.settings);
+        state.jobChanged.clear();
+        state.settingsChanged.clear();
       } catch (e) { /* перечитаем при следующем открытии раздела */ }
       await this.load();
       this.drawParams();
@@ -10826,13 +10928,19 @@ RENDERERS.system = {
         toast('Рекомендации применены', 'ok');
       } catch (err) { fail(err); }
     };
-    qs('#btn-cleanup').onclick = async () => {
+    // Кнопок обслуживания у неадминистратора нет вовсе — карточка вместо них
+    // говорит, что раскладка хранилища ему не показывается. Обработчик
+    // вешался безусловно, и раздел «Сервер» у пользователя с ролью user
+    // падал целиком: «Cannot set properties of null (setting 'onclick')».
+    const очистка = qs('#btn-cleanup');
+    if (очистка) очистка.onclick = async () => {
       try {
         const r = await API.post('/api/maintenance/cleanup');
         toast('Очистка выполнена', 'ok', JSON.stringify(r.removed));
       } catch (err) { fail(err); }
     };
-    qs('#btn-unload').onclick = async () => {
+    const выгрузка = qs('#btn-unload');
+    if (выгрузка) выгрузка.onclick = async () => {
       try { await API.post('/api/maintenance/unload-models'); toast('Модели выгружены', 'ok'); }
       catch (err) { fail(err); }
     };
@@ -12572,20 +12680,25 @@ RENDERERS.voice = {
     const д = state.voice || {};
     const с = state.voiceStatus || {};
     if (!место) return;
-    const всего = Number(д.total || 0);
-    const разобрано = Number(д.analyzed ?? д.rows_count ?? (д.rows || []).length);
-    const покрытие = всего ? разобрано / всего : 0;
-    const решено = Number(д.resolved_rate ?? д.resolved ?? 0);
-    const действий = Number(д.actions_total || (д.actions || []).length || 0);
+    // Поля — ровно те, что отдаёт GET /api/content/llm. Раздел писался под
+    // другой ответ (rows, total, resolved_rate, actions_total), и при
+    // разобранном архиве в шапке стояли нули, а на вкладках — «модель
+    // ничего не разобрала».
+    const всего = Number(д.records || 0);
+    const разобрано = Number(д.analyzed || 0);
+    const покрытие = д.coverage != null ? Number(д.coverage) : (всего ? разобрано / всего : 0);
+    const решено = д.resolved_share;           // проценты 0–100 или null
+    const действий = Number(д.actions || 0);
     место.innerHTML = `<div class="grid cols-5" style="margin-bottom:16px">
       ${kpi('Разговоров за период', num(всего), 'с расшифровкой')}
       ${kpi('Разобрано моделью', num(разобрано),
         всего ? `${pct(покрытие, 0)} покрытия` : '',
         покрытие < 0.5 && всего ? { dir: 'down', text: 'модель отстаёт' } : null)}
-      ${kpi('Решено при обращении', решено ? pct(решено > 1 ? решено / 100 : решено, 0) : '—',
+      ${kpi('Решено при обращении', решено == null ? '—' : pct(Number(решено) / 100, 0),
         'по мнению модели')}
-      ${kpi('Обязательств', num(действий), 'обещаний, данных клиентам')}
-      ${kpi('Модель', esc(с.model || '—'),
+      ${kpi('Обязательств', num(действий),
+        д.records_with_actions ? `в ${num(д.records_with_actions)} разговорах` : 'обещаний, данных клиентам')}
+      ${kpi('Модель', esc(с.model || д.model || '—'),
         с.enabled ? (с.reachable === false ? '<span class="err">сервер не отвечает</span>' : 'на связи')
           : '<span class="warn">слой выключен</span>')}
     </div>`;
@@ -12595,8 +12708,7 @@ RENDERERS.voice = {
     const место = qs('#vo-body');
     const д = state.voice || {};
     if (!место) return;
-    const строки = д.rows || [];
-    if (!строки.length && this.вкладка !== 'summary') {
+    if (!Number(д.analyzed || 0) && this.вкладка !== 'summary') {
       место.innerHTML = '<div class="empty">За период модель ничего не разобрала.</div>';
       return;
     }
@@ -12609,8 +12721,7 @@ RENDERERS.voice = {
   },
 
   drawSummary(место, д) {
-    const строки = д.rows || [];
-    if (!строки.length) {
+    if (!Number(д.analyzed || 0)) {
       место.innerHTML = `<div class="empty">
         За период модель ничего не разобрала.
         <div class="small dim" style="margin-top:8px">
@@ -12618,41 +12729,41 @@ RENDERERS.voice = {
           разбора виден в разделе «Очередь LLM».</div></div>`;
       return;
     }
-    const причины = свести(строки, 'reason');
-    const исходы = свести(строки, 'outcome');
+    const причины = д.reasons || [];
+    const исходы = д.outcomes || [];
     место.innerHTML = `
       <div class="grid cols-2">
         ${card('Причины обращений', 'о чём звонили', '<div id="vo-s1" class="chart"></div>')}
         ${card('Чем закончилось', 'исход из закрытого списка', '<div id="vo-s2" class="chart"></div>')}
       </div>
       ${card('Последние разборы', 'резюме, причина и исход по каждой записи',
-        this.таблицаЗаписей(строки.slice(0, 25)))}`;
+        this.таблицаЗаписей((д.rows || []).slice(0, 25)))}`;
+    // У графиков свой формат: hbars ждёт items, donut — parts. С labels и
+    // values оба рисовали пустоту даже при данных.
     window.Charts.hbars(qs('#vo-s1'), {
-      labels: причины.map((п) => п[0]), values: причины.map((п) => п[1]), height: 240,
+      items: причины.slice(0, 12).map((п) => ({ label: п.key, value: п.records })),
+      labelWidth: 200, emptyText: 'причины не спрашивались',
     });
     window.Charts.donut(qs('#vo-s2'), {
-      labels: исходы.map((п) => п[0]), values: исходы.map((п) => п[1]), height: 240,
+      parts: исходы.map((п) => ({ label: п.key, value: п.records })),
+      size: 170, centerLabel: 'записей', emptyText: 'исходы не спрашивались',
     });
     this.связатьТаблицу(место);
   },
 
   drawReasons(место, д) {
-    const строки = д.rows || [];
-    const причины = свести(строки, 'reason');
-    const исходы = свести(строки, 'outcome');
+    const строки = (д.rows || []).filter((с) => !с.error);
     // Перекрёстная таблица «причина × исход» — то, ради чего этот раздел и
     // нужен: сама по себе причина не говорит ничего, а «доставка → не
-    // решено, 40 %» говорит всё.
+    // решено, 40 %» говорит всё. Клетки считает сервер по всем записям
+    // периода: построчный список ниже обрезан.
     const пары = new Map();
-    строки.forEach((с) => {
-      const ключ = `${с.reason || '—'}|${с.outcome || '—'}`;
-      пары.set(ключ, (пары.get(ключ) || 0) + 1);
-    });
-    const топ_причин = причины.slice(0, 12).map((п) => п[0]);
-    const топ_исходов = исходы.slice(0, 6).map((п) => п[0]);
+    (д.pairs || []).forEach((п) => пары.set(`${п.reason}|${п.outcome}`, Number(п.records || 0)));
+    const топ_причин = (д.reasons || []).slice(0, 12).map((п) => п.key);
+    const топ_исходов = (д.outcomes || []).slice(0, 6).map((п) => п.key);
     место.innerHTML = `
       ${card('Причина и исход', 'сколько разговоров в каждой клетке',
-        `<div class="table-wrap"><table><thead><tr><th>Причина</th>
+        топ_причин.length && топ_исходов.length ? `<div class="table-wrap"><table><thead><tr><th>Причина</th>
           ${топ_исходов.map((и) => `<th class="num">${esc(и)}</th>`).join('')}
           <th class="num">всего</th></tr></thead><tbody>
           ${топ_причин.map((п) => {
@@ -12664,7 +12775,8 @@ RENDERERS.voice = {
               }).join('')}
               <td class="num mono">${num(всего)}</td></tr>`;
           }).join('')}
-        </tbody></table></div>`)}
+        </tbody></table></div>`
+          : '<div class="empty">Причины или исходы у модели не спрашивались.</div>')}
       ${card('Цитаты, по которым модель решила', 'проверка на доверие: видно, за что зацепилась модель',
         `<div class="table-wrap"><table>
           <thead><tr><th style="width:170px">Причина</th><th>Цитата</th>
@@ -12679,23 +12791,22 @@ RENDERERS.voice = {
   },
 
   drawActions(место, д) {
-    const строки = д.rows || [];
-    const действия = [];
-    строки.forEach((с) => {
-      (с.actions || []).forEach((д2) => действия.push({ ...(typeof д2 === 'string'
-        ? { text: д2 } : д2), job_id: с.job_id, filename: с.filename, at: с.created_at }));
-    });
+    const действия = д.action_items || [];
+    const всего = Number(д.actions || действия.length);
     место.innerHTML = card('Обязательства перед клиентами',
-      `${действия.length} за период — то, что обещали сделать`,
+      `${num(всего)} за период — то, что обещали сделать` +
+        (всего > действия.length ? ` · показаны последние ${num(действия.length)}` : ''),
       действия.length ? `<div class="table-wrap"><table>
-        <thead><tr><th style="width:150px">Когда</th><th>Что обещано</th>
-          <th style="width:140px">Срок</th><th style="width:200px">Запись</th></tr></thead>
-        <tbody>${действия.slice(0, 200).map((д2) => `<tr>
-          <td class="small faint nowrap">${fmtTime(д2.at)}</td>
-          <td class="small">${esc(д2.text || д2.what || '')}</td>
-          <td class="small dim">${esc(д2.due || д2.when || '—')}</td>
+        <thead><tr><th style="width:150px">Когда</th><th style="width:140px">Кто</th>
+          <th>Что обещано</th><th style="width:140px">Срок</th>
+          <th style="width:200px">Запись</th></tr></thead>
+        <tbody>${действия.map((а) => `<tr>
+          <td class="small faint nowrap">${fmtTime(а.created_at)}</td>
+          <td class="small">${esc(а.who || '—')}</td>
+          <td class="small">${esc(а.what || а.text || '')}</td>
+          <td class="small dim">${esc(а.when || а.due || '—')}</td>
           <td class="small truncate" style="max-width:200px">
-            <a href="#" data-open="${esc(д2.job_id)}">${esc(д2.filename || д2.job_id)}</a></td>
+            <a href="#" data-open="${esc(а.job_id)}">${esc(а.filename || а.job_id)}</a></td>
         </tr>`).join('')}</tbody></table></div>`
         : `<div class="empty">Модель не нашла ни одного обещания.
              <div class="small dim" style="margin-top:6px">Проверьте, включена ли задача
@@ -12704,66 +12815,59 @@ RENDERERS.voice = {
   },
 
   drawTrackers(место, д) {
-    const строки = д.rows || [];
-    const счёт = new Map();
-    строки.forEach((с) => {
-      const т = с.trackers || {};
-      Object.entries(т).forEach(([имя, значение]) => {
-        if (!значение) return;
-        счёт.set(имя, (счёт.get(имя) || 0) + 1);
-      });
-    });
-    const пары = Array.from(счёт.entries()).sort((a, b) => b[1] - a[1]);
+    const трекеры = (д.trackers || []).filter((т) => Number(т.checked || 0) > 0);
+    // У записи трекеры — список {id, label, fired}.
+    const сработавшие = (с) => (Array.isArray(с.trackers) ? с.trackers : [])
+      .filter((т) => т && т.fired);
+    const строки = (д.rows || []).filter((с) => сработавшие(с).length);
     место.innerHTML = `
       ${card('Умные трекеры', 'сколько разговоров задело каждый',
-        пары.length ? '<div id="vo-t1" class="chart"></div>'
-          : `<div class="empty">Трекеры не настроены или ни один не сработал.
+        трекеры.length ? '<div id="vo-t1" class="chart"></div>'
+          : `<div class="empty">Трекеры не настроены или ни один не проверялся.
                <div class="small dim" style="margin-top:6px">Список трекеров — в настройках
                языковой модели.</div></div>`)}
-      ${пары.length ? card('Разговоры со срабатываниями', '',
+      ${строки.length ? card('Разговоры со срабатываниями', '',
         `<div class="table-wrap"><table>
           <thead><tr><th style="width:150px">Когда</th><th style="width:220px">Запись</th>
             <th>Сработало</th></tr></thead>
-          <tbody>${строки.filter((с) => Object.values(с.trackers || {}).some(Boolean))
-            .slice(0, 100).map((с) => `<tr>
+          <tbody>${строки.slice(0, 100).map((с) => `<tr>
               <td class="small faint nowrap">${fmtTime(с.created_at)}</td>
               <td class="small truncate" style="max-width:220px">
                 <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
-              <td><div class="chips">${Object.entries(с.trackers || {})
-                .filter(([, з]) => з)
-                .map(([имя]) => `<span class="chip warn">${esc(имя)}</span>`).join('')}</div></td>
+              <td><div class="chips">${сработавшие(с)
+                .map((т) => `<span class="chip warn">${esc(т.label || т.id)}</span>`).join('')}</div></td>
             </tr>`).join('')}</tbody></table></div>`) : ''}`;
-    if (пары.length) {
+    if (трекеры.length) {
       window.Charts.hbars(qs('#vo-t1'), {
-        labels: пары.map((п) => п[0]), values: пары.map((п) => п[1]), height: 260,
+        items: трекеры.map((т) => ({
+          label: т.label || т.id, value: Number(т.fired || 0),
+          note: `проверено ${num(т.checked)}`,
+        })),
+        labelWidth: 220,
       });
     }
     this.связатьТаблицу(место);
   },
 
   drawScorecard(место, д) {
-    const строки = д.rows || [];
-    const вопросы = new Map();
-    строки.forEach((с) => {
-      Object.entries(с.scorecard || {}).forEach(([вопрос, ответ]) => {
-        const св = вопросы.get(вопрос) || { да: 0, нет: 0 };
-        if (ответ === true || ответ === 'да' || ответ === 'yes') св.да += 1;
-        else if (ответ === false || ответ === 'нет' || ответ === 'no') св.нет += 1;
-        вопросы.set(вопрос, св);
-      });
-    });
-    const пары = Array.from(вопросы.entries())
-      .map(([в, с]) => [в, с.да, с.нет, с.да + с.нет ? с.да / (с.да + с.нет) : 0])
-      .sort((a, b) => a[3] - b[3]);
+    // Сервер отдаёт по вопросу счётчики «да», «нет» и «н/п». Доля — среди
+    // тех, к кому вопрос применим: «н/п» не выполнение и не провал.
+    const пары = (д.scorecard || [])
+      .map((в) => {
+        const да = Number(в['да'] || 0), нет = Number(в['нет'] || 0);
+        return [в.question || в.id, да, нет, Number(в['н/п'] || 0), да + нет ? да / (да + нет) : 0];
+      })
+      .sort((a, b) => a[4] - b[4]);
     место.innerHTML = card('Скоркарта', 'доля разговоров, где пункт выполнен',
       пари(пары) ? `<div class="table-wrap"><table>
         <thead><tr><th>Пункт</th><th class="num">выполнено</th><th class="num">нет</th>
-          <th style="width:240px">доля</th></tr></thead>
-        <tbody>${пары.map(([в, да, нет, доля]) => `<tr>
+          <th class="num">н/п</th><th style="width:240px">доля</th></tr></thead>
+        <tbody>${пары.map(([в, да, нет, нп, доля]) => `<tr>
           <td class="small">${esc(в)}</td>
           <td class="num mono">${num(да)}</td>
           <td class="num mono">${num(нет)}</td>
-          <td>${полоса_доли(доля, доля > 0.8 ? 'ok' : (доля > 0.5 ? 'warn' : 'err'))}</td>
+          <td class="num mono faint">${num(нп)}</td>
+          <td>${да + нет ? полоса_доли(доля, доля > 0.8 ? 'ok' : (доля > 0.5 ? 'warn' : 'err')) : '—'}</td>
         </tr>`).join('')}</tbody></table></div>`
         : `<div class="empty">Скоркарта не настроена.
              <div class="small dim" style="margin-top:6px">Вопросы задаются настройкой
@@ -12771,8 +12875,11 @@ RENDERERS.voice = {
   },
 
   drawRecords(место, д) {
+    const строки = д.rows || [];
+    const всего = Number(д.rows_total || строки.length);
     место.innerHTML = card('Разобранные записи',
-      `${(д.rows || []).length} за период`, this.таблицаЗаписей(д.rows || []));
+      `${num(всего)} за период` + (всего > строки.length ? ` · показаны последние ${num(строки.length)}` : ''),
+      this.таблицаЗаписей(строки));
     this.связатьТаблицу(место);
   },
 
@@ -12814,17 +12921,6 @@ RENDERERS.voice = {
     }
   },
 };
-
-/** Свод по полю: [[значение, сколько], …] по убыванию. */
-function свести(строки, поле) {
-  const счёт = new Map();
-  строки.forEach((с) => {
-    const з = с[поле];
-    if (!з) return;
-    счёт.set(з, (счёт.get(з) || 0) + 1);
-  });
-  return Array.from(счёт.entries()).sort((a, b) => b[1] - a[1]);
-}
 
 /** Есть ли что показывать в скоркарте. Отдельной функцией ради читаемости. */
 function пари(пары) { return пары && пары.length > 0; }

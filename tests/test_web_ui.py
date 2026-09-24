@@ -963,3 +963,99 @@ def test_вкладка_агентов_не_рисуется_поверх_выб
     assert "Установка агента" not in тело, \
         f"список агентов дорисовался поверх выбранной вкладки:\n{тело[:400]}"
     _чисто(страница)
+
+
+# ---------------------------------------------------------------------------
+# Заход 40
+# ---------------------------------------------------------------------------
+
+
+def test_голосовая_аналитика_показывает_разобранное(страница):
+    """Раздел был написан под другой ответ сервера.
+
+    Он читал rows, total, resolved_rate и actions_total, а сервер отдаёт
+    records, analyzed, resolved_share, actions; графикам шли labels и values
+    вместо items и parts. Модель разобрала шесть записей — а в шапке стояли
+    нули, и на каждой вкладке «За период модель ничего не разобрала».
+    """
+    _открыть(страница, "voice")
+    страница.select_option("#vo-period", "all")
+    страница.wait_for_selector("#vo-s1 svg", timeout=20000)
+    страница.wait_for_selector("#vo-s2 svg", timeout=20000)
+    # Подписи KPI набраны прописными через CSS — сравниваем без регистра.
+    шапка = страница.inner_text("#vo-head").lower()
+    assert "разобрано моделью\n6\n" in шапка, шапка
+    assert "разговоров за период\n30\n" in шапка, шапка
+    for вкладка, метка in (("reasons", "table"), ("records", "table"),
+                           ("actions", ".card"), ("trackers", ".card"),
+                           ("scorecard", ".card")):
+        страница.click(f'#vo-tabs button[data-tab="{вкладка}"]')
+        страница.wait_for_selector(f"#vo-body {метка}", timeout=10000)
+        тело = страница.inner_text("#vo-body")
+        assert "ничего не разобрала" not in тело, (вкладка, тело[:300])
+        assert "undefined" not in тело and "NaN" not in тело, (вкладка, тело[:300])
+    _чисто(страница)
+
+
+def test_применить_отправляет_только_изменённое_в_браузере(страница):
+    """«Применить» слал снимок всех настроек страницы.
+
+    Заведённая после её загрузки станция АТС пропадала, набор категорий
+    откатывался, пароль станции «***» ложился поверх настоящего.
+    """
+    отправлено: list[str] = []
+    страница.on("request", lambda з: отправлено.append(з.post_data or "")
+                if з.method == "PUT" and з.url.endswith("/api/settings") else None)
+    _открыть(страница, "settings")
+    страница.wait_for_selector("#p-apply", timeout=15000)
+    страница.click("#p-apply")
+    страница.wait_for_timeout(600)
+    assert not отправлено, f"без изменений ушло: {отправлено}"
+    assert "Изменений нет" in страница.inner_text("#toasts")
+
+    страница.click('#group-nav button[data-group="server"]')
+    поле = страница.locator('.param[data-key="max_upload_mb"] input[type=number]')
+    поле.wait_for(timeout=10000)
+    поле.fill("1500")
+    поле.dispatch_event("change")
+    страница.click("#p-apply")
+    страница.wait_for_timeout(800)
+    assert len(отправлено) == 1, отправлено
+    import json as _json
+
+    assert _json.loads(отправлено[0]) == {"max_upload_mb": 1500}
+    _чисто(страница)
+
+
+def test_загрузка_файла_несёт_только_заданное_человеком(страница, tmp_path):
+    """В settings задания уходила копия всех настроек сервера.
+
+    Неадминистратор получал webhook_url заглушкой «***» и отправлял её
+    обратно — загрузка отклонялась с 400.
+    """
+    import struct
+    import wave as _wave
+
+    файл = tmp_path / "проба.wav"
+    with _wave.open(str(файл), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(struct.pack("<h", 0) * 16000)
+    тела: list[str] = []
+
+    def перехват(маршрут):
+        тела.append(маршрут.request.post_data or "")
+        маршрут.fulfill(status=200, content_type="application/json",
+                        body='{"id": "ui-проба", "status": "queued"}')
+
+    страница.route("**/api/jobs", перехват)
+    _открыть(страница, "transcribe")
+    страница.wait_for_selector("#file-input", state="attached", timeout=15000)
+    страница.set_input_files("#file-input", str(файл))
+    страница.click("#btn-submit")
+    страница.wait_for_timeout(1000)
+    assert тела, "запрос на постановку не ушёл"
+    часть = тела[0].split('name="settings"', 1)[1]
+    значение = часть.split("\r\n\r\n", 1)[1].split("\r\n--", 1)[0]
+    assert значение.strip() == "{}", значение[:300]

@@ -214,22 +214,27 @@ UNITEOF
     as_root chown -R "${run_user}" "${DATA_DIR}/cache" 2>/dev/null || true
   fi
 
+  # enable + restart, а не `enable --now`: у работающей службы `--now` не
+  # делает ничего. Повторная установка оставляла работать старый код над
+  # новыми файлами, а новый порт или адрес из юнита вступали в силу только
+  # при случайном перезапуске — вопреки обещанию «служба будет перезапущена».
   if [[ "${user_mode}" -eq 1 ]]; then
     printf '%s\n' "${content}" > "${unit_path}"
     run systemctl --user daemon-reload
-    run systemctl --user enable --now "${SERVICE_NAME}.service"
-    ok "Служба пользователя создана: ${unit_path}"
+    run systemctl --user enable "${SERVICE_NAME}.service"
+    run systemctl --user restart "${SERVICE_NAME}.service"
+    ok "Служба пользователя создана и запущена: ${unit_path}"
     hint "Автозапуск без входа в систему: sudo loginctl enable-linger ${USER}"
   else
     printf '%s\n' "${content}" | as_root tee "${unit_path}" >/dev/null
     as_root systemctl daemon-reload
-    as_root systemctl enable --now "${SERVICE_NAME}.service"
-    ok "Служба создана: ${unit_path}"
+    as_root systemctl enable "${SERVICE_NAME}.service"
+    as_root systemctl restart "${SERVICE_NAME}.service"
+    ok "Служба создана и запущена: ${unit_path}"
   fi
 }
 
 install_launchd() {
-  mkdir -p "$(dirname "${PLIST}")" "${DATA_DIR}/logs"
   local content
   content="$(cat <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -264,6 +269,10 @@ install_launchd() {
 PLISTEOF
 )"
   if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then printf '%s\n' "${content}"; return 0; fi
+  # Каталоги — после проверки пробного запуска: `install.sh --dry-run` на
+  # macOS создавал через них дерево каталога данных и писал «изменений не
+  # вносилось».
+  mkdir -p "$(dirname "${PLIST}")" "${DATA_DIR}/logs"
   printf '%s\n' "${content}" > "${PLIST}"
   run launchctl unload "${PLIST}" 2>/dev/null || true
   run launchctl load -w "${PLIST}"
@@ -390,11 +399,17 @@ from pathlib import Path
 
 from asrhub.config import load
 from asrhub.db import Database
-from asrhub.maintenance import backup_dir, make_backup
+from asrhub.maintenance import backup_dir, make_backup, как_у_каталога
 
 settings = load()
-db = Database(Path(settings.paths.data) / "asrhub.db")
+данные = Path(settings.paths.data)
+база = данные / "asrhub.db"
+db = Database(база)
 копия = make_backup(db, settings)
+db.close()
+# Скрипт обычно запущен от root: спутники базы, созданные этим открытием при
+# остановленной службе, отдаём её пользователю — иначе служба их не откроет.
+как_у_каталога(данные, база, Path(str(база) + "-wal"), Path(str(база) + "-shm"))
 if копия is None:
     print("Копию сделать не удалось — причина в журнале выше.")
     raise SystemExit(1)
@@ -410,7 +425,18 @@ PYCODE
     # продолжит писать в файл, которого больше нет. Останавливаем сами: это
     # не тот случай, где предупреждения достаточно.
     warn "Служба будет остановлена на время восстановления."
-    bash "${BASH_SOURCE[0]}" stop --data "${DATA_DIR}" >/dev/null 2>&1 || true
+    # Своя служба — по имени: без --name останавливалась служба «asrhub»,
+    # то есть у второй установки чужая, а своя продолжала писать в базу,
+    # которую сейчас подменят.
+    bash "${BASH_SOURCE[0]}" stop --data "${DATA_DIR}" --name "${SERVICE_NAME}" \
+      >/dev/null 2>&1 || true
+    if [[ "${OS}" != "macos" ]] && have systemctl \
+       && { systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null \
+            || systemctl --user is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; }; then
+      error "Служба ${SERVICE_NAME} не остановилась — восстановление отменено."
+      hint "Остановите её вручную: sudo systemctl stop ${SERVICE_NAME} — и повторите."
+      exit 1
+    fi
     py="$(asrhub_python)" || { error "Не найден интерпретатор ASR Hub."; exit 1; }
     ASRHUB_DATA_DIR="${DATA_DIR}" ASRHUB_RESTORE_FROM="${RESTORE_FROM}"       "${py}" - <<'PYCODE' || exit 1
 import os

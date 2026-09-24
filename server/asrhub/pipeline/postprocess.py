@@ -922,9 +922,33 @@ def build_paragraphs(segments: list[dict[str, Any]], mode: str = "speaker",
 # Основная точка входа
 # --------------------------------------------------------------------------
 
+def _к_движку(ключ: str, engine: str) -> bool:
+    """Относится ли параметр каталога к этому движку.
+
+    Фильтр галлюцинаций объявлен в каталоге только для семейства Whisper, и
+    для остальных движков интерфейс его не показывает, а значит, и выключить
+    его там нельзя. Применялся же он ко всем: на модели по умолчанию
+    (GigaAM) из звонка пропадали настоящие реплики — «алло алло алло»,
+    «да да да», «всем пока», «до новых встреч». Зацикливание и фразы из
+    обучающих субтитров — беда порождающего декодера; у GigaAM, NeMo и Vosk
+    повтор в тексте — это повтор в речи. Движок не известен — как раньше.
+    """
+    if not engine:
+        return True
+    from ..catalog import PARAMS_BY_KEY  # noqa: PLC0415
+
+    spec = PARAMS_BY_KEY.get(ключ)
+    return spec is None or not spec.engines or engine in spec.engines
+
+
 def process(segments: list[dict[str, Any]], settings: dict[str, Any],
-            *, model_has_punctuation: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Применяет весь конвейер постобработки. Возвращает (сегменты, статистику)."""
+            *, model_has_punctuation: bool = False,
+            engine: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Применяет весь конвейер постобработки. Возвращает (сегменты, статистику).
+
+    `engine` — движок, который распознавал: от него зависит, нужен ли фильтр
+    галлюцинаций (см. `_к_движку`).
+    """
     stats: dict[str, Any] = {
         "hallucinations_removed": 0,
         "glossary_replacements": 0,
@@ -935,13 +959,17 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
     if language == "auto":
         language = str(segments[0].get("language") or "ru") if segments else "ru"
 
-    if settings.get("hallucination_filter", True):
+    галлюцинации_возможны = _к_движку("hallucination_filter", engine)
+    if settings.get("hallucination_filter", True) and галлюцинации_возможны:
         segments, removed = filter_hallucinations(
             segments, settings.get("hallucination_phrases") or ())
         stats["hallucinations_removed"] = removed
 
     for seg in segments:
-        seg["text"] = collapse_repeats(normalize_spaces(seg.get("text", "")))
+        текст = normalize_spaces(seg.get("text", ""))
+        # Схлопывание «да да да да» в «да да» — против зацикливания того же
+        # декодера; настоящий повтор в речи оставляем как сказан.
+        seg["text"] = collapse_repeats(текст) if галлюцинации_возможны else текст
 
     if settings.get("remove_filler_words"):
         for seg in segments:
@@ -992,10 +1020,39 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
     return segments, stats
 
 
+#: Метка канала при разделении стерео по каналам (audio.prepare, «split»).
+_КАНАЛ_RE = re.compile(r"^Канал (\d+)$")
+
+
 def _speaker_mapping(segments: list[dict[str, Any]], names: list[str]) -> dict[str, str]:
+    """Какое имя получает каждая метка говорящего.
+
+    Каналы — по номеру: «Канал 1» — первое имя, «Канал 2» — второе, кто бы
+    ни заговорил первым. Раньше и каналы шли по порядку первой реплики, и в
+    исходящем звонке, где первым звучит «Алло» абонента из второго канала,
+    вся речь клиента уходила под именем оператора. Совместимость с phone_asr
+    на этом держится целиком: там первый канал — всегда SPEAKER_00, а
+    `swap_sides` меняет местами каналы, а не «кто заговорил первым».
+
+    Метки диаризации (кто есть кто, заранее не известно) — по порядку
+    первого появления, как и прежде.
+    """
+    mapping: dict[str, str] = {}
     order: list[str] = []
     for seg in segments:
         speaker = seg.get("speaker")
-        if speaker and speaker not in order:
-            order.append(speaker)
-    return {speaker: names[i] for i, speaker in enumerate(order) if i < len(names)}
+        if not speaker or speaker in mapping or speaker in order:
+            continue
+        канал = _КАНАЛ_RE.match(str(speaker))
+        if канал:
+            номер = int(канал.group(1)) - 1
+            if 0 <= номер < len(names):
+                mapping[speaker] = names[номер]
+            continue
+        order.append(speaker)
+    занятые = set(mapping.values())
+    свободные = [имя for имя in names if имя not in занятые] if mapping else names
+    for i, speaker in enumerate(order):
+        if i < len(свободные):
+            mapping[speaker] = свободные[i]
+    return mapping

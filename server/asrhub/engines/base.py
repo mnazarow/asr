@@ -94,6 +94,37 @@ class TranscriptionResult:
         }
 
 
+
+def device_for(settings: dict[str, Any]) -> str:
+    """Устройство для torch по настройке `device`.
+
+    «auto» — видеокарта, если torch её видит, иначе Apple Metal, иначе
+    процессор. «rocm» и «hip» — это «cuda»: ROCm-сборка PyTorch называет
+    карту AMD так же, как NVIDIA, а строку «rocm» не принимает вовсе.
+    Установщик пишет `device: rocm` на машине с AMD, и каждое задание
+    GigaAM, Whisper, NeMo и Transformers падало при загрузке модели, хотя
+    самопроверка отвечала «устройство rocm — в порядке». Номер карты
+    («rocm:1») сохраняется.
+    """
+    device = str(settings.get("device") or "auto").strip()
+    низ = device.lower()
+    for имя in ("rocm", "hip"):
+        if низ == имя or низ.startswith(имя + ":"):
+            return "cuda" + device[len(имя):]
+    if низ != "auto":
+        return device
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class Engine(ABC):
     """Общий интерфейс всех движков."""
 
@@ -225,19 +256,7 @@ class Engine(ABC):
     # --- вспомогательное -------------------------------------------------
 
     def resolve_device(self, settings: dict[str, Any]) -> str:
-        device = str(settings.get("device") or "auto")
-        if device != "auto":
-            return device
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available():
-                return "cuda"
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                return "mps"
-        except Exception:
-            pass
-        return "cpu"
+        return device_for(settings)
 
     def resolve_compute_type(self, settings: dict[str, Any], device: str) -> str:
         value = str(settings.get("compute_type") or "auto")

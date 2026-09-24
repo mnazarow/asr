@@ -440,8 +440,13 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     model_punct = bool(engine_meta.get("punctuation_from_model")) or (
         spec is not None and spec.punctuation)
     try:
+        _, движок = registry.resolve(settings)
+    except Exception:                                       # noqa: BLE001
+        движок = ""
+    try:
         processed, pp_stats = postprocess.process(raw_segments, settings,
-                                                  model_has_punctuation=model_punct)
+                                                  model_has_punctuation=model_punct,
+                                                  engine=движок)
     except Exception as exc:                                # noqa: BLE001
         # Единственный шаг после распознавания, который не имел защиты, — а
         # ронять его умеет и опечатка в пользовательском словаре замен.

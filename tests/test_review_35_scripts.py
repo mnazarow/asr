@@ -139,7 +139,13 @@ def test_занятый_своим_же_сервером_порт_не_меня�
     текст = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
     начало = текст.index('if ! check_port_free "${PORT}"; then')
     кусок = текст[начало:начало + 1400]
-    assert "http_probe" in кусок, "занятый порт не опрашивается — чей он, неизвестно"
+    # С захода 40 опрос порта живёт в common.sh (port_is_ours): им же
+    # пользуется мастер, который прежде предлагал соседний порт вместо своего.
+    библиотека = (repo_root / "scripts" / "lib" / "common.sh").read_text(encoding="utf-8")
+    опрос = библиотека[библиотека.index("port_is_ours() {"):]
+    опрос = опрос[:опрос.index("\n}\n")]
+    assert "port_is_ours" in кусок and "http_probe" in опрос, \
+        "занятый порт не опрашивается — чей он, неизвестно"
     assert "PORT_IS_OURS" in кусок
     # Переезд на другой порт остаётся, но только для ЧУЖОГО процесса.
     assert "find_free_port" in кусок

@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.11"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.12"
 # Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
 # пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
 # сменить каталог, и относительный путь указывал бы в никуда. Те же
@@ -2266,6 +2266,84 @@ service_name_for() {
     fi
   done
   printf 'asrhub'
+}
+
+# Адрес, порт или пользователь службы, которая уже стоит для этого каталога.
+#
+#   installed_service_value ИМЯ_СЛУЖБЫ КАТАЛОГ_ПРОГРАММЫ host|port|user
+#
+# Повторная установка поверх стоящей берёт их отсюда, когда они не заданы
+# ключами. Флаги в строке запуска перекрывают config.yaml, а установщик
+# подставлял свои умолчания: `install.sh --force`, который подсказки советуют
+# для починки окружения, переносил сервер с 8081 на 8080, установка с
+# `--host 127.0.0.1` после повторного запуска открывалась в сеть. Юнит чужой
+# установки (другой каталог программы) не в счёт. Пусто — ничего не нашли.
+installed_service_value() {
+  local name="${1:-asrhub}" prefix="${2:-}" what="${3:-}" unit="" value="" line=""
+  prefix="${prefix%/}"
+  case "${what}" in host|port|user) ;; *) return 1 ;; esac
+  for unit in "/etc/systemd/system/${name}.service" \
+              "${HOME}/.config/systemd/user/${name}.service"; do
+    [[ -r "${unit}" ]] || continue
+    if [[ -n "${prefix}" ]] && ! grep -qF -- "${prefix}/" "${unit}" 2>/dev/null \
+       && ! grep -qF -- "${prefix// /\\x20}/" "${unit}" 2>/dev/null; then
+      continue
+    fi
+    if [[ "${what}" == "user" ]]; then
+      value="$(sed -n 's/^User=//p' "${unit}" 2>/dev/null | head -1 || true)"
+    else
+      line="$(grep -E '^ExecStart=' "${unit}" 2>/dev/null | head -1 || true)"
+      value="$(grep -oE -- "--${what}[= ]+[^ \"]+" <<<"${line}" | head -1 \
+               | sed -E "s/^--${what}[= ]+//" || true)"
+    fi
+    [[ -n "${value}" ]] && { printf '%s' "${value}"; return 0; }
+  done
+  # macOS: строка запуска лежит в plist по одному аргументу на <string>.
+  local plist="${HOME}/Library/LaunchAgents/com.asrhub.server.plist"
+  if [[ "${what}" != "user" && -r "${plist}" ]] \
+     && { [[ -z "${prefix}" ]] || grep -qF -- "${prefix}/" "${plist}" 2>/dev/null; }; then
+    value="$(tr -d '\n\r\t' < "${plist}" 2>/dev/null \
+             | grep -oE "<string>--${what}</string>[[:space:]]*<string>[^<]+</string>" \
+             | head -1 | sed -E 's/.*<string>([^<]+)<\/string>$/\1/' || true)"
+    [[ -n "${value}" ]] && { printf '%s' "${value}"; return 0; }
+  fi
+  return 1
+}
+
+# Занят ли порт нашим же сервером из этого каталога.
+#
+#   port_is_ours ПОРТ [КАТАЛОГ_ПРОГРАММЫ]
+#
+# Чаще всего так и есть: установщик запускают повторно, чтобы доставить
+# движок или починить окружение, и сервер при этом работает. Порт
+# спрашивается прямо (http_probe): отвечает ASR Hub, а каталог установки уже
+# есть — значит, это мы, и переезжать на соседний порт незачем.
+port_is_ours() {
+  local port="${1:-}" prefix="${2:-${PREFIX:-}}"
+  [[ -n "${prefix}" && -d "${prefix}" ]] || return 1
+  http_probe "http://127.0.0.1:${port}/api/health" 3 || return 1
+  case "${HTTP_BODY}" in
+    *asrhub*|*ASR*|*'"status"'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Значение верхнего уровня или секции из config.yaml: `server_port: 8081`.
+#
+#   config_yaml_value ФАЙЛ КЛЮЧ
+#
+# Для скриптов этого хватает: установщик пишет плоские «ключ: значение», а
+# разбирать YAML целиком ради двух строк незачем. Кавычки и хвостовой
+# комментарий снимаются.
+config_yaml_value() {
+  local file="${1:-}" key="${2:-}" value=""
+  [[ -r "${file}" && -n "${key}" ]] || return 1
+  value="$(grep -E "^[[:space:]]*${key}:[[:space:]]*[^[:space:]#]" "${file}" 2>/dev/null \
+           | head -1 | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//; s/[[:space:]]+#.*$//" \
+           | tr -d "\"'\r" || true)"
+  value="${value%"${value##*[![:space:]]}"}"
+  [[ -n "${value}" ]] || return 1
+  printf '%s' "${value}"
 }
 
 print_banner() {

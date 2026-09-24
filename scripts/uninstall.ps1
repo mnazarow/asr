@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Удаление ASR Hub с Windows.
 .DESCRIPTION
@@ -175,7 +175,9 @@ foreach ($path in @([Environment]::GetEnvironmentVariable('ASRHUB_DATA_DIR', 'Ma
 }
 if ($leftovers) {
     Write-Warn "Найдены остатки: $($leftovers -join ', ')"
-    if (Confirm-Action 'Удалить их?') {
+    if (Get-DryRun) {
+        Write-Host '  [пробный запуск] удалить переменную окружения ASRHUB_DATA_DIR'
+    } elseif (Confirm-Action 'Удалить их?') {
         [Environment]::SetEnvironmentVariable('ASRHUB_DATA_DIR', $null, 'Machine')
         Write-Ok 'Переменная окружения удалена'
     }
@@ -183,6 +185,11 @@ if ($leftovers) {
 
 Clear-Rollback
 Write-Host ''
+if (Get-DryRun) {
+    Write-Host 'Пробный запуск завершён — ничего не удалено.' -ForegroundColor Green
+    Write-Host ''
+    exit 0
+}
 Write-Host 'ASR Hub удалён' -ForegroundColor Green
 if (Test-Path $backupDir) { Write-Host "  Резервная копия: $backupDir" }
 if (-not $Purge -and $DataDir) { Write-Host "  Данные остались в $DataDir" }

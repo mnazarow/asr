@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Установка ASR Hub на Windows.
 
@@ -18,6 +18,16 @@
     Не ставить драйвер видеокарты. По умолчанию установщик находит карту
     через Windows (она видна и без драйвера производителя) и, если стоит
     стандартный адаптер, ставит драйвер через winget.
+
+.PARAMETER Force
+    Переустановить поверх существующей установки: код, зависимости и
+    окружение Python собираются заново. config.yaml, ключи и данные не
+    трогаются.
+
+.PARAMETER ResetConfig
+    Заменить config.yaml шаблоном. Прежний файл остаётся рядом копией
+    config.yaml.bak.*; пропадут ключи интеграций, токен Hugging Face и все
+    настройки.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1
@@ -46,6 +56,7 @@ param(
     [switch]$NoInteractive,
     [switch]$Offline,
     [switch]$Force,
+    [switch]$ResetConfig,
     [switch]$DryRun,
     [switch]$Yes,
     [switch]$Quiet
@@ -487,6 +498,33 @@ if ($Mode -eq 'docker') {
 } else {
     Write-Step 'Виртуальное окружение Python'
 
+    # -Force советуют для починки окружения, а при той же версии Python оно
+    # раньше переиспользовалось как есть, и сломанный пакет оставался на
+    # месте. Прежнее окружение откладывается до конца установки: сорвётся
+    # новая сборка — откат вернёт его на место.
+    $venvOld = "$venv.before-force"
+    $venvMoved = $false
+    if ($Force -and (Test-Path $venvPython)) {
+        Write-Info 'Ключ -Force: окружение Python собирается заново.'
+        Write-Hint "Прежнее отложено в $venvOld и удалится в конце установки."
+        if (-not (Get-DryRun)) {
+            # Работающий сервер держит python.exe и загруженные .pyd, и без
+            # остановки перенос каталога падает с «отказано в доступе».
+            # Служба поднимется снова на шаге «Настройка автозапуска».
+            try { & (Join-Path $PSScriptRoot 'service.ps1') -Action stop -Prefix $Prefix -DataDir $DataDir | Out-Null } catch { }
+            if (Test-Path $venvOld) { Remove-Item $venvOld -Recurse -Force }
+            try { Move-Item -Path $venv -Destination $venvOld }
+            catch {
+                throw ("Окружение $venv занято работающим процессом — видимо, сервер " +
+                       "запущен вручную. Остановите его и повторите установку.")
+            }
+            $venvMoved = $true
+            Add-Rollback ({
+                if (Test-Path $venv) { Remove-Item $venv -Recurse -Force -ErrorAction SilentlyContinue }
+                Move-Item -Path $venvOld -Destination $venv
+            }.GetNewClosure()) 'вернуть прежнее окружение'
+        }
+    }
     if (-not (Test-Path $venvPython)) {
         Invoke-Checked -Command $python -Arguments @('-m', 'venv', $venv) -Description 'создание venv'
         Add-Rollback { Remove-Item $venv -Recurse -Force -ErrorAction SilentlyContinue } 'удалить venv'
@@ -582,9 +620,19 @@ if ($Mode -eq 'docker') {
 Write-Step 'Создание конфигурации'
 
 $configFile = Join-Path $DataDir 'config.yaml'
-if ((Test-Path $configFile) -and -not $Force) {
+# -Force конфигурацию не трогает: его советуют для починки окружения, а он
+# стирал ключи интеграций, токен и настройки. Заменить её шаблоном — отдельный
+# ключ -ResetConfig, и прежний файл остаётся рядом копией.
+if ((Test-Path $configFile) -and -not $ResetConfig) {
     Write-Info 'Конфигурация уже существует — оставляем без изменений.'
+    if ($Force) { Write-Hint '-Force конфигурацию не трогает. Заменить её шаблоном — ключ -ResetConfig.' }
 } elseif (-not (Get-DryRun)) {
+    if (Test-Path $configFile) {
+        $configBackup = "$configFile.bak.$(Get-Date -Format 'yyyyMMddHHmmss')"
+        Copy-Item $configFile $configBackup -Force
+        Write-Warn 'Ключ -ResetConfig: config.yaml заменяется шаблоном.'
+        Write-Hint "Прежний файл: $configBackup"
+    }
     $firstModel = ($Models -split ',')[0]
     if (-not $firstModel) { $firstModel = 'demo-simulator' }
     $concurrent = if ($hw.Accelerator -eq 'cpu') { 1 } else { 2 }
@@ -712,6 +760,10 @@ else {
 }
 
 Clear-Rollback
+# Новое окружение собрано и сервер проверен — отложенное прежнее больше не нужно.
+if ($Mode -eq 'native' -and $venvMoved -and (Test-Path $venvOld)) {
+    Remove-Item $venvOld -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $apiKeyFile = Join-Path $DataDir 'api-key.txt'
 $apiKey = if (Test-Path $apiKeyFile) { (Get-Content $apiKeyFile -Raw).Trim() } else { '' }

@@ -225,8 +225,10 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
     require_admin(principal)
     # Приведение до проверки: интерфейс и внешние клиенты присылают то, что
     # ввёл человек, — «5» там, где каталог ждёт число, и 5 там, где строку.
-    свои = catalog.coerce_all({k: v for k, v in values.items()
-                               if k in catalog.PARAMS_BY_KEY})
+    # Заглушки «***» вместо секретов означают «не менял» и значением не
+    # становятся — см. Settings.без_заглушек.
+    свои = catalog.coerce_all(state.settings.без_заглушек(
+        {k: v for k, v in values.items() if k in catalog.PARAMS_BY_KEY}))
     errors = catalog.validate_all(свои)
     if errors:
         raise error_response(ConfigError("; ".join(errors)))

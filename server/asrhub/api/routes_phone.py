@@ -87,6 +87,12 @@ def process_call(request: Request, body: ProcessCallBody,
         state.queue._check_webhook_url(target)          # noqa: SLF001
     except ASRHubError as exc:
         raise error_response(exc) from exc
+    # Суточная квота по числу заданий — тоже сразу, как у обычной загрузки.
+    # Объём и длительность известны только после скачивания и проверяются
+    # там же (`_accept`). Раньше этот путь квоту не проверял вовсе.
+    from .routes_jobs import check_quota  # noqa: PLC0415
+
+    check_quota(request, principal)
 
     # Скачивание идёт в отдельном потоке: файл лежит на чужом сервере, и ждать
     # его, держа обработчик запроса, значит отвечать 202 через полминуты.
@@ -165,12 +171,22 @@ def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
                 hint="Проверьте значение call_id: в нём не должно быть "
                      "разделителей пути.")
         shutil.move(str(fetched.path), stored)
+        try:
+            from .routes_jobs import _probe_duration, проверить_квоту  # noqa: PLC0415
 
-        settings = _settings_for(state, call, fetched)
-        job = state.queue.submit(
-            file_path=stored, filename=fetched.filename, settings=settings,
-            owner=principal.name, api_key_name=principal.name,
-            group_id=call.call_id, source="phone", webhook_url=target)
+            проверить_квоту(state, principal, incoming_bytes=stored.stat().st_size,
+                            incoming_audio_s=_probe_duration(stored))
+            settings = _settings_for(state, call, fetched)
+            job = state.queue.submit(
+                file_path=stored, filename=fetched.filename, settings=settings,
+                owner=principal.name, api_key_name=principal.name,
+                group_id=call.call_id, source="phone", webhook_url=target)
+        except BaseException:
+            # Файл уже в uploads, а задания, которое на него ссылается, нет —
+            # уборка по таблице заданий его не найдёт никогда. Три отказа
+            # очереди «переполнена» оставляли три записи на диске навсегда.
+            stored.unlink(missing_ok=True)
+            raise
         log.info("Разговор %s принят как задание %s", call.uuid, job["id"],
                  extra={"job_id": job["id"]})
     except ASRHubError as exc:

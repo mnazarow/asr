@@ -178,7 +178,7 @@ def download(urls: list[str], workdir: Path, *, limit_bytes: int,
         if check_url is not None:
             check_url(url)
         local.append(_fetch(url, workdir / f"часть-{index}{_suffix(url)}",
-                            limit_bytes=limit_bytes))
+                            limit_bytes=limit_bytes, check_url=check_url))
 
     if len(local) == 1:
         channels = _channel_count(local[0])
@@ -246,13 +246,22 @@ def encode_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, path, query, parts.fragment))
 
 
-def _fetch(url: str, target: Path, *, limit_bytes: int) -> Path:
-    """Скачивает файл, не давая ему превысить предел загрузки."""
+def _fetch(url: str, target: Path, *, limit_bytes: int, check_url: Any = None) -> Path:
+    """Скачивает файл, не давая ему превысить предел загрузки.
+
+    Перенаправления проверяются той же проверкой адреса, что и исходная
+    ссылка: иначе внешний сервер с ответом «302 → внутренний адрес»
+    заставлял бы нас скачать внутреннее.
+    """
+    from .job_queue import открыватель_наружу  # noqa: PLC0415
+
     request = urllib.request.Request(encode_url(url),
                                      headers={"User-Agent": "ASRHub/3.0"})
+    opener = (открыватель_наружу(проверка=check_url) if check_url is not None
+              else urllib.request.build_opener())
     written = 0
     try:
-        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_S) as response, \
+        with opener.open(request, timeout=DOWNLOAD_TIMEOUT_S) as response, \
                 target.open("wb") as handle:
             while True:
                 chunk = response.read(1 << 16)
@@ -315,11 +324,31 @@ def _merge_to_stereo(left: Path, right: Path, target: Path) -> Path:
     if not ffmpeg:
         raise AudioError("Для двух раздельных дорожек нужен ffmpeg.",
                          hint="Либо присылайте одну стереозапись.")
+    # amerge кончается вместе с КОРОТКОЙ дорожкой. Оператор говорит десять
+    # минут, клиент — три, и распознавались три минуты, а остальные семь
+    # молча терялись вместе с длительностью в обратном вызове. Обе дорожки
+    # дополняются тишиной (apad), а выход обрезается по длинной.
+    from .pipeline.audio import probe  # noqa: PLC0415
+
+    длины = []
+    for дорожка in (left, right):
+        try:
+            длины.append(float(probe(дорожка).duration_s or 0.0))
+        except Exception:                                    # noqa: BLE001
+            длины.append(0.0)
+    длина = max(длины)
+    if длина > 0:
+        граф = "[0:a]apad[l];[1:a]apad[r];[l][r]amerge=inputs=2[a]"
+        срок = ["-t", f"{длина:.3f}"]
+    else:
+        # Длительность не узнать — склеиваем как раньше: хуже, но не пусто.
+        граф = "[0:a][1:a]amerge=inputs=2[a]"
+        срок = []
     result = subprocess.run(
         [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
          "-i", str(left), "-i", str(right),
-         "-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
-         "-map", "[a]", "-ac", "2", str(target)],
+         "-filter_complex", граф,
+         "-map", "[a]", "-ac", "2", *срок, str(target)],
         capture_output=True, text=True, timeout=600)
     if result.returncode != 0 or not target.exists():
         raise AudioError("Не удалось совместить дорожки сторон в стереозапись.",

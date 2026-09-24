@@ -326,7 +326,16 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     settings = settings or load()
     setup(str(settings.get("log_level") or "INFO"), settings.paths.logs)
 
+    # Восстановление данных из копии подменяет базу здесь — до того, как её
+    # откроет хоть одно соединение (см. backup._вернуть_базу).
+    from .. import backup as _копии  # noqa: PLC0415
+
+    прежняя_база = _копии.применить_отложенное(settings.paths.db)
     db = Database(settings.paths.db)
+    if прежняя_база:
+        db.add_event(None, "restore_applied",
+                     f"База восстановлена из копии при запуске; прежняя сохранена "
+                     f"рядом как {прежняя_база}")
     # Через `S`, а не через `or`: у `model_idle_unload_s` ноль означает
     # «не выгружать модели никогда», и `int(значение or 900)` включал
     # автовыгрузку через пятнадцать минут — при том что в интерфейсе стоял
@@ -425,6 +434,57 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             allow_headers=["*"],
         )
 
+    def _предел_тела(путь: str) -> tuple[int, float, int]:
+        """Предел тела запроса в байтах — общий для обеих проверок ниже."""
+        limit_mb = float(settings.get("max_upload_mb") or 2048)
+        # Пакетная загрузка везёт несколько файлов одним запросом.
+        multiplier = 1
+        if путь.rstrip("/").endswith("/batch"):
+            multiplier = max(1, int(settings.get("max_batch_files") or 20))
+        # Небольшой запас на границы multipart и остальные поля формы.
+        return int(limit_mb * 1024 * 1024) * multiplier + (1 << 20), limit_mb, multiplier
+
+    class _СчётТела:
+        """Предел тела по тому, что пришло на самом деле, а не по заголовку.
+
+        Проверка Content-Length ниже закрывает обычного клиента, но заголовок
+        можно не прислать: запрос с Transfer-Encoding: chunked разбирался
+        FastAPI целиком и оседал во временном файле без предела — и всё это
+        ДО проверки ключа: анонимный запрос успевал записать восемь
+        мегабайт при пределе в один и только потом получал 401. Здесь
+        считаются байты по мере чтения, и чтение обрывается на пределе.
+        """
+
+        def __init__(self, inner: Any) -> None:
+            self.app = inner
+
+        async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+            if scope.get("type") != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+                await self.app(scope, receive, send)
+                return
+            предел, limit_mb, multiplier = _предел_тела(str(scope.get("path") or ""))
+            получено = 0
+
+            async def считать() -> dict[str, Any]:
+                nonlocal получено
+                сообщение = await receive()
+                if сообщение.get("type") == "http.request":
+                    получено += len(сообщение.get("body") or b"")
+                    if получено > предел:
+                        ошибка = FileTooLarge(получено / 1024 / 1024,
+                                              int(limit_mb * multiplier))
+                        RUNTIME.note_error(ошибка.code, ошибка.retryable)
+                        # HTTPException, а не своё исключение: FastAPI
+                        # пропускает его сквозь разбор формы как есть, а
+                        # любое другое превращает в «ошибку разбора тела».
+                        raise StarletteHTTPException(status_code=413,
+                                                     detail=ошибка.to_dict())
+                return сообщение
+
+            await self.app(scope, считать, send)
+
+    app.add_middleware(_СчётТела)
+
     @app.middleware("http")
     async def limit_body_size(request: Request, call_next):
         """Отсекает слишком большое тело до того, как его начнут принимать.
@@ -440,13 +500,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         if request.method in ("POST", "PUT", "PATCH"):
             declared = request.headers.get("content-length")
             if declared and declared.isdigit():
-                limit_mb = float(settings.get("max_upload_mb") or 2048)
-                # Пакетная загрузка везёт несколько файлов одним запросом.
-                multiplier = 1
-                if request.url.path.rstrip("/").endswith("/batch"):
-                    multiplier = max(1, int(settings.get("max_batch_files") or 20))
-                # Небольшой запас на границы multipart и остальные поля формы.
-                limit = int(limit_mb * 1024 * 1024) * multiplier + (1 << 20)
+                limit, limit_mb, multiplier = _предел_тела(request.url.path)
                 if int(declared) > limit:
                     error = FileTooLarge(int(declared) / 1024 / 1024,
                                          int(limit_mb * multiplier))
@@ -634,6 +688,26 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(phone_router)
     app.include_router(phone_router, prefix="/api")
 
+    def _аккаунт_сессии(websocket: WebSocket, hub_state: Any) -> Any:
+        """Учётная запись по куке сессии для веб-сокета — или None.
+
+        Кука уходит и при рукопожатии, поэтому чужая страница могла бы
+        открыть сокет от имени вошедшего. SameSite=Lax браузер обычно такого
+        не пускает; здесь второй рубеж, тот же, что у запросов с кукой:
+        страница-источник должна быть с того же адреса, что и сервер.
+        """
+        if hub_state is None or hub_state.accounts is None:
+            return None
+        token = websocket.cookies.get(SESSION_COOKIE, "")
+        if not token:
+            return None
+        origin = websocket.headers.get("origin") or ""
+        host = websocket.headers.get("host") or ""
+        if origin and host and origin.split("://", 1)[-1] != host:
+            log.warning("Веб-сокет с чужой страницы отклонён: %s", origin)
+            return None
+        return hub_state.accounts.session_account(token)
+
     ws_router = APIRouter()
 
     @ws_router.websocket("/api/stream")
@@ -650,6 +724,12 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         либо ключом в заголовке или параметре — для сторонних клиентов.
         """
         import asyncio as _asyncio
+
+        # Сначала принимаем соединение, потом отказываем кодом. Закрытие до
+        # accept() uvicorn превращает в HTTP 403 на рукопожатии, браузер
+        # видит код 1006 — и сообщения интерфейса для 4401/4403/4404 не
+        # показывались никогда: статус висел на «запрашиваем микрофон…».
+        await websocket.accept()
 
         if not settings.get("stream_enabled", True):
             await websocket.close(
@@ -673,19 +753,32 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 # 4401 «ключ недействителен» на действующем ключе.
                 token = token_of(websocket)
             info = settings.api_keys.get(token)
-            if not info or info.get("enabled") is False:
+            account = None
+            if not info:
+                # Вход по логину и паролю — кукой сессии, как на /ws. Её не
+                # было, и у вошедшего паролем диктовка не работала вовсе:
+                # билет выдаётся на ключ, а у сессии ключа нет.
+                account = _аккаунт_сессии(websocket, hub_state)
+            if account is not None:
+                if account.must_change_password:
+                    await websocket.close(
+                        code=4403, reason="Сначала смените пароль по умолчанию")
+                    return
+                principal_name = account.username
+                can_write = account.role in ("admin", "user")
+            elif not info or info.get("enabled") is False:
                 await websocket.close(code=4401,
                                       reason="Ключ доступа отсутствует или недействителен")
                 return
-            principal_name = str(info.get("name") or "ключ")
-            can_write = str(info.get("role") or "user") in ("admin", "user")
+            else:
+                principal_name = str(info.get("name") or "ключ")
+                can_write = str(info.get("role") or "user") in ("admin", "user")
         # Поток — это работа, а не чтение: ключу только для чтения он закрыт,
         # как и постановка задания.
         if not can_write:
             await websocket.close(code=4403, reason="Ключ доступа работает только на чтение")
             return
 
-        await websocket.accept()
         session = None
         try:
             first = await websocket.receive()
@@ -790,9 +883,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 # рукопожатии WebSocket, поэтому билет здесь не нужен: без
                 # этой ветки лента событий у вошедшего паролем молча
                 # закрывалась с кодом 4401, и интерфейс показывал «нет связи».
-                if hub_state is not None and hub_state.accounts is not None:
-                    account = hub_state.accounts.session_account(
-                        websocket.cookies.get(SESSION_COOKIE, ""))
+                account = _аккаунт_сессии(websocket, hub_state)
             if info is None and account is None:
                 await websocket.close(code=4401, reason="Ключ доступа отсутствует или недействителен")
                 return
