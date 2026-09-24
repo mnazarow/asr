@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 
 from ..errors import ASRHubError, ConfigError, JobNotFound
-from ..insights import ОТБОРЫ, ПРИЗНАКИ, РАЗРЕЗЫ, Insights
+from ..insights import ОТБОРЫ, РАЗРЕЗЫ, Insights, признаки_для
 from .deps import (
     Principal,
     authenticate,
@@ -49,6 +49,21 @@ def _index(request: Request) -> Any:
             hint="Сервер запущен в урезанном режиме; перезапустите его "
                  "обычным способом."))
     return состояние
+
+
+def _реплики_записи(state: Any, задание: dict[str, Any]) -> list[dict[str, Any]]:
+    """Реплики записи для проверки в редакторе — те же, что у разбора.
+
+    Запись без реплик проверяется одной «репликой» на весь текст, но без
+    подписей говорящих: «Говорящий 1» иначе попадал в приметы.
+    """
+    сегменты = state.db.get_segments(str(задание.get("id") or ""))
+    if not сегменты and задание.get("text"):
+        from ..content.analyze import _без_меток  # noqa: PLC0415
+
+        сегменты = [{"start": 0.0, "end": float(задание.get("media_duration_s") or 0.0),
+                     "text": _без_меток(str(задание["text"]))}]
+    return сегменты
 
 
 def _insights(request: Request) -> Insights:
@@ -94,7 +109,7 @@ def summary(request: Request, period: str = ПЕРИОД,
         "previous": (свод.summary(period, owner=scope_owner(principal),
                                   since=прошлое, until=начало)
                      if начало is not None else None),
-        "features": ПРИЗНАКИ,
+        "features": признаки_для(get_state(request).settings),
     }
 
 
@@ -177,7 +192,7 @@ def kinds(request: Request, preset: str = Query(default="", max_length=32),
         "kinds": [{"key": к, "title": о["title"]} for к, о in ОТБОРЫ.items()],
         "dimensions": [{"key": к, "title": о["title"]}
                        for к, о in РАЗРЕЗЫ.items()],
-        "features": ПРИЗНАКИ,
+        "features": признаки_для(get_state(request).settings),
         "default_script": ПО_УМОЛЧАНИЮ,
         # Категории — действующий набор (свой или готовый): по нему список
         # заданий строит отбор «про оплату», а редактор — заготовки.
@@ -374,16 +389,13 @@ def categories_check(request: Request, body: dict[str, Any] = Body(default={}),
     if набор is not None and not isinstance(набор, list):
         raise error_response(ConfigError("Поле categories должно быть списком."))
     индекс = _index(request)
-    сегменты = state.db.get_segments(job_id)
-    if not сегменты and задание.get("text"):
-        сегменты = [{"start": 0.0, "end": float(задание.get("media_duration_s") or 0.0),
-                     "text": задание["text"]}]
-    оператор = str(state.settings.get("content_agent_speaker") or "").strip() or None
-    # Стороны — те же, что у разбора записи: оператор по скрипту (первый
-    # заговоривший), клиент — самый говорливый из остальных.
+    сегменты = _реплики_записи(state, задание)
+    # Стороны — те же, что у разбора записи: оператор из настройки (у
+    # переписки — своя сторона чата) или первый заговоривший, клиент — самый
+    # говорливый из остальных.
     from ..content.analyze import _клиент  # noqa: PLC0415
 
-    кто = compliance.agent(сегменты, оператор)
+    кто = compliance.agent(сегменты, индекс.оператор_записи(задание, сегменты))
     клиент = _клиент(сегменты, кто)
     проверяемые = набор if набор is not None else индекс.categories()
     итог = категории.apply(сегменты, проверяемые, agent=кто, customer=клиент,
@@ -396,6 +408,8 @@ def categories_check(request: Request, body: dict[str, Any] = Body(default={}),
         "result": итог,
         "suspicious": категории.suspicious(проверяемые, частоты, корпус),
         "errors": категории.validate(набор) if набор is not None else [],
+        # Не ошибки, а предупреждения: сохранить такой набор можно.
+        "notes": категории.notes(проверяемые),
         "default": набор is None and not индекс.categories_own(),
     }
 
@@ -480,13 +494,14 @@ def script_check(request: Request, body: dict[str, Any] = Body(default={}),
         скрипт = значение if isinstance(значение, list) and значение else None
 
     from ..content import compliance  # noqa: PLC0415
+    from ..content.analyze import факты_скрипта  # noqa: PLC0415
 
-    сегменты = state.db.get_segments(job_id)
-    if not сегменты and задание.get("text"):
-        сегменты = [{"start": 0.0, "end": float(задание.get("media_duration_s") or 0.0),
-                     "text": задание["text"]}]
-    оператор = str(state.settings.get("content_agent_speaker") or "").strip() or None
-    итог = compliance.check(сегменты, script=скрипт, speaker=оператор)
+    сегменты = _реплики_записи(state, задание)
+    оператор = _index(request).оператор_записи(задание, сегменты)
+    # Факты — те же, что у разбора записи: пункт «Обратился по имени»
+    # раньше был выполнен в разборе и не выполнен здесь, на той же записи.
+    итог = compliance.check(сегменты, script=скрипт, speaker=оператор,
+                            facts=факты_скрипта(сегменты, оператор))
     частоты, корпус = _index(request).corpus_frequency()
     return {
         "job_id": job_id,

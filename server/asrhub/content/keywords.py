@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 from .lexicons import СТОП_СЛОВА
@@ -118,21 +119,36 @@ def keywords(текст: str, *, document_frequency: dict[str, int] | None = Non
     return out[:limit]
 
 
-def phrases(текст: str, *, size: int = 2, limit: int = 15) -> list[dict[str, Any]]:
+#: Где сочетание обрывается: конец предложения, точка с запятой, двоеточие,
+#: перевод строки. Запятая — нет: «срок, поставка» встречается реже, чем
+#: «сроки поставки, оплаты» с перечислением через неё.
+_ГРАНИЦА_СОЧЕТАНИЯ = re.compile(r"[.!?;:…\n]+")
+
+
+def phrases(текст: str | Iterable[str], *, size: int = 2,
+            limit: int = 15) -> list[dict[str, Any]]:
     """Устойчивые сочетания из двух-трёх слов.
 
     Отдельные слова отвечают «о чём», сочетания — «о чём именно»: «срок» и
     «поставка» по отдельности говорят меньше, чем «срок поставки».
+
+    Сочетание ищется внутри одной реплики и одного предложения: на стыке
+    двух реплик слова друг с другом не связаны, и по склеенному тексту
+    разговора в сочетания попадали «четверг говорящий» и «спасибо договор».
+    Поэтому на вход лучше давать список реплик, а не их склейку.
     """
-    значимые = _значимые(текст)
-    if len(значимые) < size:
-        return []
+    куски = [текст] if isinstance(текст, str) else list(текст or [])
     счётчик: Counter[tuple[str, ...]] = Counter()
     показ: dict[tuple[str, ...], str] = {}
-    for i in range(len(значимые) - size + 1):
-        окно = значимые[i:i + size]
-        ключ = tuple(о for о, _ in окно)
-        счётчик[ключ] += 1
-        показ.setdefault(ключ, " ".join(с for _, с in окно))
+    for кусок in куски:
+        # Адреса и ссылки — до деления на предложения: точка в них не
+        # граница, и «site.ru/page» иначе распадался бы на слова.
+        for предложение in _ГРАНИЦА_СОЧЕТАНИЯ.split(_МУСОР.sub(" ", str(кусок or ""))):
+            значимые = _значимые(предложение)
+            for i in range(len(значимые) - size + 1):
+                окно = значимые[i:i + size]
+                ключ = tuple(о for о, _ in окно)
+                счётчик[ключ] += 1
+                показ.setdefault(ключ, " ".join(с for _, с in окно))
     return [{"phrase": показ[к], "count": n}
             for к, n in счётчик.most_common(limit) if n > 1]

@@ -222,12 +222,44 @@ log = get_logger("insights")
      "hint": "«секундочку», «договорчик»: в деловом разговоре звучат снисходительно"},
     {"key": "nps", "title": "NPS разговора", "unit": "0–10", "good": 1,
      "digits": 1,
-     "hint": "названный клиентом балл, а где его не спрашивали — предсказанный"},
+     "hint": "предсказанный балл: настроение клиента к концу, усилие и напряжение; "
+             "названный клиентом — отдельным числом"},
     {"key": "nps_index", "title": "Индекс NPS", "unit": "от −100 до +100",
      "good": 1, "digits": 0,
-     "hint": "доля промоутеров минус доля критиков (Райхельд)"},
+     "hint": "доля промоутеров минус доля критиков по предсказанным баллам (Райхельд)"},
+    {"key": "nps_stated_avg", "title": "Названный балл NPS", "unit": "0–10",
+     "good": 1, "digits": 1,
+     "hint": "средний балл, который клиенты назвали вслух по шкале от нуля до десяти"},
+    {"key": "csat_avg", "title": "Оценка по пятибалльной шкале", "unit": "1–5",
+     "good": 1, "digits": 2,
+     "hint": "средняя оценка, названная клиентами на вопрос по пятибалльной шкале"},
 ]
 ПРИЗНАКИ_ПО_КЛЮЧУ = {п["key"]: п for п in ПРИЗНАКИ}
+
+
+def _секунды(значение: float) -> str:
+    """Порог в секундах для подписи: «3», «2,5» — как пишут люди."""
+    return f"{float(значение):g}".replace(".", ",")
+
+
+def признаки_для(settings: Any) -> list[dict[str, Any]]:
+    """Описания признаков с порогами, которые действуют на этом сервере.
+
+    «Сумма пауз от 3 с» было зашито в подписи, а сам порог — настройка
+    `content_dead_air_s`: сервер, где его подняли до пяти, показывал рядом
+    с числом неверное объяснение, откуда оно взялось.
+    """
+    from .content.speech import Пороги  # noqa: PLC0415
+
+    пороги = Пороги.из_настроек(settings)
+    подписи = {
+        "dead_air_s": (f"сумма пауз от {_секунды(пороги.тишина)} с "
+                       "(у NICE и Amazon Contact Lens порог 3 с)"),
+        "reply_delay_s": (f"ориентир 0,6–1,0 с (Gong); паузы от "
+                          f"{_секунды(пороги.пауза)} с считаются тишиной"),
+    }
+    return [{**п, "hint": подписи[п["key"]]} if п["key"] in подписи else dict(п)
+            for п in ПРИЗНАКИ]
 
 #: Пары для проверки связи — перечислены руками. Автоматический перебор всех
 #: пар из дюжины признаков даёт шестьдесят шесть коэффициентов, из которых
@@ -636,6 +668,12 @@ class Insights:
             "nps_stated_index": _индекс_nps(строка.get("promoters_stated"),
                                             строка.get("detractors_stated"),
                                             строка.get("nps_stated_count")),
+            "promoters_stated": int(строка.get("promoters_stated") or 0),
+            "passives_stated": int(строка.get("passives_stated") or 0),
+            "detractors_stated": int(строка.get("detractors_stated") or 0),
+            # Оценка по пятибалльной шкале — не NPS и в индекс не входит.
+            "csat_count": int(строка.get("csat_count") or 0),
+            "csat_avg": _округлить(строка.get("csat_avg"), 2),
         }
         for признак in ПРИЗНАКИ:
             ключ = признак["key"]
@@ -677,7 +715,8 @@ class Insights:
         else:
             запас = limit + 50
         строки = self.db.content_aggregate(
-            since=начало, owner=owner, group_by=dimension, limit=запас)
+            since=начало, owner=owner, group_by=dimension, limit=запас,
+            weights=bool(описание.get("multi")))
         группы = (self._развернуть_метки(строки) if описание.get("multi")
                   else [(str(с.get("group_key")), с) for с in строки])
         подписи = self._подписи_категорий() if dimension == "category" else {}
@@ -737,8 +776,18 @@ class Insights:
                         # считается по непустым значениям: сочетание из ста
                         # записей, где тональность измерена у пяти, весило
                         # как сто — и метка с сотней неразобранных записей
-                        # перебивала метку с двадцатью разобранными.
-                        вес = float(строка.get(_ВЕС_СРЕДНЕГО.get(имя, "records")) or 0) or n
+                        # перебивала метку с двадцатью разобранными. Число
+                        # берётся из самой базы (`_n_<имя>` — COUNT по тому
+                        # же выражению): таблица соответствий покрывала
+                        # не все средние, и доля речи, монолог, пауза перед
+                        # ответом, темп, скрипт и настроение взвешивались
+                        # по всем записям.
+                        вес = строка.get(f"_n_{имя}")
+                        if вес is None:
+                            вес = float(строка.get(_ВЕС_СРЕДНЕГО.get(имя, "records")) or 0) or n
+                        вес = float(вес)
+                        if not вес:
+                            continue
                         цель[имя] = цель.get(имя, 0.0) + float(значение) * вес
                         цель[f"_{имя}_вес"] = цель.get(f"_{имя}_вес", 0.0) + вес
                     elif имя == "money_max":
@@ -825,6 +874,10 @@ class Insights:
                 "nps": _округлить(с.get("nps"), 1),
                 "nps_index": _индекс_nps(с.get("promoters"), с.get("detractors"),
                                          с.get("nps_checked")),
+                # Названный клиентом балл — своим рядом: на одной оси с
+                # предсказанным его видно, а сложенный с ним он пропадает.
+                "nps_said": _округлить(с.get("nps_said"), 1),
+                "nps_said_count": int(с.get("nps_said_count") or 0),
             })
         return {"buckets": точки, "step_s": round(шаг, 1),
                 "from": round(начало, 1), "to": round(конец, 1)}
@@ -858,37 +911,38 @@ class Insights:
         Сравниваются доли, а не количества: если записей за неделю стало
         вдвое больше, чаще станут встречаться все темы разом, и список
         «что изменилось» превратится в список «о чём вообще говорят».
+
+        Считаются все основы обоих окон, а не верхушка текущего: тема,
+        которой на этой неделе не стало совсем (сбой починили, акция
+        кончилась), в верхушку текущего окна не попадает никогда, а «стало
+        звучать реже» — ровно про неё. Порог в три записи на оба окна
+        отсекает опечатки распознавания.
         """
         начало, прошлое = self.window(period)
         if начало is None:
             # «За всё время» сравнивать не с чем: предыдущего окна нет.
             return []
-        сейчас = self.db.top_terms(since=начало, owner=owner, limit=limit * 6)
-        # Прошлое окно спрашиваем точечно по основам текущего, а не его
-        # верхушкой. Верхушкой было неверно: основ в корпусе тысячи, в срез
-        # попадает верхушка, и отсутствие основы в срезе трактовалось как
-        # ноль употреблений. Список «стало звучать чаще» из-за этого
-        # состоял из тем, которые не менялись вовсе, — сортировка по
-        # величине изменения выносила выдуманные скачки в самое начало.
-        раньше = {т["stem"]: т for т in self.db.top_terms(
-            since=прошлое, until=начало, owner=owner,
-            stems=[т["stem"] for т in сейчас], min_records=0)}
         n_сейчас = self.db.content_window_size(since=начало, owner=owner)
         n_раньше = self.db.content_window_size(
             since=прошлое, until=начало, owner=owner)
         if not n_сейчас or not n_раньше:
             return []
+        # Оба окна — одним запросом, по всем основам, с порядком по модулю
+        # изменения доли в самой базе. Верхушками окон было неверно дважды:
+        # прошлое окно, спрошенное перечнем основ, срезалось пределом, и
+        # «было» становилось нулём; а тема, которой не стало, в верхушку
+        # текущего окна не попадала вовсе.
         out = []
-        for тема in сейчас:
-            было = раньше.get(тема["stem"], {}).get("records", 0)
-            доля = _процент(тема["records"], n_сейчас)
-            доля_было = _процент(было, n_раньше)
-            out.append({"stem": тема["stem"], "word": тема["word"],
-                        "now": тема["records"], "before": было,
+        for т in self.db.term_shift(since=начало, before_since=прошлое, owner=owner,
+                                    size_now=n_сейчас, size_before=n_раньше,
+                                    min_records=МИН_НОВОГО, limit=limit):
+            доля = _процент(т["now"], n_сейчас)
+            доля_было = _процент(т["before"], n_раньше)
+            out.append({"stem": т["stem"], "word": т["word"],
+                        "now": т["now"], "before": т["before"],
                         "share_now": доля, "share_before": доля_было,
                         "delta": round(доля - доля_было, 1)})
-        out.sort(key=lambda т: -abs(т["delta"]))
-        return out[:limit]
+        return out
 
     def new_topics(self, period: str = "week",
                    owner: str | list[str] | None = None,
@@ -899,11 +953,29 @@ class Insights:
         Miner: новая модель, новая акция, новый сбой называются словом,
         которого раньше в разговорах не звучало. Порог в три записи
         отсекает опечатки распознавания: слово из одной записи — шум.
+
+        Ищется своим запросом (`Database.new_terms`), а не фильтром по
+        верхушке тренда: настоящее новое слово редкое по определению и в
+        верхушку по числу записей не попадает.
         """
-        строки = self.topic_trend(period, owner, limit=max(limit * 8, 80))
-        новые = [т for т in строки if т["before"] == 0 and т["now"] >= МИН_НОВОГО]
-        новые.sort(key=lambda т: -т["now"])
-        return новые[:limit]
+        начало, прошлое = self.window(period)
+        if начало is None:
+            return []
+        n_сейчас = self.db.content_window_size(since=начало, owner=owner)
+        n_раньше = self.db.content_window_size(
+            since=прошлое, until=начало, owner=owner)
+        if not n_сейчас or not n_раньше:
+            # Прошлое окно пустое — «нового» в нём не было бы ничего, и
+            # список состоял бы из всего словаря.
+            return []
+        новые = self.db.new_terms(since=начало, before_since=прошлое,
+                                  before_until=начало, owner=owner,
+                                  min_records=МИН_НОВОГО, limit=limit)
+        return [{"stem": т["stem"], "word": т["word"], "now": т["records"],
+                 "before": 0, "share_now": _процент(т["records"], n_сейчас),
+                 "share_before": 0.0,
+                 "delta": round(_процент(т["records"], n_сейчас) or 0.0, 1)}
+                for т in новые]
 
     # --- категории обращений ---------------------------------------------
 
@@ -1374,13 +1446,20 @@ class Insights:
         начало = self.window(period)[0]
         строки = self.db.coaching_queue(since=начало, owner=owner, agent=agent,
                                         limit=limit, include_done=include_done)
+        # Всего — настоящим счётом, а не длиной выдачи: при пятистах записях
+        # в очереди карточка оператора писала «20», и очередь выглядела
+        # разобранной.
+        всего = (len(строки) if len(строки) < limit else
+                 self.db.coaching_count(since=начало, owner=owner, agent=agent,
+                                        include_done=include_done))
         items = []
         for з in строки:
             items.append({**з, "reasons": self._причины(з),
                           "mark": ({"status": з.get("mark_status"), "note": з.get("mark_note"),
                                     "updated_at": з.get("mark_at")}
                                    if з.get("mark_status") else None)})
-        return {"period": period, "items": items, "total": len(items),
+        return {"period": period, "items": items, "total": всего,
+                "shown": len(items),
                 "reasons": [{"key": к, "title": п} for к, _, п in self.ПРИЧИНЫ_КОУЧИНГА]}
 
     def references(self, period: str = "week", owner: str | list[str] | None = None,
@@ -1600,9 +1679,13 @@ class Insights:
         тишина_с = свод.get("dead_air_s")
         длительность = свод.get("duration_s")
         if тишина_с and длительность and тишина_с / длительность >= 0.2:
+            from .content.speech import Пороги  # noqa: PLC0415
+
+            порог = Пороги.из_настроек(self.index.settings if self.index else None).тишина
             добавить("info",
                      f"Заметная тишина занимает {round(100 * тишина_с / длительность)}% "
-                     f"записи: в среднем {round(тишина_с)} с пауз от трёх секунд",
+                     f"записи: в среднем {round(тишина_с)} с пауз от "
+                     f"{_секунды(порог)} с",
                      metric="dead_air_s", value=тишина_с)
         смешанных = свод.get("mixed")
         if смешанных and свод.get("scored") and смешанных / свод["scored"] >= 0.15:
@@ -1754,10 +1837,12 @@ class Insights:
         if len(годные) >= 4 and среднее is not None:
             худший = min(годные, key=lambda ч: ч["sentiment"])
             if худший["sentiment"] <= среднее - 0.2:
+                # Два знака, как в выводе о группах: «−0,2123 против
+                # 0,1734» — точность, которой в словарной оценке нет.
                 добавить("info",
                          f"Тяжелее всего разговоры идут в {худший['label']}: "
-                         f"тональность {худший['sentiment']} против {среднее} "
-                         f"в среднем",
+                         f"тональность {round(худший['sentiment'], 2)} против "
+                         f"{round(среднее, 2)} в среднем",
                          metric="sentiment", value=худший["sentiment"],
                          group=худший["label"], dimension="hour")
 
@@ -1788,6 +1873,15 @@ class Insights:
         return out
 
     # --- полный отчёт -----------------------------------------------------
+
+    def _пороги(self) -> dict[str, float]:
+        """Пороги пауз, тишины и перебивания, по которым посчитан разбор."""
+        from .content.speech import Пороги  # noqa: PLC0415
+
+        пороги = Пороги.из_настроек(self.index.settings if self.index else None)
+        return {"pause_s": пороги.пауза, "long_pause_s": пороги.длинная,
+                "dead_air_s": пороги.тишина, "interruption_s": -пороги.перебивание,
+                "backchannel_s": пороги.поддакивание}
 
     def report(self, period: str = "week", owner: str | list[str] | None = None,
                *, dimensions: tuple[str, ...] = ("owner", "speaker", "tag", "category",
@@ -1837,7 +1931,8 @@ class Insights:
             "highlights": {k: self.records(k, period, owner, limit=10)
                            for k in ("negative", "downturn", "alerts",
                                      "open_commitments", "script")},
-            "features": ПРИЗНАКИ,
+            "features": признаки_для(self.index.settings if self.index else None),
+            "thresholds": self._пороги(),
             "kinds": self.kinds(),
             "dimensions": [{"key": k, "title": v["title"]}
                            for k, v in РАЗРЕЗЫ.items()],

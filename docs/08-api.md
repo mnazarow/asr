@@ -504,6 +504,16 @@ POST /api/content/recompute              пересчитать архив (ну
 GET  /api/content/export?format=xlsx     выгрузка отчёта файлом
 ```
 
+Что изменилось в ответах с версии 3.1.15:
+
+- в речевых характеристиках записи (`speech`) — `backchannels` и `backchannel_threshold_s`: поддакивания отдельно от перебиваний; паузы, тишина и наложение меряются от самого позднего конца речи, а не от предыдущей реплики;
+- в узле `indices.nps` — `score` всегда предсказанный балл (или `null`, когда оценивать не по чему), названный клиентом по шкале от нуля до десяти — `stated` и `stated_group`, по пятибалльной — `csat` и `csat_scale`, текст вопроса — `question`;
+- в своде (`summary`) `nps`, `nps_index`, `promoters`, `passives`, `detractors` — только по предсказанным; названные — `nps_stated_avg`, `nps_stated_count`, `nps_stated_index`, `promoters_stated`, `passives_stated`, `detractors_stated`; оценка из пяти — `csat_avg`, `csat_count`; в ряду (`timeline`) — `nps_said` и `nps_said_count`;
+- в разборе категорий (`categories`) — `violations_unsure`: нарушения без известной стороны, которые не штрафуют;
+- `POST /api/content/categories/check` возвращает `notes` — предупреждения (правило из одних `НЕ`);
+- очередь коучинга (`GET /api/content/coaching`) — `total` настоящим счётом и `shown` — сколько отдано;
+- отчёт `GET /api/content` несёт `thresholds` — пороги пауз, тишины, перебивания и поддакивания, по которым он посчитан.
+
 Отборы списка заданий (`GET /api/jobs?content=…`) — по содержанию (`negative`, `positive`, `downturn`, `recovered`, `alerts`, `open_commitments`, `interruptions`, `silence`, `script_failed`, `money`, `monologue`, `mixed`, `dead_air`, `frustrated`, `repeat`, `profanity`, `profanity_agent`), по здоровью распознавания (`suspect`, `hallucination`, `speakers_mismatch`), по звуку на входе (`bad_audio`, `noisy`, `clipped`) и по ответу языковой модели (`llm_unresolved`, `llm_actions`, `outcome:<исход>`, `reason:<причина>`); всё, кроме первой группы, работает и там, где разбор содержания выключен.
 
 Персональные данные — ключом администратора:

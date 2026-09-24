@@ -462,6 +462,29 @@ def normalize(категории: Any) -> list[dict[str, Any]]:
     return out
 
 
+def notes(категории: Any) -> list[str]:
+    """Предупреждения по набору — не ошибки: сохранить такой набор можно.
+
+    Правило из одних НЕ срабатывает там, где фраз нет, и совпадений у него
+    нет: «что нашли» оно не покажет, а в счёте даёт одно совпадение на
+    запись. Так и задумывают «не попрощался», но так же легко получить
+    категорию, которая горит на каждой короткой записи.
+
+    Принимает и сырой набор из настройки, и уже разобранный.
+    """
+    if not isinstance(категории, list):
+        return []
+    out: list[str] = []
+    for категория in compile(категории):
+        if категория.error or категория.tree is None:
+            continue
+        if not rules.positive(категория.tree):
+            out.append(f"«{категория.label}»: правило из одних НЕ — срабатывает там, "
+                       f"где фраз нет, считается одним совпадением на запись и «что "
+                       f"нашли» не покажет")
+    return out
+
+
 def validate(категории: Any) -> list[str]:
     """Ошибки набора — для проверки настройки при сохранении.
 
@@ -600,6 +623,14 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
                               "hits": [], "sides": True})
             continue
         номера, известна = _область(сегменты, категория, стороны)
+        if not номера:
+            # Искать негде: у стороны нет ни одной реплики. Правило из
+            # одних НЕ на пустом месте сработало бы всегда — и «не
+            # попрощался» доставался бы оператору, который вообще не говорил.
+            if everything:
+                items.append({**категория.to_dict(), "count": 0, "first_s": None,
+                              "hits": [], "sides": известна, "error": None})
+            continue
         куски = [сегменты[i] for i in номера]
         текст = rules.Text.of(куски)
         итог = rules.evaluate(категория.tree, текст)
@@ -624,9 +655,15 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
                     "matched": совпадение.text,
                     "text": str(реплика.get("text") or "").strip()[:200],
                 })
+        # Правило из одних НЕ совпадений не даёт: «не попрощался» — это
+        # отсутствие слов, а не слова. Сработавшее такое правило считается
+        # одним совпадением на запись, иначе категория не засчитывалась
+        # вовсе: ни нарушения, ни штрафа, ни строки в таблице совпадений,
+        # хотя пункт скрипта с тем же правилом был «выполнен».
+        сколько = len(итог.hits) or (1 if итог.matched else 0)
         items.append({
             "id": категория.id, "label": категория.label, "kind": категория.kind,
-            "who": категория.who, "count": len(итог.hits),
+            "who": категория.who, "count": сколько,
             "first_s": round(первое, 2) if первое is not None else None,
             "hits": примеры, "sides": известна, "penalty": категория.penalty,
             **({"error": None, "rule": категория.rule, "where": категория.where,
@@ -634,6 +671,12 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
         })
     сработали = [и["id"] for и in items if и.get("count")]
     штрафы = {к.id: к.penalty for к in набор if к.penalty}
+    # Нарушение, найденное в реплике неизвестно кого (говорящий один или не
+    # размечен), — не обвинение, а повод послушать: в число нарушений
+    # оператора и в штраф к его баллу оно не идёт. Иначе на моно-записи «не
+    # знаю» клиента снимало с оператора баллы и отправляло запись в коучинг
+    # как его нарушение.
+    доказано = [и for и in items if и.get("count") and и.get("sides", True)]
     return {"checked": len(набор), "errors": ошибок, "matched": сработали,
             "items": items,
             "objections": _возражения(сегменты, возражения, отработки, есть_отработка,
@@ -643,9 +686,13 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
             # одно нарушение, а не пять; сколько раз — видно по счёту.
             "violations": [{"id": и["id"], "label": и["label"], "count": и["count"],
                             "penalty": штрафы.get(и["id"], 0.0)}
-                           for и in items if и.get("count") and и["kind"] == "violation"],
-            "penalty_total": sum(штрафы.get(и["id"], 0.0)
-                                 for и in items if и.get("count"))}
+                           for и in доказано if и["kind"] == "violation"],
+            # Те же нарушения, но без известной стороны: показываются в
+            # карточке записи с пометкой, в балл и в счёт не входят.
+            "violations_unsure": [{"id": и["id"], "label": и["label"], "count": и["count"]}
+                                  for и in items if и.get("count") and not и.get("sides", True)
+                                  and и["kind"] == "violation"],
+            "penalty_total": sum(штрафы.get(и["id"], 0.0) for и in доказано)}
 
 
 #: В скольких следующих репликах ждать отработки возражения. Три — это

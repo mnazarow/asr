@@ -1593,6 +1593,9 @@ def create_text_job(request: Request, данные: dict[str, Any] = Body(...),
         "finished_at": time.time(),
         "params": {"channel": разобрано["channel"],
                    "external_id": str(данные.get("external_id") or ""),
+                   # Кто здесь оператор — чтобы пересчёт и проверка скрипта
+                   # взяли ту же сторону, что и разбор при приёме.
+                   **({"agent": разобрано["agent"]} if разобрано["agent"] else {}),
                    **({"crm_entity_id": str(данные["crm_entity_id"])}
                       if данные.get("crm_entity_id") else {})},
     })

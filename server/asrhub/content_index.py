@@ -95,6 +95,27 @@ class ContentIndex:
                         if self.settings else "") or "").strip()
         return значение or None
 
+    def оператор_записи(self, задание: dict[str, Any] | None,
+                        реплики: list[dict[str, Any]]) -> str | None:
+        """Кто оператор в этой записи — одним правилом для всех путей разбора.
+
+        У звонка — метка из настройки (или «кто заговорил первым», если она
+        пуста). У переписки — сторона, которую назвали при приёме или которую
+        видно из подписей: настройка рассчитана на диаризацию с её
+        «SPEAKER_00» и к чату отношения не имеет. Раньше оператор переписки
+        определялся только при приёме: «Пересчитать», разбор архива и
+        проверка скрипта в редакторе брали настройку, и в чате, где первым
+        пишет клиент, скрипт и балл оператора считались по клиенту.
+        """
+        if str((задание or {}).get("source") or "") != "text":
+            return self._оператор()
+        from . import textchat  # noqa: PLC0415
+
+        параметры = (задание or {}).get("params") or {}
+        подсказка = str((параметры.get("agent") if isinstance(параметры, dict) else "")
+                        or self._оператор() or "")
+        return textchat.оператор_среди(реплики, подсказка) or None
+
     @property
     def enabled(self) -> bool:
         return bool(self.settings.get("content_analysis", True)) if self.settings else True
@@ -166,7 +187,7 @@ class ContentIndex:
             text=текст, segments=реплики,
             duration_s=float(задание.get("media_duration_s") or 0.0),
             script=self._скрипт(),
-            agent_speaker=agent_speaker or self._оператор(),
+            agent_speaker=agent_speaker or self.оператор_записи(задание, реплики),
             document_frequency=частоты, corpus_size=размер,
             profanity=self._мат(), categories=self.categories(),
             thresholds=self._пороги(),
@@ -186,7 +207,7 @@ class ContentIndex:
             # смены ожидаемого числа говорящих иначе пришлось бы ждать
             # фонового разбора, который эту запись уже прошёл.
             try:
-                self._оценить_качество(job_id, реплики)
+                self._оценить_качество(job_id, реплики, задание)
             except Exception as exc:                         # noqa: BLE001
                 log.warning("Признаки качества для %s не пересчитаны: %s",
                             job_id, exc, extra={"job_id": job_id})
@@ -289,10 +310,23 @@ class ContentIndex:
         for событие in события:
             send_json({"event": "tracker", **событие}, адрес, what="трекер")
 
-    def _оценить_качество(self, job_id: str, реплики: list[dict[str, Any]]) -> None:
-        """Признаки подозрительной расшифровки — по уже поднятым сегментам."""
+    def _оценить_качество(self, job_id: str, реплики: list[dict[str, Any]],
+                          задание: dict[str, Any] | None = None) -> None:
+        """Признаки подозрительной расшифровки — по уже поднятым сегментам.
+
+        Переписку не оценивает: распознавания в ней не было, а у реплик нет
+        длительности, и любая переписка от шести сообщений получала признак
+        «осколки разметки говорящих» — попадала в отбор «подозрительная
+        расшифровка», в тренд и в метрику по модели «переписка:chat» с
+        долей 1,0. Прежние такие отметки здесь же снимаются.
+        """
         from . import quality  # noqa: PLC0415
 
+        if str((задание or {}).get("source") or "") == "text":
+            if (задание or {}).get("quality_flags") is not None:
+                self.db.update_job(job_id, suspect_segments=None, suspect_share=None,
+                                   quality_flags=None, quality_detail=None)
+            return
         ожидается = int(self.settings.get("quality_expected_speakers") or 0) \
             if self.settings else 0
         оценка = quality.assess(реплики, expected_speakers=ожидается)
@@ -317,11 +351,16 @@ class ContentIndex:
             job_id = str(запись["id"])
             try:
                 реплики = self.db.get_segments(job_id)
+                переписка = str(запись.get("source") or "") == "text"
+                # У переписки оператор — своя сторона чата, а не метка из
+                # настройки; параметры задания поднимаются только ради неё.
+                кто = (self.оператор_записи(self.db.get_job(job_id) or запись, реплики)
+                       if переписка else оператор)
                 разбор = content.analyze(
                     text=str(запись.get("text") or ""),
                     segments=реплики,
                     duration_s=float(запись.get("media_duration_s") or 0.0),
-                    script=скрипт, agent_speaker=оператор,
+                    script=скрипт, agent_speaker=кто,
                     document_frequency=частоты, corpus_size=корпус,
                     profanity=мат, categories=набор, thresholds=пороги,
                     timed=str(запись.get("source") or "") != "text",
@@ -331,8 +370,8 @@ class ContentIndex:
                 # Здоровье распознавания у записей, сделанных до его
                 # появления: те же сегменты уже подняты, второй раз ходить
                 # за ними незачем.
-                if запись.get("quality_flags") is None:
-                    self._оценить_качество(job_id, реплики)
+                if запись.get("quality_flags") is None or переписка:
+                    self._оценить_качество(job_id, реплики, запись)
                 сделано += 1
             except Exception as exc:                         # noqa: BLE001
                 # Одна битая запись не должна останавливать разбор архива.

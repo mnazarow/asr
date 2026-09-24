@@ -27,7 +27,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -132,6 +132,12 @@ _CONTENT_SCHEMA = """
         nps               INTEGER,
         nps_group         TEXT,
         nps_stated        INTEGER,
+        -- Версия 28: названный клиентом балл — отдельно от предсказанного
+        -- `nps`. `nps_said` — по шкале от нуля до десяти, `csat_said` — по
+        -- пятибалльной: пятёрка из пяти и пятёрка из десяти — противоположные
+        -- оценки, и в одной колонке их не различить.
+        nps_said          INTEGER,
+        csat_said         INTEGER,
         -- Подробности: сам разбор целиком, как его показывает карточка.
         detail            TEXT
     )
@@ -1050,6 +1056,8 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "nps": "INTEGER",
         "nps_group": "TEXT",
         "nps_stated": "INTEGER",
+        "nps_said": "INTEGER",
+        "csat_said": "INTEGER",
         "detail": "TEXT",
     },
     "content_marks": {
@@ -1451,6 +1459,9 @@ class Database:
                     self._починка_ключей_звонков(conn)
                 if current < 26:
                     self._вычистить_секреты_заданий(conn)
+                if current < 28:
+                    self._разделить_названный_nps(conn)
+                    self._снять_качество_с_переписки(conn)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:
@@ -1543,6 +1554,40 @@ class Database:
             return
         if вычищено:
             log.info("Миграция: из параметров %s заданий убраны секреты сервера", вычищено)
+
+    def _разделить_названный_nps(self, conn: sqlite3.Connection) -> None:
+        """Названный клиентом балл — в свою колонку, из предсказанного — вон.
+
+        До версии 28 в `nps` лежал названный балл, если клиент его назвал, и
+        предсказанный — если нет, а индекс NPS складывал их вместе. Теперь
+        `nps` — только предсказанный. Прежний названный переезжает в
+        `nps_said`, а предсказанного у таких записей пока нет: его посчитает
+        пересчёт разбора (версия разбора тоже поднята). Держать названный
+        балл в колонке предсказанного до пересчёта значило бы продолжать
+        складывать одно с другим.
+        """
+        перенесено = conn.execute(
+            "UPDATE content SET nps_said = nps, nps = NULL, nps_group = NULL "
+            "WHERE nps_stated = 1 AND nps IS NOT NULL").rowcount
+        if перенесено:
+            log.info("Миграция: названный клиентом балл NPS перенесён в свою "
+                     "колонку у %s записей", перенесено)
+
+    def _снять_качество_с_переписки(self, conn: sqlite3.Connection) -> None:
+        """Снимает признаки «подозрительной расшифровки» с переписки.
+
+        Распознавания у переписки не было, а у её реплик нет длительности:
+        любая переписка от шести сообщений получала «осколки разметки
+        говорящих» и попадала в отбор подозрительных, в тренд и в метрику по
+        модели «переписка:chat» с долей 1,0.
+        """
+        снято = conn.execute(
+            "UPDATE jobs SET suspect_segments = NULL, suspect_share = NULL, "
+            "quality_flags = NULL, quality_detail = NULL "
+            "WHERE source = 'text' AND quality_flags IS NOT NULL").rowcount
+        if снято:
+            log.info("Миграция: признаки качества распознавания сняты с %s "
+                     "переписок", снято)
 
     def _setup_fts(self) -> None:
         """Заводит полнотекстовый указатель — если сборка SQLite его умеет.
@@ -2167,7 +2212,8 @@ class Database:
         "objections_unhandled, violations, agent_score, empathy, name_uses, "
         "mood, mood_shift, intensity, stress, effort, fatigue, clarity, "
         "accuracy, politeness, personalization, rhythm, filler_top, "
-        "diminutives, diminutive_rate, nps, nps_group, nps_stated"
+        "diminutives, diminutive_rate, nps, nps_group, nps_stated, nps_said, "
+        "csat_said"
     )
 
     def save_content(self, job_id: str, features: dict[str, Any],
@@ -2456,20 +2502,23 @@ class Database:
         ("diminutive_records",
          "SUM(CASE WHEN COALESCE(c.diminutives,0) > 0 THEN 1 ELSE 0 END)"),
         ("diminutive_rate", "AVG(c.diminutive_rate)"),
-        # NPS: названный клиентом и предсказанный считаются раздельно.
-        # Смешать их — значит объявить настоящим то, что сервер угадал.
+        # NPS: предсказанный и названный клиентом — разными колонками и
+        # разными числами. Смешать их — значит объявить настоящим то, что
+        # сервер угадал. `nps` и группы — только предсказанный балл,
+        # `*_stated` — только названный по шкале от нуля до десяти.
         ("nps", "AVG(c.nps)"),
-        ("nps_stated_avg",
-         "AVG(CASE WHEN c.nps_stated = 1 THEN c.nps END)"),
-        ("nps_stated_count", "SUM(CASE WHEN c.nps_stated = 1 THEN 1 ELSE 0 END)"),
+        ("nps_stated_avg", "AVG(c.nps_said)"),
+        ("nps_stated_count", "SUM(CASE WHEN c.nps_said IS NOT NULL THEN 1 ELSE 0 END)"),
         ("nps_checked", "SUM(CASE WHEN c.nps IS NOT NULL THEN 1 ELSE 0 END)"),
         ("promoters", "SUM(CASE WHEN c.nps_group = 'промоутер' THEN 1 ELSE 0 END)"),
         ("passives", "SUM(CASE WHEN c.nps_group = 'нейтрал' THEN 1 ELSE 0 END)"),
         ("detractors", "SUM(CASE WHEN c.nps_group = 'критик' THEN 1 ELSE 0 END)"),
-        ("promoters_stated",
-         "SUM(CASE WHEN c.nps_stated = 1 AND c.nps_group = 'промоутер' THEN 1 ELSE 0 END)"),
-        ("detractors_stated",
-         "SUM(CASE WHEN c.nps_stated = 1 AND c.nps_group = 'критик' THEN 1 ELSE 0 END)"),
+        ("promoters_stated", "SUM(CASE WHEN c.nps_said >= 9 THEN 1 ELSE 0 END)"),
+        ("passives_stated", "SUM(CASE WHEN c.nps_said IN (7, 8) THEN 1 ELSE 0 END)"),
+        ("detractors_stated", "SUM(CASE WHEN c.nps_said <= 6 THEN 1 ELSE 0 END)"),
+        # Оценка по пятибалльной шкале — не NPS: пятёрка здесь высшая оценка.
+        ("csat_avg", "AVG(c.csat_said)"),
+        ("csat_count", "SUM(CASE WHEN c.csat_said IS NOT NULL THEN 1 ELSE 0 END)"),
     )
 
     #: Как группировать свод. Значение — выражение SQL; None — без
@@ -2631,12 +2680,18 @@ class Database:
                           owner: str | list[str] | None = None,
                           group_by: str | None = None,
                           limit: int = 200,
-                          agent: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+                          agent: tuple[str, str] | None = None,
+                          weights: bool = False) -> list[dict[str, Any]]:
         """Свод по разобранным записям — целиком или по группам.
 
         Возвращает список строк; без группировки — ровно одну. Пустой корпус
         тоже даёт строку, с нулями и None: разделу нужно показать «записей
         нет», а не свалиться на отсутствующем ключе.
+
+        `weights` — к каждому среднему добавить `_n_<имя>`: по скольким
+        записям оно посчитано. Нужно тому, кто складывает средние групп
+        сам (разрез по меткам): вес «всех записей группы» завышал вклад
+        групп, где показатель измерен у малой части.
         """
         # Категория — не колонка записи, а строки таблицы совпадений:
         # запись про оплату и доставку входит в обе группы, и разрез по
@@ -2650,6 +2705,14 @@ class Database:
             if group_by and выражение is None:
                 return []
         показатели = ", ".join(f"{выр} AS {имя}" for имя, выр in self.CONTENT_METRICS)
+        if weights:
+            # COUNT по тому же выражению, что и AVG, — ровно то число
+            # значений, по которому AVG посчитан: NULL не входит ни туда, ни
+            # сюда.
+            показатели += "".join(
+                f", COUNT({выр[4:-1]}) AS _n_{имя}"
+                for имя, выр in self.CONTENT_METRICS
+                if выр.startswith("AVG(") and выр.endswith(")"))
         условие, args = self._content_where(since, until, owner, agent=agent)
         начало = f"SELECT {выражение} AS group_key, " if выражение else "SELECT "
         хвост = (f" GROUP BY group_key ORDER BY records DESC LIMIT {int(limit)}"
@@ -2991,6 +3054,26 @@ class Database:
             [*args, limit])
         return [dict(r) for r in rows]
 
+    def coaching_count(self, *, since: float | None = None,
+                       until: float | None = None,
+                       owner: str | list[str] | None = None,
+                       agent: tuple[str, str] | None = None,
+                       include_done: bool = False) -> int:
+        """Сколько записей в очереди коучинга всего — без предела выдачи.
+
+        Число в заголовке очереди раньше было длиной выданного списка: при
+        пятистах записях в очереди карточка оператора писала «20», и
+        очередь выглядела разобранной.
+        """
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        причины = " OR ".join(f"({выр})" for _, выр in self.COACHING_REASONS)
+        готово = "" if include_done else " AND COALESCE(m.status,'') <> 'done'"
+        row = self.query_one(
+            "SELECT COUNT(*) AS n FROM content c JOIN jobs j ON j.id = c.job_id "
+            "LEFT JOIN content_marks m ON m.job_id = c.job_id AND m.kind = 'coaching' "
+            f"WHERE {условие} AND ({причины}){готово}", args)
+        return int(row["n"]) if row else 0
+
     def reference_records(self, *, since: float | None = None,
                           until: float | None = None,
                           owner: str | list[str] | None = None,
@@ -3114,7 +3197,11 @@ class Database:
             "       AVG(c.filler_rate) AS filler_rate, AVG(c.nps) AS nps, "
             "       SUM(CASE WHEN c.nps_group = 'промоутер' THEN 1 ELSE 0 END) AS promoters, "
             "       SUM(CASE WHEN c.nps_group = 'критик' THEN 1 ELSE 0 END) AS detractors, "
-            "       SUM(CASE WHEN c.nps IS NOT NULL THEN 1 ELSE 0 END) AS nps_checked "
+            "       SUM(CASE WHEN c.nps IS NOT NULL THEN 1 ELSE 0 END) AS nps_checked, "
+            # Названный балл — своим рядом: на одной оси с предсказанным его
+            # видно, а сложенный с ним он пропадает.
+            "       AVG(c.nps_said) AS nps_said, "
+            "       SUM(CASE WHEN c.nps_said IS NOT NULL THEN 1 ELSE 0 END) AS nps_said_count "
             "FROM content c JOIN jobs j ON j.id = c.job_id "
             f"WHERE {условие} GROUP BY bucket ORDER BY bucket",
             [since, шаг, *args])
@@ -3258,6 +3345,13 @@ class Database:
         # встретившейся ноль раз — то есть новой.
         if stems is not None and not stems:
             return []
+        if stems is not None:
+            # Перечень основ сам задаёт размер ответа. Предел по умолчанию
+            # (60) молча срезал его: из девяноста запрошенных основ прошлого
+            # окна возвращались шестьдесят, остальные считались «было 0», и
+            # сортировка по величине изменения выносила наверх именно их —
+            # «что изменилось» целиком состояло из выдуманных скачков.
+            limit = max(int(limit or 0), len(stems))
         нужен_join = bool(since or until or owner)
         отбор = ""
         отбор_args: list[Any] = []
@@ -3285,6 +3379,75 @@ class Database:
             "GROUP BY t.stem HAVING records >= ? "
             "ORDER BY records DESC, mentions DESC LIMIT ?",
             [*args, min_records, limit])
+        формы = self.term_words([str(r["stem"]) for r in rows])
+        return [{"stem": r["stem"], "word": формы.get(str(r["stem"]), r["stem"]),
+                 "records": int(r["records"]), "mentions": int(r["mentions"] or 0)}
+                for r in rows]
+
+    def term_shift(self, *, since: float, before_since: float,
+                   owner: str | list[str] | None = None,
+                   size_now: int, size_before: int,
+                   min_records: int = 3, limit: int = 15) -> list[dict[str, Any]]:
+        """Основы, доля которых сильнее всего изменилась между двумя окнами.
+
+        Окна смежные: прошлое — от `before_since` до `since`, текущее — от
+        `since`. Оба считаются одним проходом с условной суммой, и порядок —
+        по модулю изменения доли прямо в базе, по ВСЕМ основам обоих окон.
+        Прежний способ брал кандидатов из верхушек окон по числу записей, и
+        тема, которой не стало совсем (сбой починили, акция кончилась), в
+        кандидаты не попадала: в верхушке текущего окна её нет, а в верхушке
+        прошлого ей мешали темы почаще — хотя её изменение самое большое.
+
+        `size_now` и `size_before` — число разобранных записей в окнах: доля
+        считается от них, как и в своде тем.
+        """
+        if not size_now or not size_before:
+            return []
+        условие, args = self._content_where(before_since, None, owner)
+        rows = self.query(
+            "SELECT t.stem AS stem, "
+            "       SUM(CASE WHEN j.created_at >= ? THEN 1 ELSE 0 END) AS now, "
+            "       SUM(CASE WHEN j.created_at < ? THEN 1 ELSE 0 END) AS before "
+            "FROM content_terms t JOIN jobs j ON j.id = t.job_id "
+            f"WHERE {условие} "
+            "GROUP BY t.stem HAVING now + before >= ? "
+            "ORDER BY ABS(now * ? - before * ?) DESC, now + before DESC, t.stem "
+            "LIMIT ?",
+            [since, since, *args, int(min_records),
+             100.0 / size_now, 100.0 / size_before, int(limit)])
+        формы = self.term_words([str(r["stem"]) for r in rows])
+        return [{"stem": r["stem"], "word": формы.get(str(r["stem"]), r["stem"]),
+                 "now": int(r["now"] or 0), "before": int(r["before"] or 0)}
+                for r in rows]
+
+    def new_terms(self, *, since: float, until: float | None = None,
+                  before_since: float | None, before_until: float,
+                  owner: str | list[str] | None = None,
+                  min_records: int = 3, limit: int = 15) -> list[dict[str, Any]]:
+        """Основы окна, которых в прошлом окне не было ни в одной записи.
+
+        Отдельный запрос, а не фильтр по верхушке тренда. Раньше новые слова
+        искались среди первых сотен основ по числу записей, потом среди
+        первых сотни по величине изменения — и только после этого
+        отбрасывалось всё, что звучало раньше. Настоящее новое слово редкое по
+        определению: «мегаакция» в трёх записях стояла 676-й из 677 и до
+        фильтра не доживала никогда, а список пустел.
+
+        Прошлое окно сворачивается в набор основ один раз (`NOT IN` по
+        подзапросу без связи с внешним — SQLite строит по нему временный
+        указатель), так что стоимость — два прохода по окнам, как у тренда.
+        """
+        условие, args = self._content_where(since, until, owner)
+        условие_было, args_было = self._content_where(before_since, before_until, owner)
+        rows = self.query(
+            "SELECT t.stem AS stem, COUNT(*) AS records, SUM(t.n) AS mentions "
+            "FROM content_terms t JOIN jobs j ON j.id = t.job_id "
+            f"WHERE {условие} AND t.stem NOT IN ("
+            "  SELECT t2.stem FROM content_terms t2 JOIN jobs j ON j.id = t2.job_id "
+            f"  WHERE {условие_было}) "
+            "GROUP BY t.stem HAVING records >= ? "
+            "ORDER BY records DESC, mentions DESC LIMIT ?",
+            [*args, *args_было, int(min_records), int(limit)])
         формы = self.term_words([str(r["stem"]) for r in rows])
         return [{"stem": r["stem"], "word": формы.get(str(r["stem"]), r["stem"]),
                  "records": int(r["records"]), "mentions": int(r["mentions"] or 0)}

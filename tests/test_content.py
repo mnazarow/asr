@@ -1832,6 +1832,11 @@ def test_new_words_of_the_period_are_those_the_previous_period_never_heard(tmp_p
                      (3, "опечатка"), (4, "опечатка")):
         db.execute("UPDATE jobs SET text = text || ? , created_at=? WHERE id=?",
                    (f" {слово} {слово}", сейчас - n * 60, f"job{n:04d}"))
+        # Разбор читает реплики, а не текст задания (в том — подписи
+        # говорящих), поэтому слово дописывается и в последнюю реплику.
+        реплики = db.get_segments(f"job{n:04d}")
+        реплики[-1]["text"] = f"{реплики[-1]['text']} {слово} {слово}"
+        db.save_segments(f"job{n:04d}", реплики)
     # Остальные — в прошлую неделю, чтобы окна «неделя» и «прошлая неделя»
     # были непустыми.
     db.execute("UPDATE jobs SET created_at = ? - 8*86400 - (CAST(substr(id, 4) AS INTEGER) * 60) "

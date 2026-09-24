@@ -248,7 +248,10 @@ class Analytics:
                 cell["words"] = int(cell["words"]) + int(job.get("words_count") or 0)
                 if job.get("rtf"):
                     cell["rtf"].append(float(job["rtf"]))             # type: ignore[union-attr]
-                if job.get("queue_time_s"):
+                # `is not None`, а не «истинно»: ноль — законное ожидание
+                # (задание из кеша, пустая очередь), и выброшенные нули
+                # завышали среднее ряда против сводки и трендов.
+                if job.get("queue_time_s") is not None:
                     cell["queue"].append(float(job["queue_time_s"]))  # type: ignore[union-attr]
             elif job["status"] == "failed":
                 cell["failed"] = int(cell["failed"]) + 1              # type: ignore[assignment]
@@ -1586,7 +1589,7 @@ class Analytics:
         ("content_reply_delay_avg", "reply_delay_s",
          "Пауза оператора перед ответом, секунд"),
         ("content_dead_air_avg", "dead_air_s",
-         "Заметная тишина (паузы от 3 с), секунд на запись"),
+         "Заметная тишина (паузы от порога content_dead_air_s), секунд на запись"),
         ("content_objections_unhandled_share", "objections_unhandled_share",
          "Доля возражений клиента без отработки, процентов"),
         ("content_agent_score_avg", "agent_score",
@@ -1636,13 +1639,17 @@ class Analytics:
         первая = True
         for к in категории.get("items") or []:
             if к.get("records") and к.get("share") is not None:
+                # Метки — через экранирование: имя категории задаёт человек, и
+                # кавычка в нём ломала весь снимок метрик, а не одну строку.
                 add("content_category_share", round(float(к["share"]) / 100.0, 4),
-                    f'category="{к["id"]}",kind="{к.get("kind")}"',
+                    f'category="{_escape_label(к["id"])}",'
+                    f'kind="{_escape_label(к.get("kind"))}"',
                     "Доля разобранных записей за сутки в категории обращения"
                     if первая else "")
                 первая = False
         первая = True
         for т in категории.get("trackers") or []:
-            add("content_tracker_hits", т.get("hits"), f'category="{т["category"]}"',
+            add("content_tracker_hits", т.get("hits"),
+                f'category="{_escape_label(т["category"])}"',
                 "Срабатываний трекера за сутки" if первая else "")
             первая = False

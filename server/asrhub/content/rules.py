@@ -390,6 +390,23 @@ def operands(дерево: Node) -> list[Phrase]:
     return [ф for р in дерево.children for ф in operands(р)]
 
 
+def positive(дерево: Node) -> bool:
+    """Может ли правило указать на слова записи — или оно из одних НЕ.
+
+    Правило «НЕ ("до свидания" ИЛИ "всего доброго")» срабатывает там, где
+    фраз нет, и совпадений у него нет по определению: показать «что нашли»
+    ему нечего. Категория с таким правилом считается сработавшей один раз
+    на запись — об этом редактор и предупреждает.
+    """
+    if isinstance(дерево, Phrase):
+        return True
+    if isinstance(дерево, Not):
+        return False
+    if isinstance(дерево, Near):
+        return positive(дерево.left) or positive(дерево.right)
+    return any(positive(р) for р in дерево.children)
+
+
 def describe(дерево: Node) -> str:
     """Правило обратно в строку — в каноническом виде, для показа."""
     if isinstance(дерево, Phrase):

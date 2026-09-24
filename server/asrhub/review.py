@@ -45,10 +45,18 @@ log = get_logger("review")
 ИСТОЧНИК_КОНТРОЛЯ = "control"
 
 
+#: Источники, которым ручная проверка распознавания не нужна: контрольный
+#: прогон — сам проверка, а у переписки распознавания не было вовсе —
+#: эталон и WER для неё бессмысленны, и место в дневном пределе она занимала
+#: зря.
+_НЕ_ПРОВЕРЯТЬ = frozenset({ИСТОЧНИК_КОНТРОЛЯ, "text"})
+
+
 def _кандидаты(db: Any, *, since: float) -> list[dict[str, Any]]:
-    """Завершённые за окно записи, посчитанные сервером самим и не контрольные."""
+    """Завершённые за окно записи, распознанные сервером самим: не из кеша,
+    не контрольные и не переписка."""
     return [j for j in db.list_jobs(status="completed", since=since, limit=100000, light=True)
-            if not j.get("cached_from") and str(j.get("source") or "") != ИСТОЧНИК_КОНТРОЛЯ]
+            if not j.get("cached_from") and str(j.get("source") or "") not in _НЕ_ПРОВЕРЯТЬ]
 
 
 def sample_review(db: Any, settings: Any, *, now: float | None = None,

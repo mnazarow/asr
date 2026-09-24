@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.14"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.15"
 # Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
 # пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
 # сменить каталог, и относительный путь указывал бы в никуда. Те же

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .content import categories as категории_модуль
-from .content import compliance
+from .content import compliance, rules
 from .logging_setup import get_logger
 
 log = get_logger("liveassist")
@@ -147,7 +147,12 @@ class Помощник:
         return len(метки - {""}) > 1
 
     def _разбор(self) -> dict[str, Any]:
-        категории = self.категории
+        # Правило из одних НЕ («не попрощался») судит об отсутствии слов, а
+        # отсутствие в идущем разговоре ещё ничего не значит: такая
+        # категория сработала бы на первой же реплике. Её место — в разборе
+        # записи после разговора, а не в подсказках по ходу.
+        категории = [к for к in self.категории
+                     if getattr(к, "tree", None) is None or rules.positive(к.tree)]
         if not self._клиент_слышен():
             категории = [к for к in категории
                          if getattr(к, "who", "") != "customer"

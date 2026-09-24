@@ -3552,6 +3552,9 @@ async function loadJobAnalysis(backdrop, job) {
   const возражения = категории.objections || { items: [], count: 0, unhandled: null };
   const балл = a.scorecard || {};
   const эмпатия = a.empathy || {};
+  const показатели = a.indices || {};
+  const пусто = (v) => v === null || v === undefined;
+  const сек = (v) => `${String(v).replace('.', ',')} с`;
 
   const реплика = (з, доп) => `<div class="analysis-line" data-start="${з.start_s || 0}">
     <span class="ts mono">${fmtDur(з.start_s || 0)}</span>
@@ -3584,9 +3587,13 @@ async function loadJobAnalysis(backdrop, job) {
               : `вежливых ${num(эмпатия.polite)}, невежливых ${num(эмпатия.impolite)}${
                   эмпатия.speaker ? ` — по репликам «${esc(эмпатия.speaker)}»` : ' — по всем репликам'}`)}
       ${kpi('Нарушения оператора', num((категории.violations || []).length),
-            (категории.violations || []).length
+            ((категории.violations || []).length
               ? (категории.violations || []).map((н) => `${esc(н.label)} ×${н.count}`).join(', ')
-              : 'стоп-слов и других нарушений не найдено')}
+              : 'стоп-слов и других нарушений не найдено')
+            + ((категории.violations_unsure || []).length
+              ? `<br><span class="faint" title="говорящий не определён: найдено в реплике неизвестно кого — повод послушать, в балл и в счёт не входит">без стороны: ${
+                  (категории.violations_unsure || []).map((н) => `${esc(н.label)} ×${н.count}`).join(', ')}</span>`
+              : ''))}
       ${kpi('Возражения', num(возражения.count || 0),
             возражения.unhandled === null || возражения.unhandled === undefined
               ? (возражения.count ? 'отработку считать нечем' : 'возражений клиента нет')
@@ -3596,6 +3603,67 @@ async function loadJobAnalysis(backdrop, job) {
     ${card('Ход тональности', 'форма разговора: упало и не поднялось, выправилось к концу, ровно',
            '<div id="analysis-traj"></div>')}
 
+    ${Object.keys(показатели).length ? card('Показатели разговора',
+      'то, чего не видно в одном числе тональности: настроение клиента, напряжение, усилие, NPS, понятность речи оператора',
+      (() => {
+        const н = показатели.mood || {};
+        const ст = показатели.stress || {};
+        const ус = показатели.effort || {};
+        const nps = показатели.nps || {};
+        const пон = показатели.clarity || {};
+        const точ = показатели.accuracy || {};
+        const веж = показатели.politeness || {};
+        const уст = показатели.fatigue || {};
+        const рит = показатели.rhythm || {};
+        const пер = показатели.personalization || {};
+        const пар = показатели.fillers || {};
+        const npsПодпись = [
+          пусто(nps.score) ? 'оценивать не по чему: клиент ровен, усилия и решения не видно'
+            : `предсказанный, ${esc(nps.group || '')}${nps.confidence ? `, уверенность ${num(nps.confidence, 2)}` : ''}`,
+          пусто(nps.stated) ? '' : `<b>клиент назвал ${num(nps.stated, 0)}</b> (${esc(nps.stated_group || '')})`,
+          пусто(nps.csat) ? '' : `<b>оценка из пяти: ${num(nps.csat, 0)}</b> — не NPS`,
+        ].filter(Boolean).join('<br>');
+        return `<div class="grid cols-4" style="padding:14px 16px">
+          ${kpi('Настроение клиента', пусто(н.score) ? '—' : num(н.score, 2),
+                `${esc(н.label || 'нет окрашенных реплик')}${н.recovered ? ' · к концу подобрел'
+                  : н.worsened ? ' · к концу испортилось' : ''}`)}
+          ${kpi('Напряжение', пусто(ст.index) ? '—' : num(ст.index, 0),
+                пусто(ст.index) ? 'слишком мало реплик'
+                  : `${esc(ст.level || '')}${(ст.signals || []).length
+                    ? `: ${(ст.signals || []).slice(0, 3).map((з) => esc(з.name)).join(', ')}` : ''}`)}
+          ${kpi('Усилие клиента', пусто(ус.score) ? '—' : `${ус.score > 0 ? '+' : ''}${num(ус.score, 1)}`,
+                `${esc(ус.level || '')}${(ус.markers || []).length
+                  ? `: «${(ус.markers || []).slice(0, 2).map(esc).join('», «')}»` : ''}`)}
+          ${kpi('NPS разговора', пусто(nps.score) ? '—' : num(nps.score, 0), npsПодпись)}
+          ${kpi('Понятность речи', пусто(пон.index) ? '—' : num(пон.index, 0),
+                пусто(пон.index) ? 'оператор не определён или говорил мало'
+                  : `${esc(пон.grade || '')}${(пон.signals || []).length
+                    ? `: ${(пон.signals || []).slice(0, 2).map(esc).join('; ')}` : ''}`)}
+          ${kpi('Точность ответов', пусто(точ.index) ? '—' : num(точ.index, 0),
+                (точ.vague || []).length ? `размыто: «${(точ.vague || []).slice(0, 3).map(esc).join('», «')}»`
+                  : 'конкретика против «наверное» и «где-то так»')}
+          ${kpi('Вежливость', пусто(веж.index) ? '—' : num(веж.index, 0),
+                (веж.missing || []).length && !пусто(веж.index)
+                  ? `не прозвучало: ${(веж.missing || []).map(esc).join(', ')}`
+                  : `вежливых ${num(веж.polite || 0)}, обрывающих ${num(веж.impolite || 0)}`)}
+          ${kpi('Слова-паразиты', пусто(пар.rate) ? '—' : pct(пар.rate, 1),
+                (пар.top || []).length ? (пар.top || []).slice(0, 4).map((т) =>
+                  `${esc(т.word)} ×${т.count}`).join(', ') : 'в речи оператора')}
+          ${kpi('Усталость к концу', пусто(уст.index) ? '—' : num(уст.index, 0),
+                пусто(уст.index) ? 'меньше шести реплик оператора' : 'падение темпа, рост пауз и паразитов')}
+          ${kpi('Ритмичность', пусто(рит.index) ? '—' : num(рит.index, 0),
+                пусто(рит.index) ? 'мало реплик для оценки' : esc(рит.level || ''))}
+          ${kpi('Персонализация', пусто(пер.index) ? '—' : num(пер.index, 0),
+                пусто(пер.name_uses) ? 'оператор не определён'
+                  : `по имени ${num(пер.name_uses)} раз${(пер.references || []).length
+                    ? `, отсылок к сказанному ${(пер.references || []).length}` : ''}`)}
+          ${kpi('Сила эмоции', пусто(показатели.intensity) ? '—' : `${num(показатели.intensity, 0)} из 5`,
+                'отдельно от знака: «слегка недоволен» и «в ярости» — разные разговоры')}
+        </div>
+        ${nps.question ? `<div class="small dim" style="padding:0 16px 14px">Вопрос об оценке: «${
+          esc(nps.question)}»</div>` : ''}`;
+      })()) : ''}
+
     ${(тон.by_speaker || []).length > 1 ? card('По говорящим',
       'средняя по разговору смешивает раздражённого клиента с ровным оператором',
       `<div class="table-wrap"><table>
@@ -3603,7 +3671,8 @@ async function loadJobAnalysis(backdrop, job) {
           <th class="num">Реплик</th><th class="num">Говорил</th>
           <th class="num">Темп</th><th class="num">Паразитов</th>
           <th class="num" title="самая долгая непрерывная речь">Монолог</th>
-          <th class="num" title="средняя пауза перед ответом собеседнику; паузы от 2 с считаются тишиной и сюда не входят">Пауза перед ответом</th></tr></thead>
+          <th class="num" title="средняя пауза перед ответом собеседнику; паузы от ${
+            сек(речь.pause_threshold_s ?? 2)} считаются тишиной и сюда не входят">Пауза перед ответом</th></tr></thead>
         <tbody>${(тон.by_speaker || []).map((г) => {
           const р = (речь.speakers || []).find((s) => s.speaker === г.speaker) || {};
           const стороны = речь.sides || {};
@@ -3750,6 +3819,9 @@ async function loadJobAnalysis(backdrop, job) {
                    num(речь.overlap_s, 1)} с)</span>` : ''}</td></tr>
                <tr><td class="small dim">Смен говорящего</td><td class="mono">${num(речь.switches)}${
                  речь.switches_per_min ? ` <span class="faint">(${num(речь.switches_per_min, 1)} в минуту)</span>` : ''}</td></tr>
+               ${пусто(речь.backchannels) ? '' : `<tr><td class="small dim" title="короткие реплики внутри чужой речи (до ${
+                 сек(речь.backchannel_threshold_s ?? 1.5)}): «угу», «да-да» — знак, что слушают; не перебивания и не смена говорящего">Поддакиваний</td><td class="mono">${
+                 num(речь.backchannels)}</td></tr>`}
                <tr><td class="small dim" title="${речь.pause_threshold_s
                  ? `разрывы дольше ${речь.pause_threshold_s} с` : 'разрывы между репликами'}">Пауз</td><td class="mono">${num(речь.pauses)}${
                  речь.longest_pause_s ? ` <span class="faint">(дольше всего ${
@@ -3758,7 +3830,7 @@ async function loadJobAnalysis(backdrop, job) {
                <tr><td class="small dim" title="отраслевой счёт: паузы дольше ${
                  речь.long_pause_threshold_s || 4} с">Из них длинных</td><td class="mono">${
                  num(речь.long_pauses)}</td></tr>`}
-               <tr><td class="small dim" title="сумма пауз от трёх секунд">Заметная тишина</td><td class="mono">${
+               <tr><td class="small dim" title="сумма пауз от ${сек(речь.dead_air_threshold_s ?? 3)}">Заметная тишина</td><td class="mono">${
                  речь.dead_air_s ? `${num(речь.dead_air_s, 0)} с${
                    речь.dead_air_share ? ` <span class="faint">(${pct(речь.dead_air_share, 0)} записи)</span>` : ''}` : '—'}</td></tr>
                ${(речь.sides || {}).agent ? `<tr><td class="small dim">Темп оператора к темпу клиента</td><td class="mono">${
@@ -7414,36 +7486,45 @@ RENDERERS.content = {
     const p = свод.previous || {};
     const всего = c.nps_checked || 0;
     const индекс = c.nps_index;
+    const пусто = (v) => v === null || v === undefined;
     host.innerHTML = `
       <section class="card">
         <div class="card-head"><h3>Индекс NPS</h3>
-          <span class="hint">доля промоутеров минус доля критиков</span>
+          <span class="hint">предсказанный: доля промоутеров минус доля критиков</span>
           <span class="spacer"></span>
           ${c.nps_stated_count ? `<span class="chip ok" title="балл, который клиент назвал вслух">
             назвали балл: ${num(c.nps_stated_count, 0)}</span>` : ''}
-          <span class="chip" title="по скольким разговорам вообще есть оценка">${
+          <span class="chip" title="по скольким разговорам было что оценивать; ровные разговоры без окрашенных реплик клиента балла не получают">${
             num(всего, 0)} ${plural(всего, 'разговор', 'разговора', 'разговоров')}</span>
         </div>
         <div class="grid cols-4" style="padding:14px 16px">
-          ${kpi('Индекс NPS', индекс === null || индекс === undefined ? '—' : num(индекс, 0),
-                p.nps_index !== null && p.nps_index !== undefined
-                  ? `было ${num(p.nps_index, 0)}` : 'от −100 до +100')}
-          ${kpi('Средний балл', c.nps === null || c.nps === undefined ? '—' : num(c.nps, 1),
-                'по шкале 0–10')}
-          ${kpi('Названный балл', c.nps_stated_avg === null || c.nps_stated_avg === undefined
-                  ? '—' : num(c.nps_stated_avg, 1),
+          ${kpi('Индекс NPS', пусто(индекс) ? '—' : num(индекс, 0),
+                !пусто(p.nps_index) ? `было ${num(p.nps_index, 0)}` : 'предсказанный, от −100 до +100')}
+          ${kpi('Средний балл', пусто(c.nps) ? '—' : num(c.nps, 1),
+                'предсказанный, по шкале 0–10')}
+          ${kpi('Названный балл', пусто(c.nps_stated_avg) ? '—' : num(c.nps_stated_avg, 1),
                 c.nps_stated_count ? `индекс ${c.nps_stated_index ?? '—'} по ${
                   num(c.nps_stated_count, 0)} ответам` : 'клиентов не спрашивали')}
           ${kpi('Промоутеры', num(c.promoters || 0, 0),
                 `нейтралы ${num(c.passives || 0, 0)} · критики ${num(c.detractors || 0, 0)}`)}
         </div>
+        ${c.csat_count ? `<div class="grid cols-4" style="padding:0 16px 14px">
+          ${kpi('Оценка из пяти', num(c.csat_avg, 2),
+                `названа ${num(c.csat_count, 0)} ${plural(c.csat_count, 'раз', 'раза', 'раз')} на вопрос по пятибалльной шкале — это не NPS`)}
+          ${kpi('Названный: промоутеры', num(c.promoters_stated || 0, 0),
+                `нейтралы ${num(c.passives_stated || 0, 0)} · критики ${num(c.detractors_stated || 0, 0)}`)}
+        </div>` : ''}
         <div style="padding:0 16px 16px"><div id="nps-bar"></div></div>
         <div class="banner" style="margin:0 16px 16px">
-          <b>Предсказанный балл — не опрос.</b> Там, где клиента прямо спросили
-          «оцените по шкале», сервер берёт названное число и помечает его как
-          названное. Где не спрашивали — считает балл из настроения к концу
-          разговора, усилия клиента и напряжения. Смешивать эти два числа в
-          отчёте наружу нельзя: первое — факт, второе — оценка.
+          <b>Предсказанный балл — не опрос.</b> Индекс, средний балл и промоутеры
+          выше — предсказанные: сервер считает их из настроения клиента к концу
+          разговора, его усилия и напряжения у каждого разговора, где было что
+          оценивать. Где клиента прямо спросили «оцените по шкале от нуля до
+          десяти» или «порекомендуете ли вы нас», названное число лежит отдельно —
+          «названный балл» и его индекс. Ответ на вопрос по пятибалльной шкале —
+          не NPS: пятёрка там высшая оценка, и она показана своей строкой.
+          Смешивать эти числа в отчёте наружу нельзя: названное — факт,
+          предсказанное — оценка.
         </div>
       </section>
       <div class="grid cols-2" style="margin-top:14px">
@@ -7468,7 +7549,12 @@ RENDERERS.content = {
     const точки = лента.buckets || [];
     Charts.line(qs('#nps-line'), {
       labels: точки.map((т) => fmtBucket(т.ts, лента.step_s || 86400)),
-      series: [{ name: 'средний балл', values: точки.map((т) => т.nps ?? null) }],
+      series: [{ name: 'предсказанный', values: точки.map((т) => т.nps ?? null) },
+        // Названный — своей линией и только там, где его называли: сложенный
+        // с предсказанным он пропадает, а нулём рисовать «не спрашивали» нельзя.
+        ...(точки.some((т) => т.nps_said_count)
+          ? [{ name: 'названный', values: точки.map((т) => (т.nps_said_count ? т.nps_said : null)) }]
+          : [])],
       height: 250, yMin: 0, yMax: 10,
       emptyText: 'За период разобранных записей нет',
     });
@@ -8122,7 +8208,8 @@ RENDERERS.content.tab_agents = async function (host) {
           Скрыто операторов с числом записей меньше пяти: ${операторы.hidden}.</p>` : ''}`
            : '<div class="empty small">За период нет операторов с пятью и более записями</div>')}
     <div class="grid cols-2">
-      ${card(`Очередь коучинга (${num(очередь.total)})`,
+      ${card(`Очередь коучинга (${очередь.total > (очередь.shown ?? очередь.total)
+               ? `${num(очередь.shown)} из ${num(очередь.total)}` : num(очередь.total)})`,
              'записи, которые стоит разобрать с оператором, — худшие первыми; «разобрано» убирает из очереди',
              this.coachingTable(очередь.items || []))}
       ${card('Эталонные разговоры',
@@ -8258,7 +8345,9 @@ RENDERERS.content.drawAgentCard = async function (host) {
       ${card('Лучшие записи', 'по баллу и тональности', список(к.best || []))}
       ${card('Худшие записи', 'по баллу и тональности', список(к.worst || []))}
     </div>
-    ${card(`Очередь коучинга оператора (${num(к.coaching_total)})`, 'разобрать с оператором',
+    ${card(`Очередь коучинга оператора (${к.coaching_total > (к.coaching || []).length
+             ? `${num((к.coaching || []).length)} из ${num(к.coaching_total)}` : num(к.coaching_total)})`,
+           'разобрать с оператором',
            this.coachingTable(к.coaching || []))}`;
   qs('#agent-back').addEventListener('click', () => {
     state.contentAgent = '';
@@ -8692,6 +8781,9 @@ RENDERERS.content.checkCategories = async function () {
     </div>` : ''}
     ${(ответ.errors || []).length ? `<div class="finding warning" style="margin-top:12px">
       Набор не сохранится, пока есть ошибки: ${(ответ.errors || []).map(esc).join('; ')}
+    </div>` : ''}
+    ${(ответ.notes || []).length ? `<div class="finding info" style="margin-top:12px">
+      Обратите внимание: ${(ответ.notes || []).map(esc).join('; ')}.
     </div>` : ''}`;
 };
 
@@ -10454,7 +10546,8 @@ const СОТРУДНИК_КОЛОНКИ = [
   ['diminutive_rate', 'Уменьшительные', 4, -1, '«секундочку», «договорчик»'],
   ['empathy', 'Эмпатия', 0, 1, '(вежливых − невежливых) ÷ сумму'],
   ['compliance', 'Скрипт', 2, 1, 'доля выполненных пунктов'],
-  ['nps_index', 'Индекс NPS', 0, 1, 'промоутеры минус критики'],
+  ['nps_index', 'Индекс NPS', 0, 1, 'предсказанный: промоутеры минус критики'],
+  ['nps_stated_index', 'NPS названный', 0, 1, 'индекс по баллам, которые клиенты назвали вслух'],
   ['violation_share', 'Нарушений, %', 1, -1, 'доля записей со стоп-словами'],
 ];
 
@@ -10469,7 +10562,8 @@ const СОТРУДНИК_НАБОРЫ = [
     columns: ['records', 'clarity', 'accuracy', 'rhythm', 'filler_rate',
               'diminutive_rate', 'fatigue'] },
   { key: 'clients', title: 'Клиенты',
-    columns: ['records', 'sentiment', 'mood', 'stress', 'effort', 'nps_index'] },
+    columns: ['records', 'sentiment', 'mood', 'stress', 'effort', 'nps_index',
+              'nps_stated_index'] },
   { key: 'script', title: 'Скрипт и вежливость',
     columns: ['records', 'agent_score', 'compliance', 'politeness',
               'personalization', 'empathy', 'violation_share'] },
@@ -10597,7 +10691,7 @@ RENDERERS.employees = {
           ${kpi('Понятность речи', к.clarity === null || к.clarity === undefined
                   ? '—' : num(к.clarity, 0), 'из 100')}
           ${kpi('Индекс NPS', к.nps_index === null || к.nps_index === undefined
-                  ? '—' : num(к.nps_index, 0), 'промоутеры минус критики')}
+                  ? '—' : num(к.nps_index, 0), 'предсказанный: промоутеры минус критики')}
         </div>
       </section>`;
   },

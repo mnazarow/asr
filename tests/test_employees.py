@@ -45,6 +45,7 @@ def стенд(tmp_path):
         запись(db, f"ivan{н}", оператор="Иванов А.", когда=сейчас - н * 3600,
                stress=60, clarity=40, accuracy=50, politeness=70, mood=-0.4,
                nps=4, nps_group="критик", nps_stated=1 if н < 3 else 0,
+               nps_said=4 if н < 3 else None,
                diminutive_rate=0.02, filler_rate=0.05)
     for н in range(10):
         запись(db, f"petr{н}", оператор="Петрова М.", когда=сейчас - н * 3600,
