@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from ..catalog import ModelSpec, get_engine, get_model
-from ..errors import DependencyMissing, ModelNotFound, UnsupportedFeature
+from ..errors import DependencyMissing, EngineBusy, ModelNotFound, UnsupportedFeature
 from ..logging_setup import get_logger
 from .base import Engine, Segment, TranscriptionResult
 from .demo import DemoEngine
@@ -132,8 +132,12 @@ class EngineRegistry:
             raise UnsupportedFeature(f"движок «{engine_id}»", model=spec.id)
         return spec, engine_id
 
-    def get(self, settings: dict[str, Any]) -> Engine:
-        """Отдаёт движок из кеша. Для работы пользуйтесь `lease()`."""
+    def get(self, settings: dict[str, Any], *, отдельный: bool = False) -> Engine:
+        """Отдаёт движок из кеша. Для работы пользуйтесь `lease()`.
+
+        `отдельный` — второй экземпляр той же модели для потока (см.
+        `lease`): у него свой ключ в кеше и своя блокировка.
+        """
         spec, engine_id = self.resolve(settings)
         cls = ENGINE_CLASSES[engine_id]
         available, reason = cls.check_available()
@@ -142,6 +146,8 @@ class EngineRegistry:
 
         key = f"{engine_id}::{spec.id}::{settings.get('device', 'auto')}::" \
               f"{settings.get('compute_type', 'auto')}"
+        if отдельный:
+            key += "::поток"
         with self._lock:
             engine = self._cache.get(key)
             if engine is None:
@@ -156,8 +162,31 @@ class EngineRegistry:
             engine.last_used = time.time()
             return engine
 
+    def _занять(self, settings: dict[str, Any], *, отдельный: bool = False) -> Engine:
+        """Движок из кеша, сразу помеченный занятым — одним шагом.
+
+        Раньше между `get()` и пометкой «занят» был зазор: в него успевал
+        вклиниться сборщик простоя или вытеснение, модель выгружалась, и
+        задание работало с выброшенным из кеша экземпляром — веса грузились
+        второй раз мимо кеша, вдвое по памяти.
+        """
+        with self._lock:
+            engine = self.get(settings, отдельный=отдельный)
+            self._busy[id(engine)] = self._busy.get(id(engine), 0) + 1
+            return engine
+
+    def _освободить(self, engine: Engine) -> None:
+        with self._lock:
+            remaining = self._busy.get(id(engine), 1) - 1
+            if remaining <= 0:
+                self._busy.pop(id(engine), None)
+            else:
+                self._busy[id(engine)] = remaining
+            engine.last_used = time.time()
+
     @contextmanager
-    def lease(self, settings: dict[str, Any]) -> Iterator[Engine]:
+    def lease(self, settings: dict[str, Any], *, wait_s: float | None = None,
+              отдельный_если_занят: bool = False) -> Iterator[Engine]:
         """Выдаёт движок во временное пользование.
 
         Пока движок занят, его нельзя ни выгрузить по простою, ни вытеснить
@@ -168,22 +197,37 @@ class EngineRegistry:
         Дополнительно движок держится под собственной блокировкой: один
         экземпляр общий для всех воркеров, а модели в PyTorch и CTranslate2
         не рассчитаны на одновременный вызов из нескольких потоков.
+
+        `wait_s` — сколько ждать блокировку. Файловое задание держит её всё
+        распознавание, и поток диктовки на той же модели висел до конца
+        файла, занимая поток сервера. С пределом ожидания вызывающий
+        получает `EngineBusy`, а с `отдельный_если_занят` — второй
+        экземпляр модели со своей блокировкой.
         """
-        engine = self.get(settings)
-        with self._lock:
-            self._busy[id(engine)] = self._busy.get(id(engine), 0) + 1
+        первый = self._занять(settings)
+        взятый: Engine | None = None
         try:
-            with engine.lock:
-                engine.last_used = time.time()
-                yield engine
+            if первый.lock.acquire(timeout=-1 if wait_s is None else max(0.0, wait_s)):
+                взятый = первый
+            elif отдельный_если_занят:
+                второй = self._занять(settings, отдельный=True)
+                try:
+                    второй.lock.acquire()
+                except BaseException:
+                    self._освободить(второй)
+                    raise
+                взятый = второй
+                self._освободить(первый)
+                первый = второй
+            else:
+                raise EngineBusy(str(settings.get("model") or первый.spec.id),
+                                 float(wait_s or 0.0))
+            взятый.last_used = time.time()
+            yield взятый
         finally:
-            with self._lock:
-                remaining = self._busy.get(id(engine), 1) - 1
-                if remaining <= 0:
-                    self._busy.pop(id(engine), None)
-                else:
-                    self._busy[id(engine)] = remaining
-                engine.last_used = time.time()
+            if взятый is not None:
+                взятый.lock.release()
+            self._освободить(первый)
 
     def _is_busy(self, engine: Engine) -> bool:
         return self._busy.get(id(engine), 0) > 0
@@ -203,9 +247,20 @@ class EngineRegistry:
             self._cache.pop(oldest_key, None)
 
     def collect_idle(self) -> int:
-        """Выгружает модели, простаивающие дольше заданного времени."""
+        """Выгружает модели, простаивающие дольше заданного времени.
+
+        Вместе с моделями распознавания — и вспомогательные (диаризация,
+        выравнивание): они живут в своём кеше, и без этого вызова держали бы
+        видеопамять до перезапуска.
+        """
         if self.idle_unload_s <= 0:
             return 0
+        try:
+            from ..pipeline import model_cache  # noqa: PLC0415
+
+            model_cache.выгрузить(float(self.idle_unload_s))
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Вспомогательные модели не выгружены: %s", exc)
         cutoff = time.time() - self.idle_unload_s
         removed = 0
         with self._lock:
@@ -241,6 +296,12 @@ class EngineRegistry:
                 log.info("Выгружено моделей постобработки: %d", freed)
         except Exception as exc:                            # noqa: BLE001
             log.debug("Не удалось выгрузить модели постобработки: %s", exc)
+        try:
+            from ..pipeline import model_cache  # noqa: PLC0415
+
+            model_cache.выгрузить(None)
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Не удалось выгрузить вспомогательные модели: %s", exc)
 
     def loaded(self) -> list[dict[str, Any]]:
         with self._lock:

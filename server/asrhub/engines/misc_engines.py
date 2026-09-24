@@ -188,25 +188,101 @@ class VoxtralEngine(Engine):
             device_map="auto" if device.startswith("cuda") else None)
         return {"processor": processor, "model": model, "device": device}
 
+    #: Сколько звука отдаётся модели за раз. Окно Voxtral — 32 тысячи
+    #: токенов, и полчаса звука (заявленный предел) съедают из них больше
+    #: двадцати: на текст остаётся мало, и длинная запись обрывалась молча.
+    #: Десять минут — с запасом и для звука, и для текста.
+    КУСОК_С = 600.0
+
+    #: Токенов текста на секунду звука — с запасом на быструю речь: около
+    #: трёх слов в секунду и полтора-два токена на слово.
+    ТОКЕНОВ_НА_СЕКУНДУ = 6
+
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:
+        """Распознаёт запись кусками по речи, не длиннее `КУСОК_С`.
+
+        Прежде здесь было три беды разом. Метод назывался
+        `apply_transcrition_request` — с опечаткой, которой в transformers
+        нет, — и движок падал на первом же задании. Запись отдавалась
+        целиком, хотя модель принимает не больше получаса. А ответ
+        обрезался на 2048 токенах — это минут десять речи, остальное молча
+        пропадало. Язык по умолчанию стоял «ru», которого Voxtral не знает;
+        теперь, если язык не задан, модель определяет его сама.
+        """
+        import tempfile  # noqa: PLC0415
+
+        from ..pipeline.audio import slice_wav  # noqa: PLC0415
+
         info = probe(audio_path)
         processor = self._model["processor"]
         model = self._model["model"]
-        language = self.language_for(settings) or "ru"
-        self.report(progress, 0.2, "распознавание")
+        language = self.language_for(settings) or None
+        предел = min(float(self.spec.max_audio_s or self.КУСОК_С), self.КУСОК_С)
+        куски = _куски_по_речи(audio_path, info.duration_s, settings, предел)
+        segments: list[Segment] = []
+        with tempfile.TemporaryDirectory(prefix="voxtral-",
+                                         dir=settings.get("temp_dir") or None) as tmp:
+            for номер, (начало, конец) in enumerate(куски):
+                self.report(progress, 0.1 + 0.85 * номер / max(1, len(куски)),
+                            "распознавание")
+                путь = audio_path
+                if len(куски) > 1:
+                    путь = slice_wav(audio_path, Path(tmp) / f"part{номер:04d}.wav",
+                                     начало, конец)
+                text = self._кусок(processor, model, путь, language, конец - начало)
+                if text.strip():
+                    segments.append(Segment(start=round(начало, 3), end=round(конец, 3),
+                                            text=text.strip(), language=language))
+        return TranscriptionResult(segments=segments, language=language or "",
+                                   duration=info.duration_s)
+
+    def _кусок(self, processor: Any, model: Any, path: Path, language: str | None,
+               seconds: float) -> str:
         try:
-            inputs = processor.apply_transcrition_request(
-                language=language, audio=str(audio_path), model_id=self.spec.source)
+            inputs = processor.apply_transcription_request(
+                language=language, audio=str(path), model_id=self.spec.source)
             inputs = inputs.to(model.device, dtype=model.dtype)
-            outputs = model.generate(**inputs, max_new_tokens=2048)
+            предел = int(min(8192, max(256, seconds * self.ТОКЕНОВ_НА_СЕКУНДУ)))
+            outputs = model.generate(**inputs, max_new_tokens=предел)
             decoded = processor.batch_decode(
                 outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
-            text = decoded[0] if decoded else ""
+            return str(decoded[0]) if decoded else ""
         except Exception as exc:
             raise classify_exception(exc, engine=self.id, model=self.spec.id) from exc
-        return TranscriptionResult(segments=_single(text, info.duration_s, language),
-                                   language=language, duration=info.duration_s)
+
+
+def _куски_по_речи(path: Path, duration: float, settings: dict[str, Any],
+                   предел: float) -> list[tuple[float, float]]:
+    """Нарезка записи на куски не длиннее `предел` — с разрезами в паузах.
+
+    Участки речи складываются подряд, пока кусок помещается в предел;
+    разрез проходит между участками, то есть в тишине, а не посреди слова.
+    Без поиска речи (выключен или ничего не нашёл) — ровными долями.
+    """
+    import math  # noqa: PLC0415
+
+    from ..pipeline import vad  # noqa: PLC0415
+
+    if duration <= предел:
+        return [(0.0, duration)]
+    спаны = []
+    if settings.get("vad_enabled", True):
+        спаны = vad.detect(path, {**settings, "vad_max_speech_s": min(предел, 30.0)})
+    if not спаны:
+        частей = int(math.ceil(duration / предел))
+        шаг = duration / частей
+        return [(i * шаг, min(duration, (i + 1) * шаг)) for i in range(частей)]
+    куски: list[tuple[float, float]] = []
+    начало, конец = спаны[0].start, спаны[0].end
+    for спан in спаны[1:]:
+        if спан.end - начало <= предел:
+            конец = спан.end
+        else:
+            куски.append((начало, конец))
+            начало, конец = спан.start, спан.end
+    куски.append((начало, конец))
+    return куски
 
 
 class KyutaiEngine(Engine):

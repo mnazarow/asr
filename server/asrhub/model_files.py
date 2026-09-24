@@ -90,25 +90,31 @@ def directory_size(path: Path | None) -> int:
     return total
 
 
-def fingerprint(models_dir: Path | str, source: str) -> str:
+def fingerprint(models_dir: Path | str, source: str, revision: str = "") -> str:
     """Короткий отпечаток весов модели.
 
     Пустая строка означает «весов на диске нет» — так бывает, когда модель
     ещё не скачана или движок держит их в другом месте. В этом случае кеш
     работает как раньше, по имени модели: хуже, чем с отпечатком, но не
     хуже, чем было.
+
+    Ревизия нужна там, где варианты одной модели лежат рядом: у GigaAM это
+    `v3_ctc.ckpt` и `v3_rnnt.ckpt` в одном каталоге. Без неё `find_local`
+    брал первый по алфавиту — `v3_ctc`, — и обновление весов модели по
+    умолчанию (`gigaam-v3-rnnt`) отпечаток не меняло: кеш отдавал
+    расшифровку прежними весами, ровно то, ради чего отпечаток заводили.
     """
     if not source:
         return ""
     directory = Path(models_dir)
-    key = f"{directory}|{source}"
+    key = f"{directory}|{source}|{revision or ''}"
     now = time.time()
     with _lock:
         cached = _cache.get(key)
         if cached and now - cached[0] < _TTL_S:
             return cached[1]
 
-    local = find_local(directory, source)
+    local = find_local(directory, source, revision or "")
     value = ""
     if local is not None:
         digest = hashlib.blake2b(digest_size=8)

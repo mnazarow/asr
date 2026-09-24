@@ -15,7 +15,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="3.1.12"
+VERSION="3.1.13"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
 CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"

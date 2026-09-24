@@ -305,8 +305,26 @@ class Settings:
             errors = catalog.validate_all(свои)
             if errors:
                 raise ConfigError("; ".join(errors))
+            self._в_пределах_сервера(свои)
             result.update(свои)
         return result
+
+    def _в_пределах_сервера(self, свои: dict[str, Any]) -> None:
+        """Тайм-аут и число повторов задания — не больше серверных.
+
+        Меньше — пожалуйста: задание вправе сдаться раньше. Больше или
+        «без предела» — нет: предел ставит администратор против зависших
+        и бесконечно падающих заданий, и обычный ключ снимал его одной
+        строкой в настройках загрузки.
+        """
+        if "job_timeout_s" in свои:
+            сервер = _целое(self.values.get("job_timeout_s"), 0)
+            своё = _целое(свои.get("job_timeout_s"), 0)
+            if сервер > 0 and (своё <= 0 or своё > сервер):
+                свои["job_timeout_s"] = сервер
+        if "max_retries" in свои:
+            сервер = max(0, _целое(self.values.get("max_retries"), 2))
+            свои["max_retries"] = max(0, min(_целое(свои.get("max_retries"), сервер), сервер))
 
     #: Параметры, которые нельзя показывать без include_secrets. Это обычные
     #: значения каталога, поэтому они лежали в values и уходили любому ключу
@@ -349,12 +367,25 @@ class Settings:
     #: уведомления — обычная возможность API.
     СВОЁ_У_ЗАДАНИЯ = ("webhook_url",)
 
+    #: Параметры, которые решает только сервер (см. `_только_серверу`).
+    ТОЛЬКО_СЕРВЕРУ: frozenset[str] = frozenset()
+
     #: Так интерфейс показывает секрет тому, кому его знать не положено.
     ЗАГЛУШКА = "***"
 
     @classmethod
     def чужое_заданию(cls, ключ: str, значение: Any) -> bool:
-        """Не даёт заданию переопределить секрет сервера (см. `merged`)."""
+        """Не даёт заданию переопределить то, что принадлежит серверу.
+
+        Это секреты (см. `merged`) и параметры самого сервера: каталог
+        моделей, адрес языковой модели, станции АТС, копии, журнал доступа.
+        Задание переопределяло любой ключ каталога, и обычный ключ мог
+        указать движку свой `models_dir` — веса модели грузились бы оттуда,
+        откуда скажет запрос, — или снять `job_timeout_s`, который
+        администратор поставил против зависших заданий.
+        """
+        if ключ in cls.ТОЛЬКО_СЕРВЕРУ:
+            return True
         if ключ not in cls.НЕ_В_ЗАДАНИИ:
             return False
         if ключ in cls.СВОЁ_У_ЗАДАНИЯ:
@@ -363,8 +394,16 @@ class Settings:
 
     @classmethod
     def для_задания(cls, параметры: dict[str, Any] | None) -> dict[str, Any]:
-        """Параметры задания без секретов сервера — для хранения и выдачи."""
-        return {к: з for к, з in (параметры or {}).items() if к not in cls.НЕ_В_ЗАДАНИИ}
+        """Параметры задания без секретов и без параметров сервера.
+
+        Для хранения и выдачи. Параметры сервера в снимке задания — это
+        адреса и пути инфраструктуры (языковая модель, АТС, каталог
+        предприятия, каталоги на диске), и владелец задания видел их в
+        карточке. Заданию они не нужны: при обработке они берутся из
+        нынешних настроек сервера.
+        """
+        return {к: з for к, з in (параметры or {}).items()
+                if к not in cls.НЕ_В_ЗАДАНИИ and к not in cls.ТОЛЬКО_СЕРВЕРУ}
 
     def без_заглушек(self, значения: dict[str, Any]) -> dict[str, Any]:
         """Убирает из изменения настроек заглушки «***» вместо секретов.
@@ -505,6 +544,49 @@ class Settings:
         except ConfigError as exc:
             log.warning("Ключи доступа не сохранены: %s", exc)
             return False
+
+
+def _целое(значение: Any, умолчание: int) -> int:
+    """Целое с честным нулём; мусор — умолчание."""
+    if значение is None or значение == "":
+        return int(умолчание)
+    try:
+        return int(float(значение))
+    except (TypeError, ValueError, OverflowError):
+        return int(умолчание)
+
+
+#: Группы каталога, которые целиком принадлежат серверу: доступ, каталоги
+#: на диске, наблюдение, языковая модель, телефония, CRM, справочник
+#: сотрудников, контроль качества. Задание в них ничего не решает.
+ГРУППЫ_СЕРВЕРА = frozenset({"server", "access", "runtime", "monitoring", "llm",
+                            "llm_queue", "telephony", "crm", "employees", "health"})
+
+#: Параметры сервера в группах, где остальное задание задаёт само: очередь
+#: целиком (предел, число воркеров, политика), хранение и копии, фоновый
+#: разбор архива.
+КЛЮЧИ_СЕРВЕРА = frozenset({
+    "webhook_allow_internal", "webhook_workers", "scheduling_window", "max_batch_files",
+    "max_queue_size", "max_concurrent_jobs", "max_concurrent_per_model",
+    "scheduling_policy", "consent_tag", "consent_days", "result_retention_days",
+    "backup_enabled", "backup_time", "backup_kind", "backup_keep_days",
+    "backup_include_results", "backup_interval_hours", "backup_keep", "backup_dir",
+    "content_backfill", "content_backfill_batch", "digest_content",
+})
+
+#: Из группы сервера сессия диктовки вправе задать себе окно гипотез: это
+#: свойство самой сессии, а не сервера.
+СВОЁ_У_СЕССИИ = frozenset({"stream_window_s"})
+
+
+def _только_серверу() -> frozenset[str]:
+    return frozenset(
+        p.key for p in catalog.PARAMS
+        if (p.group in ГРУППЫ_СЕРВЕРА or p.key in КЛЮЧИ_СЕРВЕРА)
+        and p.key not in СВОЁ_У_СЕССИИ and p.key not in Settings.СВОЁ_У_ЗАДАНИЯ)
+
+
+Settings.ТОЛЬКО_СЕРВЕРУ = _только_серверу()
 
 
 def _dump_yaml(payload: dict[str, Any]) -> str:

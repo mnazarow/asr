@@ -68,6 +68,34 @@ class AccountError(ASRHubError):
     hint = "Проверьте имя пользователя и пароль."
 
 
+def _текст_поля(поле: str, значение: Any, предел: int = 200) -> str:
+    """Текстовое поле учётной записи: строка разумной длины."""
+    if значение is None:
+        return ""
+    if not isinstance(значение, (str, int, float)) or isinstance(значение, bool):
+        raise AccountError(f"Поле «{поле}» должно быть строкой.",
+                           hint="Вложенные объекты и списки здесь не принимаются.")
+    текст = str(значение).strip()
+    if len(текст) > предел:
+        raise AccountError(f"Поле «{поле}» длиннее {предел} знаков.")
+    return текст
+
+
+def поле_да_нет(поле: str, значение: Any) -> bool:
+    """«Да/нет» в поле учётной записи — строго, без истинности строк."""
+    if isinstance(значение, bool):
+        return значение
+    if isinstance(значение, (int, float)) and значение in (0, 1):
+        return bool(значение)
+    if isinstance(значение, str):
+        нижнее = значение.strip().lower()
+        if нижнее in ("true", "1", "yes", "on", "да"):
+            return True
+        if нижнее in ("false", "0", "no", "off", "нет"):
+            return False
+    raise AccountError(f"Поле «{поле}» принимает только true или false.")
+
+
 class AccountNotFound(ASRHubError):
     """Учётная запись не найдена."""
 
@@ -255,6 +283,9 @@ class Accounts:
             raise AccountError(problem)
         if role not in ROLES:
             raise AccountError(f"Неизвестная роль «{role}». Допустимые: {', '.join(ROLES)}.")
+        display_name = _текст_поля("display_name", display_name)
+        group = _текст_поля("group", group)
+        must_change_password = поле_да_нет("must_change_password", must_change_password)
         if self.by_username(username):
             raise AccountError(f"Пользователь «{username}» уже есть.")
         now = time.time()
@@ -348,10 +379,17 @@ class Accounts:
             raise AccountNotFound(f"Учётная запись {user_id} не найдена.")
         if not updates:
             return account
+        # Поля проверяются здесь, а не в базе. Словарь в имени доходил до
+        # SQLite и возвращался 507 «ошибка записи в базу», а строка «false»
+        # в `enabled` была истинной — «отключить» через API включало запись.
+        for поле in ("display_name", "user_group"):
+            if поле in updates:
+                updates[поле] = _текст_поля(поле, updates[поле])
         if "enabled" in updates:
-            updates["enabled"] = 1 if updates["enabled"] else 0
+            updates["enabled"] = 1 if поле_да_нет("enabled", updates["enabled"]) else 0
         if "must_change" in updates:
-            updates["must_change"] = 1 if updates["must_change"] else 0
+            updates["must_change"] = 1 if поле_да_нет("must_change_password",
+                                                  updates["must_change"]) else 0
         updates["updated_at"] = time.time()
         assignments = ", ".join(f"{name} = ?" for name in updates)
         self.db.execute(f"UPDATE users SET {assignments} WHERE id = ?",

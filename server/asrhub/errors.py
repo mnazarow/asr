@@ -333,11 +333,17 @@ class JobCancelled(ASRHubError):
 
 
 class JobTimeout(ASRHubError):
-    """Превышено время выполнения."""
+    """Превышено время выполнения.
+
+    Не повторяется: повтор с теми же настройками на той же записи упрётся
+    в тот же предел, и сервер только потратит ещё `max_retries` таких же
+    отрезков времени. Лечится настройкой — больший предел или модель
+    быстрее, — а не повтором.
+    """
 
     code = "job_timeout"
     http_status = 504
-    retryable = True
+    retryable = False
 
     def __init__(self, timeout_s: int):
         super().__init__(
@@ -346,6 +352,24 @@ class JobTimeout(ASRHubError):
                   "Проверьте, не ушла ли модель в зацикливание: включите VAD "
                   "и отключите перенос контекста между окнами."),
             details={"timeout_s": timeout_s},
+        )
+
+
+class EngineBusy(ASRHubError):
+    """Модель занята другой работой дольше, чем готов ждать вызывающий."""
+
+    code = "engine_busy"
+    http_status = 503
+    retryable = True
+
+    def __init__(self, model: str, waited_s: float):
+        super().__init__(
+            f"Модель «{model}» занята распознаванием файла из очереди.",
+            hint=("Поток подождёт: звук копится и будет распознан, когда модель "
+                  "освободится. Чтобы диктовка шла параллельно с очередью, "
+                  "включите stream_separate_engine или выберите для потока "
+                  "другую модель."),
+            details={"model": model, "waited_s": round(float(waited_s), 1)},
         )
 
 

@@ -26,6 +26,8 @@
 """
 from __future__ import annotations
 
+import functools
+import ipaddress
 import re
 from typing import Any
 
@@ -120,24 +122,67 @@ def записывать(method: str, path: str, *, reads: bool) -> bool:
     return bool(reads) and чувствительное_чтение(path)
 
 
-def адрес(headers: Any, client: Any) -> str:
+#: Кому верить без настройки — то же, что умолчание `trusted_proxies`.
+ДОВЕРЕННЫЕ_ПО_УМОЛЧАНИЮ = ("127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, "
+                           "192.168.0.0/16, fc00::/7")
+
+
+@functools.lru_cache(maxsize=32)
+def _сети(запись: str) -> tuple[Any, ...]:
+    сети = []
+    for часть in str(запись or "").split(","):
+        часть = часть.strip()
+        if not часть:
+            continue
+        try:
+            сети.append(ipaddress.ip_network(часть, strict=False))
+        except ValueError:
+            continue
+    return tuple(сети)
+
+
+def _в_сетях(адрес_узла: str, сети: tuple[Any, ...]) -> bool:
+    try:
+        узел = ipaddress.ip_address(str(адрес_узла).strip().split("%", 1)[0])
+    except ValueError:
+        return False
+    сопоставленный = getattr(узел, "ipv4_mapped", None)
+    if сопоставленный is not None:
+        узел = сопоставленный
+    return any(узел.version == сеть.version and узел in сеть for сеть in сети)
+
+
+def адрес(headers: Any, client: Any, доверенные: str | None = None) -> str:
     """Откуда пришли: заголовок обратного прокси или сам сокет.
 
     За nginx у каждого запроса адрес самого nginx, и журнал, записавший
     «127.0.0.1» напротив каждой строки, бесполезен ровно там, где он нужнее
-    всего. `X-Forwarded-For` берётся первым значением — это адрес клиента;
-    остальные добавили промежуточные прокси.
+    всего. Но и верить заголовку от кого угодно нельзя: при прямом доступе
+    к серверу `X-Forwarded-For: 6.6.6.6` подписывал запрос чужим адресом.
+
+    Поэтому заголовок читается, только если соединение пришло от
+    доверенного прокси (`trusted_proxies`), а из цепочки берётся ближайший
+    справа недоверенный адрес — тот, от кого прокси запрос и получил;
+    дописанное клиентом левее ничего не решает.
     """
+    сокет = str(getattr(client, "host", "") or "")
+    сети = _сети(ДОВЕРЕННЫЕ_ПО_УМОЛЧАНИЮ if доверенные is None else str(доверенные))
+    if not сети or not _в_сетях(сокет, сети):
+        return сокет[:64]
     try:
-        цепочка = str(headers.get("x-forwarded-for") or "")
+        цепочка = [часть.strip() for часть in
+                   str(headers.get("x-forwarded-for") or "").split(",") if часть.strip()]
     except Exception:                                       # noqa: BLE001
-        цепочка = ""
+        цепочка = []
+    for звено in reversed(цепочка):
+        if not _в_сетях(звено, сети):
+            return звено[:64]
     if цепочка:
-        return цепочка.split(",")[0].strip()[:64]
+        # Вся цепочка из доверенных — клиент внутри своей же сети.
+        return цепочка[0][:64]
     try:
-        реальный = str(headers.get("x-real-ip") or "")
+        реальный = str(headers.get("x-real-ip") or "").strip()
     except Exception:                                       # noqa: BLE001
         реальный = ""
-    if реальный:
-        return реальный.strip()[:64]
-    return str(getattr(client, "host", "") or "")[:64]
+    return (реальный or сокет)[:64]
+

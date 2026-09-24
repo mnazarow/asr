@@ -235,10 +235,12 @@ def test_проверка_окружения_проваливается_из_з�
 # ---------------------------------------------------------------------------
 
 def test_настройки_задания_принимают_прежнюю_запись(tmp_path):
+    # Параметр задания, а не сервера: телефонию задание с заходом 41
+    # переопределять не может вовсе (см. Settings.ТОЛЬКО_СЕРВЕРУ).
     настройки = load(конфиг(tmp_path, "server:\n  server_port: 8081\n"),
                      apply_hardware=False)
-    итог = настройки.merged({"telephony_internal_digits": 4})
-    assert итог["telephony_internal_digits"] == "4"
+    итог = настройки.merged({"speaker_names": 4})
+    assert итог["speaker_names"] == "4"
 
 
 def test_settings_set_приводит_значение(tmp_path):

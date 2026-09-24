@@ -197,6 +197,19 @@ def to_srt(result: dict[str, Any], settings: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _vtt_escape(text: str) -> str:
+    """Обезвреживает разметку WebVTT внутри реплики.
+
+    В тексте реплики WebVTT понимает «<» как начало тега, «&» — как начало
+    сущности, а строка «-->» внутри текста ломает разбор реплики целиком.
+    «Скидка <20 %> & бонус» браузер показывал обрывком, а «А --> Б»
+    превращал следующую строку в чужие таймкоды.
+    """
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
 def to_vtt(result: dict[str, Any], settings: dict[str, Any]) -> str:
     width = int(settings.get("subtitle_max_line_width") or 42)
     lines_limit = int(settings.get("subtitle_max_lines") or 2)
@@ -209,7 +222,7 @@ def to_vtt(result: dict[str, Any], settings: dict[str, Any]) -> str:
             continue
         out.append(f"{format_timestamp(seg['start'], 'vtt')} --> "
                    f"{format_timestamp(seg['end'], 'vtt')}")
-        out.append(text)
+        out.append(_vtt_escape(text))
         out.append("")
     return "\n".join(out)
 
@@ -254,21 +267,34 @@ def to_ass(result: dict[str, Any], settings: dict[str, Any]) -> str:
                              width, lines_limit).replace("\n", "\\N")
         if not text.strip():
             continue
-        speaker = seg.get("speaker") or ""
+        # Поля строки Dialogue разделены запятыми, и запятая в имени
+        # говорящего («Иванов, менеджер») сдвигала все поля после него: часть
+        # имени уезжала в отступы, а текст начинался с середины.
+        speaker = re.sub(r"[,\r\n]+", " ", str(seg.get("speaker") or "")).strip()
         header.append(f"Dialogue: 0,{format_timestamp(seg['start'], 'ass')},"
                       f"{format_timestamp(seg['end'], 'ass')},Default,{speaker},0,0,0,,{text}")
     return "\n".join(header) + "\n"
 
 
 def _prepare_subtitles(result: dict[str, Any], min_duration: float) -> list[dict[str, Any]]:
-    """Гарантирует минимальную длительность и отсутствие наложений."""
+    """Гарантирует минимальную длительность и отсутствие наложений у одного говорящего.
+
+    Конец реплики подрезается по началу следующей реплики ТОГО ЖЕ
+    говорящего. Прежде резали по любой следующей: на стереозаписи звонка
+    короткое «угу» клиента посреди десятисекундной реплики оператора
+    урезало её до полусекунды — остальные девять с половиной секунд текст
+    не показывался вовсе. Реплики разных говорящих в субтитрах одновременно
+    — обычное дело: SRT, WebVTT и ASS их показывают стопкой.
+    """
     segments = [dict(s) for s in result.get("segments", []) if s.get("text", "").strip()]
     for idx, seg in enumerate(segments):
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
         if end - start < min_duration:
             end = start + min_duration
-        next_start = float(segments[idx + 1].get("start", end)) if idx + 1 < len(segments) else None
+        кто = seg.get("speaker")
+        next_start = next((float(дальше.get("start", end)) for дальше in segments[idx + 1:]
+                           if дальше.get("speaker") == кто), None)
         if next_start is not None and end > next_start:
             end = max(start + 0.2, next_start - 0.04)
         seg["start"], seg["end"] = start, end
@@ -393,6 +419,15 @@ def to_docx(result: dict[str, Any], settings: dict[str, Any], path: Path) -> Pat
 # Точка входа
 # --------------------------------------------------------------------------
 
+def safe_basename(basename: str) -> str:
+    """Имя файлов результата: то, что останется от имени записи на диске.
+
+    Одно правило на всех: по нему пишет выгрузка и по нему же клон из кеша
+    переименовывает скопированные файлы под своё задание.
+    """
+    return re.sub(r"[^\w\-. ]+", "_", str(basename or "")).strip() or "result"
+
+
 def write_all(result: dict[str, Any], settings: dict[str, Any], outdir: Path,
               basename: str) -> dict[str, str]:
     """Сохраняет все запрошенные форматы. Возвращает соответствие формат → путь."""
@@ -400,7 +435,7 @@ def write_all(result: dict[str, Any], settings: dict[str, Any], outdir: Path,
     formats = settings.get("output_formats") or ["txt", "json"]
     if isinstance(formats, str):
         formats = [formats]
-    safe = re.sub(r"[^\w\-. ]+", "_", basename).strip() or "result"
+    safe = safe_basename(basename)
     written: dict[str, str] = {}
 
     handlers = {

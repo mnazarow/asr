@@ -15,6 +15,7 @@ from ..engines.base import Segment, device_for
 from ..errors import DependencyMissing, GatedModelError
 from ..logging_setup import get_logger
 from ..monitoring.collector import RUNTIME
+from . import model_cache
 
 log = get_logger("diarization")
 
@@ -90,21 +91,28 @@ def _pyannote(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, f
 
     model_name = str(settings.get("diarization_model")
                      or "pyannote/speaker-diarization-community-1")
-    pipeline = _из_хаба(Pipeline, model_name, token)
-    if pipeline is None:
-        raise GatedModelError(model_name, f"https://huggingface.co/{model_name}")
-
     # «auto» — это видеокарта, если она есть. Раньше на карту переносили
     # только при явном «cuda», а умолчание «auto» оставляло pyannote считать
     # на процессоре — в разы дольше самого распознавания.
     device = device_for(settings)
-    if device.startswith("cuda"):
-        try:
-            import torch  # type: ignore
 
-            pipeline.to(torch.device(device))
-        except Exception as exc:                            # noqa: BLE001
-            log.warning("Диаризация остаётся на процессоре: %s", exc)
+    def загрузить() -> Any:
+        pipeline = _из_хаба(Pipeline, model_name, token)
+        if pipeline is None:
+            raise GatedModelError(model_name, f"https://huggingface.co/{model_name}")
+        if device.startswith("cuda"):
+            try:
+                import torch  # type: ignore
+
+                pipeline.to(torch.device(device))
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("Диаризация остаётся на процессоре: %s", exc)
+        return pipeline
+
+    # Конвейер грузится один раз и живёт в кеше, как модели распознавания:
+    # раньше — заново на каждое задание, секунды и гигабайт видеопамяти.
+    # В ключе класс конвейера: у 3.x и 4.x они разные.
+    запись = model_cache.взять(("pyannote", id(Pipeline), model_name, device), загрузить)
 
     kwargs: dict[str, Any] = {}
     num = S.integer(settings, "diarization_num_speakers", 0)
@@ -114,7 +122,8 @@ def _pyannote(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float, f
         kwargs["min_speakers"] = int(settings.get("diarization_min_speakers") or 1)
         kwargs["max_speakers"] = int(settings.get("diarization_max_speakers") or 8)
 
-    итог = pipeline(str(audio_path), **kwargs)
+    with запись.замок:
+        итог = запись.модель(str(audio_path), **kwargs)
     # pyannote.audio 4 отдаёт не разметку, а набор разметок. Для расшифровки
     # нужна «исключающая» — без наложенных реплик: каждому слову один
     # говорящий. В 3.x ответ — сама разметка.
@@ -154,10 +163,16 @@ def _sortformer(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float,
     except ModuleNotFoundError as exc:
         raise DependencyMissing("nemo", "nemo-toolkit-asr", cause=exc) from exc
 
-    model = SortformerEncLabelModel.from_pretrained(
-        str(settings.get("diarization_model") or "nvidia/diar_streaming_sortformer_4spk-v2"))
-    model.eval()
-    predictions = model.diarize(audio=str(audio_path), batch_size=1)
+    имя = str(settings.get("diarization_model") or "nvidia/diar_streaming_sortformer_4spk-v2")
+
+    def загрузить() -> Any:
+        model = SortformerEncLabelModel.from_pretrained(имя)
+        model.eval()
+        return model
+
+    запись = model_cache.взять(("sortformer", id(SortformerEncLabelModel), имя), загрузить)
+    with запись.замок:
+        predictions = запись.модель.diarize(audio=str(audio_path), batch_size=1)
     turns: list[tuple[float, float, str]] = []
     for item in predictions or []:
         for entry in (item if isinstance(item, (list, tuple)) else [item]):

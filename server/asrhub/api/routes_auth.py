@@ -10,7 +10,14 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 
-from ..accounts import DEFAULT_PASSWORD, DEFAULT_USERNAME, AccountError, AccountNotFound
+from .. import audit
+from ..accounts import (
+    DEFAULT_PASSWORD,
+    DEFAULT_USERNAME,
+    AccountError,
+    AccountNotFound,
+    поле_да_нет,
+)
 from ..errors import AuthError, ForbiddenError
 from ..logging_setup import get_logger
 from .deps import (
@@ -76,7 +83,11 @@ def login(request: Request, response: Response,
     # 1,1 ГБ, а /api/health отвечал четыре секунды вместо десятой доли.
     # Блокировка учётной записи здесь не помощник: она привязана к
     # существующему логину, а наплыв идёт по выдуманным.
-    адрес = request.client.host if request.client else "неизвестно"
+    # Адрес клиента — за доверенным прокси из его заголовка: за nginx у
+    # всех один адрес, и предел считался общим на всех — чужой подбор
+    # пароля запирал вход каждому (см. `trusted_proxies`).
+    адрес = (audit.адрес(request.headers, request.client,
+                         state.settings.get("trusted_proxies")) or "неизвестно")
     state.check_rate(f"login:{адрес}",
                      int(state.settings.get("login_rate_limit") or 0))
     accounts = _accounts(request)
@@ -94,7 +105,7 @@ def login(request: Request, response: Response,
     token, expires = accounts.open_session(
         account.id,
         user_agent=request.headers.get("user-agent", ""),
-        address=(request.client.host if request.client else ""))
+        address=адрес if адрес != "неизвестно" else "")
     _set_cookie(request, response, token, expires)
     log.info("Вход: %s", account.username)
     return {
@@ -244,9 +255,11 @@ def create_user(request: Request, payload: dict[str, Any] = Body(...),
         str(payload.get("username") or "").strip(),
         str(payload.get("password") or ""),
         role=str(payload.get("role") or "user"),
-        display_name=str(payload.get("display_name") or ""),
-        group=str(payload.get("group") or ""),
-        must_change_password=bool(payload.get("must_change_password", True)))
+        # Как пришло — проверяет `Accounts.create`: `str(...)` превращал
+        # словарь в его запись, а `bool("false")` — в «да».
+        display_name=payload.get("display_name") or "",
+        group=payload.get("group") or "",
+        must_change_password=payload.get("must_change_password", True))
     return account.to_dict()
 
 
@@ -262,9 +275,12 @@ def update_user(user_id: str, request: Request, payload: dict[str, Any] = Body(.
     # Последнего действующего администратора нельзя ни разжаловать, ни
     # отключить: иначе управлять сервером станет некому, и восстанавливать
     # доступ придётся из консоли.
+    # «Отключить» разбирается тем же правилом, что и при записи: строка
+    # «false» здесь проходила мимо (`is False`), а запись её честно
+    # выключала — и последний администратор отключался.
+    выключают = "enabled" in payload and not поле_да_нет("enabled", payload["enabled"])
     losing_admin = (account.role == "admin"
-                    and (payload.get("role") not in (None, "admin")
-                         or payload.get("enabled") is False))
+                    and (payload.get("role") not in (None, "admin") or выключают))
     if losing_admin and accounts.admin_count() <= 1:
         raise ForbiddenError(
             "Это последний администратор — сервером станет некому управлять.",
@@ -279,7 +295,8 @@ def update_user(user_id: str, request: Request, payload: dict[str, Any] = Body(.
     # Пароль меняет администратор без знания старого — это сброс, а не смена.
     if payload.get("password"):
         accounts.set_password(user_id, str(payload["password"]),
-                              must_change=bool(payload.get("must_change_password", True)))
+                              must_change=поле_да_нет("must_change_password",
+                                                      payload.get("must_change_password", True)))
         log.info("Пароль сброшен администратором: %s", updated.username)
         updated = accounts.get(user_id) or updated
     return updated.to_dict()

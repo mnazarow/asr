@@ -1980,6 +1980,15 @@ RENDERERS.dictation = {
           this.partial = '';
           this.paint();
           break;
+        case 'busy':
+          // Модель занята файлом из очереди: звук копится на сервере и
+          // будет распознан, когда она освободится, — это не ошибка.
+          if (message.busy) {
+            this.setStatus('модель занята распознаванием файла — текст догонит', 'warn');
+          } else if (this.session) {
+            this.setStatus('идёт запись', 'ok');
+          }
+          break;
         case 'hint':
           this.hint(message);
           break;

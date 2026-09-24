@@ -138,7 +138,8 @@ def test_грамматики_нормализации_складываются_
     assert каталог.is_dir(), каталог
     assert str(tmp_path) in str(каталог)
 
-    текст = inspect.getsource(postprocess._load_itn)
+    # Загрузка — в `_load_itn_unlocked`, обёртка лишь берёт замок (заход 41).
+    текст = inspect.getsource(postprocess._load_itn_unlocked)
     assert "cache_dir=" in текст, "грамматики снова собираются каждый раз"
 
 

@@ -70,11 +70,18 @@ class WhisperXEngine(Engine):
             self.report(progress, 0.5, "выравнивание таймкодов")
             align_name = str(settings.get("align_model") or "") or _ALIGN_MODELS.get(language, "")
             try:
-                align_model, metadata = whisperx.load_align_model(
-                    language_code=language, device=device,
-                    model_name=align_name or None)
-                raw = whisperx.align(raw["segments"], align_model, metadata, audio, device,
-                                     return_char_alignments=False)
+                from ..pipeline import model_cache  # noqa: PLC0415
+
+                # Один раз на язык и устройство, а не на каждое задание.
+                запись = model_cache.взять(
+                    ("whisperx_align", id(whisperx), language, device, align_name),
+                    lambda: whisperx.load_align_model(
+                        language_code=language, device=device,
+                        model_name=align_name or None))
+                align_model, metadata = запись.модель
+                with запись.замок:
+                    raw = whisperx.align(raw["segments"], align_model, metadata, audio,
+                                         device, return_char_alignments=False)
             except Exception as exc:
                 self.log.warning("Выравнивание не выполнено (%s), используются исходные таймкоды", exc)
 
@@ -93,15 +100,24 @@ class WhisperXEngine(Engine):
                 # строка ошибки в журнале сервера.
                 import inspect  # noqa: PLC0415
 
+                from ..pipeline import model_cache  # noqa: PLC0415
+
                 конвейер = whisperx.diarize.DiarizationPipeline
                 try:
                     параметры = inspect.signature(конвейер).parameters
                 except (TypeError, ValueError):
                     параметры = {}
-                if "use_auth_token" in параметры and "token" not in параметры:
-                    diarize = конвейер(use_auth_token=token, device=device)
-                else:
-                    diarize = конвейер(token=token, device=device)
+
+                def загрузить() -> Any:
+                    if "use_auth_token" in параметры and "token" not in параметры:
+                        return конвейер(use_auth_token=token, device=device)
+                    return конвейер(token=token, device=device)
+
+                # Конвейер диаризации — один на устройство, а не новый на
+                # каждое задание: загрузка pyannote стоит секунды и гигабайт.
+                запись_диаризации = model_cache.взять(
+                    ("whisperx_diarize", id(конвейер), device), загрузить)
+                diarize = запись_диаризации.модель
                 kwargs: dict[str, Any] = {}
                 num = S.integer(settings, "diarization_num_speakers", 0)
                 if num:
@@ -109,7 +125,8 @@ class WhisperXEngine(Engine):
                 else:
                     kwargs["min_speakers"] = int(settings.get("diarization_min_speakers") or 1)
                     kwargs["max_speakers"] = int(settings.get("diarization_max_speakers") or 8)
-                diarized = diarize(audio, **kwargs)
+                with запись_диаризации.замок:
+                    diarized = diarize(audio, **kwargs)
                 raw = whisperx.assign_word_speakers(diarized, raw)
             except GatedModelError:
                 raise

@@ -242,7 +242,7 @@ class _Реестр:
     def get(self, settings):
         return _Движок()
 
-    def lease(self, settings):
+    def lease(self, settings, **_):
         import contextlib
 
         return contextlib.nullcontext(_Движок())
@@ -252,7 +252,8 @@ def test_stream_session_reports_time_to_first_text(tmp_path, monkeypatch):
     from asrhub import streaming
     from asrhub.streaming import SAMPLE_RATE, StreamSession, tone
 
-    monkeypatch.setattr(streaming.StreamSession, "_recognize", lambda self, pcm: "привет мир")
+    monkeypatch.setattr(streaming.StreamSession, "_recognize",
+                        lambda self, pcm, **_: "привет мир")
     сессия = StreamSession(_Реестр(), {"model": "m1", "stream_window_s": 1.0,
                                        "temp_dir": str(tmp_path)})
     assert сессия.start().extra["mode"] == "window"

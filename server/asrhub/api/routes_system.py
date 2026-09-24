@@ -554,6 +554,25 @@ def create_key(request: Request, name: str = Body(embed=True),
             f"Недопустимая роль «{role}».",
             hint="Допустимые роли: admin — полный доступ, user — отправка заданий, "
                  "readonly — только чтение."))
+    # Имя ключа — это и есть его область: по нему ключ видит свои задания.
+    # Два ключа без имени получали одно имя «ключ» и видели задания друг
+    # друга — ровно то, от чего область и заводилась.
+    name = str(name or "").strip()
+    if not name:
+        raise error_response(ConfigError(
+            "Укажите имя ключа.",
+            hint="По имени ключ видит свои задания: два ключа с одним именем "
+                 "делят одну область. Назовите ключ по системе или человеку, "
+                 "которому он выдаётся."))
+    if len(name) > 100:
+        raise error_response(ConfigError("Имя ключа длиннее ста знаков."))
+    тёзки = [info for info in state.settings.api_keys.values()
+             if str(info.get("name") or "ключ") == name]
+    учётка = None
+    try:
+        учётка = state.accounts.by_username(name) if getattr(state, "accounts", None) else None
+    except Exception:                                    # noqa: BLE001
+        учётка = None
     key = "ah_" + secrets.token_urlsafe(24)
     # group объединяет ключи в подразделение: они видят задания друг друга.
     # Квоты нулевые означают «без ограничения» и считаются за скользящие сутки.
@@ -571,13 +590,25 @@ def create_key(request: Request, name: str = Body(embed=True),
     # интерфейс обещает пользователю обратное.
     saved = state.settings.persist_api_keys()
     state.db.add_event(None, "key_created", f"Создан ключ «{name}» с ролью {role}")
-    return {"key": key, "name": name, "role": role, "group": group,
-            "mask_pii": bool(mask_pii),
-            "persisted": saved,
-            "warning": "Ключ показывается один раз — сохраните его."
-                       if saved else
-                       "Ключ показывается один раз. Внимание: файл конфигурации "
-                       "недоступен, поэтому ключ будет действовать только до перезапуска."}
+    ответ: dict[str, Any] = {
+        "key": key, "name": name, "role": role, "group": group,
+        "mask_pii": bool(mask_pii),
+        "persisted": saved,
+        "warning": "Ключ показывается один раз — сохраните его."
+                   if saved else
+                   "Ключ показывается один раз. Внимание: файл конфигурации "
+                   "недоступен, поэтому ключ будет действовать только до перезапуска."}
+    # Одно имя — одна область. Для смены ключа так и задумано (новый ключ
+    # видит задания прежнего), но по ошибке это открывает чужие задания,
+    # поэтому говорим об этом прямо.
+    if тёзки or учётка is not None:
+        ответ["note"] = (
+            f"Имя «{name}» уже носит "
+            + ("другой ключ" if тёзки else "учётная запись")
+            + ": они видят задания друг друга. Если это смена ключа — так и "
+              "задумано, прежний можно отозвать; если нет — отзовите этот и "
+              "создайте с другим именем.")
+    return ответ
 
 
 @router.delete("/keys/{preview}", summary="Отозвать ключ доступа")

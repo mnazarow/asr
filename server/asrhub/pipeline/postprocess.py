@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
 import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -170,7 +171,20 @@ def unload_text_models() -> int:
     return count
 
 
+#: Загрузка моделей постобработки — под замком. Два задания, дошедшие до
+#: пунктуации разом, грузили RUPunct дважды: полторы копии трансформера в
+#: памяти, одна из которых тут же выбрасывалась.
+_ЗАГРУЗКА_МОДЕЛЕЙ = threading.RLock()
+
+
 def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
+    if model in _PUNCT_CACHE:
+        return _PUNCT_CACHE[model]
+    with _ЗАГРУЗКА_МОДЕЛЕЙ:
+        return _load_punctuator_unlocked(model, language)
+
+
+def _load_punctuator_unlocked(model: str, language: str) -> Callable[[str], str] | None:
     # В ключе только выбор модели. Язык добавлять нельзя: загружаемая модель
     # от него не зависит, а при `language: auto` и разноязычном потоке каждый
     # новый определившийся язык добавлял ещё одну полную копию того же
@@ -494,6 +508,14 @@ _SCALES_RU = {"тысяча": 1000, "тысячи": 1000, "тысяч": 1000, "�
 
 
 def _load_itn(backend: str, language: str):
+    key = f"{backend}:{language}"
+    if key in _ITN_CACHE:
+        return _ITN_CACHE[key]
+    with _ЗАГРУЗКА_МОДЕЛЕЙ:
+        return _load_itn_unlocked(backend, language)
+
+
+def _load_itn_unlocked(backend: str, language: str):
     # Язык здесь значим: InverseNormalizer(lang=...) создаётся под конкретный
     # язык. Но число языков ограничиваем — иначе кеш растёт без предела.
     key = f"{backend}:{language}"
@@ -709,12 +731,6 @@ def _кеш_грамматик() -> str:
     return str(путь)
 
 
-#: Слова, где «ё» обязана остаться: без неё меняется смысл, а не написание.
-#: Список короткий намеренно — он про смысл, а не про орфографию.
-_Ё_ЗНАЧИМА = ("все", "всё", "небо", "нёбо", "узнаем", "узнаём",
-              "передохнем", "передохнём")
-
-
 def без_ё(text: str) -> str:
     """«ё» → «е». Нужно перед грамматиками NeMo.
 
@@ -732,6 +748,42 @@ def без_ё(text: str) -> str:
     return text.replace("ё", "е").replace("Ё", "Е")
 
 
+def вернуть_ё(исходный: str, подано: str, итог: str) -> str:
+    """Возвращает «ё» в слова, которых нормализация не касалась.
+
+    В грамматику уходит текст без «ё» (см. `без_ё`), и прежде, стоило
+    нормализации поменять в реплике хоть одно число, возвращался весь её
+    ответ — без единой «ё». «Всё будет готово через двадцать пять минут,
+    ещё раз…» превращалось в «Все будет готово через 25 минут, еще раз…»,
+    а «всё» и «все», «её» и «ее» — разные слова.
+
+    Слова сопоставляются выравниванием: всё, что нормализация оставила как
+    было, берётся из исходного текста вместе с «ё», а изменённое (числа,
+    сокращения) — из её ответа.
+    """
+    if "ё" not in исходный and "Ё" not in исходный:
+        return итог
+    было, без, стало = исходный.split(), подано.split(), итог.split()
+    if len(было) != len(без):
+        return итог
+    import difflib  # noqa: PLC0415
+
+    out = list(стало)
+    сопоставление = difflib.SequenceMatcher(a=без, b=стало, autojunk=False)
+    for вид, i1, i2, j1, j2 in сопоставление.get_opcodes():
+        if вид == "equal":
+            for k in range(i2 - i1):
+                out[j1 + k] = было[i1 + k]
+        elif вид == "replace":
+            # Слово внутри изменённого куска могло остаться прежним — тогда
+            # и «ё» в нём прежняя.
+            прежние = {без[i]: было[i] for i in range(i1, i2)}
+            for j in range(j1, j2):
+                if out[j] in прежние:
+                    out[j] = прежние[out[j]]
+    return " ".join(out)
+
+
 def apply_itn(text: str, backend: str = "auto", language: str = "ru") -> str:
     if not text.strip():
         return text
@@ -746,6 +798,9 @@ def apply_itn(text: str, backend: str = "auto", language: str = "ru") -> str:
             итог = normalize_spaces(fn(подано))
             if language == "ru" and итог.strip() == подано.strip():
                 return normalize_spaces(text)
+            if language == "ru":
+                return normalize_spaces(вернуть_ё(normalize_spaces(text),
+                                                  normalize_spaces(подано), итог))
             return итог
         except Exception as exc:
             log.warning("Нормализация чисел дала сбой (%s), применено встроенное правило", exc)
@@ -835,6 +890,27 @@ def filter_profanity(text: str, mode: str = "off") -> tuple[str, int]:
 
     result = pattern.sub(_replace, text)
     return normalize_spaces(result), hits
+
+
+def _слова_без_мата(слова: list[Any], mode: str) -> list[Any]:
+    """Пословные метки после фильтра: то же правило, что и для текста."""
+    итог: list[Any] = []
+    for слово in слова:
+        if not isinstance(слово, dict):
+            итог.append(слово)
+            continue
+        поле = "word" if "word" in слово else ("text" if "text" in слово else None)
+        if поле is None:
+            итог.append(слово)
+            continue
+        значение, n = filter_profanity(str(слово.get(поле) or ""), mode)
+        if not n:
+            итог.append(слово)
+            continue
+        if mode == "remove" or not значение.strip():
+            continue
+        итог.append({**слово, поле: значение})
+    return итог
 
 
 # --------------------------------------------------------------------------
@@ -1001,6 +1077,11 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
         for seg in segments:
             seg["text"], n = filter_profanity(seg["text"], mode)
             total += n
+            # И в пословных метках: JSON выгружает `words` по умолчанию, и
+            # при маскировании текста исходные слова оставались в
+            # `words[].word` — фильтр работал только для глаз.
+            if n and seg.get("words"):
+                seg["words"] = _слова_без_мата(seg["words"], mode)
         stats["profanity_hits"] = total
 
     segments = [s for s in segments if s.get("text", "").strip()]

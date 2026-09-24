@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import ASRHubError, AudioError, ConfigError, EngineError
+from .errors import ASRHubError, AudioError, ConfigError, EngineBusy, EngineError
 from .logging_setup import get_logger
 
 log = get_logger("streaming")
@@ -59,6 +59,17 @@ MAX_TAIL_S = 30.0
 #: Доля, которой пишут в ffmpeg. Меньше трубы вывода, чтобы между записями
 #: успевал сработать читающий поток.
 _WRITE_CHUNK = 1 << 15
+
+#: Сколько ждать модель, занятую файлом из очереди, прежде чем пропустить
+#: гипотезу или закрепление (звук при этом не теряется — он копится).
+#: Файловое задание держит модель всё распознавание, и без предела поток
+#: висел до конца файла, занимая поток сервера — тот же пул, что нужен
+#: приёму файлов.
+ОЖИДАНИЕ_ОКНА_С = 2.0
+
+#: Сколько ждать модель на завершении сессии: человек нажал «Остановить» и
+#: ждёт итог, поэтому здесь терпения больше, но не бесконечно.
+ОЖИДАНИЕ_ИТОГА_С = 120.0
 
 
 @dataclass(slots=True)
@@ -98,6 +109,7 @@ class _Decoder:
         self._out = bytearray()
         self._eof = False
         self._lock = threading.Lock()
+        self._остаток = b""              # половина отсчёта до следующего куска
         if source_format not in ("pcm_s16le", "auto"):
             raise ConfigError(
                 f"Неизвестный формат потока «{source_format}».",
@@ -110,9 +122,24 @@ class _Decoder:
                 hint="Установите ffmpeg или присылайте сырой звук: "
                      "format=pcm_s16le, моно 16 кГц, 16 бит.")
 
+    def _выровнять(self, data: bytes) -> bytes:
+        """Отдаёт только целые отсчёты, лишний байт ждёт следующего куска.
+
+        Отсчёт — два байта, а кадр WebSocket или порция из трубы ffmpeg
+        могут кончиться посреди отсчёта. Нечётный кусок сдвигал весь
+        дальнейший поток на байт: младшие байты становились старшими, и
+        движок до конца сессии распознавал шум.
+        """
+        остаток = getattr(self, "_остаток", b"")
+        if остаток:
+            data = остаток + data
+        ровно = len(data) - (len(data) % 2)
+        self._остаток = data[ровно:]
+        return data[:ровно]
+
     def feed(self, chunk: bytes) -> bytes:
         if self.format == "pcm_s16le":
-            return chunk
+            return self._выровнять(chunk)
         if self._process is None:
             self._start()
         assert self._process is not None and self._process.stdin is not None
@@ -129,7 +156,7 @@ class _Decoder:
             raise AudioError("Поток ffmpeg оборвался.",
                              hint="Проверьте, что присылаете один непрерывный "
                                   "контейнер, а не отдельные файлы.") from exc
-        return self._take()
+        return self._выровнять(self._take())
 
     def _start(self) -> None:
         self._process = subprocess.Popen(
@@ -183,7 +210,7 @@ class _Decoder:
         if self._reader is not None:
             self._reader.join(timeout=5)
             self._reader = None
-        tail = self._take()
+        tail = self._выровнять(self._take())
         self._process = None
         return tail
 
@@ -310,6 +337,8 @@ class StreamSession:
 
         try:
             text = self._recognize(bytes(self._pcm))
+        except EngineBusy as exc:
+            return self._занята(exc)
         except ASRHubError as exc:
             # Промежуточный результат — вещь необязательная: не посчитался,
             # и ладно, следующее окно посчитает. Ронять из-за него сессию
@@ -317,12 +346,29 @@ class StreamSession:
             log.info("Промежуточное распознавание пропущено: %s", exc.message)
             return []
 
+        события = self._освободилась()
         if text and text != self._last_partial:
             self._last_partial = text
             self._note_first_text()
-            return [StreamEvent("partial", text=text,
-                                start=self._committed_s, end=self.duration_s)]
-        return []
+            события.append(StreamEvent("partial", text=text,
+                                       start=self._committed_s, end=self.duration_s))
+        return события
+
+    def _занята(self, exc: EngineBusy) -> list[StreamEvent]:
+        """Модель занята файлом: говорим клиенту один раз, звук копим."""
+        if getattr(self, "_занято", False):
+            return []
+        self._занято = True
+        log.info("Поток ждёт модель: %s", exc.message)
+        return [StreamEvent("busy", extra={"busy": True, "message": exc.message,
+                                           "hint": exc.hint})]
+
+    def _освободилась(self) -> list[StreamEvent]:
+        """Модель снова отвечает — снимаем «занято» у клиента."""
+        if not getattr(self, "_занято", False):
+            return []
+        self._занято = False
+        return [StreamEvent("busy", extra={"busy": False})]
 
     def _подсказать(self, events: list[StreamEvent]) -> list[StreamEvent]:
         """Добавляет к закреплённому тексту подсказки оператору.
@@ -383,6 +429,11 @@ class StreamSession:
             return []
         try:
             text = self._recognize(bytes(self._pcm[:cut]))
+        except EngineBusy as exc:
+            # Модель занята файлом — звук остаётся в хвосте и закрепится,
+            # когда она освободится. Это не ошибка сессии: раньше на каждом
+            # окне клиент получал `error`, пока идёт файл из очереди.
+            return self._занята(exc)
         except ASRHubError as exc:
             # Звук НЕ выбрасываем. Раньше `_recognize` глотал любое
             # исключение и отвечал пустой строкой, а хвост удалялся в любом
@@ -397,11 +448,12 @@ class StreamSession:
         del self._pcm[:cut]
         self._committed_s = end
         self._last_partial = ""
+        события = self._освободилась()
         if not text:
-            return []
+            return события
         self._note_first_text()
         self._final_text = (self._final_text + " " + text).strip()
-        return self._подсказать(
+        return события + self._подсказать(
             [StreamEvent("final", text=text, start=start, end=end)])
 
     def finish(self) -> list[StreamEvent]:
@@ -420,8 +472,23 @@ class StreamSession:
         if self._native is not None:
             events.extend(self._finish_native())
         else:
-            text = self._recognize(bytes(self._pcm))
             start = self._committed_s
+            try:
+                text = self._recognize(bytes(self._pcm), ждать_с=ОЖИДАНИЕ_ИТОГА_С)
+            except EngineBusy as exc:
+                # Итог ждём дольше окна, но не бесконечно: поток сервера
+                # нужен и другим. Сказать, сколько звука осталось без
+                # текста, — честнее, чем молча отдать неполный итог.
+                хвост_с = len(self._pcm) / (SAMPLE_RATE * 2)
+                log.warning("Итог потока не распознан — модель занята: %s", exc.message)
+                events.append(StreamEvent("error", extra={
+                    "message": (f"Модель занята распознаванием файла дольше "
+                                f"{ОЖИДАНИЕ_ИТОГА_С / 60:.0f} мин — последние "
+                                f"{хвост_с:.0f} с речи не распознаны."),
+                    "hint": exc.hint}))
+                text = ""
+            else:
+                events.extend(self._освободилась())
             if text:
                 self._note_first_text()
                 self._final_text = (self._final_text + " " + text).strip()
@@ -473,13 +540,20 @@ class StreamSession:
         if not text or (kind == "partial" and text == self._last_partial):
             return []
         self._note_first_text()
+        # Начало куска — там, где кончился прошлый закреплённый: прежде у
+        # каждого `final` стояло start=0.0, и клиент, раскладывающий текст
+        # по времени (субтитры, привязка к записи), складывал все фразы в
+        # начало разговора.
+        начало = self._committed_s
         if kind == "final":
             self._final_text = (self._final_text + " " + text).strip()
             self._last_partial = ""
+            конец = self.duration_s
+            self._committed_s, self._native_bytes = конец, 0
             return self._подсказать(
-                [StreamEvent("final", text=text, start=0.0, end=self.duration_s)])
+                [StreamEvent("final", text=text, start=начало, end=конец)])
         self._last_partial = text
-        return [StreamEvent("partial", text=text, start=0.0, end=self.duration_s)]
+        return [StreamEvent("partial", text=text, start=начало, end=self.duration_s)]
 
     def _finish_native(self) -> list[StreamEvent]:
         try:
@@ -504,19 +578,32 @@ class StreamSession:
             [StreamEvent("final", text=text, start=self._committed_s,
                          end=self.duration_s)])
 
-    def _recognize(self, pcm: bytes) -> str:
-        """Распознаёт накопленный звук целиком — путь скользящего окна."""
+    def _recognize(self, pcm: bytes, *, ждать_с: float = ОЖИДАНИЕ_ОКНА_С) -> str:
+        """Распознаёт накопленный звук целиком — путь скользящего окна.
+
+        Модель берётся с пределом ожидания: если её держит файл из очереди,
+        то либо поднимается второй экземпляр (`stream_separate_engine`),
+        либо вызывающий получает `EngineBusy` и копит звук дальше.
+        """
         if len(pcm) < SAMPLE_RATE:          # меньше полусекунды — не о чем говорить
             return ""
         path = self.workdir / f"stream-{id(self)}.wav"
+        отдельный = bool(self.settings.get("stream_separate_engine", True))
         try:
             with wave.open(str(path), "wb") as handle:
                 handle.setnchannels(1)
                 handle.setsampwidth(2)
                 handle.setframerate(SAMPLE_RATE)
                 handle.writeframes(pcm)
-            with self.registry.lease(self.settings) as engine:
+            with self.registry.lease(
+                    self.settings,
+                    # Со вторым экземпляром ждать основной почти незачем:
+                    # полсекунды — чтобы не поднимать его из-за мгновения.
+                    wait_s=min(0.5, ждать_с) if отдельный else ждать_с,
+                    отдельный_если_занят=отдельный) as engine:
                 result = engine.transcribe(path, self.settings, None)
+        except EngineBusy:
+            raise
         except ASRHubError as exc:
             log.info("Распознавание куска не удалось: %s", exc.message)
             raise

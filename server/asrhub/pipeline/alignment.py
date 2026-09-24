@@ -190,12 +190,20 @@ def _align_whisperx(audio_path: Path, segments: list[Any], settings: Any) -> lis
     if language in ("auto", ""):
         language = next((s.language for s in segments if getattr(s, "language", None)), "ru")
 
-    model, meta = whisperx.load_align_model(language_code=language, device=device)
+    from . import model_cache  # noqa: PLC0415
+
+    # Модель выравнивания грузится один раз на язык и устройство — раньше
+    # заново на каждое задание и на каждый канал стереозаписи.
+    запись = model_cache.взять(
+        ("whisperx_align", id(whisperx), language, device, ""),
+        lambda: whisperx.load_align_model(language_code=language, device=device))
+    model, meta = запись.модель
     payload = [{"start": float(s.start), "end": float(s.end), "text": s.text}
                for s in segments]
     audio = whisperx.load_audio(str(audio_path))
-    aligned = whisperx.align(payload, model, meta, audio, device,
-                             return_char_alignments=False)
+    with запись.замок:
+        aligned = whisperx.align(payload, model, meta, audio, device,
+                                 return_char_alignments=False)
 
     words: list[dict[str, Any]] = []
     for item in aligned.get("segments", []):

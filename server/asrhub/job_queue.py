@@ -32,8 +32,8 @@ from .engines import EngineRegistry
 from .errors import (
     ASRHubError,
     ConfigError,
+    JobCancelled,
     JobNotFound,
-    JobTimeout,
     OutOfMemoryError,
     QueueFull,
     StorageError,
@@ -62,6 +62,18 @@ INSTANCE_ID = _INSTANCE_ID
 #: с запасом покрывают паузу на выгрузке большой модели: отметка ставится
 #: на каждом шаге конвейера, а самый долгий из них — загрузка весов.
 STALE_AFTER_S = 300.0
+
+#: Как часто отдельный поток подтверждает, что идущие задания живы.
+#:
+#: Раньше отметку ставил только обработчик прогресса, а шагов, которые идут
+#: без прогресса дольше пяти минут, хватает: второй воркер ждёт, пока
+#: первый дочитает длинный файл той же моделью; подготовка двухчасовой
+#: записи — один вызов ffmpeg; половина движков сообщает прогресс только в
+#: начале и в конце. Сосед на общей базе принимал живое задание за
+#: брошенное, возвращал его в очередь и считал второй раз, а после пары
+#: таких кругов снимал с «instance_lost» — задание, которое всё это время
+#: честно считалось.
+HEARTBEAT_S = 30.0
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -270,8 +282,45 @@ class JobQueue:
         #: вопрос «хватит ли карты».
         self._concurrency: dict[str, int] = {}
         self._model_counts: dict[str, int] = {}
-        self._max_queue = int(getattr(settings, "get", lambda *_: 1000)("max_queue_size", 1000) or 1000)
+        #: Задания, которые этот процесс сейчас действительно считает, — уже
+        #: захваченные в базе. Не то же самое, что `_running`: туда задание
+        #: попадает раньше захвата, и отметка жизни по нему сочла бы
+        #: незахваченное задание отобранным.
+        self._идут: set[str] = set()
         self._started = False
+
+    @property
+    def _max_queue(self) -> int:
+        """Предел очереди — из настроек в момент приёма, а не при запуске.
+
+        Значение читалось один раз в конструкторе: предел, изменённый через
+        PUT /api/settings, не действовал до перезапуска — при пределе 2
+        принимались четыре задания, а /api/queue показывал прежнюю тысячу.
+        """
+        получить = getattr(self.settings, "get", None)
+        if получить is None:
+            return 1000
+        try:
+            return max(1, int(получить("max_queue_size", 1000) or 1000))
+        except (TypeError, ValueError):
+            return 1000
+
+    def _предел_повторов(self, job: dict[str, Any]) -> int:
+        """Сколько повторов положено заданию.
+
+        Своё значение задания — не больше серверного и с честным нулём:
+        `int(params.get("max_retries") or сервер)` превращал «без повторов»
+        у задания в серверные два.
+        """
+        настройки = getattr(self, "settings", None)
+        сервер = max(0, S.integer(настройки, "max_retries", 2)) if настройки is not None else 2
+        своё = (job.get("params") or {}).get("max_retries")
+        if своё is None or своё == "":
+            return сервер
+        try:
+            return max(0, min(int(своё), сервер))
+        except (TypeError, ValueError):
+            return сервер
 
     # --- запуск и остановка ---------------------------------------------
 
@@ -290,10 +339,27 @@ class JobQueue:
         janitor = threading.Thread(target=self._janitor_loop, name="asrhub-janitor", daemon=True)
         janitor.start()
         self._workers.append(janitor)
+        # Отметка жизни — своим потоком, а не в служебном цикле: у того
+        # бывают долгие шаги (снятие копии базы, уборка), и отметка за ними
+        # опаздывала бы ровно так же, как опаздывала за долгими шагами
+        # конвейера.
+        heartbeat = threading.Thread(target=self._heartbeat_loop,
+                                     name="asrhub-heartbeat", daemon=True)
+        heartbeat.start()
+        self._workers.append(heartbeat)
         self._started = True
         log.info("Очередь запущена: воркеров %d", count)
 
     def stop(self, timeout: float = 10.0) -> None:
+        """Останавливает очередь. Недосчитанное возвращается без траты попытки.
+
+        Идущие задания узнают об остановке на ближайшей проверке отмены и
+        сами встают обратно в очередь. Те, что сидят внутри долгого вызова
+        движка и проверку не проходят, возвращаются отсюда, когда истечёт
+        ожидание. Раньше они оставались «выполняется» до следующего запуска,
+        и тот считал их потерянными — то есть плановое обновление сервера
+        тратило попытку у каждого идущего задания.
+        """
         self._stop.set()
         with self._lock:
             pool, self._webhooks = self._webhooks, None
@@ -302,8 +368,31 @@ class JobQueue:
         self._wake.set()
         for thread in self._workers:
             thread.join(timeout=timeout / max(1, len(self._workers)))
+        try:
+            возвращено = self._вернуть_свои_при_остановке()
+            if возвращено:
+                log.info("Возвращено в очередь при остановке: %d", возвращено)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Идущие задания не возвращены в очередь при остановке: %s", exc)
         self._started = False
         log.info("Очередь остановлена")
+
+    def _вернуть_в_очередь_без_попытки(self, job_id: str) -> bool:
+        """Своё идущее задание — обратно в очередь, счётчик повторов не трогаем."""
+        вернулось = self.db.update_job_if_status(
+            job_id, [STATUS_RUNNING], expected_instance=INSTANCE_ID,
+            status=STATUS_QUEUED, stage="возвращено в очередь", progress=0.0,
+            started_at=None, instance_id=None, heartbeat_at=None, queued_at=now())
+        if вернулось:
+            self.db.add_event(job_id, "requeued",
+                              "Сервер остановлен штатно — задание вернётся в очередь "
+                              "без траты попытки")
+        return вернулось
+
+    def _вернуть_свои_при_остановке(self) -> int:
+        with self._lock:
+            свои = list(self._идут)
+        return sum(1 for job_id in свои if self._вернуть_в_очередь_без_попытки(job_id))
 
     def recover(self) -> int:
         """Возвращает в очередь задания, оставшиеся в состоянии «выполняется».
@@ -316,6 +405,13 @@ class JobQueue:
         сбрасывал прогресс всех соседей и запускал их задания второй раз —
         двойная оплата видеокарты и два одинаковых уведомления заказчику,
         то есть ровно то, что неделимый захват и должен был исключить.
+
+        Возврат — это попытка, и она считается, как у брошенных заданий
+        соседей. Иначе запись, на которой процесс падает сам (убит по
+        нехватке памяти, сбой в нативной библиотеке), крутилась по кругу:
+        перезапуск службы — задание снова первым — снова падение, и так без
+        конца, без единой записи об ошибке. Плановая остановка попытку не
+        тратит: свои задания она возвращает в очередь сама (см. `stop`).
         """
         total = 0
         while True:
@@ -341,17 +437,48 @@ class JobQueue:
             if not stuck:
                 break
             for job in stuck:
-                self.db.update_job(job["id"], status=STATUS_QUEUED, stage="",
-                                   progress=0.0, started_at=None,
-                                   instance_id=None, heartbeat_at=None)
-                self.db.add_event(job["id"], "recovered",
-                                  "Задание возвращено в очередь после перезапуска сервера")
+                self._подобрать_после_перезапуска(str(job["id"]))
             total += len(stuck)
             if len(кандидаты) < 1000:
                 break
         if total:
             log.warning("Возвращено в очередь после перезапуска: %d заданий", total)
         return total
+
+    def _подобрать_после_перезапуска(self, job_id: str) -> None:
+        """Одно своё задание, оставшееся «выполняется»: в очередь или в ошибку."""
+        строка = self.db.get_job(job_id) or {}
+        retries = int(строка.get("retries") or 0)
+        предел = self._предел_повторов(строка)
+        if retries >= предел:
+            снято = self.db.update_job_if_status(
+                job_id, [STATUS_RUNNING],
+                status=STATUS_FAILED, finished_at=now(), stage="ошибка",
+                progress=0.0, instance_id=None, heartbeat_at=None,
+                error_code="instance_lost",
+                error_message=(f"Сервер перезапускался посреди этого задания "
+                               f"{retries + 1} раз подряд — оно снято."),
+                error_hint=("Похоже, процесс падает на этой записи: чаще всего "
+                            "это нехватка памяти или сбой в библиотеке движка. "
+                            "Посмотрите журнал сервера за время перезапуска "
+                            "(journalctl -u asrhub). Повторить вручную: "
+                            "POST /api/jobs/{id}/retry"))
+            if снято:
+                log.error("Задание %s снято: сервер перезапускался на нём %d раз подряд",
+                          job_id, retries + 1, extra={"job_id": job_id})
+                self.db.add_event(job_id, "failed",
+                                  f"Задание снято: сервер перезапускался посреди него "
+                                  f"{retries + 1} раз подряд")
+            return
+        вернулось = self.db.update_job_if_status(
+            job_id, [STATUS_RUNNING],
+            status=STATUS_QUEUED, stage="", progress=0.0, started_at=None,
+            instance_id=None, heartbeat_at=None, retries=retries + 1,
+            queued_at=now())
+        if вернулось:
+            self.db.add_event(job_id, "recovered",
+                              f"Задание возвращено в очередь после перезапуска сервера "
+                              f"(попытка {retries + 1} из {предел})")
 
     # --- добавление -----------------------------------------------------
 
@@ -382,18 +509,7 @@ class JobQueue:
 
         digest = file_hash(path)
         spec = get_model(str(settings.get("model") or ""))
-        # Отпечаток весов входит в ключ кеша: без него обновление модели под
-        # тем же именем отдавало старый результат как свежий, и понять это
-        # было нельзя ни по ответу, ни по карточке задания.
-        weights = ""
-        if spec is not None:
-            try:
-                weights = model_files.fingerprint(
-                    self.settings.get("models_dir") or self.settings.paths.models,
-                    spec.source)
-            except OSError as exc:
-                log.debug("Отпечаток весов «%s» не снят: %s", spec.id, exc)
-        params_digest = settings_digest(settings, weights=weights)
+        params_digest = settings_digest(settings, weights=self._отпечаток_весов(spec))
 
         duration = 0.0
         try:
@@ -401,9 +517,13 @@ class JobQueue:
         except ASRHubError as exc:
             log.info("Не удалось определить длительность «%s»: %s", filename, exc.message)
 
-        # Кеш результатов по содержимому и настройкам
+        # Кеш результатов по содержимому и настройкам — только среди своих
+        # заданий. Общий на всех кеш говорил Бобу, что такую же запись уже
+        # присылал кто-то другой (задание готово мгновенно, стадия «из
+        # кеша»), а клон приносил файлы результата под именем первого
+        # загрузившего — «+79161234567 Иванов Пётр.json» вместо «my.json».
         if settings.get("deduplicate_jobs", True):
-            cached = self._find_cached(digest, params_digest)
+            cached = self._find_cached(digest, params_digest, owner=owner)
             if cached is not None:
                 job_id = self._clone_cached(cached, filename, str(path), owner,
                                             group_id, settings, webhook_url,
@@ -416,6 +536,11 @@ class JobQueue:
                 # ждала колбэка до собственного тайм-аута.
                 if webhook_url:
                     self._send_webhook(job_id)
+                # «Удалять исходник после обработки» действует и здесь:
+                # задание из кеша тоже обработано, а загрузка оставалась в
+                # uploads навсегда — уборка по сроку файл задания не трогает.
+                if settings.get("delete_source_after"):
+                    self._удалить_исходник(self.get(job_id))
                 return self.get(job_id)
 
         # Секреты сервера в параметры задания не уносятся: параметры видит
@@ -453,14 +578,35 @@ class JobQueue:
         self._wake.set()
         return self.get(job_id)
 
-    def _find_cached(self, file_digest: str, params_digest: str) -> dict[str, Any] | None:
+    def _отпечаток_весов(self, spec: Any) -> str:
+        """Отпечаток файлов модели для ключа кеша (см. `model_files.fingerprint`).
+
+        Отпечаток весов входит в ключ кеша: без него обновление модели под
+        тем же именем отдавало старый результат как свежий, и понять это
+        было нельзя ни по ответу, ни по карточке задания. Ревизия — часть
+        отпечатка: у GigaAM варианты модели лежат рядом (`v3_ctc.ckpt`,
+        `v3_rnnt.ckpt`), и без неё брался первый по алфавиту — обновление
+        весов модели по умолчанию отпечаток не меняло.
+        """
+        if spec is None:
+            return ""
+        try:
+            return model_files.fingerprint(
+                self.settings.get("models_dir") or self.settings.paths.models,
+                spec.source, getattr(spec, "revision", "") or "")
+        except OSError as exc:
+            log.debug("Отпечаток весов «%s» не снят: %s", spec.id, exc)
+            return ""
+
+    def _find_cached(self, file_digest: str, params_digest: str, *,
+                     owner: str | None = None) -> dict[str, Any] | None:
         """Ищет готовый результат для той же записи с теми же настройками.
 
         Поиск идёт запросом по индексу, а не перебором последних заданий:
         при потоке больше полусотни файлов перебор просто не находил
         совпадений, и дедупликация тихо переставала работать.
         """
-        cached = self.db.find_cached(file_digest, params_digest)
+        cached = self.db.find_cached(file_digest, params_digest, owner=owner)
         if cached is None:
             return None
         # Результаты могли быть удалены очисткой, а запись остаться:
@@ -501,7 +647,9 @@ class JobQueue:
         })
         # Копируем каталог результатов, а не ссылаемся на чужой: иначе
         # удаление любого из двух заданий уничтожало результаты второго.
-        result_path = self._copy_results(cached.get("result_path"), job_id)
+        result_path = self._copy_results(
+            cached.get("result_path"), job_id,
+            прежнее_имя=str(cached.get("filename") or cached["id"]), новое_имя=filename)
         self.db.update_job(
             job_id,
             status=STATUS_COMPLETED,
@@ -568,8 +716,15 @@ class JobQueue:
             raise JobNotFound(f"Задание «{job_id}» не найдено.")
         return job
 
-    def _copy_results(self, source: str | None, job_id: str) -> str | None:
-        """Копирует каталог результатов для задания, отданного из кеша."""
+    def _copy_results(self, source: str | None, job_id: str, *,
+                      прежнее_имя: str = "", новое_имя: str = "") -> str | None:
+        """Копирует каталог результатов для задания, отданного из кеша.
+
+        Файлы результата названы по имени записи, и копия носила имя первого
+        загрузившего: скачивание отдавало «_79161234567 Иванов Пётр.json» тому,
+        кто прислал «my.wav». Скопированные файлы переименовываются под своё
+        задание — так же, как их назвала бы выгрузка.
+        """
         if not source:
             return None
         origin = Path(source)
@@ -581,6 +736,20 @@ class JobQueue:
         except OSError as exc:
             log.warning("Не удалось скопировать результаты из кеша: %s", exc)
             return str(origin)          # хуже, чем копия, но лучше, чем ничего
+        if прежнее_имя and новое_имя:
+            from .pipeline.export import safe_basename  # noqa: PLC0415
+
+            было = safe_basename(Path(прежнее_имя).stem)
+            стало = safe_basename(Path(новое_имя).stem)
+            if было != стало:
+                for файл in list(target.iterdir()):
+                    if файл.is_file() and файл.name.startswith(было + "."):
+                        новый = target / (стало + файл.name[len(было):])
+                        try:
+                            if not новый.exists():
+                                файл.rename(новый)
+                        except OSError as exc:
+                            log.debug("Файл %s из кеша не переименован: %s", файл.name, exc)
         return str(target)
 
     def cancel(self, job_id: str, by: str = "user") -> dict[str, Any]:
@@ -654,11 +823,32 @@ class JobQueue:
             raise ConfigError(
                 "Задание ещё распознаётся — повторять его сейчас незачем.",
                 hint="Дождитесь окончания или отмените задание, потом повторите.")
+        # Повтор без записи обречён: задание уходило в очередь, занимало
+        # место в ней и заканчивалось «Повторное распознавание не удалось»
+        # — а «Распознать архив заново» ставило так тысячи записей, которые
+        # АТС уже удалила по сроку хранения. Говорим сразу и понятно.
+        if str(job.get("source") or "") == "text":
+            raise ConfigError(
+                "Это переписка, а не запись: распознавать заново нечего.",
+                hint="Разбор переписки пересчитывается в карточке записи: "
+                     "«Пересчитать» в разделе аналитики.")
+        исходник = str(job.get("file_path") or "")
+        if not исходник or not Path(исходник).is_file():
+            raise ConfigError(
+                f"Исходной записи «{job.get('filename') or job_id}» больше нет на "
+                f"сервере — распознать её заново нельзя.",
+                hint="Запись удалила уборка по сроку хранения, настройка «Удалять "
+                     "исходник после обработки» или сама АТС. Прежний результат "
+                     "остаётся на месте; чтобы распознать заново, загрузите файл ещё раз.")
         params = Settings.для_задания(job.get("params"))
         if overrides:
             params.update(overrides)
         params.pop("_hash", None)
-        params["_hash"] = settings_digest(params)
+        # Отпечаток — так же, как при постановке, вместе с весами модели:
+        # без них отпечаток повторённого задания не совпадал ни с одной новой
+        # загрузкой, и кеш по такому заданию не срабатывал никогда.
+        params["_hash"] = settings_digest(
+            params, weights=self._отпечаток_весов(get_model(str(params.get("model") or ""))))
         self._отложить_прежний(job)
         # Счётчик повторов — заново: ручной повтор начинает новую попытку.
         # Без сброса первая же нехватка памяти после ручного повтора давала
@@ -1009,24 +1199,36 @@ class JobQueue:
         paths = self.settings.paths
         workdir = safe_workdir(paths.tmp, job_id)
         outdir = paths.results / job_id
-        timeout = int(merged.get("job_timeout_s") or 0)
+        timeout = max(0, S.integer(merged, "job_timeout_s", 0))
         started = time.time()
 
         def progress(value: float, stage: str) -> None:
+            # Полоса только вперёд: этапы конвейера и движки докладывают
+            # долю каждый по-своему, и откат с 0,82 на 0,80 выглядел как
+            # «задание пошло назад».
+            value = max(float(value), state.progress)
             state.progress = value
             state.stage = stage
-            # heartbeat_at обновляется вместе с прогрессом: по нему другой
-            # экземпляр понимает, что задание живо, а не брошено умершим
-            # процессом. Отдельного потока для этого не нужно — шаги
-            # конвейера и так идут чаще, чем срок устаревания.
-            self.db.update_job(job_id, progress=round(value, 4), stage=stage,
-                               heartbeat_at=now())
+            # Запись — только пока задание за нами. Безусловная запись
+            # переписывала стадию и прогресс уже отменённого задания: отмена,
+            # пришедшая на соседний сервер, жила только в памяти его
+            # процесса, а этот досчитывал до конца, превращая «отменено» в
+            # «распознавание, 76 %». Не записалось — задание больше не наше:
+            # останавливаемся на ближайшей проверке отмены.
+            своё = self.db.update_job_if_status(
+                job_id, [STATUS_RUNNING], expected_instance=INSTANCE_ID,
+                progress=round(value, 4), stage=stage, heartbeat_at=now())
+            if not своё:
+                self._отобрано(job_id)
+                return
             self._emit("job.progress", {"id": job_id, "progress": round(value, 4),
                                         "stage": stage})
 
         def cancelled() -> bool:
-            if timeout and (time.time() - started) > timeout:
-                raise JobTimeout(timeout)
+            # Остановка сервера — тоже повод прерваться: задание вернётся в
+            # очередь без траты попытки (см. `_handle_failure`).
+            if self._stop.is_set():
+                return True
             with self._lock:
                 return job_id in self._cancelled
 
@@ -1052,12 +1254,44 @@ class JobQueue:
         # замер оказался бы заниженным.
         with self._lock:
             одно = len(self._running) <= 1
+            self._идут.add(job_id)
+        try:
+            self._execute_claimed(job, state, merged, workdir=workdir, outdir=outdir,
+                                  timeout=timeout, started=started, одно=одно,
+                                  progress=progress, cancelled=cancelled)
+        finally:
+            with self._lock:
+                self._идут.discard(job_id)
+                # Исполнение кончилось — пометка отмены больше ничего не
+                # значит. Отметка жизни могла поставить её в последний миг,
+                # между записью «готово» и этой строкой.
+                self._cancelled.discard(job_id)
+
+    def _отобрано(self, job_id: str) -> None:
+        """Задание больше не за нами: его отменили на соседнем сервере,
+        удалили или отдали другому экземпляру. Останавливаем конвейер на
+        ближайшей проверке отмены."""
+        with self._lock:
+            if job_id not in self._идут or job_id in self._cancelled:
+                return
+            self._cancelled.add(job_id)
+        log.info("Задание %s больше не за этим сервером — обработка прерывается",
+                 job_id, extra={"job_id": job_id})
+
+    def _execute_claimed(self, job: dict[str, Any], state: WorkerState,
+                         merged: dict[str, Any], *, workdir: Path, outdir: Path,
+                         timeout: int, started: float, одно: bool,
+                         progress: Callable[[float, str], None],
+                         cancelled: Callable[[], bool]) -> None:
+        job_id = job["id"]
         try:
             outcome = process_job(
                 Path(job["file_path"]), merged, self.registry,
                 workdir=workdir, outdir=outdir,
                 basename=Path(job.get("filename") or job_id).stem,
+                filename=str(job.get("filename") or ""),
                 progress=progress, cancelled=cancelled,
+                deadline=(started + timeout) if timeout else None, timeout_s=timeout,
                 measure_memory=True, reset_memory=одно)
         except ASRHubError as exc:
             self._handle_failure(job, exc, merged, outdir=outdir)
@@ -1368,11 +1602,23 @@ class JobQueue:
                                   ожидаемые=[STATUS_CANCELLED])
             return
 
+        # Прервано остановкой сервера — это не отказ задания: оно вернётся в
+        # очередь без траты попытки и досчитается после запуска.
+        if self._stop.is_set() and isinstance(error, JobCancelled):
+            if not self._вернуть_в_очередь_без_попытки(job_id):
+                self._discard_unless_taken(outdir, job_id)
+                return
+            self._discard_results(outdir)
+            return
+
         retries = int(job.get("retries") or 0)
-        max_retries = int(merged.get("max_retries") or 0)
+        # Уже в пределах серверного: `Settings.merged` не даёт заданию больше.
+        max_retries = max(0, S.integer(merged, "max_retries", 0))
 
         if error.retryable and retries < max_retries:
-            delay = float(merged.get("retry_backoff_s") or 10.0) * (2 ** retries)
+            # Ноль — законное значение: «повторять сразу». `or 10.0`
+            # превращал его в десять секунд.
+            delay = max(0.0, S.num(merged, "retry_backoff_s", 10.0)) * (2 ** retries)
             delay *= 0.75 + random.random() * 0.5      # разброс, чтобы повторы не совпали
             params = dict(job.get("params") or {})
             if isinstance(error, OutOfMemoryError):
@@ -1719,8 +1965,7 @@ class JobQueue:
             # сигнала администратору. Обычный путь повторов сюда не доходит —
             # процесс умирает раньше, чем успевает его пройти.
             job = self.db.get_job(job_id) or {}
-            limit = int((job.get("params") or {}).get("max_retries")
-                        or self.settings.get("max_retries") or 0)
+            limit = self._предел_повторов(job)
             if retries >= limit:
                 given_up = self.db.update_job_if_status(
                     job_id, [STATUS_RUNNING],
@@ -1761,6 +2006,33 @@ class JobQueue:
                     f"задание возвращено в очередь (попытка {retries + 1} "
                     f"из {limit})")
                 self._wake.set()
+
+    def _heartbeat_loop(self) -> None:
+        """Раз в `HEARTBEAT_S` подтверждает, что идущие задания живы.
+
+        Отметка ставится условной записью — только пока задание за нами. Не
+        записалось — значит, его отменили на соседнем сервере, удалили или
+        уже отдали другому экземпляру, и досчитывать его незачем.
+        """
+        while not self._stop.wait(timeout=HEARTBEAT_S):
+            self._отметить_живые()
+
+    def _отметить_живые(self) -> None:
+        with self._lock:
+            идут = list(self._идут)
+        for job_id in идут:
+            try:
+                своё = self.db.update_job_if_status(
+                    job_id, [STATUS_RUNNING], expected_instance=INSTANCE_ID,
+                    heartbeat_at=now())
+            except Exception as exc:                        # noqa: BLE001
+                # Занятая база — не повод объявлять задание чужим: следующий
+                # оборот попробует снова, а срок устаревания в десять раз
+                # длиннее шага.
+                log.debug("Отметка жизни %s не поставлена: %s", job_id, exc)
+                continue
+            if not своё:
+                self._отобрано(job_id)
 
     def _janitor_loop(self) -> None:
         last_cleanup = 0.0

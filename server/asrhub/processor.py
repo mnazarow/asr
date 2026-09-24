@@ -4,9 +4,14 @@
   подготовка аудио      0 → 12 %
   поиск речи (VAD)     12 → 18 %
   распознавание        18 → 82 %
-  диаризация           82 → 90 %
-  постобработка        90 → 96 %
+  выравнивание         82 → 84 %
+  диаризация           84 → 90 %
+  постобработка        90 → 93 %
+  полоса громкости     93 → 96 %
   выгрузка форматов    96 → 100 %
+
+Доля только растёт: этап, начавшийся позже, не докладывает меньше, чем уже
+показано.
 
 Каждый этап замеряется отдельно: разбивка времени видна в аналитике и
 помогает понять, где именно теряется производительность.
@@ -23,7 +28,7 @@ from typing import Any
 
 from .catalog import get_model
 from .engines import EngineRegistry, Segment
-from .errors import ASRHubError, JobCancelled, NoSpeechDetected
+from .errors import ASRHubError, JobCancelled, JobTimeout, NoSpeechDetected
 from .logging_setup import get_logger
 from .pipeline import audio as audio_mod
 from .pipeline import audio_profile, export, metrics, postprocess, vad
@@ -181,28 +186,50 @@ def _peak_memory_mb(device: str) -> float:
 
 def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry,
                 *, workdir: Path, outdir: Path, basename: str,
+                filename: str = "",
                 progress: ProgressFn | None = None,
                 cancelled: Callable[[], bool] | None = None,
+                deadline: float | None = None,
+                timeout_s: int = 0,
                 measure_memory: bool = False,
                 reset_memory: bool = False) -> ProcessOutcome:
-    """Полный цикл обработки одного файла."""
+    """Полный цикл обработки одного файла.
 
-    def report(value: float, stage: str) -> None:
+    `filename` — имя записи, как его прислали. `source` — это файл в
+    каталоге загрузок под служебным именем «up_….wav», и в выгрузку
+    (заголовок DOCX и Markdown, поле meta.filename в JSON) уходило оно.
+
+    `deadline` — момент, после которого распознавание прерывается по
+    тайм-ауту. Только распознавание: когда движок уже вернул текст,
+    выбрасывать его из-за того, что постобработка закончится на минуту
+    позже срока, — значит потерять всю работу, ради которой задание и
+    ждали. Прежде тайм-аут проверялся в каждом докладе о прогрессе, и
+    движок, считающий файл одним вызовом, досчитывал до конца, после чего
+    первый же доклад поднимал тайм-аут — а повторы делали то же самое ещё
+    `max_retries` раз.
+    """
+    имя = filename or source.name
+    распознано = False
+
+    def report(value: float, stage: str, *, проверить_срок: bool = True) -> None:
         # Проверка отмены живёт здесь, потому что этот обработчик движки
         # вызывают между фрагментами: так отмена доходит внутрь распознавания,
         # а не ждёт его конца.
-        check_cancel()
+        check_cancel(проверить_срок)
         if progress is not None:
             try:
                 progress(max(0.0, min(1.0, value)), stage)
             except Exception:
                 pass
 
-    def check_cancel() -> None:
+    def check_cancel(проверить_срок: bool = True) -> None:
         if cancelled is not None and cancelled():
             raise JobCancelled(
                 "Задание отменено пользователем.",
                 hint="Повторить можно кнопкой «Повторить» в карточке задания.")
+        if (проверить_срок and deadline is not None and not распознано
+                and time.time() > deadline):
+            raise JobTimeout(int(timeout_s or 0))
 
     if reset_memory:
         _reset_peak_memory()
@@ -261,7 +288,10 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         spans: list[Any] = []
         if settings.get("vad_enabled", True):
             timer.start("vad")
-            report(0.14, "поиск речи")
+            # У второго канала поиск речи идёт после распознавания первого,
+            # и доля у него — от начала его отрезка, а не прежние 0,14.
+            report(0.14 if channel_index == 0
+                   else 0.18 + 0.64 * channel_index / max(1, len(channels)), "поиск речи")
             spans = vad.detect(prepared, settings)
             speech_stats = vad.speech_statistics(spans, info.duration_s)
             timer.stop()
@@ -297,7 +327,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             def engine_progress(value: float, stage: str) -> None:
                 base = 0.18 + 0.64 * (index / max(1, total))
                 width = 0.64 / max(1, total)
-                report(base + width * value, stage)
+                # 0,98 и выше — «сборка результата»: работа движка уже
+                # сделана, и тайм-аут на этом докладе выбросил бы её целиком.
+                report(base + width * value, stage, проверить_срок=value < 0.98)
             return engine_progress
 
         # lease() держит модель занятой: пока идёт распознавание, её не
@@ -333,11 +365,14 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             all_segments.append(segment)
         по_каналам.append((prepared, свои))
 
+    # Текст получен — дальше тайм-аут его не выбрасывает (см. `deadline`).
+    распознано = True
+
     # Речи нет ни в одном канале — вот это уже отказ. Если молчал только
     # один, отмечаем это предупреждением и работаем с остальными.
     if silent_channels and not all_segments:
         raise NoSpeechDetected(
-            f"В файле «{source.name}» не обнаружено речи "
+            f"В файле «{имя}» не обнаружено речи "
             f"(длительность {info.duration_s:.1f} с).")
     if silent_channels:
         outcome.warnings.append(
@@ -351,7 +386,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     if str(settings.get("alignment_backend") or "none") != "none" and all_segments:
         check_cancel()
         timer.start("alignment")
-        report(0.80, "уточнение границ слов")
+        # 0,82 — там, где кончилось распознавание: прежние 0,80 откатывали
+        # полосу назад.
+        report(0.82, "уточнение границ слов")
         # Каждый канал выравнивается по СВОЕМУ звуку. Раньше сюда уходил
         # файл первого канала и реплики обоих: на стереозаписи звонка
         # слова второго собеседника искались в чужом звуке. Совпасть им
@@ -483,7 +520,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     if settings.get("waveform_enabled", True):
         check_cancel()
         timer.start("waveform")
-        report(0.86, "полоса громкости")
+        # Полоса строится после постобработки (0,90), поэтому и доля её
+        # выше: прежние 0,86 откатывали полосу прогресса назад.
+        report(0.93, "полоса громкости")
         try:
             from .pipeline.waveform import build as build_waveform
 
@@ -557,7 +596,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     timer.start("export")
     report(0.96, "сохранение результатов")
     meta = {
-        "filename": source.name,
+        "filename": имя,
         "model": settings.get("model"),
         "engine": engine_meta.get("engine") or settings.get("engine"),
         "language": outcome.language,
@@ -600,11 +639,22 @@ def settings_digest(settings: dict[str, Any], *, weights: str = "") -> str:
     import hashlib
 
     from .catalog import PARAMS_BY_KEY
+    from .config import Settings
 
+    # Секреты и параметры сервера в отпечаток не входят: на расшифровку они
+    # не влияют, а их присутствие делало отпечаток задания, поставленного
+    # заново (его параметры хранятся уже без них), несовпадающим ни с одной
+    # новой загрузкой, — и смена ключа модели или адреса АТС сбрасывала кеш
+    # результатов целиком.
+    # Судьба задания — приоритет, повторы, уведомление, удалить ли исходник,
+    # искать ли в кеше — на расшифровку тоже не влияет: с ними одна и та же
+    # запись переставала находиться в кеше у того же владельца.
     relevant = {k: v for k, v in sorted(settings.items())
                 if k in PARAMS_BY_KEY and k not in (
                     "priority", "max_retries", "job_timeout_s", "webhook_url",
-                    "result_retention_days", "output_formats")}
+                    "result_retention_days", "output_formats", "retry_backoff_s",
+                    "delete_source_after", "deduplicate_jobs", "webhook_waveform")
+                and k not in Settings.НЕ_В_ЗАДАНИИ and k not in Settings.ТОЛЬКО_СЕРВЕРУ}
     blob = json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str)
     if weights:
         blob += f"\nweights={weights}"

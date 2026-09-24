@@ -110,16 +110,40 @@ def has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+#: До какого размера файл хешируется целиком. Сотня мегабайт читается за
+#: десятые доли секунды — это пять часов телефонного звука в WAV.
+_ХЕШ_ЦЕЛИКОМ = 128 << 20
+
+#: Сколько проб берётся из середины большого файла и какой длины.
+_ХЕШ_ПРОБ = 64
+_ХЕШ_ПРОБА = 64 << 10
+
+
 def file_hash(path: Path, chunk: int = 1 << 20) -> str:
-    """Быстрый хеш файла: начало, конец и размер. Для кеша этого достаточно."""
+    """Хеш содержимого файла — ключ кеша результатов.
+
+    Прежде брались только первый и последний мегабайт и размер, а файл от
+    одного до двух мегабайт хешировался по первому мегабайту вовсе: две
+    минутные записи звонков одинаковой длины с одним и тем же приветствием
+    автоответчика в начале получали один хеш — и кеш отдавал второй чужую
+    расшифровку. Теперь файл до `_ХЕШ_ЦЕЛИКОМ` хешируется целиком, а больший
+    — по началу, концу и равномерно разнесённым пробам из середины.
+    """
     digest = hashlib.blake2b(digest_size=16)
     size = path.stat().st_size
-    digest.update(str(size).encode())
+    digest.update(f"v2:{size}".encode())
     with path.open("rb") as fh:
+        if size <= _ХЕШ_ЦЕЛИКОМ:
+            for кусок in iter(lambda: fh.read(chunk), b""):
+                digest.update(кусок)
+            return digest.hexdigest()
         digest.update(fh.read(chunk))
-        if size > chunk * 2:
-            fh.seek(-chunk, os.SEEK_END)
-            digest.update(fh.read(chunk))
+        шаг = (size - 2 * chunk) // (_ХЕШ_ПРОБ + 1)
+        for номер in range(1, _ХЕШ_ПРОБ + 1):
+            fh.seek(chunk + номер * шаг)
+            digest.update(fh.read(_ХЕШ_ПРОБА))
+        fh.seek(-chunk, os.SEEK_END)
+        digest.update(fh.read(chunk))
     return digest.hexdigest()
 
 
@@ -823,17 +847,28 @@ def read_wav_mono(path: Path) -> tuple[list[float], int]:
     return [v / 32768.0 for v in values], rate
 
 
-def load_samples(path: Path):
-    """Загружает отсчёты как numpy-массив float32, если numpy доступен."""
+def load_samples(path: Path, max_seconds: float | None = None):
+    """Загружает отсчёты как numpy-массив float32, если numpy доступен.
+
+    `max_seconds` — читать только начало записи. Профиль звука меряет
+    первые двадцать минут, а файл читался целиком: на четырёхчасовой
+    записи это полтора гигабайта памяти ради того, чтобы тут же отрезать
+    пять шестых.
+    """
     try:
         import numpy as np  # type: ignore
     except ModuleNotFoundError:
         values, rate = read_wav_mono(path)
+        if max_seconds is not None and max_seconds > 0:
+            values = values[:int(max_seconds * rate)]
         return values, rate
     with wave.open(str(path), "rb") as wf:
         rate = wf.getframerate()
         channels = wf.getnchannels()
-        raw = wf.readframes(wf.getnframes())
+        кадров = wf.getnframes()
+        if max_seconds is not None and max_seconds > 0:
+            кадров = min(кадров, int(max_seconds * rate))
+        raw = wf.readframes(кадров)
     data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     if channels > 1:
         data = data.reshape(-1, channels).mean(axis=1)

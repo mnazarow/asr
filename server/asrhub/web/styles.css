@@ -273,6 +273,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .dim { color: var(--text-dim); }
 .ok { color: var(--ok); }
 .err { color: var(--err); }
+.small.warn { color: var(--warn); }
 .faint { color: var(--text-faint); }
 .small { font-size: 12px; }
 .nowrap { white-space: nowrap; }

@@ -649,7 +649,7 @@ def test_window_work_does_not_grow_with_the_conversation(tmp_path: Path):
         def get(self, settings):
             return _Engine()
 
-        def lease(self, settings):
+        def lease(self, settings, **_):
             return contextlib.nullcontext(_Engine())
 
     session = StreamSession(_Registry(), {"stream_window_s": 4.0}, workdir=tmp_path)
@@ -788,7 +788,7 @@ def test_cached_job_counts_towards_the_storage_quota(database, tmp_path: Path,
     before = database.owner_usage("объём", 0)["storage_gb"]
     queue = jq.JobQueue.__new__(jq.JobQueue)
     queue.db = database
-    queue._copy_results = lambda *args: None
+    queue._copy_results = lambda *args, **kwargs: None
     clone = queue._clone_cached(database.get_job(original), copy.name, str(copy),
                                 "объём", None, {"model": "demo-simulator"})
     after = database.owner_usage("объём", 0)["storage_gb"]

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,8 +36,30 @@ class SpeechSegment:
 
 _SILERO_CACHE: dict[str, Any] = {}
 
+#: Silero — модель с состоянием: скомпилированная сеть держит `_state` и
+#: `_context` и меняет их на каждом окне, а `get_speech_timestamps`
+#: начинает с `reset_states()`. Экземпляр один на процесс, а поиск речи
+#: зовут и конвейер (вне аренды движка), и движки под своими блокировками:
+#: два задания разом перемешивали состояние друг друга, и участки речи
+#: выходили лишними или пропущенными. Один замок и на загрузку, и на разбор.
+_SILERO_LOCK = threading.Lock()
+
+#: Недавние результаты поиска речи. Конвейер ищет речь в подготовленном
+#: канале, а GigaAM и NeMo — в том же файле ещё раз, со своим пределом
+#: длины участка; на часовой записи это десятки секунд процессора на
+#: задание впустую. Ключ — файл (путь, размер, время изменения) и все
+#: параметры поиска: другой предел длины — другой ответ.
+_НЕДАВНИЕ: dict[tuple[Any, ...], list[SpeechSegment]] = {}
+_НЕДАВНИЕ_ПРЕДЕЛ = 16
+_НЕДАВНИЕ_LOCK = threading.Lock()
+
 
 def _silero_model():
+    with _SILERO_LOCK:
+        return _silero_model_unlocked()
+
+
+def _silero_model_unlocked():
     if "model" in _SILERO_CACHE:
         return _SILERO_CACHE["model"], _SILERO_CACHE["utils"]
     try:
@@ -72,17 +95,18 @@ def _detect_silero(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | No
 
         samples, rate = load_samples(path)
         tensor = torch.as_tensor(samples, dtype=torch.float32)
-        stamps = utils["get_speech_timestamps"](
-            tensor, model,
-            sampling_rate=rate,
-            threshold=float(opts.get("vad_threshold", 0.5)),
-            neg_threshold=float(opts.get("vad_neg_threshold", 0.35)),
-            min_speech_duration_ms=int(opts.get("vad_min_speech_ms", 250)),
-            max_speech_duration_s=float(opts.get("vad_max_speech_s", 22.0)),
-            min_silence_duration_ms=int(opts.get("vad_min_silence_ms", 500)),
-            speech_pad_ms=int(opts.get("vad_speech_pad_ms", 200)),
-            return_seconds=True,
-        )
+        with _SILERO_LOCK:
+            stamps = utils["get_speech_timestamps"](
+                tensor, model,
+                sampling_rate=rate,
+                threshold=float(opts.get("vad_threshold", 0.5)),
+                neg_threshold=float(opts.get("vad_neg_threshold", 0.35)),
+                min_speech_duration_ms=int(opts.get("vad_min_speech_ms", 250)),
+                max_speech_duration_s=float(opts.get("vad_max_speech_s", 22.0)),
+                min_silence_duration_ms=int(opts.get("vad_min_silence_ms", 500)),
+                speech_pad_ms=int(opts.get("vad_speech_pad_ms", 200)),
+                return_seconds=True,
+            )
         return [SpeechSegment(float(s["start"]), float(s["end"])) for s in stamps]
     except Exception as exc:
         log.warning("Silero VAD дал сбой (%s), используется запасной детектор", exc)
@@ -113,7 +137,8 @@ def _detect_webrtc(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | No
                 flags.append(vad.is_speech(chunk, rate))
             except Exception:
                 flags.append(False)
-        return _flags_to_segments(flags, step_ms / 1000.0, opts)
+        return _flags_to_segments(flags, step_ms / 1000.0, opts,
+                                  energies=_энергии_кадров(frames, step // 2, len(flags)))
     except Exception as exc:
         log.debug("WebRTC VAD недоступен: %s", exc)
         return None
@@ -179,11 +204,29 @@ def _detect_energy(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
         # Предохранитель: в записи есть сигнал, но порог его не пропустил.
         log.debug("Энергетический VAD не нашёл речи при пике %.4f — снижаем порог", peak)
         flags = [e >= peak * 0.1 for e in energies]
-    return _flags_to_segments(flags, frame_ms / 1000.0, opts)
+    return _flags_to_segments(flags, frame_ms / 1000.0, opts, energies=energies)
+
+
+def _энергии_кадров(pcm: bytes, кадр: int, кадров: int) -> list[float] | None:
+    """Средняя громкость каждого кадра 16-битного звука — для выбора места разреза."""
+    if кадр <= 0 or кадров <= 0:
+        return None
+    try:
+        import numpy as np  # type: ignore
+
+        отсчёты = np.frombuffer(pcm[:кадр * кадров * 2], dtype="<i2").astype("float32")
+        usable = (len(отсчёты) // кадр) * кадр
+        if usable == 0:
+            return None
+        блоки = отсчёты[:usable].reshape(-1, кадр) / 32768.0
+        return np.sqrt((блоки ** 2).mean(axis=1)).tolist()
+    except ModuleNotFoundError:
+        return None
 
 
 def _flags_to_segments(flags: Sequence[bool], step_s: float,
-                       opts: dict[str, Any]) -> list[SpeechSegment]:
+                       opts: dict[str, Any],
+                       energies: Sequence[float] | None = None) -> list[SpeechSegment]:
     min_speech = float(opts.get("vad_min_speech_ms", 250)) / 1000.0
     min_silence = float(opts.get("vad_min_silence_ms", 500)) / 1000.0
     pad = float(opts.get("vad_speech_pad_ms", 200)) / 1000.0
@@ -224,10 +267,26 @@ def _flags_to_segments(flags: Sequence[bool], step_s: float,
         else:
             merged.append(seg)
 
-    return _enforce_max_length(merged, max_speech)
+    return _enforce_max_length(merged, max_speech, energies=energies, step_s=step_s)
 
 
-def _enforce_max_length(segments: list[SpeechSegment], max_len: float) -> list[SpeechSegment]:
+#: Где искать тихое место для разреза длинного участка: в последней четверти
+#: допустимой длины, но не дальше трёх секунд от предела.
+_ОКНО_РАЗРЕЗА_С = 3.0
+
+
+def _enforce_max_length(segments: list[SpeechSegment], max_len: float, *,
+                        energies: Sequence[float] | None = None,
+                        step_s: float = 0.0) -> list[SpeechSegment]:
+    """Режет участки длиннее предела — по самому тихому месту у границы.
+
+    Прежде участок делился на равные части, то есть посреди слова: движок
+    видел обе половины обрывками, и слово на стыке терялось или
+    распознавалось дважды искажённым. Громкость кадров у детекторов на
+    флагах (энергетический, WebRTC, TEN) под рукой — разрез ставится туда,
+    где в окне перед пределом тише всего: между словами, на вдохе. Без
+    громкости — как раньше, поровну.
+    """
     if max_len <= 0:
         return segments
     out: list[SpeechSegment] = []
@@ -235,16 +294,78 @@ def _enforce_max_length(segments: list[SpeechSegment], max_len: float) -> list[S
         if seg.duration <= max_len:
             out.append(seg)
             continue
-        parts = int(math.ceil(seg.duration / max_len))
-        step = seg.duration / parts
-        for i in range(parts):
-            out.append(SpeechSegment(seg.start + i * step,
-                                     min(seg.end, seg.start + (i + 1) * step)))
+        if not energies or step_s <= 0:
+            parts = int(math.ceil(seg.duration / max_len))
+            step = seg.duration / parts
+            for i in range(parts):
+                out.append(SpeechSegment(seg.start + i * step,
+                                         min(seg.end, seg.start + (i + 1) * step)))
+            continue
+        начало = seg.start
+        while seg.end - начало > max_len:
+            предел = начало + max_len
+            окно = min(_ОКНО_РАЗРЕЗА_С, max_len * 0.25)
+            с = max(0, int((предел - окно) / step_s))
+            по = min(len(energies) - 1, int(предел / step_s) - 1)
+            if по < с:
+                разрез = предел
+            else:
+                тише = min(range(с, по + 1), key=lambda i: (energies[i], -i))
+                разрез = min(предел, max(начало + step_s, (тише + 0.5) * step_s))
+            out.append(SpeechSegment(начало, разрез))
+            начало = разрез
+        out.append(SpeechSegment(начало, seg.end))
     return out
 
 
+def _ключ_поиска(path: Path, opts: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Ключ недавнего поиска: файл и все параметры поиска.
+
+    Кроме пути, размера и времени изменения — отпечаток краёв содержимого:
+    окно потоковой диктовки перезаписывает один и тот же файл, и две записи
+    в пределах одного такта часов файловой системы иначе выглядели бы одним
+    файлом.
+    """
+    import hashlib  # noqa: PLC0415
+
+    try:
+        st = Path(path).stat()
+        with Path(path).open("rb") as файл:
+            края = hashlib.blake2b(файл.read(1 << 16), digest_size=8)
+            if st.st_size > (1 << 17):
+                файл.seek(-(1 << 16), 2)
+                края.update(файл.read(1 << 16))
+    except OSError:
+        return None
+    return (str(Path(path).resolve()), st.st_size, st.st_mtime_ns, края.hexdigest(),
+            str(opts.get("vad_backend") or "auto"),
+            *(str(opts.get(к)) for к in (
+                "vad_threshold", "vad_neg_threshold", "vad_min_speech_ms",
+                "vad_max_speech_s", "vad_min_silence_ms", "vad_speech_pad_ms")))
+
+
 def detect(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
-    """Находит участки речи выбранным или доступным детектором."""
+    """Находит участки речи выбранным или доступным детектором.
+
+    Повторный поиск в том же файле с теми же параметрами берётся из
+    недавних (см. `_НЕДАВНИЕ`): конвейер и движок ищут речь в одном файле.
+    """
+    ключ = _ключ_поиска(path, opts)
+    if ключ is not None:
+        with _НЕДАВНИЕ_LOCK:
+            готово = _НЕДАВНИЕ.get(ключ)
+        if готово is not None:
+            return [SpeechSegment(s.start, s.end) for s in готово]
+    найдено = _detect(path, opts)
+    if ключ is not None:
+        with _НЕДАВНИЕ_LOCK:
+            if len(_НЕДАВНИЕ) >= _НЕДАВНИЕ_ПРЕДЕЛ:
+                _НЕДАВНИЕ.pop(next(iter(_НЕДАВНИЕ)))
+            _НЕДАВНИЕ[ключ] = [SpeechSegment(s.start, s.end) for s in найдено]
+    return найдено
+
+
+def _detect(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
     backend = str(opts.get("vad_backend") or "auto")
     order: list[str]
     if backend == "auto" or backend == "silero":
@@ -291,7 +412,14 @@ def _detect_ten(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | None:
         for offset in range(0, len(arr) - hop, hop):
             _, flag = vad.process(arr[offset:offset + hop])
             flags.append(bool(flag))
-        return _flags_to_segments(flags, hop / rate, opts)
+        энергии = None
+        try:
+            import numpy as np  # type: ignore
+
+            энергии = _энергии_кадров(np.asarray(arr, dtype="<i2").tobytes(), hop, len(flags))
+        except ModuleNotFoundError:
+            pass
+        return _flags_to_segments(flags, hop / rate, opts, energies=энергии)
     except Exception as exc:
         log.debug("TEN VAD недоступен: %s", exc)
         return None

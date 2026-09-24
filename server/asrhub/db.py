@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .errors import StorageError
+from .errors import ConfigError, StorageError
 from .logging_setup import get_logger
 
 log = get_logger("db")
@@ -1285,6 +1285,12 @@ def _порядок_заданий(order: str, соединение: bool) -> st
     п = "jobs." if соединение else ""
     if order == "deadline ASC":
         return (f"({п}deadline IS NULL), {п}deadline ASC, {п}created_at ASC")
+    # Внутри одного приоритета — по времени постановки. Без второго ключа
+    # SQLite отдавал сначала задания в «queued», потом в «retry», и задание,
+    # у которого время повтора давно наступило, не попадало в окно выборки
+    # планировщика, пока очередь не станет меньше окна.
+    if order in ("priority DESC", "priority ASC"):
+        return f"{п}{order}, {п}created_at ASC, {п}id ASC"
     return f"{п}{order}" if соединение and not order.startswith("jobs.") else order
 
 
@@ -1347,6 +1353,7 @@ class Database:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
+                _значение_не_того_вида(exc)
                 raise StorageError(f"Ошибка записи в базу: {exc}") from exc
             except Exception:
                 try:
@@ -1359,7 +1366,12 @@ class Database:
         try:
             return list(self.conn.execute(sql, params))
         except sqlite3.Error as exc:
-            raise StorageError(f"Ошибка чтения из базы: {exc}", details={"sql": sql[:200]}) from exc
+            _значение_не_того_вида(exc)
+            # Текст запроса — в журнал сервера, а не в ответ: ответ видит
+            # любой клиент, и кусок SQL в нём — это рассказ об устройстве
+            # базы тому, кто его подбирает.
+            log.warning("Ошибка чтения из базы: %s; запрос: %s", exc, sql[:200])
+            raise StorageError(f"Ошибка чтения из базы: {exc}") from exc
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
         rows = self.query(sql, params)
@@ -2007,10 +2019,23 @@ class Database:
     #: параметров.
     SEARCH_LIMIT = 400
 
-    #: Уперся ли последний поиск в этот предел. Читают `list_jobs` и
-    #: `count_jobs` сразу после сборки условий — в том же потоке и до
-    #: любого следующего запроса.
-    last_search_truncated = False
+    @property
+    def last_search_truncated(self) -> bool:
+        """Упёрся ли последний поиск ЭТОГО ПОТОКА в предел `SEARCH_LIMIT`.
+
+        Признак лежал в общем объекте базы: параллельный поиск другого
+        пользователя перезаписывал его между `list_jobs` и чтением, и отдел,
+        упёршийся в предел, получал `search_truncated=false` — то есть
+        уверенность, что старых разговоров нет. Обработчик запроса читает
+        признак в том же потоке сразу после выборки.
+        """
+        return bool(getattr(getattr(self, "_local", None), "search_truncated", False))
+
+    @last_search_truncated.setter
+    def last_search_truncated(self, значение: bool) -> None:
+        if getattr(self, "_local", None) is None:
+            self._local = threading.local()
+        self._local.search_truncated = bool(значение)
 
     def jobs_matching(self, search: str, limit: int = 0, *,
                       owner: str | list[str] | None = None) -> list[str]:
@@ -3309,7 +3334,12 @@ class Database:
             "       COALESCE(SUM(media_duration_s), 0) AS audio_s, "
             "       COALESCE(SUM(file_size), 0) AS bytes "
             f"FROM jobs WHERE owner IN ({placeholders}) AND created_at>=? "
-            "  AND status NOT IN ('cancelled', 'failed')",
+            "  AND status NOT IN ('cancelled', 'failed') "
+            # Контрольный прогон второй моделью ставит сервер, а не человек:
+            # записывался он на владельца исходной записи и съедал его
+            # суточную квоту — ключ с квотой в сто заданий упирался в неё
+            # на семидесяти своих.
+            "  AND COALESCE(source, '')<>'control'",
             [*owners, since])
         if row is None:
             return {"jobs": 0, "audio_hours": 0.0, "storage_gb": 0.0}
@@ -3419,11 +3449,21 @@ class Database:
         changed = self.execute(f"UPDATE jobs SET {columns} WHERE {where}", args)
         return bool(changed)
 
-    def find_cached(self, file_hash: str, params_hash: str) -> dict[str, Any] | None:
+    def find_cached(self, file_hash: str, params_hash: str, *,
+                    owner: str | None = None) -> dict[str, Any] | None:
+        """Готовое задание с той же записью и теми же настройками.
+
+        `owner` ограничивает поиск своими заданиями: общий кеш говорил
+        одному владельцу, что такую же запись уже присылал другой.
+        """
+        условие, аргументы = "", [file_hash, params_hash]
+        if owner is not None:
+            условие = " AND owner=?"
+            аргументы.append(owner)
         row = self.query_one(
             "SELECT * FROM jobs WHERE file_hash=? AND status='completed' "
-            "AND json_extract(params, '$._hash')=? ORDER BY finished_at DESC LIMIT 1",
-            (file_hash, params_hash))
+            f"AND json_extract(params, '$._hash')=?{условие} "
+            "ORDER BY finished_at DESC LIMIT 1", аргументы)
         return _row_to_job(row) if row else None
 
     # --- сегменты -------------------------------------------------------
@@ -4462,12 +4502,14 @@ class Database:
                       limit: int = 500, offset: int = 0) -> dict[str, Any]:
         условия, параметры = [], []
         if query:
-            искомое = f"%{query.strip().lower()}%"
+            # «_» и «%» — буквы запроса («ivan_petrov@…»), а не образцы LIKE.
+            искомое = f"%{_экранировать_like(query.strip().lower())}%"
             условия.append(
-                "(LOWER(last_name) LIKE ? OR LOWER(first_name) LIKE ? OR "
-                " LOWER(middle_name) LIKE ? OR LOWER(position) LIKE ? OR "
-                " LOWER(department) LIKE ? OR LOWER(email) LIKE ? OR "
-                " phone_ext LIKE ? OR phone_mobile LIKE ? OR phone_work LIKE ?)")
+                "(LOWER(last_name) LIKE ? ESCAPE '\\' OR LOWER(first_name) LIKE ? ESCAPE '\\' OR "
+                " LOWER(middle_name) LIKE ? ESCAPE '\\' OR LOWER(position) LIKE ? ESCAPE '\\' OR "
+                " LOWER(department) LIKE ? ESCAPE '\\' OR LOWER(email) LIKE ? ESCAPE '\\' OR "
+                " phone_ext LIKE ? ESCAPE '\\' OR phone_mobile LIKE ? ESCAPE '\\' OR "
+                " phone_work LIKE ? ESCAPE '\\')")
             параметры.extend([искомое] * 9)
         if department:
             условия.append("department=?")
@@ -5119,8 +5161,10 @@ class Database:
             условия.append("actor=?")
             args.append(str(actor))
         if query:
-            условия.append("(action LIKE ? OR path LIKE ? OR ip LIKE ?)")
-            args.extend([f"%{query}%"] * 3)
+            # «_» и «%» в запросе — буквы, а не образцы LIKE.
+            условия.append("(action LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' "
+                           "OR ip LIKE ? ESCAPE '\\')")
+            args.extend([f"%{_экранировать_like(str(query))}%"] * 3)
         if failed_only:
             # Отказы — то, ради чего журнал открывают чаще всего: чужой
             # подбор пароля и попытки дотянуться туда, куда не положено.
@@ -5329,6 +5373,22 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
         except OSError as exc:
             log.warning("Не удалось удалить исходник %s: %s", path, exc)
     return freed
+
+
+def _значение_не_того_вида(exc: sqlite3.Error) -> None:
+    """Значение не того вида из запроса — это 400, а не «ошибка базы».
+
+    `PATCH /api/users/{id}` с `{"display_name": {...}}` доходил до SQLite
+    словарём и возвращался клиенту как 507 «Ошибка записи в базу: Error
+    binding parameter 1: type 'dict' is not supported» — отказ хранилища
+    вместо «поле заполнено не тем» и внутренности базы в ответе.
+    """
+    if isinstance(exc, (sqlite3.ProgrammingError, sqlite3.InterfaceError)) and \
+            "binding parameter" in str(exc).lower():
+        raise ConfigError(
+            "Значение поля не того вида: ожидались текст, число или «да/нет».",
+            hint="Проверьте тело запроса: вложенные объекты и списки в этих "
+                 "полях не принимаются.") from exc
 
 
 def _экранировать_like(значение: str) -> str:

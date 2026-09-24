@@ -295,7 +295,9 @@ def profile_file(path: Path, *, speech_spans: list[tuple[float, float]] | None =
     """Профиль подготовленного WAV — по первым `max_seconds` секундам."""
     from .audio import load_samples
 
-    samples, rate = load_samples(path)
+    # Читаем только то, что меряем: раньше файл поднимался в память целиком
+    # и тут же обрезался до `max_seconds`.
+    samples, rate = load_samples(path, max_seconds=max_seconds)
     предел = int(max_seconds * rate)
     if len(samples) > предел:
         samples = samples[:предел]

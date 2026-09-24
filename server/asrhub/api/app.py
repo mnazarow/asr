@@ -585,7 +585,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                 role=getattr(участник, "role", "") or "",
                 method=request.method, path=путь,
                 status=int(getattr(response, "status_code", 0) or 0),
-                ip=audit.адрес(request.headers, request.client))
+                ip=audit.адрес(request.headers, request.client,
+                               settings.get("trusted_proxies")))
         except Exception as exc:                            # noqa: BLE001
             log.warning("Журнал доступа не записан: %s", exc)
         return response
