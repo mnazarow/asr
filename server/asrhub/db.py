@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -23,11 +25,12 @@ from typing import Any
 
 from .config import Settings
 from .errors import ConfigError, StorageError
+from .instance import HOSTNAME, INSTANCE_ID, KERNEL_ID, own_host, process_alive
 from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -39,6 +42,87 @@ SERIES_MAX_BUCKETS = 2000
 #: Такт служебного цикла: с этим шагом пишутся замеры нагрузки. Здесь он
 #: потому, что от него зависит и запись, и чтение рядов.
 SAMPLE_PERIOD_S = 20.0
+
+#: Режимы журнала, которые сервер умеет держать (настройка `db_journal_mode`).
+#: WAL — умолчание: читатели не мешают писателю. Журнал отката — для
+#: нескольких машин над общим каталогом: WAL опирается на общую память одной
+#: машины и по сети не работает (см. `fsinfo`).
+РЕЖИМЫ_ЖУРНАЛА = ("wal", "delete")
+
+#: Кеш страниц одного соединения, КБ. Соединение у каждого потока своё, а
+#: потоков у сервера под сорок (пул запросов AnyIO): при 32 МБ на каждое
+#: после тяжёлых запросов процесс держал 1,35 ГБ одних кешей страниц. В
+#: пуле запросов кеш соединения почти не помогает — следующий запрос
+#: приходит в другой поток, — а файловый кеш системы общий для всех.
+КЕШ_СОЕДИНЕНИЯ_КБ = 8000
+
+#: Предел, до которого усекается журнал после контрольной точки, байт.
+#: Без него файл `-wal` сохраняет размер самого большого пика навсегда:
+#: после VACUUM на базе в 260 МБ рядом оставался журнал в 174 МБ.
+ПРЕДЕЛ_ЖУРНАЛА = 64 * 1024 * 1024
+
+#: Отметка жизни экземпляра в `kv`: `instance:<машина:процесс>`.
+РЕЕСТР = "instance:"
+
+#: Поля звонка, в которых есть кто-то конкретный: номера, имя звонящего,
+#: каналы (у прямых SIP-абонентов в имени канала стоит номер), путь к записи
+#: (в имени файла Asterisk пишет номер) и поля, которые станция заполняет
+#: своими данными. Ключ, станция, время, длительность, очередь и
+#: внутренний номер оператора остаются: без ключа импорт завёл бы звонок
+#: заново, а по остальному считаются нагрузка и отчёты.
+ПОЛЯ_ЛИЧНЫЕ_ЗВОНКА = ("src", "dst", "clid", "channel", "dstchannel",
+                      "recording", "userfield", "accountcode")
+ОБЕЗЛИЧИТЬ_ЗВОНОК = ", ".join(f"{поле}=''" for поле in ПОЛЯ_ЛИЧНЫЕ_ЗВОНКА)
+
+#: Признак «из указателя удаляли — пора вычистить» (см. `Database.fts_purge`).
+КЛЮЧ_УКАЗАТЕЛЬ_ГРЯЗНЫЙ = "fts.dirty"
+
+#: Сколько секунд отметка экземпляра считается свежей. Отметку ставит
+#: служебный поток очереди раз в полминуты; срок тот же, что у заданий
+#: (`job_queue.STALE_AFTER_S`): медленный, но живой сервер не должен
+#: считаться умершим.
+СВЕЖЕСТЬ_ОТМЕТКИ_С = 300.0
+
+
+def _режим_журнала(значение: Any) -> str | None:
+    """Режим из настройки: «wal», «delete» или None — «оставить как в файле»."""
+    текст = str(значение or "").strip().lower()
+    if not текст or текст == "auto":
+        return None
+    if текст not in РЕЖИМЫ_ЖУРНАЛА:
+        raise ConfigError(f"Неизвестный режим журнала базы: {значение!r}",
+                          hint="Бывают: wal, delete.")
+    return текст
+
+
+def _живые_отметки(строки: Sequence[Any], *, свежее: float) -> list[dict[str, Any]]:
+    """Отметки экземпляров из `kv`, свежее порога, со своими признаками.
+
+    Своя машина проверяется по процессу: отметка сервера, которого только
+    что перезапустили, ещё свежая, а процесса уже нет — ждать пять минут,
+    пока она устареет, незачем. Чужую машину так не проверить, и там
+    решает только свежесть.
+    """
+    итог = []
+    for строка in строки:
+        ключ, значение, момент = строка[0], строка[1], строка[2]
+        if float(момент or 0) < свежее:
+            continue
+        ид = str(ключ)[len(РЕЕСТР):]
+        try:
+            данные = json.loads(значение) if значение else {}
+        except (TypeError, ValueError):
+            данные = {}
+        if not isinstance(данные, dict):
+            данные = {}
+        машина = str(данные.get("host") or ид.rsplit(":", 1)[0])
+        свой = ид == INSTANCE_ID
+        if not свой and own_host(ид) and not process_alive(ид):
+            continue
+        итог.append({**данные, "instance": ид, "host": машина, "self": свой,
+                     "seen_at": float(момент or 0)})
+    итог.sort(key=lambda з: (not з["self"], з["instance"]))
+    return итог
 
 _CONTENT_SCHEMA = """
     CREATE TABLE IF NOT EXISTS content (
@@ -221,6 +305,11 @@ _LLM_RESULTS_SCHEMA = """
 
 #: Кеш ответов модели по отпечатку подсказки: одна и та же запись с теми
 #: же подсказками второй раз модель не спрашивает.
+#:
+#: Версия 29: `job_id` — чья это запись. Пересказ разговора с именем и
+#: номером клиента жил в кеше до срока хранения, а при «хранить бессрочно»
+#: — вечно: удаление записи (кнопкой, по сроку, по требованию субъекта) его
+#: не находило, потому что ключ кеша — отпечаток подсказки, а не задание.
 _LLM_CACHE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS llm_cache (
         key         TEXT PRIMARY KEY,
@@ -228,7 +317,8 @@ _LLM_CACHE_SCHEMA = """
         model       TEXT,
         response    TEXT,
         latency_ms  REAL,
-        created_at  REAL NOT NULL
+        created_at  REAL NOT NULL,
+        job_id      TEXT
     ) WITHOUT ROWID
 """
 
@@ -260,7 +350,10 @@ _CONTENT_TERMS_SCHEMA = """
 #:
 #: Счётчик здесь — «сколько раз форма встречалась когда-либо». При удалении
 #: заданий он не уменьшается, и это сознательно: он выбирает подпись, а не
-#: считает статистику, и подпись от устаревшего счётчика не портится.
+#: считает статистику, и подпись от устаревшего счётчика не портится. Но
+#: основа, которой не осталось ни в одной записи, уходит целиком — суточной
+#: уборкой и удалением по требованию (`sweep_orphans`): фамилия клиента,
+#: прозвучавшая только в стёртом разговоре, не должна пережить разговор.
 _CONTENT_VOCAB_SCHEMA = """
     CREATE TABLE IF NOT EXISTS content_vocab (
         stem    TEXT NOT NULL,
@@ -362,6 +455,11 @@ _SCHEMA = [
     _LLM_RESULTS_SCHEMA,
     _LLM_CACHE_SCHEMA,
     "CREATE INDEX IF NOT EXISTS idx_llm_results_created ON llm_results(created_at DESC)",
+    # Уборка кеша по сроку: `created_at` в таблице WITHOUT ROWID стоит после
+    # ответа модели, и без указателя часовая уборка читала все ответы —
+    # больше гигабайта на двадцати тысячах. И по записи — для удаления.
+    "CREATE INDEX IF NOT EXISTS idx_llm_cache_created ON llm_cache(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_cache_job ON llm_cache(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_results_outcome ON llm_results(outcome)",
     "CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, picked_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_model_checks_created ON model_checks(created_at DESC)",
@@ -469,6 +567,19 @@ _SCHEMA = [
     # Общий файл записи: контрольный прогон идёт по записи исходного задания,
     # и удаление одного из двух не должно уносить звук второго.
     "CREATE INDEX IF NOT EXISTS idx_jobs_file ON jobs(file_path)",
+    # Уборка по сроку и сборщик показателей отбирают по времени окончания.
+    "CREATE INDEX IF NOT EXISTS idx_jobs_finished ON jobs(finished_at)",
+    # Задания с расшифровкой — частичный указатель. Полоса разбора (раз в
+    # пятнадцать секунд), метрика покрытия и поиск неразобранного (раз в две
+    # минуты) спрашивают «завершённые, с текстом, не контрольные». Условие
+    # `text != ''` заставляло читать каждую расшифровку целиком, а `source`
+    # и `owner` лежат в строке ПОСЛЕ текста — до них SQLite добирается
+    # только через все страницы переполнения. На четырёх тысячах часовых
+    # записей это 590 МБ чтения на вопрос, ответ на который — «нечего».
+    # Условие указателя совпадает с условием запросов буква в букву: только
+    # так SQLite знает, что указатель годится, и текст не читает вовсе.
+    "CREATE INDEX IF NOT EXISTS idx_jobs_text_ready ON jobs(status, source, owner, created_at) "
+    "WHERE text IS NOT NULL AND text != ''",
     """
     CREATE TABLE IF NOT EXISTS segments (
         job_id        TEXT NOT NULL,
@@ -512,6 +623,8 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_metrics_name_ts ON metrics(name, ts DESC)",
+    # Уборка показателей по сроку идёт по одному времени, без имени.
+    "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts)",
     "CREATE INDEX IF NOT EXISTS idx_metrics_model ON metrics(model, name, ts DESC)",
     """
     CREATE TABLE IF NOT EXISTS qa_reviews (
@@ -850,6 +963,9 @@ _SCHEMA = [
     # этого индекса решение с первого обращения считается перебором всего
     # архива на каждый звонок.
     "CREATE INDEX IF NOT EXISTS idx_calls_src ON calls(src, started_at)",
+    # Уборка журнала звонков по сроку и множество известных звонков для
+    # обхода каталога записей — по времени импорта.
+    "CREATE INDEX IF NOT EXISTS idx_calls_imported ON calls(imported_at)",
     "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit(actor, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_qa_status ON qa_reviews(status, assigned_at DESC)",
@@ -867,414 +983,56 @@ def new_id(prefix: str = "job") -> str:
 
 
 
-#: Ожидаемый набор колонок — сверяется при миграции. Собран из _SCHEMA,
-#: поэтому не может разойтись с ней при добавлении новых полей.
-_EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
-    "users": {
-        "id": "TEXT",
-        "username": "TEXT",
-        "password_hash": "TEXT",
-        "display_name": "TEXT DEFAULT ''",
-        "role": "TEXT DEFAULT 'user'",
-        "user_group": "TEXT DEFAULT ''",
-        "enabled": "INTEGER DEFAULT 1",
-        "must_change": "INTEGER DEFAULT 0",
-        "created_at": "REAL",
-        "updated_at": "REAL",
-        "last_login": "REAL",
-        "failed_attempts": "INTEGER DEFAULT 0",
-        "locked_until": "REAL DEFAULT 0",
-        "source": "TEXT DEFAULT 'local'",
-    },
-    "sessions": {
-        "token_hash": "TEXT",
-        "user_id": "TEXT",
-        "created_at": "REAL",
-        "expires_at": "REAL",
-        "last_seen": "REAL",
-        "user_agent": "TEXT DEFAULT ''",
-        "address": "TEXT DEFAULT ''",
-    },
-    "jobs": {
-        "id": "TEXT",
-        "group_id": "TEXT",
-        "created_at": "REAL",
-        "updated_at": "REAL",
-        "queued_at": "REAL",
-        "started_at": "REAL",
-        "finished_at": "REAL",
-        "deadline": "REAL",
-        "status": "TEXT NOT NULL DEFAULT 'queued'",
-        "stage": "TEXT DEFAULT ''",
-        "progress": "REAL DEFAULT 0",
-        "priority": "INTEGER DEFAULT 50",
-        "filename": "TEXT",
-        "file_path": "TEXT",
-        "file_size": "INTEGER DEFAULT 0",
-        "file_hash": "TEXT",
-        "media_duration_s": "REAL DEFAULT 0",
-        "engine": "TEXT",
-        "model": "TEXT",
-        "language": "TEXT",
-        "params": "TEXT DEFAULT '{}'",
-        "result_path": "TEXT",
-        "text": "TEXT",
-        "segments_count": "INTEGER DEFAULT 0",
-        "words_count": "INTEGER DEFAULT 0",
-        "chars_count": "INTEGER DEFAULT 0",
-        "speakers_count": "INTEGER DEFAULT 0",
-        # Огибающая громкости: массив кривых в JSON. Хранится рядом с
-        # заданием, а не в файле результата, чтобы её можно было отдать в
-        # карточке задания, не читая диск.
-        "waveform": "TEXT",
-        "suspect_segments": "INTEGER",
-        "suspect_share": "REAL",
-        "quality_flags": "TEXT",
-        "quality_detail": "TEXT",
-        # Какой экземпляр сервера взял задание и когда в последний раз
-        # подтвердил, что жив. Нужно, чтобы два сервера на общей базе не
-        # брали одно задание и чтобы задания умершего экземпляра вернулись
-        # в очередь, а не висели «выполняется» вечно.
-        "instance_id": "TEXT",
-        "heartbeat_at": "REAL",
-        "avg_confidence": "REAL",
-        "rtf": "REAL",
-        "queue_time_s": "REAL",
-        "processing_time_s": "REAL",
-        "audio_prep_s": "REAL",
-        "model_load_s": "REAL",
-        "inference_s": "REAL",
-        "postprocess_s": "REAL",
-        "peak_memory_mb": "REAL",
-        # Сколько заданий шло разом, когда снимался пик. Без этого числа
-        # сам пик не отвечает на вопрос, ради которого его смотрят.
-        "peak_memory_jobs": "INTEGER",
-        "device": "TEXT",
-        "retries": "INTEGER DEFAULT 0",
-        "error_code": "TEXT",
-        "error_message": "TEXT",
-        "error_hint": "TEXT",
-        "cancelled_by": "TEXT",
-        "owner": "TEXT DEFAULT 'anonymous'",
-        "api_key_name": "TEXT",
-        "source": "TEXT DEFAULT 'api'",
-        "tags": "TEXT DEFAULT ''",
-        "reference_text": "TEXT",
-        "wer": "REAL",
-        "cer": "REAL",
-        "mer": "REAL",
-        "wil": "REAL",
-        "ref_words": "INTEGER",
-        "sub_words": "INTEGER",
-        "del_words": "INTEGER",
-        "ins_words": "INTEGER",
-        "calibration": "TEXT",
-        "snr_db": "REAL",
-        "peak_dbfs": "REAL",
-        "clipping_share": "REAL",
-        "loudness_lufs": "REAL",
-        "silence_share": "REAL",
-        "cached_from": "TEXT",
-        "webhook_url": "TEXT",
-        "webhook_status": "TEXT",
-        "crm_status": "TEXT",
-        "crm_at": "REAL",
-    },
-    "segments": {
-        "job_id": "TEXT",
-        "idx": "INTEGER",
-        "start_s": "REAL",
-        "end_s": "REAL",
-        "text": "TEXT",
-        "speaker": "TEXT",
-        "confidence": "REAL",
-        "no_speech": "REAL",
-        "compression": "REAL",
-        "temperature": "REAL",
-        "language": "TEXT",
-        "words": "TEXT",
-    },
-    # Таблица разбора появилась целиком в десятой версии, и дописывать ей
-    # колонки было незачем — до одиннадцатой. Перечень полный, а не только
-    # новые: так следующая колонка не потребует вспоминать, как это делается.
-    "content": {
-        "job_id": "TEXT",
-        "version": "INTEGER",
-        "computed_at": "REAL",
-        "sentiment": "REAL",
-        "sentiment_label": "TEXT",
-        "sentiment_shift": "REAL",
-        "negative_segments": "INTEGER",
-        "positive_segments": "INTEGER",
-        "wpm": "INTEGER",
-        "silence_share": "REAL",
-        "interruptions": "INTEGER",
-        "pauses": "INTEGER",
-        "long_pauses": "INTEGER",
-        "longest_pause_s": "REAL",
-        "filler_rate": "REAL",
-        "questions": "INTEGER",
-        "commitments": "INTEGER",
-        "commitments_dated": "INTEGER",
-        "alerts": "INTEGER",
-        "compliance": "REAL",
-        "money_max": "REAL",
-        "speakers": "INTEGER",
-        "agent_speaker": "TEXT",
-        "overlap_s": "REAL",
-        "dead_air_s": "REAL",
-        "switches": "INTEGER",
-        "talk_share": "REAL",
-        "monologue_s": "REAL",
-        "customer_story_s": "REAL",
-        "reply_delay_s": "REAL",
-        "tempo_ratio": "REAL",
-        "frustration": "INTEGER",
-        "repeat_contact": "INTEGER",
-        "profanity": "INTEGER",
-        "profanity_agent": "INTEGER",
-        "objections": "INTEGER",
-        "objections_unhandled": "INTEGER",
-        "violations": "INTEGER",
-        "agent_score": "REAL",
-        "empathy": "REAL",
-        "name_uses": "INTEGER",
-        "mood": "REAL",
-        "mood_shift": "REAL",
-        "intensity": "INTEGER",
-        "stress": "INTEGER",
-        "effort": "REAL",
-        "fatigue": "INTEGER",
-        "clarity": "INTEGER",
-        "accuracy": "INTEGER",
-        "politeness": "INTEGER",
-        "personalization": "INTEGER",
-        "rhythm": "INTEGER",
-        "filler_top": "TEXT",
-        "diminutives": "INTEGER",
-        "diminutive_rate": "REAL",
-        "nps": "INTEGER",
-        "nps_group": "TEXT",
-        "nps_stated": "INTEGER",
-        "nps_said": "INTEGER",
-        "csat_said": "INTEGER",
-        "detail": "TEXT",
-    },
-    "content_marks": {
-        "job_id": "TEXT",
-        "kind": "TEXT",
-        "status": "TEXT",
-        "note": "TEXT",
-        "updated_at": "REAL",
-    },
-    "review_queue": {
-        "job_id": "TEXT",
-        "reason": "TEXT",
-        "status": "TEXT DEFAULT 'pending'",
-        "picked_at": "REAL",
-        "done_at": "REAL",
-        "reviewer": "TEXT",
-        "note": "TEXT",
-    },
-    "llm_results": {
-        "job_id": "TEXT", "version": "INTEGER", "model": "TEXT", "summary": "TEXT",
-        "reason": "TEXT", "reason_quote": "TEXT", "outcome": "TEXT",
-        "outcome_quote": "TEXT", "resolved": "INTEGER", "actions": "TEXT",
-        "trackers": "TEXT", "scorecard": "TEXT", "chunks": "INTEGER DEFAULT 1",
-        "calls": "INTEGER DEFAULT 0", "latency_ms": "REAL", "error": "TEXT",
-        "warnings": "TEXT", "created_at": "REAL",
-    },
-    "llm_cache": {
-        "key": "TEXT", "kind": "TEXT", "model": "TEXT", "response": "TEXT",
-        "latency_ms": "REAL", "created_at": "REAL",
-    },
-    "model_checks": {
-        "id": "INTEGER",
-        "job_id": "TEXT",
-        "check_job_id": "TEXT",
-        "model": "TEXT",
-        "control_model": "TEXT",
-        "wer": "REAL",
-        "mer": "REAL",
-        "words": "INTEGER",
-        "created_at": "REAL",
-    },
-    "content_hits": {
-        "job_id": "TEXT",
-        "category": "TEXT",
-        "kind": "TEXT DEFAULT 'topic'",
-        "count": "INTEGER DEFAULT 1",
-        "first_s": "REAL",
-    },
-    "content_terms": {
-        "job_id": "TEXT",
-        "stem": "TEXT",
-        "n": "INTEGER NOT NULL DEFAULT 1",
-    },
-    "content_vocab": {
-        "stem": "TEXT",
-        "word": "TEXT",
-        "n": "INTEGER NOT NULL DEFAULT 1",
-    },
-    "gpu_samples": {
-        "ts": "REAL",
-        "gpu": "INTEGER",
-        "name": "TEXT",
-        "util_percent": "REAL",
-        "mem_used_mb": "REAL",
-        "mem_total_mb": "REAL",
-        "temperature_c": "REAL",
-        "power_w": "REAL",
-        "power_limit_w": "REAL",
-    },
-    "qa_reviews": {
-        "id": "INTEGER",
-        "job_id": "TEXT",
-        "agent": "TEXT DEFAULT ''",
-        "assigned_to": "TEXT DEFAULT ''",
-        "assigned_by": "TEXT DEFAULT ''",
-        "assigned_at": "REAL",
-        "due_at": "REAL",
-        "status": "TEXT NOT NULL DEFAULT 'pending'",
-        "reviewer": "TEXT DEFAULT ''",
-        "reviewed_at": "REAL",
-        "auto_score": "REAL",
-        "score": "REAL",
-        "agree": "INTEGER",
-        "items": "TEXT",
-        "comment": "TEXT",
-        "reason": "TEXT DEFAULT ''",
-    },
-    "audit": {
-        "id": "INTEGER",
-        "ts": "REAL",
-        "actor": "TEXT DEFAULT ''",
-        "actor_id": "TEXT DEFAULT ''",
-        "kind": "TEXT DEFAULT ''",
-        "role": "TEXT DEFAULT ''",
-        "action": "TEXT DEFAULT ''",
-        "method": "TEXT DEFAULT ''",
-        "path": "TEXT DEFAULT ''",
-        "status": "INTEGER DEFAULT 0",
-        "ip": "TEXT DEFAULT ''",
-    },
-    "events": {
-        # Ключевые колонки объявлены как в CREATE TABLE. Прежнее
-        # «INTEGER  AUTOINCREMENT» — не синтаксис ALTER TABLE, и если бы
-        # догонялка когда-нибудь до него дошла, миграция упала бы целиком.
-        # Не доходила только потому, что колонка есть с первой версии.
-        "id": "INTEGER",
-        "job_id": "TEXT",
-        "ts": "REAL",
-        "kind": "TEXT",
-        "message": "TEXT",
-        "data": "TEXT",
-    },
-    "metrics": {
-        "id": "INTEGER",
-        "ts": "REAL",
-        "name": "TEXT",
-        "value": "REAL",
-        "job_id": "TEXT",
-        "model": "TEXT",
-        "engine": "TEXT",
-        "labels": "TEXT",
-    },
-    "api_keys": {
-        "key": "TEXT",
-        "name": "TEXT",
-        "role": "TEXT DEFAULT 'user'",
-        "created_at": "REAL",
-        "last_used": "REAL",
-        "requests": "INTEGER DEFAULT 0",
-        "rate_limit": "INTEGER DEFAULT 0",
-        "enabled": "INTEGER DEFAULT 1",
-    },
-    "kv": {
-        "key": "TEXT",
-        "value": "TEXT",
-        "ts": "REAL",
-    },
-    "model_stats": {
-        "model": "TEXT",
-        "engine": "TEXT",
-        "jobs_total": "INTEGER DEFAULT 0",
-        "jobs_ok": "INTEGER DEFAULT 0",
-        "jobs_failed": "INTEGER DEFAULT 0",
-        "audio_seconds": "REAL DEFAULT 0",
-        "processing_s": "REAL DEFAULT 0",
-        "words_total": "INTEGER DEFAULT 0",
-        "rtf_sum": "REAL DEFAULT 0",
-        "rtf_count": "INTEGER DEFAULT 0",
-        "confidence_sum": "REAL DEFAULT 0",
-        "confidence_count": "INTEGER DEFAULT 0",
-        "wer_sum": "REAL DEFAULT 0",
-        "wer_count": "INTEGER DEFAULT 0",
-        "last_used": "REAL",
-    },
-    "system_samples": {
-        "ts": "REAL",
-        "cpu_percent": "REAL",
-        "ram_used_mb": "REAL",
-        "ram_total_mb": "REAL",
-        "gpu_percent": "REAL",
-        "gpu_mem_mb": "REAL",
-        "gpu_mem_total": "REAL",
-        "disk_free_gb": "REAL",
-        "queue_depth": "INTEGER",
-        "active_jobs": "INTEGER",
-    },
-    "benchmarks": {
-        "id": "TEXT",
-        "created_at": "REAL",
-        "name": "TEXT",
-        "dataset": "TEXT",
-        "models": "TEXT",
-        "status": "TEXT DEFAULT 'running'",
-        "results": "TEXT",
-        "notes": "TEXT",
-    },
-    "calls": {
-        "uniqueid": "TEXT",
-        "job_id": "TEXT",
-        "src": "TEXT DEFAULT ''",
-        "dst": "TEXT DEFAULT ''",
-        "clid": "TEXT DEFAULT ''",
-        "channel": "TEXT DEFAULT ''",
-        "dstchannel": "TEXT DEFAULT ''",
-        "context": "TEXT DEFAULT ''",
-        "disposition": "TEXT DEFAULT ''",
-        "direction": "TEXT DEFAULT ''",
-        "queue": "TEXT DEFAULT ''",
-        "agent": "TEXT DEFAULT ''",
-        "duration": "INTEGER DEFAULT 0",
-        "billsec": "INTEGER DEFAULT 0",
-        "answered": "INTEGER DEFAULT 0",
-        "started_at": "REAL DEFAULT 0",
-        "recording": "TEXT DEFAULT ''",
-        "userfield": "TEXT DEFAULT ''",
-        "accountcode": "TEXT DEFAULT ''",
-        "owner": "TEXT DEFAULT ''",
-        "skipped": "TEXT DEFAULT ''",
-        "imported_at": "REAL",
-        "station": "TEXT DEFAULT ''",
-        "pbx_uid": "TEXT DEFAULT ''",
-        "deferred_at": "REAL",
-    },
-    # Владелец агента — ключ, которым агент поздоровался впервые. Без него
-    # личность агента задавалась телом запроса, и любой ключ с правом
-    # записи выдавал себя за чужого агента: забирал его задание и заранее
-    # «занимал» идентификаторы его звонков.
-    "agents": {
-        "owner": "TEXT DEFAULT ''",
-    },
-    # Экземпляр и отметка жизни у строки очереди модели: несколько серверов
-    # над одной базой не должны отбирать друг у друга идущий разбор.
-    "llm_queue": {
-        "instance": "TEXT DEFAULT ''",
-        "heartbeat_at": "REAL",
-    },
-}
+def _ожидаемые_колонки() -> dict[str, dict[str, str]]:
+    """Колонки каждой таблицы — из самой схемы, выполненной в памяти.
+
+    Набор сверяется при каждом открытии базы: колонку, которой в ней нет,
+    дописывает `ALTER TABLE`. Прежде он был написан руками, с комментарием
+    «собран из _SCHEMA, поэтому не может разойтись» — и разошёлся: таблиц
+    сотрудников, агентов и очереди модели в нём не было вовсе, и новая
+    колонка в любой из них на базе прежней версии не появилась бы никогда —
+    каждый запрос к таблице падал бы с «no such column».
+
+    Объявление — тип, `NOT NULL` при значении по умолчанию и само значение:
+    `ALTER TABLE … ADD COLUMN` принимает `NOT NULL` только вместе с ним.
+    """
+    соединение = sqlite3.connect(":memory:")
+    try:
+        for statement in _SCHEMA:
+            соединение.execute(statement)
+        таблицы = [строка[0] for строка in соединение.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        итог: dict[str, dict[str, str]] = {}
+        for таблица in таблицы:
+            колонки: dict[str, str] = {}
+            for _, имя, тип, обязательна, умолчание, _ in соединение.execute(
+                    f"PRAGMA table_info({таблица})"):
+                объявление = str(тип or "").strip()
+                if умолчание is not None:
+                    if обязательна:
+                        объявление += " NOT NULL"
+                    объявление += f" DEFAULT {умолчание}"
+                колонки[str(имя)] = объявление
+            итог[таблица] = колонки
+        return итог
+    finally:
+        соединение.close()
+
+
+#: Ожидаемый набор колонок — сверяется при миграции (см. `_ожидаемые_колонки`).
+_EXPECTED_COLUMNS: dict[str, dict[str, str]] = _ожидаемые_колонки()
+
+
+#: С какой длины последнее слово поиска ищется как начало слова.
+ПРЕФИКС_ОТ = 2
+
+#: Сколько секунд поток помнит ответ указателя на тот же поиск. Один запрос
+#: списка «Результатов» спрашивал указатель трижды — список, счётчик и
+#: признак обрезки, — и на большом архиве каждое обращение стоило столько же,
+#: сколько первое.
+ПАМЯТЬ_ПОИСКА_С = 5.0
+
 
 def fts_query(text: str) -> str:
     """Превращает набранное человеком в запрос к указателю.
@@ -1289,6 +1047,11 @@ def fts_query(text: str) -> str:
 
     Пустая строка на выходе означает «искать нечего» — вызывающий тогда
     просто не ставит условия.
+
+    Продолжение — только от двух букв. Одна буква со звёздочкой («д»*) —
+    это полсловаря: на четырёхстах тысячах реплик такой запрос шёл больше
+    полусекунды, а найти по нему нельзя ничего осмысленного. Однобуквенное
+    последнее слово ищется как слово.
     """
     слова = re.findall(r"[^\W_]+", text or "", flags=re.UNICODE)
     if not слова:
@@ -1297,7 +1060,8 @@ def fts_query(text: str) -> str:
     # каждое слово стоит времени, а пользы за пределами первых нет.
     слова = слова[:12]
     части = [f'"{w}"' for w in слова[:-1]]
-    части.append(f'"{слова[-1]}"*')
+    последнее = слова[-1]
+    части.append(f'"{последнее}"*' if len(последнее) >= ПРЕФИКС_ОТ else f'"{последнее}"')
     return " ".join(части)
 
 
@@ -1320,20 +1084,26 @@ def _порядок_заданий(order: str, соединение: bool) -> st
     """
     п = "jobs." if соединение else ""
     if order == "deadline ASC":
-        return (f"({п}deadline IS NULL), {п}deadline ASC, {п}created_at ASC")
+        return (f"({п}deadline IS NULL), {п}deadline ASC, {п}created_at ASC, {п}id ASC")
     # Внутри одного приоритета — по времени постановки. Без второго ключа
     # SQLite отдавал сначала задания в «queued», потом в «retry», и задание,
     # у которого время повтора давно наступило, не попадало в окно выборки
     # планировщика, пока очередь не станет меньше окна.
     if order in ("priority DESC", "priority ASC"):
         return f"{п}{order}, {п}created_at ASC, {п}id ASC"
-    return f"{п}{order}" if соединение and not order.startswith("jobs.") else order
+    # Номер задания — последним ключом. Задания пакета заводятся в одну
+    # секунду, и при равном времени SQLite вправе отдавать их в любом
+    # порядке: страница вторая повторяла строку с первой, а соседняя не
+    # попадала ни на одну.
+    направление = "DESC" if order.endswith("DESC") else "ASC"
+    основа = f"{п}{order}" if соединение and not order.startswith("jobs.") else order
+    return f"{основа}, {п}id {направление}"
 
 
 class Database:
     """Тонкая обёртка над SQLite с пулом соединений по потокам."""
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, journal_mode: str | None = None):
         self.path = Path(path)
         self._local = threading.local()
         self._write_lock = threading.RLock()
@@ -1341,6 +1111,21 @@ class Database:
         #: Есть ли полнотекстовый указатель. False — сборка SQLite без FTS5;
         #: поиск тогда работает перебором, как раньше.
         self.fts_ready = False
+        #: Какой режим журнала просили: «wal», «delete» или None — «как в
+        #: файле» (новая база получает WAL). Сервер передаёт настройку
+        #: `db_journal_mode`; сценарии командной строки — ничего, чтобы не
+        #: переключать режим под работающим сервером.
+        self._журнал_просили = _режим_журнала(journal_mode)
+        #: Режим, в котором база работает на самом деле, — после первого
+        #: соединения. Им же выбирается `synchronous` у остальных.
+        self.journal_mode = ""
+        self._журнал_выбран = False
+        #: Поколение реплик: растёт при каждой их записи и удалении. Память
+        #: поиска (`jobs_matching`) действительна только в своём поколении.
+        self._поколение_реплик = 0
+        #: Что сервер рассказывает о себе в отметке жизни (версия, файловая
+        #: система) — заполняет `create_app`.
+        self.сведения_отметки: dict[str, Any] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._migrate()
         self._setup_fts()
@@ -1358,12 +1143,33 @@ class Database:
             except sqlite3.Error as exc:
                 raise StorageError(f"Не удалось открыть базу {self.path}: {exc}") from exc
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("PRAGMA cache_size=-32000")
+            try:
+                # Ожидание занятой базы — первым делом: всё ниже может
+                # упереться в чужую блокировку и без него падало бы сразу.
+                conn.execute("PRAGMA busy_timeout=30000")
+                if not self._журнал_выбран:
+                    with self._write_lock:
+                        if not self._журнал_выбран:
+                            self.journal_mode = self._выбрать_журнал(conn)
+                            self._журнал_выбран = True
+                # WAL переживает закрытие соединения: новое открывает базу в
+                # нём само, и ставить его каждому потоку заново незачем — а
+                # под соседним сервером в режиме отката и вредно. У журнала
+                # отката NORMAL при сбое питания может испортить базу, у WAL —
+                # нет: отсюда разный `synchronous`.
+                conn.execute("PRAGMA synchronous="
+                             + ("NORMAL" if self.journal_mode == "wal" else "FULL"))
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute(f"PRAGMA cache_size=-{КЕШ_СОЕДИНЕНИЯ_КБ}")
+                conn.execute(f"PRAGMA journal_size_limit={ПРЕДЕЛ_ЖУРНАЛА}")
+            except sqlite3.DatabaseError as exc:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+                raise StorageError(f"База повреждена или недоступна: {self.path}: {exc}",
+                                   hint="Проверьте файл базы (PRAGMA integrity_check) и "
+                                        "права на каталог данных; при порче — "
+                                        "восстановите базу из резервной копии.") from exc
             # LOWER() в SQLite понимает только латиницу: «Иванов» она
             # оставляет как есть, и поиск по справочнику не находил
             # человека, если регистр не совпал буква в букву. Подменяем
@@ -1374,6 +1180,91 @@ class Database:
                 conn.create_function("lower", 1, _нижний)
             self._local.conn = conn
         return conn
+
+    def _выбрать_журнал(self, conn: sqlite3.Connection) -> str:
+        """Ставит просимый режим журнала первому соединению; возвращает итог.
+
+        Режим — свойство файла, а не соединения: WAL, однажды включённый,
+        переживает закрытие, и все соединения всех процессов работают в нём.
+        Поэтому менять его можно только когда над базой не работает никто:
+        сосед со старым режимом и мы с новым видят базу по-разному, и это
+        кончается порчей. Сосед виден по его отметке в `kv` (`instance:…`);
+        есть живой сосед — режим не меняется, а журнал сервера говорит, что
+        делать. Своё соединение здесь единственное: зовётся из `__init__`.
+        """
+        текущий = str(conn.execute("PRAGMA journal_mode").fetchone()[0] or "").lower()
+        if текущий == "memory" or str(self.path) == ":memory:":
+            return текущий
+        новая = int(conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]) == 0
+        желаемый = self._журнал_просили or ("wal" if новая else "")
+        if not желаемый or желаемый == текущий:
+            return текущий
+        if not новая:
+            соседи = [с for с in self._отметки(conn) if not с["self"]]
+            if соседи:
+                log.error(
+                    "Режим журнала базы не сменён (%s → %s): над ней работают другие "
+                    "серверы — %s. Остановите все серверы над этой базой, задайте "
+                    "всем одинаковый db_journal_mode и запускайте заново.",
+                    текущий, желаемый, ", ".join(с["instance"] for с in соседи))
+                return текущий
+        try:
+            итог = str(conn.execute(f"PRAGMA journal_mode={желаемый}").fetchone()[0]
+                       or "").lower()
+        except sqlite3.Error as exc:
+            log.error("Режим журнала базы не сменён (%s → %s): %s", текущий, желаемый, exc)
+            return текущий
+        if итог != желаемый:
+            log.warning("База осталась в режиме «%s» вместо «%s»: файловая система "
+                        "не дала его сменить.", итог, желаемый)
+        elif not новая:
+            log.warning("Режим журнала базы сменён: %s → %s", текущий, итог)
+        return итог
+
+    @staticmethod
+    def _отметки(conn: sqlite3.Connection, *,
+                 свежесть: float = СВЕЖЕСТЬ_ОТМЕТКИ_С) -> list[dict[str, Any]]:
+        """Живые отметки экземпляров — прямо через соединение, без `self.conn`."""
+        try:
+            строки = conn.execute(
+                "SELECT key, value, ts FROM kv WHERE key LIKE ? ESCAPE '\\'",
+                (_экранировать_like(РЕЕСТР) + "%",)).fetchall()
+        except sqlite3.Error:
+            return []                       # таблицы ещё нет — новая база
+        return _живые_отметки(строки, свежее=now() - свежесть)
+
+    # --- экземпляры над общей базой ---------------------------------------
+
+    def instance_beat(self, **сведения: Any) -> None:
+        """Отметка «этот сервер жив» — раз в полминуты из служебного потока.
+
+        Задания показывают только тех, кто сейчас считает; простаивающий
+        сосед был невидим, и ни смена режима журнала, ни восстановление
+        базы, ни VACUUM не знали, что над базой работает кто-то ещё.
+        """
+        данные = {"host": HOSTNAME, "pid": os.getpid(), "kernel": KERNEL_ID,
+                  "journal": self.journal_mode, **self.сведения_отметки, **сведения}
+        self.set_kv(f"{РЕЕСТР}{INSTANCE_ID}", данные)
+
+    def instance_forget(self) -> None:
+        """Снимает свою отметку — при штатной остановке сервера."""
+        try:
+            self.execute("DELETE FROM kv WHERE key=?", (f"{РЕЕСТР}{INSTANCE_ID}",))
+        except StorageError as exc:
+            log.debug("Отметка экземпляра не снята: %s", exc)
+
+    def instances(self, *, свежесть: float = СВЕЖЕСТЬ_ОТМЕТКИ_С) -> list[dict[str, Any]]:
+        """Живые экземпляры над этой базой, свой — первым."""
+        return self._отметки(self.conn, свежесть=свежесть)
+
+    def other_instances(self, *, свежесть: float = СВЕЖЕСТЬ_ОТМЕТКИ_С) -> list[dict[str, Any]]:
+        """Живые соседи — все, кроме себя."""
+        return [э for э in self.instances(свежесть=свежесть) if not э["self"]]
+
+    def instances_prune(self, *, старше: float = 7 * 86400) -> int:
+        """Убирает отметки давно умерших экземпляров."""
+        return self.execute("DELETE FROM kv WHERE key LIKE ? ESCAPE '\\' AND ts < ?",
+                            (_экранировать_like(РЕЕСТР) + "%", now() - старше))
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
@@ -1505,14 +1396,25 @@ class Database:
         if not всего:
             return
 
-        # Сначала дубли: перенести задание и убрать старую строку.
+        # Сначала дубли: перенести задание и убрать старую строку. Задание
+        # прежней строки главнее всегда, а не только когда у дубля своего
+        # нет: обычный дубль своё задание уже получил (импорт поставил
+        # запись второй раз), и прежнее условие `job_id IS NULL` оставляло
+        # звонок привязанным к дублю — у исходной расшифровки, той, что в
+        # отчётах и по которой стоят ссылки, связь со звонком терялась.
+        прежняя = (
+            "SELECT c.job_id FROM calls c WHERE "
+            + условие.replace("station", "c.station").replace("pbx_uid", "c.pbx_uid")
+            .replace("uniqueid", "c.uniqueid")
+            + " AND c.station = calls.station AND c.pbx_uid = calls.pbx_uid"
+              " AND c.job_id IS NOT NULL")
+        брошенные = [str(строка[0]) for строка in conn.execute(
+            "SELECT job_id FROM calls WHERE job_id IS NOT NULL "
+            "AND uniqueid = station || ':' || pbx_uid "
+            f"AND EXISTS ({прежняя} AND c.job_id <> calls.job_id)")]
         conn.execute(
-            "UPDATE calls SET job_id = COALESCE("
-            "  (SELECT c.job_id FROM calls c"
-            f"   WHERE {условие.replace('station', 'c.station').replace('pbx_uid', 'c.pbx_uid').replace('uniqueid', 'c.uniqueid')}"
-            "     AND c.station = calls.station AND c.pbx_uid = calls.pbx_uid),"
-            "  job_id) "
-            "WHERE job_id IS NULL AND uniqueid = station || ':' || pbx_uid")
+            f"UPDATE calls SET job_id = COALESCE(({прежняя} LIMIT 1), job_id) "
+            "WHERE uniqueid = station || ':' || pbx_uid")
         дублей = conn.execute(
             f"DELETE FROM calls WHERE {условие} AND EXISTS ("
             "  SELECT 1 FROM calls c WHERE c.uniqueid = calls.station || ':' || calls.pbx_uid)"
@@ -1522,6 +1424,16 @@ class Database:
         ).rowcount
         log.info("Миграция: ключи звонков приведены к виду «станция:идентификатор» — "
                  "переименовано %s, дублей убрано %s", переименовано, дублей)
+        if брошенные:
+            # Второе задание на ту же запись не удаляется молча: это
+            # расшифровка, которую человек мог уже открыть. Но и в отчётах
+            # оно считает разговор второй раз — поэтому список в журнал.
+            log.warning(
+                "Миграция: у %s звонков было по два задания; звонок оставлен за "
+                "прежним, повторное осталось без звонка — удалите его в "
+                "«Результатах», если оно не нужно: %s",
+                len(брошенные), ", ".join(брошенные[:20])
+                + (" …" if len(брошенные) > 20 else ""))
 
 
     def _вычистить_секреты_заданий(self, conn: sqlite3.Connection) -> None:
@@ -2129,6 +2041,13 @@ class Database:
             return []
         условие, свои = self._owner_clause(owner, "j")
         где = f" AND {условие}" if условие else ""
+        предел = limit or self.SEARCH_LIMIT
+        # Память — у потока: обработчик запроса зовёт список и счётчик в
+        # одном потоке подряд, а другим потокам чужой ответ не нужен.
+        ключ = (запрос, где, tuple(свои), предел, self._поколение_реплик)
+        помню = getattr(self._local, "поиск", None)
+        if помню and помню[0] == ключ and time.monotonic() - помню[1] < ПАМЯТЬ_ПОИСКА_С:
+            return list(помню[2])
         try:
             # Порядок обязателен: без него FTS отдаёт совпадения по
             # возрастанию номера строки, то есть от самых старых реплик, а
@@ -2141,12 +2060,14 @@ class Database:
                 "JOIN segments s ON s.rowid = f.rowid "
                 "JOIN jobs j ON j.id = s.job_id "
                 f"WHERE f.text MATCH ?{где} GROUP BY s.job_id "
-                "ORDER BY свежесть DESC LIMIT ?",
-                (запрос, *свои, limit or self.SEARCH_LIMIT))
+                "ORDER BY свежесть DESC, s.job_id LIMIT ?",
+                (запрос, *свои, предел))
         except StorageError as exc:
             log.warning("Поиск по указателю не удался (%s) — идём перебором", exc)
             return []
-        return [str(r["job_id"]) for r in rows]
+        найдено = [str(r["job_id"]) for r in rows]
+        self._local.поиск = (ключ, time.monotonic(), tuple(найдено))
+        return найдено
 
     def search_segments(self, search: str, *, job_id: str = "",
                         job_ids: Sequence[str] = (),
@@ -2846,8 +2767,12 @@ class Database:
             "       j.filename, j.model, j.owner, j.source, j.media_duration_s, "
             "       j.avg_confidence, j.snr_db, j.wer, j.ref_words, j.created_at "
             f"FROM review_queue r JOIN jobs j ON j.id = r.job_id {clause} "
+            # Номер задания — последним ключом: у записей с одинаковой
+            # уверенностью и одной секундой отбора порядок иначе не задан, и
+            # листалка показывала одну запись на двух страницах, а другую —
+            # ни на одной.
             "ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, "
-            "         j.avg_confidence ASC, r.picked_at DESC LIMIT ? OFFSET ?",
+            "         j.avg_confidence ASC, r.picked_at DESC, r.job_id LIMIT ? OFFSET ?",
             [*args, limit, offset])
         return [dict(r) for r in rows]
 
@@ -2985,10 +2910,101 @@ class Database:
         self.execute("DELETE FROM llm_cache WHERE key=?", (key,))
 
     def llm_cache_put(self, key: str, kind: str, model: str, response: str,
-                      latency_ms: float) -> None:
+                      latency_ms: float, *, job_id: str | None = None) -> None:
+        """Кладёт ответ модели в кеш; `job_id` — чья это запись (для удаления)."""
         self.execute(
             "INSERT OR REPLACE INTO llm_cache (key, kind, model, response, latency_ms, "
-            "created_at) VALUES (?,?,?,?,?,?)", (key, kind, model, response, latency_ms, now()))
+            "created_at, job_id) VALUES (?,?,?,?,?,?,?)",
+            (key, kind, model, response, latency_ms, now(), job_id or None))
+
+    def llm_cache_forget_matching(self, образец: str) -> int:
+        """Убирает ответы модели, в которых встречается образец.
+
+        Для удаления по требованию: ответы, положенные в кеш до версии 29,
+        не знают своей записи, а пересказ мог сохранить и номер, и фамилию.
+        """
+        текст = str(образец or "").strip()
+        if len(текст) < 4:
+            return 0
+        условия = ["lower(response) LIKE ? ESCAPE '\\'"]
+        args: list[Any] = [f"%{_экранировать_like(текст.lower())}%"]
+        # Номер — по цифрам: модель пишет его по-своему («+7 916 123-45-67»),
+        # а удалить просят так, как он записан у человека.
+        цифры = self._цифры_номера(текст)
+        if цифры:
+            чистый = "COALESCE(response,'')"
+            for знак in ("+", " ", "-", "(", ")"):
+                чистый = f"REPLACE({чистый}, '{знак}', '')"
+            условия.append(f"{чистый} LIKE ? ESCAPE '\\'")
+            args.append(f"%{_экранировать_like(цифры)}%")
+        return self.execute(f"DELETE FROM llm_cache WHERE {' OR '.join(условия)}", args)
+
+    # --- удаление по требованию --------------------------------------------
+
+    @staticmethod
+    def _цифры_номера(запрос: str) -> str:
+        """Цифры номера из запроса — десять последних, если их хотя бы семь.
+
+        Номер пишут кто как: «+7 (916) 123-45-67», «89161234567»,
+        «9161234567»; станция кладёт его своим способом. Сравнение по
+        десяти последним цифрам ловит все три записи одного номера. Меньше
+        семи цифр — это внутренний номер или номер заказа, а не телефон:
+        «12345» нашлось бы в сотне чужих номеров.
+        """
+        цифры = re.sub(r"\D", "", str(запрос or ""))
+        return цифры[-10:] if len(цифры) >= 7 else ""
+
+    def _условие_звонка(self, запрос: str) -> tuple[str, list[Any]]:
+        """Условие «звонок про этого человека»: номер в любом поле или имя.
+
+        Цифры поля перед сравнением очищаются от «+», пробелов, скобок и
+        дефисов — у SQLite нет замены по образцу, а REPLACE по пяти знакам
+        покрывает всё, что пишет Asterisk и что набирает человек.
+        """
+        части: list[str] = []
+        args: list[Any] = []
+        цифры = self._цифры_номера(запрос)
+        if цифры:
+            for поле in ("src", "dst", "clid", "channel", "dstchannel", "recording"):
+                чистое = f"COALESCE({поле},'')"
+                for знак in ("+", " ", "-", "(", ")"):
+                    чистое = f"REPLACE({чистое}, '{знак}', '')"
+                части.append(f"{чистое} LIKE ? ESCAPE '\\'")
+                args.append(f"%{_экранировать_like(цифры)}%")
+        текст = str(запрос or "").strip().lower()
+        if текст:
+            части.append("lower(COALESCE(clid,'')) LIKE ? ESCAPE '\\'")
+            args.append(f"%{_экранировать_like(текст)}%")
+        return ("(" + " OR ".join(части) + ")") if части else "0", args
+
+    def erase_call_job_ids(self, запрос: str, *, limit: int = 1000) -> list[str]:
+        """Задания звонков, где встречается номер или имя из запроса.
+
+        Поиск «Результатов» смотрит в имя файла, номер задания и текст. Номер
+        клиента он находил, только если его произнесли вслух: запись,
+        названная `${UNIQUEID}.wav`, по номеру не находилась вовсе — субъекту
+        отвечали «удалено», а разговор оставался.
+        """
+        условие, args = self._условие_звонка(запрос)
+        строки = self.query(
+            f"SELECT DISTINCT job_id FROM calls WHERE job_id IS NOT NULL AND {условие} "
+            "LIMIT ?", [*args, max(1, int(limit))])
+        return [str(с["job_id"]) for с in строки]
+
+    def erase_calls_count(self, запрос: str) -> int:
+        """Сколько строк журнала звонков обезличит `erase_calls` — для пробы."""
+        условие, args = self._условие_звонка(запрос)
+        строка = self.query_one(f"SELECT COUNT(*) AS n FROM calls WHERE {условие}", args)
+        return int(строка["n"]) if строка else 0
+
+    def erase_calls(self, запрос: str) -> int:
+        """Обезличивает строки журнала звонков, где встречается номер или имя.
+
+        И звонки без задания: пропущенные (короткий, без записи, не
+        отвеченный) тоже хранят номер — удалять по требованию нужно и их.
+        """
+        условие, args = self._условие_звонка(запрос)
+        return self.execute(f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE {условие}", args)
 
     def llm_outcome_filter(self, kind: str, value: str) -> tuple[str, list[Any]]:
         """Условие отбора заданий по исходу или причине из ответа модели."""
@@ -3564,6 +3580,32 @@ class Database:
             f"SELECT COUNT(*) AS n FROM jobs{соединение} {clause}", args)
         return int(row["n"]) if row else 0
 
+    def job_file_refs(self) -> tuple[set[str], set[str], set[str]]:
+        """Все пути, которые держат задания: исходники, каталоги результатов, номера.
+
+        Для уборки файлов без задания (`maintenance.подмести_файлы`). Пути
+        приводятся к настоящим (`resolve`), чтобы ссылка и файл сравнивались
+        одинаково; номера нужны отдельно — каталог результатов называется
+        номером задания, даже если путь в базе ведёт в другое место.
+        """
+        файлы: set[str] = set()
+        каталоги: set[str] = set()
+        номера: set[str] = set()
+
+        def настоящий(путь: str) -> str:
+            try:
+                return str(Path(путь).resolve())
+            except (OSError, RuntimeError, ValueError):
+                return путь
+
+        for строка in self.query("SELECT id, file_path, result_path FROM jobs"):
+            номера.add(str(строка[0]))
+            if строка[1]:
+                файлы.add(настоящий(str(строка[1])))
+            if строка[2]:
+                каталоги.add(настоящий(str(строка[2])))
+        return файлы, каталоги, номера
+
     def file_used_elsewhere(self, file_path: str, except_id: str) -> bool:
         """Ссылается ли на этот файл записи другое задание.
 
@@ -3579,6 +3621,7 @@ class Database:
             (file_path, except_id)) is not None
 
     def delete_job(self, job_id: str) -> None:
+        self._поколение_реплик += 1
         with self.write() as conn:
             conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM events WHERE job_id=?", (job_id,))
@@ -3601,10 +3644,29 @@ class Database:
             conn.execute("DELETE FROM llm_queue WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM model_checks WHERE job_id=? OR check_job_id=?",
                          (job_id, job_id))
-            # content_vocab не трогаем: это словарь форм на весь сервер, а не
-            # данные задания. Строка «поставк → поставки» после удаления
-            # записи остаётся верной, а перебирать ради неё все прочие записи
-            # с той же основой — работа на ровном месте.
+            # Проверка оператора по этой записи. Её не удалял никто: она
+            # висела в «ожидает» и «просрочено» вечно, считалась в очереди
+            # проверяющего и хранила оператора, комментарий и пункты оценки
+            # разговора, которого больше нет.
+            conn.execute("DELETE FROM qa_reviews WHERE job_id=?", (job_id,))
+            # Ответы модели по этой записи: пересказ с именем и номером.
+            # Ключ кеша — отпечаток подсказки, поэтому до версии 29 удаление
+            # записи их не находило вовсе (см. `_LLM_CACHE_SCHEMA`).
+            conn.execute("DELETE FROM llm_cache WHERE job_id=?", (job_id,))
+            # Звонок остаётся строкой журнала — без неё импорт завёл бы его
+            # заново, — но без номеров, имени звонящего и пути к записи: они
+            # переживали разговор и были видны в журнале и топах раздела
+            # «АТС» до срока хранения, а при «хранить бессрочно» — всегда.
+            conn.execute(f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE job_id=?", (job_id,))
+            # Поисковый указатель при удалении пишет «надгробия», а сами
+            # слова физически остаются в нём до слияния сегментов — и уезжают
+            # в резервные копии. Суточная уборка вычищает их (`fts_purge`),
+            # если с прошлого раза что-то удаляли.
+            conn.execute("INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?,?,?)",
+                         (КЛЮЧ_УКАЗАТЕЛЬ_ГРЯЗНЫЙ, "true", now()))
+            # content_vocab здесь не трогаем: это словарь форм на весь
+            # сервер. Основы, которых не осталось ни в одной записи, убирает
+            # `sweep_orphans` — одним запросом на все удалённые разом.
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
     def update_job_if_status(self, job_id: str, expected: list[str],
@@ -3688,6 +3750,7 @@ class Database:
                 seg.get("temperature"), seg.get("language"),
                 json.dumps(seg.get("words"), ensure_ascii=False) if seg.get("words") else None,
             ))
+        self._поколение_реплик += 1
         with self.write() as conn:
             conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
             conn.executemany(
@@ -3703,6 +3766,7 @@ class Database:
         так «готово» никогда не врёт про их число, — и остаться без
         задания они могут только на этом пути.
         """
+        self._поколение_реплик += 1
         self.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
 
     def get_segments(self, job_id: str) -> list[dict[str, Any]]:
@@ -4208,19 +4272,24 @@ class Database:
         return self.query_one("SELECT 1 FROM calls WHERE uniqueid=?",
                               (str(uniqueid),)) is not None
 
-    def known_call_ids(self, limit: int = 100000, *,
+    #: Сколько известных звонков держать в памяти при обходе каталога.
+    ПРЕДЕЛ_ИЗВЕСТНЫХ_ЗВОНКОВ = 100000
+
+    def known_call_ids(self, limit: int | None = None, *,
                        station: str = "") -> set[str]:
         """Множество известных идентификаторов — для обхода папки записей.
 
         Спрашивать базу по файлу на каждом заходе — это тысячи запросов на
         каталог в десять тысяч записей. Одно множество дешевле и по времени,
-        и по блокировкам.
+        и по блокировкам. Множество ограничено свежими звонками; если в нём
+        ровно `limit` — оно неполное, и вызывающий доспрашивает промахи
+        через `call_exists` (см. `telephony.importer`).
         """
         где = " WHERE station=?" if station else ""
         args: list[Any] = [station] if station else []
         rows = self.query(
             f"SELECT uniqueid FROM calls{где} ORDER BY imported_at DESC LIMIT ?",
-            (*args, max(1, int(limit))))
+            (*args, max(1, int(limit or self.ПРЕДЕЛ_ИЗВЕСТНЫХ_ЗВОНКОВ))))
         return {str(r["uniqueid"]) for r in rows}
 
     def call_counts(self, *, owner: str | list[str] | None = None,
@@ -4508,6 +4577,32 @@ class Database:
 
     ШАГ_КОРЗИНЫ = {"hour": 3600, "day": 86400, "week": 7 * 86400, "month": 30 * 86400}
 
+    #: Эпоха началась в четверг: неделя, отсчитанная от неё делением, шла с
+    #: четверга по среду, и «неделя с Thu 10.09» собирала четверг,
+    #: воскресенье и понедельник. Первый понедельник эпохи — 5 января 1970.
+    СДВИГ_НЕДЕЛИ = 4 * 86400
+
+    def _корзина_звонка(self, шаг: int, сдвиг: int) -> tuple[str, str]:
+        """SQL начала корзины (секунды эпохи) и её порядкового номера.
+
+        Час и сутки — арифметикой по местному сдвигу. Неделя — так же, но
+        от понедельника. Месяц — календарный: «30 суток» уводили корзины
+        от первых чисел на день за месяц, и к декабрю «месяц» начинался
+        25 ноября. Календарный месяц считает сам SQLite: `localtime` →
+        начало месяца → `utc`; номер корзины — год·12 + месяц, чтобы
+        соседние месяцы шли подряд, как и прочие корзины.
+        """
+        t = "c.started_at"
+        if шаг == self.ШАГ_КОРЗИНЫ["month"]:
+            начало = (f"CAST(strftime('%s', {t}, 'unixepoch', 'localtime', "
+                      "'start of month', 'utc') AS INTEGER)")
+            номер = (f"(CAST(strftime('%Y', {t}, 'unixepoch', 'localtime') AS INTEGER) * 12"
+                     f" + CAST(strftime('%m', {t}, 'unixepoch', 'localtime') AS INTEGER))")
+            return начало, номер
+        неделя = self.СДВИГ_НЕДЕЛИ if шаг == self.ШАГ_КОРЗИНЫ["week"] else 0
+        номер = f"CAST(({t} + {сдвиг} - {неделя}) / {шаг} AS INTEGER)"
+        return f"{номер} * {шаг} + {неделя} - {сдвиг}", номер
+
     @staticmethod
     def _сдвиг_времени() -> int:
         """Смещение местного времени от UTC, секунды.
@@ -4543,9 +4638,9 @@ class Database:
         # считается через `localtime`) противоречила этой же линии в одном
         # и том же ответе.
         сдвиг = self._сдвиг_времени() if шаг >= 86400 else 0
+        начало, _ = self._корзина_звонка(шаг, сдвиг)
         rows = self.query(
-            f"SELECT CAST((c.started_at + {сдвиг}) / {шаг} AS INTEGER) * {шаг} - {сдвиг} "
-            "AS bucket, "
+            f"SELECT {начало} AS bucket, "
             + ", ".join(self.СЧЁТ_ЗВОНКОВ)
             + f" FROM calls c WHERE {' AND '.join(части)} "
             f"GROUP BY bucket ORDER BY bucket LIMIT {int(limit)}", args)
@@ -4570,9 +4665,10 @@ class Database:
         части, args = self._условия_звонков(owner, "", since, until)
         части.append("c.started_at>0")
         сдвиг = self._сдвиг_времени() if шаг >= 86400 else 0
+        _, номер = self._корзина_звонка(шаг, сдвиг)
         rows = self.query(
             f"SELECT COALESCE(c.station,'') AS station, "
-            f"       CAST((c.started_at + {сдвиг}) / {шаг} AS INTEGER) AS bucket, "
+            f"       {номер} AS bucket, "
             "       COUNT(*) AS n "
             f"FROM calls c WHERE {' AND '.join(части)} "
             "GROUP BY station, bucket", args)
@@ -4817,7 +4913,7 @@ class Database:
         где = (" WHERE " + " AND ".join(условия)) if условия else ""
         всего = self.query_one(f"SELECT COUNT(*) AS n FROM employees{где}", параметры)
         rows = self.query(
-            f"SELECT * FROM employees{где} ORDER BY active DESC, last_name, first_name "
+            f"SELECT * FROM employees{где} ORDER BY active DESC, last_name, first_name, id "
             f"LIMIT ? OFFSET ?", [*параметры, max(1, int(limit)), max(0, int(offset))])
         return {"total": int(всего["n"]) if всего else 0,
                 "items": [dict(r) for r in rows]}
@@ -5352,49 +5448,57 @@ class Database:
         Повторное назначение той же записи не заводит вторую строку: две
         проверки одного разговора дают два балла, и дальше начинается спор о
         том, какой из них настоящий.
+
+        Проверка «уже стоит» — в том же выражении, что и вставка, внутри
+        одной транзакции записи. Раньше она шла отдельным чтением до неё, и
+        два сервера над общей базой (или часовой набор и кнопка в одну
+        секунду) заводили по проверке каждый.
         """
-        существует = self.query_one(
-            "SELECT id FROM qa_reviews WHERE job_id=? AND status='pending'",
-            (str(job_id),))
-        if существует:
-            return None
         with self.write() as conn:
             курсор = conn.execute(
                 "INSERT INTO qa_reviews (job_id, agent, assigned_to, assigned_by, "
                 "assigned_at, due_at, status, auto_score, reason) "
                 "SELECT ?,?,?,?,?,?,'pending',?,? "
-                "WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?)",
+                "WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?) "
+                "AND NOT EXISTS (SELECT 1 FROM qa_reviews "
+                "                WHERE job_id=? AND status='pending')",
                 (str(job_id), str(agent or ""), str(assigned_to or ""),
                  str(assigned_by or ""), now(), due_at,
-                 auto_score, str(reason or ""), str(job_id)))
+                 auto_score, str(reason or ""), str(job_id), str(job_id)))
             return int(курсор.lastrowid) if курсор.rowcount else None
 
     def qa_submit(self, review_id: int, *, reviewer: str, score: float | None,
                   agree: bool | None = None, items: Any = None,
                   comment: str = "") -> bool:
-        """Записывает исход проверки. False — такой проверки нет или она закрыта."""
-        строка = self.query_one(
-            "SELECT auto_score FROM qa_reviews WHERE id=? AND status='pending'",
-            (int(review_id),))
-        if строка is None:
-            return False
-        авто = строка["auto_score"]
-        # Согласие считается само, когда о нём не сказали: расхождение
-        # больше десяти баллов из ста — это уже другая оценка, а не
-        # округление. Спрашивать об этом человека отдельно значит получать
-        # пустое поле в половине проверок.
-        своё = agree
-        if своё is None and авто is not None and score is not None:
-            своё = abs(float(авто) - float(score)) <= 10.0
-        self.execute(
-            "UPDATE qa_reviews SET status='done', reviewer=?, reviewed_at=?, "
-            "score=?, agree=?, items=?, comment=? WHERE id=?",
-            (str(reviewer or ""), now(),
-             None if score is None else float(score),
-             None if своё is None else int(bool(своё)),
-             json.dumps(items, ensure_ascii=False) if items is not None else None,
-             str(comment or ""), int(review_id)))
-        return True
+        """Записывает исход проверки. False — такой проверки нет или она закрыта.
+
+        Чтение и запись — одной транзакцией, а запись — только пока проверка
+        открыта. Два проверяющих, отправивших оценку в одну секунду, прежде
+        оба получали «принято», и вторая оценка молча затирала первую.
+        """
+        with self.write() as conn:
+            строка = conn.execute(
+                "SELECT auto_score FROM qa_reviews WHERE id=? AND status='pending'",
+                (int(review_id),)).fetchone()
+            if строка is None:
+                return False
+            авто = строка["auto_score"]
+            # Согласие считается само, когда о нём не сказали: расхождение
+            # больше десяти баллов из ста — это уже другая оценка, а не
+            # округление. Спрашивать об этом человека отдельно значит
+            # получать пустое поле в половине проверок.
+            своё = agree
+            if своё is None and авто is not None and score is not None:
+                своё = abs(float(авто) - float(score)) <= 10.0
+            курсор = conn.execute(
+                "UPDATE qa_reviews SET status='done', reviewer=?, reviewed_at=?, "
+                "score=?, agree=?, items=?, comment=? WHERE id=? AND status='pending'",
+                (str(reviewer or ""), now(),
+                 None if score is None else float(score),
+                 None if своё is None else int(bool(своё)),
+                 json.dumps(items, ensure_ascii=False) if items is not None else None,
+                 str(comment or ""), int(review_id)))
+            return bool(курсор.rowcount)
 
     def qa_get(self, review_id: int) -> dict[str, Any] | None:
         """Одна проверка вместе с владельцем записи — для проверки прав."""
@@ -5427,7 +5531,7 @@ class Database:
         строки = self.query(
             "SELECT q.*, j.filename AS filename, j.media_duration_s AS duration_s "
             f"FROM qa_reviews q LEFT JOIN jobs j ON j.id = q.job_id{где} "
-            "ORDER BY q.assigned_at DESC LIMIT ?",
+            "ORDER BY q.assigned_at DESC, q.id DESC LIMIT ?",
             [*args, max(1, min(1000, int(limit)))])
         готово: list[dict[str, Any]] = []
         for строка in строки:
@@ -5670,24 +5774,10 @@ class Database:
             removed["llm_cache"] = self.execute(
                 "DELETE FROM llm_cache WHERE created_at<?",
                 (ts - results_days * 86400,))
-        # Строки разбора, потерявшие своё задание. Сегодня их появиться
-        # не должно — запись разбора идёт условием «если задание есть», —
-        # но на базе, пережившей прежние версии, они уже лежат, и убрать
-        # их больше некому: и уборка по сроку, и удаление по требованию
-        # субъекта ходят по таблице заданий. Заход дешёвый: у всех этих
-        # таблиц job_id в указателе.
-        осиротевшие = 0
-        for таблица in ("content", "content_terms", "content_hits",
-                        "content_marks", "review_queue", "llm_results",
-                        "llm_queue", "segments", "events"):
-            осиротевшие += self.execute(
-                f"DELETE FROM {таблица} WHERE job_id IS NOT NULL "
-                "AND job_id NOT IN (SELECT id FROM jobs)")
-        осиротевшие += self.execute(
-            "DELETE FROM model_checks WHERE job_id NOT IN (SELECT id FROM jobs)")
-        removed["orphans"] = осиротевшие
-        if осиротевшие:
-            log.info("Убрано строк разбора без задания: %d", осиротевшие)
+        # Строки без задания убирает `sweep_orphans` — раз в сутки, а не
+        # здесь: на двадцати тысячах заданий подметание девяти таблиц
+        # занимало секунды под блокировкой записи каждый час, а сироты
+        # сегодня появляются только из баз прежних версий.
 
         # Журнал звонков — по тому же сроку и по той же причине. Запись
         # звонка занимает сотни байт, но это номер клиента и номер
@@ -5699,20 +5789,177 @@ class Database:
                 before=ts - results_days * 86400)
         return removed
 
-    def vacuum(self) -> None:
-        """Сжатие файла базы — под общим замком записи.
+    def sweep_orphans(self) -> dict[str, Any]:
+        """Строки без задания и следы удалённых разговоров. Раз в сутки.
+
+        Сегодня сирот появляться не должно — запись разбора идёт условием
+        «если задание есть», а удаление задания чистит всё за собой, — но на
+        базе, пережившей прежние версии, они уже лежат, и убрать их больше
+        некому: и уборка по сроку, и удаление по требованию ходят по таблице
+        заданий. Здесь же то, что удобнее делать одним заходом на все
+        удалённые записи разом:
+
+        * звонки удалённых записей теряют номера и имя (ключ остаётся);
+        * основы, которых не осталось ни в одной записи, уходят из словаря
+          форм;
+        * поисковый указатель физически забывает удалённые реплики.
+        """
+        итог: dict[str, Any] = {"rows": 0, "calls": 0, "vocab": 0, "fts": False}
+        self._поколение_реплик += 1
+        for таблица in ("content", "content_terms", "content_hits",
+                        "content_marks", "review_queue", "llm_results",
+                        "llm_queue", "segments", "events", "qa_reviews",
+                        "llm_cache"):
+            итог["rows"] += self.execute(
+                f"DELETE FROM {таблица} WHERE job_id IS NOT NULL "
+                "AND job_id NOT IN (SELECT id FROM jobs)")
+        итог["rows"] += self.execute(
+            "DELETE FROM model_checks WHERE job_id NOT IN (SELECT id FROM jobs)")
+        итог["calls"] = self.execute(
+            f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE job_id IS NOT NULL "
+            "AND job_id NOT IN (SELECT id FROM jobs) AND (" + " OR ".join(
+                f"COALESCE({поле},'')<>''" for поле in ПОЛЯ_ЛИЧНЫЕ_ЗВОНКА) + ")")
+        итог["vocab"] = self.forget_unused_forms()
+        if self.get_kv(КЛЮЧ_УКАЗАТЕЛЬ_ГРЯЗНЫЙ):
+            итог["fts"] = self.fts_purge()
+            if итог["fts"]:
+                self.execute("DELETE FROM kv WHERE key=?", (КЛЮЧ_УКАЗАТЕЛЬ_ГРЯЗНЫЙ,))
+        try:
+            self.instances_prune()
+        except StorageError as exc:
+            log.debug("Старые отметки экземпляров не убраны: %s", exc)
+        self.checkpoint()
+        if итог["rows"] or итог["calls"] or итог["vocab"]:
+            log.info("Суточная уборка базы: строк без задания %d, звонков обезличено %d, "
+                     "форм слов %d, указатель %s", итог["rows"], итог["calls"],
+                     итог["vocab"], "вычищен" if итог["fts"] else "не трогали")
+        return итог
+
+    def forget_unused_forms(self) -> int:
+        """Убирает из словаря форм основы, которых нет ни в одной записи."""
+        return self.execute(
+            "DELETE FROM content_vocab WHERE NOT EXISTS ("
+            "  SELECT 1 FROM content_terms t WHERE t.stem = content_vocab.stem)")
+
+    def fts_purge(self, *, шаг: int = 2000, предел_с: float = 600.0) -> bool:
+        """Физически вычищает из указателя удалённые реплики.
+
+        FTS5 при удалении не стирает слова, а дописывает отметку «удалено»;
+        сами слова лежат в `segments_fts_data`, пока сегмент не сольют с
+        другими, — а это может не случиться никогда. После удаления по
+        требованию субъекта номер телефона, произнесённый в разговоре,
+        оставался в файле базы и уезжал в резервные копии.
+
+        Слияние идёт порциями (`merge` с отрицательным шагом — «слить всё в
+        один сегмент, но не больше N страниц за раз»), каждая — своей
+        короткой транзакцией: одно `optimize` на большом архиве держало бы
+        блокировку записи минутами. Порция, не изменившая почти ничего
+        (меньше двух строк), значит, что сливать больше нечего.
+
+        Возвращает True, если указатель дочищен до конца.
+        """
+        if not self.fts_ready:
+            return False
+        начало = time.monotonic()
+        try:
+            while time.monotonic() - начало < предел_с:
+                with self.write() as conn:
+                    до = conn.total_changes
+                    conn.execute("INSERT INTO segments_fts(segments_fts, rank) "
+                                 "VALUES('merge', ?)", (-abs(int(шаг)),))
+                    сделано = conn.total_changes - до
+                if сделано < 2:
+                    return True
+        except StorageError as exc:
+            log.warning("Поисковый указатель не дочищен: %s", exc)
+            return False
+        log.info("Поисковый указатель дочищается дольше %.0f с — продолжим завтра", предел_с)
+        return False
+
+    def checkpoint(self) -> dict[str, int] | None:
+        """Вливает журнал WAL в базу и усекает его файл до нуля.
+
+        Нужна после больших перестроек (VACUUM, слияние указателя): сама
+        собой контрольная точка отложена, пока открыт хоть один читатель, и
+        всё это время рядом с базой лежит журнал размером с перестроенное.
+        """
+        if self.journal_mode != "wal":
+            return None
+        try:
+            with self._write_lock:
+                строка = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as exc:
+            log.debug("Контрольная точка не прошла: %s", exc)
+            return None
+        return {"busy": int(строка[0]), "log": int(строка[1]),
+                "checkpointed": int(строка[2])} if строка else None
+
+    def vacuum(self) -> dict[str, Any]:
+        """Сжатие файла базы — под общим замком записи. Возвращает, как прошло.
 
         VACUUM перестраивает базу целиком и держит исключительную
         блокировку SQLite минутами на большом архиве. Без общего замка
         пишущий поток входил в `BEGIN IMMEDIATE`, упирался в неё, ждал
         `busy_timeout` и получал «database is locked» — а это воркер,
         записывающий готовую расшифровку: текст был, и текст пропадал.
+
+        Три условия, без которых «очистка» делала хуже:
+
+        * **Соседи.** Замок записи — внутри процесса. Второй сервер над той
+          же базой ждал свои тридцать секунд и получал ту же «database is
+          locked». Если соседи живы, сжатие пропускается с объяснением.
+        * **Место.** Копия базы строится рядом, а переписанное идёт через
+          журнал: на время нужно до двух размеров базы. Самопроверка
+          советует очистку именно тогда, когда диск почти полон, и VACUUM
+          на полном диске падал, успев занять остаток места.
+        * **Память.** При `temp_store=MEMORY` копия строилась в памяти
+          процесса, где лежат модели: база в 534 МБ давала пик в 622 МБ
+          против 82 МБ с временным файлом. После сжатия журнал усекается —
+          иначе рядом оставался WAL размером с базу, и на диске было занято
+          больше, чем до «очистки».
         """
+        соседи = self.other_instances()
+        if соседи:
+            причина = ("над базой работают другие серверы ("
+                       + ", ".join(с["instance"] for с in соседи[:3])
+                       + "): сжатие заперло бы их запись — запустите его, "
+                         "когда сервер над базой один")
+            log.info("VACUUM пропущен: %s", причина)
+            return {"done": False, "reason": причина}
+        def размер_файлов() -> int:
+            всего = 0
+            for хвост in ("", "-wal"):
+                with contextlib.suppress(OSError):
+                    всего += Path(str(self.path) + хвост).stat().st_size
+            return всего
+        до = размер_файлов()
+        try:
+            свободно = shutil.disk_usage(self.path.parent).free
+        except OSError:
+            свободно = -1
+        нужно = 2 * до + ПРЕДЕЛ_ЖУРНАЛА
+        if 0 <= свободно < нужно:
+            причина = (f"не хватит места: на время сжатия нужно около "
+                       f"{нужно / 1048576:.0f} МБ, свободно {свободно / 1048576:.0f} МБ")
+            log.warning("VACUUM пропущен: %s", причина)
+            return {"done": False, "reason": причина, "free_bytes": свободно,
+                    "need_bytes": нужно}
+        начало = time.monotonic()
         with self._write_lock:
+            conn = self.conn
             try:
-                self.conn.execute("VACUUM")
+                conn.execute("PRAGMA temp_store=FILE")
+                conn.execute("VACUUM")
             except sqlite3.Error as exc:
                 log.warning("VACUUM не выполнен: %s", exc)
+                return {"done": False, "reason": str(exc)}
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("PRAGMA temp_store=MEMORY")
+        self.checkpoint()
+        после = размер_файлов()
+        return {"done": True, "before_bytes": до, "after_bytes": после,
+                "seconds": round(time.monotonic() - начало, 2)}
 
     def stats(self) -> dict[str, Any]:
         size = self.path.stat().st_size if self.path.exists() else 0
@@ -5780,13 +6027,27 @@ def _remove_job_files(job: dict[str, Any], base: Path) -> int:
     if path is not None and job.get("_file_shared"):
         path = None
     if path is not None:
-        try:
-            if path.is_file():
-                freed += path.stat().st_size
-                path.unlink()
-        except OSError as exc:
-            log.warning("Не удалось удалить исходник %s: %s", path, exc)
+        # Копия с заглушёнными персональными данными лежит рядом с записью и
+        # удалялась только вместе с каталогом: удаление задания, уборка по
+        # сроку и удаление по требованию оставляли голос клиента на диске.
+        for файл in (path, путь_отредактированной(path)):
+            try:
+                if файл.is_file():
+                    freed += файл.stat().st_size
+                    файл.unlink()
+            except OSError as exc:
+                log.warning("Не удалось удалить %s: %s", файл, exc)
     return freed
+
+
+def путь_отредактированной(путь: Path) -> Path:
+    """Где лежит копия записи с заглушёнными персональными данными.
+
+    Отдельным именем рядом с исходником, а не поверх него: редакция — это
+    производная, и переписать ею запись значило бы уничтожить исходные
+    данные по нажатию кнопки.
+    """
+    return путь.with_name(f"{путь.stem}.redacted{путь.suffix}")
 
 
 def _значение_не_того_вида(exc: sqlite3.Error) -> None:

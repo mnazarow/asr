@@ -30,6 +30,30 @@ log = get_logger("maintenance")
 #: Ключи отметок в таблице настроек: когда обслуживание выполнялось.
 KV_BACKUP = "maintenance.backup_at"
 KV_DIGEST = "maintenance.digest_at"
+#: Когда копия по расписанию в последний раз не удалась.
+KV_BACKUP_FAILED = "maintenance.backup_failed_at"
+#: Суточная уборка базы и файлов без задания.
+KV_SWEEP = "maintenance.sweep_at"
+
+#: После сбоя копии по расписанию — пауза до следующей попытки, секунд.
+#: Отметку «копия снята» ставим только после успеха, и без паузы упавшая
+#: копия повторялась бы каждые двадцать секунд — полным чтением базы.
+ПОВТОР_КОПИИ_С = 3600.0
+
+#: Аренда на снятие копии: на общей базе серверов несколько, и раньше от
+#: двойной копии их берегла отметка, поставленная ДО попытки, — ценой того,
+#: что упавшая копия повторялась только через сутки.
+АРЕНДА_КОПИИ = "maintenance.backup_lease"
+СРОК_АРЕНДЫ_КОПИИ_С = 6 * 3600.0
+
+#: Файл без задания младше этого — не сирота, а загрузка, задание по
+#: которой ещё не заведено (или заводится соседним сервером).
+ВОЗРАСТ_СИРОТЫ_С = 86400.0
+
+#: Сколько дней файлы без задания лежат в карантине `orphans/`, прежде
+#: чем уйти насовсем. Карантин, а не удаление: «без задания» может значить
+#: и «база не та» — восстановили чужую копию, перепутали каталог данных.
+КАРАНТИН_ДНЕЙ = 14
 
 #: Сколько ждать ответа от адреса сводки. Дольше держать служебный поток
 #: незачем: сводка — не то, ради чего стоит задерживать уборку хранилища.
@@ -57,6 +81,15 @@ def _пора(db: Any, ключ: str, часов: float) -> bool:
         db.set_kv(ключ, сейчас)
         return False
     return прошло >= часов * 3600
+
+
+def _можно_повторить_копию(db: Any) -> bool:
+    """Прошла ли пауза после неудачной копии."""
+    try:
+        было = float(db.get_kv(KV_BACKUP_FAILED, 0) or 0)
+    except (TypeError, ValueError):
+        было = 0.0
+    return time.time() - было >= ПОВТОР_КОПИИ_С
 
 
 def backup_dir(settings: Any) -> Path:
@@ -652,19 +685,42 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
     # время или по интервалу в часах, если он задан.
     from . import backup as резерв  # noqa: PLC0415
 
-    if резерв.пора(db, settings, ключ=KV_BACKUP):
-        db.set_kv(KV_BACKUP, time.time())
+    if резерв.пора(db, settings, ключ=KV_BACKUP) and _можно_повторить_копию(db):
+        # Отметка «снята» — только после успеха. Прежде она ставилась до
+        # попытки, и упавшая копия (полный диск, чужие права на каталог)
+        # повторялась лишь на следующие сутки: неделя сбоев — неделя без
+        # копий. Двойную копию на общей базе теперь держит аренда.
+        держатель = db.lease_take(АРЕНДА_КОПИИ, INSTANCE_ID, СРОК_АРЕНДЫ_КОПИИ_С)
+        if держатель is None:
+            try:
+                копия = резерв.создать(db, settings,
+                                       kind=str(settings.get("backup_kind") or "full"),
+                                       comment="по расписанию")
+                db.set_kv(KV_BACKUP, time.time())
+                сделано["backup"] = копия.get("name")
+            except Exception as exc:                         # noqa: BLE001
+                # Сбой копии не должен ронять служебный заход: следом идут
+                # уборка и сводка, и они к копии отношения не имеют.
+                log.warning("Резервная копия не снята: %s", exc)
+                db.set_kv(KV_BACKUP_FAILED, time.time())
+                сделано["backup"] = None
+                сделано["backup_error"] = str(exc)
+            finally:
+                db.lease_release(АРЕНДА_КОПИИ, INSTANCE_ID)
+
+    # Суточная уборка: строки и файлы без задания, следы удалённых
+    # разговоров в указателе и словаре форм. Раз в сутки, а не с часовой
+    # уборкой по сроку: подметание таблиц стоит секунд под блокировкой.
+    if _пора(db, KV_SWEEP, 24.0):
+        db.set_kv(KV_SWEEP, time.time())
         try:
-            копия = резерв.создать(db, settings,
-                                   kind=str(settings.get("backup_kind") or "full"),
-                                   comment="по расписанию")
-            сделано["backup"] = копия.get("name")
+            сделано["sweep"] = db.sweep_orphans()
         except Exception as exc:                             # noqa: BLE001
-            # Сбой копии не должен ронять служебный заход: следом идут
-            # уборка и сводка, и они к копии отношения не имеют.
-            log.warning("Резервная копия не снята: %s", exc)
-            сделано["backup"] = None
-            сделано["backup_error"] = str(exc)
+            log.warning("Суточная уборка базы не прошла: %s", exc)
+        try:
+            сделано["orphan_files"] = подмести_файлы(db, settings)
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Уборка файлов без задания не прошла: %s", exc)
 
     адрес = str(settings.get("digest_url") or "").strip()
     if адрес and _пора(db, KV_DIGEST, float(settings.get("digest_interval_hours") or 0)):
@@ -678,39 +734,156 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
     return сделано
 
 
-def restore(path: Path, target: Path) -> None:
-    """Возвращает базу из копии на место рабочей.
+def restore(path: Path, target: Path, settings: Any = None) -> str:
+    """Возвращает базу из копии на место рабочей — сервер остановлен.
 
-    Рабочую базу не удаляем, а переименовываем: восстановление из не той
-    копии — обычная ошибка, и она должна быть обратимой. Файлы `-wal` и
-    `-shm` от прежней базы обязаны уйти вместе с ней, иначе SQLite
-    достроит по ним состояние, которого в восстановленной копии нет.
+    Работу делает `backup.восстановить_из_файла`, тот же путь, что у
+    восстановления из интерфейса: копия (файл базы или архив
+    `*.asrhub.tar.gz`) проверяется ДО того, как трогать рабочую базу, пути
+    заданий переписываются под этот каталог данных, прежняя база уходит
+    рядом под именем `….before-restore-ДАТА` вместе со своим журналом —
+    под именами, по которым SQLite его найдёт. Прежде `-wal` откладывался
+    как «asrhub.db-wal.before-restore-…», и последние транзакции прежней
+    базы при её возвращении терялись.
+
+    Ошибки — `FileNotFoundError` и `ValueError` с объяснением: их печатает
+    `service.sh restore`. Возвращает имя сохранённой прежней базы.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"Копия не найдена: {path}")
-    # Проверяем ДО того, как трогать рабочую базу. Восстановление из битого
-    # файла, обнаруженное после подмены, оставляет человека вообще без
-    # базы — с двумя нерабочими файлами вместо одного.
-    try:
-        with sqlite3.connect(str(path)) as проверка:
-            итог = проверка.execute("PRAGMA integrity_check").fetchone()[0]
-    except sqlite3.DatabaseError as exc:
-        raise ValueError(
-            f"Файл «{path}» не похож на базу ASR Hub: {exc}. "
-            "Проверьте, что указана копия, а не архив или журнал.") from exc
-    if итог != "ok":
-        raise ValueError(f"Копия повреждена, восстановление отменено: {итог}")
+    from . import backup as резерв  # noqa: PLC0415
+    from .errors import ASRHubError  # noqa: PLC0415
 
-    метка = time.strftime("%Y%m%d-%H%M%S")
-    if target.exists():
-        target.rename(target.with_suffix(f".db.before-restore-{метка}"))
-    for хвост in ("-wal", "-shm"):
-        спутник = Path(str(target) + хвост)
-        if спутник.exists():
-            спутник.rename(Path(str(спутник) + f".before-restore-{метка}"))
-    shutil.copy2(path, target)
-    как_у_каталога(target.parent, target)
-    log.info("База восстановлена из %s", path)
+    if not Path(path).exists():
+        raise FileNotFoundError(f"Копия не найдена: {path}")
+    настройки = settings if settings is not None else _НастройкиБазы(Path(target))
+    try:
+        итог = резерв.восстановить_из_файла(path, настройки)
+    except ASRHubError as exc:
+        текст = exc.message.rstrip(". ") + "."
+        raise ValueError(f"{текст} {exc.hint}" if exc.hint else текст) from exc
+    прежняя = str(итог.get("previous") or "")
+    спутники = [Path(target).with_name(прежняя + хвост) for хвост in ("", "-wal", "-shm")] \
+        if прежняя else []
+    как_у_каталога(Path(target).parent, Path(target), *спутники)
+    log.info("База восстановлена из %s; прежняя — %s", path, прежняя or "—")
+    return прежняя
+
+
+class _НастройкиБазы:
+    """Настройки для восстановления, когда известен только путь базы."""
+
+    def __init__(self, база: Path) -> None:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        self.paths = SimpleNamespace(db=база, data=база.parent, tmp=база.parent / "tmp")
+
+    def get(self, ключ: str, по_умолчанию: Any = None) -> Any:
+        return по_умолчанию
+
+
+def подмести_файлы(db: Any, settings: Any, *, сейчас: float | None = None) -> dict[str, Any]:
+    """Файлы загрузок и результатов, на которые не ссылается ни одно задание.
+
+    Откуда они берутся: восстановление «на вчера» оставляет файлы заданий,
+    появившихся после копии; перенос базы с другого сервера — файлы, пути к
+    которым в базе вели в чужой каталог; сбой между записью файла и заведением
+    задания. Удаление задания и уборка по сроку ходят по таблице заданий и
+    таких файлов не видят никогда — они лежали вечно, а в них разговоры.
+
+    Сироты не удаляются, а переезжают в карантин `orphans/<дата>/` в каталоге
+    данных и уходят насовсем через `КАРАНТИН_ДНЕЙ`. Предохранитель: если
+    сирот больше половины всех файлов, уборка не делает ничего и говорит об
+    этом — так выглядит не мусор, а чужая база (не тот каталог данных, не та
+    копия), и переносить в карантин весь архив нельзя.
+    """
+    момент = time.time() if сейчас is None else float(сейчас)
+    загрузки = Path(settings.paths.uploads)
+    результаты = Path(settings.paths.results)
+    карантин = Path(settings.paths.data) / "orphans"
+    файлы, каталоги, номера = db.job_file_refs()
+
+    def своё(путь: Path) -> str:
+        try:
+            return str(путь.resolve())
+        except OSError:
+            return str(путь)
+
+    кандидаты: list[tuple[str, Path]] = []
+    всего = 0
+    for вид, корень in (("uploads", загрузки), ("results", результаты)):
+        if not корень.is_dir():
+            continue
+        for путь in корень.iterdir():
+            всего += 1
+            if вид == "uploads":
+                имя = путь.name
+                основа = имя.replace(".redacted", "", 1) if ".redacted" in имя else имя
+                if своё(путь) in файлы or своё(путь.with_name(основа)) in файлы:
+                    continue
+            else:
+                номер = путь.name[:-5] if путь.name.endswith(".prev") else путь.name
+                if номер in номера or своё(путь) in каталоги:
+                    continue
+            try:
+                возраст = момент - путь.stat().st_mtime
+            except OSError:
+                continue
+            if возраст < ВОЗРАСТ_СИРОТЫ_С:
+                continue
+            кандидаты.append((вид, путь))
+
+    итог: dict[str, Any] = {"orphans": len(кандидаты), "moved": 0, "expired": 0,
+                            "total": всего}
+    if кандидаты and len(кандидаты) > 20 and len(кандидаты) * 2 > всего:
+        итог["skipped"] = (
+            f"файлов без задания {len(кандидаты)} из {всего} — больше половины: так "
+            "выглядит не мусор, а чужая база. Проверьте каталог данных и то, из "
+            "какой копии восстанавливали; уборка файлы не трогала.")
+        log.warning("Уборка файлов без задания пропущена: %s", итог["skipped"])
+        try:
+            db.add_event(None, "orphans_skipped", итог["skipped"])
+        except Exception:                                    # noqa: BLE001
+            pass
+        return итог
+
+    сегодня = карантин / time.strftime("%Y-%m-%d", time.localtime(момент))
+    for вид, путь in кандидаты:
+        куда = сегодня / вид / путь.name
+        try:
+            куда.parent.mkdir(parents=True, exist_ok=True)
+            if куда.exists():
+                куда = куда.with_name(f"{куда.name}.{int(момент)}")
+            try:
+                путь.replace(куда)
+            except OSError:
+                # Другой том (каталог загрузок вынесен ссылкой) — копией.
+                shutil.move(str(путь), str(куда))
+            итог["moved"] += 1
+        except OSError as exc:
+            log.warning("Файл без задания %s не убран в карантин: %s", путь, exc)
+    if итог["moved"]:
+        try:
+            os.chmod(карантин, 0o700)
+        except OSError:
+            pass
+        log.warning("Файлов без задания убрано в карантин: %d (%s); через %d дн. "
+                    "они будут удалены", итог["moved"], сегодня, КАРАНТИН_ДНЕЙ)
+        try:
+            db.add_event(None, "orphans_moved",
+                         f"Файлов без задания: {итог['moved']} — в карантине "
+                         f"{сегодня.name}, удалятся через {КАРАНТИН_ДНЕЙ} дн.",
+                         {"moved": итог["moved"], "dir": str(сегодня)})
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    # Срок карантина: каталоги называются датой, по ней и считаем.
+    if карантин.is_dir():
+        граница = time.strftime("%Y-%m-%d",
+                                time.localtime(момент - КАРАНТИН_ДНЕЙ * 86400))
+        for каталог in карантин.iterdir():
+            if каталог.is_dir() and len(каталог.name) == 10 and каталог.name < граница:
+                shutil.rmtree(каталог, ignore_errors=True)
+                итог["expired"] += 1
+    return итог
 
 
 #: Срок хранения результатов из настроек.

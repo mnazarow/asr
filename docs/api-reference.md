@@ -362,61 +362,13 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/jobs?status=complet
 
 ```json
 {
-  "items": [
-    {
-      "id": "job000006",
-      "status": "completed",
-      "model": "v2_rnnt",
-      "engine": "gigaam",
-      "language": "ru",
-      "owner": "grigoriy",
-      "source": "phone",
-      "priority": 50,
-      "filename": "6.wav",
-      "deadline": null,
-      "created_at": 1788969961.7053154,
-      "queued_at": 1788973115.6931176,
-      "started_at": null,
-      "finished_at": 1788969991.7053154,
-      "media_duration_s": 31.9,
-      "processing_time_s": null,
-      "queue_time_s": null,
-      "audio_prep_s": null,
-      "model_load_s": null,
-      "inference_s": null,
-      "postprocess_s": null,
-      "rtf": null,
-      "words_count": 0,
-      "chars_count": 0,
-      "segments_count": 0,
-      "speakers_count": 0,
-      "avg_confidence": null,
-      "wer": null,
-      "cer": null,
-      "error_code": null,
-      "error_message": null,
-      "error_hint": null,
-      "retries": 0,
-      "cached_from": null,
-      "device": null,
-      "file_size": 0,
-      "progress": 0.0,
-      "stage": "",
-      "tags": "продажи",
-      "peak_memory_mb": null,
-      "peak_memory_jobs": null,
-      "file_hash": null,
-      "cancelled_by": null,
-      "webhook_status": null,
-      "suspect_segments": 0,
-      "suspect_share": 0.0,
-      "quality_flags": "",
-      "mer": null,
-      "wil": null,
-      "ref_words": null,
-      "sub_words": null,
-      "del_words": null,
-…
+  "items": [],
+  "total": 0,
+  "search_truncated": false,
+  "search_limit": null,
+  "limit": 2,
+  "offset": 0
+}
 ```
 
 Показан облегчённый список (`light=true`): только поля для таблицы. Без него в каждом задании приходят ещё расшифровка целиком и разбор по сегментам — на сотне часовых записей это единицы мегабайт вместо десятков килобайт.
@@ -888,7 +840,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:12685",
+  "instance": "vm:28815",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -897,7 +849,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
     "running": 0,
     "retry": 0,
     "paused": 0,
-    "completed": 2000,
+    "completed": 0,
     "failed": 0,
     "cancelled": 0
   },
@@ -1466,7 +1418,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1790246350.5557375,
+    "generated_at": 1790252037.3301768,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1633,8 +1585,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.15",
-  "uptime_s": 140.4,
+  "version": "3.1.16",
+  "uptime_s": 127.4,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1678,7 +1630,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 5
+    "INFO": 4,
+    "WARNING": 2
   }
 }
 ```
@@ -1712,8 +1665,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.15",
-  "uptime_s": 140.5,
+  "version": "3.1.16",
+  "uptime_s": 127.5,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v37",
@@ -1722,8 +1675,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
-    "disk_free_gb": 15.3,
+    "ram_available_gb": 7.0,
+    "disk_free_gb": 14.5,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1734,7 +1687,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 15.3 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 14.5 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ]
   },
   "recommended": {
@@ -2614,9 +2567,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 7.1,
+    "free_gb": 7.0,
     "reserve_gb": 4.0,
-    "budget_gb": 3.0,
+    "budget_gb": 2.9,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -3807,7 +3760,9 @@ curl -X POST -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/maintenance/
 Удалить записи по требованию.
 
 Находит и удаляет всё, где встречается запрос: по номеру телефона,
-имени файла, фамилии — тем же поиском, что в «Результатах».
+имени файла, фамилии — тем же поиском, что в «Результатах», и по
+журналу звонков: номер в любом поле звонка (сравниваются цифры, от
+семи) и имя звонящего.
 
 Нужно для 152-ФЗ: при отзыве согласия записи уничтожаются в срок до
 тридцати дней, и искать их по одной в архиве на сто тысяч записей —
@@ -4390,6 +4345,10 @@ Pushgateway учётные данные сплошь и рядом стоят п
 Загрузить копию с другой машины.
 
 Кладёт присланный архив в каталог копий — перенос на новый сервер.
+
+Обработчик обычный, а не `async`: запись копии в гигабайты и проверка
+базы — блокирующее чтение и запись диска, и в цикле событий они
+останавливали весь сервер, вместе с ответами очереди и диктовкой.
 
 **Доступ:** ключ с правом записи (**admin** или **user**).
 

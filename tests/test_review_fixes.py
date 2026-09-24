@@ -2067,7 +2067,12 @@ def test_restore_keeps_the_previous_database_and_its_journal(tmp_path: Path):
     maintenance.restore(копия, рабочая)
     assert Database(рабочая).count_jobs() == 12
     assert list(данные.glob("asrhub.db.before-restore-*")), "прежняя база потеряна"
-    assert list(данные.glob("asrhub.db-wal.before-restore-*")), "журнал остался на месте"
+    # Журнал — под именем, по которому SQLite найдёт его у отложенной базы:
+    # «asrhub.db-wal.before-restore-…» при её возвращении не подхватывался
+    # никогда, и последние транзакции прежней базы терялись (заход 44).
+    assert list(данные.glob("asrhub.db.before-restore-*-wal")), "журнал остался на месте"
+    assert not (данные / "asrhub.db-wal").exists() or \
+        (данные / "asrhub.db-wal").read_bytes() != "старый журнал".encode()
 
 
 def test_the_digest_says_the_same_thing_in_words(tmp_path: Path):

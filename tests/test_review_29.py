@@ -355,8 +355,10 @@ def test_уборка_подметает_разбор_без_задания(tmp_
                "VALUES ('старьё', 1, 0, 'чужой пересказ')")
     db.execute("INSERT INTO segments (job_id, idx, start_s, end_s, text) "
                "VALUES ('старьё', 0, 0, 1, 'чужая реплика')")
-    убрано = db.cleanup(results_days=30)
-    assert убрано["orphans"] >= 2
+    # С 3.1.16 сирот подметает суточная уборка, а не часовая: подметание
+    # таблиц стоило секунд под блокировкой записи каждый час.
+    убрано = db.sweep_orphans()
+    assert убрано["rows"] >= 2
     assert db.query_one("SELECT COUNT(*) n FROM llm_results")["n"] == 0
     assert db.query_one("SELECT COUNT(*) n FROM segments")["n"] == 0
 

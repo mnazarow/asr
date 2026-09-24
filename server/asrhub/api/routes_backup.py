@@ -114,9 +114,14 @@ def скачать(request: Request, name: str,
 
 
 @router.post("/upload", summary="Загрузить копию с другой машины")
-async def загрузить(request: Request, file: UploadFile = File(...),
-                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    """Кладёт присланный архив в каталог копий — перенос на новый сервер."""
+def загрузить(request: Request, file: UploadFile = File(...),
+              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Кладёт присланный архив в каталог копий — перенос на новый сервер.
+
+    Обработчик обычный, а не `async`: запись копии в гигабайты и проверка
+    базы — блокирующее чтение и запись диска, и в цикле событий они
+    останавливали весь сервер, вместе с ответами очереди и диктовкой.
+    """
     require_admin(require_write(principal))
     state = get_state(request)
     try:

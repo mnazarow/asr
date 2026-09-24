@@ -446,11 +446,16 @@ from asrhub.config import load
 from asrhub.maintenance import restore
 
 settings = load()
-цель = Path(settings.paths.data) / "asrhub.db"
-restore(Path(os.environ["ASRHUB_RESTORE_FROM"]), цель)
+цель = Path(settings.paths.db)
+try:
+    прежняя = restore(Path(os.environ["ASRHUB_RESTORE_FROM"]), цель, settings)
+except (FileNotFoundError, ValueError) as exc:
+    print(f"Восстановление отменено, рабочая база не тронута: {exc}")
+    raise SystemExit(1)
 print(f"База восстановлена: {цель}")
-print("Прежняя база сохранена рядом с пометкой before-restore — "
-      "удалите её, когда убедитесь, что всё на месте.")
+if прежняя:
+    print(f"Прежняя база сохранена рядом: {прежняя} (вместе со своим журналом) — "
+          "удалите её, когда убедитесь, что всё на месте.")
 PYCODE
     ok "Восстановление завершено. Запустите службу: bash scripts/service.sh start" ;;
 
@@ -469,7 +474,9 @@ Linux — systemd (системная или пользовательская с
 
 Резервная копия снимается командой SQLite «.backup»: обычное копирование
 файла базы на работающем сервере даёт несогласованный результат. Сервер
-умеет делать копии и сам — настройка backup_interval_hours.
+умеет делать копии и сам — архивы *.asrhub.tar.gz по расписанию
+(backup_time, backup_interval_hours). restore принимает и файл базы *.db,
+и такой архив: из архива возвращается база, настройки — в разделе «Копии».
 USAGE
     exit 2 ;;
 esac

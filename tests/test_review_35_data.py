@@ -466,8 +466,9 @@ def test_уборка_подбирает_строки_очереди_без_за
     for н in range(2):                               # строки без задания
         db.execute("INSERT INTO llm_queue (job_id, state, enqueued_at) VALUES (?,?,?)",
                    (f"призрак{н}", db.LLMQ_ИДЁТ, time.time()))
-    убрано = db.cleanup(results_days=0, metrics_days=0, events_days=0)
-    assert убрано["orphans"] >= 2
+    # С 3.1.16 — суточной уборкой (`sweep_orphans`), а не часовой.
+    убрано = db.sweep_orphans()
+    assert убрано["rows"] >= 2
     остались = {с["job_id"] for с in db.query("SELECT job_id FROM llm_queue")}
     assert остались == {"живое"}, остались
     db.close()

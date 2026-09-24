@@ -2016,6 +2016,19 @@ class JobQueue:
         """
         while not self._stop.wait(timeout=HEARTBEAT_S):
             self._отметить_живые()
+            self._отметиться()
+
+    def _отметиться(self) -> None:
+        """Отметка «этот сервер жив» в общей базе — и без идущих заданий.
+
+        По заданиям видно только того, кто сейчас считает. Простаивающий
+        сосед был невидим, и смена режима журнала, восстановление базы и
+        VACUUM не знали, что над базой работает кто-то ещё.
+        """
+        try:
+            self.db.instance_beat(workers=self._worker_count)
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Отметка экземпляра не поставлена: %s", exc)
 
     def _отметить_живые(self) -> None:
         with self._lock:

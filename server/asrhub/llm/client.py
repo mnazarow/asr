@@ -28,6 +28,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -316,6 +318,24 @@ class LLMClient:
         self._probe: tuple[float, tuple[str, str, str], dict[str, Any]] | None = None
         #: Модели, которые отказали из-за поля think: им его больше не шлём.
         self._без_think: set[str] = set()
+        #: Чью запись разбираем в этом потоке — см. `для_записи`.
+        self._запись = threading.local()
+
+    @contextmanager
+    def для_записи(self, job_id: str) -> Iterator[None]:
+        """Ответы модели внутри — ответы по этой записи: так их и кешируем.
+
+        Ключ кеша — отпечаток подсказки, а не задание, и пересказ разговора
+        с именем и номером клиента удаление записи не находило. Контекст, а
+        не параметр: задачи разбора зовут модель в пяти местах, и параметр,
+        забытый в шестом, молча вернул бы ту же утечку.
+        """
+        прежняя = getattr(self._запись, "job_id", None)
+        self._запись.job_id = str(job_id or "") or None
+        try:
+            yield
+        finally:
+            self._запись.job_id = прежняя
 
     # --- настройки ------------------------------------------------------
 
@@ -476,7 +496,8 @@ class LLMClient:
         # закрывает запись от повторных попыток навсегда.
         if use_cache and self.db is not None and _годится(ответ, validate):
             try:
-                self.db.llm_cache_put(ключ, kind, self.model, ответ, round(прошло, 1))
+                self.db.llm_cache_put(ключ, kind, self.model, ответ, round(прошло, 1),
+                                      job_id=getattr(self._запись, "job_id", None))
             except Exception as exc:                         # noqa: BLE001
                 log.debug("Кеш ответа модели не записан: %s", exc)
         return ответ

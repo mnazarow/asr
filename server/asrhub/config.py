@@ -18,6 +18,8 @@ import os
 import re
 import secrets
 import stat
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -484,6 +486,14 @@ class Settings:
         if target is None:
             raise ConfigError("Не задан путь к файлу конфигурации.")
         target = Path(target)
+        # Сохранения — по одному, от снимка значений до переименования: иначе
+        # второе сохранение, снявшее значения раньше, но записавшее позже,
+        # затирало ключ доступа, только что заведённый первым.
+        with _ЗАМОК_СОХРАНЕНИЯ:
+            return self._save_locked(target)
+
+    def _save_locked(self, target: Path) -> Path:
+        """Сохранение под `_ЗАМОК_СОХРАНЕНИЯ` — см. `save`."""
         grouped: dict[str, dict[str, Any]] = {}
         for spec in catalog.PARAMS:
             if spec.key in self.values:
@@ -504,7 +514,6 @@ class Settings:
         # Диаризация после этого падала с «нужен токен» на ровном месте.
         if self.hf_token:
             payload["hf_token"] = self.hf_token
-        tmp = target.with_suffix(target.suffix + ".tmp")
         # Права наследуем от существующего файла. Временный создаётся по umask
         # (обычно 0644), а replace() отдаёт цели ЕГО права — установщик ставил
         # 0640, и первый же запуск сервера, тот самый, который дописывает сюда
@@ -514,18 +523,34 @@ class Settings:
             mode = stat.S_IMODE(target.stat().st_mode)
         except OSError:
             mode = 0o600
+        # Два сохранения разом (создали ключ, пока применялись настройки)
+        # писали в один и тот же «.tmp» каждое со своего дескриптора: второе
+        # обрезало файл первого посреди записи, и в конфигурацию мог лечь
+        # обрывок YAML — сервер после перезапуска не поднимался. Теперь у
+        # каждого сохранения свой временный файл, а сами сохранения идут по
+        # одному (замок — в `save`).
+        tmp: Path | None = None
         try:
             text = (_dump_yaml(payload) if target.suffix in (".yaml", ".yml")
                     else json.dumps(payload, ensure_ascii=False, indent=2))
-            # Сразу с узкими правами: выставлять их после записи — значит
-            # оставить окно, в котором ключи доступны на чтение всем.
-            handle = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # mkstemp создаёт файл сразу с правами 0600: выставлять их после
+            # записи — значит оставить окно, в котором ключи доступны на
+            # чтение всем.
+            handle, имя = tempfile.mkstemp(prefix=f".{target.name}.",
+                                           suffix=".tmp", dir=str(target.parent))
+            tmp = Path(имя)
             with os.fdopen(handle, "w", encoding="utf-8") as fh:
                 fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.chmod(tmp, mode)
             tmp.replace(target)
+            tmp = None
         except OSError as exc:
             raise ConfigError(f"Не удалось сохранить конфигурацию: {exc}") from exc
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
         return target
 
 
@@ -544,6 +569,10 @@ class Settings:
         except ConfigError as exc:
             log.warning("Ключи доступа не сохранены: %s", exc)
             return False
+
+
+#: Сохранения файла настроек — по одному (см. `Settings.save`).
+_ЗАМОК_СОХРАНЕНИЯ = threading.Lock()
 
 
 def _целое(значение: Any, умолчание: int) -> int:

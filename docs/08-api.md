@@ -432,7 +432,7 @@ GET  /api/metrics                  формат Prometheus
 GET  /api/keys
 POST /api/keys                     {"name": "…", "role": "user"}
 DELETE /api/keys/{первые_символы}
-POST /api/maintenance/cleanup
+POST /api/maintenance/cleanup      ответ: removed, sweep (суточная уборка), vacuum (сжато ли и почему нет)
 POST /api/maintenance/unload-models
 ```
 
@@ -521,6 +521,7 @@ GET  /api/content/export?format=xlsx     выгрузка отчёта файл�
 ```
 POST /api/maintenance/erase   {"query": "+7 999 555-12-34"}                 что найдётся — ничего не удаляет
 POST /api/maintenance/erase   {"query": "+7 999 555-12-34", "dry_run": false}  удалить найденное
+                              ответ: ids, calls (строки журнала звонков), llm_cache, index_purged
 GET  /api/maintenance/consent?days=30    записи без метки согласия старше срока (настройка consent_tag)
 ```
 

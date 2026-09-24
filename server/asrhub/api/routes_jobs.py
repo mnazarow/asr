@@ -985,11 +985,12 @@ def _source_audio(request: Request, job: dict[str, Any]) -> Path:
 def _отредактированный_путь(real: Path) -> Path:
     """Куда кладётся отредактированная копия — рядом с исходником.
 
-    Отдельным именем, а не поверх оригинала: редакция — это производная,
-    и переписать ею запись значило бы уничтожить исходные данные по нажатию
-    кнопки, без возможности передумать.
+    Правило одно на сервер (`db.путь_отредактированной`): удаление задания
+    обязано найти копию там же, где её положила редакция.
     """
-    return real.with_name(f"{real.stem}.redacted{real.suffix}")
+    from ..db import путь_отредактированной  # noqa: PLC0415
+
+    return путь_отредактированной(real)
 
 
 @router.post("/{job_id}/redact", summary="Заглушить персональные данные в записи")
@@ -1524,6 +1525,8 @@ def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
     if файл is not None and not state.db.file_used_elsewhere(
             str(job.get("file_path") or ""), job_id):
         файл.unlink(missing_ok=True)
+        # И копию с заглушёнными данными: это тот же голос клиента.
+        _отредактированный_путь(файл).unlink(missing_ok=True)
     state.db.delete_job(job_id)
 
 

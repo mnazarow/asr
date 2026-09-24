@@ -32,6 +32,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import Any
@@ -62,6 +63,15 @@ log = get_logger("llm")
 
 #: Как часто подбирать брошенное соседями и досылать отложенные примечания CRM.
 ОБХОД_С = 300.0
+
+
+def _для_записи(клиент: Any, job_id: str) -> Any:
+    """Контекст «разбираем эту запись»: ответы модели кешируются за ней.
+
+    Подставной клиент в проверках его не знает — тогда пустой контекст.
+    """
+    контекст = getattr(клиент, "для_записи", None)
+    return контекст(job_id) if callable(контекст) else contextlib.nullcontext()
 
 
 def _целое(настройки: Any, ключ: str, по_умолчанию: int) -> int:
@@ -166,9 +176,10 @@ class LLMWorker:
         скрипт = list(self.settings.get("content_script") or [])
         оператор = str(self.settings.get("content_agent_speaker") or "")
         try:
-            итог = tasks.analyze(self.client, text=str(job.get("text") or ""),
-                                 segments=сегменты, settings=self.settings,
-                                 agent_speaker=оператор, script=скрипт)
+            with _для_записи(self.client, job_id):
+                итог = tasks.analyze(self.client, text=str(job.get("text") or ""),
+                                     segments=сегменты, settings=self.settings,
+                                     agent_speaker=оператор, script=скрипт)
         except LLMError as exc:
             self._отметить_сбой(job_id, str(exc))
             self.db.llmq_finish(job_id, error=str(exc))

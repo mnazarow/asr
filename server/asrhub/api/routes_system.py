@@ -761,8 +761,12 @@ def cleanup(request: Request, principal: Principal = Depends(authenticate)) -> d
     removed = state.db.cleanup(
         results_days=retention_days(state.settings),
         audit_days=S.integer(state.settings, "audit_days", 365))
-    state.db.vacuum()
-    return {"removed": removed}
+    # Очистка по кнопке — вся: и строки без задания со следами удалённых
+    # разговоров, которые служебный цикл убирает раз в сутки.
+    уборка = state.db.sweep_orphans()
+    removed["orphans"] = уборка.get("rows", 0)
+    сжатие = state.db.vacuum()
+    return {"removed": removed, "sweep": уборка, "vacuum": сжатие}
 
 
 #: Самый короткий запрос на удаление по требованию. Три буквы нашли бы
@@ -776,7 +780,9 @@ def erase(request: Request,
           dry_run: bool = Body(default=True, embed=True),
           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Находит и удаляет всё, где встречается запрос: по номеру телефона,
-    имени файла, фамилии — тем же поиском, что в «Результатах».
+    имени файла, фамилии — тем же поиском, что в «Результатах», и по
+    журналу звонков: номер в любом поле звонка (сравниваются цифры, от
+    семи) и имя звонящего.
 
     Нужно для 152-ФЗ: при отзыве согласия записи уничтожаются в срок до
     тридцати дней, и искать их по одной в архиве на сто тысяч записей —
@@ -796,18 +802,42 @@ def erase(request: Request,
             hint="Укажите номер телефона, имя файла или фамилию целиком."))
     найдено = state.db.list_jobs(search=запрос, limit=BULK_LIMIT)
     номера = [str(j["id"]) for j in найдено]
+    # И звонки по номеру и имени звонящего: запись, названная
+    # `${UNIQUEID}.wav`, по номеру клиента не находилась ничем, если номер
+    # не произнесли вслух, — субъекту отвечали «удалено», а разговор
+    # оставался.
+    for номер in state.db.erase_call_job_ids(запрос, limit=BULK_LIMIT):
+        if номер not in номера and len(номера) < BULK_LIMIT:
+            задание = state.db.get_job(номер)
+            if задание is not None:
+                найдено.append(задание)
+                номера.append(номер)
+    звонков = state.db.erase_calls_count(запрос)
     if dry_run:
         return {"dry_run": True, "matched": len(номера), "ids": номера,
-                "limit": BULK_LIMIT}
+                "calls": звонков, "limit": BULK_LIMIT}
     for job in найдено:
         _delete_one(state, job, principal)
+    # Звонки без задания (пропущенные — короткий, без записи, не отвечен)
+    # хранят тот же номер: обезличиваются и они, ключ остаётся. Звонки
+    # удалённых записей обезличило уже само удаление — в ответе все, что
+    # нашлись по запросу.
+    state.db.erase_calls(запрос)
+    обезличено = звонков
+    # Ответы модели, положенные в кеш до того, как он узнал свои записи.
+    из_кеша = state.db.llm_cache_forget_matching(запрос)
+    # Следы в указателе поиска и словаре форм — сразу, а не суточной
+    # уборкой: требование субъекта исполняется в срок, а не «к утру».
+    уборка = state.db.sweep_orphans()
     усечённый = запрос[:3] + "…" if len(запрос) > 3 else "…"
     state.db.add_event(None, "erase",
-                       f"Удалено по требованию: {len(номера)} записей по запросу "
-                       f"«{усечённый}» ({principal.name})",
-                       {"count": len(номера), "by": principal.name})
+                       f"Удалено по требованию: {len(номера)} записей, звонков "
+                       f"обезличено {обезличено} по запросу «{усечённый}» "
+                       f"({principal.name})",
+                       {"count": len(номера), "calls": обезличено, "by": principal.name})
     return {"dry_run": False, "deleted": len(номера), "ids": номера,
-            "limit": BULK_LIMIT}
+            "calls": обезличено, "llm_cache": из_кеша,
+            "index_purged": bool(уборка.get("fts")), "limit": BULK_LIMIT}
 
 
 @router.get("/maintenance/consent", summary="Записи без отметки о согласии")

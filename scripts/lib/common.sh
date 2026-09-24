@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.15"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.16"
 # Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
 # пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
 # сменить каталог, и относительный путь указывал бы в никуда. Те же
@@ -1539,7 +1539,10 @@ check_memory() {
 # захватывается неделимо, и каждый экземпляр подписывает взятое своим именем.
 # Для скриптов это значит, что каталог данных может быть не только «наш»:
 # удаление с --purge или подмена кода под работающими соседями — это потеря
-# чужой работы. Спрашиваем саму базу: она знает, кто держит задания.
+# чужой работы. Спрашиваем саму базу: она знает, кто держит задания, а с 3.1.16
+# — и кто просто жив: каждый сервер раз в полминуты ставит отметку
+# instance:<машина:процесс> в таблице kv. Без неё простаивающий сосед был
+# невидим — ровно тот, кого проще всего не заметить.
 #
 # Печатает имена посторонних экземпляров через запятую; пусто — все свои.
 other_instances() {
@@ -1554,13 +1557,18 @@ try:
         "SELECT DISTINCT instance_id, MAX(COALESCE(heartbeat_at, started_at, 0)) "
         "FROM jobs WHERE status='running' AND instance_id IS NOT NULL "
         "GROUP BY instance_id").fetchall()
+    try:
+        rows += [(key[len("instance:"):], ts) for key, ts in conn.execute(
+            "SELECT key, ts FROM kv WHERE substr(key, 1, 9) = 'instance:'")]
+    except Exception:
+        pass
 except Exception:
     sys.exit(0)
 host = socket.gethostname()
 # Свежая отметка жизни — экземпляр действительно работает; пять минут это тот
 # же порог, по которому сервер возвращает брошенные задания в очередь.
-alive = [name for name, beat in rows
-         if name and not name.startswith(f"{host}:") and time.time() - (beat or 0) < 300]
+alive = {name for name, beat in rows
+         if name and not name.startswith(f"{host}:") and time.time() - (beat or 0) < 300}
 print(",".join(sorted(alive)))
 PYEOF
 }

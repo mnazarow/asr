@@ -322,6 +322,69 @@ class _CachedStatic(StaticFiles):
         return response
 
 
+def _открыть_базу(settings: Settings) -> Database:
+    """Открывает базу в режиме журнала из настроек и отмечается в ней.
+
+    Режим журнала — свойство файла, общее для всех серверов над базой, и
+    ошибка в нём не видна, пока базу не испортит второй сервер с другой
+    машины. Поэтому здесь же — сверка с соседями по их отметкам жизни:
+    WAL при соседе с другой машины и разные режимы у соседей — громкая
+    ошибка в журнале сервера и событие, а самопроверка повторяет её
+    каждый раз, пока причина не исчезнет.
+    """
+    import os  # noqa: PLC0415
+
+    from .. import fsinfo  # noqa: PLC0415
+    from ..instance import other_machine  # noqa: PLC0415
+
+    # Временные файлы SQLite (сжатие базы строит копию на диске) — в каталог
+    # временных файлов сервера, а не в системный: там бывает tmpfs, то есть
+    # память, или раздел в сотню мегабайт. Заданное администратором не трогаем.
+    временные = str(settings.get("temp_dir") or settings.paths.tmp)
+    os.environ.setdefault("SQLITE_TMPDIR", временные)
+
+    режим = str(settings.get("db_journal_mode") or "wal")
+    try:
+        db = Database(settings.paths.db, journal_mode=режим)
+    except ASRHubError as exc:
+        if exc.code != "config_error":
+            raise
+        log.error("Режим журнала базы «%s» не годится (%s) — открываю в WAL", режим, exc)
+        db = Database(settings.paths.db, journal_mode="wal")
+    фс = fsinfo.файловая_система(settings.paths.data)
+    db.сведения_отметки = {"version": __version__, "fs": фс.тип,
+                           "network": фс.сетевая}
+    try:
+        db.instance_beat()
+        соседи = db.other_instances()
+    except ASRHubError as exc:
+        log.warning("Отметка экземпляра не поставлена: %s", exc)
+        соседи = []
+    чужие_машины = sorted({str(с.get("host") or с["instance"]) for с in соседи
+                           if other_machine(с)})
+    if чужие_машины and db.journal_mode == "wal":
+        текст = (f"Над базой работают серверы с других машин ({', '.join(чужие_машины)}), "
+                 "а журнал базы — WAL. WAL опирается на общую память одной машины и по "
+                 "сети не работает: записи соседей не видны, база портится. Остановите "
+                 "все серверы, задайте db_journal_mode: delete всем и запускайте заново. "
+                 "Если это прежний экземпляр этого же сервера, упавший без остановки, "
+                 "его отметка погаснет за пять минут.")
+        log.error("%s", текст)
+        db.add_event(None, "storage_warning", текст)
+    иные = sorted({str(с.get("journal")) for с in соседи
+                   if с.get("journal") and с.get("journal") != db.journal_mode})
+    if иные:
+        текст = (f"У соседних серверов другой режим журнала базы ({', '.join(иные)}), "
+                 f"у этого — {db.journal_mode}. Режим — свойство файла: задайте всем "
+                 "одинаковый db_journal_mode и перезапустите их по очереди, остановив все.")
+        log.error("%s", текст)
+        db.add_event(None, "storage_warning", текст)
+    if фс.сетевая:
+        log.info("Каталог данных на сетевой файловой системе: %s (%s), журнал базы — %s",
+                 фс.тип, фс.точка, db.journal_mode)
+    return db
+
+
 def create_app(settings: Settings | None = None, *, start_queue: bool = True) -> FastAPI:
     settings = settings or load()
     setup(str(settings.get("log_level") or "INFO"), settings.paths.logs)
@@ -331,7 +394,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     from .. import backup as _копии  # noqa: PLC0415
 
     прежняя_база = _копии.применить_отложенное(settings.paths.db)
-    db = Database(settings.paths.db)
+    db = _открыть_базу(settings)
     if прежняя_база:
         db.add_event(None, "restore_applied",
                      f"База восстановлена из копии при запуске; прежняя сохранена "
@@ -408,6 +471,10 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         state.telephony.stop()
         queue.stop()
         registry.unload_all()
+        # Отметка «жив» снимается при штатной остановке: иначе ещё пять
+        # минут соседи считали бы этот сервер работающим — и отказывались
+        # бы от восстановления базы и смены режима журнала.
+        db.instance_forget()
         db.close()
         log.info("ASR Hub остановлен")
 

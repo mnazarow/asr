@@ -11080,7 +11080,18 @@ RENDERERS.system = {
     if (очистка) очистка.onclick = async () => {
       try {
         const r = await API.post('/api/maintenance/cleanup');
-        toast('Очистка выполнена', 'ok', JSON.stringify(r.removed));
+        // Словами, а не сырым JSON: главное — сколько убрано и сжалась ли
+        // база, а если сжатие пропущено (соседний сервер, мало места), —
+        // почему.
+        const уб = r.removed || {};
+        const мб = (байт) => `${(Number(байт || 0) / 1048576).toFixed(1)} МБ`;
+        const части = [`заданий ${уб.jobs || 0}`, `освобождено ${мб(уб.bytes)}`];
+        if (уб.orphans) части.push(`строк без задания ${уб.orphans}`);
+        const сж = r.vacuum || {};
+        const строка = сж.done
+          ? `база сжата: ${мб(сж.before_bytes)} → ${мб(сж.after_bytes)}`
+          : `сжатие пропущено: ${сж.reason || 'причина в журнале сервера'}`;
+        toast('Очистка выполнена', сж.done ? 'ok' : 'warn', `${части.join(', ')}; ${строка}`);
       } catch (err) { fail(err); }
     };
     const выгрузка = qs('#btn-unload');
