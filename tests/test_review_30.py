@@ -859,7 +859,10 @@ def test_безнадёжные_отложенные_не_забивают_оч�
         db.save_call(f"pbx:z{н}", job_id=None, skipped=f"{db.ОТЛОЖЕН}файл ещё растёт",
                      owner="telephony", station="pbx", pbx_uid=f"z{н}",
                      src="1", dst="2", started_at=старьё, duration=100, billsec=90)
-    db.execute("UPDATE calls SET imported_at=? WHERE uniqueid LIKE 'pbx:z%'", [старьё])
+    # С захода 42 срок считается от ПЕРВОГО откладывания (`deferred_at`):
+    # состарить надо и его.
+    db.execute("UPDATE calls SET imported_at=?, deferred_at=? WHERE uniqueid LIKE 'pbx:z%'",
+               [старьё, старьё])
     db.save_call("pbx:свежий", job_id=None, skipped=f"{db.ОТЛОЖЕН}ещё пишется",
                  owner="telephony", station="pbx", pbx_uid="свежий",
                  src="1", dst="2", started_at=time.time() - 300, duration=100, billsec=90)

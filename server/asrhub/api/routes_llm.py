@@ -268,7 +268,8 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
                 tasks.VERSION, limit=предел, owner=scope_owner(principal))]
         elif отбор == "failed":
             повторено = state.db.llmq_retry_failed(limit=предел,
-                                                   owner=scope_owner(principal))
+                                                   owner=scope_owner(principal),
+                                                   priority=важность)
             return {"queued": повторено, "scope": отбор, "worker": поток.status()}
         elif отбор == "period":
             начало = _число(данные.get("since"), 0.0)

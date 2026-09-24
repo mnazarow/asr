@@ -27,7 +27,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -443,10 +443,18 @@ _SCHEMA = [
         peak_dbfs         REAL,
         clipping_share    REAL,
         loudness_lufs     REAL,
-        silence_share     REAL
+        silence_share     REAL,
+        -- Версия 27: обратная запись в CRM. Отметка по заданию — чтобы
+        -- примечание в карточке сделки появлялось один раз: раньше каждый
+        -- пересчёт разбора и каждое открытие карточки записи слали в CRM
+        -- новое примечание. «ждёт модель» — примечание отложено до
+        -- смыслового разбора, иначе оно уходило без пересказа.
+        crm_status        TEXT,
+        crm_at            REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_crm ON jobs(crm_status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_model ON jobs(model, created_at DESC)",
@@ -736,7 +744,12 @@ _SCHEMA = [
         -- импортирован». Поэтому ключ собирается как «станция:идентификатор»,
         -- а настоящий идентификатор станции живёт здесь: по нему ищется
         -- файл записи и по нему звонок узнают на самой АТС.
-        pbx_uid      TEXT DEFAULT ''
+        pbx_uid      TEXT DEFAULT '',
+        -- Версия 27: когда звонок впервые отложили. Срок жизни отложенного
+        -- считался от `imported_at`, а его обновляет каждое повторное
+        -- откладывание — и безнадёжный звонок (запись нулевой длины, не
+        -- задан каталог) крутился в отложенных вечно.
+        deferred_at  REAL
     )
     """,
     # --- версия 23: сотрудники, агенты на АТС, очередь к языковой модели ---
@@ -811,7 +824,13 @@ _SCHEMA = [
         calls        INTEGER DEFAULT 0,
         chunks       INTEGER DEFAULT 0,
         source       TEXT DEFAULT '',
-        owner        TEXT DEFAULT ''
+        owner        TEXT DEFAULT '',
+        -- Версия 27: какой сервер разбирает запись и когда он последний раз
+        -- подтвердил, что жив. Без них второй сервер на общей базе при
+        -- старте возвращал в очередь ЧУЖОЙ идущий разбор и разбирал его
+        -- второй раз.
+        instance     TEXT DEFAULT '',
+        heartbeat_at REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_llmq_state ON llm_queue(state, priority DESC, enqueued_at)",
@@ -952,6 +971,8 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "cached_from": "TEXT",
         "webhook_url": "TEXT",
         "webhook_status": "TEXT",
+        "crm_status": "TEXT",
+        "crm_at": "REAL",
     },
     "segments": {
         "job_id": "TEXT",
@@ -1230,6 +1251,7 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         "imported_at": "REAL",
         "station": "TEXT DEFAULT ''",
         "pbx_uid": "TEXT DEFAULT ''",
+        "deferred_at": "REAL",
     },
     # Владелец агента — ключ, которым агент поздоровался впервые. Без него
     # личность агента задавалась телом запроса, и любой ключ с правом
@@ -1237,6 +1259,12 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
     # «занимал» идентификаторы его звонков.
     "agents": {
         "owner": "TEXT DEFAULT ''",
+    },
+    # Экземпляр и отметка жизни у строки очереди модели: несколько серверов
+    # над одной базой не должны отбирать друг у друга идущий разбор.
+    "llm_queue": {
+        "instance": "TEXT DEFAULT ''",
+        "heartbeat_at": "REAL",
     },
 }
 
@@ -3775,6 +3803,64 @@ class Database:
         self.execute("INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?,?,?)",
                      (key, json.dumps(value, ensure_ascii=False), now()))
 
+    def set_kv_many(self, пары: dict[str, Any]) -> None:
+        """Несколько ключей одной транзакцией — когда половина пары хуже ничего.
+
+        Позиция журнала звонков — это смещение И номер файла, в котором оно
+        отсчитано. Записанные по отдельности, они могли разойтись на сбое
+        между двумя записями: смещение из нового файла при номере старого
+        дочитывало бы старый файл с чужого места.
+        """
+        мгновение = now()
+        with self.write() as conn:
+            for ключ, значение in пары.items():
+                conn.execute("INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?,?,?)",
+                             (ключ, json.dumps(значение, ensure_ascii=False), мгновение))
+
+    def lease_take(self, key: str, holder: str, ttl_s: float) -> str | None:
+        """Берёт аренду на время; None — взята, иначе — кто её держит.
+
+        Аренда нужна там, где работу по одному предмету (станции АТС) может
+        начать любой из серверов над общей базой, а делать её вдвоём нельзя.
+        Свободна та, которой нет, которая уже наша, чей срок вышел, или чей
+        держатель — процесс этой же машины, которого больше нет (сервер
+        перезапустили, и ждать истечения срока незачем).
+        """
+        from .instance import process_alive  # noqa: PLC0415
+
+        мгновение = now()
+        with self.write() as conn:
+            строка = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            if строка is not None:
+                try:
+                    данные = json.loads(строка["value"]) or {}
+                except (TypeError, ValueError):
+                    данные = {}
+                чей = str(данные.get("holder") or "") if isinstance(данные, dict) else ""
+                до = float(данные.get("until") or 0) if isinstance(данные, dict) else 0.0
+                if чей and чей != holder and до > мгновение and process_alive(чей):
+                    return чей
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?,?,?)",
+                (key, json.dumps({"holder": holder, "until": мгновение + float(ttl_s)},
+                                 ensure_ascii=False), мгновение))
+        return None
+
+    def lease_release(self, key: str, holder: str) -> bool:
+        """Отдаёт свою аренду; чужую не трогает."""
+        with self.write() as conn:
+            строка = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            if строка is None:
+                return False
+            try:
+                данные = json.loads(строка["value"]) or {}
+            except (TypeError, ValueError):
+                данные = {}
+            if not isinstance(данные, dict) or str(данные.get("holder") or "") != holder:
+                return False
+            conn.execute("DELETE FROM kv WHERE key=?", (key,))
+        return True
+
     def get_kv(self, key: str, default: Any = None) -> Any:
         row = self.query_one("SELECT value FROM kv WHERE key=?", (key,))
         if row is None:
@@ -3820,11 +3906,13 @@ class Database:
         """
         if not uniqueid:
             raise StorageError("Звонок без идентификатора не сохраняется.")
+        отложен = str(skipped or "").startswith(self.ОТЛОЖЕН)
         данные: dict[str, Any] = {"uniqueid": str(uniqueid),
                                   "job_id": job_id or None,
                                   "owner": str(owner) if owner else None,
                                   "skipped": str(skipped or ""),
-                                  "imported_at": now()}
+                                  "imported_at": now(),
+                                  "deferred_at": now() if отложен else None}
         for имя in self.ПОЛЯ_ЗВОНКА:
             if имя not in поля:
                 continue
@@ -3843,9 +3931,18 @@ class Database:
         УДЕРЖИВАТЬ = ("job_id", "owner")
         обновить = ",".join(
             f"{к}=excluded.{к}" for к in колонки
-            if к != "uniqueid" and к not in УДЕРЖИВАТЬ)
+            if к != "uniqueid" and к not in УДЕРЖИВАТЬ and к != "deferred_at")
         обновить += "".join(f",{к}=COALESCE(excluded.{к}, calls.{к})"
                             for к in УДЕРЖИВАТЬ)
+        # Время ПЕРВОГО откладывания держится, пока звонок остаётся
+        # отложенным: иначе каждое повторное откладывание продлевало ему
+        # жизнь, и безнадёжный звонок не протухал никогда. У строк прежних
+        # версий этого времени нет — для них отсчёт идёт от прошлой записи.
+        обновить += (
+            ",deferred_at=CASE WHEN excluded.deferred_at IS NULL THEN NULL "
+            f"WHEN calls.skipped LIKE '{self.ОТЛОЖЕН}%' "
+            "THEN COALESCE(calls.deferred_at, calls.imported_at, excluded.deferred_at) "
+            "ELSE excluded.deferred_at END")
         self.execute(
             f"INSERT INTO calls ({','.join(колонки)}) VALUES ({места}) "
             f"ON CONFLICT(uniqueid) DO UPDATE SET {обновить}",
@@ -3875,13 +3972,13 @@ class Database:
         уже никогда, иначе навечно занимает место в очереди отложенных, и
         импорт по станции встаёт целиком после одного сбоя записи.
 
-        Срок считается от времени откладывания (`imported_at` — когда строку
-        последний раз писали), а не от времени разговора. По времени
-        разговора любой архивный звонок выпадал из очереди в тот же миг, как
-        туда попадал: сбор архива десятидневной давности, одна переполненная
-        очередь — и разговор навсегда оставался с пометкой «отложен» и без
-        задания, а повторное чтение журнала его не спасало, потому что
-        `call_exists` отвечал «уже импортирован».
+        Срок считается от ПЕРВОГО откладывания (`deferred_at`), а не от
+        времени разговора. По времени разговора любой архивный звонок
+        выпадал из очереди в тот же миг, как туда попадал: сбор архива
+        десятидневной давности, одна переполненная очередь — и разговор
+        навсегда оставался с пометкой «отложен» и без задания. И не от
+        последней записи строки (`imported_at`): её обновляет каждое
+        повторное откладывание, и срок не наступал никогда.
         """
         условия = ["skipped LIKE ? ESCAPE '\\'"]
         args: list[Any] = [f"{_экранировать_like(self.ОТЛОЖЕН)}%"]
@@ -3889,7 +3986,7 @@ class Database:
             условия.append("COALESCE(station,'')=?")
             args.append(str(station))
         if older_than is not None:
-            условия.append("COALESCE(imported_at, started_at, 0) >= ?")
+            условия.append("COALESCE(deferred_at, imported_at, started_at, 0) >= ?")
             args.append(float(older_than))
         args.append(max(1, int(limit)))
         rows = self.query(
@@ -3901,6 +3998,31 @@ class Database:
             звонок["answered"] = bool(звонок.get("answered"))
             звонки.append(звонок)
         return звонки
+
+    #: Приставка окончательного пропуска для отложенного звонка, чья запись
+    #: так и не появилась за срок хранения отложенных.
+    НЕ_ДОЖДАЛИСЬ = "не дождались записи: "
+
+    def calls_expire_deferred(self, *, station: str = "",
+                              older_than: float) -> int:
+        """Отложенные дольше срока — в окончательный пропуск с причиной.
+
+        Раньше такой звонок просто переставал выбираться, но оставался
+        «отложенным» навсегда: в счётчике отложенных, без ответа на вопрос,
+        чем кончилось. Теперь пометка честная — «не дождались записи: ещё
+        пишется» (или какая была причина откладывания), и она видна в
+        разрезе пропусков.
+        """
+        условия = ["skipped LIKE ? ESCAPE '\\'",
+                   "COALESCE(deferred_at, imported_at, started_at, 0) < ?"]
+        args: list[Any] = [f"{_экранировать_like(self.ОТЛОЖЕН)}%", float(older_than)]
+        if station:
+            условия.append("COALESCE(station,'')=?")
+            args.append(str(station))
+        return self.execute(
+            f"UPDATE calls SET skipped = ? || substr(skipped, ?), deferred_at = NULL "
+            f"WHERE {' AND '.join(условия)}",
+            [self.НЕ_ДОЖДАЛИСЬ, len(self.ОТЛОЖЕН) + 1, *args])
 
     def call_owner(self, uniqueid: str) -> str | None:
         """Кому принадлежит строка архива. None — строки нет вовсе.
@@ -4487,6 +4609,15 @@ class Database:
         row = self.query_one("SELECT * FROM employees WHERE id=?", (str(id),))
         return dict(row) if row else None
 
+    def employee_by_key(self, source: str, external_id: str) -> dict[str, Any] | None:
+        """Карточка по паре «источник и внешний ключ» — так её узнаёт импорт."""
+        if not external_id:
+            return None
+        row = self.query_one(
+            "SELECT * FROM employees WHERE source=? AND external_id=?",
+            (str(source or "ручной"), str(external_id)))
+        return dict(row) if row else None
+
     def employee_by_ext(self, номер: str) -> dict[str, Any] | None:
         """Сотрудник по внутреннему номеру — так звонок узнаёт оператора."""
         номер = str(номер or "").strip()
@@ -4654,6 +4785,48 @@ class Database:
                 conn.execute("UPDATE agents SET command='' WHERE id=?", (str(id),))
         return команда
 
+    # --- обратная запись в CRM ----------------------------------------------
+
+    #: Состояния обратной записи по заданию. Пусто — ещё не решали.
+    CRM_ЖДЁТ_МОДЕЛЬ = "ждёт модель"
+    CRM_ОТПРАВЛЯЕТСЯ = "отправляется"
+    CRM_ОТПРАВЛЕНО = "отправлено"
+    CRM_БЕЗ_СДЕЛКИ = "без сделки"
+
+    def crm_claim(self, job_id: str) -> bool:
+        """Занимает отправку примечания по заданию; False — уже отправляли.
+
+        Одним UPDATE с условием: два пути, дошедшие до отправки разом
+        (разбор модели закончился, пока шла досылка по сроку, или два
+        сервера на общей базе), не отправят примечание дважды — дубль в
+        чужой ленте заметнее и неприятнее пропуска.
+        """
+        return self.execute(
+            "UPDATE jobs SET crm_status=?, crm_at=? WHERE id=? "
+            "AND COALESCE(crm_status,'') IN ('', ?, ?)",
+            (self.CRM_ОТПРАВЛЯЕТСЯ, now(), str(job_id),
+             self.CRM_ЖДЁТ_МОДЕЛЬ, self.CRM_БЕЗ_СДЕЛКИ)) > 0
+
+    def crm_mark(self, job_id: str, status: str, *, только_если: str | None = None) -> bool:
+        """Ставит состояние обратной записи. `updated_at` задания не трогает:
+        отметка о CRM — не правка записи, и списки «недавно изменённых» от
+        неё не должны перестраиваться."""
+        if только_если is None:
+            return self.execute("UPDATE jobs SET crm_status=?, crm_at=? WHERE id=?",
+                                (str(status)[:300], now(), str(job_id))) > 0
+        return self.execute(
+            "UPDATE jobs SET crm_status=?, crm_at=? WHERE id=? AND COALESCE(crm_status,'')=?",
+            (str(status)[:300], now(), str(job_id), только_если)) > 0
+
+    def crm_waiting(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Задания, чьё примечание ждёт смыслового разбора, — со строкой очереди."""
+        строки = self.query(
+            "SELECT j.id AS id, j.crm_at AS crm_at, q.state AS llm_state "
+            "FROM jobs j LEFT JOIN llm_queue q ON q.job_id=j.id "
+            "WHERE j.crm_status=? ORDER BY j.crm_at LIMIT ?",
+            (self.CRM_ЖДЁТ_МОДЕЛЬ, max(1, int(limit))))
+        return [dict(с) for с in строки]
+
     # --- очередь запросов к языковой модели --------------------------------
 
     #: Состояния очереди. Строками, а не числами: их читает человек в
@@ -4672,30 +4845,42 @@ class Database:
         выше: нажатие «разобрать сейчас» по записи, стоящей в хвосте
         фоновой очереди, должно её двигать, а не создавать вторую.
         """
-        прежняя = self.query_one("SELECT * FROM llm_queue WHERE job_id=?", (str(job_id),))
+        # Одним выражением, а не «прочитать, потом записать». Между двумя
+        # шагами успевал вклиниться фоновый поток: кнопка «Разобрать
+        # моделью» читала «готово», поток тем временем брал запись в
+        # работу, а кнопка возвращала её в «ждёт» — модель разбирала одну
+        # запись дважды. Одновременная вставка двух новых давала UNIQUE и
+        # ошибку записи в базу. Идущую строку выражение не трогает вовсе.
+        #
+        # Счётчик заходов обнуляется, когда запись приходит заново из
+        # конечного состояния (готово, ошибка, отменено): новая просьба —
+        # новые попытки, а не «последняя из трёх прежних».
         мгновение = now()
-        if прежняя is None:
-            self.execute(
-                "INSERT INTO llm_queue (job_id, kind, state, priority, enqueued_at, "
-                "source, owner) VALUES (?,?,?,?,?,?,?)",
-                (str(job_id), kind, self.LLMQ_ЖДЁТ, int(priority), мгновение, source, owner))
-            return True
-        if str(прежняя["state"]) == self.LLMQ_ИДЁТ:
-            return False
-        self.execute(
-            "UPDATE llm_queue SET state=?, kind=?, priority=MAX(priority, ?), "
-            "enqueued_at=CASE WHEN state=? THEN enqueued_at ELSE ? END, "
-            "error='', finished_at=NULL WHERE job_id=?",
-            (self.LLMQ_ЖДЁТ, kind, int(priority), self.LLMQ_ЖДЁТ, мгновение, str(job_id)))
-        return True
+        return self.execute(
+            "INSERT INTO llm_queue (job_id, kind, state, priority, enqueued_at, "
+            "source, owner) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(job_id) DO UPDATE SET "
+            "kind=excluded.kind, priority=MAX(llm_queue.priority, excluded.priority), "
+            "enqueued_at=CASE WHEN llm_queue.state=? THEN llm_queue.enqueued_at "
+            "ELSE excluded.enqueued_at END, "
+            "attempts=CASE WHEN llm_queue.state=? THEN llm_queue.attempts ELSE 0 END, "
+            "state=?, error='', finished_at=NULL "
+            "WHERE llm_queue.state<>?",
+            (str(job_id), kind, self.LLMQ_ЖДЁТ, int(priority), мгновение, source, owner,
+             self.LLMQ_ЖДЁТ, self.LLMQ_ЖДЁТ, self.LLMQ_ЖДЁТ, self.LLMQ_ИДЁТ)) > 0
 
-    def llmq_take(self) -> dict[str, Any] | None:
+    def llmq_take(self, *, instance: str = "") -> dict[str, Any] | None:
         """Берёт следующую запись и помечает её выполняющейся.
 
         Отбор и пометка — одним запросом под замком записи: иначе два
         потока (фоновый разбор и ручной вызов из интерфейса) взяли бы одну
-        и ту же запись и сходили бы к модели дважды.
+        и ту же запись и сходили бы к модели дважды. Строка подписывается
+        экземпляром сервера (`instance`) и отметкой жизни — по ним сосед на
+        общей базе отличает чужой идущий разбор от брошенного.
         """
+        from .instance import INSTANCE_ID  # noqa: PLC0415
+
+        мгновение = now()
         with self.write() as conn:
             строка = conn.execute(
                 "SELECT * FROM llm_queue WHERE state=? "
@@ -4704,14 +4889,16 @@ class Database:
             if строка is None:
                 return None
             conn.execute(
-                "UPDATE llm_queue SET state=?, started_at=?, attempts=attempts+1 "
-                "WHERE job_id=?", (self.LLMQ_ИДЁТ, now(), строка["job_id"]))
+                "UPDATE llm_queue SET state=?, started_at=?, attempts=attempts+1, "
+                "instance=?, heartbeat_at=? WHERE job_id=?",
+                (self.LLMQ_ИДЁТ, мгновение, instance or INSTANCE_ID, мгновение,
+                 строка["job_id"]))
             данные = dict(строка)
         данные["state"] = self.LLMQ_ИДЁТ
         return данные
 
     def llmq_begin(self, job_id: str, *, kind: str = "вручную",
-                   priority: int = 70) -> bool:
+                   priority: int = 70, instance: str = "") -> bool:
         """Отмечает, что к записи пошли прямо сейчас, мимо очереди.
 
         Разбор по кнопке «Разобрать сейчас» идёт в потоке запроса, а не в
@@ -4729,7 +4916,10 @@ class Database:
         Отметка ставится одним действием под замком записи: две кнопки,
         нажатые разом, иначе обе прочитали бы «свободно».
         """
+        from .instance import INSTANCE_ID  # noqa: PLC0415
+
         мгновение = now()
+        чей = instance or INSTANCE_ID
         with self.write() as conn:
             строка = conn.execute(
                 "SELECT state FROM llm_queue WHERE job_id=?", (str(job_id),)).fetchone()
@@ -4737,17 +4927,18 @@ class Database:
                 return False
             if строка is None:
                 conn.execute(
-                    "INSERT INTO llm_queue (job_id, kind, state, priority, enqueued_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (str(job_id), kind, self.LLMQ_ИДЁТ, int(priority), мгновение))
-                conn.execute("UPDATE llm_queue SET started_at=?, attempts=attempts+1 "
-                             "WHERE job_id=?", (мгновение, str(job_id)))
+                    "INSERT INTO llm_queue (job_id, kind, state, priority, enqueued_at, "
+                    "started_at, attempts, instance, heartbeat_at) "
+                    "VALUES (?,?,?,?,?,?,1,?,?)",
+                    (str(job_id), kind, self.LLMQ_ИДЁТ, int(priority), мгновение,
+                     мгновение, чей, мгновение))
                 return True
             conn.execute(
                 "UPDATE llm_queue SET state=?, kind=?, priority=MAX(priority, ?), "
-                "started_at=?, attempts=attempts+1, error='', finished_at=NULL "
-                "WHERE job_id=?",
-                (self.LLMQ_ИДЁТ, kind, int(priority), мгновение, str(job_id)))
+                "started_at=?, attempts=attempts+1, error='', finished_at=NULL, "
+                "instance=?, heartbeat_at=? WHERE job_id=?",
+                (self.LLMQ_ИДЁТ, kind, int(priority), мгновение, чей, мгновение,
+                 str(job_id)))
             return True
 
     def llmq_prune(self, keep_days: int = 14, *, limit: int = 20000) -> int:
@@ -4774,7 +4965,7 @@ class Database:
              latency_ms, int(calls), int(chunks), str(job_id)))
 
     def llmq_release(self, job_id: str, *, error: str = "",
-                     attempts_max: int = 3) -> bool:
+                     attempts_max: int = 3, потратить: bool = True) -> bool:
         """Возвращает взятую запись в очередь — сходим к модели ещё раз.
 
         Сбой сбою рознь. Сервер модели не отвечает, видеокарта занята,
@@ -4791,6 +4982,12 @@ class Database:
         `attempts_max` запись честно уходит в «ошибку» — оттуда её поднимет
         кнопка «Повторить упавшие», когда причину устранят.
 
+        `потратить=False` — сбой не про запись, а про сервер модели: он не
+        отвечает на соединение, перезапускается, занят (502/503/504) или не
+        хватает видеопамяти. Такой заход не считается: минутный перезапуск
+        Ollama раньше уводил головные записи очереди в «ошибку» за полминуты
+        — три захода подряд, и каждый отказ мгновенный.
+
         Returns:
             True, если запись вернулась в очередь; False — если ушла в «ошибку».
         """
@@ -4799,24 +4996,71 @@ class Database:
         if строка is None:
             return False
         заходов = int(строка["attempts"] or 0)
-        if заходов >= max(1, int(attempts_max)):
+        if потратить and заходов >= max(1, int(attempts_max)):
             self.llmq_finish(job_id, error=error or "разбор не удался")
             return False
         self.execute(
-            "UPDATE llm_queue SET state=?, started_at=NULL, error=? WHERE job_id=?",
-            (self.LLMQ_ЖДЁТ, error, str(job_id)))
+            "UPDATE llm_queue SET state=?, started_at=NULL, error=?, instance='', "
+            "heartbeat_at=NULL, finished_at=NULL, "
+            "attempts=CASE WHEN ? THEN attempts ELSE MAX(0, attempts-1) END "
+            "WHERE job_id=?",
+            (self.LLMQ_ЖДЁТ, error, 1 if потратить else 0, str(job_id)))
         return True
 
-    def llmq_reset_running(self) -> int:
-        """Возвращает в очередь то, что «шло» в момент остановки сервера.
+    def llmq_reset_running(self, *, instance: str = "",
+                           stale_s: float | None = None, свои: bool = True) -> int:
+        """Возвращает в очередь то, что «шло» у этого сервера или у мёртвых.
 
         Без этого запись, на которой сервер перезапустили, оставалась бы
         выполняющейся навсегда: раздел показывал бы вечный текущий запрос,
         а сама запись больше никогда не разобралась бы.
+
+        Но возвращается только своё и брошенное. Раньше сервер при старте
+        возвращал в очередь ВСЕ идущие строки — и строку, которую прямо
+        сейчас разбирает соседний сервер на общей базе: запись разбиралась
+        второй раз, и победителем в базе оказывался тот ответ, что пришёл
+        позже. Брошенной считается строка процесса этой машины, которого
+        больше нет, строка без подписи (так её оставляли прежние версии) и
+        строка, чья отметка жизни старше `stale_s` (сервер на другой машине
+        умер или потерял базу).
+
+        `свои=False` — обход на ходу: свои идущие строки живы (их разбирает
+        этот же процесс), подбирается только брошенное соседями.
         """
+        from .instance import INSTANCE_ID, own_host, process_alive  # noqa: PLC0415
+
+        свой = instance or INSTANCE_ID
+        строки = self.query(
+            "SELECT job_id, instance, heartbeat_at FROM llm_queue WHERE state=?",
+            (self.LLMQ_ИДЁТ,))
+        порог = now() - float(stale_s) if stale_s else None
+        вернуть = []
+        for строка in строки:
+            чей = str(строка["instance"] or "")
+            отметка = строка["heartbeat_at"]
+            if чей == свой and not свои:
+                continue
+            if (not чей or чей == свой
+                    or (own_host(чей) and not process_alive(чей))
+                    or (порог is not None and (отметка is None or float(отметка) < порог))):
+                вернуть.append(str(строка["job_id"]))
+        вернулось = 0
+        for job_id in вернуть:
+            # Условие состояния повторяется в самом UPDATE: между чтением и
+            # записью строку мог закончить её хозяин.
+            вернулось += self.execute(
+                "UPDATE llm_queue SET state=?, started_at=NULL, instance='', "
+                "heartbeat_at=NULL WHERE job_id=? AND state=?",
+                (self.LLMQ_ЖДЁТ, job_id, self.LLMQ_ИДЁТ))
+        return вернулось
+
+    def llmq_heartbeat(self, *, instance: str = "") -> int:
+        """Отметка жизни у всех своих идущих строк очереди модели."""
+        from .instance import INSTANCE_ID  # noqa: PLC0415
+
         return self.execute(
-            "UPDATE llm_queue SET state=?, started_at=NULL WHERE state=?",
-            (self.LLMQ_ЖДЁТ, self.LLMQ_ИДЁТ))
+            "UPDATE llm_queue SET heartbeat_at=? WHERE state=? AND instance=?",
+            (now(), self.LLMQ_ИДЁТ, instance or INSTANCE_ID))
 
     def llmq_cancel(self, job_id: str) -> bool:
         return self.execute(
@@ -4836,14 +5080,21 @@ class Database:
         return "FROM llm_queue q JOIN jobs j ON j.id=q.job_id", своё, своё_args
 
     def llmq_retry_failed(self, limit: int = 500, *,
-                          owner: str | list[str] | None = None) -> int:
+                          owner: str | list[str] | None = None,
+                          priority: int = 30) -> int:
+        """Упавшие записи — обратно в очередь.
+
+        С важностью архива по умолчанию, а не выше свежих записей: «повторить
+        упавшие» — это сотни записей разом, и свежие звонки ждали бы, пока
+        переберётся весь этот хвост.
+        """
         откуда, своё, своё_args = self._llmq_откуда(owner)
         строки = self.query(
             f"SELECT q.job_id AS job_id {откуда} WHERE q.state=? AND {своё} "
             "ORDER BY q.finished_at DESC LIMIT ?",
             (self.LLMQ_ОШИБКА, *своё_args, max(1, int(limit))))
         for строка in строки:
-            self.llmq_put(str(строка["job_id"]), kind="повтор", priority=60)
+            self.llmq_put(str(строка["job_id"]), kind="повтор", priority=int(priority))
         return len(строки)
 
     def llmq_counts(self, *, owner: str | list[str] | None = None) -> dict[str, int]:

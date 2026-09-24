@@ -17,9 +17,11 @@
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,54 @@ from ..logging_setup import get_logger
 from .asterisk import длины_внутренних, правила_контекстов
 
 log = get_logger("telephony")
+
+#: Смещение от всемирного времени, записанное числом: «+03:00», «UTC+3»,
+#: «GMT-05:30». Нужно там, где базы часовых поясов нет (Windows без пакета
+#: tzdata, урезанный образ контейнера), и тем, кто привык так писать.
+_СМЕЩЕНИЕ = re.compile(r"^(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=64)
+def разобрать_пояс(имя: str) -> tzinfo | None:
+    """Часовой пояс станции по его записи; None — пояс самого сервера.
+
+    Asterisk пишет время звонка в журнал и в событие AMI по местным часам
+    станции, без пояса. Сервер раньше читал его по своим часам — и сервер в
+    контейнере (там всемирное время) сдвигал каждый звонок московской
+    станции на три часа: выдержка откладывала каждый звонок «ещё пишется»
+    на три часа, запись по номерам не находилась в окне поиска, а отчёты и
+    тепловые карты съезжали. То же с филиалом в другом поясе.
+
+    Понимает имя из базы поясов («Europe/Moscow», «Asia/Yekaterinburg»),
+    «UTC» и смещение числом («+03:00», «UTC+5»). Неизвестное — ValueError
+    с объяснением: молча читать время по часам сервера значит вернуть ровно
+    ту ошибку, от которой настройка и заведена.
+    """
+    запись = str(имя or "").strip()
+    if not запись:
+        return None
+    if запись.upper() in ("UTC", "GMT", "Z"):
+        return timezone.utc
+    смещение = _СМЕЩЕНИЕ.match(запись)
+    if смещение:
+        знак, часы, минуты = смещение.groups()
+        сдвиг = timedelta(hours=int(часы), minutes=int(минуты or 0))
+        if сдвиг > timedelta(hours=14):
+            raise ValueError(f"смещение «{запись}» больше четырнадцати часов")
+        return timezone(-сдвиг if знак == "-" else сдвиг)
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: PLC0415
+    except ImportError as exc:                              # pragma: no cover
+        raise ValueError("в этой сборке Python нет часовых поясов — укажите "
+                         "смещение числом, например +03:00") from exc
+    try:
+        return ZoneInfo(запись)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"часовой пояс «{запись}» не найден — нужно имя из базы поясов "
+            "(Europe/Moscow, Asia/Novosibirsk) или смещение числом (+03:00); "
+            "если не находится ни одно имя, на сервере нет базы поясов: "
+            "поставьте пакет tzdata") from exc
 
 #: Источники, которые умеет читать сервер.
 ИСТОЧНИКИ = ("cdr_csv", "ami", "folder")
@@ -109,6 +159,25 @@ class Станция:
     # Как часто ходить
     poll_s: int = 60
 
+    #: Часовой пояс, в котором станция пишет время звонков. Пусто — пояс
+    #: сервера (так было всегда, и для АТС на той же машине это верно).
+    timezone: str = ""
+
+    @property
+    def пояс(self) -> tzinfo | None:
+        """Пояс станции для разбора времени; None — пояс сервера.
+
+        Негодная запись здесь не роняет забор: её ловит проверка при
+        сохранении, а на случай настройки, написанной руками, — журнал и
+        пояс сервера, то есть прежнее поведение.
+        """
+        try:
+            return разобрать_пояс(self.timezone)
+        except ValueError as exc:
+            log.warning("Станция «%s»: %s — время читается по часам сервера",
+                        self.name, exc)
+            return None
+
     @property
     def длины(self) -> set[int]:
         return длины_внутренних(self.internal_digits) or {5}
@@ -133,6 +202,7 @@ class Станция:
             "settle_s": self.settle_s, "lookback_days": self.lookback_days,
             "match_window": self.match_window,
             "poll_s": self.poll_s, "tags": self.tags,
+            "timezone": self.timezone,
         }
         if for_admin:
             данные.update({
@@ -183,6 +253,7 @@ def _станция_из(данные: dict[str, Any], номер: int) -> Ст�
         priority=число("priority", 40),
         tags=str(данные.get("tags") or "").strip(),
         poll_s=число("poll_s", 60),
+        timezone=str(данные.get("timezone") or данные.get("tz") or "").strip(),
     )
     return станция
 
@@ -302,8 +373,14 @@ def проверить_набор(сырые: Any) -> list[str]:
             if правило[1] not in ("входящий", "исходящий", "внутренний"):
                 ошибки.append(f"«{имя or номер}»: направление «{правило[1]}» "
                               "не бывает — только входящий, исходящий, внутренний")
+        пояс = str(данные.get("timezone") or данные.get("tz") or "").strip()
+        if пояс:
+            try:
+                разобрать_пояс(пояс)
+            except ValueError as exc:
+                ошибки.append(f"«{имя or номер}»: {exc}")
     return ошибки
 
 
 __all__ = ["ЗАКРЫТЫЕ", "ИСТОЧНИКИ", "СЕКРЕТНЫЕ", "Станция", "найти",
-           "проверить_набор", "список"]
+           "проверить_набор", "разобрать_пояс", "список"]

@@ -51,6 +51,18 @@ log = get_logger("llm")
 #: Сколько не подходить к записи после сбоя разбора.
 ОСТЫТЬ = 1800.0
 
+#: Как часто подтверждать, что идущий разбор жив. Разбор длинной записи —
+#: это минуты вызовов модели, и без отметки соседний сервер на общей базе
+#: не отличил бы живой разбор от брошенного.
+ОТМЕТКА_С = 30.0
+
+#: Через сколько секунд без отметки чужой идущий разбор считается брошенным
+#: (сервер, который его вёл, умер или потерял базу).
+СРОК_ЖИЗНИ_С = 600.0
+
+#: Как часто подбирать брошенное соседями и досылать отложенные примечания CRM.
+ОБХОД_С = 300.0
+
 
 def _целое(настройки: Any, ключ: str, по_умолчанию: int) -> int:
     """Целое из настроек с сохранением осмысленного нуля.
@@ -77,6 +89,10 @@ class LLMWorker:
         self._content = content_index
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: Служебный поток: отметка жизни, подбор брошенного соседями и
+        #: досылка отложенных примечаний CRM. Отдельно от разбора — тот
+        #: стоит в вызове модели минутами.
+        self._служба: threading.Thread | None = None
         self.done = 0
         self.failed = 0
         self.last_error: str | None = None
@@ -124,6 +140,7 @@ class LLMWorker:
             готовое = self.db.llm_get(job_id)
             if готовое and готовое.get("version") == tasks.VERSION and not готовое.get("error"):
                 self.db.llmq_finish(job_id, latency_ms=готовое.get("latency_ms"))
+                self._после_модели(job_id)
                 return готовое
         job = self.db.get_job(job_id)
         if job is None:
@@ -182,7 +199,23 @@ class LLMWorker:
             job_id, error="; ".join(замечания) if пусто and замечания else "",
             latency_ms=итог.get("latency_ms"), calls=int(итог.get("calls") or 0),
             chunks=int(итог.get("chunks") or 1))
+        self._после_модели(job_id)
         return self.db.llm_get(job_id) or итог
+
+    def _после_модели(self, job_id: str) -> None:
+        """Модель закончила с записью — пора примечанию в CRM, если оно её ждало.
+
+        Примечание свежей записи откладывается до смыслового разбора: без
+        этого оно уходило сразу после разбора содержания, с пустым
+        пересказом, и дослать пересказ было уже некуда — второе примечание
+        в карточке сделки хуже первого пустого.
+        """
+        from .. import crm  # noqa: PLC0415
+
+        try:
+            crm.после_модели(self.db, self.settings, job_id)
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Примечание в CRM по %s не отправлено: %s", job_id, exc)
 
     def _отметить_сбой(self, job_id: str, текст: str) -> None:
         """Отметка о сбое — но не поверх удачного разбора.
@@ -238,18 +271,30 @@ class LLMWorker:
         self._stop.clear()
         # Записи, застигнутые остановкой сервера в состоянии «идёт», иначе
         # остались бы такими навсегда: раздел показывал бы вечный текущий
-        # запрос, а сама запись не разобралась бы уже никогда.
+        # запрос, а сама запись не разобралась бы уже никогда. Только свои и
+        # брошенные: идущий разбор соседа по общей базе не трогаем.
         try:
-            вернулось = self.db.llmq_reset_running()
+            вернулось = self.db.llmq_reset_running(stale_s=СРОК_ЖИЗНИ_С)
             if вернулось:
                 log.info("Возвращено в очередь разбора после перезапуска: %d", вернулось)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Очередь разбора не приведена в порядок: %s", exc)
         self._thread = threading.Thread(target=self._loop, name="asrhub-llm", daemon=True)
         self._thread.start()
+        if self._служба is None or not self._служба.is_alive():
+            self._служба = threading.Thread(target=self._служебный, name="asrhub-llm-svc",
+                                            daemon=True)
+            self._служба.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        служба = self._служба
+        if служба is not None and служба.is_alive():
+            # Служебный поток просыпается от флага сразу, если только не
+            # досылает примечание в CRM прямо сейчас.
+            служба.join(timeout=min(2.0, timeout))
+        if служба is not None and not служба.is_alive():
+            self._служба = None
         поток = self._thread
         if поток and поток.is_alive():
             поток.join(timeout=timeout)
@@ -261,6 +306,30 @@ class LLMWorker:
                             "завершится сам после ответа.")
                 return
         self._thread = None
+
+    def _служебный(self) -> None:
+        """Отметка жизни раз в полминуты, обход брошенного — раз в пять минут."""
+        from .. import crm  # noqa: PLC0415
+
+        последний_обход = time.time()
+        while not self._stop.wait(timeout=ОТМЕТКА_С):
+            try:
+                self.db.llmq_heartbeat()
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Отметка жизни очереди разбора не поставлена: %s", exc)
+            if time.time() - последний_обход < ОБХОД_С:
+                continue
+            последний_обход = time.time()
+            try:
+                вернулось = self.db.llmq_reset_running(stale_s=СРОК_ЖИЗНИ_С, свои=False)
+                if вернулось:
+                    log.info("Подобрано брошенных разборов соседних серверов: %d", вернулось)
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Брошенные разборы не подобраны: %s", exc)
+            try:
+                crm.досылка(self.db, self.settings)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Досылка примечаний в CRM не удалась: %s", exc)
 
     def _queue_busy(self) -> bool:
         """Ждут ли задания распознавания — тогда модель подождёт."""
@@ -328,12 +397,22 @@ class LLMWorker:
                 # даже когда модель возвращалась. После нескольких заходов
                 # запись уходит в «ошибку» — оттуда её поднимает кнопка
                 # «Повторить упавшие».
+                # Сервер модели лежит или занят — заход не считается:
+                # иначе минутный перезапуск Ollama уводил головные записи
+                # в «ошибку» за полминуты.
+                временная = bool(getattr(exc, "временная", False))
                 try:
-                    self.db.llmq_release(
+                    вернулась = self.db.llmq_release(
                         job_id, error=str(exc),
-                        attempts_max=_целое(self.settings, "llm_queue_attempts", 3))
+                        attempts_max=_целое(self.settings, "llm_queue_attempts", 3),
+                        потратить=not временная)
                 except Exception:                            # noqa: BLE001
                     log.debug("Строку очереди %s вернуть не удалось", job_id)
+                    вернулась = True
+                if not вернулась:
+                    # Попытки кончились: примечание в CRM, ждавшее пересказа,
+                    # уходит без него — ждать больше нечего.
+                    self._после_модели(job_id)
                 # Сервер модели лежит — не долбить его каждой записью.
                 пауза = простой
             except Exception as exc:                         # noqa: BLE001

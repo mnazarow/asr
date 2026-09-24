@@ -260,6 +260,42 @@ class LLMError(Exception):
 
     status: int | None = None
     body: str = ""
+    #: Сбой не про запись, а про сервер модели: он не принимает соединение,
+    #: перезапускается, за прокси отвечает 502/503/504, занят (429) или не
+    #: хватает видеопамяти. Такой заход очередь не считает попыткой:
+    #: минутный перезапуск Ollama раньше уводил головные записи в «ошибку»
+    #: за полминуты. Тайм-аут сюда не входит намеренно: запись, на которой
+    #: модель не укладывается в срок, повторялась бы вечно.
+    временная: bool = False
+
+
+def _временная(текст: str, *, status: int | None = None, body: str = "") -> LLMError:
+    ошибка = LLMError(текст)
+    ошибка.временная = True
+    if status is not None:
+        ошибка.status = status
+        ошибка.body = body
+    return ошибка
+
+
+#: Ответы сервера модели, которые говорят о нём самом, а не о запросе.
+_ВРЕМЕННЫЕ_КОДЫ = frozenset({429, 502, 503, 504})
+
+
+def та_же_модель(установлена: str, нужна: str) -> bool:
+    """Одна ли это модель в записи Ollama.
+
+    Совпадение только полное — с точностью до тега `:latest`, который Ollama
+    дописывает сама («qwen3» и «qwen3:latest» — одно). Раньше совпадением
+    считалось одно семейство: задано `qwen3.5:27b`, скачана `qwen3.5:9b` —
+    проба отвечала «модель есть», панель горела зелёным, а каждый вызов
+    получал 404 «model not found».
+    """
+    def полное(имя: str) -> str:
+        имя = str(имя or "").strip()
+        return имя if ":" in имя.rsplit("/", 1)[-1] else f"{имя}:latest"
+
+    return bool(нужна) and полное(установлена) == полное(нужна)
 
 
 class LLMClient:
@@ -370,8 +406,7 @@ class LLMClient:
             if self.backend == "ollama":
                 данные = self._http("GET", f"{self.url}/api/tags", None, timeout=5.0)
                 имена = [str(м.get("name") or "") for м in (данные.get("models") or [])]
-                известна = any(и == self.model or и.split(":")[0] == self.model.split(":")[0]
-                               for и in имена)
+                известна = any(та_же_модель(и, self.model) for и in имена)
                 return {"available": True, "models": имена[:50], "model_known": известна,
                         "reason": None if известна else
                         f"модель «{self.model}» не скачана: ollama pull {self.model}"}
@@ -465,8 +500,8 @@ class LLMClient:
             return
         свободно = self._free_vram_gb()
         if свободно is not None and свободно < порог:
-            raise LLMError(f"Свободной видеопамяти {свободно:.1f} ГБ — меньше порога "
-                           f"{порог:g} ГБ; вызов отложен.")
+            raise _временная(f"Свободной видеопамяти {свободно:.1f} ГБ — меньше порога "
+                             f"{порог:g} ГБ; вызов отложен.")
 
     def _free_vram_gb(self) -> float | None:
         """Свободная память первой видеокарты — по nvidia-smi, если он есть."""
@@ -694,16 +729,18 @@ class LLMClient:
             ошибка = LLMError(f"Сервер модели ответил {exc.code}: {кусок or exc.reason}")
             ошибка.status = int(exc.code)
             ошибка.body = кусок
+            ошибка.временная = int(exc.code) in _ВРЕМЕННЫЕ_КОДЫ
             raise ошибка from exc
         except urllib.error.URLError as exc:
             причина = getattr(exc, "reason", exc)
             if isinstance(причина, TimeoutError) or "timed out" in str(причина):
                 raise LLMError(f"Сервер модели не ответил за {timeout:g} с.") from exc
-            raise LLMError(f"Сервер модели недоступен по адресу {self.url}: {причина}") from exc
+            raise _временная(
+                f"Сервер модели недоступен по адресу {self.url}: {причина}") from exc
         except TimeoutError as exc:
             raise LLMError(f"Сервер модели не ответил за {timeout:g} с.") from exc
         except OSError as exc:
-            raise LLMError(f"Сервер модели недоступен: {exc}") from exc
+            raise _временная(f"Сервер модели недоступен: {exc}") from exc
         except http.client.HTTPException as exc:
             # IncompleteRead и родня не наследуют ни URLError, ни OSError,
             # и уходили из клиента сырым исключением: состояние слоя

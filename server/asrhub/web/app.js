@@ -350,6 +350,9 @@ async function bootstrap() {
     if (здоровье && здоровье.version) {
       const подпись = qs('#version-label');
       if (подпись) подпись.textContent = `v${здоровье.version}`;
+      // Версия сервера нужна и разделу «АТС»: агент на станции берётся из
+      // установки сервера, и отставший агент там подсвечивается.
+      state.serverVersion = String(здоровье.version);
     }
     state.catalog = catalog;
     state.models = catalog.models;
@@ -5611,7 +5614,8 @@ RENDERERS.telephony = {
       const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
       const сбои = (итог.errors || []).map((о) => `${о.name || о.station}: ${о.error}`).join('; ');
       toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
-            сбои ? 'warn' : итог.imported ? 'ok' : '', сбои || причины);
+            сбои ? 'warn' : итог.imported ? 'ok' : '',
+            [сбои, чужие_станции(итог), причины].filter(Boolean).join('; '));
       await this.loadStatus();
       await this.loadCalls();
     } catch (err) {
@@ -5818,11 +5822,14 @@ const ПАТС_ПОЛЯ = [
                '/mnt/pbx-filial/monitor'] },
   { key: 'filename', label: 'Шаблон имени файла', type: 'text',
     desc: 'Если MixMonitor зовут с особым именем, опишите его здесь: '
-        + '${UNIQUEID}, ${SRC}, ${DST}, ${YYYY}, ${MM}, ${DD}.',
+        + '${UNIQUEID}, ${SRC}, ${DST}, ${YEAR}, ${MONTH}, ${DAY}, ${HOUR} '
+        + '(или коротко ${YYYY}, ${MM}, ${DD}). Звёздочка заменяет любую часть '
+        + 'имени — из подошедших берётся ближайшая по времени запись.',
     rec: 'Оставьте пустым, если имена обычные: поиск по идентификатору '
-       + 'находит запись и без шаблона.',
-    examples: ['${YYYY}/${MM}/${UNIQUEID}.wav',
-               'out-${DST}-${SRC}-${YYYY}${MM}${DD}-${UNIQUEID}'] },
+       + 'находит запись и без шаблона. Даты подставляются по часам станции '
+       + '(см. «Часовой пояс станции»).',
+    examples: ['${YEAR}/${MONTH}/${DAY}/${UNIQUEID}.wav',
+               'out-${DST}-${SRC}-${YEAR}${MONTH}${DAY}-*.wav'] },
   { key: 'internal_digits', label: 'Длина внутренних номеров', type: 'text',
     desc: 'Сколько цифр во внутреннем номере. Можно несколько значений через '
         + 'запятую — в организации, которая росла или объединялась, рядом живут '
@@ -5869,6 +5876,17 @@ const ПАТС_ПОЛЯ = [
        + 'день; 0 снимает ограничение вовсе.',
     examples: ['120 — обычное значение', '15 — плотный поток звонков',
                '0 — без ограничения (не рекомендуется)'] },
+  { key: 'timezone', label: 'Часовой пояс станции', type: 'text',
+    desc: 'В каком поясе станция пишет время звонков. Asterisk пишет в журнал '
+        + 'и в события AMI местное время без пояса; пусто — время читается по '
+        + 'часам этого сервера.',
+    rec: 'Задайте, если сервер живёт в другом поясе: в контейнере это всегда '
+       + 'всемирное время, и без пояса каждый звонок московской станции '
+       + 'сдвинется на три часа — свежие звонки будут откладываться как «ещё '
+       + 'пишется», а запись по номерам не найдётся. Разбор забора подскажет '
+       + 'пояс, если время в журнале с ним не сходится.',
+    examples: ['Europe/Moscow', 'Asia/Yekaterinburg', '+03:00',
+               'пусто — пояс сервера'] },
   { key: 'poll_s', label: 'Интервал опроса, с', type: 'number',
     desc: 'Как часто заглядывать на станцию за новыми звонками.',
     rec: '60 секунд. Чаще имеет смысл только при AMI и требовании «расшифровка '
@@ -6294,7 +6312,10 @@ RENDERERS.pbx = {
               <div class="small dim mono">${esc(а.host || '')} · ${esc(а.id)}</div>
               ${а.last_error ? `<div class="small err">${esc(а.last_error)}</div>` : ''}</td>
             <td class="small mono">${esc(а.station || '')}</td>
-            <td class="small">${esc(а.version || '—')}
+            <td class="small">${esc(а.version || '—')}${а.version && state.serverVersion
+              && а.version !== state.serverVersion ? `<div class="small warn"
+              title="Агент берётся из установки сервера: переустановите его на станции
+той же командой, что выше">сервер ${esc(state.serverVersion)} — обновите</div>` : ''}
               <div class="small dim">${esc(а.asterisk || '')}</div></td>
             <td class="small ${давно > 86400 ? 'err' : ''}">${
               а.last_seen ? fmtAgo(а.last_seen) : 'ни разу'}</td>
@@ -6824,7 +6845,8 @@ RENDERERS.pbx = {
       const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
       const сбои = (итог.errors || []).map((о) => `${о.name || о.station}: ${о.error}`).join('; ');
       toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
-            сбои ? 'warn' : итог.imported ? 'ok' : '', сбои || причины);
+            сбои ? 'warn' : итог.imported ? 'ok' : '',
+            [сбои, чужие_станции(итог), причины].filter(Boolean).join('; '));
       await this.load();
     } catch (err) {
       toast(err.message || 'Заход не удался', 'err', err.hint || '');
@@ -7039,6 +7061,14 @@ RENDERERS.pbx.edit = function (ид) {
   });
 };
 
+/* Станции, которые сейчас ведёт соседний сервер над общей базой: заход по
+ * ним ничего не забирает, и «просмотрено 0» без объяснения выглядело бы
+ * поломкой. */
+function чужие_станции(итог) {
+  return ((итог && итог.stations) || []).filter((с) => с.held_by)
+    .map((с) => `${с.name || с.station}: ведёт сервер ${с.held_by}`).join('; ');
+}
+
 function ПАТС_ПО_УМОЛЧАНИЮ() {
   return {
     name: '', source: 'cdr_csv', enabled: true, host: '127.0.0.1', port: 5038,
@@ -7047,6 +7077,7 @@ function ПАТС_ПО_УМОЛЧАНИЮ() {
     internal_digits: '3, 4', contexts: 'from-trunk=входящий, from-internal=исходящий',
     min_duration_s: 10, skip_unanswered: true, settle_s: 30, lookback_days: 7,
     match_window: 120, poll_s: 60, owner: 'telephony', priority: 40, tags: '',
+    timezone: '',
   };
 }
 
@@ -9992,14 +10023,24 @@ function wireCrmTest() {
     вывод.textContent = 'Собираю запрос…';
     try {
       const итог = await API.post(`/api/crm/test?${пары}`);
+      // Запросов бывает два: примечание и — если сопоставлены свои поля —
+      // правка самой сделки. Показываем оба: второй уходит отдельно.
+      const запросы = (итог.requests && итог.requests.length) ? итог.requests
+        : [{ method: 'POST', url: итог.url, body: итог.body, purpose: 'примечание' }];
+      const ответ = итог.response || {};
       вывод.innerHTML = `
         <div><b>${esc(итог.kind)}</b> → <span class="mono">${esc(итог.url)}</span></div>
         <div style="margin-top:6px">Сделка: <span class="mono">${
-          esc(итог.entity_id || '— не определена')}</span></div>
-        <pre class="mono small" style="white-space:pre-wrap;margin-top:8px">${
-          esc(итог.body)}</pre>
+          esc(итог.entity_id || '— не определена')}</span>${итог.entity_example
+          ? ` <span class="small warn">в показанном запросе №1 подставлен для примера;
+              отправить без сделки нельзя — впишите её номер</span>` : ''}</div>
+        ${запросы.map((з) => `<div class="small dim" style="margin-top:8px">${
+          esc(з.purpose || '')}: <span class="mono">${esc(з.method || 'POST')} ${esc(з.url || '')}</span></div>
+          <pre class="mono small" style="white-space:pre-wrap;margin-top:4px">${esc(з.body || '')}</pre>`).join('')}
         ${итог.sent ? `<div class="chip ok" style="margin-top:6px">CRM ответила ${
-          esc(String((итог.response || {}).status || ''))}</div>` : ''}`;
+          esc(String(ответ.status || ''))}</div>` : ''}
+        ${итог.sent && ответ.fields_error ? `<div class="small warn" style="margin-top:6px">
+          Примечание принято, свои поля — нет: ${esc(ответ.fields_error)}</div>` : ''}`;
     } catch (err) {
       вывод.innerHTML = `<span class="err">${esc(err.message || 'не получилось')}</span>${
         err.hint ? ` <span class="dim">${esc(err.hint)}</span>` : ''}`;
@@ -13154,16 +13195,24 @@ RENDERERS.staff = {
     document.body.appendChild(фон);
     mountModal(фон, { label: новая ? 'Новый сотрудник' : 'Карточка сотрудника' });
     qsa('[data-close]', фон).forEach((к) => { к.onclick = () => closeModal(фон); });
-    фон.querySelector('#st-save').onclick = async () => {
+    фон.querySelector('#st-save').onclick = async (ев) => {
+      // Кнопка гасится на время запроса: двойной щелчок по «Сохранить» у
+      // новой карточки заводил двух одинаковых людей.
+      const кнопка = ев.currentTarget;
+      if (кнопка.disabled) return;
+      кнопка.disabled = true;
       const тело = { active: фон.querySelector('#st-active-box').checked };
       qsa('[data-field]', фон).forEach((поле) => { тело[поле.dataset.field] = поле.value.trim(); });
       try {
-        if (новая) await API.post('/api/employees', тело);
-        else await API.put(`/api/employees/${encodeURIComponent(ч.id)}`, тело);
-        toast('Сохранено', 'ok');
+        const итог = новая ? await API.post('/api/employees', тело)
+          : await API.put(`/api/employees/${encodeURIComponent(ч.id)}`, тело);
+        // Тёзка или сосед по общему номеру — вторая карточка заведена, но
+        // человек должен знать, что первая уже была.
+        if (итог && итог.warning) toast('Сохранено', 'warn', итог.warning);
+        else toast('Сохранено', 'ok');
         closeModal(фон);
         this.load();
-      } catch (err) { fail(err); }
+      } catch (err) { fail(err); } finally { кнопка.disabled = false; }
     };
   },
 

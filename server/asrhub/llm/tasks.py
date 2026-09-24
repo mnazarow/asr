@@ -115,21 +115,47 @@ def chunks_of(transcript: str, limit: int) -> list[str]:
     return куски
 
 
+#: Сколько раз пробовать начать объект с очередной «{». Ответ модели — это
+#: страница текста, а не мегабайт, но и перебирать каждую скобку длинного
+#: пояснения незачем.
+_ПОПЫТОК_РАЗБОРА = 50
+
+
 def parse_json(text: str) -> dict[str, Any]:
-    """Объект JSON из ответа модели — даже если она обернула его в текст."""
+    """Объект JSON из ответа модели — даже если она обернула его в текст.
+
+    Объект берётся первый целый — от «{», с которой он разбирается, до его
+    собственного конца (`raw_decode`), а не от первой «{» до последней «}».
+    Модель нередко дописывает после ответа пояснение, и если в пояснении
+    есть фигурные скобки («поле {reason} заполнено по…»), вырезка до
+    последней «}» захватывала их и давала «повреждённый JSON». При
+    temperature 0 модель отвечает так же и на повторе — запись не
+    разбиралась никогда.
+    """
     text = (text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text)
     try:
         данные = json.loads(text)
     except (TypeError, ValueError):
-        начало, конец = text.find("{"), text.rfind("}")
-        if начало < 0 or конец <= начало:
+        начало = text.find("{")
+        if начало < 0:
             raise LLMError("Модель ответила не JSON.") from None
-        try:
-            данные = json.loads(text[начало:конец + 1])
-        except (TypeError, ValueError) as exc:
-            raise LLMError("Модель ответила повреждённым JSON.") from exc
+        разборщик = json.JSONDecoder()
+        данные = None
+        for _n in range(_ПОПЫТОК_РАЗБОРА):
+            try:
+                найдено, _конец = разборщик.raw_decode(text, начало)
+            except ValueError:
+                найдено = None
+            if isinstance(найдено, dict):
+                данные = найдено
+                break
+            начало = text.find("{", начало + 1)
+            if начало < 0:
+                break
+        if данные is None:
+            raise LLMError("Модель ответила повреждённым JSON.") from None
     if not isinstance(данные, dict):
         raise LLMError("Модель ответила не объектом JSON.")
     return данные

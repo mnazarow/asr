@@ -209,8 +209,9 @@ def test_отложенный_доживает_до_срока_и_после_н�
                      skipped=f"{db.ОТЛОЖЕН}файл ещё растёт", owner="telephony",
                      station="pbx", pbx_uid=uid, src="1", dst="2",
                      started_at=time.time() - 10 * 86400, duration=300, billsec=290)
-    db.execute("UPDATE calls SET imported_at=? WHERE uniqueid='pbx:древний'",
-               [time.time() - 3 * 86400])
+    # Срок — от первого откладывания (`deferred_at`, заход 42).
+    db.execute("UPDATE calls SET imported_at=?, deferred_at=? WHERE uniqueid='pbx:древний'",
+               [time.time() - 3 * 86400, time.time() - 3 * 86400])
     порог = time.time() - 24 * 3600
     очередь = db.calls_deferred(limit=50, station="pbx", older_than=порог)
     assert [з["pbx_uid"] for з in очередь] == ["свежий"]

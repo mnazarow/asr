@@ -572,13 +572,15 @@ def _область(сегменты: list[dict[str, Any]], категория: 
 
 def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict[str, Any]],
           *, agent: str | None = None, customer: str | None = None,
-          everything: bool = False) -> dict[str, Any]:
+          everything: bool = False, objections_limit: int = 20) -> dict[str, Any]:
     """Применить набор к одной записи.
 
     Возвращает сработавшие категории со счётом совпадений, временем первого
     и примерами реплик; с `everything=True` — все категории, включая те,
     что не сработали и не разобрались: так проверяет редактор. Отдельно —
-    возражения клиента и то, были ли они отработаны (см. `_возражения`).
+    возражения клиента и то, были ли они отработаны (см. `_возражения`);
+    `objections_limit` — сколько возражений отдать списком (подсказкам в
+    живом разговоре нужны все, отчёту — первые двадцать).
     """
     набор = compile(categories)
     сегменты = list(segments or [])
@@ -634,7 +636,8 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
     штрафы = {к.id: к.penalty for к in набор if к.penalty}
     return {"checked": len(набор), "errors": ошибок, "matched": сработали,
             "items": items,
-            "objections": _возражения(сегменты, возражения, отработки, есть_отработка),
+            "objections": _возражения(сегменты, возражения, отработки, есть_отработка,
+                                      предел=objections_limit),
             # Нарушения оператора и штрафы к баллу: штраф — за категорию, а
             # не за каждое совпадение: пять «не знаю» в одном разговоре —
             # одно нарушение, а не пять; сколько раз — видно по счёту.
@@ -652,7 +655,8 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
 
 
 def _возражения(сегменты: list[dict[str, Any]], найденные: list[tuple[int, str, str]],
-                отработки: set[int], есть_отработка: bool) -> dict[str, Any]:
+                отработки: set[int], есть_отработка: bool, *,
+                предел: int = 20) -> dict[str, Any]:
     """Возражения клиента и было ли за каждым что-то из «отработки».
 
     Правило Т-Банка «где менеджер не отработал возражение»: за репликой
@@ -683,10 +687,14 @@ def _возражения(сегменты: list[dict[str, Any]], найденн
             "matched": ", ".join(приметы),
             "text": str(реплика.get("text") or "").strip()[:200],
             "handled": отработано,
+            # Номер реплики: подсказке в живом разговоре нужно знать, прошло
+            # ли после возражения окно на отработку, а по времени реплик
+            # (у переписки его нет вовсе) этого не понять.
+            "index": номер,
         })
     return {"count": len(items),
             "unhandled": без_ответа if есть_отработка else None,
-            "items": items[:20]}
+            "items": items[:max(1, int(предел))]}
 
 
 def for_db(результат: dict[str, Any]) -> list[dict[str, Any]]:

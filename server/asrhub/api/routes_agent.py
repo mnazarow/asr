@@ -34,7 +34,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 
 from ..db import new_id
-from ..errors import ASRHubError, ConfigError, ForbiddenError, StorageError
+from ..errors import (
+    ASRHubError,
+    ConfigError,
+    FileTooLarge,
+    ForbiddenError,
+    StorageError,
+    UnsupportedFormat,
+)
 from ..logging_setup import get_logger
 from .deps import (
     Principal,
@@ -174,6 +181,15 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
     новый = state.db.agent_get(agent_id) is None
     if not новый:
         _свой_агент(state, agent_id, principal)
+    # «Только посмотреть»: самопроверка агента (`--selftest`) здоровается,
+    # чтобы проверить связь и часы, — и раньше забирала при этом задание
+    # сервера («собрать всё»), которого сама не выполняет: нажатое в
+    # разделе «АТС» задание пропадало, если на станции в это время
+    # запускали самопроверку (а её запускает и повторный install.sh). Её же
+    # состояние {"selftest": true} затирало настоящее состояние агента в
+    # разделе. Прежние агенты шлют только state.selftest — узнаём и их.
+    состояние_агента = данные.get("state") if isinstance(данные.get("state"), dict) else {}
+    посмотреть = bool(данные.get("peek")) or bool((состояние_агента or {}).get("selftest"))
 
     запись = state.db.agent_save(agent_id, {
         # Владелец ставится один раз — при первом приветствии. Иначе
@@ -187,9 +203,13 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         "version": str(данные.get("version") or "")[:40],
         "source": str(данные.get("source") or "")[:40],
         "station": _агентская_станция(agent_id),
-        "state": json.dumps(данные.get("state") or {}, ensure_ascii=False)[:4000],
+        **({} if посмотреть else
+           {"state": json.dumps(данные.get("state") or {}, ensure_ascii=False)[:4000]}),
     })
-    команда = state.db.agent_command_take(agent_id)
+    # При «только посмотреть» задание остаётся на сервере: его покажут,
+    # но не снимут — выполнит его настоящий заход агента.
+    команда = (str(запись.get("command") or "") if посмотреть
+               else state.db.agent_command_take(agent_id))
     # Часы станции и сервера расходятся чаще, чем кажется, а по времени
     # звонка потом строится вся аналитика. Пусть агент знает наше время и
     # скажет человеку, если разошлись.
@@ -200,6 +220,7 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         "max_file_mb": int(state.settings.get("max_upload_mb") or 2048),
         "want_audio": True,
         "command": команда,
+        "peek": посмотреть,
         "enabled": bool(запись.get("enabled", 1)),
         "min_duration_s": int(state.settings.get("telephony_min_duration_s") or 0),
         "skip_unanswered": bool(state.settings.get("telephony_skip_unanswered", True)),
@@ -288,9 +309,12 @@ async def call(request: Request,
     имя = Path(str(file.filename)).name
     расширение = Path(имя).suffix.lower()
     if расширение not in ЗВУК:
-        raise error_response(ConfigError(
-            f"«{имя}»: такие записи сервер не принимает.",
-            hint="Ожидаются " + ", ".join(sorted(ЗВУК)) + "."))
+        # 415, а не 400: агент по этому коду понимает, что дело в ЗАПИСИ, и
+        # шлёт звонок ещё раз без неё — звонок остаётся в журнале.
+        ошибка = UnsupportedFormat(имя)
+        ошибка.message = f"«{имя}»: такие записи сервер не принимает."
+        ошибка.hint = "Ожидаются " + ", ".join(sorted(ЗВУК)) + "."
+        raise error_response(ошибка)
     предел = int(state.settings.get("max_upload_mb") or 2048)
     цель = state.settings.paths.uploads / f"{new_id('pbx')}{расширение}"
     размер = 0
@@ -304,9 +328,12 @@ async def call(request: Request,
                 if размер > предел * 1024 * 1024:
                     выход.close()
                     цель.unlink(missing_ok=True)
-                    raise error_response(ConfigError(
-                        f"Запись больше предела в {предел} МБ.",
-                        hint="Поднимите «Предел размера загрузки» или сжимайте записи на станции."))
+                    # 413, а не 400: агент по нему шлёт звонок без записи.
+                    ошибка = FileTooLarge(размер / 1048576, предел)
+                    ошибка.message = f"Запись больше предела в {предел} МБ."
+                    ошибка.hint = ("Поднимите «Предел размера загрузки» или сжимайте "
+                                   "записи на станции.")
+                    raise error_response(ошибка)
                 выход.write(кусок)
     except OSError as exc:
         цель.unlink(missing_ok=True)

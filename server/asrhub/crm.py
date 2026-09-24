@@ -14,7 +14,14 @@
   работающих способов: они не требуют заранее заведённых своих полей и
   видны человеку сразу.
 * **Сопоставление своих полей.** Кому мало примечания, тот указывает
-  «наше поле = их поле», и значения уходят ещё и в них.
+  «наше поле = их поле», и значения уходят ещё и в них — вторым запросом,
+  правкой самой сущности: у amoCRM это `PATCH /api/v4/<сущности>/<id>`, у
+  Bitrix24 — `crm.<сущность>.update`. В примечание и в комментарий ленты
+  свои поля не пишутся ни там, ни там.
+* **Одно примечание на запись.** Примечание свежей записи ждёт смыслового
+  разбора (иначе оно уходит без пересказа, и дослать пересказ уже некуда),
+  а отметка «отправлено» по заданию держит от повторов: пересчёт разбора,
+  открытие карточки и повторное распознавание в CRM больше не пишут.
 * **Нет OAuth.** У amoCRM это отдельная история с обновлением токена, и
   делать её вслепую, без рабочего аккаунта, — значит написать то, что
   никогда не проверялось. Токен долгоживущий даётся в настройках, а у
@@ -28,6 +35,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -222,13 +230,48 @@ def _свои_поля(данные: dict[str, Any], настройки: Нас�
     return итог
 
 
-def запрос(данные: dict[str, Any], настройки: Настройки, *,
-           entity_id: str = "") -> tuple[str, dict[str, str], bytes]:
-    """Адрес, заголовки и тело запроса — под выбранную CRM.
+@dataclass(frozen=True)
+class Запрос:
+    """Один запрос к CRM: что, куда и с каким телом."""
 
-    Возвращается всё сразу и ничего не отправляется: так эту часть можно
-    проверить целиком, не поднимая CRM, и показать человеку в разделе
-    настроек, что именно уйдёт.
+    method: str
+    url: str
+    headers: dict[str, str]
+    body: bytes
+    #: Зачем этот запрос: «примечание» или «поля» — для ответа и журнала.
+    назначение: str = "примечание"
+
+
+def _значения_amo(свои: dict[str, Any]) -> list[dict[str, Any]]:
+    """Свои поля в виде amoCRM: `[{field_id|field_code, values: [{value}]}]`.
+
+    Номер поля — числом (`field_id`), всё остальное — кодом поля
+    (`field_code`): у amoCRM есть оба способа сослаться на своё поле.
+    Пустые значения не шлются: пустота затёрла бы то, что менеджер
+    вписал руками.
+    """
+    итог: list[dict[str, Any]] = []
+    for поле, значение in свои.items():
+        if значение in (None, "", [], {}):
+            continue
+        ссылка: dict[str, Any] = ({"field_id": int(поле)} if str(поле).strip().isdigit()
+                                  else {"field_code": str(поле).strip()})
+        итог.append({**ссылка, "values": [{"value": значение}]})
+    return итог
+
+
+def запросы(данные: dict[str, Any], настройки: Настройки, *,
+            entity_id: str = "") -> list[Запрос]:
+    """Все запросы к CRM по одной записи — по порядку отправки.
+
+    Ничего не отправляется: так эту часть можно проверить целиком, не
+    поднимая CRM, и показать человеку в разделе настроек, что именно уйдёт.
+
+    Свои поля — ВТОРЫМ запросом, правкой самой сущности. У amoCRM раньше
+    уходил один объект `{"notes": …, "custom_fields_values": …}` на адрес
+    примечаний, который принимает только массив примечаний: запись в CRM
+    ломалась целиком, как только человек сопоставлял хоть одно своё поле.
+    У Bitrix24 поля клались в комментарий ленты, где их молча не пишут.
     """
     беда = настройки.проблема()
     if беда:
@@ -238,6 +281,9 @@ def запрос(данные: dict[str, Any], настройки: Настро�
     заголовки = {"Content-Type": "application/json; charset=utf-8",
                  "User-Agent": "ASRHub/3.0"}
 
+    def тело(что: Any) -> bytes:
+        return json.dumps(что, ensure_ascii=False).encode("utf-8")
+
     if настройки.kind == "amocrm":
         if not entity_id:
             raise CRMError(
@@ -246,29 +292,33 @@ def запрос(данные: dict[str, Any], настройки: Настро�
                      "accountcode; задайте его на АТС или передайте в задании.")
         сущность = {"lead": "leads", "contact": "contacts",
                     "company": "companies"}.get(настройки.entity, "leads")
-        адрес = f"{настройки.url.rstrip('/')}/api/v4/{сущность}/{entity_id}/notes"
         заголовки["Authorization"] = f"Bearer {настройки.token}"
-        тело: Any = [{"note_type": "common", "params": {"text": текст}}]
-        if свои:
-            # Свои поля у amoCRM правятся не примечанием, а самой сущностью —
-            # это отдельный запрос, и он честно отдаётся вторым телом.
-            тело = {"notes": тело, "custom_fields_values": свои}
-        return адрес, заголовки, json.dumps(тело, ensure_ascii=False).encode("utf-8")
+        основа = f"{настройки.url.rstrip('/')}/api/v4/{сущность}/{entity_id}"
+        итог = [Запрос("POST", f"{основа}/notes", dict(заголовки),
+                       тело([{"note_type": "common", "params": {"text": текст}}]))]
+        значения = _значения_amo(свои)
+        if значения:
+            итог.append(Запрос("PATCH", основа, dict(заголовки),
+                               тело({"custom_fields_values": значения}), "поля"))
+        return итог
 
     if настройки.kind == "bitrix24":
         # Входящий вебхук Bitrix24 несёт ключ прямо в адресе, поэтому токена
         # отдельно не нужно. Адрес выглядит как
         # https://фирма.bitrix24.ru/rest/1/КЛЮЧ/
-        метод = "crm.timeline.comment.add"
-        адрес = f"{настройки.url.rstrip('/')}/{метод}.json"
         тип = {"lead": "lead", "deal": "deal", "contact": "contact",
                "company": "company"}.get(настройки.entity, "deal")
+        основа = настройки.url.rstrip("/")
         поля: dict[str, Any] = {"ENTITY_TYPE": тип, "COMMENT": текст}
         if entity_id:
             поля["ENTITY_ID"] = entity_id
-        поля.update(свои)
-        return адрес, заголовки, json.dumps({"fields": поля},
-                                            ensure_ascii=False).encode("utf-8")
+        итог = [Запрос("POST", f"{основа}/crm.timeline.comment.add.json",
+                       dict(заголовки), тело({"fields": поля}))]
+        значимые = {к: з for к, з in свои.items() if з not in (None, "", [], {})}
+        if значимые and entity_id:
+            итог.append(Запрос("POST", f"{основа}/crm.{тип}.update.json", dict(заголовки),
+                               тело({"id": entity_id, "fields": значимые}), "поля"))
+        return итог
 
     # «custom» — своё тело: всё, что есть, плюс сопоставленные имена. Так
     # подключается то, чего мы не знаем, без правки кода.
@@ -277,27 +327,27 @@ def запрос(данные: dict[str, Any], настройки: Настро�
         тело_свой["entity_id"] = entity_id
     if настройки.token:
         заголовки["Authorization"] = f"Bearer {настройки.token}"
-    return настройки.url, заголовки, json.dumps(
-        тело_свой, ensure_ascii=False).encode("utf-8")
+    return [Запрос("POST", настройки.url, заголовки, тело(тело_свой))]
 
 
-def отправить(данные: dict[str, Any], настройки: Настройки, *,
-              entity_id: str = "", allow_internal: bool = False) -> dict[str, Any]:
-    """Шлёт запись в CRM. Возвращает код ответа и начало тела.
+def запрос(данные: dict[str, Any], настройки: Настройки, *,
+           entity_id: str = "") -> tuple[str, dict[str, str], bytes]:
+    """Адрес, заголовки и тело ПЕРВОГО запроса — примечания (см. `запросы`)."""
+    первый = запросы(данные, настройки, entity_id=entity_id)[0]
+    return первый.url, первый.headers, первый.body
 
-    Одна попытка, без повторов: обратная запись в CRM — не то, что нужно
-    доставить любой ценой. Повтор в чужую систему вслепую даёт дубли
-    комментариев в карточке, а это заметнее и неприятнее пропуска.
-    """
+
+def _послать(запрос_crm: Запрос, настройки: Настройки,
+             allow_internal: bool) -> dict[str, Any]:
     import urllib.error
     import urllib.request
 
     from .job_queue import check_outbound_url, открыватель_наружу
 
-    адрес, заголовки, тело = запрос(данные, настройки, entity_id=entity_id)
-    проверенный = check_outbound_url(адрес, allow_internal)
-    запрос_http = urllib.request.Request(проверенный, data=тело,
-                                         headers=заголовки, method="POST")
+    проверенный = check_outbound_url(запрос_crm.url, allow_internal)
+    запрос_http = urllib.request.Request(проверенный, data=запрос_crm.body,
+                                         headers=запрос_crm.headers,
+                                         method=запрос_crm.method)
     try:
         with открыватель_наружу(allow_internal).open(
                 запрос_http, timeout=max(1.0, настройки.timeout_s)) as ответ:
@@ -312,6 +362,32 @@ def отправить(данные: dict[str, Any], настройки: Нас�
     except Exception as exc:                                # noqa: BLE001
         raise CRMError(f"CRM недоступна: {exc}",
                        hint="Проверьте адрес и сеть.") from exc
+
+
+def отправить(данные: dict[str, Any], настройки: Настройки, *,
+              entity_id: str = "", allow_internal: bool = False) -> dict[str, Any]:
+    """Шлёт запись в CRM. Возвращает код ответа и начало тела примечания.
+
+    Одна попытка, без повторов: обратная запись в CRM — не то, что нужно
+    доставить любой ценой. Повтор в чужую систему вслепую даёт дубли
+    комментариев в карточке, а это заметнее и неприятнее пропуска.
+
+    Примечание — первым запросом; его отказ поднимается ошибкой. Свои поля
+    — вторым; их отказ ошибкой не поднимается: примечание уже в карточке, и
+    «не ушло ничего» было бы неправдой. Он возвращается в `fields_error`.
+    """
+    список = запросы(данные, настройки, entity_id=entity_id)
+    итог = _послать(список[0], настройки, allow_internal)
+    for следующий in список[1:]:
+        try:
+            ответ = _послать(следующий, настройки, allow_internal)
+            итог.setdefault("extra", []).append(
+                {"purpose": следующий.назначение, "status": ответ["status"]})
+        except CRMError as exc:
+            log.warning("CRM приняла примечание, но не %s: %s",
+                        следующий.назначение, exc.message)
+            итог["fields_error"] = exc.message
+    return итог
 
 
 #: Поля звонка, в которых АТС обычно передаёт идентификатор сделки. Порядок —
@@ -341,12 +417,13 @@ def сущность_из(job: dict[str, Any], звонок: dict[str, Any] | No
 
 def отправить_разбор(db: Any, settings: Any, job_id: str, *,
                      разбор: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """Собирает всё о записи и шлёт в CRM. None — отправлять не нужно.
+    """Собирает всё о записи и шлёт в CRM — ОДИН раз. None — не отправлялось.
 
     Ошибки не поднимаются наружу: разбор записи не должен падать из-за того,
     что чужая система не отвечает. Всё, что случилось, уходит в журнал —
     и туда же уходит успех, потому что «комментарий не появился» разбирают по
-    журналу, а не по памяти.
+    журналу, а не по памяти. Итог ложится отметкой на задание (`crm_status`):
+    по ней отправка не повторяется и видна в карточке записи.
     """
     настройки = Настройки.из_настроек(settings)
     if not настройки.enabled:
@@ -362,10 +439,18 @@ def отправить_разбор(db: Any, settings: Any, job_id: str, *,
     сделка = сущность_из(задание, звонок)
     if not сделка and настройки.kind != "custom":
         log.info("Запись %s не привязана к сделке — в CRM не отправляется", job_id)
+        if hasattr(db, "crm_mark") and str(задание.get("crm_status") or "") in (
+                "", db.CRM_ЖДЁТ_МОДЕЛЬ):
+            db.crm_mark(job_id, db.CRM_БЕЗ_СДЕЛКИ)
         return None
+    if hasattr(db, "crm_claim") and not db.crm_claim(job_id):
+        log.info("Примечание по записи %s в CRM уже уходило — повторно не шлём", job_id)
+        return None
+    if разбор is None and hasattr(db, "get_content"):
+        разбор = dict((db.get_content(job_id) or {}).get("detail") or {})
     модель = db.llm_get(job_id) if hasattr(db, "llm_get") else None
     полный = dict(разбор or {})
-    if модель:
+    if модель and not модель.get("error"):
         полный["llm"] = dict(модель)
     данные = собрать(задание, полный, звонок,
                      base_url=str(settings.get("public_url") or ""),
@@ -376,8 +461,89 @@ def отправить_разбор(db: Any, settings: Any, job_id: str, *,
             allow_internal=bool(settings.get("webhook_allow_internal", False)))
     except ASRHubError as exc:
         log.warning("Запись %s не ушла в CRM: %s", job_id, exc, extra={"job_id": job_id})
+        if hasattr(db, "crm_mark"):
+            db.crm_mark(job_id, f"ошибка: {exc.message}")
         return {"status": 0, "error": str(exc)}
     log.info("Запись %s ушла в CRM (%s), сделка %s, ответ %s",
              job_id, настройки.kind, сделка, ответ.get("status"),
              extra={"job_id": job_id})
+    if hasattr(db, "crm_mark"):
+        db.crm_mark(job_id, db.CRM_ОТПРАВЛЕНО if not ответ.get("fields_error")
+                    else f"{db.CRM_ОТПРАВЛЕНО}, поля не приняты")
     return ответ
+
+
+#: Задачи модели, ради которых примечание стоит подождать: без них в нём
+#: не будет пересказа, причины, исхода и действий.
+_ЗАДАЧИ_ДЛЯ_ПРИМЕЧАНИЯ = frozenset({"summary", "outcome", "actions"})
+
+#: Дольше этого примечание модель не ждёт: сервер модели лёг надолго,
+#: очередь разбора приостановили — карточка сделки не должна оставаться
+#: пустой до конца недели.
+ЖДАТЬ_МОДЕЛЬ_С = 6 * 3600
+
+
+def модель_будет(settings: Any) -> bool:
+    """Будет ли по свежей записи смысловой разбор, нужный примечанию."""
+    if str(settings.get("llm_backend") or "off") not in ("ollama", "openai", "stub"):
+        return False
+    if not settings.get("llm_auto", True):
+        return False
+    задачи = settings.get("llm_tasks")
+    if задачи is None:
+        return True
+    return bool(_ЗАДАЧИ_ДЛЯ_ПРИМЕЧАНИЯ & {str(з) for з in (задачи or [])})
+
+
+def после_разбора(db: Any, settings: Any, job_id: str,
+                  разбор: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Свежая запись разобрана: отправить примечание сейчас или после модели.
+
+    Только для свежих записей. Пересчёт разбора, открытие карточки и
+    разбор архива сюда не приходят — раньше каждый из них слал в карточку
+    сделки новое примечание.
+    """
+    настройки = Настройки.из_настроек(settings)
+    if not настройки.enabled or настройки.проблема():
+        return None
+    if модель_будет(settings) and hasattr(db, "crm_mark"):
+        # Отметка ставится, только если по записи ещё ничего не решали:
+        # повторное распознавание уже отправленной записи не должно снова
+        # поставить её в ожидание.
+        db.crm_mark(job_id, db.CRM_ЖДЁТ_МОДЕЛЬ, только_если="")
+        return None
+    return отправить_разбор(db, settings, job_id, разбор=разбор)
+
+
+def после_модели(db: Any, settings: Any, job_id: str) -> dict[str, Any] | None:
+    """Модель закончила с записью (или бросила её): дослать, если ждали."""
+    задание = db.get_job(job_id) if hasattr(db, "get_job") else None
+    if not задание or str(задание.get("crm_status") or "") != getattr(
+            db, "CRM_ЖДЁТ_МОДЕЛЬ", "ждёт модель"):
+        return None
+    return отправить_разбор(db, settings, job_id)
+
+
+def досылка(db: Any, settings: Any, *, предел: int = 20) -> int:
+    """Примечания, которые ждут модель слишком долго или уже зря.
+
+    Зря — когда строки в очереди модели больше нет или она не ждёт и не
+    идёт (сняли, отменили, запись ушла в ошибку): ждать больше нечего.
+    Слишком долго — когда сервер модели лёг или очередь приостановлена.
+    Возвращает, сколько примечаний отправлено.
+    """
+    if not hasattr(db, "crm_waiting"):
+        return 0
+    настройки = Настройки.из_настроек(settings)
+    if not настройки.enabled or настройки.проблема():
+        return 0
+    сейчас = time.time()
+    отправлено = 0
+    for строка in db.crm_waiting(limit=предел):
+        ждёт = str(строка.get("llm_state") or "") in (
+            getattr(db, "LLMQ_ЖДЁТ", "ждёт"), getattr(db, "LLMQ_ИДЁТ", "идёт"))
+        if ждёт and сейчас - float(строка.get("crm_at") or сейчас) < ЖДАТЬ_МОДЕЛЬ_С:
+            continue
+        if отправить_разбор(db, settings, str(строка["id"])) is not None:
+            отправлено += 1
+    return отправлено

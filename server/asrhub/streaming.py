@@ -215,6 +215,11 @@ class _Decoder:
         return tail
 
 
+def _метка_оператора(settings: Any) -> str:
+    """Кем подписаны реплики потока: в потоке одна дорожка — оператора."""
+    return str((settings or {}).get("stream_agent") or "оператор")
+
+
 class StreamSession:
     """Одна сессия распознавания «на лету».
 
@@ -256,8 +261,12 @@ class StreamSession:
             try:
                 from .liveassist import Помощник  # noqa: PLC0415
 
-                self.assist = Помощник.из_настроек(
-                    settings, agent=str(settings.get("stream_agent") or ""))
+                # Одна и та же метка и у помощника, и у реплик потока. Раньше
+                # при пустом `stream_agent` помощник брал метку оператора из
+                # `content_agent_speaker` («SPEAKER_00»), а реплики потока
+                # подписывались «оператор»: стоп-слова оператора не ловились,
+                # а скрипт проверялся по пустому набору.
+                self.assist = Помощник.из_настроек(settings, agent=_метка_оператора(settings))
             except Exception as exc:                        # noqa: BLE001
                 # Подсказки необязательны. Сессия распознавания из-за них
                 # падать не должна: человек в разговоре, и текст важнее.
@@ -389,8 +398,7 @@ class StreamSession:
                 continue
             try:
                 подсказки = помощник.добавить(
-                    событие.text,
-                    speaker=str(self.settings.get("stream_agent") or "оператор"),
+                    событие.text, speaker=_метка_оператора(self.settings),
                     start=событие.start, end=событие.end)
             except Exception as exc:                        # noqa: BLE001
                 log.warning("Подсказки не посчитаны: %s", exc)

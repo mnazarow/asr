@@ -1096,22 +1096,57 @@ def crm_test(request: Request, job_id: str = Query(default="", max_length=64),
     данные = crm_mod.собрать(задание, разбор, звонок,
                              base_url=str(state.settings.get("public_url") or ""),
                              mask=настройки.mask_pii)
-    адрес, заголовки, тело = crm_mod.запрос(данные, настройки, entity_id=сделка or "1")
+    # Без сделки запрос к amoCRM и Bitrix24 показать можно только с номером
+    # для примера — «1». Но ОТПРАВЛЯТЬ с ним нельзя: раньше «Отправить» без
+    # сделки писал показательное примечание в сделку №1 — карточку
+    # настоящего клиента, — а интерфейс при этом показывал «Сделка: не
+    # определена». У своего адреса («custom») номер сделки необязателен.
+    нужна_сделка = настройки.kind != "custom"
+    пример = нужна_сделка and not сделка
+    if пример and not dry_run:
+        raise error_response(ConfigError(
+            "Не указано, в какую сделку отправлять: примечание ушло бы в "
+            "сделку №1 — карточку чужого клиента.",
+            hint="Впишите номер сделки в поле проверки или выберите запись, "
+                 "у которой он есть (поле звонка userfield или accountcode, "
+                 "параметр задания crm_entity_id)."))
+    try:
+        список = crm_mod.запросы(данные, настройки,
+                                 entity_id=сделка or ("1" if пример else ""))
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+
     # Токен в показанном теле и заголовках не нужен: человек и так его знает,
     # а ответ API уходит в журналы и на экран.
-    безопасные = {к: ("…" if к.lower() == "authorization" else з)
-                  for к, з in заголовки.items()}
+    def безопасные(заголовки: dict[str, str]) -> dict[str, str]:
+        return {к: ("…" if к.lower() == "authorization" else з)
+                for к, з in заголовки.items()}
+
+    первый = список[0]
     итог: dict[str, Any] = {
         "kind": настройки.kind, "entity_id": сделка,
-        "url": адрес, "headers": безопасные,
-        "body": тело.decode("utf-8", "replace"),
+        # Номер в показанном запросе — для примера, а не найденная сделка.
+        "entity_example": пример,
+        "url": первый.url, "headers": безопасные(первый.headers),
+        "body": первый.body.decode("utf-8", "replace"),
+        # Все запросы по порядку: свои поля уходят вторым — правкой сущности.
+        "requests": [{"method": з.method, "url": з.url, "purpose": з.назначение,
+                      "headers": безопасные(з.headers),
+                      "body": з.body.decode("utf-8", "replace")} for з in список],
         "note": crm_mod.примечание(данные, transcript=настройки.send_transcript),
         "sent": False,
     }
     if not dry_run:
-        ответ = crm_mod.отправить(
-            данные, настройки, entity_id=сделка or "1",
-            allow_internal=bool(state.settings.get("webhook_allow_internal", False)))
+        try:
+            ответ = crm_mod.отправить(
+                данные, настройки, entity_id=сделка,
+                allow_internal=bool(state.settings.get("webhook_allow_internal", False)))
+        except ASRHubError as exc:
+            raise error_response(exc) from exc
         итог["sent"] = True
         итог["response"] = ответ
+        if job_id and задание.get("id") == job_id:
+            # Отправили руками — автоматическая отправка по этой записи
+            # второго примечания уже не сделает.
+            state.db.crm_mark(job_id, state.db.CRM_ОТПРАВЛЕНО)
     return итог
