@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 from . import catalog
@@ -42,16 +44,30 @@ def _heading(text: str) -> None:
     print(f"{DIM}{'─' * len(text)}{RESET}")
 
 
+def _каталог(settings: Settings, ключ: str, запасной: Path) -> Path:
+    """Каталог из настройки (`models_dir`, `temp_dir`) — тот, с которым работает сервер."""
+    задан = str(settings.get(ключ) or "").strip()
+    return Path(задан).expanduser() if задан else запасной
+
+
 def run_checks(settings: Settings) -> bool:
     """Выполняет все проверки. Возвращает True, если критических ошибок нет."""
+    global _passed, _warned, _failed
+    # Счётчики — на один прогон: второй вызов (проверка после правки
+    # настроек в том же процессе) складывал итоги с первым.
+    _passed = _warned = _failed = 0
     print(f"\n{BOLD}Проверка окружения ASR Hub{RESET}")
 
     _heading("Оборудование")
     hardware = detect(str(settings.paths.data))
     _check("Операционная система", "ok", f"{hardware.os_name} {hardware.os_version} ({hardware.arch})")
     _check("Python", "ok", hardware.python_version)
-    _check("Ядер процессора", "ok" if hardware.cpu_cores_physical >= 4 else "warn",
-           str(hardware.cpu_cores_physical),
+    ядер = hardware.cpu_cores_available
+    _check("Ядер процессора", "ok" if ядер >= 4 else "warn",
+           str(ядер) + (f" (квота контейнера {hardware.cpu_limit:g} из "
+                        f"{hardware.cpu_cores_physical})"
+                        if hardware.cpu_limit and hardware.cpu_limit < hardware.cpu_cores_physical
+                        else ""),
            "Меньше четырёх ядер: обработка на процессоре будет медленной.")
     _check("Оперативная память",
            "ok" if hardware.ram_total_gb >= 16 else ("warn" if hardware.ram_total_gb >= 6 else "fail"),
@@ -87,12 +103,40 @@ def run_checks(settings: Settings) -> bool:
 
     _heading("Каталоги и права")
     paths = settings.paths
+    # Модели и временные файлы — там, куда указывают models_dir и temp_dir, а
+    # не в каталоге данных по умолчанию. Раньше проверялись paths.models и
+    # paths.tmp: при `models_dir: /nonexistent/models` проверка отвечала
+    # «✓ Каталог модели …/data/models», а сервер падал на первом же задании.
+    модели = _каталог(settings, "models_dir", paths.models)
+    временные = _каталог(settings, "temp_dir", paths.tmp)
     for label, path in (("данные", paths.data), ("загрузки", paths.uploads),
-                        ("результаты", paths.results), ("модели", paths.models),
-                        ("журналы", paths.logs), ("временные", paths.tmp)):
+                        ("результаты", paths.results), ("журналы", paths.logs),
+                        ("временные", временные)):
         writable = path.exists() and _writable(path)
         _check(f"Каталог {label}", "ok" if writable else "fail", str(path),
                f"Создайте и дайте права: mkdir -p '{path}' && chmod 750 '{path}'")
+    # Каталог моделей бывает только для чтения — веса разложены заранее
+    # (том Docker с :ro). Это не поломка: скачать новые модели не выйдет,
+    # а уже лежащие работают.
+    if not модели.exists():
+        _check("Каталог моделей", "fail", str(модели),
+               f"Каталога нет — модели некуда скачивать и неоткуда брать. "
+               f"Создайте: mkdir -p '{модели}' или поправьте models_dir.")
+    elif not _writable(модели):
+        _check("Каталог моделей", "warn", f"{модели} (только чтение)",
+               "Уже скачанные модели работают, новые скачать не получится.")
+    else:
+        _check("Каталог моделей", "ok", str(модели))
+    # Модели часто выносят на отдельный диск — тогда «свободно на диске»
+    # выше говорит о каталоге данных, а не о том, куда лягут веса.
+    try:
+        if модели.exists() and os.stat(модели).st_dev != os.stat(paths.data).st_dev:
+            свободно = round(shutil.disk_usage(модели).free / 1024 ** 3, 1)
+            _check("Свободно под модели", "ok" if свободно >= 20 else
+                   ("warn" if свободно >= 5 else "fail"), f"{свободно} ГБ",
+                   "Полный набор моделей занимает свыше 100 ГБ.")
+    except OSError:
+        pass
 
     _heading("Конфигурация")
     _check("Файл конфигурации", "ok" if settings.config_file else "warn",

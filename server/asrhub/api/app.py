@@ -410,7 +410,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     queue = JobQueue(db, settings, registry, on_event=hub.publish)
     analytics = Analytics(db)
     state = AppState(settings=settings, db=db, registry=registry,
-                     queue=queue, analytics=analytics)
+                     queue=queue, analytics=analytics, queue_enabled=start_queue)
     state.accounts = Accounts(db, float(settings.get("session_ttl_hours") or 168))
     # Первый запуск: заводим admin с временным паролем. Без этого открыть
     # интерфейс можно было только сходив на сервер за api-key.txt.

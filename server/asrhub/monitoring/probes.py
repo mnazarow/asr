@@ -27,16 +27,34 @@ def _check(name: str, status: str, detail: str = "", hint: str = "") -> dict[str
     return {"name": name, "status": status, "detail": detail, "hint": hint}
 
 
+def _очередь_здесь(state: Any) -> bool:
+    """Должна ли очередь работать в этом процессе (не запущен ли он с --no-queue)."""
+    return bool(getattr(state, "queue_enabled", True))
+
+
+#: Что пишет проба об очереди у сервера «только интерфейс».
+БЕЗ_ОЧЕРЕДИ = ("очередь здесь не обрабатывается (запуск с --no-queue): "
+               "задания считает соседний сервер")
+
+
 def liveness(state: Any) -> dict[str, Any]:
-    """Максимально дешёвая проверка: процесс отвечает и цикл очереди жив."""
+    """Максимально дешёвая проверка: процесс отвечает и цикл очереди жив.
+
+    У сервера, запущенного с `--no-queue` («только интерфейс»), рабочих
+    потоков нет по замыслу. Проба называла их отсутствие провалом, и
+    Kubernetes по рекомендованным пробам перезапускал такой под по кругу.
+    """
     checks = [_check("process", CHECK_OK, f"работает {round(time.time() - state.started_at)} с")]
 
     queue = getattr(state, "queue", None)
-    alive = bool(getattr(queue, "_started", False)) if queue is not None else False
-    checks.append(_check(
-        "queue_thread", CHECK_OK if alive else CHECK_FAIL,
-        "рабочие потоки запущены" if alive else "рабочие потоки не запущены",
-        "" if alive else "Перезапустите службу: scripts/service.sh restart"))
+    if not _очередь_здесь(state):
+        checks.append(_check("queue_thread", CHECK_OK, БЕЗ_ОЧЕРЕДИ))
+    else:
+        alive = bool(getattr(queue, "_started", False)) if queue is not None else False
+        checks.append(_check(
+            "queue_thread", CHECK_OK if alive else CHECK_FAIL,
+            "рабочие потоки запущены" if alive else "рабочие потоки не запущены",
+            "" if alive else "Перезапустите службу: scripts/service.sh restart"))
 
     failed = any(c["status"] == CHECK_FAIL for c in checks)
     return {"status": "fail" if failed else "ok", "checks": checks}
@@ -100,13 +118,16 @@ def readiness(state: Any) -> dict[str, Any]:
 
 def startup(state: Any) -> dict[str, Any]:
     """Завершился ли запуск: каталог прочитан, база открыта, очередь поднята."""
+    очередь_здесь = _очередь_здесь(state)
     checks = [
         _check("catalog", CHECK_OK if getattr(state, "settings", None) else CHECK_FAIL,
                "настройки загружены"),
         _check("database", CHECK_OK if getattr(state, "db", None) else CHECK_FAIL,
                "база открыта"),
-        _check("queue", CHECK_OK if getattr(state.queue, "_started", False) else CHECK_FAIL,
-               "очередь запущена"),
+        _check("queue",
+               CHECK_OK if (not очередь_здесь or getattr(state.queue, "_started", False))
+               else CHECK_FAIL,
+               "очередь запущена" if очередь_здесь else БЕЗ_ОЧЕРЕДИ),
     ]
     failed = any(c["status"] == CHECK_FAIL for c in checks)
     return {"status": "fail" if failed else "ok", "checks": checks}

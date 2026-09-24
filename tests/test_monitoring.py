@@ -624,6 +624,9 @@ def test_zabbix_template_matches_what_is_sent(client):
     template = yaml.safe_load(client.get("/api/monitoring/config/zabbix").text)
     tpl = template["zabbix_export"]["templates"][0]
     declared = {item["key"] for item in tpl["items"]}
+    # Наборы меток для правил обнаружения сервер присылает сам — ключом
+    # самого правила (заход 45).
+    declared |= {rule["key"] for rule in tpl.get("discovery_rules", [])}
     prototypes = {p["key"].split("[")[0]
                   for rule in tpl.get("discovery_rules", [])
                   for p in rule.get("item_prototypes", [])}
@@ -653,9 +656,12 @@ def test_zabbix_triggers_are_not_always_firing(client):
         "процент сравнивается с байтами"
     assert "last(/ASR Hub/asrhub_up)<1" not in joined, \
         "метрика есть только когда равна единице — условие никогда не сработает"
-    # Один порог не должен заводить три одинаковых триггера по срезам.
-    rtf = [e for e in expressions if "asrhub_rtf" in e]
-    assert len(rtf) <= 1, f"по срезам заведено {len(rtf)} одинаковых триггеров"
+    # Один порог не должен заводить три одинаковых триггера по срезам:
+    # триггеры — только на срезе p95, по одному на уровень (заход 45 завёл
+    # предупреждение рядом с аварией).
+    rtf = [e for e in expressions if "asrhub_rtf[" in e]
+    assert rtf and all("asrhub_rtf[p95]" in e for e in rtf), rtf
+    assert len(rtf) <= 2, f"по срезам заведено {len(rtf)} одинаковых триггеров"
 
 
 def test_zero_is_a_legal_setting_value():

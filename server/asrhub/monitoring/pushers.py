@@ -4,7 +4,7 @@ Prometheus забирает метрики сам, и это правильны�
 сервер распознавания часто стоит там, куда снаружи не достучаться: закрытый
 контур, NAT, машина под столом. Тогда метрики отправляет он сам.
 
-Поддерживаются пять приёмников. Все они работают по одной схеме: раз в
+Поддерживаются шесть приёмников. Все они работают по одной схеме: раз в
 `interval_s` собирается снимок, переводится в нужный формат и отправляется.
 Сбой отправки не влияет на работу сервиса — он только отмечается в метрике
 asrhub_push_targets_healthy, чтобы молчащий приёмник было видно.
@@ -28,7 +28,15 @@ from .collector import Sample
 
 log = logging.getLogger("asrhub.monitoring")
 
-KINDS = ("prometheus_pushgateway", "influxdb", "otlp", "statsd", "webhook")
+KINDS = ("prometheus_pushgateway", "influxdb", "otlp", "statsd", "webhook", "zabbix")
+
+#: Заглушка вместо значения заголовка в ответах сервера. Пришла обратно —
+#: значит «не менял»: заголовок берётся у сохранённого приёмника.
+ЗАГЛУШКА = "***"
+
+#: Как часто повторять данные обнаружения Zabbix, даже если наборы меток не
+#: менялись: сервер Zabbix мог перезапуститься, шаблон — переимпортироваться.
+ZABBIX_LLD_ПОВТОР_С = 1800.0
 
 #: Как часто жаловаться в журнал на один и тот же недоступный приёмник.
 COMPLAIN_INTERVAL_S = 3600.0
@@ -49,39 +57,93 @@ class Target:
     database: str = "asrhub"
     prefix: str = "asrhub"
     timeout_s: float = 10.0
+    #: Имя узла в Zabbix — ровно как он заведён там. Пусто — имя машины.
+    host: str = ""
+    #: Что задано руками: пустое — «имя машины». В config.yaml пишется
+    #: именно это, а не подставленное имя: иначе приёмник, сохранённый из
+    #: интерфейса, навсегда получал имя той машины, где его сохранили, и
+    #: два сервера с общей настройкой слали в Pushgateway под одним
+    #: `instance`, затирая друг друга.
+    instance_задан: str = field(default="", init=False, repr=False, compare=False)
+    host_задан: str = field(default="", init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.name:
             self.name = self.kind
+        self.instance_задан = self.instance
+        self.host_задан = self.host
         if not self.instance:
             self.instance = socket.gethostname()
+        if not self.host:
+            self.host = self.instance
 
     def to_dict(self) -> dict[str, Any]:
+        """Описание приёмника — со всеми полями, какие у него есть.
+
+        Прежде здесь не было заголовков, базы, тайм-аута и имени узла, а
+        интерфейс собирал список для сохранения из этого ответа: добавление
+        нового приёмника стирало у прежних заголовок Authorization,
+        сбрасывало базу InfluxDB в «asrhub» и включало выключенные. Значения
+        заголовков по-прежнему не отдаются — вместо них заглушка, которая
+        при сохранении означает «оставить как было».
+        """
         return {"name": self.name, "kind": self.kind, "url": self.url,
                 "interval_s": self.interval_s, "enabled": self.enabled,
-                "job": self.job, "instance": self.instance, "prefix": self.prefix}
+                "job": self.job, "instance": self.instance_задан, "prefix": self.prefix,
+                "database": self.database, "timeout_s": self.timeout_s,
+                "host": self.host_задан,
+                "headers": dict.fromkeys(self.headers, ЗАГЛУШКА)}
+
+    def to_config(self) -> dict[str, Any]:
+        """Запись для config.yaml: всё, включая настоящие заголовки."""
+        return {**self.to_dict(), "headers": dict(self.headers)}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Target:
+    def from_dict(cls, data: dict[str, Any], *, прежний: Target | None = None) -> Target:
+        """Приёмник из настроек или запроса.
+
+        `прежний` — сохранённый приёмник с тем же именем: из него берётся
+        всё, чего в описании нет, и значения заголовков, пришедшие
+        заглушкой. Так список можно отредактировать по ответу GET и
+        отправить обратно, ничего не потеряв.
+        """
         if not isinstance(data, dict):
             raise TypeError("приёмник — объект с полями kind и url")
         if data.get("headers") is not None and not isinstance(data["headers"], dict):
             raise TypeError("headers — объект «заголовок: значение»")
-        kind = str(data.get("kind") or "")
+        основа = прежний.to_config() if прежний is not None else {}
+        поля = {**основа, **{к: з for к, з in data.items() if з is not None}}
+        kind = str(поля.get("kind") or "")
         if kind not in KINDS:
             raise ValueError(f"Неизвестный приёмник «{kind}». Доступны: {', '.join(KINDS)}")
+        заголовки: dict[str, str] = {}
+        прежние = dict(основа.get("headers") or {})
+        for ключ, значение in (поля.get("headers") or {}).items():
+            if str(значение) == ЗАГЛУШКА:
+                if ключ in прежние:
+                    заголовки[str(ключ)] = str(прежние[ключ])
+                continue
+            заголовки[str(ключ)] = str(значение)
         return cls(
-            kind=kind, url=str(data.get("url") or ""),
-            interval_s=max(10, int(data.get("interval_s", 60))),
-            enabled=bool(data.get("enabled", True)),
-            name=str(data.get("name") or kind),
-            headers={str(k): str(v) for k, v in (data.get("headers") or {}).items()},
-            job=str(data.get("job") or "asrhub"),
-            instance=str(data.get("instance") or ""),
-            database=str(data.get("database") or "asrhub"),
-            prefix=str(data.get("prefix") or "asrhub"),
-            timeout_s=min(60.0, max(1.0, float(data.get("timeout_s", 10.0)))),
+            kind=kind, url=str(поля.get("url") or ""),
+            interval_s=max(10, int(float(поля.get("interval_s", 60)))),
+            enabled=_да(поля.get("enabled", True)),
+            name=str(поля.get("name") or kind),
+            headers=заголовки,
+            job=str(поля.get("job") or "asrhub"),
+            instance=str(поля.get("instance") or ""),
+            database=str(поля.get("database") or "asrhub"),
+            prefix=str(поля.get("prefix") or "asrhub"),
+            timeout_s=min(60.0, max(1.0, float(поля.get("timeout_s", 10.0)))),
+            host=str(поля.get("host") or ""),
         )
+
+
+def _да(значение: Any) -> bool:
+    """«false» из формы или YAML — это «нет», а не непустая строка."""
+    if isinstance(значение, str):
+        return значение.strip().lower() not in ("0", "false", "no", "off", "нет", "")
+    return bool(значение)
 
 
 @dataclass
@@ -99,6 +161,15 @@ class TargetState:
     #: за ночь это полторы тысячи одинаковых предупреждений, в которых тонет
     #: всё остальное — в том числе причина, по которой пришли в журнал.
     last_complaint: float = 0.0
+    #: StatsD: значения накопительных счётчиков при последней удачной
+    #: отправке — чтобы слать прирост, а не итог (см. `_statsd_lines`).
+    statsd_last: dict[str, float] = field(default_factory=dict)
+    #: Zabbix: отпечаток наборов меток обнаружения и когда их слали.
+    zabbix_lld: str = ""
+    zabbix_lld_at: float = 0.0
+    #: Что ответил приёмник на последнюю отправку, если он что-то сказал
+    #: (Zabbix: «processed: 120; failed: 3»).
+    last_info: str = ""
 
     @property
     def healthy(self) -> bool:
@@ -111,6 +182,7 @@ class TargetState:
             "last_attempt": self.last_attempt or None,
             "last_success": self.last_success or None,
             "last_error": self.last_error,
+            "last_info": self.last_info,
             "sent": self.sent, "failed": self.failed,
         }
 
@@ -204,8 +276,140 @@ def _format_value(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else repr(round(float(value), 6))
 
 
-def send(target: Target, samples: list[Sample]) -> None:
-    """Отправляет снимок в один приёмник. Бросает исключение при неудаче."""
+def _statsd_lines(target: Target, samples: list[Sample],
+                  прежние: dict[str, float] | None) -> tuple[list[str], dict[str, float]]:
+    """Строки StatsD и новые «прежние» значения счётчиков.
+
+    StatsD складывает присланное с типом `|c` как ПРИРОСТ. А слали итог с
+    запуска: `jobs_total:150|c` каждую минуту без единого нового задания
+    давал в StatsD +150 за каждый интервал — за три отправки 450 при нуле
+    новых. Теперь уходит разница с прошлой удачной отправкой; если значение
+    уменьшилось (сервер перезапускался), приростом считается само значение
+    — ровно так rate() в Prometheus понимает сброс счётчика.
+
+    `прежние` = None — разовая проба приёмника: прирост ей считать не от
+    чего, а итог с запуска удвоил бы счёт у рабочей отправки. Проба шлёт
+    по счётчикам ноль — связь проверена, данные не испорчены.
+
+    Корзины гистограмм не отправляются: StatsD их не понимает, а двенадцать
+    рядов на гистограмму — шум. Число наблюдений и сумма уходят приростом.
+    """
+    from .catalog import METRICS_BY_NAME
+
+    строки: list[str] = []
+    новые: dict[str, float] = {}
+    for item in samples:
+        base = _base_metric_name(item.name)
+        spec = METRICS_BY_NAME.get(base)
+        if spec is not None and spec.type == "histogram" and item.name.endswith("_bucket"):
+            continue
+        имя = _statsd_name(item, target.prefix)
+        накопительный = spec is not None and (
+            spec.type == "counter" or (spec.type == "histogram" and item.name != base))
+        if not накопительный:
+            строки.append(f"{имя}:{_format_value(item.value)}|g")
+            continue
+        значение = float(item.value)
+        новые[имя] = значение
+        if прежние is None:
+            прирост = 0.0
+        else:
+            было = прежние.get(имя, 0.0)
+            прирост = значение - было if значение >= было else значение
+        строки.append(f"{имя}:{_format_value(прирост)}|c")
+    return строки, новые
+
+
+#: Заголовок пакета протокола Zabbix: «ZBXD» и флаги (1 — обычный пакет).
+_ZBXD = b"ZBXD"
+
+
+def _zabbix_address(url: str) -> tuple[str, int]:
+    """Узел и порт траппера из адреса: zabbix://узел:10051, tcp://…, узел:порт."""
+    текст = str(url or "").strip()
+    for схема in ("zabbix://", "tcp://"):
+        if текст.startswith(схема):
+            текст = текст[len(схема):]
+    текст = текст.split("/", 1)[0]
+    if текст.startswith("["):                      # [::1]:10051
+        узел, _, хвост = текст[1:].partition("]")
+        порт = хвост.lstrip(":")
+    else:
+        узел, _, порт = текст.rpartition(":") if текст.count(":") == 1 else (текст, "", "")
+    if not узел:
+        raise ValueError("адрес Zabbix: укажите узел, например zabbix://zabbix:10051")
+    return узел, int(порт or 10051)
+
+
+def _zabbix_send(target: Target, данные: list[dict[str, Any]]) -> str:
+    """Отправляет значения серверу или прокси Zabbix по протоколу траппера.
+
+    Прежде документация велела слать в Zabbix «webhook» на порт 10051 — это
+    HTTP POST со снимком в JSON, которого траппер не понимает: данных не
+    доходило ни одного. Протокол траппера — тот же, что у zabbix_sender:
+    заголовок ZBXD, длина, JSON `{"request": "sender data", "data": […]}`.
+    Ответ — строка «processed: N; failed: M; total: K»; если не принято ни
+    одно значение — это ошибка доставки, а не успех.
+    """
+    import struct
+    import zlib
+
+    узел, порт = _zabbix_address(target.url)
+    тело = json.dumps({"request": "sender data", "data": данные, "clock": int(time.time())},
+                      ensure_ascii=False).encode("utf-8")
+    пакет = _ZBXD + b"\x01" + struct.pack("<II", len(тело), 0) + тело
+    with socket.create_connection((узел, порт), timeout=target.timeout_s) as связь:
+        связь.settimeout(target.timeout_s)
+        связь.sendall(пакет)
+        ответ = b""
+        while True:
+            кусок = связь.recv(65536)
+            if not кусок:
+                break
+            ответ += кусок
+            if len(ответ) >= 13 and ответ[:4] == _ZBXD:
+                флаги = ответ[4]
+                ширина = 8 if флаги & 0x04 else 4
+                длина = int.from_bytes(ответ[5:5 + ширина], "little")
+                if len(ответ) >= 5 + 2 * ширина + длина:
+                    break
+    if len(ответ) < 13 or ответ[:4] != _ZBXD:
+        raise RuntimeError("Zabbix ответил не по протоколу траппера — это точно порт "
+                           "10051 сервера или прокси Zabbix?")
+    флаги = ответ[4]
+    ширина = 8 if флаги & 0x04 else 4
+    длина = int.from_bytes(ответ[5:5 + ширина], "little")
+    данные_ответа = ответ[5 + 2 * ширина:5 + 2 * ширина + длина]
+    if флаги & 0x02:
+        данные_ответа = zlib.decompress(данные_ответа)
+    try:
+        разбор = json.loads(данные_ответа.decode("utf-8", errors="replace"))
+    except ValueError as exc:
+        raise RuntimeError(f"Zabbix ответил не JSON: {данные_ответа[:120]!r}") from exc
+    сведения = str(разбор.get("info") or "")
+    if разбор.get("response") != "success":
+        raise RuntimeError(f"Zabbix отказал: {разбор.get('response')} {сведения}".strip())
+    принято = re.search(r"processed:?\s*(\d+)", сведения)
+    отбито = re.search(r"failed:?\s*(\d+)", сведения)
+    if принято and отбито and int(принято.group(1)) == 0 and int(отбито.group(1)) > 0:
+        raise RuntimeError(
+            f"Zabbix не принял ни одного значения ({сведения}). Проверьте, что узел "
+            f"«{target.host}» заведён в Zabbix под этим именем и к нему привязан шаблон "
+            "«ASR Hub» (GET /api/monitoring/config/zabbix). Первая отправка после "
+            "привязки шаблона бывает отбита: элементы по обнаружению Zabbix создаёт "
+            "с задержкой.")
+    return сведения
+
+
+def send(target: Target, samples: list[Sample],
+         state: TargetState | None = None) -> str:
+    """Отправляет снимок в один приёмник. Бросает исключение при неудаче.
+
+    `state` — состояние приёмника в рассылке: StatsD и Zabbix помнят в нём,
+    что уже отправлено. Без него (разовая проба) отправка ни на что
+    прошлое не опирается и ничего не запоминает. Ответ — что сказал
+    приёмник, если он что-то говорит (Zabbix), иначе пустая строка.
+    """
     if target.kind == "prometheus_pushgateway":
         # Pushgateway различает наборы по пути job/instance, а не по телу.
         url = target.url.rstrip("/")
@@ -232,8 +436,6 @@ def send(target: Target, samples: list[Sample]) -> None:
               {"Content-Type": "application/json", **target.headers}, target.timeout_s)
 
     elif target.kind == "statsd":
-        from .catalog import METRICS_BY_NAME
-
         host, _, port = target.url.replace("udp://", "").partition(":")
         host = host or "127.0.0.1"
         port_number = int(port or 8125)
@@ -244,15 +446,32 @@ def send(target: Target, samples: list[Sample]) -> None:
         except (socket.gaierror, ValueError):
             pass
 
+        строки, новые = _statsd_lines(target, samples,
+                                      state.statsd_last if state is not None else None)
         with socket.socket(family, socket.SOCK_DGRAM) as sock:
             sock.settimeout(target.timeout_s)
-            for item in samples:
-                spec = METRICS_BY_NAME.get(_base_metric_name(item.name))
-                # Тип имеет значение: счётчик, отправленный как gauge, теряет
-                # смысл — StatsD перестаёт видеть по нему прирост.
-                kind = "c" if (spec and spec.type == "counter") else "g"
-                line = f"{_statsd_name(item, target.prefix)}:{_format_value(item.value)}|{kind}"
+            for line in строки:
                 sock.sendto(line.encode("utf-8"), (host, port_number))
+        # Запоминаем только после отправки: упавшая на полпути отправка не
+        # должна съесть прирост, который до приёмника не дошёл.
+        if state is not None:
+            state.statsd_last = новые
+
+    elif target.kind == "zabbix":
+        # Наборы меток для обнаружения — когда изменились и раз в полчаса:
+        # обработка правил обнаружения для Zabbix дорогая, а каждую минуту
+        # слать одно и то же незачем. Проба шлёт их всегда.
+        наборы = exporters.zabbix_discovery(samples)
+        отпечаток = json.dumps(наборы, sort_keys=True, ensure_ascii=False)
+        сейчас = time.time()
+        с_обнаружением = (state is None or отпечаток != state.zabbix_lld
+                          or сейчас - state.zabbix_lld_at > ZABBIX_LLD_ПОВТОР_С)
+        сведения = _zabbix_send(target, exporters.zabbix_data(
+            samples, target.host, discovery=с_обнаружением))
+        if state is not None and с_обнаружением:
+            state.zabbix_lld = отпечаток
+            state.zabbix_lld_at = сейчас
+        return сведения
 
     elif target.kind == "webhook":
         body = json.dumps(exporters.json_snapshot(samples, with_meta=False),
@@ -263,6 +482,7 @@ def send(target: Target, samples: list[Sample]) -> None:
 
     else:
         raise ValueError(f"Неизвестный приёмник: {target.kind}")
+    return ""
 
 
 class PushManager:
@@ -281,9 +501,34 @@ class PushManager:
     # -- настройка -----------------------------------------------------------
 
     def set_targets(self, targets: list[Target]) -> None:
+        """Заменяет список приёмников.
+
+        Приёмник, который остался тем же (имя, вид и адрес), сохраняет своё
+        состояние: счётчики отправок, время последнего успеха, что уже
+        ушло в StatsD и Zabbix. Раньше любое изменение списка — добавили
+        соседний приёмник — обнуляло всё это у остальных, а StatsD после
+        этого получал итог с запуска как прирост.
+        """
         with self._lock:
-            self._states = {t.name: TargetState(target=t) for t in targets}
-            self._next_at = {t.name: 0.0 for t in targets}
+            прежние = self._states
+            состояния: dict[str, TargetState] = {}
+            сроки: dict[str, float] = {}
+            for t in targets:
+                было = прежние.get(t.name)
+                if было is not None and (было.target.kind, было.target.url) == (t.kind, t.url):
+                    было.target = t
+                    состояния[t.name] = было
+                    сроки[t.name] = self._next_at.get(t.name, 0.0)
+                else:
+                    состояния[t.name] = TargetState(target=t)
+                    сроки[t.name] = 0.0
+            self._states = состояния
+            self._next_at = сроки
+
+    def target_list(self) -> list[Target]:
+        """Сами приёмники — для сохранения в настройки."""
+        with self._lock:
+            return [s.target for s in self._states.values()]
 
     def targets(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -385,7 +630,7 @@ class PushManager:
                 self._states[target.name] = state
             state.last_attempt = time.time()
         try:
-            send(target, payload)
+            сведения = send(target, payload, None if проба else state)
         except Exception as exc:                             # noqa: BLE001
             # Любое исключение, а не только сетевые: http.client.InvalidURL
             # (опечатка в порту) и BadStatusLine (приёмник отвечает не по
@@ -418,4 +663,8 @@ class PushManager:
             state.last_success = time.time()
             state.last_error = ""
             state.last_complaint = 0.0
-        return {"ok": True, "sent_metrics": len(payload)}
+            state.last_info = _без_секретов(сведения or "", target)
+        итог: dict[str, Any] = {"ok": True, "sent_metrics": len(payload)}
+        if сведения:
+            итог["info"] = state.last_info
+        return итог

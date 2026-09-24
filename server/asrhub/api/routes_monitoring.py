@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -15,7 +16,14 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, MetricNotFound
+from ..errors import (
+    ASRHubError,
+    AuthError,
+    ConfigError,
+    ForbiddenError,
+    MetricNotFound,
+    MetricsDisabled,
+)
 from ..monitoring import METRICS, MetricSpec, exporters, probes
 from ..monitoring import catalog as metric_catalog
 from ..monitoring.alerts import Rule
@@ -66,6 +74,20 @@ def _guard(request: Request) -> None:
         raise error_response(ForbiddenError("Ключ доступа отключён."))
 
 
+def _экспорт_включён(request: Request) -> None:
+    """Экспорт опросом выключен настройкой — отвечаем 404, как /api/metrics.
+
+    `metrics_enabled: false` закрывал только прежний адрес /api/metrics, а
+    /api/monitoring/metrics продолжал отдавать всё; самопроверка при этом
+    писала «Экспорт метрик: выключен». Теперь настройка значит то, что
+    написано: опросом метрики не отдаются ни по одному адресу. Отправка в
+    приёмники и встроенные тревоги от неё не зависят.
+    """
+    if not get_state(request).settings.get("metrics_enabled", True):
+        raise error_response(MetricsDisabled("Экспорт метрик выключен настройкой "
+                                             "metrics_enabled."))
+
+
 # ---------------------------------------------------------------------------
 # Метрики
 # ---------------------------------------------------------------------------
@@ -75,7 +97,7 @@ def _guard(request: Request) -> None:
 def metrics(request: Request,
             format: str = Query(default="prometheus",
                                 description="prometheus, openmetrics, json, otlp, "
-                                            "influx, graphite, zabbix, csv"),
+                                            "influx, graphite, zabbix, zabbix_sender, csv"),
             host: str = Query(default="asrhub", description="Имя узла для Zabbix"),
             ) -> Response:
     """Полный снимок всех параметров работы сервиса.
@@ -84,6 +106,7 @@ def metrics(request: Request,
     Prometheus, его же ждёт большинство систем сбора.
     """
     _guard(request)
+    _экспорт_включён(request)
     service = _monitoring(request)
     try:
         body, content_type = service.render(format, host=host)
@@ -102,6 +125,7 @@ def metrics_json(request: Request,
     получателю нужно не только число, но и то, что оно означает.
     """
     _guard(request)
+    _экспорт_включён(request)
     service = _monitoring(request)
     samples, errors = service.samples()
     # Ошибки сбора — это тексты исключений, а в них абсолютные пути: путь к
@@ -161,28 +185,46 @@ def health(request: Request) -> Any:
     _guard(request)
     service = _monitoring(request)
     result = service.health()
+    for проба in ("liveness", "readiness", "startup"):
+        if isinstance(result.get(проба), dict):
+            result[проба] = _проба_без_путей(request, result[проба])
     code = {"ok": 200, "warning": 200, "degraded": 503, "critical": 503}[result["status"]]
     return JSONResponse(result, status_code=code)
+
+
+def _проба_без_путей(request: Request, result: dict[str, Any]) -> dict[str, Any]:
+    """Пробы открыты без ключа — тексты исключений в них без путей.
+
+    Оркестратору ключ не нужен, и это правильно, но проба базы отдавала
+    текст исключения целиком: «unable to open database file» вместе с
+    путём к каталогу данных уходил анониму — то, что `/metrics.json` уже
+    прячет.
+    """
+    проверки = [dict(п) for п in result.get("checks") or []]
+    тексты = _без_путей(request, [str(п.get("detail") or "") for п in проверки])
+    for проверка, текст in zip(проверки, тексты, strict=False):
+        проверка["detail"] = текст
+    return {**result, "checks": проверки}
 
 
 @router.get("/live", summary="Проба живости")
 def live(request: Request) -> Any:
     """Для оркестратора: провал означает «перезапусти контейнер»."""
-    result = probes.liveness(get_state(request))
+    result = _проба_без_путей(request, probes.liveness(get_state(request)))
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
 
 
 @router.get("/ready", summary="Проба готовности")
 def ready(request: Request) -> Any:
     """Для балансировщика: провал означает «не шли сюда запросы»."""
-    result = probes.readiness(get_state(request))
+    result = _проба_без_путей(request, probes.readiness(get_state(request)))
     return JSONResponse(result, status_code=503 if result["status"] == "fail" else 200)
 
 
 @router.get("/startup", summary="Проба завершения запуска")
 def startup_probe(request: Request) -> Any:
     """Пока не пройдена, остальные пробы учитывать не следует."""
-    result = probes.startup(get_state(request))
+    result = _проба_без_путей(request, probes.startup(get_state(request)))
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
 
 
@@ -325,6 +367,13 @@ def alert_rules(request: Request,
 @router.put("/alerts/rules", summary="Заменить правила оповещения")
 def set_alert_rules(request: Request, rules: list[dict[str, Any]] = Body(...),
                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Заменяет правила и сохраняет их в настройку `monitoring_rules`.
+
+    Раньше правила жили только в памяти процесса и пропадали при
+    перезапуске, хотя интерфейс об этом не предупреждал. Теперь они
+    записываются в настройки и в файл конфигурации (`persisted` в ответе
+    говорит, получилось ли второе).
+    """
     require_admin(principal)
     service = _monitoring(request)
     try:
@@ -343,8 +392,8 @@ def set_alert_rules(request: Request, rules: list[dict[str, Any]] = Body(...),
         raise error_response(ConfigError(
             f"Метрик нет в каталоге: {', '.join(неизвестные)}.",
             hint="Список метрик: GET /api/monitoring/catalog"))
-    service.alerts.set_rules(parsed)
-    return {"rules": len(parsed)}
+    сохранено = service.save_rules(parsed)
+    return {"rules": len(service.alerts.rules), **сохранено}
 
 
 @router.post("/alerts/rules/reset", summary="Вернуть правила из каталога метрик")
@@ -352,8 +401,8 @@ def reset_alert_rules(request: Request,
                       principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     require_admin(principal)
     service = _monitoring(request)
-    service.alerts.reset_rules()
-    return {"rules": len(service.alerts.rules)}
+    сохранено = service.save_rules(None)
+    return {"rules": len(service.alerts.rules), **сохранено}
 
 
 # ---------------------------------------------------------------------------
@@ -419,22 +468,95 @@ def _hide_url(url: str) -> str:
     return f"{разбор.scheme}://{разбор.hostname}{порт}{хвост}"
 
 
+_ПОДСКАЗКА_ПРИЁМНИКА = ('Каждый приёмник: {"kind": "' + "|".join(KINDS) + '", '
+                        '"url": "...", "interval_s": 60}')
+
+
+def _разобрать_приёмники(service: Any, targets: list[Any]) -> list[Target]:
+    """Приёмники из запроса — поверх сохранённых с теми же именами.
+
+    Чего в описании нет, берётся у сохранённого приёмника с тем же именем:
+    заголовки (их значения GET отдаёт заглушкой), база InfluxDB, тайм-аут,
+    выключенность. Раньше «Добавить приёмник» собирал список из ответа
+    GET, где этих полей не было, и у всех прежних приёмников пропадал
+    заголовок Authorization, база сбрасывалась в «asrhub», а выключенные
+    включались.
+    """
+    прежние = {t.name: t for t in service.push.target_list()}
+    итог: list[Target] = []
+    имена: set[str] = set()
+    for номер, item in enumerate(targets, 1):
+        if not isinstance(item, dict):
+            raise error_response(ConfigError(
+                f"Приёмник {номер}: ожидается объект", hint=_ПОДСКАЗКА_ПРИЁМНИКА))
+        имя = str(item.get("name") or item.get("kind") or "")
+        try:
+            приёмник = Target.from_dict(item, прежний=прежние.get(имя))
+        except (KeyError, ValueError, TypeError) as exc:
+            raise error_response(ConfigError(
+                f"Неверное описание приёмника: {exc}", hint=_ПОДСКАЗКА_ПРИЁМНИКА)) from exc
+        if not приёмник.url.strip():
+            raise error_response(ConfigError(
+                f"Приёмник «{приёмник.name}»: не задан адрес (url).",
+                hint=_ПОДСКАЗКА_ПРИЁМНИКА))
+        if приёмник.name in имена:
+            raise error_response(ConfigError(
+                f"Два приёмника с именем «{приёмник.name}».",
+                hint="Имя — ключ приёмника: задайте разные поля name."))
+        имена.add(приёмник.name)
+        итог.append(приёмник)
+    return итог
+
+
 @router.put("/targets", summary="Заменить список приёмников")
 def set_targets(request: Request, targets: list[dict[str, Any]] = Body(...),
                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Заменяет список целиком и сохраняет его в настройку `monitoring_targets`."""
     require_admin(principal)
     service = _monitoring(request)
-    try:
-        parsed = [Target.from_dict(item) for item in targets]
-    except (KeyError, ValueError, TypeError) as exc:
-        raise error_response(ConfigError(
-            f"Неверное описание приёмника: {exc}",
-            hint='Каждый приёмник: {"kind": "' + "|".join(KINDS) + '", '
-                 '"url": "...", "interval_s": 60}')) from exc
-    service.push.set_targets(parsed)
-    if parsed:
-        service.push.start()
-    return {"targets": len(parsed)}
+    parsed = _разобрать_приёмники(service, targets)
+    сохранено = service.save_targets(parsed)
+    return {"targets": len(parsed), **сохранено}
+
+
+@router.post("/targets", summary="Добавить приёмник")
+def add_target(request: Request, target: dict[str, Any] = Body(...),
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Добавляет один приёмник, не трогая остальные.
+
+    Имя — ключ: если его не дали, берётся вид приёмника, а занятое имя
+    получает номер («influxdb-2»). Остальные приёмники остаются ровно
+    такими, какими были, — со своими заголовками и базами.
+    """
+    require_admin(principal)
+    service = _monitoring(request)
+    if not isinstance(target, dict):
+        raise error_response(ConfigError("Приёмник — объект с полями kind и url.",
+                                         hint=_ПОДСКАЗКА_ПРИЁМНИКА))
+    прежние = service.push.target_list()
+    занятые = {t.name for t in прежние}
+    основа = str(target.get("name") or target.get("kind") or "").strip()
+    имя, номер = основа, 2
+    while имя in занятые:
+        имя = f"{основа}-{номер}"
+        номер += 1
+    новый = _разобрать_приёмники(service, [{**target, "name": имя}])[0]
+    сохранено = service.save_targets([*прежние, новый])
+    return {"target": новый.to_dict(), "targets": len(прежние) + 1, **сохранено}
+
+
+@router.delete("/targets/{name}", summary="Убрать приёмник")
+def delete_target(request: Request, name: str,
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    require_admin(principal)
+    service = _monitoring(request)
+    прежние = service.push.target_list()
+    осталось = [t for t in прежние if t.name != name]
+    if len(осталось) == len(прежние):
+        raise error_response(ConfigError(f"Приёмника «{name}» нет.",
+                                         hint="Список: GET /api/monitoring/targets"))
+    сохранено = service.save_targets(осталось)
+    return {"removed": name, "targets": len(осталось), **сохранено}
 
 
 @router.post("/targets/test", summary="Проверить приёмник немедленно")
@@ -447,8 +569,12 @@ def test_target(request: Request, target: dict[str, Any] = Body(...),
     """
     require_admin(principal)
     service = _monitoring(request)
+    # Проверяют и новый приёмник, и уже сохранённый (по имени): у второго
+    # заголовки приходят заглушкой и берутся у сохранённого.
+    прежние = {t.name: t for t in service.push.target_list()}
     try:
-        parsed = Target.from_dict(target)
+        parsed = Target.from_dict(target, прежний=прежние.get(
+            str((target or {}).get("name") or "")) if isinstance(target, dict) else None)
     except (KeyError, ValueError, TypeError) as exc:
         raise error_response(ConfigError(f"Неверное описание приёмника: {exc}")) from exc
     return service.push.push_once(parsed, проба=True)
@@ -463,35 +589,75 @@ def test_target(request: Request, target: dict[str, Any] = Body(...),
 def prometheus_rules(request: Request) -> Response:
     """Файл правил, собранный из порогов каталога. Скопировать в rules.yml."""
     _guard(request)
-    return Response(content=exporters.prometheus_rules(),
+    return Response(content=exporters.prometheus_rules(get_state(request).settings),
                     media_type="text/yaml; charset=utf-8",
                     headers={"Content-Disposition": 'attachment; filename="asrhub-rules.yml"'})
+
+
+#: Адреса «слушать всё» — в targets Prometheus они бессмысленны.
+_ВСЕ_АДРЕСА = {"", "0.0.0.0", "::", "[::]", "*"}
+
+#: Что может стоять в `targets`: узел или адрес и порт. Всё прочее во
+#: фрагмент YAML не пускаем — ни кавычку, ни перевод строки.
+_АДРЕС = re.compile(r"[\w.\-]+(?::\d{1,5})?|\[[0-9A-Fa-f:.]+\](?::\d{1,5})?")
+
+
+def _адрес_сбора(request: Request, state: Any) -> str:
+    """Адрес, по которому Prometheus найдёт сервер.
+
+    Раньше брался `server_host`, а он по умолчанию 0.0.0.0 — «слушать на
+    всех адресах», — и во фрагмент уходило `targets: ['0.0.0.0:8080']`.
+    Правильнее всего тот адрес, по которому фрагмент и забрали: заголовок
+    Host запроса. Настройка — запасной путь, если она задана конкретным
+    адресом.
+    """
+    узел = str(request.headers.get("host") or "").strip()
+    if (узел and _АДРЕС.fullmatch(узел)
+            and узел.rsplit(":", 1)[0].strip("[]") not in _ВСЕ_АДРЕСА):
+        return узел
+    настроен = str(state.settings.get("server_host") or "").strip()
+    порт = state.settings.get("server_port") or 8080
+    if настроен in _ВСЕ_АДРЕСА:
+        настроен = "127.0.0.1"
+    return f"{настроен}:{порт}"
 
 
 @router.get("/config/prometheus-scrape", summary="Фрагмент prometheus.yml для сбора",
             response_class=PlainTextResponse)
 def prometheus_scrape(request: Request,
                       target: str = Query(default="", description="адрес:порт сервера")) -> Response:
-    """Готовый блок scrape_configs — с правильным путём и разумным интервалом."""
+    """Готовое задание сбора — элемент списка `scrape_configs`.
+
+    Прежде отдавался блок вместе с ключом `scrape_configs:`, а документация
+    предлагала дописать его в конец prometheus.yml. В файле, где этот ключ
+    уже есть, получался второй ключ верхнего уровня: строгий разбор YAML
+    Prometheus такой файл отвергает, нестрогий теряет все прежние задания.
+    Теперь это одно задание — его вставляют под существующий
+    `scrape_configs:`.
+    """
     _guard(request)
     state = get_state(request)
-    host = target or f"{state.settings.get('server_host') or '127.0.0.1'}:" \
-                     f"{state.settings.get('server_port') or 8080}"
+    if target.strip() and not _АДРЕС.fullmatch(target.strip()):
+        raise error_response(ConfigError(
+            "target — узел и порт сервера, например asr.company.ru:8080."))
+    host = target.strip() or _адрес_сбора(request, state)
+    схема = "https" if request.url.scheme == "https" else "http"
     body = (
-        "# Фрагмент prometheus.yml для сбора метрик ASR Hub.\n"
-        "scrape_configs:\n"
-        "  - job_name: asrhub\n"
-        "    metrics_path: /api/monitoring/metrics\n"
-        "    # Сбор чаще, чем раз в 15 секунд, смысла не имеет: замеры железа\n"
-        "    # обновляются раз в 20 секунд служебным циклом сервера.\n"
-        "    scrape_interval: 30s\n"
-        "    scrape_timeout: 10s\n"
-        "    static_configs:\n"
-        f"      - targets: ['{host}']\n"
-        "    # Если monitoring_public выключен, добавьте ключ доступа:\n"
-        "    # authorization:\n"
-        "    #   type: Bearer\n"
-        "    #   credentials: ah_ваш_ключ\n"
+        "# Задание сбора метрик ASR Hub. Вставьте его в prometheus.yml под ключ\n"
+        "# scrape_configs: (второй такой ключ в файле Prometheus не примет).\n"
+        "- job_name: asrhub\n"
+        "  metrics_path: /api/monitoring/metrics\n"
+        + (f"  scheme: {схема}\n" if схема == "https" else "")
+        + "  # Сбор чаще, чем раз в 15 секунд, смысла не имеет: замеры железа\n"
+        "  # обновляются раз в 20 секунд служебным циклом сервера.\n"
+        "  scrape_interval: 30s\n"
+        "  scrape_timeout: 10s\n"
+        "  static_configs:\n"
+        f"    - targets: ['{host}']\n"
+        "  # Если monitoring_public выключен, добавьте ключ доступа:\n"
+        "  # authorization:\n"
+        "  #   type: Bearer\n"
+        "  #   credentials: ah_ваш_ключ\n"
     )
     return Response(content=body, media_type="text/yaml; charset=utf-8")
 
@@ -510,7 +676,7 @@ def grafana(request: Request, title: str = "ASR Hub") -> Response:
             response_class=PlainTextResponse)
 def zabbix(request: Request) -> Response:
     _guard(request)
-    return Response(content=exporters.zabbix_template(),
+    return Response(content=exporters.zabbix_template(get_state(request).settings),
                     media_type="text/yaml; charset=utf-8",
                     headers={"Content-Disposition":
                              'attachment; filename="asrhub-zabbix-template.yaml"'})

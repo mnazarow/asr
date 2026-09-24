@@ -996,7 +996,7 @@ _add(ModelSpec(
     strengths=["Перевод в обе стороны между английским и 24 языками",
                "Автоматическая нарезка длинного аудио с параллельной обработкой"],
     weaknesses=["Один проход ограничен 40 секундами", "Требует минимум 6 ГБ видеопамяти"],
-    default_params={"batch_size": 8, "task": "asr", "timestamps": True},
+    default_params={"batch_size": 8, "task": "transcribe", "timestamps": True},
 ))
 
 _add(ModelSpec(
@@ -1027,7 +1027,7 @@ _add(ModelSpec(
     recommended_for=["Английский, немецкий, французский, испанский"],
     strengths=["RTFx 1669 на H100", "Работает на Jetson"],
     weaknesses=["Нет русского языка"],
-    default_params={"batch_size": 16, "task": "asr"},
+    default_params={"batch_size": 16, "task": "transcribe"},
 ))
 
 _add(ModelSpec(
@@ -1060,7 +1060,7 @@ _add(ModelSpec(
     recommended_for=["Jetson и другие edge-устройства", "Форсированное выравнивание"],
     strengths=["182 млн параметров при качестве, близком к Whisper medium"],
     weaknesses=["Нет русского языка"],
-    default_params={"batch_size": 32, "task": "asr"},
+    default_params={"batch_size": 32, "task": "transcribe"},
 ))
 
 _add(ModelSpec(

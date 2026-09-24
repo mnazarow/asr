@@ -11214,6 +11214,17 @@ const TARGET_KIND_LABEL = {
   otlp: 'OpenTelemetry (OTLP)',
   statsd: 'StatsD / Graphite',
   webhook: 'Webhook (JSON)',
+  zabbix: 'Zabbix (траппер)',
+};
+
+/* Подсказка к адресу приёмника: у каждого вида свой. */
+const TARGET_URL_HINT = {
+  prometheus_pushgateway: 'http://pushgw:9091',
+  influxdb: 'http://influx:8086',
+  otlp: 'http://otel-collector:4318',
+  statsd: 'udp://statsd:8125',
+  webhook: 'https://ваш-сервис/metrics',
+  zabbix: 'zabbix://zabbix-server:10051',
 };
 
 RENDERERS.monitoring = {
@@ -11310,12 +11321,25 @@ RENDERERS.monitoring = {
 
     qs('#mon-reset-rules').onclick = async () => {
       try {
-        await API.post('/api/monitoring/alerts/rules/reset');
-        toast('Пороги возвращены к значениям каталога');
+        const итог = await API.post('/api/monitoring/alerts/rules/reset');
+        toast('Пороги возвращены к значениям каталога',
+              итог.persisted === false ? 'warn' : 'ok', persistedHint(итог));
         renderView();
       } catch (err) { fail(err); }
     };
-    qs('#mon-add-target').onclick = () => targetDialog(targets);
+    qs('#mon-add-target').onclick = () => targetDialog();
+    qsa('[data-drop-target]').forEach((кнопка) => {
+      кнопка.onclick = async () => {
+        const имя = кнопка.dataset.dropTarget;
+        if (!confirm(`Убрать приёмник «${имя}»? Метрики туда больше не пойдут.`)) return;
+        try {
+          const итог = await API.del(`/api/monitoring/targets/${encodeURIComponent(имя)}`);
+          toast(`Приёмник «${имя}» убран`, итог.persisted === false ? 'warn' : 'ok',
+                persistedHint(итог));
+          renderView();
+        } catch (err) { fail(err); }
+      };
+    });
     qsa('#mon-window button').forEach((b) => b.addEventListener('click', () => {
       qsa('#mon-window button').forEach((x) => x.classList.toggle('active', x === b));
       this.loadResources(Number(b.dataset.minutes));
@@ -11536,20 +11560,36 @@ function alertsTable(alerts) {
 }
 
 function targetsTable(data) {
+  // «Доставляется» — только после первой удачной отправки. Свежий приёмник,
+  // к которому ещё не ходили, красной плашкой не пугает: судить не о чем.
+  const состояние = (t) => {
+    if (t.enabled === false) return '<span class="chip idle">выключен</span>';
+    if (!t.last_attempt) return '<span class="chip idle">ещё не отправляли</span>';
+    return `<span class="chip ${t.healthy ? 'ok' : 'err'}">${t.healthy ? 'доставляется' : 'нет'}</span>`;
+  };
   const rows = (data.targets || []).map((t) => `<tr>
     <td><b>${esc(t.name)}</b></td>
     <td>${esc(TARGET_KIND_LABEL[t.kind] || t.kind)}</td>
     <td class="small">${esc(t.url)}</td>
     <td>${t.interval_s} с</td>
-    <td><span class="chip ${t.healthy ? 'ok' : 'err'}">${t.healthy ? 'доставляется' : 'нет'}</span>
-      ${t.last_error ? `<div class="small dim">${esc(t.last_error)}</div>` : ''}</td>
-    <td class="small dim">отправлено ${t.sent}, ошибок ${t.failed}</td></tr>`).join('');
+    <td>${состояние(t)}
+      ${t.last_error ? `<div class="small dim">${esc(t.last_error)}</div>` : ''}
+      ${!t.last_error && t.last_info ? `<div class="small faint">${esc(t.last_info)}</div>` : ''}</td>
+    <td class="small dim">отправлено ${t.sent}, ошибок ${t.failed}</td>
+    <td><button class="ghost small" data-drop-target="${esc(t.name)}"
+      title="Убрать приёмник — метрики туда больше не пойдут">Убрать</button></td></tr>`).join('');
   return `<div class="table-wrap"><table>
     <thead><tr><th>Имя</th><th>Тип</th><th>Адрес</th><th>Интервал</th>
-      <th>Доставка</th><th>Счётчики</th></tr></thead>
-    <tbody>${rows || `<tr><td colspan="6" class="empty">
+      <th>Доставка</th><th>Счётчики</th><th></th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="7" class="empty">
       Приёмники не настроены — метрики забирает система сбора сама
       </td></tr>`}</tbody></table></div>`;
+}
+
+/* Итог сохранения из раздела «Мониторинг»: записано ли в config.yaml. */
+function persistedHint(result) {
+  if (!result || result.persisted !== false) return 'Записано в файл конфигурации';
+  return `Действует до перезапуска: ${result.reason || 'в файл конфигурации не записано'}`;
 }
 
 function endpointsTable() {
@@ -11589,7 +11629,7 @@ function metricCard(m) {
     </div></details>`;
 }
 
-function targetDialog(existing) {
+function targetDialog() {
   const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:560px">
     <div class="modal-head"><b>Новый приёмник метрик</b><span class="spacer"></span>
       <button class="ghost icon" id="tg-close" aria-label="Закрыть" title="Закрыть">✕</button></div>
@@ -11597,12 +11637,18 @@ function targetDialog(existing) {
       <label class="mon-field"><span>Тип</span>
         <select id="tg-kind">${Object.entries(TARGET_KIND_LABEL).map(
           ([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select></label>
+      <label class="mon-field"><span>Имя</span>
+        <input type="text" id="tg-name" placeholder="по виду приёмника"></label>
       <label class="mon-field"><span>Адрес</span>
         <input type="text" id="tg-url" placeholder="http://pushgw:9091"></label>
+      <label class="mon-field" id="tg-host-row" hidden><span>Узел в Zabbix</span>
+        <input type="text" id="tg-host" placeholder="имя узла, как оно заведено в Zabbix"></label>
       <label class="mon-field"><span>Интервал, секунд</span>
         <input type="number" id="tg-interval" value="60" min="10"></label>
       <p class="small dim">Проверка отправляет текущий снимок немедленно и показывает
-        результат — настройку видно до того, как она сохранена.</p>
+        результат — настройку видно до того, как она сохранена. Сохранённый приёмник
+        записывается в файл конфигурации и переживает перезапуск; остальные приёмники
+        при добавлении не меняются.</p>
       <div id="tg-result" class="small"></div>
     </div>
     <div class="modal-foot">
@@ -11614,11 +11660,26 @@ function targetDialog(existing) {
   const close = () => closeModal(backdrop);
   qs('#tg-close', backdrop).onclick = close;
 
-  const collect = () => ({
-    kind: qs('#tg-kind', backdrop).value,
-    url: qs('#tg-url', backdrop).value.trim(),
-    interval_s: Number(qs('#tg-interval', backdrop).value) || 60,
-  });
+  const вид = qs('#tg-kind', backdrop);
+  const обновитьВид = () => {
+    qs('#tg-url', backdrop).placeholder = TARGET_URL_HINT[вид.value] || '';
+    qs('#tg-host-row', backdrop).hidden = вид.value !== 'zabbix';
+  };
+  вид.addEventListener('change', обновитьВид);
+  обновитьВид();
+
+  const collect = () => {
+    const описание = {
+      kind: вид.value,
+      url: qs('#tg-url', backdrop).value.trim(),
+      interval_s: Number(qs('#tg-interval', backdrop).value) || 60,
+    };
+    const имя = qs('#tg-name', backdrop).value.trim();
+    if (имя) описание.name = имя;
+    const узел = qs('#tg-host', backdrop).value.trim();
+    if (вид.value === 'zabbix' && узел) описание.host = узел;
+    return описание;
+  };
 
   qs('#tg-test', backdrop).onclick = async () => {
     const box = qs('#tg-result', backdrop);
@@ -11626,21 +11687,27 @@ function targetDialog(existing) {
     try {
       const result = await API.post('/api/monitoring/targets/test', collect());
       box.innerHTML = result.ok
-        ? `<span class="chip ok">доставлено</span> метрик: ${result.sent_metrics}`
+        ? `<span class="chip ok">доставлено</span> метрик: ${result.sent_metrics}${
+          result.info ? ` <span class="dim">· ${esc(result.info)}</span>` : ''}`
         : `<span class="chip err">не доставлено</span> ${esc(result.error || '')}`;
     } catch (err) {
       box.innerHTML = `<span class="chip err">ошибка</span> ${esc(err.message || '')}`;
     }
   };
 
+  // Добавляется один приёмник, а не список целиком. Прежде список
+  // собирался из ответа GET, где не было заголовков, базы и признака
+  // «выключен», и сохранение стирало всё это у прежних приёмников.
   qs('#tg-save', backdrop).onclick = async () => {
-    const list = (existing.targets || []).map((t) => ({
-      kind: t.kind, url: t.url, interval_s: t.interval_s, name: t.name,
-    }));
-    list.push(collect());
+    const описание = collect();
+    if (!описание.url) {
+      toast('Укажите адрес приёмника', 'err', TARGET_URL_HINT[описание.kind] || '');
+      return;
+    }
     try {
-      await API.put('/api/monitoring/targets', list);
-      toast('Приёмник добавлен');
+      const итог = await API.post('/api/monitoring/targets', описание);
+      toast(`Приёмник «${(итог.target || {}).name || описание.kind}» добавлен`,
+            итог.persisted === false ? 'warn' : 'ok', persistedHint(итог));
       close();
       renderView();
     } catch (err) { fail(err); }

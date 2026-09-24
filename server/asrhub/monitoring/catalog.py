@@ -11,7 +11,8 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 MetricType = Literal["gauge", "counter", "histogram", "info"]
@@ -48,6 +49,36 @@ class Threshold:
         return {"direction": self.direction, "warning": self.warning,
                 "critical": self.critical, "for_seconds": self.for_seconds,
                 "note": self.note, "inclusive": self.inclusive}
+
+
+def оператор_порога(direction: str, inclusive: bool) -> str:
+    """Знак сравнения порога — один на все три системы наблюдения.
+
+    Встроенные тревоги, правила Prometheus и триггеры Zabbix раньше решали
+    это каждый по-своему. Встроенный движок сам считал включительными
+    пороги 1 «выше» и 0 «ниже», выгрузка для Prometheus — только
+    `queue_paused`, а Zabbix — никакие. «Записей с тревожными упоминаниями»
+    с порогом 1 («ставить на любое ненулевое») Prometheus получал как
+    `> 1` и пропускал день с одной такой записью, а у эмпатии интерфейс
+    горел на ровном нуле, которого Prometheus не видел. Теперь признак
+    включительности — только явный, из каталога, и знак строится здесь.
+    """
+    return (">" if direction == "above" else "<") + ("=" if inclusive else "")
+
+
+def слово_порога(direction: str, inclusive: bool) -> str:
+    """Тот же знак словами — для подписей тревог и уведомлений дежурному."""
+    if direction == "above":
+        return "не меньше" if inclusive else "выше"
+    return "не больше" if inclusive else "ниже"
+
+
+def порог_нарушен(value: float, direction: str, threshold: float,
+                  inclusive: bool) -> bool:
+    """Нарушен ли порог — тем же знаком, что уходит в Prometheus и Zabbix."""
+    if direction == "above":
+        return value >= threshold if inclusive else value > threshold
+    return value <= threshold if inclusive else value < threshold
 
 
 @dataclass(frozen=True)
@@ -181,9 +212,31 @@ _m(MetricSpec(
         "и это самая обидная из простых аварий."
     ),
     normal="0",
-    threshold=Threshold("above", warning=1, for_seconds=1800,
+    # Признак 0/1: «выше единицы» не бывает, тревога — на самой единице.
+    threshold=Threshold("above", warning=1, for_seconds=1800, inclusive=True,
                         note="Полчаса на паузе — уже подозрительно"),
     troubleshooting="POST /api/queue/resume",
+))
+
+_m(MetricSpec(
+    name="asrhub_collector_source_up", type="gauge", group="service",
+    label="Источник метрик опрашивается", labels=("source",),
+    description=(
+        "Единица, если часть сбора метрик (очередь, задания, качество, "
+        "оборудование, содержание и другие) отработала при последнем опросе, "
+        "и ноль, если упала. Упавший источник не роняет снимок целиком — "
+        "его метрики просто пропадают из выгрузки."
+    ),
+    recommendation=(
+        "Без этой метрики отказ источника не виден никак: его метрики "
+        "исчезают, тревоги по ним через пять минут снимаются, а в выгрузке "
+        "нет ни одного признака беды. Причину называет GET "
+        "/api/monitoring/info → collection_errors."
+    ),
+    normal="1 у каждого источника",
+    threshold=Threshold("below", warning=1, for_seconds=900,
+                        note="Четверть часа без источника — это не заминка, а отказ"),
+    troubleshooting="GET /api/monitoring/info → collection_errors; журнал сервера",
 ))
 
 _m(MetricSpec(
@@ -406,22 +459,61 @@ _m(MetricSpec(
 
 _m(MetricSpec(
     name="asrhub_job_duration_seconds", type="histogram", group="jobs",
-    label="Длительность обработки", unit="с",
-    description="Гистограмма времени обработки одного задания.",
+    label="Длительность обработки", unit="с", since_restart=True,
+    description=(
+        "Гистограмма времени обработки заданий, посчитанных с запуска "
+        "сервиса. Как и положено гистограмме, только растёт; при перезапуске "
+        "обнуляется, и функции rate() и histogram_quantile() это учитывают."
+    ),
     recommendation=(
-        "По гистограмме считается любая квантиль на стороне Prometheus, и она "
-        "переживает перезапуск сервиса, в отличие от посчитанных перцентилей."
+        "Квантиль за любое окно: histogram_quantile(0.95, sum by (le) "
+        "(rate(asrhub_job_duration_seconds_bucket[1h]))). Распределение за "
+        "скользящие сутки по базе, переживающее перезапуск, — отдельной "
+        "метрикой asrhub_job_duration_day_seconds."
     ),
 ))
 
 _m(MetricSpec(
     name="asrhub_media_duration_seconds", type="histogram", group="jobs",
-    label="Длительность записей", unit="с",
-    description="Гистограмма длительности входных файлов.",
+    label="Длительность записей", unit="с", since_restart=True,
+    description=(
+        "Гистограмма длительности входных файлов, обработанных с запуска "
+        "сервиса."
+    ),
     recommendation=(
         "Полезна при подборе scheduling_policy: если распределение двугорбое — "
         "много коротких и немного очень длинных, — shortest_first резко снизит "
-        "среднее ожидание."
+        "среднее ожидание. За скользящие сутки — asrhub_media_duration_day_seconds."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_job_duration_day_seconds", type="gauge", group="jobs",
+    label="Длительность обработки за сутки", unit="с", labels=("stat",),
+    description=(
+        "Среднее и перцентили p50, p90, p95, p99 времени обработки заданий, "
+        "созданных за последние сутки, — по базе, поэтому переживает "
+        "перезапуск сервиса."
+    ),
+    recommendation=(
+        "Раньше это распределение отдавалось под именем гистограммы, и "
+        "счётчики корзин убывали, когда задания выходили из окна: rate() "
+        "принимал убыль за перезапуск и выдавал в разы больше заданий, чем "
+        "было. Теперь окно — мгновенные значения, а гистограмма — честный "
+        "счётчик с запуска."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_media_duration_day_seconds", type="gauge", group="jobs",
+    label="Длительность записей за сутки", unit="с", labels=("stat",),
+    description=(
+        "Среднее и перцентили p50, p90, p95, p99 длительности записей, "
+        "поступивших за последние сутки, — по базе."
+    ),
+    recommendation=(
+        "Рост p95 при прежнем среднем — пошли длинные файлы: очередь начнёт "
+        "расти раньше, чем это покажет число заданий."
     ),
 ))
 
@@ -519,13 +611,17 @@ _m(MetricSpec(
     name="asrhub_stage_seconds", type="gauge", group="performance",
     label="Время по стадиям", unit="с", labels=("stage",),
     description=(
-        "Среднее время каждой стадии конвейера: audio_prep, model_load, vad, "
-        "inference, diarization, postprocess."
+        "Среднее время каждой стадии конвейера за сутки по готовым заданиям: "
+        "audio_prep, vad, model_load, inference, alignment, diarization, "
+        "postprocess. Стадия, которой в заданиях за сутки не было (например, "
+        "выравнивание выключено), в выгрузку не попадает."
     ),
     recommendation=(
         "Разбивка отвечает на вопрос «что именно тормозит». Большая доля model_load "
         "означает, что модель выгружается между заданиями — увеличьте model_cache_size. "
-        "Большая доля diarization — выключите её, если говорящие не нужны."
+        "Большая доля diarization — выключите её, если говорящие не нужны. "
+        "Время vad, alignment и diarization записывается с версии 3.1.17; у "
+        "заданий, посчитанных раньше, этих стадий нет."
     ),
     troubleshooting="GET /api/analytics/efficiency покажет долю загрузки моделей за период",
 ))
@@ -580,11 +676,17 @@ _m(MetricSpec(
 
 _m(MetricSpec(
     name="asrhub_low_confidence_share", type="gauge", group="quality",
-    label="Доля неуверенных сегментов",
-    description="Какая часть сегментов имеет уверенность ниже 0,7.",
+    label="Доля неуверенных заданий",
+    description=(
+        "Какая часть заданий за сутки имеет среднюю уверенность ниже 0,75 — "
+        "та же доля и тот же порог, что в разделе «Аналитика»."
+    ),
     recommendation=(
-        "Практичнее среднего: показывает, сколько текста придётся вычитывать вручную. "
-        "Рост доли — первый признак, что во входном потоке появились плохие записи."
+        "Практичнее среднего: показывает, сколько записей придётся вычитывать вручную. "
+        "Рост доли — первый признак, что во входном потоке появились плохие записи. "
+        "Прежде метрика называлась долей сегментов и считалась с порогом 0,7, "
+        "а раздел «Аналитика» — с порогом 0,75: одна и та же величина в двух "
+        "местах давала два разных числа."
     ),
     threshold=Threshold("above", warning=0.2, critical=0.4, for_seconds=3600),
 ))
@@ -728,7 +830,10 @@ _m(MetricSpec(
         "Ollama или vLLM и что модель скачана (POST /api/llm/test)."
     ),
     normal="1",
-    threshold=Threshold("below", warning=1.0, critical=0.5, for_seconds=1800),
+    # У признака 0/1 второй уровень был бы тем же условием: «ниже 1» и
+    # «ниже 0,5» при значениях 0 и 1 срабатывают вместе, и дежурный получал
+    # две тревоги об одном.
+    threshold=Threshold("below", warning=1.0, for_seconds=1800),
     troubleshooting="GET /api/llm/status → reason; POST /api/llm/test",
 ))
 
@@ -1061,10 +1166,15 @@ _m(MetricSpec(
     description="Свободное место на разделе с каталогом данных.",
     recommendation=(
         "Самая недооценённая метрика. Заполненный диск ночью оставляет наполовину "
-        "записанные результаты и повреждает базу. Порог ставьте выше disk_min_free_gb, "
-        "чтобы успеть среагировать до того, как сервер начнёт отказывать в приёме."
+        "записанные результаты и повреждает базу. Критический порог — это "
+        "disk_min_free_gb, ниже которого сервер перестаёт принимать задания; "
+        "предупреждение — вдвое выше, но не меньше 10 ГБ, как у пробы /ready. "
+        "Встроенные тревоги, правила Prometheus и шаблон Zabbix берут оба "
+        "порога из этой настройки."
     ),
-    threshold=Threshold("below", warning=20, critical=5, for_seconds=300),
+    threshold=Threshold("below", warning=10, critical=5, for_seconds=300,
+                        note="Здесь — для disk_min_free_gb по умолчанию (5 ГБ); "
+                             "при другом значении пороги сдвигаются вместе с ним"),
     troubleshooting="POST /api/maintenance/cleanup, затем bash scripts/models.sh disk",
 ))
 
@@ -1080,8 +1190,12 @@ _m(MetricSpec(
     label="Размер каталогов", unit="Б", labels=("kind",), expensive=True,
     description=(
         "Сколько занимают загрузки, результаты, веса моделей и журналы. "
-        "Замер по каталогам делается не чаще раза в пять минут: обход каталога "
-        "моделей на десятки гигабайт стоит дорого."
+        "Замер по каталогам делается не чаще раза в пять минут и в фоне: "
+        "обход каталога результатов на сотни тысяч файлов стоит секунды, и "
+        "опрос метрик не должен их ждать. Файл, на который ведут несколько "
+        "ссылок (снимки кеша Hugging Face ссылаются на общие blobs), "
+        "считается один раз. На каталоге больше миллиона файлов обход "
+        "обрывается, и значение — оценка снизу."
     ),
     recommendation=(
         "Растущие uploads означают, что delete_source_after выключен, а исходники "
@@ -1346,7 +1460,10 @@ _m(MetricSpec(
         "разумно ставить на любое ненулевое значение."
     ),
     normal="0",
-    threshold=Threshold("above", warning=1, critical=5, for_seconds=600),
+    # Включительно: «на любое ненулевое» — это «не меньше единицы». Строгое
+    # «больше единицы» пропускало день с одной такой записью.
+    threshold=Threshold("above", warning=1, critical=5, for_seconds=600,
+                        inclusive=True),
     troubleshooting="Раздел «Аналитика записей» → «Что послушать» → "
                     "«С тревожными упоминаниями»",
 ))
@@ -1372,7 +1489,11 @@ _m(MetricSpec(
     label="Соблюдение скрипта разговора",
     description=(
         "Средняя доля выполненных пунктов скрипта, от 0 до 1. Считается по "
-        "репликам того, кто заговорил первым."
+        "репликам оператора (content_agent_speaker, а если он не задан — "
+        "того, кто заговорил первым). Отдаётся, только когда скрипт задан "
+        "в настройке content_script: оценка по готовому скрипту службы "
+        "поддержки на совещаниях, лекциях и диктовке — шум, и по нему "
+        "критическая тревога горела бы на такой установке круглые сутки."
     ),
     recommendation=(
         "Резкое падение чаще означает не ухудшение работы, а смену модели "
@@ -1508,7 +1629,8 @@ _m(MetricSpec(
         "Балл 0–100 по записям за сутки: сумма весов выполненных пунктов "
         "скрипта к сумме всех, минус штрафы сработавших категорий (стоп-слова). "
         "Считается, как у Verint Quality Bots и Google Quality AI; без пунктов "
-        "скрипта балла нет."
+        "скрипта балла нет. Как и соблюдение скрипта, отдаётся только при "
+        "заданном content_script."
     ),
     recommendation=(
         "Порог — своя обычная величина за первые недели. Падение среднего "
@@ -1671,22 +1793,61 @@ def _apply_renames() -> None:
 
 
 def _rescale(threshold: Threshold | None, factor: float) -> Threshold | None:
-    """Пересчитывает порог под новую единицу измерения."""
+    """Пересчитывает порог под новую единицу измерения.
+
+    Через `replace`, а не заново: собранный руками порог терял признак
+    включительности — поле, добавленное позже, чем эта функция.
+    """
     if threshold is None or factor == 1.0:
         return threshold
     # Пороги, заданные в процентах, пересчитывать нельзя — их узнаём по примечанию.
     if "процент" in (threshold.note or "").lower():
         return threshold
-    return Threshold(
-        direction=threshold.direction,
+    return replace(
+        threshold,
         warning=threshold.warning * factor if threshold.warning is not None else None,
-        critical=threshold.critical * factor if threshold.critical is not None else None,
-        for_seconds=threshold.for_seconds, note=threshold.note)
+        critical=threshold.critical * factor if threshold.critical is not None else None)
 
 
 _apply_renames()
 
 METRICS_BY_NAME = {m.name: m for m in METRICS}
+
+#: Во сколько раз предупреждение о месте выше критического порога, и не
+#: ниже какого значения, — как у пробы /ready (см. probes.readiness).
+МЕСТО_ПРЕДУПРЕЖДЕНИЕ_РАЗ = 2.0
+МЕСТО_ПРЕДУПРЕЖДЕНИЕ_МИН_ГБ = 10.0
+
+
+def порог(spec: MetricSpec, settings: Any = None) -> Threshold | None:
+    """Действующий порог метрики: из каталога, со сдвигом по настройкам.
+
+    Сейчас сдвигается один — свободное место. Критическая граница у сервера
+    уже есть: `disk_min_free_gb`, ниже которого он перестаёт принимать
+    задания, а проба /ready с того же места выводит его из балансировки.
+    Порог тревоги стоял отдельно, двадцатью гигабайтами: на томе в
+    тридцать гигабайт предупреждение горело всегда, а администратор,
+    поднявший предел до пятидесяти, узнавал о нехватке места уже из
+    отказов в приёме. Теперь все три системы наблюдения считают от
+    настройки: критично — ниже предела, предупреждение — ниже двойного,
+    но не меньше десяти гигабайт.
+    """
+    threshold = spec.threshold
+    if threshold is None or settings is None:
+        return threshold
+    if spec.name in ("asrhub_disk_free_bytes", "asrhub_disk_free_gb"):
+        try:
+            предел_гб = float(settings.get("disk_min_free_gb"))
+        except (TypeError, ValueError):
+            return threshold
+        if not math.isfinite(предел_гб) or предел_гб <= 0:
+            return threshold
+        множитель = 1024 ** 3 if spec.name.endswith("_bytes") else 1
+        предупреждение = max(предел_гб * МЕСТО_ПРЕДУПРЕЖДЕНИЕ_РАЗ,
+                             МЕСТО_ПРЕДУПРЕЖДЕНИЕ_МИН_ГБ)
+        return replace(threshold, critical=предел_гб * множитель,
+                       warning=предупреждение * множитель)
+    return threshold
 
 
 def metrics_for_group(group: str) -> list[MetricSpec]:

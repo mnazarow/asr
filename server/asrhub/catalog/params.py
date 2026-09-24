@@ -1843,7 +1843,7 @@ _p(P(
     default=900,
     minimum=30,
     maximum=7200,
-    step=60,
+    step=30,
     unit="с",
     description="Сколько ждать MFA, прежде чем считать выравнивание неудавшимся.",
     recommendation=(
@@ -2280,7 +2280,7 @@ _p(P(
     default=1.5,
     minimum=0.0,
     maximum=30.0,
-    step=0.5,
+    step=0.1,
     unit="с",
     description="Сегменты короче указанного присоединяются к соседнему при склейке.",
     recommendation="1.5 секунды для связного текста, 0.8 для субтитров, 0 чтобы отключить.",
@@ -2882,7 +2882,7 @@ _p(P(
     default=500,
     minimum=50,
     maximum=100000,
-    step=100,
+    step=50,
     description=(
         "Сколько ожидающих заданий планировщик рассматривает за один выбор. "
         "Порядок предварительной выборки подбирается под политику планирования."
@@ -2910,7 +2910,7 @@ _p(P(
     default=200,
     minimum=1,
     maximum=5000,
-    step=10,
+    step=1,
     description=(
         "Сколько файлов принимается одним запросом POST /api/jobs/batch. "
         "Сверх этого предела пакет отклоняется целиком."
@@ -2938,7 +2938,7 @@ _p(P(
     default=1000,
     minimum=1,
     maximum=100000,
-    step=50,
+    step=1,
     description=(
         "Сколько заданий сервер согласен держать в очереди одновременно. При попытке "
         "поставить задание сверх этого предела клиент получает ошибку «очередь переполнена» "
@@ -3777,7 +3777,7 @@ _p(P(
     default=168,
     minimum=1,
     maximum=8760,
-    step=24,
+    step=1,
     description=(
         "Сколько часов действует вход по логину и паролю. Срок продлевается при "
         "работе, поэтому речь о простое: неделя означает «неделю не заходил — войди "
@@ -3859,7 +3859,7 @@ _p(P(
     default=2048,
     minimum=1,
     maximum=51200,
-    step=64,
+    step=1,
     unit="МБ",
     description="Максимальный размер одного загружаемого файла.",
     recommendation=(
@@ -4053,13 +4053,19 @@ _p(P(
     default=[],
     description=(
         "Куда сервер отправляет метрики сам. Каждый приёмник описывается объектом "
-        "с полями kind, url и interval_s. Доступные kind: prometheus_pushgateway, "
-        "influxdb, otlp, statsd, webhook."
+        "с полями kind, url и interval_s; по желанию — name (ключ приёмника), "
+        "headers, timeout_s, enabled, а также database (InfluxDB), job и instance "
+        "(Pushgateway), prefix (StatsD), host (имя узла в Zabbix). Доступные kind: "
+        "prometheus_pushgateway, influxdb, otlp, statsd, webhook, zabbix. Раздел "
+        "«Мониторинг» пишет сюда же: добавленный там приёмник виден здесь и "
+        "переживает перезапуск."
     ),
     recommendation=(
         "Интервал меньше 30 секунд редко оправдан: замеры железа обновляются раз "
         "в 20 секунд, и более частая отправка шлёт те же самые числа. Проверить "
-        "настройку до сохранения можно через POST /api/monitoring/targets/test."
+        "настройку до сохранения можно через POST /api/monitoring/targets/test. "
+        "Для Zabbix нужен kind: zabbix — это протокол траппера (порт 10051), "
+        "а не webhook: HTTP-запрос траппер не понимает."
     ),
     examples=[
         Ex("Pushgateway",
@@ -4076,6 +4082,10 @@ _p(P(
            [{"kind": "influxdb", "url": "http://influx:8086", "interval_s": 30},
             {"kind": "webhook", "url": "https://ваш-сервис/metrics", "interval_s": 300}],
            "Сбой одного не мешает другому"),
+        Ex("Zabbix",
+           [{"kind": "zabbix", "url": "zabbix://zabbix-server:10051", "host": "asr-01",
+             "interval_s": 60}],
+           "host — имя узла в Zabbix; к узлу привязывается шаблон «ASR Hub»"),
     ],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
     advanced=True,
@@ -4089,7 +4099,11 @@ _p(P(
     default=[],
     description=(
         "Собственные пороги тревог. Пустой список означает пороги из каталога "
-        "метрик — они подобраны под типичную установку и обычно годятся как есть."
+        "метрик — они подобраны под типичную установку и обычно годятся как есть. "
+        "PUT /api/monitoring/alerts/rules пишет сюда же, а «Вернуть пороги по "
+        "умолчанию» — очищает список. Поле inclusive (сравнивать включительно) "
+        "можно не указывать: порог 1 «выше» и 0 «ниже» сравниваются включительно, "
+        "остальные — строго."
     ),
     recommendation=(
         "Если у вас есть Prometheus, оповещения лучше держать в нём: там история, "
@@ -4109,11 +4123,16 @@ _p(P(
 
 _p(P(
     key="metrics_enabled",
-    label="Экспорт метрик Prometheus",
+    label="Экспорт метрик опросом",
     group="server",
     type="bool",
     default=True,
-    description="Публиковать метрики на /metrics в формате Prometheus.",
+    description=(
+        "Отдавать метрики тем, кто за ними приходит: /api/monitoring/metrics "
+        "(все форматы, и /metrics.json) и прежний адрес /api/metrics. "
+        "Выключенный экспорт отвечает на обоих адресах 404; отправка в "
+        "приёмники (monitoring_targets) и встроенные тревоги от него не зависят."
+    ),
     recommendation="Включено. Метрики не содержат текста — только счётчики и распределения.",
     examples=[Ex("По умолчанию", True, "")],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
@@ -4319,7 +4338,7 @@ _p(P(
     default=50,
     minimum=1,
     maximum=1000,
-    step=10,
+    step=1,
     unit="записей",
     advanced=True,
     description=(
@@ -4388,7 +4407,7 @@ _p(P(
         Ex("Определять самому", "", ""),
         Ex("Всегда первый канал", "SPEAKER_00", "Запись по каналам, оператор слева"),
     ],
-    see_also=["content_script", "diarization"],
+    see_also=["content_script", "diarization_enabled"],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
 ))
 
@@ -4420,7 +4439,7 @@ _p(P(
         Ex("Не проверять", 0, "встречи, лекции, диктовка"),
         Ex("Телефонные разговоры", 2, ""),
     ],
-    see_also=["diarization", "content_analysis"],
+    see_also=["diarization_enabled", "content_analysis"],
 ))
 
 _p(P(
@@ -4822,7 +4841,7 @@ _p(P(
     default=1200,
     minimum=256,
     maximum=32768,
-    step=256,
+    step=1,
     unit="токенов",
     description=(
         "Сколько токенов модель может сказать в ответ — не считая "
@@ -5368,7 +5387,7 @@ _p(P(
         Ex("Без дат рождения", "card,phone,email,snils,inn,passport",
            "Даты в разговоре часто не про рождение"),
     ],
-    see_also=["redact_mode", "mask_pii"],
+    see_also=["redact_mode", "export_mask_pii"],
 ))
 
 _p(P(
@@ -5397,7 +5416,7 @@ _p(P(
         Ex("С выравниванием — по умолчанию", 120, ""),
         Ex("Без выравнивания", 300, "Границы оценены по тексту реплики"),
     ],
-    see_also=["redact_mode", "alignment"],
+    see_also=["redact_mode", "alignment_backend"],
 ))
 
 _p(P(
@@ -5599,7 +5618,7 @@ _p(P(
         Ex("Как есть — по умолчанию", False, "CRM в своём контуре"),
         Ex("Обезличивать", True, "Облачная CRM"),
     ],
-    see_also=["crm_send_transcript", "mask_pii"],
+    see_also=["crm_send_transcript", "export_mask_pii"],
 ))
 
 _p(P(
@@ -5860,7 +5879,7 @@ _p(P(
         Ex("Три года", 1095, "Когда срок задан регламентом"),
         Ex("Хранить вечно", 0, "Журнал не чистится совсем"),
     ],
-    see_also=["audit_enabled", "retention_days"],
+    see_also=["audit_enabled", "result_retention_days"],
 ))
 
 _p(P(
@@ -6148,7 +6167,7 @@ _p(P(
            "Мнимые наложения отсеиваются"),
         Ex("Чистое стерео", 0.0, "Любое совпадение по времени — перебивание"),
     ],
-    see_also=["content_pause_s", "content_backchannel_s", "diarization"],
+    see_also=["content_pause_s", "content_backchannel_s", "diarization_enabled"],
 ))
 
 _p(P(
@@ -6518,7 +6537,7 @@ _p(P(
         Ex("Обычно", 14, ""),
         Ex("Долгое наблюдение", 90, "Если смотрите на тренды времени ответа"),
     ],
-    see_also=["retention_days"],
+    see_also=["result_retention_days"],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
 ))
 
@@ -7504,10 +7523,41 @@ def _проверить_сети(значение: Any) -> list[str]:
     return ошибки
 
 
+def _контексты_из_строки(текст: str) -> Any:
+    """«from-trunk=входящий, from-internal=исходящий» → словарь с порядком.
+
+    Рекомендация параметра обещает запись строкой, а проверка её не
+    принимала: «ожидается объект JSON» — про пример из самого каталога.
+    """
+    from ..telephony.asterisk import правила_контекстов  # noqa: PLC0415
+
+    пары = правила_контекстов(текст)
+    return dict(пары) if пары else текст
+
+
+def _проверить_контексты(value: object) -> list[str]:
+    """Направления в правилах контекстов — только из трёх известных."""
+    from ..telephony.asterisk import правила_контекстов  # noqa: PLC0415
+
+    try:
+        пары = правила_контекстов(value)
+    except (TypeError, ValueError):
+        return ["ожидается «контекст → направление»"]
+    return [f"направление «{куда}» у контекста «{контекст}» не бывает — только "
+            "входящий, исходящий, внутренний"
+            for контекст, куда in пары
+            if куда not in ("входящий", "исходящий", "внутренний")]
+
+
 _ПРОВЕРКИ = {"content_categories": _проверить_категории,
              "monitoring_targets": _проверить_приёмники,
              "monitoring_rules": _проверить_правила,
-             "trusted_proxies": _проверить_сети}
+             "trusted_proxies": _проверить_сети,
+             "telephony_contexts": _проверить_контексты}
+
+#: Разбор строки для параметров-объектов, у которых строковая запись —
+#: обещанная форма, а не ошибка (см. `coerce_value`).
+_ИЗ_СТРОКИ = {"telephony_contexts": _контексты_из_строки}
 
 
 #: Как записывают «да» и «нет» руками и в переменных окружения.
@@ -7680,7 +7730,8 @@ def coerce_value(key: str, value: Any) -> Any:
             try:
                 разобрано = json.loads(текст)
             except ValueError:
-                return value
+                разбор = _ИЗ_СТРОКИ.get(key)
+                return разбор(текст) if разбор is not None else value
             if isinstance(разобрано, (dict, list)):
                 return разобрано
         return value

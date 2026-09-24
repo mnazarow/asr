@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -503,6 +503,9 @@ _SCHEMA = [
         model_load_s      REAL,
         inference_s       REAL,
         postprocess_s     REAL,
+        vad_s             REAL,
+        alignment_s       REAL,
+        diarization_s     REAL,
         peak_memory_mb    REAL,
         peak_memory_jobs  INTEGER,
         device            TEXT,
@@ -1708,7 +1711,8 @@ class Database:
         "id, status, model, engine, language, owner, source, priority, "
         "filename, deadline, created_at, queued_at, started_at, finished_at, "
         "media_duration_s, processing_time_s, queue_time_s, audio_prep_s, "
-        "model_load_s, inference_s, postprocess_s, rtf, words_count, "
+        "model_load_s, inference_s, postprocess_s, vad_s, alignment_s, "
+        "diarization_s, rtf, words_count, "
         "chars_count, segments_count, speakers_count, avg_confidence, wer, "
         "cer, error_code, error_message, error_hint, retries, cached_from, "
         # progress и stage — по несколько байт, но без них облегчённый список

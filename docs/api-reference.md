@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **185**, операций: **204**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **186**, операций: **206**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -258,8 +258,10 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/monitoring/resources` | Ряды нагрузки: сервер и видеокарты | любой действующий ключ |
 | `GET` | `/api/monitoring/startup` | Проба завершения запуска | без ключа при `monitoring_public: true`, иначе любой ключ |
 | `GET` | `/api/monitoring/targets` | Приёмники метрик и состояние доставки | любой действующий ключ |
+| `POST` | `/api/monitoring/targets` | Добавить приёмник | ключ с правом записи (**admin** или **user**) |
 | `PUT` | `/api/monitoring/targets` | Заменить список приёмников | ключ с ролью **admin** |
 | `POST` | `/api/monitoring/targets/test` | Проверить приёмник немедленно | ключ с ролью **admin** |
+| `DELETE` | `/api/monitoring/targets/{name}` | Убрать приёмник | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/params` | Все параметры с описаниями и примерами | любой действующий ключ |
 | `GET` | `/api/presets` | Готовые наборы настроек | любой действующий ключ |
 | `POST` | `/api/presets/{preset_id}/apply` | Применить пресет к серверным настройкам | ключ с правом записи (**admin** или **user**) |
@@ -840,7 +842,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:28815",
+  "instance": "vm:12245",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1215,14 +1217,12 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/presets
     {
       "id": "ru-accuracy",
       "name": "Русский: максимальная точность",
-      "description": "GigaAM v3 RNNT с готовой пунктуацией, широкий луч, аккуратная нарезка по VAD. Самый точный вариант для русского языка из доступных свободных моделей.",
+      "description": "GigaAM v3 RNNT с готовой пунктуацией и аккуратной нарезкой по VAD: мягкий порог речи и длинные паузы, чтобы фраза не резалась посередине. Самый точный вариант для русского языка из доступных свободных моделей.",
       "scenario": "Протоколы совещаний, юридические записи, интервью для публикации",
       "values": {
         "engine": "gigaam",
         "model": "gigaam-v3-e2e-rnnt",
         "language": "ru",
-        "beam_size": 8,
-        "temperature_fallback": true,
         "vad_enabled": true,
         "vad_backend": "silero",
         "vad_threshold": 0.45,
@@ -1418,7 +1418,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1790252037.3301768,
+    "generated_at": 1790264189.0490324,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1585,8 +1585,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.16",
-  "uptime_s": 127.4,
+  "version": "3.1.17",
+  "uptime_s": 113.5,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1630,8 +1630,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 4,
-    "WARNING": 2
+    "INFO": 2
   }
 }
 ```
@@ -1665,8 +1664,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.16",
-  "uptime_s": 127.5,
+  "version": "3.1.17",
+  "uptime_s": 113.5,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v37",
@@ -1675,8 +1674,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.0,
-    "disk_free_gb": 14.5,
+    "ram_available_gb": 6.7,
+    "disk_free_gb": 14.4,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1687,8 +1686,13 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 14.5 ГБ. Полный набор моделей занимает свыше 100 ГБ."
-    ]
+      "На диске свободно 14.4 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+    ],
+    "cpu_limit": 0.0,
+    "memory_limit_gb": 0.0,
+    "ram_host_gb": 7.8,
+    "cpu_affinity": 2,
+    "cpu_cores_available": 2
   },
   "recommended": {
     "device": "cpu",
@@ -1696,8 +1700,6 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "batch_size": 2,
     "model": "faster-whisper-small",
     "model_cache_size": 1,
-    "max_concurrent_jobs": 1,
-    "cpu_threads": 1,
 …
 ```
 
@@ -2567,9 +2569,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 7.0,
+    "free_gb": 6.7,
     "reserve_gb": 4.0,
-    "budget_gb": 2.9,
+    "budget_gb": 2.7,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -3556,7 +3558,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/review?status=pendi
 }
 ```
 
-Строка закрывается сама, когда по записи задан эталон (`POST /api/jobs/{id}/reference`).
+Пропустить запись без эталона — `PUT /api/review/{id}` с телом `{"status": "skipped"}`; пополнить очередь, не дожидаясь суточного отбора, — `POST /api/review/sample` (администратор).
 
 ### `POST /api/review/sample`
 
@@ -3979,6 +3981,13 @@ curl http://сервер:8080/api/metrics
 
 Заменить правила оповещения.
 
+Заменяет правила и сохраняет их в настройку `monitoring_rules`.
+
+Раньше правила жили только в памяти процесса и пропадали при
+перезапуске, хотя интерфейс об этом не предупреждал. Теперь они
+записываются в настройки и в файл конфигурации (`persisted` в ответе
+говорит, получилось ли второе).
+
 **Доступ:** ключ с ролью **admin**.
 
 
@@ -4055,7 +4064,14 @@ curl http://сервер:8080/api/metrics
 
 Фрагмент prometheus.yml для сбора.
 
-Готовый блок scrape_configs — с правильным путём и разумным интервалом.
+Готовое задание сбора — элемент списка `scrape_configs`.
+
+Прежде отдавался блок вместе с ключом `scrape_configs:`, а документация
+предлагала дописать его в конец prometheus.yml. В файле, где этот ключ
+уже есть, получался второй ключ верхнего уровня: строгий разбор YAML
+Prometheus такой файл отвергает, нестрогий теряет все прежние задания.
+Теперь это одно задание — его вставляют под существующий
+`scrape_configs:`.
 
 **Доступ:** без ключа при `monitoring_public: true`, иначе любой ключ.
 
@@ -4088,8 +4104,52 @@ curl http://сервер:8080/api/monitoring/health
 
 **Ответ**
 
-```
-(сервер недоступен: HTTP Error 503: Service Unavailable)
+```json
+{
+  "status": "ok",
+  "uptime_s": 113.5,
+  "liveness": {
+    "status": "ok",
+    "checks": [
+      {
+        "name": "process",
+        "status": "ok",
+        "detail": "работает 114 с",
+        "hint": ""
+      },
+      {
+        "name": "queue_thread",
+        "status": "ok",
+        "detail": "очередь здесь не обрабатывается (запуск с --no-queue): задания считает соседний сервер",
+        "hint": ""
+      }
+    ]
+  },
+  "readiness": {
+    "status": "ok",
+    "checks": [
+      {
+        "name": "database",
+        "status": "ok",
+        "detail": "отвечает",
+        "hint": ""
+      },
+      {
+        "name": "engines",
+        "status": "ok",
+        "detail": "доступно 1",
+        "hint": ""
+      },
+      {
+        "name": "disk",
+        "status": "ok",
+        "detail": "свободно 14.4 ГБ",
+        "hint": ""
+      },
+      {
+        "name": "queue",
+        "status": "ok",
+…
 ```
 
 Код ответа 200 при `ok` и `warning`, 503 при `degraded` и `critical` — проверку можно навесить, не разбирая тело.
@@ -4131,7 +4191,7 @@ Prometheus, его же ждёт большинство систем сбора.
 
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
-| `format` | в адресе | string | `prometheus` | prometheus, openmetrics, json, otlp, influx, graphite, zabbix, csv |
+| `format` | в адресе | string | `prometheus` | prometheus, openmetrics, json, otlp, influx, graphite, zabbix, zabbix_sender, csv |
 | `host` | в адресе | string | `asrhub` | Имя узла для Zabbix |
 
 **Пример**
@@ -4219,9 +4279,34 @@ Pushgateway учётные данные сплошь и рядом стоят п
 **Доступ:** любой действующий ключ.
 
 
+### `POST /api/monitoring/targets`
+
+Добавить приёмник.
+
+Добавляет один приёмник, не трогая остальные.
+
+Имя — ключ: если его не дали, берётся вид приёмника, а занятое имя
+получает номер («influxdb-2»). Остальные приёмники остаются ровно
+такими, какими были, — со своими заголовками и базами.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": true,
+  "title": "Target"
+}
+```
+
 ### `PUT /api/monitoring/targets`
 
 Заменить список приёмников.
+
+Заменяет список целиком и сохраняет его в настройку `monitoring_targets`.
 
 **Доступ:** ключ с ролью **admin**.
 
@@ -4260,6 +4345,17 @@ Pushgateway учётные данные сплошь и рядом стоят п
   "title": "Target"
 }
 ```
+
+### `DELETE /api/monitoring/targets/{name}`
+
+Убрать приёмник.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `name` | в пути | string | обязателен | — |
 
 ## Прочие маршруты
 

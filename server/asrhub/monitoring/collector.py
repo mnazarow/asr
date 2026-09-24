@@ -41,6 +41,10 @@ HTTP_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
 #: С какого числа завершённых заданий модели её доля успеха идёт в метрику.
 МИН_ЗАВЕРШЁННЫХ = 5
 
+#: Стадии конвейера, время которых хранится у задания (колонка `<стадия>_s`).
+СТАДИИ = ("audio_prep", "vad", "model_load", "inference", "alignment",
+          "diarization", "postprocess")
+
 
 @dataclass
 class Sample:
@@ -139,8 +143,40 @@ class Runtime:
         with self._lock:
             return dict(self.counters), dict(self.gauges), dict(self.histograms)
 
+    def zero(self, name: str, labels: dict[str, str] | None = None) -> None:
+        """Заводит счётчик нулём, если его ещё нет.
+
+        Счётчик, которого нет в выгрузке, для Prometheus не существует, и
+        первый его прирост после перезапуска функция rate() не видит: ей
+        нужна пара значений, а первое значение — уже единица. Первая
+        упавшая после перезапуска задача в долю отказов не попадала вовсе.
+        Поэтому известные наборы меток выкладываются нулями с запуска.
+        """
+        with self._lock:
+            ключ = self._key(name, labels)
+            if ключ not in self.counters:
+                self.counters[ключ] = 0
+
+
+#: Счётчики, которые выкладываются нулями с запуска, — с известными
+#: заранее метками (см. `Runtime.zero`).
+НУЛИ_С_ЗАПУСКА: tuple[tuple[str, dict[str, str] | None], ...] = (
+    ("asrhub_jobs_total", {"status": "completed"}),
+    ("asrhub_jobs_total", {"status": "failed"}),
+    ("asrhub_jobs_total", {"status": "cancelled"}),
+    ("asrhub_webhooks_total", {"result": "ok"}),
+    ("asrhub_webhooks_total", {"result": "failed"}),
+    ("asrhub_retries_total", None),
+    ("asrhub_no_speech_total", None),
+    ("asrhub_cached_jobs_total", None),
+    ("asrhub_auth_failures_total", None),
+    ("asrhub_rate_limited_total", None),
+    ("asrhub_config_reloads_total", None),
+)
 
 RUNTIME = Runtime()
+for _имя, _метки in НУЛИ_С_ЗАПУСКА:
+    RUNTIME.zero(_имя, _метки)
 
 
 
@@ -153,8 +189,20 @@ def _file_size(path: Any) -> int:
     except OSError:
         return 0
 
+#: Сколько файлов обходит замер размера каталогов для метрики. Обход идёт
+#: в фоне, поэтому предел широкий: он защищает не опрос, а сам сервер от
+#: получаса стат-вызовов по каталогу на десяток миллионов файлов.
+ПРЕДЕЛ_ОБХОДА_МЕТРИК = 1_000_000
+
+
 class Collector:
     """Собирает снимок всех параметров работы сервиса."""
+
+    #: Части сбора по порядку: имя источника (оно же метка `source` у
+    #: `asrhub_collector_source_up`) и метод.
+    ИСТОЧНИКИ: tuple[str, ...] = (
+        "service", "queue", "jobs", "performance", "quality", "models",
+        "resources", "storage", "api", "errors", "content", "runtime")
 
     def __init__(self, state: Any, runtime: Runtime | None = None,
                  expensive_interval_s: float = 300.0) -> None:
@@ -163,6 +211,9 @@ class Collector:
         self.expensive_interval_s = expensive_interval_s
         self._expensive_cache: list[Sample] = []
         self._expensive_at = 0.0
+        self._expensive_thread: threading.Thread | None = None
+        self._expensive_error = ""
+        self._неполные: set[str] = set()
         self._lock = threading.Lock()
         self._collect_id = 0
         self._by_model_at = -1
@@ -182,34 +233,40 @@ class Collector:
     # -- вспомогательное -----------------------------------------------------
 
     @staticmethod
-    def _safe(source: str, fn: Any, out: list[Sample], errors: list[str]) -> None:
-        """Выполняет часть сбора, не давая ей уронить весь снимок."""
+    def _safe(source: str, fn: Any, out: list[Sample], errors: list[str]) -> bool:
+        """Выполняет часть сбора, не давая ей уронить весь снимок.
+
+        Ответ — удалась ли часть: из него складывается
+        `asrhub_collector_source_up`.
+        """
         try:
             fn(out)
         except Exception as exc:                        # noqa: BLE001
             errors.append(f"{source}: {type(exc).__name__}: {exc}")
+            return False
+        return True
 
     def collect(self) -> tuple[list[Sample], list[str]]:
         """Возвращает снимок и список источников, которые не удалось опросить."""
         out: list[Sample] = []
         errors: list[str] = []
         self._collect_id += 1
-        for source, fn in (
-            ("service", self._service),
-            ("queue", self._queue),
-            ("jobs", self._jobs),
-            ("performance", self._performance),
-            ("quality", self._quality),
-            ("models", self._models),
-            ("resources", self._resources),
-            ("storage", self._storage),
-            ("api", self._api),
-            ("errors", self._errors),
-            ("content", self._content),
-            ("runtime", self._runtime_series),
-        ):
-            self._safe(source, fn, out, errors)
-        self._safe("storage_size", lambda acc: acc.extend(self._expensive()), out, errors)
+        здоровье: list[Sample] = []
+        for source in self.ИСТОЧНИКИ:
+            fn = getattr(self, "_runtime_series" if source == "runtime" else f"_{source}")
+            удалось = self._safe(source, fn, out, errors)
+            здоровье.append(Sample("asrhub_collector_source_up", 1.0 if удалось else 0.0,
+                                   {"source": source}))
+        удалось = self._safe("storage_size", lambda acc: acc.extend(self._expensive()),
+                             out, errors)
+        if удалось and self._expensive_error:
+            # Фоновый замер размеров упал: снимок отдаёт прежние цифры, но
+            # молчать об этом нельзя — иначе они выглядят свежими.
+            errors.append(f"storage_size: {self._expensive_error}")
+            удалось = False
+        здоровье.append(Sample("asrhub_collector_source_up", 1.0 if удалось else 0.0,
+                               {"source": "storage_size"}))
+        out.extend(здоровье)
         out = self._без_повторов(out)
         out.extend(self._deprecated_aliases(out))
         return out, errors
@@ -221,15 +278,16 @@ class Collector:
         Выгрузка, где одна и та же пара «имя + метки» встречается дважды, для
         Prometheus не просто некрасива — она неверна: при разборе побеждает
         произвольная из двух, а `promtool check metrics` называет это
-        ошибкой. Так и вышло с гистограммами длительности: их выкладывал и
+        ошибкой. Так было с гистограммами длительности: их выкладывал и
         разбор заданий по базе, и накопитель в памяти, — двадцать семь
         задвоенных серий на каждый ответ `/api/monitoring/metrics`.
 
-        Первым идёт разбор по базе, и это правильный порядок: та гистограмма
-        переживает перезапуск сервиса — ровно то, что обещано в справочнике
-        метрики. Накопитель в памяти остаётся запасным: если разбор по базе
-        сорвался (база занята, файл недоступен), его значения в снимке
-        единственные, и метрика не пропадает вовсе.
+        Суточное окно из базы с тех пор отдаётся мгновенными значениями под
+        своими именами (`asrhub_job_duration_day_seconds`), а под именем
+        гистограммы — только накопитель в памяти: окно, выложенное
+        гистограммой, убывало, когда задания выходили из суток, и rate()
+        принимал убыль за перезапуск. Проверка на повторы осталась
+        страховкой — теперь от того, чтобы это не вернулось незамеченным.
         """
         видели: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
         итог: list[Sample] = []
@@ -320,16 +378,16 @@ class Collector:
 
         by_model: Counter[tuple[str, str]] = Counter()
         by_source: Counter[str] = Counter()
-        durations = Histogram(JOB_DURATION_BUCKETS)
-        media = Histogram(MEDIA_DURATION_BUCKETS)
+        обработка: list[float] = []
+        записи: list[float] = []
 
         for row in rows:
             by_model[(row["model"] or "", row["engine"] or "")] += 1
             by_source[row["source"] or "unknown"] += 1
             if row["processing_time_s"]:
-                durations.observe(float(row["processing_time_s"]))
+                обработка.append(float(row["processing_time_s"]))
             if row["media_duration_s"]:
-                media.observe(float(row["media_duration_s"]))
+                записи.append(float(row["media_duration_s"]))
 
         for (model, engine), count in by_model.most_common(40):
             out.append(Sample("asrhub_jobs_by_model", float(count),
@@ -337,8 +395,16 @@ class Collector:
         for source, count in by_source.items():
             out.append(Sample("asrhub_jobs_by_source", float(count), {"source": source}))
 
-        self._emit_histogram(out, "asrhub_job_duration_seconds", durations, {})
-        self._emit_histogram(out, "asrhub_media_duration_seconds", media, {})
+        # Суточное окно — мгновенными значениями, а не гистограммой: корзины
+        # окна убывают, когда задания выходят из суток, и rate() принимал
+        # убыль за перезапуск. Гистограмма под своим именем — накопитель в
+        # памяти (см. _runtime_series), честный счётчик с запуска.
+        for stat, value in self._quantiles(обработка).items():
+            out.append(Sample("asrhub_job_duration_day_seconds", round(value, 3),
+                              {"stat": stat}))
+        for stat, value in self._quantiles(записи).items():
+            out.append(Sample("asrhub_media_duration_day_seconds", round(value, 3),
+                              {"stat": stat}))
 
     # -- производительность --------------------------------------------------
 
@@ -356,15 +422,18 @@ class Collector:
                 out.append(Sample("asrhub_rtf_by_model", float(row["rtf_avg"]),
                                   {"model": str(row.get("model") or "")}))
 
+        # Стадии, которые справочник обещал, а база не хранила: поиск речи,
+        # выравнивание и разделение по говорящим. Рекомендация метрики
+        # опиралась как раз на долю разделения по говорящим, а в выгрузке её
+        # не было никогда.
         row = self.state.db.query_one(
-            "SELECT AVG(audio_prep_s) prep, AVG(model_load_s) load, AVG(inference_s) inf, "
-            "AVG(postprocess_s) post FROM jobs WHERE status='completed' AND finished_at>=?",
+            "SELECT " + ", ".join(f"AVG({стадия}_s) AS {стадия}" for стадия in СТАДИИ)
+            + " FROM jobs WHERE status='completed' AND finished_at>=?",
             (time.time() - 86400,))
         stages = dict(row) if row else {}
-        for stage, column in (("audio_prep", "prep"), ("model_load", "load"),
-                              ("inference", "inf"), ("postprocess", "post")):
-            if stages.get(column) is not None:
-                out.append(Sample("asrhub_stage_seconds", round(float(stages[column]), 4),
+        for stage in СТАДИИ:
+            if stages.get(stage) is not None:
+                out.append(Sample("asrhub_stage_seconds", round(float(stages[stage]), 4),
                                   {"stage": stage}))
 
         efficiency = self.state.analytics.efficiency("day")
@@ -406,7 +475,12 @@ class Collector:
         for stat, value in self._quantiles(confidences).items():
             out.append(Sample("asrhub_confidence", round(value, 4), {"stat": stat}))
         if confidences:
-            low = sum(1 for value in confidences if value < 0.7) / len(confidences)
+            # Порог — тот же, что в «Аналитике»: одна и та же доля в двух
+            # местах давала два разных числа (0,7 здесь против 0,75 там).
+            from ..analytics import НИЗКАЯ_УВЕРЕННОСТЬ  # noqa: PLC0415
+
+            low = sum(1 for value in confidences
+                      if value < НИЗКАЯ_УВЕРЕННОСТЬ) / len(confidences)
             out.append(Sample("asrhub_low_confidence_share", round(low, 4)))
 
         # WER складывается по словам, а не усредняется по записям: три
@@ -704,6 +778,15 @@ class Collector:
         за_сутки = Insights(self.state.db, свод).summary("day")
         if not за_сутки.get("records"):
             return
+        # Соблюдение скрипта и балл оператора — только при скрипте, заданном
+        # человеком. Пустая настройка означает готовый скрипт службы
+        # поддержки, и на установке для совещаний, лекций или диктовки обе
+        # величины низкие по определению: критические тревоги «соблюдение
+        # ниже 0,3» и «балл ниже 40» горели там круглые сутки, ни о чём не
+        # сообщая.
+        скрипт = self.state.settings.get("content_script")
+        без_скрипта = ({"asrhub_content_compliance_avg", "asrhub_content_agent_score_avg"}
+                       if not (isinstance(скрипт, list) and скрипт) else set())
         for имя, ключ in (
             ("asrhub_content_records", "records"),
             ("asrhub_content_sentiment_avg", "sentiment"),
@@ -725,7 +808,7 @@ class Collector:
             ("asrhub_content_violation_records", "violation_records"),
         ):
             значение = за_сутки.get(ключ)
-            if значение is not None:
+            if значение is not None and имя not in без_скрипта:
                 out.append(Sample(имя, float(значение)))
         # Категории обращений — по одной метке на категорию: доля записей за
         # сутки и срабатывания трекеров. Только сработавшие: набор из двухсот
@@ -756,39 +839,103 @@ class Collector:
 
     # -- дорогие замеры ------------------------------------------------------
 
-    def _expensive(self) -> list[Sample]:
-        """Размеры каталогов: обход каталога моделей стоит дорого, поэтому кеш."""
+    def _expensive(self, *, ждать: bool = False) -> list[Sample]:
+        """Размеры каталогов: обход дорогой, поэтому кеш и фон.
+
+        Кеш жил пять минут, но пересчитывал его тот опрос, которому не
+        повезло: на каталоге результатов в сотни тысяч файлов это секунды, и
+        раз в пять минут Prometheus упирался в scrape_timeout — пропадал
+        весь снимок, а не одна метрика. Теперь устаревший кеш отдаётся как
+        есть, а пересчёт идёт отдельным потоком, по одному за раз. Ждать
+        приходится только самый первый замер: без него метрике нечего
+        показать.
+        """
         with self._lock:
-            if time.time() - self._expensive_at < self.expensive_interval_s:
+            есть = self._expensive_at > 0
+            свежий = есть and time.time() - self._expensive_at < self.expensive_interval_s
+            if not есть and not ждать and self._expensive_thread is not None \
+                    and self._expensive_thread.is_alive():
+                # Первый замер уже идёт в фоне (его начинает запуск службы):
+                # опрос не ждёт его и не начинает второй такой же обход.
+                return []
+            if свежий or (есть and not ждать):
+                if not свежий and (self._expensive_thread is None
+                                   or not self._expensive_thread.is_alive()):
+                    self._expensive_thread = threading.Thread(
+                        target=self._размеры_в_фоне, name="asrhub-storage-size",
+                        daemon=True)
+                    self._expensive_thread.start()
                 return list(self._expensive_cache)
+        return self._пересчитать_размеры()
+
+    def начать_замер(self) -> None:
+        """Первый замер размеров — в фоне, сразу при запуске службы.
+
+        Иначе его платил бы первый же опрос Prometheus: на каталоге
+        результатов в сотни тысяч файлов это секунды, и первый сбор после
+        перезапуска упирался в scrape_timeout.
+        """
+        with self._lock:
+            if self._expensive_at > 0 or (self._expensive_thread is not None
+                                          and self._expensive_thread.is_alive()):
+                return
+            self._expensive_thread = threading.Thread(
+                target=self._размеры_в_фоне, name="asrhub-storage-size", daemon=True)
+            self._expensive_thread.start()
+
+    def _размеры_в_фоне(self) -> None:
+        """Пересчёт размеров в своём потоке: ошибка остаётся в `_expensive_error`."""
+        try:
+            self._пересчитать_размеры()
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Фоновый замер размеров каталогов не удался: %s", exc)
+
+    def _пересчитать_размеры(self) -> list[Sample]:
+        """Обходит каталоги и кладёт результат в кеш."""
+        from ..model_files import размер_каталога  # noqa: PLC0415
 
         result: list[Sample] = []
         paths = self.state.settings.paths
-        for kind in ("uploads", "results", "models", "logs"):
-            directory = getattr(paths, kind, None)
-            if kind == "models":
-                # Веса лежат там, куда указывает настройка `models_dir`, а
-                # `paths.models` — это каталог данных сервера. На сервере,
-                # где модели вынесены на отдельный диск (а их выносят почти
-                # всегда: девяносто гигабайт), метрика показывала ноль, и
-                # «место под модели» в наблюдении было нулём при полном
-                # диске. Самопроверка при этом считает по `models_dir` и
-                # видит настоящий размер — две цифры об одном и том же
-                # расходились в разы.
-                задан = str(self.state.settings.get("models_dir") or "").strip()
-                if задан:
-                    directory = Path(задан)
-            if directory is None:
-                continue
-            try:
-                total = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
-            except OSError:
-                continue
-            result.append(Sample("asrhub_storage_bytes", float(total), {"kind": kind}))
-
+        try:
+            for kind in ("uploads", "results", "models", "logs"):
+                directory = getattr(paths, kind, None)
+                if kind == "models":
+                    # Веса лежат там, куда указывает настройка `models_dir`, а
+                    # `paths.models` — это каталог данных сервера. На сервере,
+                    # где модели вынесены на отдельный диск (а их выносят почти
+                    # всегда: девяносто гигабайт), метрика показывала ноль, и
+                    # «место под модели» в наблюдении было нулём при полном
+                    # диске. Самопроверка при этом считает по `models_dir` и
+                    # видит настоящий размер — две цифры об одном и том же
+                    # расходились в разы.
+                    задан = str(self.state.settings.get("models_dir") or "").strip()
+                    if задан:
+                        directory = Path(задан)
+                if directory is None:
+                    continue
+                total, _, полностью = размер_каталога(directory,
+                                                      предел=ПРЕДЕЛ_ОБХОДА_МЕТРИК)
+                if not полностью and kind not in self._неполные:
+                    # Раз на процесс: замер повторяется каждые пять минут, и
+                    # строка в журнале каждые пять минут — это шум.
+                    self._неполные.add(kind)
+                    log.info("Размер каталога %s посчитан не до конца (предел "
+                             "обхода %d файлов): метрика — оценка снизу",
+                             kind, ПРЕДЕЛ_ОБХОДА_МЕТРИК)
+                result.append(Sample("asrhub_storage_bytes", float(total), {"kind": kind}))
+        except Exception as exc:                            # noqa: BLE001
+            # Из фонового потока исключению деваться некуда: запоминаем его,
+            # и следующий сбор честно назовёт источник упавшим.
+            with self._lock:
+                self._expensive_error = f"{type(exc).__name__}: {exc}"
+                # Прежние цифры остаются, но и обход не повторяется на каждом
+                # опросе: следующая попытка — через обычный интервал.
+                self._expensive_at = time.time()
+            raise
         with self._lock:
             self._expensive_cache = result
             self._expensive_at = time.time()
+            self._expensive_error = ""
         return list(result)
 
     # -- общее ---------------------------------------------------------------

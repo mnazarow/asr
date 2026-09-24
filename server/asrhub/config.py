@@ -20,6 +20,7 @@ import secrets
 import stat
 import tempfile
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -219,6 +220,53 @@ def _станции_наружу(значение: Any, for_admin: bool) -> Any:
                 копия.pop(поле, None)
         наружу.append(копия)
     return наружу
+
+
+def _приёмники_наружу(значение: Any, for_admin: bool) -> Any:
+    """Прячет заголовки и учётные данные приёмников метрик.
+
+    Приёмники пишутся в настройки разделом «Мониторинг» вместе с
+    заголовками — а в заголовке Authorization лежит токен InfluxDB или
+    Pushgateway. Значения заголовков не отдаются никому (как пароли
+    станций), адрес без учётных данных — всем, кроме администратора.
+    """
+    if not isinstance(значение, list):
+        return значение
+    from .monitoring.pushers import скрыть_адрес  # noqa: PLC0415
+
+    наружу = []
+    for приёмник in значение:
+        if not isinstance(приёмник, dict):
+            наружу.append(приёмник)
+            continue
+        копия = dict(приёмник)
+        if isinstance(копия.get("headers"), dict):
+            копия["headers"] = dict.fromkeys(копия["headers"], Settings.ЗАГЛУШКА)
+        if not for_admin and копия.get("url"):
+            копия["url"] = скрыть_адрес(str(копия["url"]))
+        наружу.append(копия)
+    return наружу
+
+
+def _приёмники_с_заголовками(новые: list[Any], прежние: Any) -> list[Any]:
+    """Возвращает приёмникам заголовки, спрятанные за «***», — по имени."""
+    по_имени = {str(п.get("name") or п.get("kind") or ""): п
+                for п in (прежние if isinstance(прежние, list) else [])
+                if isinstance(п, dict)}
+    итог = []
+    for приёмник in новые:
+        if isinstance(приёмник, dict) and isinstance(приёмник.get("headers"), dict):
+            было = по_имени.get(str(приёмник.get("name") or приёмник.get("kind") or ""), {})
+            заголовки_были = было.get("headers") if isinstance(было.get("headers"), dict) else {}
+            заголовки = {}
+            for ключ, значение in приёмник["headers"].items():
+                if значение != Settings.ЗАГЛУШКА:
+                    заголовки[ключ] = значение
+                elif ключ in заголовки_были:
+                    заголовки[ключ] = заголовки_были[ключ]
+            приёмник = {**приёмник, "headers": заголовки}
+        итог.append(приёмник)
+    return итог
 
 
 def _станции_с_паролями(новые: list[Any], прежние: Any) -> list[Any]:
@@ -424,6 +472,8 @@ class Settings:
                 continue
             if ключ == "telephony_stations" and isinstance(значение, list):
                 значение = _станции_с_паролями(значение, self.values.get(ключ))
+            if ключ == "monitoring_targets" and isinstance(значение, list):
+                значение = _приёмники_с_заголовками(значение, self.values.get(ключ))
             итог[ключ] = значение
         return итог
 
@@ -457,6 +507,9 @@ class Settings:
         if values.get("telephony_stations"):
             values["telephony_stations"] = _станции_наружу(
                 values["telephony_stations"], for_admin)
+        if values.get("monitoring_targets"):
+            values["monitoring_targets"] = _приёмники_наружу(
+                values["monitoring_targets"], for_admin)
         data = {
             "values": values,
             "sources": dict(self.sources),
@@ -492,6 +545,56 @@ class Settings:
         with _ЗАМОК_СОХРАНЕНИЯ:
             return self._save_locked(target)
 
+    def persist_keys(self, keys: Iterable[str]) -> Path | None:
+        """Записывает в файл конфигурации только названные параметры.
+
+        Нужно разделам, которые сами хранят свою часть настроек: приёмники
+        метрик и правила тревог. Раньше они жили только в памяти процесса —
+        интерфейс отвечал «Приёмник добавлен», а перезапуск его стирал.
+        Полное `save()` здесь не годится: вместе с приёмником в файл ушло бы
+        и всё, что администратор «применил на пробу» на странице настроек.
+        Поэтому файл читается, в нём меняются ровно эти ключи — там, где они
+        уже лежат, или в группе параметра, — и файл пишется обратно тем же
+        атомарным способом, что и при полном сохранении.
+
+        Ответ — путь к файлу; None — файла конфигурации у сервера нет
+        (запуск без него), и сохранять некуда.
+        """
+        if self.config_file is None:
+            return None
+        target = Path(self.config_file)
+        with _ЗАМОК_СОХРАНЕНИЯ:
+            if not target.exists():
+                return self._save_locked(target)
+            try:
+                raw = _load_structured(target) or {}
+            except Exception as exc:                          # noqa: BLE001
+                raise ConfigError(f"Не удалось прочитать {target}: {exc}") from exc
+            if not isinstance(raw, dict):
+                raise ConfigError(f"{target}: ожидается словарь параметров")
+            по_группам = any(isinstance(значение, dict) and ключ in catalog.GROUPS_BY_ID
+                             for ключ, значение in raw.items())
+            for ключ in keys:
+                spec = catalog.PARAMS_BY_KEY.get(ключ)
+                if spec is None:
+                    continue
+                # Параметр мог быть записан и плоско, и в группе: при
+                # чтении побеждает последний, поэтому убираем все копии.
+                raw.pop(ключ, None)
+                for группа, значение in raw.items():
+                    if isinstance(значение, dict) and группа in catalog.GROUPS_BY_ID:
+                        значение.pop(ключ, None)
+                if ключ not in self.values:
+                    continue
+                if по_группам:
+                    группа = raw.setdefault(spec.group, {})
+                    if not isinstance(группа, dict):
+                        raw[spec.group] = группа = {}
+                    группа[ключ] = self.values[ключ]
+                else:
+                    raw[ключ] = self.values[ключ]
+            return self._write_locked(target, raw)
+
     def _save_locked(self, target: Path) -> Path:
         """Сохранение под `_ЗАМОК_СОХРАНЕНИЯ` — см. `save`."""
         grouped: dict[str, dict[str, Any]] = {}
@@ -514,6 +617,11 @@ class Settings:
         # Диаризация после этого падала с «нужен токен» на ровном месте.
         if self.hf_token:
             payload["hf_token"] = self.hf_token
+        return self._write_locked(target, payload)
+
+    @staticmethod
+    def _write_locked(target: Path, payload: dict[str, Any]) -> Path:
+        """Атомарная запись файла настроек (под `_ЗАМОК_СОХРАНЕНИЯ`)."""
         # Права наследуем от существующего файла. Временный создаётся по umask
         # (обычно 0644), а replace() отдаёт цели ЕГО права — установщик ставил
         # 0640, и первый же запуск сервера, тот самый, который дописывает сюда

@@ -316,6 +316,14 @@ class MetricNotFound(ASRHubError):
         self.details = {"metric": name, "suggestions": suggestions or []}
 
 
+class MetricsDisabled(ASRHubError):
+    """Экспорт метрик опросом выключен настройкой metrics_enabled."""
+
+    code = "metrics_disabled"
+    http_status = 404
+    hint = 'Включить: PUT /api/settings {"metrics_enabled": true}'
+
+
 class JobNotFound(ASRHubError):
     """Задание не найдено."""
 

@@ -244,9 +244,29 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
         state.registry.configure(
             max(1, S.integer(state.settings, "model_cache_size", 2)),
             S.integer(state.settings, "model_idle_unload_s", 900))
+    _применить_мониторинг(state, applied)
     state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
     RUNTIME.inc("asrhub_config_reloads_total")
     return {"applied": applied}
+
+
+def _применить_мониторинг(state: Any, изменено: dict[str, Any] | None) -> None:
+    """Приёмники, пороги и кеш мониторинга — сразу, а не с перезапуска.
+
+    Мониторинг читал свои настройки один раз, при запуске: приёмник,
+    добавленный в «Настройках», не начинал работать, выключенная отправка
+    продолжала слать, а свой порог тревоги не действовал — при том что
+    страница отвечала «Применено».
+    """
+    from ..monitoring.service import КЛЮЧИ_НАСТРОЕК  # noqa: PLC0415
+
+    служба = getattr(state, "monitoring", None)
+    if служба is None or (изменено is not None and not КЛЮЧИ_НАСТРОЕК & set(изменено)):
+        return
+    try:
+        служба.apply_settings(state.settings)
+    except Exception as exc:                                  # noqa: BLE001
+        log.warning("Настройки мониторинга не применились на ходу: %s", exc)
 
 
 @router.get("/settings/hf-token", summary="Задан ли токен Hugging Face")
@@ -323,6 +343,7 @@ def reset_settings(request: Request,
     require_admin(principal)
     for key, value in catalog.defaults().items():
         state.settings.set(key, value, source="default")
+    _применить_мониторинг(state, None)
     return {"reset": True}
 
 

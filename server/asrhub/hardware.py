@@ -5,10 +5,14 @@
 """
 from __future__ import annotations
 
+import copy
+import math
 import os
 import platform
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -48,11 +52,37 @@ class HardwareInfo:
     ffmpeg_version: str = ""
     python_version: str = ""
     warnings: list[str] = field(default_factory=list)
+    #: Предел контейнера: доля процессора в ядрах (cgroup cpu.max) и память
+    #: (memory.max). Ноль — предела нет. Память машины при пределе — в
+    #: `ram_host_gb`, а `ram_total_gb` — то, что процессу можно на деле.
+    cpu_limit: float = 0.0
+    memory_limit_gb: float = 0.0
+    ram_host_gb: float = 0.0
+    #: Сколько логических процессоров процессу разрешено (sched_getaffinity).
+    cpu_affinity: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["gpus"] = [g.to_dict() for g in self.gpus]
+        data["cpu_cores_available"] = self.cpu_cores_available
         return data
+
+    @property
+    def cpu_cores_available(self) -> int:
+        """Ядра, на которые процессу можно рассчитывать.
+
+        В контейнере с `--cpus=4` на машине с тридцатью двумя ядрами
+        рекомендации брали тридцать два: `cpu_threads: 31`, четыре задания
+        разом — и всё это на четыре ядра квоты, с троттлингом cgroup вместо
+        ускорения. Здесь меньшее из физических ядер, разрешённых процессу
+        логических и квоты контейнера.
+        """
+        ядра = max(1, int(self.cpu_cores_physical or 1))
+        if self.cpu_affinity:
+            ядра = min(ядра, self.cpu_affinity)
+        if self.cpu_limit:
+            ядра = min(ядра, max(1, math.ceil(self.cpu_limit)))
+        return ядра
 
     @property
     def total_vram_gb(self) -> float:
@@ -235,9 +265,81 @@ def _torch_info() -> tuple[str, str, str, bool]:
     return torch.__version__, cuda, cudnn, mps
 
 
-@lru_cache(maxsize=1)
-def detect(data_dir: str = ".") -> HardwareInfo:
-    """Полное определение оборудования. Результат кешируется на время процесса."""
+#: Корень файловой системы cgroup — для проверок подменяется.
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _прочитать(путь: str) -> str:
+    try:
+        with open(путь, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def _каталог_cgroup(корень: str) -> str:
+    """Каталог своей группы: `/proc/self/cgroup` → «0::/путь» (cgroup v2)."""
+    for строка in _прочитать("/proc/self/cgroup").splitlines():
+        if строка.startswith("0::"):
+            путь = строка[3:].strip()
+            полный = os.path.join(корень, путь.lstrip("/"))
+            if путь not in ("", "/") and os.path.isdir(полный):
+                return полный
+    return корень
+
+
+def пределы_контейнера(корень: str = "") -> tuple[float, float, float]:
+    """Квота процессора (ядер), предел и занятость памяти (байты) из cgroup.
+
+    Нули — предела нет или прочитать не удалось. Понимает cgroup v2
+    (`cpu.max`, `memory.max`, `memory.current`) и v1 (`cpu.cfs_quota_us`,
+    `memory.limit_in_bytes`, `memory.usage_in_bytes`).
+    """
+    корень = корень or CGROUP_ROOT
+    квота = предел = занято = 0.0
+    группа = _каталог_cgroup(корень)
+    for каталог in dict.fromkeys((группа, корень)):
+        cpu_max = _прочитать(os.path.join(каталог, "cpu.max")).split()
+        if len(cpu_max) >= 2 and cpu_max[0] != "max" and not квота:
+            try:
+                квота = float(cpu_max[0]) / float(cpu_max[1] or 100000)
+            except (ValueError, ZeroDivisionError):
+                pass
+        mem_max = _прочитать(os.path.join(каталог, "memory.max"))
+        if mem_max.isdigit() and not предел:
+            предел = float(mem_max)
+            текущее = _прочитать(os.path.join(каталог, "memory.current"))
+            занято = float(текущее) if текущее.isdigit() else 0.0
+    if not квота:
+        доля = _прочитать(os.path.join(корень, "cpu", "cpu.cfs_quota_us"))
+        период = _прочитать(os.path.join(корень, "cpu", "cpu.cfs_period_us"))
+        try:
+            if доля and int(доля) > 0 and период:
+                квота = int(доля) / int(период)
+        except (ValueError, ZeroDivisionError):
+            pass
+    if not предел:
+        v1 = _прочитать(os.path.join(корень, "memory", "memory.limit_in_bytes"))
+        # «Без предела» в v1 — число около 2⁶³, округлённое до страницы.
+        if v1.isdigit() and int(v1) < (1 << 60):
+            предел = float(v1)
+            текущее = _прочитать(os.path.join(корень, "memory", "memory.usage_in_bytes"))
+            занято = float(текущее) if текущее.isdigit() else 0.0
+    return квота, предел, занято
+
+
+def _доступно_процессоров() -> int:
+    """Сколько логических процессоров процессу разрешено (0 — неизвестно)."""
+    try:
+        return len(os.sched_getaffinity(0))          # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return 0
+
+
+@lru_cache(maxsize=4)
+def _постоянное(data_dir: str = ".") -> HardwareInfo:
+    """То, что за время работы процесса не меняется: модель процессора,
+    карты, версии библиотек. Кешируется на всё время процесса."""
     total_ram, avail_ram = _memory_gb()
     ffmpeg_ok, ffmpeg_ver = _ffmpeg()
     torch_ver, cuda_ver, cudnn_ver, mps_ok = _torch_info()
@@ -253,12 +355,7 @@ def detect(data_dir: str = ".") -> HardwareInfo:
         elif mps_ok or (platform.system() == "Darwin" and platform.machine() == "arm64"):
             accelerator = "mps"
 
-    try:
-        usage = shutil.disk_usage(data_dir)
-        disk_free = round(usage.free / 1024 ** 3, 1)
-    except OSError:
-        disk_free = 0.0
-
+    квота, предел_памяти, _ = пределы_контейнера()
     info = HardwareInfo(
         os_name=platform.system(),
         os_version=platform.release(),
@@ -268,7 +365,7 @@ def detect(data_dir: str = ".") -> HardwareInfo:
         cpu_cores_logical=os.cpu_count() or 1,
         ram_total_gb=total_ram,
         ram_available_gb=avail_ram,
-        disk_free_gb=disk_free,
+        disk_free_gb=0.0,
         gpus=gpus,
         accelerator=accelerator,
         cuda_version=cuda_ver,
@@ -277,29 +374,111 @@ def detect(data_dir: str = ".") -> HardwareInfo:
         ffmpeg=ffmpeg_ok,
         ffmpeg_version=ffmpeg_ver,
         python_version=platform.python_version(),
+        cpu_limit=round(квота, 2),
+        memory_limit_gb=round(предел_памяти / 1024 ** 3, 1) if предел_памяти else 0.0,
+        ram_host_gb=total_ram,
+        cpu_affinity=_доступно_процессоров(),
     )
+    if info.memory_limit_gb and info.memory_limit_gb < total_ram:
+        info.ram_total_gb = info.memory_limit_gb
+    return info
 
-    if not ffmpeg_ok:
-        info.warnings.append(
+
+#: Как долго верить замеру свободной видеопамяти: `nvidia-smi` — это
+#: десятки миллисекунд, а спрашивают о ней при каждом открытии панели.
+ВИДЕОПАМЯТЬ_С = 15.0
+_видеопамять: dict[str, Any] = {"at": 0.0, "free": {}}
+_видеопамять_замок = threading.Lock()
+
+
+def _свободная_видеопамять() -> dict[int, int]:
+    """Свободная видеопамять по картам NVIDIA, не старше `ВИДЕОПАМЯТЬ_С`."""
+    with _видеопамять_замок:
+        if time.time() - _видеопамять["at"] < ВИДЕОПАМЯТЬ_С:
+            return dict(_видеопамять["free"])
+        свободно: dict[int, int] = {}
+        if shutil.which("nvidia-smi"):
+            for строка in _run(["nvidia-smi", "--query-gpu=index,memory.free",
+                                "--format=csv,noheader,nounits"], timeout=4.0).splitlines():
+                части = [ч.strip() for ч in строка.split(",")]
+                if len(части) >= 2 and части[0].isdigit():
+                    try:
+                        свободно[int(части[0])] = int(float(части[1]))
+                    except ValueError:
+                        continue
+        _видеопамять["at"] = time.time()
+        _видеопамять["free"] = свободно
+        return dict(свободно)
+
+
+def detect(data_dir: str = ".") -> HardwareInfo:
+    """Оборудование: постоянное — из кеша процесса, изменчивое — свежее.
+
+    Прежде кешировалось всё сразу, на всё время процесса: свободное место,
+    доступная память и свободная видеопамять замерялись один раз при
+    запуске. «Свободно на диске» в панели и предупреждения показывали
+    вчерашние числа, а установщик языковой модели проверял место и память
+    по состоянию на момент запуска сервера — после скачивания десятков
+    гигабайт он всё ещё считал их свободными.
+    """
+    info = copy.deepcopy(_постоянное(data_dir))
+    _, info.ram_available_gb = _memory_gb()
+    _, предел, занято = пределы_контейнера()
+    if предел:
+        # MemAvailable в контейнере — память всей машины: на сервере со
+        # ста гигабайтами контейнер с пределом в восемь видел девяносто
+        # «доступных» и брал модель, которую тут же убивал OOM.
+        info.ram_available_gb = round(min(info.ram_available_gb,
+                                          max(0.0, предел - занято) / 1024 ** 3), 1)
+    try:
+        info.disk_free_gb = round(shutil.disk_usage(data_dir).free / 1024 ** 3, 1)
+    except OSError:
+        info.disk_free_gb = 0.0
+    if any(g.vendor == "nvidia" for g in info.gpus):
+        свободно = _свободная_видеопамять()
+        for карта in info.gpus:
+            if карта.index in свободно:
+                карта.memory_free_mb = свободно[карта.index]
+    info.warnings = _предупреждения(info)
+    return info
+
+
+detect.cache_clear = _постоянное.cache_clear          # type: ignore[attr-defined]
+
+
+def _предупреждения(info: HardwareInfo) -> list[str]:
+    """Предупреждения — по свежим числам, а не по замеру при запуске."""
+    итог: list[str] = []
+    if not info.ffmpeg:
+        итог.append(
             "Не найден ffmpeg. Без него доступны только файлы WAV 16 кГц моно. "
             "Установите: apt install ffmpeg / brew install ffmpeg / winget install ffmpeg")
-    if accelerator == "cpu" and total_ram and total_ram < 8:
-        info.warnings.append(
-            f"Всего {total_ram} ГБ оперативной памяти. Для моделей уровня large "
+    if info.accelerator == "cpu" and info.ram_total_gb and info.ram_total_gb < 8:
+        итог.append(
+            f"Всего {info.ram_total_gb} ГБ оперативной памяти. Для моделей уровня large "
             "рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.")
-    if disk_free and disk_free < 20:
-        info.warnings.append(
-            f"На диске свободно {disk_free} ГБ. Полный набор моделей занимает свыше 100 ГБ.")
-    if accelerator == "cuda" and cuda_ver and cudnn_ver:
-        major = cudnn_ver[:1]
-        if cuda_ver.startswith("12") and major == "8":
-            info.warnings.append(
+    if info.memory_limit_gb and info.memory_limit_gb < info.ram_host_gb:
+        итог.append(
+            f"Контейнеру отведено {info.memory_limit_gb} ГБ памяти из {info.ram_host_gb} ГБ "
+            "машины: рекомендации и подбор модели считаются по пределу контейнера.")
+    if info.cpu_limit and info.cpu_limit < info.cpu_cores_physical:
+        итог.append(
+            f"Контейнеру отведено {info.cpu_limit:g} ядра процессора из "
+            f"{info.cpu_cores_physical}: число потоков подобрано по квоте.")
+    if info.disk_free_gb and info.disk_free_gb < 20:
+        итог.append(
+            f"На диске свободно {info.disk_free_gb} ГБ. Полный набор моделей занимает "
+            "свыше 100 ГБ.")
+    if info.accelerator == "cuda" and info.cuda_version and info.cudnn_version:
+        major = info.cudnn_version[:1]
+        if info.cuda_version.startswith("12") and major == "8":
+            итог.append(
                 "Обнаружены CUDA 12 и cuDNN 8: для faster-whisper требуется ctranslate2==4.4.0.")
-    if accelerator == "mps":
-        info.warnings.append(
+    if info.accelerator == "mps":
+        итог.append(
             "Apple Silicon: часть движков (NeMo, faster-whisper на GPU) не поддерживает MPS. "
             "Для macOS рекомендуется whisper.cpp с Metal и Core ML.")
-    return info
+    return итог
 
 
 def recommended_settings(info: HardwareInfo | None = None) -> dict[str, Any]:
@@ -335,7 +514,7 @@ def recommended_settings(info: HardwareInfo | None = None) -> dict[str, Any]:
         concurrent = 1
     else:
         device, compute_type, cache = "cpu", "int8", 1
-        cores = info.cpu_cores_physical
+        cores = info.cpu_cores_available
         batch = 4 if cores >= 8 else 2
         model = "gigaam-v3-ctc" if info.ram_total_gb >= 8 else "faster-whisper-small"
         concurrent = max(1, min(4, cores // 4))
@@ -347,7 +526,7 @@ def recommended_settings(info: HardwareInfo | None = None) -> dict[str, Any]:
         "model": model,
         "model_cache_size": cache,
         "max_concurrent_jobs": concurrent,
-        "cpu_threads": 0 if info.accelerator != "cpu" else max(1, info.cpu_cores_physical - 1),
+        "cpu_threads": 0 if info.accelerator != "cpu" else max(1, info.cpu_cores_available - 1),
         "_reason": _explain(info, vram_gb),
     }
 
@@ -363,8 +542,8 @@ def _explain(info: HardwareInfo, vram_gb: float) -> str:
     if info.accelerator == "mps":
         return ("Apple Silicon: рекомендован whisper.cpp с Metal и Core ML — "
                 "это самый быстрый путь на macOS.")
-    return (f"Видеокарта не обнаружена. Выбран режим int8 на {info.cpu_cores_physical} "
-            f"физических ядрах — единственный практичный вариант на процессоре.")
+    return (f"Видеокарта не обнаружена. Выбран режим int8 на {info.cpu_cores_available} "
+            f"ядрах — единственный практичный вариант на процессоре.")
 
 
 def check_model_fits(vram_needed_gb: float, info: HardwareInfo | None = None) -> tuple[bool, str]:

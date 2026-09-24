@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 from pathlib import Path
@@ -70,24 +71,83 @@ def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None
     return direct if direct.exists() else None
 
 
+def размер_каталога(путь: Path | str | None, *, предел: int | None = None
+                    ) -> tuple[int, int, bool]:
+    """Размер каталога на диске: байты, файлы и «обход закончен».
+
+    Один обход на весь сервер: им считают и размер модели в списке, и
+    метрику `asrhub_storage_bytes`, и самопроверка. Раньше их было три, и
+    два из них шли по символическим ссылкам. В кеше Hugging Face веса лежат
+    в `blobs/`, а `snapshots/<ревизия>/` — это ссылки на них: `rglob` с
+    `is_file()` проходил и то и другое, и каталог моделей получался вдвое
+    больше настоящего. Самопроверка при этом считала верно, и две цифры об
+    одном и том же расходились ровно вдвое.
+
+    Правило такое. В каталоги по ссылке не заходим (иначе петля и чужой
+    диск). Ссылка на файл внутри обходимого дерева не считается: сам файл
+    будет посчитан, когда до него дойдёт обход. Ссылка на файл снаружи
+    считается один раз — веса, вынесенные на другой диск ссылкой, всё же
+    занимают место под модели.
+
+    `предел` — сколько файлов обойти, прежде чем сдаться: каталог
+    результатов на миллион файлов обходится минутами. Тогда третий элемент
+    ответа — False, а байты — оценка снизу.
+    """
+    if путь is None:
+        return 0, 0, True
+    корень = os.path.realpath(str(путь))
+    try:
+        if os.path.isfile(корень):
+            # Веса GigaAM — один файл, а не каталог: обход по файлу не даёт
+            # ничего, и размер скачанной модели показывался нулевым.
+            return os.path.getsize(корень), 1, True
+        if not os.path.isdir(корень):
+            return 0, 0, True
+    except OSError:
+        return 0, 0, False
+    внутри = корень.rstrip(os.sep) + os.sep
+    всего = файлов = 0
+    снаружи: set[str] = set()
+    полностью = True
+    стек = [корень]
+    while стек:
+        текущий = стек.pop()
+        try:
+            записи = list(os.scandir(текущий))
+        except OSError:
+            # Каталог без прав на чтение: остальное дерево считаем, но
+            # честно говорим, что посчитано не всё.
+            полностью = False
+            continue
+        for запись in записи:
+            try:
+                if запись.is_dir(follow_symlinks=False):
+                    стек.append(запись.path)
+                    continue
+                if запись.is_symlink():
+                    цель = os.path.realpath(запись.path)
+                    if цель.startswith(внутри) or цель in снаружи or not os.path.isfile(цель):
+                        continue
+                    снаружи.add(цель)
+                    размер = os.path.getsize(цель)
+                elif запись.is_file(follow_symlinks=False):
+                    размер = запись.stat(follow_symlinks=False).st_size
+                else:
+                    continue
+            except OSError:
+                continue
+            всего += размер
+            файлов += 1
+            if предел is not None and файлов >= предел:
+                return всего, файлов, False
+    return всего, файлов, полностью
+
+
 def directory_size(path: Path | None) -> int:
+    """Размер модели на диске в байтах — см. `размер_каталога`."""
     if path is None or not path.exists():
         return 0
-    # Веса GigaAM — один файл, а не каталог: rglob по файлу не даёт ничего, и
-    # размер скачанной модели показывался нулевым.
-    if path.is_file():
-        try:
-            return path.stat().st_size
-        except OSError:
-            return 0
-    total = 0
-    for item in path.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except OSError:
-            continue
-    return total
+    return размер_каталога(path)[0]
 
 
 def fingerprint(models_dir: Path | str, source: str, revision: str = "") -> str:

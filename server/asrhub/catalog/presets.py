@@ -2,6 +2,11 @@
 
 Пресет задаёт только те параметры, которые отличаются от значений по умолчанию.
 Остальные берутся из каталога параметров.
+
+Параметр в пресете обязан действовать на движок пресета. У GigaAM здесь
+стояли ширина луча и повтор с температурой — параметры Whisper и NeMo,
+которые GigaAM не читает вовсе, — и описания обещали «широкий луч» и
+«жадный поиск», которых не было. Проверка — в tests/test_review_45_catalog.py.
 """
 from __future__ import annotations
 
@@ -13,14 +18,14 @@ PRESETS: list[PresetSpec] = [
         name="Русский: максимальная точность",
         scenario="Протоколы совещаний, юридические записи, интервью для публикации",
         description=(
-            "GigaAM v3 RNNT с готовой пунктуацией, широкий луч, аккуратная нарезка по VAD. "
+            "GigaAM v3 RNNT с готовой пунктуацией и аккуратной нарезкой по VAD: "
+            "мягкий порог речи и длинные паузы, чтобы фраза не резалась посередине. "
             "Самый точный вариант для русского языка из доступных свободных моделей."
         ),
         hardware_hint="GPU от 8 ГБ либо CPU от 8 ядер (медленнее примерно в 10 раз)",
         expected="RTF около 0.10–0.15 на RTX 3060; WER на чистой речи менее 3 %",
         values={
             "engine": "gigaam", "model": "gigaam-v3-e2e-rnnt", "language": "ru",
-            "beam_size": 8, "temperature_fallback": True,
             "vad_enabled": True, "vad_backend": "silero", "vad_threshold": 0.45,
             "vad_min_silence_ms": 700, "vad_max_speech_s": 22.0, "vad_speech_pad_ms": 300,
             "audio_normalize": True, "audio_highpass_hz": 80, "audio_trim_silence": True,
@@ -35,15 +40,14 @@ PRESETS: list[PresetSpec] = [
         name="Русский: массовая обработка архива",
         scenario="Тысячи файлов, важна пропускная способность",
         description=(
-            "GigaAM v3 CTC с жадным поиском и крупным пакетом. Потеря точности "
-            "относительно максимального режима — менее одного процентного пункта, "
-            "выигрыш по времени — в три-четыре раза."
+            "GigaAM v3 CTC и крупный пакет: CTC декодируется за один проход, без "
+            "поиска по гипотезам. Потеря точности относительно максимального режима — "
+            "менее одного процентного пункта, выигрыш по времени — в три-четыре раза."
         ),
         hardware_hint="GPU от 12 ГБ",
         expected="RTF около 0.03–0.05 на RTX 3090; WER на чистой речи около 3–4 %",
         values={
             "engine": "gigaam", "model": "gigaam-v3-ctc", "language": "ru",
-            "beam_size": 1, "temperature_fallback": True,
             "vad_enabled": True, "vad_threshold": 0.5, "vad_min_silence_ms": 500,
             "vad_max_speech_s": 22.0, "vad_speech_pad_ms": 150,
             "audio_normalize": True, "audio_trim_silence": True,
@@ -90,7 +94,6 @@ PRESETS: list[PresetSpec] = [
         expected="Время обработки примерно в 1.5 раза больше, чем без диаризации",
         values={
             "engine": "gigaam", "model": "gigaam-v3-e2e-rnnt", "language": "ru",
-            "beam_size": 5,
             "vad_enabled": True, "vad_threshold": 0.35, "vad_min_silence_ms": 600,
             "vad_speech_pad_ms": 300,
             "audio_normalize": True, "audio_highpass_hz": 80,
@@ -116,7 +119,6 @@ PRESETS: list[PresetSpec] = [
         expected="Готовые SRT и VTT без ручной правки таймингов",
         values={
             "engine": "gigaam", "model": "gigaam-v3-e2e-rnnt", "language": "ru",
-            "beam_size": 5,
             "vad_enabled": True, "vad_min_silence_ms": 400, "vad_max_speech_s": 12.0,
             "vad_speech_pad_ms": 150,
             "word_timestamps": True,

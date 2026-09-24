@@ -47,7 +47,7 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      (f"{PREFIX}/alerts", f"{PREFIX}/alerts/history",
       f"{PREFIX}/alerts/rules", f"{PREFIX}/alerts/rules/reset")),
     ("Приёмники метрик", "Куда сервер отправляет метрики сам.",
-     (f"{PREFIX}/targets", f"{PREFIX}/targets/test")),
+     (f"{PREFIX}/targets", f"{PREFIX}/targets/{{name}}", f"{PREFIX}/targets/test")),
     ("Готовые конфигурации", "Файлы для Prometheus, Grafana и Zabbix.",
      (f"{PREFIX}/config/prometheus", f"{PREFIX}/config/prometheus-scrape",
       f"{PREFIX}/config/grafana", f"{PREFIX}/config/zabbix")),
@@ -64,7 +64,8 @@ OPEN_ROUTES = {
 }
 ADMIN_ROUTES = {
     (f"{PREFIX}/alerts/rules", "put"), (f"{PREFIX}/alerts/rules/reset", "post"),
-    (f"{PREFIX}/targets", "put"), (f"{PREFIX}/targets/test", "post"),
+    (f"{PREFIX}/targets", "put"), (f"{PREFIX}/targets", "post"),
+    (f"{PREFIX}/targets/{{name}}", "delete"), (f"{PREFIX}/targets/test", "post"),
 }
 
 
@@ -150,7 +151,11 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "curl": "curl 'http://сервер:8080/api/monitoring/metrics'",
         "show": f"{PREFIX}/metrics", "lang": "", "limit": 700,
         "note": "Формат задаётся параметром `format`; по умолчанию — текстовый "
-                "формат Prometheus.",
+                "формат Prometheus. `zabbix_sender` — строки «узел ключ значение» "
+                "для `zabbix_sender -i -`, `zabbix` — то же телом запроса "
+                "траппера (JSON). При `metrics_enabled: false` ответ — 404 с "
+                "кодом `metrics_disabled`: выключенный экспорт закрывает и этот "
+                "адрес, и прежний `/api/metrics`.",
     },
     (f"{PREFIX}/metrics.json", "get"): {
         "curl": "curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'",
@@ -168,7 +173,11 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     (f"{PREFIX}/live", "get"): {
         "curl": "curl -o /dev/null -w '%{http_code}\\n' http://сервер:8080/api/monitoring/live",
         "note": "Провал означает «перезапусти контейнер», поэтому проба не "
-                "зависит ни от базы, ни от очереди.",
+                "зависит ни от базы, ни от очереди. У сервера, запущенного с "
+                "`--no-queue` («только интерфейс», задания считает соседний "
+                "сервер), отсутствие рабочих потоков — не провал: проба "
+                "отвечает 200 и так и пишет. Тексты ошибок в пробах — без "
+                "путей на диске: пробы открыты без ключа.",
     },
     (f"{PREFIX}/ready", "get"): {
         "curl": "curl 'http://сервер:8080/api/monitoring/ready'",
@@ -197,7 +206,8 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
                 "  -d '[{\"metric\": \"asrhub_queue_depth\", \"direction\": \"above\",\n"
                 "        \"threshold\": 500, \"severity\": \"warning\",\n"
                 "        \"for_seconds\": 1800}]'",
-        "note": "Заменяет весь набор правил целиком. Вернуть пороги каталога — "
+        "note": "Набор заменяется целиком: правило не добавляется к прежним, "
+                "передавайте весь список. Вернуть пороги каталога — "
                 "`POST /api/monitoring/alerts/rules/reset`.\n\n"
                 "Каждое правило проверяется: `direction` — `above` или `below`, "
                 "`severity` — `warning` или `critical` (регистр не важен), "
@@ -205,7 +215,41 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
                 "Опечатка в имени — 400 с названием метрики: правило на "
                 "несуществующую метрику молчало бы всегда. Поле `inclusive` "
                 "(сравнивать с порогом включительно) сохраняется — правило, "
-                "полученное из `GET`, можно отправить обратно как есть.",
+                "полученное из `GET`, можно отправить обратно как есть; не "
+                "названное — включительно для порога 1 «выше» и 0 «ниже». "
+                "Правила с одной метрикой и важностью, но разными порогами "
+                "живут раздельно (второе получает номер в `id`), а точный "
+                "повтор отбрасывается.",
+    },
+    (f"{PREFIX}/targets", "put"): {
+        "curl": "curl -X PUT http://сервер:8080/api/monitoring/targets \\\n"
+                f"  -H 'X-API-Key: {K}' -H 'Content-Type: application/json' \\\n"
+                "  -d '[{\"name\": \"influx\", \"kind\": \"influxdb\",\n"
+                "        \"url\": \"http://influx:8086\", \"database\": \"asrhub\",\n"
+                "        \"headers\": {\"Authorization\": \"Token …\"}}]'",
+        "note": "Список записывается и в config.yaml (`persisted` в ответе "
+                "говорит, удалась ли запись в файл). Приёмник сопоставляется "
+                "с сохранённым по имени: чего в описании нет, берётся у "
+                "сохранённого, а заголовок со значением `***` (так их отдаёт "
+                "`GET`) означает «оставить как было». Поэтому список из ответа "
+                "`GET` можно отправить обратно, ничего не потеряв.",
+    },
+    (f"{PREFIX}/targets", "post"): {
+        "curl": "curl -X POST http://сервер:8080/api/monitoring/targets \\\n"
+                f"  -H 'X-API-Key: {K}' -H 'Content-Type: application/json' \\\n"
+                "  -d '{\"kind\": \"zabbix\", \"url\": \"zabbix://zabbix:10051\",\n"
+                "       \"host\": \"asr-01\"}'",
+        "note": "Так работает кнопка «Добавить приёмник» в интерфейсе. "
+                "Ответ — добавленный приёмник, сколько их теперь и удалась ли "
+                "запись в config.yaml:\n\n"
+                "```json\n{\"target\": {\"name\": \"zabbix\", …}, \"targets\": 2, "
+                "\"persisted\": true}\n```",
+    },
+    (f"{PREFIX}/targets/{{name}}", "delete"): {
+        "curl": f"curl -X DELETE -H 'X-API-Key: {K}' "
+                "http://сервер:8080/api/monitoring/targets/influxdb-2",
+        "note": "Оставшийся список записывается в config.yaml. Приёмника с "
+                "таким именем нет — 400 с подсказкой, где взять список.",
     },
     (f"{PREFIX}/targets", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' http://сервер:8080/api/monitoring/targets",
@@ -216,19 +260,40 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
                 f"  -H 'X-API-Key: {K}' -H 'Content-Type: application/json' \\\n"
                 "  -d '{\"kind\": \"influxdb\", \"url\": \"http://influx:8086\",\n"
                 "       \"database\": \"asrhub\"}'",
-        "note": "Отправляет текущий снимок немедленно и возвращает результат. "
-                "Приёмник при этом не сохраняется и в рассылку не встаёт — "
-                "настройку удобно проверить до того, как записать её в "
-                "конфигурацию. Сбой любого рода (опечатка в порту, приёмник, "
+        "note": "Приёмник в рассылку не встаёт. Сбой любого рода "
+                "(опечатка в порту, приёмник, "
                 "отвечающий не по HTTP, перенаправление) возвращается в `error`; "
-                "учётные данные из адреса в тексте ошибки маскируются.\n\n"
+                "учётные данные из адреса в тексте ошибки маскируются. Имя "
+                "сохранённого приёмника позволяет проверить его, не зная "
+                "заголовков: значения `***` берутся у сохранённого. Zabbix "
+                "отвечает строкой «processed: …; failed: …» — она приходит в "
+                "`info`; если не принято ни одного значения, это ошибка с "
+                "подсказкой про имя узла и шаблон. Проба StatsD шлёт по "
+                "счётчикам ноль: иначе итог с запуска удвоил бы счёт у рабочей "
+                "отправки.\n\n"
                 "```json\n{\"ok\": true, \"sent_metrics\": 118}\n```",
+    },
+    (f"{PREFIX}/config/prometheus-scrape", "get"): {
+        "curl": "curl http://сервер:8080/api/monitoring/config/prometheus-scrape",
+        "note": "Одно задание сбора — элемент списка `scrape_configs`: вставьте "
+                "его под этот ключ в prometheus.yml. Прежде отдавался блок "
+                "вместе с ключом, и дописанный в конец файла он давал второй "
+                "`scrape_configs:`. Адрес сервера — тот, по которому фрагмент "
+                "забрали (заголовок `Host`), а не `0.0.0.0` из настройки; "
+                "параметр `target` задаёт его явно.\n\n"
+                "```yaml\n- job_name: asrhub\n  metrics_path: /api/monitoring/metrics\n"
+                "  scrape_interval: 30s\n  scrape_timeout: 10s\n  static_configs:\n"
+                "    - targets: ['сервер:8080']\n```",
     },
     (f"{PREFIX}/config/prometheus", "get"): {
         "curl": "curl http://сервер:8080/api/monitoring/config/prometheus \\\n"
                 "  -o /etc/prometheus/asrhub-rules.yml",
-        "note": "Файл правил, собранный из порогов каталога. Проверить перед "
-                "применением: `promtool check rules asrhub-rules.yml`.",
+        "note": "Пороги — те же, что у встроенных тревог и шаблона Zabbix "
+                "(свободное место — от `disk_min_free_gb`), знак сравнения — "
+                "тот же. Сверх них — правило на замолчавший сервер "
+                "(`ASRHubDown`) и на остановившуюся отправку в Pushgateway "
+                "(`ASRHubPushStale`). Проверить перед применением: "
+                "`promtool check rules asrhub-rules.yml`.",
     },
     (f"{PREFIX}/info", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' http://сервер:8080/api/monitoring/info",
@@ -288,6 +353,7 @@ curl -H "X-API-Key: $КЛЮЧ" "$СЕРВЕР/api/monitoring/catalog"
 | `auth_error` | 401 | ключ не передан или недействителен при `monitoring_public: false` |
 | `forbidden` | 403 | ключ есть, но роли не хватает |
 | `metric_not_found` | 404 | нет метрики с таким именем |
+| `metrics_disabled` | 404 | экспорт метрик выключен настройкой `metrics_enabled` |
 | `rate_limited` | 429 | превышен лимит частоты для ключа |
 
 ⚠️ Ответ 503 у `/health`, `/ready` и `/startup` — не ошибка запроса, а
@@ -385,9 +451,14 @@ echo "развёртывание проверено"
 - **Пробы — не метрики.** `/live` и `/ready` отвечают кодом, а не числом, и
   вызывать их для сбора статистики не нужно.
 - **Изменение правил заменяет набор целиком.** `PUT /api/monitoring/alerts/rules`
-  не добавляет правило к существующим: передавайте весь список.
+  не добавляет правило к существующим: передавайте весь список. Правила и
+  приёмники записываются в config.yaml и переживают перезапуск.
 - **Проверка приёмника ничего не сохраняет.** `POST /api/monitoring/targets/test`
-  только отправляет снимок и возвращает результат.
+  только отправляет снимок и возвращает результат. Добавить один приёмник —
+  `POST /api/monitoring/targets`, убрать — `DELETE /api/monitoring/targets/{имя}`.
+- **Тревоги считаются и без опроса.** Раз в минуту сервер сам снимает метрики
+  и прогоняет правила, поэтому лента событий узнаёт о кончающемся диске и
+  там, где нет ни Prometheus, ни открытой вкладки «Мониторинг».
 - **`collection_errors` важнее, чем кажется.** Пустой список означает, что все
   источники опрошены. Непустой — что часть метрик отсутствует, а тревоги поверх
   них молчат не потому, что всё хорошо.

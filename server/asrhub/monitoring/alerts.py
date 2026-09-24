@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .catalog import METRICS_BY_NAME
+from .catalog import METRICS_BY_NAME, порог, порог_нарушен, слово_порога
 from .collector import Sample
 
 log = logging.getLogger("asrhub.monitoring")
@@ -42,12 +42,47 @@ class Rule:
     enabled: bool = True
     summary: str = ""
     #: Сравнивать включительно — когда порог стоит на краю шкалы метрики.
-    inclusive: bool = False
+    #: None — «не сказано»: см. `__post_init__`.
+    inclusive: bool | None = None
+    #: Номер среди правил с тем же именем (см. `AlertEngine.set_rules`).
+    ordinal: int = field(default=0, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Признак включительности всегда явный к моменту сравнения.
+
+        Правила каталога несут его из порога — тем же знаком он уходит в
+        Prometheus и Zabbix (`catalog.оператор_порога`). Своему правилу,
+        где его не назвали, достаётся прежнее поведение движка: порог 1
+        «выше» и 0 «ниже» — на краю шкалы признака 0/1, и строгое сравнение
+        с ними не сработало бы никогда. Раньше то же самое движок решал сам
+        при каждом сравнении — и для правил каталога тоже, отчего встроенные
+        тревоги и выгрузка для Prometheus по одной метрике расходились.
+        """
+        if self.inclusive is None:
+            self.inclusive = bool(
+                (self.direction == "above" and self.threshold == 1)
+                or (self.direction == "below" and self.threshold == 0))
 
     @property
     def id(self) -> str:
+        """Имя правила: метрика, важность, метки — и номер, если имя занято.
+
+        Два своих правила на одну метрику с одной важностью, но разными
+        порогами (предупредить на 200 и на 500) раньше получали одно имя и
+        общее состояние — и сбрасывали друг другу выдержку на каждом
+        опросе. Теперь второе получает номер (`…#2`), а первое и все
+        правила каталога — прежнее имя: на него ссылаются история тревог и
+        лента событий.
+        """
         suffix = "-".join(f"{k}:{v}" for k, v in sorted(self.labels.items()))
-        return f"{self.metric}|{self.severity}" + (f"|{suffix}" if suffix else "")
+        имя = f"{self.metric}|{self.severity}" + (f"|{suffix}" if suffix else "")
+        return f"{имя}#{self.ordinal}" if self.ordinal > 1 else имя
+
+    @property
+    def условие(self) -> tuple[Any, ...]:
+        """Что правило проверяет — для поиска настоящих повторов."""
+        return (self.metric, self.severity, tuple(sorted(self.labels.items())),
+                self.direction, float(self.threshold), bool(self.inclusive))
 
     def matches(self, sample: Sample) -> bool:
         if sample.name != self.metric:
@@ -55,23 +90,8 @@ class Rule:
         return all(sample.labels.get(k) == v for k, v in self.labels.items())
 
     def breached(self, value: float) -> bool:
-        """Нарушен ли порог.
-
-        Для признаков со значениями 0 и 1 строгое «больше единицы» не
-        сработает никогда, поэтому единица сравнивается на равенство. То же
-        самое, но не так заметно, бывает с любым порогом НА КРАЮ шкалы:
-        уровень дрейфа уверенности принимает значения 0, 1 и 2, а
-        критический порог у него — 2, и «больше двух» не бывает. Такие
-        пороги помечены в каталоге как включительные.
-        """
-        включительно = self.inclusive
-        if self.direction == "above":
-            if включительно or self.threshold == 1:
-                return value >= self.threshold
-            return value > self.threshold
-        if включительно or self.threshold == 0:
-            return value <= self.threshold
-        return value < self.threshold
+        """Нарушен ли порог — тем же знаком, что в Prometheus и Zabbix."""
+        return порог_нарушен(value, self.direction, self.threshold, bool(self.inclusive))
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "metric": self.metric, "direction": self.direction,
@@ -113,8 +133,18 @@ class Rule:
             labels={str(k): str(v) for k, v in метки.items()},
             enabled=bool(data.get("enabled", True)),
             summary=str(data.get("summary", "")),
-            inclusive=bool(data.get("inclusive", False)),
+            # Не названо — решает __post_init__ (прежнее поведение движка).
+            inclusive=_да_нет(data.get("inclusive")),
         )
+
+
+def _да_нет(значение: Any) -> bool | None:
+    """Признак из настроек: строка «false» — это «нет», а не непустая строка."""
+    if значение is None or значение == "":
+        return None
+    if isinstance(значение, str):
+        return значение.strip().lower() in ("1", "true", "yes", "on", "да")
+    return bool(значение)
 
 
 #: Сколько снимков подряд метрика должна отсутствовать, чтобы это считалось
@@ -125,6 +155,14 @@ class Rule:
 #: снимка при опросе раз в полчаса — это полтора часа, а пять минут при
 #: опросе раз в пять секунд — шестьдесят снимков.
 ПРОПАЖА_СЕКУНД = 300.0
+
+#: Сколько сработавшее условие должно не держаться, чтобы тревога снялась, —
+#: но не дольше выдержки самого правила. Без этого значение, гуляющее у
+#: порога (очередь то 51, то 49 при пороге 50), давало на каждом опросе
+#: «тревога — снята — тревога» и забивало ленту событий, в которой тонуло
+#: всё остальное. Правило с нулевой выдержкой снимается сразу, как и
+#: поднимается.
+УСПОКОЕНИЕ_С = 300.0
 
 
 @dataclass
@@ -142,6 +180,9 @@ class AlertState:
     #: Пропажа на один-два снимка — не отказ источника, а заминка сбора.
     missing_since: float = 0.0
     missing: int = 0
+    #: С какого момента сработавшее условие больше не держится (см.
+    #: `УСПОКОЕНИЕ_С`); ноль — держится.
+    clear_since: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         spec = METRICS_BY_NAME.get(self.rule.metric)
@@ -165,11 +206,16 @@ class AlertState:
         }
 
 
-def default_rules() -> list[Rule]:
-    """Правила из порогов каталога метрик — то же, что уходит в Prometheus."""
+def default_rules(settings: Any = None) -> list[Rule]:
+    """Правила из порогов каталога метрик — то же, что уходит в Prometheus.
+
+    `settings` сдвигает пороги, которые зависят от настроек сервера
+    (свободное место — от `disk_min_free_gb`), тем же `catalog.порог`, что
+    и выгрузки для Prometheus и Zabbix.
+    """
     rules: list[Rule] = []
     for spec in METRICS_BY_NAME.values():
-        threshold = spec.threshold
+        threshold = порог(spec, settings)
         if not threshold or spec.name == "asrhub_up":
             continue
         # Метрики, для которых порог задан в процентах или в приросте, здесь
@@ -184,18 +230,35 @@ def default_rules() -> list[Rule]:
             labels = {"stat": "p95"}
         elif spec.name == "asrhub_confidence":
             labels = {"stat": "avg"}
+        уже: set[float] = set()
         for severity, value in (("critical", threshold.critical),
                                 ("warning", threshold.warning)):
-            if value is None:
+            # Одинаковые пороги у двух уровней — одно и то же условие: у
+            # `asrhub_engines_available` (1 и 1) поднимались две тревоги об
+            # одном. Выгрузка для Prometheus так и делала — оставляла
+            # критическую; встроенный движок заводил обе.
+            if value is None or value in уже:
                 continue
+            уже.add(value)
             rules.append(Rule(
                 metric=spec.name, direction=threshold.direction, threshold=float(value),
                 severity=severity, for_seconds=threshold.for_seconds, labels=labels,
                 inclusive=bool(getattr(threshold, "inclusive", False)),
-                summary=f"{spec.label}: {'выше' if threshold.direction == 'above' else 'ниже'} "
-                        f"{value}{(' ' + spec.unit) if spec.unit else ''}",
+                summary=f"{spec.label}: "
+                        f"{слово_порога(threshold.direction, bool(threshold.inclusive))} "
+                        f"{_для_людей(float(value), spec.unit)}",
             ))
     return rules
+
+
+def _для_людей(значение: float, единица: str) -> str:
+    """Порог в подписи тревоги: «5 ГБ», а не «5368709120.0 Б»."""
+    if единица == "Б":
+        for предел, имя in ((1024 ** 4, "ТБ"), (1024 ** 3, "ГБ"), (1024 ** 2, "МБ"),
+                            (1024, "КБ")):
+            if abs(значение) >= предел:
+                return f"{значение / предел:.4g} {имя}"
+    return f"{значение:.6g}" + (f" {единица}" if единица else "")
 
 
 def _state_order(state: AlertState) -> tuple[bool, bool, str]:
@@ -211,10 +274,11 @@ class AlertEngine:
     def __init__(self, rules: list[Rule] | None = None,
                  on_change: Callable[[AlertState, str], None] | None = None) -> None:
         self._lock = threading.Lock()
-        self._rules: list[Rule] = rules if rules is not None else default_rules()
+        self._rules: list[Rule] = []
         self._states: dict[str, AlertState] = {}
         self._history: list[dict[str, Any]] = []
         self.on_change = on_change
+        self.set_rules(rules if rules is not None else default_rules())
 
     # -- правила -------------------------------------------------------------
 
@@ -224,13 +288,33 @@ class AlertEngine:
             return list(self._rules)
 
     def set_rules(self, rules: list[Rule]) -> None:
-        with self._lock:
-            self._rules = list(rules)
-            valid = {r.id for r in rules}
-            self._states = {k: v for k, v in self._states.items() if k in valid}
+        """Заменяет правила.
 
-    def reset_rules(self) -> None:
-        self.set_rules(default_rules())
+        Правило, повторяющее уже заведённое условие, отбрасывается: два
+        одинаковых делили бы одно состояние и одну тревогу. Правило с тем
+        же именем, но другим порогом получает номер — своё имя и своё
+        состояние.
+        """
+        свои: list[Rule] = []
+        условия: set[tuple[Any, ...]] = set()
+        занято: dict[str, int] = {}
+        for правило in rules:
+            if правило.условие in условия:
+                continue
+            условия.add(правило.условие)
+            правило.ordinal = 0
+            основа = правило.id
+            занято[основа] = занято.get(основа, 0) + 1
+            if занято[основа] > 1:
+                правило.ordinal = занято[основа]
+            свои.append(правило)
+        имена = {п.id for п in свои}
+        with self._lock:
+            self._rules = свои
+            self._states = {k: v for k, v in self._states.items() if k in имена}
+
+    def reset_rules(self, settings: Any = None) -> None:
+        self.set_rules(default_rules(settings))
 
     # -- вычисление ----------------------------------------------------------
 
@@ -303,12 +387,17 @@ class AlertEngine:
             state.state = STATE_OK
             state.resolved_at = now
             state.since = 0.0
+            state.clear_since = 0.0
             state.missing = 0
             state.missing_since = 0.0
             snapshot = state.to_dict()
         log.info("Тревога снята: метрика «%s» не приходит в снимок дольше %d с",
                  rule.metric, ПРОПАЖА_СЕКУНД)
         self._record(snapshot, previous)
+        # В ленту событий — как и любое снятие. Раньше обработчик здесь не
+        # звали: сработавшая тревога молча исчезала из раздела, а в журнале
+        # событий так и оставалась «сработавшей» навсегда.
+        self._сообщить(state, previous)
 
     def _advance(self, rule: Rule, value: float, now: float) -> None:
         with self._lock:
@@ -321,12 +410,23 @@ class AlertEngine:
 
             if rule.breached(value):
                 state.breaches += 1
+                state.clear_since = 0.0
                 if previous == STATE_OK:
                     state.state = STATE_PENDING
                     state.since = now
                 elif previous == STATE_PENDING and now - state.since >= rule.for_seconds:
                     state.state = STATE_FIRING
                     state.fired_at = now
+            elif previous == STATE_FIRING:
+                # Сработавшая тревога снимается не с первого же хорошего
+                # значения, а когда оно продержалось (см. УСПОКОЕНИЕ_С).
+                if not state.clear_since:
+                    state.clear_since = now
+                if now - state.clear_since >= min(УСПОКОЕНИЕ_С, float(rule.for_seconds)):
+                    state.state = STATE_OK
+                    state.resolved_at = now
+                    state.since = 0.0
+                    state.clear_since = 0.0
             elif previous != STATE_OK:
                 state.state = STATE_OK
                 state.resolved_at = now
@@ -337,11 +437,15 @@ class AlertEngine:
 
         if changed and snapshot is not None:
             self._record(snapshot, previous)
-            if self.on_change:
-                try:
-                    self.on_change(state, previous)
-                except Exception as exc:                    # noqa: BLE001
-                    log.warning("Обработчик оповещения упал: %s", exc)
+            self._сообщить(state, previous)
+
+    def _сообщить(self, state: AlertState, previous: str) -> None:
+        """Зовёт обработчик смены состояния; его сбой — не повод падать."""
+        if self.on_change:
+            try:
+                self.on_change(state, previous)
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("Обработчик оповещения упал: %s", exc)
 
     def _record(self, snapshot: dict[str, Any], previous: str) -> None:
         entry = {"ts": time.time(), "from": previous, **snapshot}

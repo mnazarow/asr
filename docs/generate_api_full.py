@@ -508,8 +508,10 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     ("/api/review", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/review?status=pending&limit=20'",
         "show": "/api/review?status=pending&limit=3", "limit": 1200,
-        "note": "Строка закрывается сама, когда по записи задан эталон "
-                "(`POST /api/jobs/{id}/reference`).",
+        "note": "Пропустить запись без эталона — `PUT /api/review/{id}` с "
+                "телом `{\"status\": \"skipped\"}`; пополнить очередь, не "
+                "дожидаясь суточного отбора, — `POST /api/review/sample` "
+                "(администратор).",
     },
     ("/api/control", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/control?period=week'",

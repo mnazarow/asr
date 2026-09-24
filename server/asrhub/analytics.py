@@ -23,6 +23,12 @@ log = get_logger("analytics")
 #: ничем не ограничена, в отличие от моделей, движков и языков.
 TAG_LIMIT = 100
 
+#: Ниже какой средней уверенности задание считается «неуверенным». Одно
+#: число на весь сервер: этой же границей считает долю мониторинг
+#: (`asrhub_low_confidence_share`), и раньше там стояло 0,7 против 0,75
+#: здесь — одна и та же доля в двух местах давала два разных числа.
+НИЗКАЯ_УВЕРЕННОСТЬ = 0.75
+
 PERIODS = {
     "hour": 3600,
     "day": 86400,
@@ -199,7 +205,7 @@ class Analytics:
             "quality": {
                 "confidence": M.summarize(conf_values),
                 "wer": M.summarize(wer_values) if wer_values else None,
-                "low_confidence_jobs": sum(1 for c in conf_values if c < 0.75),
+                "low_confidence_jobs": sum(1 for c in conf_values if c < НИЗКАЯ_УВЕРЕННОСТЬ),
                 "confidence_distribution": M.confidence_buckets(conf_values) if conf_values else [],
             },
             "stages": self._stage_breakdown(done),
@@ -208,13 +214,23 @@ class Analytics:
     def _stage_breakdown(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
         keys = {
             "audio_prep_s": "Подготовка аудио",
+            "vad_s": "Поиск речи",
             "model_load_s": "Загрузка модели",
             "inference_s": "Распознавание",
+            "alignment_s": "Выравнивание",
+            "diarization_s": "Разделение по говорящим",
             "postprocess_s": "Постобработка",
         }
         totals: dict[str, float] = {}
         for key in keys:
             totals[key] = sum(float(j.get(key) or 0) for j in jobs)
+        # Поиск речи, выравнивание и разделение по говорящим хранятся с
+        # версии 3.1.17 и бывают не у всех заданий. Стадия, которой в периоде
+        # не было, в разбивку не идёт: «Выравнивание — 0 с» в легенде читается
+        # как «выравнивание ничего не стоит», а его просто не включали.
+        keys = {k: v for k, v in keys.items()
+                if totals[k] or k in ("audio_prep_s", "model_load_s",
+                                      "inference_s", "postprocess_s")}
         grand = sum(totals.values()) or 1.0
         return {
             "labels": [keys[k] for k in keys],
@@ -743,7 +759,7 @@ class Analytics:
                 "audio_hours": round(sum(float(j.get("media_duration_s") or 0)
                                          for j in items) / 3600, 2),
                 "confidence_avg": round(sum(conf) / len(conf), 4) if conf else None,
-                "low_confidence_share": round(sum(1 for c in conf if c < 0.75) / len(conf), 4)
+                "low_confidence_share": round(sum(1 for c in conf if c < НИЗКАЯ_УВЕРЕННОСТЬ) / len(conf), 4)
                 if conf else None,
                 "wer_avg": round(sum(wer) / len(wer), 4) if wer else None,
                 "wer_jobs": len(wer),
@@ -873,7 +889,7 @@ class Analytics:
             c = job.get("avg_confidence")
             if c is not None:
                 корзины[i]["conf"].append(float(c))
-                корзины[i]["low"].append(1.0 if float(c) < 0.75 else 0.0)
+                корзины[i]["low"].append(1.0 if float(c) < НИЗКАЯ_УВЕРЕННОСТЬ else 0.0)
             w = job.get("wer")
             if w is not None:
                 корзины[i]["wer"].append(float(w))
@@ -925,8 +941,8 @@ class Analytics:
         def сравнить(имя: str, б: list[dict[str, Any]], т: list[dict[str, Any]]) -> dict[str, Any]:
             итог = stats.drift_verdict([float(j["avg_confidence"]) for j in б],
                                        [float(j["avg_confidence"]) for j in т])
-            низких = sum(1 for j in т if float(j["avg_confidence"]) < 0.75)
-            низких_базы = sum(1 for j in б if float(j["avg_confidence"]) < 0.75)
+            низких = sum(1 for j in т if float(j["avg_confidence"]) < НИЗКАЯ_УВЕРЕННОСТЬ)
+            низких_базы = sum(1 for j in б if float(j["avg_confidence"]) < НИЗКАЯ_УВЕРЕННОСТЬ)
             return {"key": имя, **итог,
                     "low_share": round(100.0 * низких / len(т), 1) if т else None,
                     "low_share_baseline": round(100.0 * низких_базы / len(б), 1) if б else None}
@@ -986,7 +1002,7 @@ class Analytics:
                 c = j.get("avg_confidence")
                 if c is not None:
                     корзины[i]["conf"].append(float(c))
-                    корзины[i]["low"].append(1.0 if float(c) < 0.75 else 0.0)
+                    корзины[i]["low"].append(1.0 if float(c) < НИЗКАЯ_УВЕРЕННОСТЬ else 0.0)
                 if j.get("quality_flags") is not None and int(j.get("segments_count") or 0):
                     корзины[i]["suspect"].append(
                         100.0 * float(j.get("suspect_segments") or 0)

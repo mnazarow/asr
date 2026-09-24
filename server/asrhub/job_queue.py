@@ -1346,6 +1346,12 @@ class JobQueue:
             model_load_s=outcome.timings.get("model_load"),
             inference_s=outcome.timings.get("inference"),
             postprocess_s=outcome.timings.get("postprocess"),
+            # Поиск речи, выравнивание и разделение по говорящим конвейер
+            # мерил всегда, а база не хранила: метрика стадий обещала
+            # «долю diarization», которой в выгрузке не было никогда.
+            vad_s=outcome.timings.get("vad"),
+            alignment_s=outcome.timings.get("alignment"),
+            diarization_s=outcome.timings.get("diarization"),
             language=outcome.language,
             device=str(outcome.stats.get("device") or merged.get("device") or ""),
             peak_memory_mb=outcome.peak_memory_mb or None,

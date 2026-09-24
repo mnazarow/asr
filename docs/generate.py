@@ -450,15 +450,16 @@ def generate_monitoring() -> str:
     add("# 1. Убедиться, что метрики отдаются")
     add("curl http://сервер:8080/api/monitoring/metrics | head -20")
     add("")
-    add("# 2. Забрать готовый блок для prometheus.yml")
-    add("curl http://сервер:8080/api/monitoring/config/prometheus-scrape >> prometheus.yml")
+    add("# 2. Забрать готовое задание сбора и вставить его в prometheus.yml")
+    add("#    под ключ scrape_configs: (см. «Настройка Prometheus»)")
+    add("curl http://сервер:8080/api/monitoring/config/prometheus-scrape")
     add("")
     add("# 3. Забрать готовые правила оповещения и панель Grafana")
     add("curl http://сервер:8080/api/monitoring/config/prometheus -o asrhub-rules.yml")
     add("curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.json")
     add("```\n")
     add("> **Рекомендация.** Начните с пяти метрик и не пытайтесь следить за всеми сразу. "
-        "`asrhub_up`, `asrhub_queue_depth`, `asrhub_disk_free_gb`, `asrhub_rtf` и доля "
+        "`asrhub_up`, `asrhub_queue_depth`, `asrhub_disk_free_bytes`, `asrhub_rtf` и доля "
         "неудачных заданий закрывают почти все аварии, которые случаются на практике. "
         "Остальное пригодится, когда будете разбираться в причинах.\n")
 
@@ -481,7 +482,9 @@ def generate_monitoring() -> str:
         ("`GET /api/monitoring/alerts`", "Состояние тревог", "нужен"),
         ("`GET /api/monitoring/alerts/history`", "История срабатываний", "нужен"),
         ("`GET`/`PUT /api/monitoring/alerts/rules`", "Правила оповещения", "нужен"),
-        ("`GET`/`PUT /api/monitoring/targets`", "Приёмники метрик", "нужен"),
+        ("`GET`/`PUT`/`POST /api/monitoring/targets`",
+         "Приёмники метрик: список, замена, добавление одного", "нужен"),
+        ("`DELETE /api/monitoring/targets/{имя}`", "Убрать приёмник", "нужен"),
         ("`POST /api/monitoring/targets/test`", "Проверить приёмник немедленно", "нужен"),
         ("`GET /api/monitoring/config/prometheus`", "Готовые правила оповещения", "не нужен*"),
         ("`GET /api/monitoring/config/grafana`", "Готовая панель", "не нужен*"),
@@ -497,7 +500,7 @@ def generate_monitoring() -> str:
 
     # --- форматы ------------------------------------------------------------
     add("## Форматы выгрузки\n")
-    add("Один и тот же снимок отдаётся в семи форматах — параметром `format`.\n")
+    add("Один и тот же снимок отдаётся в девяти форматах — параметром `format`.\n")
     add("| Значение | Формат | Для чего |")
     add("|---|---|---|")
     formats = [
@@ -507,7 +510,8 @@ def generate_monitoring() -> str:
         ("`otlp`", "OTLP/HTTP", "OpenTelemetry Collector"),
         ("`influx`", "InfluxDB line protocol", "InfluxDB, Telegraf, VictoriaMetrics"),
         ("`graphite`", "Graphite plaintext", "Graphite, StatsD, Carbon"),
-        ("`zabbix`", "JSON для zabbix_sender", "Zabbix"),
+        ("`zabbix_sender`", "строки «узел ключ значение»", "`zabbix_sender -i -` по расписанию"),
+        ("`zabbix`", "тело запроса траппера Zabbix (JSON)", "своя доставка в Zabbix, отладка"),
         ("`csv`", "плоская таблица", "разовая выгрузка в таблицу"),
     ]
     for value, name, why in formats:
@@ -515,7 +519,7 @@ def generate_monitoring() -> str:
     add("")
     add("```bash")
     add("curl 'http://сервер:8080/api/monitoring/metrics?format=influx'")
-    add("curl 'http://сервер:8080/api/monitoring/metrics?format=zabbix&host=asr-01'")
+    add("curl 'http://сервер:8080/api/monitoring/metrics?format=zabbix_sender&host=asr-01'")
     add("```\n")
 
     add(MONITORING_SETUP)
@@ -556,7 +560,7 @@ def generate_monitoring() -> str:
                 add(f"> **Рекомендация.** {spec.recommendation}\n")
             if spec.threshold:
                 threshold = spec.threshold
-                word = "выше" if threshold.direction == "above" else "ниже"
+                word = mon.слово_порога(threshold.direction, bool(threshold.inclusive))
                 parts = []
                 if threshold.warning is not None:
                     parts.append(f"предупреждение — {word} {threshold.warning}")
@@ -650,21 +654,27 @@ MONITORING_SETUP = """## Раздел «Мониторинг» в интерфе
 
 ## Настройка Prometheus
 
-Сервер отдаёт готовый блок для `prometheus.yml`:
+Сервер отдаёт готовое задание сбора — элемент списка `scrape_configs`:
 
 ```bash
-curl http://сервер:8080/api/monitoring/config/prometheus-scrape
+curl http://asr.company.ru:8080/api/monitoring/config/prometheus-scrape
 ```
 
 ```yaml
-scrape_configs:
-  - job_name: asrhub
-    metrics_path: /api/monitoring/metrics
-    scrape_interval: 30s
-    scrape_timeout: 10s
-    static_configs:
-      - targets: ['asr.company.ru:8080']
+- job_name: asrhub
+  metrics_path: /api/monitoring/metrics
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  static_configs:
+    - targets: ['asr.company.ru:8080']
 ```
+
+Вставьте его в `prometheus.yml` под существующий ключ `scrape_configs:` с
+отступом в два пробела. Дописывать фрагмент в конец файла нельзя: второй
+ключ `scrape_configs` строгий разбор Prometheus отвергает, а нестрогий
+молча теряет все прежние задания. Адрес в `targets` — тот, по которому
+фрагмент забрали (заголовок `Host`); задать его явно можно параметром
+`?target=узел:порт`. За прокси с https во фрагмент добавляется `scheme: https`.
 
 > **Рекомендация.** Интервал сбора чаще 15 секунд смысла не имеет: замеры процессора,
 > памяти и видеокарты обновляются раз в 20 секунд служебным циклом сервера, и более
@@ -692,14 +702,21 @@ curl -X POST http://prometheus:9090/-/reload
 Внутри — правила вида:
 
 ```yaml
-- alert: ASRHubDiskFreeGbCritical
-  expr: asrhub_disk_free_gb < 5
+- alert: ASRHubDiskFreeBytesCritical
+  expr: asrhub_disk_free_bytes < 5368709120.0
   for: 300s
   labels: { severity: critical }
   annotations:
     summary: 'Свободно на диске: ниже 5 ГБ'
     description: 'POST /api/maintenance/cleanup, затем bash scripts/models.sh disk'
 ```
+
+Знак сравнения у каждого правила — тот же, что у встроенных тревог и у
+триггеров Zabbix: порог на краю шкалы («записей с тревожными упоминаниями —
+не меньше одной», «уровень дрейфа — не меньше двух») сравнивается
+включительно, остальные — строго. Пороги, зависящие от настроек сервера,
+файл берёт из них: свободное место — критично ниже `disk_min_free_gb`,
+предупреждение — ниже двойного значения, но не меньше 10 ГБ.
 
 Часть правил считается не прямым сравнением, а выражением — иначе они были бы
 бессмысленны:
@@ -710,13 +727,28 @@ curl -X POST http://prometheus:9090/-/reload
 sum(rate(asrhub_jobs_total{status="failed"}[30m]))
   / clamp_min(sum(rate(asrhub_jobs_total[30m])), 0.001) > 0.2
 
-# видеопамять в процентах от общего объёма, а не в мегабайтах
-asrhub_gpu_memory_mb / clamp_min(asrhub_gpu_memory_total_mb, 1) * 100 > 90
+# видеопамять в процентах от общего объёма, а не в байтах
+asrhub_gpu_memory_used_bytes / clamp_min(asrhub_gpu_memory_total_bytes, 1) * 100 > 90
 
 # недоступность ловится через absent(): если сервис лежит,
 # метрики нет вообще, и сравнивать её значение не с чем
 absent(asrhub_up) == 1
+
+# при отправке в Pushgateway absent() не сработает никогда: шлюз держит
+# последнее значение, и молчание видно только по времени отправки
+time() - max(push_time_seconds{job="asrhub"}) > 600
 ```
+
+Гистограммы длительности (`asrhub_job_duration_seconds`,
+`asrhub_media_duration_seconds`) — честные счётчики с запуска сервиса:
+квантиль за любое окно считается как
+`histogram_quantile(0.95, sum by (le) (rate(asrhub_job_duration_seconds_bucket[1h])))`.
+Распределение за скользящие сутки по базе, переживающее перезапуск, —
+отдельными метриками `asrhub_job_duration_day_seconds{stat}` и
+`asrhub_media_duration_day_seconds{stat}`. Раньше суточное окно выкладывалось
+под именем гистограммы, и когда задания выходили из окна, счётчики
+убывали — rate() принимал это за перезапуск и выдавал в разы больше
+заданий, чем было.
 
 ⚠️ Пороги в готовом файле — отправная точка, а не истина. Очередь из ста заданий
 бывает и нормой, и аварией: это зависит от вашего потока. Прогоните файл неделю,
@@ -731,6 +763,11 @@ curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.
 
 Импортируется как есть: Dashboards → Import → Upload JSON. Панель собирается по
 группам каталога метрик, поэтому не расходится с тем, что сервер отдаёт.
+Внутри группы панели разделены по единице измерения — время, байты,
+проценты, частоты: на одной оси метрики разного масштаба прижимали друг
+друга к нулю. Источник данных и экземпляр выбираются переменными
+`datasource` и `instance` вверху панели, а ряды с метками подписаны своими
+метками (`RTF по моделям gigaam-v3-rnnt`).
 
 Что стоит вынести на первый экран собственной панели:
 
@@ -740,8 +777,8 @@ curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.
 | Очередь и её возраст | `asrhub_queue_depth`, `asrhub_queue_oldest_seconds` |
 | Скорость | `asrhub_rtf{stat="p95"}` |
 | Доля отказов | `sum(rate(asrhub_jobs_total{status="failed"}[30m])) / clamp_min(sum(rate(asrhub_jobs_total[30m])), 0.001)` |
-| Место на диске | `asrhub_disk_free_gb` |
-| Видеопамять, % | `asrhub_gpu_memory_mb / asrhub_gpu_memory_total_mb * 100` |
+| Место на диске | `asrhub_disk_free_bytes` |
+| Видеопамять, % | `asrhub_gpu_memory_used_bytes / asrhub_gpu_memory_total_bytes * 100` |
 | Часы аудио в час | `rate(asrhub_audio_seconds_total[1h]) * 3.6` |
 
 ## Zabbix
@@ -750,17 +787,46 @@ curl http://сервер:8080/api/monitoring/config/grafana -o asrhub-dashboard.
 curl http://сервер:8080/api/monitoring/config/zabbix -o asrhub-template.yaml
 ```
 
-Импорт: Настройка → Шаблоны → Импорт. Элементы создаются типом «Zabbix trapper»,
-данные отправляет сам сервер:
+Импорт: Настройка → Шаблоны → Импорт, затем привяжите шаблон «ASR Hub» к узлу.
+Элементы шаблона — типа «Zabbix trapper»: данные присылает сам сервер,
+протоколом траппера (как `zabbix_sender`) на порт 10051 сервера или прокси
+Zabbix:
 
 ```yaml
 monitoring_targets:
-  - kind: webhook
-    url: http://zabbix-proxy:10051/
+  - kind: zabbix
+    url: zabbix://zabbix-proxy:10051
+    host: asr-01            # имя узла ровно как в Zabbix; пусто — имя машины
     interval_s: 60
 ```
 
-Либо забирайте HTTP-агентом с `/api/monitoring/metrics?format=zabbix&host=asr-01`.
+Метрики с заранее известными метками (очередь по состояниям, срезы RTF и
+уверенности, размеры каталогов) — обычные элементы. Метрики с метками,
+которых заранее не знает никто (модель, видеокарта, маршрут, категория), —
+прототипы в правилах обнаружения, по правилу на метрику:
+`asrhub.discovery[<метрика>]`. Наборы меток сервер присылает сам — вместе со
+значениями, когда наборы изменились, и раз в полчаса на случай, если Zabbix
+перезапускали. Первую отправку после привязки шаблона Zabbix может частично
+отбить: элементы по обнаружению он создаёт с задержкой, и следующая отправка
+в них уже попадёт. Если не принято ни одного значения, в «Мониторинге» и в
+`GET /api/monitoring/targets` будет ошибка с подсказкой: скорее всего, имя
+узла в `host` не совпадает с заведённым в Zabbix.
+
+У каждой метрики с порогом — триггер на каждый уровень: «Предупреждение»
+и «Высокая», тем же знаком сравнения, что у Prometheus. У прототипов с
+метками по срезу (`stat`) триггеров нет — условие на значение макроса в
+прототип не выразить; такие правила есть в файле для Prometheus.
+
+Если серверу нельзя ходить в Zabbix самому, забирайте метрики по расписанию
+и отдавайте их `zabbix_sender`:
+
+```bash
+curl -s 'http://сервер:8080/api/monitoring/metrics?format=zabbix_sender&host=asr-01' \\
+  | zabbix_sender -z zabbix-proxy -i -
+```
+
+Прежняя рекомендация — «webhook на порт 10051» — не работала никогда: это
+HTTP-запрос, а траппер понимает только свой протокол.
 
 ## OpenTelemetry
 
@@ -774,6 +840,9 @@ monitoring_targets:
 Метрики уходят в общий сборщик телеметрии в формате OTLP/HTTP и дальше — куда
 настроен коллектор. Пакет `opentelemetry` на сервере не нужен: тело запроса
 собирается вручную, лишняя зависимость на сервере распознавания ни к чему.
+Счётчики уходят накопительными суммами с началом отсчёта в момент запуска
+сервера, гистограммы — гистограммами OTLP, единицы — в записи UCUM (`s`,
+`By`, `%`).
 
 ## Kubernetes
 
@@ -795,6 +864,11 @@ startupProbe:
   periodSeconds: 10
   failureThreshold: 60
 ```
+
+Сервер, запущенный с `--no-queue` («только интерфейс»: задания принимает,
+а считает их соседний сервер над той же базой), проходит пробы живости и
+запуска — отсутствие рабочих потоков у него не поломка. Раньше такой под
+Kubernetes перезапускал по кругу.
 
 Для сбора метрик оператором Prometheus:
 
@@ -829,8 +903,20 @@ monitoring_targets:
   - kind: influxdb
     url: http://influx:8086
     database: asrhub
+    headers: { Authorization: "Token …" }
     interval_s: 30
 ```
+
+Приёмники: `prometheus_pushgateway`, `influxdb`, `otlp`, `statsd`, `webhook`,
+`zabbix`. Добавленный в разделе «Мониторинг» приёмник записывается в
+`monitoring_targets` в config.yaml и переживает перезапуск; остальные
+приёмники при этом не меняются — ни заголовки, ни база, ни признак
+«выключен». Значения заголовков сервер не показывает никому (вместо них
+`***`), а `***`, присланное обратно, означает «оставить как было». Правка
+`monitoring_targets` на странице настроек действует сразу, без перезапуска.
+
+StatsD получает по счётчикам прирост с прошлой отправки (`|c`), а не итог с
+запуска: итог, присланный как `|c`, StatsD складывал бы при каждой отправке.
 
 Проверить настройку можно до сохранения — кнопкой «Проверить» в интерфейсе или
 запросом:
@@ -861,8 +947,16 @@ MONITORING_TAIL = """## Тревоги внутри сервера
 ```
 
 Промежуточное «наблюдение» существует, чтобы одиночный всплеск не будил дежурного:
-тревога поднимается, только если условие держится дольше выдержки. Смена состояния
-пишется в ленту событий сервера, поэтому историю видно и в разделе «Журнал».
+тревога поднимается, только если условие держится дольше выдержки. Снимается она
+тоже не с первого хорошего значения, а когда оно продержалось пять минут (у правил
+с выдержкой меньше пяти минут — столько, сколько выдержка): значение, гуляющее у
+порога, иначе давало «тревога — снята — тревога» на каждом опросе. Смена состояния
+пишется в ленту событий сервера, поэтому историю видно и в разделе «Журнал», — в
+том числе снятие тревоги, когда метрика перестала приходить.
+
+Тревоги считаются и без внешнего опроса: раз в минуту сервер сам снимает метрики
+и прогоняет правила. Раньше их считал только опрос метрик, и на установке без
+Prometheus и без открытой вкладки «Мониторинг» не срабатывала ни одна.
 
 ```bash
 curl -H "X-API-Key: ключ" http://сервер:8080/api/monitoring/alerts
@@ -878,7 +972,10 @@ curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \\
         "threshold": 500, "severity": "warning", "for_seconds": 1800}]'
 ```
 
-Вернуть пороги каталога: `POST /api/monitoring/alerts/rules/reset`.
+Вернуть пороги каталога: `POST /api/monitoring/alerts/rules/reset`. Свои правила
+записываются в `monitoring_rules` в config.yaml и переживают перезапуск; правка
+этого параметра на странице настроек действует сразу. Два своих правила на одну
+метрику с разными порогами (предупредить на 200 и на 500) живут раздельно.
 
 > **Рекомендация.** Если Prometheus у вас есть, оповещения держите в нём: там
 > история, группировка, подавление и маршрутизация дежурным. Встроенные тревоги —
@@ -891,7 +988,9 @@ curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \\
 `GET /api/monitoring/info` — поле `collection_errors` перечисляет источники,
 которые не удалось опросить, с причиной. Сбой одного источника не лишает вас
 остальных метрик: это сделано намеренно, чтобы неработающий `nvidia-smi` не
-оставлял без данных об очереди.
+оставлял без данных об очереди. Сам отказ виден метрикой
+`asrhub_collector_source_up{source="…"}` — на неё стоит тревога: без неё
+пропавшие метрики выглядели бы как «всё спокойно».
 
 **В Prometheus метрики есть, но все старые.** Проверьте `monitoring_cache_ttl_s`:
 если он больше интервала сбора, вы получаете один и тот же снимок несколько раз.
@@ -922,7 +1021,7 @@ curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \\
 | Что | Выражение | Почему именно это |
 |---|---|---|
 | Сервис не отвечает | `absent(asrhub_up) == 1` | Самая частая авария; всё остальное вторично |
-| Кончается диск | `asrhub_disk_free_gb < 20` | Заполненный диск повреждает базу и результаты |
+| Кончается диск | `asrhub_disk_free_bytes < 10 * 1024^3` | Заполненный диск повреждает базу и результаты |
 | Очередь растёт | `asrhub_queue_depth > 50` за 15 мин | Не хватает мощности; чем раньше видно, тем дешевле |
 | Люди ждут | `asrhub_queue_oldest_seconds > 1800` | То, что чувствует пользователь, а не сервер |
 | Задания падают | доля `failed` > 5 % за 30 мин | Отличает поломку от единичного плохого файла |

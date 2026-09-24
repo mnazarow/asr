@@ -1076,3 +1076,50 @@ def test_очистка_отвечает_словами_а_не_сырым_json(
     assert "{" not in подсказка and "заданий" in подсказка, подсказка
     assert "база сжата" in подсказка or "сжатие пропущено" in подсказка, подсказка
     _чисто(страница)
+
+
+def test_приёмник_метрик_добавляется_и_убирается_не_трогая_соседей(страница):
+    """Заход 45: «Добавить приёмник» пересобирал список из ответа GET.
+
+    В ответе не было заголовков, базы и признака «выключен», и сохранение
+    стирало всё это у прежних приёмников. Теперь диалог добавляет один
+    приёмник, у Zabbix спрашивает имя узла, а строка списка убирается своей
+    кнопкой.
+    """
+    import json
+    import urllib.request
+
+    def запрос(метод: str, путь: str, тело=None):
+        данные = json.dumps(тело).encode() if тело is not None else None
+        ответ = urllib.request.urlopen(urllib.request.Request(
+            f"{страница.сервер}{путь}", method=метод, data=данные,
+            headers={"Content-Type": "application/json"}))
+        return json.loads(ответ.read() or b"null")
+
+    запрос("PUT", "/api/monitoring/targets", [{
+        "name": "prod", "kind": "influxdb", "url": "http://127.0.0.1:9/write",
+        "headers": {"Authorization": "Token s"}, "database": "prod", "enabled": False}])
+    try:
+        _открыть(страница, "monitoring")
+        страница.click("#mon-add-target")
+        страница.select_option("#tg-kind", "zabbix")
+        assert страница.is_visible("#tg-host"), "у Zabbix не спросили имя узла"
+        страница.fill("#tg-url", "zabbix://127.0.0.1:9")
+        страница.fill("#tg-host", "asr-01")
+        страница.click("#tg-save")
+        страница.wait_for_selector('#toasts .toast:has-text("добавлен")', timeout=15000)
+        приёмники = {п["name"]: п for п in запрос("GET", "/api/monitoring/targets")["targets"]}
+        assert приёмники["prod"]["headers"] == {"Authorization": "***"}
+        assert приёмники["prod"]["database"] == "prod"
+        assert приёмники["prod"]["enabled"] is False
+        assert приёмники["zabbix"]["host"] == "asr-01"
+
+        страница.wait_for_selector('[data-drop-target="zabbix"]', timeout=15000)
+        страница.once("dialog", lambda окно: окно.accept())
+        страница.click('[data-drop-target="zabbix"]')
+        страница.wait_for_selector('#toasts .toast:has-text("убран")', timeout=15000)
+        assert [п["name"] for п in запрос("GET", "/api/monitoring/targets")["targets"]] == [
+            "prod"]
+        _чисто(страница)
+    finally:
+        запрос("PUT", "/api/monitoring/targets", [])

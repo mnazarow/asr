@@ -76,6 +76,11 @@ class AppState:
     analytics: Analytics
     started_at: float = field(default_factory=time.time)
     subscribers: set[Any] = field(default_factory=set)
+    #: Обрабатывает ли этот процесс очередь. `--no-queue` — «только
+    #: интерфейс»: задания принимает, а считает их соседний сервер над
+    #: той же базой. Пробам это нужно знать, иначе такой сервер вечно
+    #: «мёртв» и оркестратор перезапускает его по кругу.
+    queue_enabled: bool = True
     monitoring: Any = None
     #: Разбор содержания записей: признаки, свод по корпусу, пересчёт архива.
     content: Any = None
