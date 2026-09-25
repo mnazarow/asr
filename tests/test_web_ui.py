@@ -20,6 +20,7 @@ Chromium сборки Playwright. Если его нет — проверки п
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 import time
@@ -487,7 +488,9 @@ def test_the_record_card_saves_a_reference_and_shows_accuracy(страница):
     assert "WER" in карточка and "MER" in карточка and "WIL" in карточка, карточка[:400]
     assert "подмена" in карточка, карточка[:400]
     вкладка = страница.inner_text('#job-tabs button[data-tab="reference"]')
-    assert "WER" in вкладка and "0.0%" not in вкладка, вкладка
+    # Нулевой WER пишется «0,0 %»: прежняя проверка искала «0.0%» без пробела
+    # и с точкой — такой строки интерфейс не выводил никогда.
+    assert "WER" in вкладка and not re.search(r"WER 0[,.]0\s?%", вкладка), вкладка
     _чисто(страница)
 
     _открыть(страница, "analytics")

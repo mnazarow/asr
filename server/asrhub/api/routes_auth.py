@@ -108,11 +108,17 @@ def login(request: Request, response: Response,
         address=адрес if адрес != "неизвестно" else "")
     _set_cookie(request, response, token, expires)
     log.info("Вход: %s", account.username)
-    return {
+    ответ: dict[str, Any] = {
         "user": account.to_dict(),
         "expires_at": expires,
         "must_change_password": account.must_change_password,
     }
+    if account.must_change_password:
+        # Почему смена обязательна — так форма скажет правду (см. /me).
+        ответ["password_reason"] = (
+            "default" if account.username.lower() == DEFAULT_USERNAME
+            and password == DEFAULT_PASSWORD else "assigned")
+    return ответ
 
 
 def _войти(state, accounts, username: str, password: str):
@@ -185,16 +191,29 @@ def me(request: Request,
        principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Сведения о текущем входе — их спрашивает интерфейс при загрузке."""
     state = get_state(request)
+    вход_включён = bool(state.settings.get("auth_enabled", True))
     data: dict[str, Any] = {
         "name": principal.name,
         "role": principal.role,
         "group": principal.group,
         "kind": "user" if principal.user_id else "key",
         "must_change_password": principal.must_change_password,
+        "auth_enabled": вход_включён,
     }
-    if principal.is_admin and state.accounts is not None:
+    if principal.must_change_password and state.accounts is not None:
+        # Почему нужна смена: форма говорила «пароль, заданный при первом
+        # запуске, известен всем» и тому, кому администратор выдал
+        # временный пароль лично, — а это неправда и пугает зря.
+        учётка = state.accounts.get(principal.user_id) if principal.user_id else None
+        data["password_reason"] = (
+            "default" if учётка is not None
+            and учётка.username.lower() == DEFAULT_USERNAME
+            and state.accounts.uses_default_password() else "assigned")
+    if principal.is_admin and state.accounts is not None and вход_включён:
         # Предупреждение про пароль по умолчанию видит только администратор:
-        # остальным оно ничего не даёт, а подсказывает лишнее.
+        # остальным оно ничего не даёт, а подсказывает лишнее. И только
+        # когда вход включён: без него пароль ничего не защищает, а
+        # предупреждение всплывало на каждой загрузке страницы.
         data["default_password_in_use"] = state.accounts.uses_default_password()
     return data
 

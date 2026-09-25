@@ -1289,13 +1289,18 @@ def test_a_recording_with_an_ascii_name_keeps_it_on_save(client, tmp_path: Path)
     assert "filename*=" not in заголовок, (
         "если сервер стал слать RFC 5987 и для латиницы — проверка устарела")
 
-    # Плеер разбирает заголовок общей функцией, а не своей копией.
+    # Плеер разбирает заголовок общей функцией, а не своей копией. С
+    # захода 46 все скачивания идут одним путём — `скачатьФайл`, — и разбор
+    # имени живёт там.
     app_js = (Path(__file__).resolve().parent.parent / "server" / "asrhub"
               / "web" / "app.js").read_text(encoding="utf-8")
     сохранение = app_js[app_js.index("  async save(id) {"):]
     сохранение = сохранение[:сохранение.index("\n  },")]
-    assert "parseFilename(disposition)" in сохранение, сохранение
+    assert "скачатьФайл(Player.url(id)" in сохранение, сохранение
     assert "filename\\*=utf-8" not in сохранение, "своя копия разбора вернулась"
+    общий = app_js[app_js.index("async function скачатьФайл("):]
+    общий = общий[:общий.index("\n}\n")]
+    assert "parseFilename(response.headers.get('Content-Disposition')" in общий, общий
 
 
 def test_a_status_code_is_not_recognised_inside_a_file_path():

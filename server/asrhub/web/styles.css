@@ -432,10 +432,17 @@ details.help[open] summary { margin-bottom: 6px; }
 
 .badge-license { font-family: var(--mono); font-size: 10.5px; }
 
-.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+/* Вкладки прокручиваются вбок, а не раздвигают страницу: на ширине телефона
+   одиннадцать вкладок «Аналитики записей» уводили весь раздел на 943 px. */
+.tabs {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
+  max-width: 100%;
+}
 .tabs button {
   border: 0; background: transparent; border-bottom: 2px solid transparent;
   border-radius: 0; color: var(--text-dim); padding: 8px 14px; font-size: 13px;
+  flex: 0 0 auto; white-space: nowrap;
 }
 .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 550; }
 .tabs button:hover { background: var(--bg-hover); border-color: transparent; border-bottom-color: var(--border); }
@@ -808,3 +815,14 @@ th.sortable:hover { color: var(--text); }
 
 /* Полоса доли в разделах аналитики: подпись сверху, полоса снизу. */
 .share-row { margin-bottom: 10px; }
+
+/* Кнопка без оформления — там, где действие выглядит текстом: имя в строке
+   таблицы, заголовок столбца с сортировкой. Мышью и так щёлкали по строке;
+   кнопка даёт то же с клавиатуры и диктору. */
+button.plain {
+  border: 0; background: transparent; padding: 0; margin: 0;
+  color: inherit; font: inherit; text-align: inherit; cursor: pointer;
+}
+button.plain:hover { background: transparent; text-decoration: underline; }
+button.plain:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+th.sortable button.plain { white-space: nowrap; }

@@ -59,15 +59,43 @@ function escText(value) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+/* Число для подписи — с десятичной запятой, как принято в русском тексте.
+ *
+ * Интерфейс писал «0.93» и «4.00 КБ», документация — «0,93»: одно и то же
+ * значение выглядело по-разному в двух местах. Запятая только в тексте:
+ * в разметку (ширины, координаты) эти строки не попадают. */
 function fmtNum(value, digits) {
     if (value === null || value === undefined || Number.isNaN(value)) return '—';
     const abs = Math.abs(value);
-    if (abs >= 1e9) return (value / 1e9).toFixed(1) + ' млрд';
-    if (abs >= 1e6) return (value / 1e6).toFixed(1) + ' млн';
-    if (abs >= 1e4) return (value / 1e3).toFixed(1) + ' тыс';
-    if (digits !== undefined) return value.toFixed(digits);
+    const запятая = (строка) => строка.replace('.', ',');
+    if (abs >= 1e9) return запятая((value / 1e9).toFixed(1)) + ' млрд';
+    if (abs >= 1e6) return запятая((value / 1e6).toFixed(1)) + ' млн';
+    if (abs >= 1e4) return запятая((value / 1e3).toFixed(1)) + ' тыс';
+    if (digits !== undefined) return запятая(value.toFixed(digits));
     if (Number.isInteger(value)) return String(value);
-    return value.toFixed(abs < 1 ? 3 : 2);
+    const знаков = abs < 1 ? 3 : 2;
+    // Ненулевое значение не должно выглядеть нулём: 0,0004 при трёх знаках
+    // становилось «0,000». Таким — две значащие цифры.
+    if (abs < 0.5 * Math.pow(10, -знаков)) return запятая(value.toPrecision(2));
+    return запятая(value.toFixed(знаков));
+  }
+
+  /* Сколько знаков после запятой нужно подписям делений оси.
+   *
+   * Деления подписывал общий fmtNum — три знака у чисел меньше единицы и
+   * целое без знаков. При шаге 0,0002 (время ответа модели в тысячных
+   * секунды) это давало «0,000» у двух делений подряд, а при шаге 0,5 —
+   * «0,500», «1», «1,50»: у каждого деления своя точность. Теперь знаков
+   * ровно столько, сколько у шага, и у всех делений поровну. */
+  function знаковШага(ticks) {
+    if (ticks.length < 2) return undefined;
+    const шаг = Math.abs(ticks[1] - ticks[0]);
+    if (!(шаг > 0) || шаг >= 1) return undefined;
+    return Math.min(10, Math.ceil(-Math.log10(шаг) - 1e-9));
+  }
+
+  function подписьДеления(value, знаков) {
+    return value === 0 || знаков === undefined ? fmtNum(value) : fmtNum(value, знаков);
   }
 
   function niceTicks(min, max, count) {
@@ -127,13 +155,15 @@ function fmtNum(value, digits) {
   function axes(ctx, yTicks, xLabels, opts) {
     const { svg, pad, iw, ih } = ctx;
     const grid = gridColor();
+    const знаков = знаковШага(yTicks);
     yTicks.forEach((value) => {
       const y = pad.top + ih - ((value - ctx.yMin) / (ctx.yMax - ctx.yMin || 1)) * ih;
       el('line', { x1: pad.left, y1: y, x2: pad.left + iw, y2: y,
                    stroke: grid, 'stroke-width': 1 }, svg);
       el('text', { x: pad.left - 7, y: y + 3.5, 'text-anchor': 'end',
                    fill: faint(), 'font-size': 10.5 }, svg)
-        .textContent = (opts && opts.yFormat ? opts.yFormat(value) : fmtNum(value));
+        .textContent = (opts && opts.yFormat ? opts.yFormat(value)
+          : подписьДеления(value, знаков));
     });
     if (xLabels && xLabels.length) {
       const step = Math.max(1, Math.ceil(xLabels.length / (opts && opts.xTicks || 7)));
@@ -287,8 +317,23 @@ function fmtNum(value, digits) {
 
   // ---- столбчатый график --------------------------------------------------
 
+  /* Цвет ряда: код состояния (ok, warn, err, idle, info) или свой цвет. */
+  function seriesColor(color, index) {
+    const коды = status();
+    if (color && коды[color]) return коды[color];
+    return color || palette()[index % palette().length];
+  }
+
   function bars(host, config) {
-    const values = config.values || [];
+    // Составные столбцы: `series` — ряды друг на друге («успешно» и «сбои»
+    // в одной корзине). Очередь модели передавала ряды в `Charts.stacked`,
+    // а та рисует одну полосу долей и ждёт `parts` — карточка «Разобрано»
+    // всегда показывала «Пока нет данных для графика».
+    const ряды = Array.isArray(config.series) && config.series.length ? config.series : null;
+    const values = ряды
+      ? (ряды[0].values || []).map((_, i) => ряды.reduce(
+        (сумма, ряд) => сумма + (Number((ряд.values || [])[i]) || 0), 0))
+      : (config.values || []);
     if (!values.length) return empty(host, config.emptyText);
     // Подпись значения стоит над столбцом, и у самого высокого она
     // упиралась в верхний край: число обрезалось ровно там, где столбец
@@ -313,16 +358,37 @@ function fmtNum(value, digits) {
       const height = (v / ctx.yMax) * ctx.ih;
       const x = ctx.pad.left + index * slot + gap / 2;
       const y = ctx.pad.top + ctx.ih - height;
-      const color = config.colors ? config.colors[index] : colors[0];
-      const path = el('path', {
-        d: roundedTop(x, y, barWidth, Math.max(height, v > 0 ? 2 : 0), radius),
-        fill: color,
-      }, ctx.svg);
       // Подпись в подсказке — необязательная: ниже её отсутствие уже
       // предусмотрено, а здесь обращение шло без проверки, и любой график
       // без `labels` падал на первом же столбце, уводя за собой весь раздел.
       const подпись = (config.labels || [])[index];
-      attachTip(path, `${подпись ? подпись + ': ' : ''}${fmtNum(v)}${config.unit || ''}`);
+      if (ряды) {
+        // Снизу вверх; скругление — только у верхнего непустого куска,
+        // между кусками — зазор цвета подложки.
+        const непустые = ряды.map((ряд, k) => ({ ряд, k, v: Number((ряд.values || [])[index]) || 0 }))
+          .filter((кусок) => кусок.v > 0);
+        let низ = ctx.pad.top + ctx.ih;
+        непустые.forEach((кусок, n) => {
+          const h = (кусок.v / ctx.yMax) * ctx.ih;
+          const верхний = n === непустые.length - 1;
+          const зазор = n > 0 ? 2 : 0;
+          const высота = Math.max(1, h - зазор);
+          const path = el('path', {
+            d: верхний ? roundedTop(x, низ - h, barWidth, высота, radius)
+              : `M${x},${низ - h}h${barWidth}v${высота}h${-barWidth}Z`,
+            fill: seriesColor(кусок.ряд.color, кусок.k),
+          }, ctx.svg);
+          attachTip(path, `${подпись ? подпись + ': ' : ''}${кусок.ряд.name} — ${fmtNum(кусок.v)}${config.unit || ''}`);
+          низ -= h;
+        });
+      } else {
+        const color = config.colors ? config.colors[index] : colors[0];
+        const path = el('path', {
+          d: roundedTop(x, y, barWidth, Math.max(height, v > 0 ? 2 : 0), radius),
+          fill: color,
+        }, ctx.svg);
+        attachTip(path, `${подпись ? подпись + ': ' : ''}${fmtNum(v)}${config.unit || ''}`);
+      }
       if (config.showValues !== false && values.length <= 14 && v > 0) {
         el('text', { x: x + barWidth / 2, y: y - 5, 'text-anchor': 'middle',
                      fill: ink(), 'font-size': 10.5 }, ctx.svg).textContent = fmtNum(v);
@@ -343,6 +409,9 @@ function fmtNum(value, digits) {
         }
       }
     });
+    if (ряды) {
+      legend(host, ряды.map((ряд, k) => ({ name: ряд.name, color: seriesColor(ряд.color, k) })));
+    }
     return ctx.svg;
   }
 
@@ -458,7 +527,7 @@ function fmtNum(value, digits) {
         fill: part.color || colors[index % colors.length],
       }, svg);
       attachTip(rect, `${part.label}: ${fmtNum(part.value)}${config.unit || ''} ` +
-        `(${((part.value / total) * 100).toFixed(1)} %)`);
+        `(${fmtNum((part.value / total) * 100, 1)} %)`);
       offset += width;
     });
     legend(host, parts.map((p, i) => ({

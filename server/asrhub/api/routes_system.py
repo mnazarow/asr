@@ -15,7 +15,7 @@ from fastapi.responses import (
 
 from .. import catalog, selfcheck
 from .. import settings_access as S
-from ..errors import ASRHubError, AuthError, ConfigError, ForbiddenError, KeyNotFound
+from ..errors import ASRHubError, ConfigError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
 from ..logging_setup import get_logger
@@ -29,7 +29,7 @@ from .deps import (
     get_state,
     require_admin,
     scope_owner,
-    token_of,
+    допуск_к_метрикам,
 )
 
 log = get_logger("api.settings")
@@ -100,15 +100,19 @@ def health_root(request: Request) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=body)
 
 
-@router.post("/auth/ticket", summary="Одноразовый билет для WebSocket")
+@router.post("/auth/ticket", summary="Одноразовый билет вместо ключа в адресе")
 def auth_ticket(request: Request,
                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Выдаёт короткоживущий одноразовый билет вместо ключа в адресе.
 
-    Браузерный WebSocket не умеет отправлять заголовки, поэтому ключ раньше
-    приходилось писать в строку запроса — а она видна в истории браузера, в
-    журналах обратного прокси и в поле Referer. Билет действует минуту,
-    гасится при первом же использовании и не даёт доступа к HTTP-методам.
+    Браузерный WebSocket не умеет отправлять заголовки, а обычная ссылка
+    скачивания — тем более, поэтому ключ раньше приходилось писать в строку
+    запроса — а она видна в истории браузера, в журналах обратного прокси и
+    в поле Referer. Билет действует минуту и гасится при первом же
+    использовании: одно подключение WebSocket или один запрос GET
+    (`?ticket=…`) с правами ключа, на который он выдан. Изменений он не
+    разрешает. Вошедшему логином и паролем билет не нужен — его сессию
+    несёт кука.
     """
     state = get_state(request)
     if not state.settings.get("auth_enabled", True):
@@ -220,7 +224,20 @@ def get_settings(request: Request,
 
 @router.put("/settings", summary="Изменить настройки сервера")
 def update_settings(request: Request, values: dict[str, Any] = Body(...),
+                    persist: bool = Query(
+                        default=False,
+                        description="Записать изменённые параметры и в файл "
+                                    "конфигурации — только их, не всё, что "
+                                    "применено на пробу"),
                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Применяет параметры на ходу; с `persist=true` — ещё и записывает их.
+
+    Без `persist` изменение действует до перезапуска: так работает страница
+    настроек, где «Применить» и «Сохранить в конфигурацию» — два разных
+    шага. Разделы со своими параметрами (очередь, копии, очередь модели,
+    категории и скрипт разбора) шлют `persist=true`: там «Сохранено» должно
+    значить «переживёт перезапуск», а раньше не значило.
+    """
     state = get_state(request)
     require_admin(principal)
     # Приведение до проверки: интерфейс и внешние клиенты присылают то, что
@@ -247,7 +264,10 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
     _применить_мониторинг(state, applied)
     state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
     RUNTIME.inc("asrhub_config_reloads_total")
-    return {"applied": applied}
+    ответ: dict[str, Any] = {"applied": applied}
+    if persist and applied:
+        ответ.update(state.settings.записать_ключи(applied))
+    return ответ
 
 
 def _применить_мониторинг(state: Any, изменено: dict[str, Any] | None) -> None:
@@ -315,7 +335,9 @@ def set_hf_token(request: Request, token: str = Body(default="", embed=True),
     state.settings.hf_token = token
     target = state.settings.config_file or (state.settings.paths.data / "config.yaml")
     try:
-        state.settings.save(target)
+        # Только токен: полное сохранение уносило в файл и то, что на
+        # странице настроек применили на пробу.
+        state.settings.persist_keys(["hf_token"], target=target)
     except ASRHubError as exc:
         raise error_response(exc) from exc
     state.db.add_event(None, "settings_changed",
@@ -659,17 +681,8 @@ def revoke_key(request: Request, preview: str,
 
 
 def _guard_metrics(request: Request, state: Any) -> None:
-    """Допуск к метрикам: свободно при monitoring_public, иначе по ключу."""
-    if not state.settings.get("auth_enabled", True):
-        return
-    if state.settings.get("monitoring_public", True):
-        return
-    token = token_of(request)
-    info = state.settings.api_keys.get(token)
-    if not info:
-        raise error_response(AuthError("Ключ доступа отсутствует или недействителен."))
-    if info.get("enabled") is False:
-        raise error_response(ForbiddenError("Ключ доступа отключён."))
+    """Допуск к метрикам: тот же, что у /api/monitoring (см. `допуск_к_метрикам`)."""
+    допуск_к_метрикам(request)
 
 
 @router.get("/metrics", summary="Метрики Prometheus", response_class=PlainTextResponse)
@@ -1076,7 +1089,8 @@ def system_problems(request: Request,
             записи.append(_problem_row(
                 time.time(), "warning", "языковая модель",
                 f"Разбор не удался у {неудач} записей за период",
-                "Повторить: POST /api/llm/queue/retry-failed.",
+                "Повторить: «Повторить упавшие» в разделе «Очередь LLM» или "
+                "POST /api/llm/queue/add с телом {\"scope\": \"failed\"}.",
                 component="llm"))
     except Exception as exc:                                   # noqa: BLE001
         log.warning("Состояние смыслового слоя для журнала проблем не прочитано: %s", exc)

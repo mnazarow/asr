@@ -34,7 +34,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '3.1.17'
+$Version = '3.1.18'
 # APPDATA есть только в Windows; в WSL и PowerShell для Linux берём ~/.config
 $ConfigBase = if ($env:APPDATA) { $env:APPDATA }
               elseif ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME }

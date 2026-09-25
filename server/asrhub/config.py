@@ -545,24 +545,35 @@ class Settings:
         with _ЗАМОК_СОХРАНЕНИЯ:
             return self._save_locked(target)
 
-    def persist_keys(self, keys: Iterable[str]) -> Path | None:
+    #: Записи файла конфигурации, которые не параметры каталога, но тоже
+    #: сохраняются по одной (см. `persist_keys`).
+    ОСОБЫЕ_ЗАПИСИ = ("api_keys", "hf_token")
+
+    def persist_keys(self, keys: Iterable[str], *,
+                     target: str | os.PathLike[str] | None = None) -> Path | None:
         """Записывает в файл конфигурации только названные параметры.
 
         Нужно разделам, которые сами хранят свою часть настроек: приёмники
-        метрик и правила тревог. Раньше они жили только в памяти процесса —
-        интерфейс отвечал «Приёмник добавлен», а перезапуск его стирал.
+        метрик, правила тревог, станции АТС, скрипт и категории разбора,
+        ключи доступа. Раньше они жили только в памяти процесса —
+        интерфейс отвечал «Сохранено», а перезапуск их стирал.
         Полное `save()` здесь не годится: вместе с приёмником в файл ушло бы
         и всё, что администратор «применил на пробу» на странице настроек.
         Поэтому файл читается, в нём меняются ровно эти ключи — там, где они
         уже лежат, или в группе параметра, — и файл пишется обратно тем же
-        атомарным способом, что и при полном сохранении.
+        атомарным способом, что и при полном сохранении. Кроме параметров
+        каталога так пишутся ключи доступа (`api_keys`) и токен Hugging Face
+        (`hf_token`): их полное сохранение тоже уносило в файл пробные
+        значения, а при первом запуске — и подобранные под оборудование.
 
+        `target` — другой файл вместо того, с которым сервер запущен.
         Ответ — путь к файлу; None — файла конфигурации у сервера нет
         (запуск без него), и сохранять некуда.
         """
-        if self.config_file is None:
+        цель = target or self.config_file
+        if цель is None:
             return None
-        target = Path(self.config_file)
+        target = Path(цель)
         with _ЗАМОК_СОХРАНЕНИЯ:
             if not target.exists():
                 return self._save_locked(target)
@@ -575,6 +586,13 @@ class Settings:
             по_группам = any(isinstance(значение, dict) and ключ in catalog.GROUPS_BY_ID
                              for ключ, значение in raw.items())
             for ключ in keys:
+                if ключ in self.ОСОБЫЕ_ЗАПИСИ:
+                    значение = self.api_keys if ключ == "api_keys" else self.hf_token
+                    if значение:
+                        raw[ключ] = значение
+                    else:
+                        raw.pop(ключ, None)
+                    continue
                 spec = catalog.PARAMS_BY_KEY.get(ключ)
                 if spec is None:
                     continue
@@ -594,6 +612,27 @@ class Settings:
                 else:
                     raw[ключ] = self.values[ключ]
             return self._write_locked(target, raw)
+
+    def записать_ключи(self, keys: Iterable[str], *,
+                       target: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+        """`persist_keys` с ответом для интерфейса: записано ли, а если нет — почему.
+
+        Правка из раздела применяется в любом случае; не записаться в файл
+        она может, если сервер запущен без файла конфигурации или файл
+        недоступен на запись. Об этом говорится прямо: «Сохранено», которое
+        стирает перезапуск, хуже честного «применено до перезапуска».
+        """
+        ключи = list(keys)
+        try:
+            путь = self.persist_keys(ключи, target=target)
+        except Exception as exc:                              # noqa: BLE001
+            log.warning("%s применено, но в файл конфигурации не записано: %s",
+                        ", ".join(ключи), exc)
+            return {"persisted": False, "reason": str(exc)}
+        if путь is None:
+            return {"persisted": False,
+                    "reason": "сервер запущен без файла конфигурации"}
+        return {"persisted": True}
 
     def _save_locked(self, target: Path) -> Path:
         """Сохранение под `_ЗАМОК_СОХРАНЕНИЯ` — см. `save`."""
@@ -669,11 +708,15 @@ class Settings:
         в памяти процесса и теряется при перезапуске, хотя интерфейс обещает
         обратное («ключ показывается один раз — сохраните его»).
         """
+        # Только сами ключи: полное сохранение уносило в файл и то, что на
+        # странице настроек применили на пробу, а при первом запуске — ещё и
+        # значения, подобранные под оборудование этой машины. Переехав на
+        # другую машину, сервер продолжал считать на восьми потоках из
+        # файла, хотя их было два.
         if self.config_file is None:
             return False
         try:
-            self.save()
-            return True
+            return self.persist_keys(["api_keys"]) is not None
         except ConfigError as exc:
             log.warning("Ключи доступа не сохранены: %s", exc)
             return False

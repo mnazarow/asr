@@ -1951,6 +1951,11 @@ class Database:
             columns = (", ".join(f"jobs.{к.strip()}"
                                  for к in self.LIGHT_COLUMNS.split(","))
                        if соединение else self.LIGHT_COLUMNS)
+            # Начало расшифровки — строкой в двести знаков: список
+            # «Результатов» показывает его под именем файла, и ради этой
+            # строки тянул полные тексты всех ста пятидесяти записей.
+            columns += (", substr(jobs.text, 1, 200) AS text_preview" if соединение
+                        else ", substr(text, 1, 200) AS text_preview")
         else:
             columns = "jobs.*" if соединение else "*"
         порядок = _порядок_заданий(order, bool(соединение))
@@ -3583,6 +3588,24 @@ class Database:
         row = self.query_one(
             f"SELECT COUNT(*) AS n FROM jobs{соединение} {clause}", args)
         return int(row["n"]) if row else 0
+
+    def archive_models(self, *, owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+        """Какими моделями распознан архив и сколько заданий у каждой.
+
+        Для отбора по модели: в каталоге семь десятков моделей, а в архиве
+        обычно две, и выбор из всего каталога приводил к пустым спискам.
+        Считается по указателю `idx_jobs_model` — без чтения самих заданий.
+        """
+        собрано = self._jobs_where(owner=owner)
+        if собрано is None:
+            return []
+        соединение, where, args = собрано
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        строки = self.query(
+            f"SELECT model, COUNT(*) AS n FROM jobs{соединение} {clause} "
+            "GROUP BY model ORDER BY n DESC, model", args)
+        return [{"model": str(с["model"] or ""), "jobs": int(с["n"])}
+                for с in строки if с["model"]]
 
     def job_file_refs(self) -> tuple[set[str], set[str], set[str]]:
         """Все пути, которые держат задания: исходники, каталоги результатов, номера.
@@ -5503,6 +5526,24 @@ class Database:
                  json.dumps(items, ensure_ascii=False) if items is not None else None,
                  str(comment or ""), int(review_id)))
             return bool(курсор.rowcount)
+
+    def qa_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Последняя проверка качества по записи — для карточки задания.
+
+        Очередь «Контроль качества» вела в карточку записи, а оценить там
+        было нечем: закрыть проверку можно было только запросом
+        PUT /api/qa/{id}. Карточка теперь знает, стоит ли запись на проверке.
+        """
+        строка = self.query_one(
+            "SELECT id, status, agent, assigned_to, assigned_by, assigned_at, due_at, "
+            "reviewer, reviewed_at, auto_score, score, agree, comment, reason "
+            "FROM qa_reviews WHERE job_id=? ORDER BY id DESC LIMIT 1", (str(job_id),))
+        if строка is None:
+            return None
+        запись = dict(строка)
+        if запись.get("agree") is not None:
+            запись["agree"] = bool(запись["agree"])
+        return запись
 
     def qa_get(self, review_id: int) -> dict[str, Any] | None:
         """Одна проверка вместе с владельцем записи — для проверки прав."""

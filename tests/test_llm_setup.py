@@ -41,6 +41,15 @@ class _Настройки:
         self.сохранено += 1
         return цель
 
+    def persist_keys(self, ключи, *, target=None):
+        """Как у настоящих настроек: в файл уходят только названные ключи."""
+        цель = Path(target or self.config_file)
+        было = json.loads(цель.read_text(encoding="utf-8")) if цель.exists() else {}
+        было.update({к: self.values[к] for к in ключи if к in self.values})
+        цель.write_text(json.dumps(было, ensure_ascii=False), encoding="utf-8")
+        self.сохранено += 1
+        return цель
+
 
 def _железо(*, vram_gb: float = 32, свободно_gb: float = 30, диск_gb: float = 900,
             карта: bool = True) -> HardwareInfo:

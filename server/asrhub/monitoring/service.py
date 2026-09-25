@@ -121,7 +121,8 @@ class MonitoringService:
         if fmt == "json":
             import json
 
-            return (json.dumps(exporters.json_snapshot(samples, errors),
+            return (json.dumps(exporters.json_snapshot(samples, errors,
+                                                       settings=self.state.settings),
                                ensure_ascii=False, indent=1),
                     "application/json; charset=utf-8")
         if fmt == "otlp":
@@ -192,6 +193,7 @@ class MonitoringService:
         # оставлял прежние правила как есть: убранные из настроек свои
         # пороги продолжали действовать до перезапуска.
         self.alerts.set_rules(rules or default_rules(settings))
+        self._переоценить()
 
         # Ноль — «кеш выключен», а не «по умолчанию»: `or 5.0` превращал
         # отладочный ноль из примера в каталоге обратно в пять секунд.
@@ -225,6 +227,22 @@ class MonitoringService:
             except Exception as exc:                        # noqa: BLE001
                 log.debug("Фоновый расчёт тревог не удался: %s", exc)
 
+    def _переоценить(self) -> None:
+        """Правила сменились — тревоги по ним считаются сразу, по последнему снимку.
+
+        Иначе до истечения кеша снимка у новых правил не было состояния:
+        раздел «Мониторинг» после «Вернуть пороги» или правки правила
+        показывал «Тревог нет», пока не пройдёт следующий сбор.
+        """
+        with self._собран:
+            снимок = list(self._cache)
+        if not снимок:
+            return
+        try:
+            self.alerts.evaluate(снимок)
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Тревоги по новым правилам не пересчитаны: %s", exc)
+
     # -- сохранение того, что правят из раздела «Мониторинг» -----------------
 
     def save_targets(self, targets: list[Target]) -> dict[str, Any]:
@@ -240,8 +258,10 @@ class MonitoringService:
         """Ставит правила (None — пороги каталога) и записывает в настройки."""
         if rules is None:
             self.alerts.reset_rules(self.state.settings)
+            self._переоценить()
             return self._сохранить("monitoring_rules", [])
         self.alerts.set_rules(rules)
+        self._переоценить()
         return self._сохранить("monitoring_rules",
                                [{к: з for к, з in r.to_dict().items() if к != "id"}
                                 for r in self.alerts.rules])
@@ -256,16 +276,7 @@ class MonitoringService:
         """
         settings = self.state.settings
         settings.set(ключ, значение, source="api")
-        try:
-            путь = settings.persist_keys([ключ])
-        except Exception as exc:                            # noqa: BLE001
-            log.warning("«%s» применено, но в файл конфигурации не записано: %s", ключ, exc)
-            return {"persisted": False, "reason": str(exc)}
-        if путь is None:
-            return {"persisted": False,
-                    "reason": "сервер запущен без файла конфигурации — "
-                              "изменение действует до перезапуска"}
-        return {"persisted": True}
+        return settings.записать_ключи([ключ])
 
     # -- оповещения ----------------------------------------------------------
 

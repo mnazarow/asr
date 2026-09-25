@@ -126,7 +126,7 @@ curl 'http://сервер:8080/api/monitoring/metrics'
 asrhub_up 1
 # HELP asrhub_uptime_seconds Сколько секунд прошло с момента запуска процесса. [с]
 # TYPE asrhub_uptime_seconds gauge
-asrhub_uptime_seconds 113.5
+asrhub_uptime_seconds 3351.7
 # HELP asrhub_build_info Постоянная метрика со значением 1 и метками: версия сервиса, версия схемы базы, версия Python, дата каталога моделей. Так принято передавать в Prometheus то, что не является числом.
 # TYPE asrhub_build_info gauge
 …
@@ -160,8 +160,8 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 
 ```json
 {
-  "timestamp": 1790264189.226936,
-  "collected_at": "2026-09-24T15:36:29+0000",
+  "timestamp": 1790299151.0715957,
+  "collected_at": "2026-09-25T01:19:11+0000",
   "metrics": [
     {
       "name": "asrhub_active_jobs",
@@ -212,7 +212,7 @@ curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'
 …
 ```
 
-К каждой метрике приложены описание, рекомендация и порог — получатель видит не только число, но и что оно значит.
+К каждой метрике приложены описание, рекомендация и порог — получатель видит не только число, но и что оно значит. Порог — действующий на этом сервере: у свободного места он считается от `disk_min_free_gb`, как у встроенных тревог.
 
 ## Состояние
 
@@ -238,14 +238,14 @@ curl 'http://сервер:8080/api/monitoring/health'
 ```json
 {
   "status": "ok",
-  "uptime_s": 113.6,
+  "uptime_s": 3351.7,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 114 с",
+        "detail": "работает 3352 с",
         "hint": ""
       },
       {
@@ -274,7 +274,7 @@ curl 'http://сервер:8080/api/monitoring/health'
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 14.4 ГБ",
+        "detail": "свободно 14.8 ГБ",
         "hint": ""
       },
       {
@@ -338,7 +338,7 @@ curl 'http://сервер:8080/api/monitoring/ready'
     {
       "name": "disk",
       "status": "ok",
-      "detail": "свободно 14.4 ГБ",
+      "detail": "свободно 14.8 ГБ",
       "hint": ""
     },
     {
@@ -432,6 +432,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/catalog?
 …
 ```
 
+Порог у каждой метрики — действующий на этом сервере, со знаком (`inclusive` — сравнение включительно). До 3.1.18 справочник показывал пороги каталога, и у свободного места это были 20 и 5 ГБ при тревогах, горевших по `disk_min_free_gb`.
+
 ### `GET /api/monitoring/catalog/{name}`
 
 Описание одной метрики.
@@ -513,6 +515,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/monitoring/alerts?o
   "alerts": []
 }
 ```
+
+У каждой тревоги — `inclusive` (порог включительно: «≥» и «≤») и `labels` правила: две тревоги «Доля успеха» по разным моделям различаются только метками.
 
 ### `GET /api/monitoring/alerts/history`
 
@@ -855,7 +859,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/monitoring/info
 
 ```json
 {
-  "scrapes": 3,
+  "scrapes": 58,
   "samples": 605,
   "collection_errors": [],
   "cache_ttl_s": 5.0,

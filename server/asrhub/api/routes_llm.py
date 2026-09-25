@@ -176,11 +176,12 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
     """
     state, клиент, поток = _slot(request)
     require_write(principal)
-    с_какого = time.time() - hours * 3600
+    сейчас = time.time()
+    с_какого = сейчас - hours * 3600
     # Счётчики, сводка и график — по своим записям, как и список: иначе
     # «список пуст, ждут четыре» рассказывало обычному ключу о чужой работе.
     свой = scope_owner(principal)
-    корзин, ряд = state.db.llmq_series(с_какого, time.time(), КОРЗИН, owner=свой)
+    корзин, ряд = state.db.llmq_series(с_какого, сейчас, КОРЗИН, owner=свой)
     состояние = поток.status()
     # Текущая запись — с именем файла: по идентификатору задания человек не
     # узнаёт ничего, а в разделе он смотрит именно на «какую запись жуют».
@@ -202,7 +203,11 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
         "current": текущее,
         "counts": state.db.llmq_counts(owner=свой),
         "stats": state.db.llmq_stats(с_какого, owner=свой),
-        "series": {"buckets": корзин, "since": с_какого, "rows": ряд},
+        # Ширина корзины — от сервера. Интерфейс считал её сам, от часов
+        # браузера: при расхождении часов с сервером подписи графика
+        # уезжали от корзин, которые им соответствуют.
+        "series": {"buckets": корзин, "since": с_какого,
+                   "bucket_seconds": (сейчас - с_какого) / корзин, "rows": ряд},
         "queue": state.db.llmq_list(state=state_filter, limit=limit,
                                     offset=offset, owner=свой),
         "client": клиент.status(),
@@ -226,9 +231,12 @@ def llm_queue_pause(request: Request, paused: bool = Body(default=True, embed=Tr
     state, _клиент, поток = _slot(request)
     require_admin(principal)
     state.settings.set("llm_queue_paused", bool(paused), source="api")
+    # Пауза переживает перезапуск: её ставят, когда видеокарта нужна для
+    # другого, и обновление сервера не должно молча снимать её посреди дня.
+    сохранено = state.settings.записать_ключи(["llm_queue_paused"])
     state.db.add_event(None, "llm_queue",
                        "Очередь разбора приостановлена" if paused else "Очередь разбора продолжена")
-    return {"paused": bool(paused), "worker": поток.status()}
+    return {"paused": bool(paused), "worker": поток.status(), **сохранено}
 
 
 @router.post("/llm/queue/add", summary="Поставить записи в очередь разбора")

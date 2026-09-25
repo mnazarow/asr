@@ -196,6 +196,12 @@ class AlertState:
             "value": self.value,
             "threshold": self.rule.threshold,
             "direction": self.rule.direction,
+            # Включительность и метки — чтобы интерфейс показал настоящий
+            # знак («≥ 1», а не «> 1») и то, к какой модели или станции
+            # относится тревога: две тревоги «Доля успеха» по разным моделям
+            # выглядели в таблице одинаково.
+            "inclusive": bool(self.rule.inclusive),
+            "labels": dict(self.rule.labels),
             "since": self.since,
             "active_seconds": round(time.time() - self.since, 1) if self.since else 0.0,
             "fired_at": self.fired_at or None,

@@ -1460,6 +1460,7 @@ class JobQueue:
         прежний = self._прежний_путь(job_id)
         if прежний.is_dir():
             shutil.rmtree(прежний, ignore_errors=True)
+        self._забыть_прежние_параметры(job_id)
 
         if merged.get("delete_source_after"):
             self._удалить_исходник(job)
@@ -1490,13 +1491,27 @@ class JobQueue:
     def _прежний_путь(self, job_id: str) -> Path:
         return Path(self.settings.paths.results) / f"{job_id}.prev"
 
+    #: Приставка ключа, под которым на время повтора лежат прежние параметры.
+    ПРЕЖНИЕ_ПАРАМЕТРЫ = "rescan_prev_params:"
+
     def _отложить_прежний(self, job: dict[str, Any]) -> None:
-        """Откладывает каталог готового результата на время повтора."""
+        """Откладывает каталог готового результата на время повтора.
+
+        Вместе с ним — прежние параметры задания. Повтор кладёт новые
+        параметры сразу, и при откате текст и модель в карточке были
+        прежними, а в параметрах стояла новая модель, которой задание так
+        и не посчитано: разбор «какой моделью это распознано» врал.
+        """
         if job.get("status") != STATUS_COMPLETED:
             return
         текущий = Path(self.settings.paths.results) / str(job["id"])
         if not текущий.is_dir():
             return
+        try:
+            self.db.set_kv(f"{self.ПРЕЖНИЕ_ПАРАМЕТРЫ}{job['id']}",
+                           {"params": job.get("params") or {}})
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Прежние параметры %s не отложены: %s", job["id"], exc)
         прежний = self._прежний_путь(str(job["id"]))
         try:
             if прежний.exists():
@@ -1523,6 +1538,9 @@ class JobQueue:
             "stage": "готово", "error_code": None, "error_message": None,
             "error_hint": None, "instance_id": None, "heartbeat_at": None,
             "result_path": str(текущий)}
+        отложено = self.db.get_kv(f"{self.ПРЕЖНИЕ_ПАРАМЕТРЫ}{job_id}")
+        if isinstance(отложено, dict) and isinstance(отложено.get("params"), dict):
+            поля["params"] = отложено["params"]
         if ожидаемые is None:
             записалось = self._write_own(job_id, **поля)
         else:
@@ -1536,10 +1554,21 @@ class JobQueue:
         except OSError as exc:
             log.warning("Прежний результат %s не возвращён на место: %s", job_id, exc,
                         extra={"job_id": job_id})
+        self._забыть_прежние_параметры(job_id)
         self.db.add_event(job_id, "rescan_reverted",
                           f"{причина} — оставлен прежний результат")
-        self._emit("job.completed", {"id": job_id, "reverted": True})
+        # Причина — в самом событии: интерфейс показывал на откат зелёное
+        # «Задание готово», и массовый повтор выглядел пачкой успехов.
+        self._emit("job.completed", {"id": job_id, "reverted": True,
+                                     "reason": причина})
         return True
+
+    def _забыть_прежние_параметры(self, job_id: str) -> None:
+        try:
+            self.db.execute("DELETE FROM kv WHERE key=?",
+                            (f"{self.ПРЕЖНИЕ_ПАРАМЕТРЫ}{job_id}",))
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Прежние параметры %s не убраны: %s", job_id, exc)
 
     def _write_own(self, job_id: str, **fields: Any) -> bool:
         """Записывает исход задания, только если оно всё ещё за нами.

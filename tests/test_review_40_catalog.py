@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,10 @@ def test_разбор_приёмников_пропускает_мусор_по�
 
     служба.push = PushManager(lambda: [])
     служба.alerts = AlertEngine()
+    # Смена правил пересчитывает тревоги по последнему снимку (заход 46):
+    # службе без __init__ нужен и пустой снимок под своим замком.
+    служба._собран = threading.Condition(threading.Lock())
+    служба._cache = []
     служба.apply_settings(_Настройки({
         "monitoring_targets": ["строка", {"kind": "webhook", "url": "http://a/x"}, 5],
         "monitoring_rules": "не список"}))

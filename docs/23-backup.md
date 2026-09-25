@@ -100,7 +100,14 @@ curl -X POST -H "X-API-Key: $KEY" http://localhost:8081/api/backup/restore \
 # Скачать копию
 curl -H "X-API-Key: $KEY" -O -J \
      "http://localhost:8081/api/backup/<имя>/file"
+
+# Или обычной ссылкой — с одноразовым билетом вместо ключа в адресе
+TICKET=$(curl -s -X POST -H "X-API-Key: $KEY" http://localhost:8081/api/auth/ticket \
+         | python3 -c 'import json,sys; print(json.load(sys.stdin)["ticket"])')
+curl -O -J "http://localhost:8081/api/backup/<имя>/file?ticket=$TICKET"
 ```
+
+Так же скачивает копию и интерфейс: файл бывает в гигабайты, и выкачивать его в память вкладки ради заголовка с ключом нельзя. Билет действует минуту и один раз; повторный переход по той же ссылке отвечает 401 «ссылка устарела». Вошедшему логином и паролем билет не нужен — его сессию несёт кука.
 
 ## Проверка копии
 

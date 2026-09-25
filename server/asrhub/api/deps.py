@@ -276,6 +276,17 @@ def _проверить(request: Request, x_api_key: str | None,
 
     token = token_from(x_api_key, authorization,
                        request.query_params.get("api_key"))
+    # Одноразовый билет вместо ключа — для скачивания обычной ссылкой.
+    # Копия базы бывает в гигабайты, и тянуть её в память вкладки, чтобы
+    # приложить заголовок, нельзя; а обычная ссылка заголовка не несёт, и
+    # у вошедшего по ключу скачивание срывалось с 401. Билет живёт минуту,
+    # тратится один раз и принимается только на чтение.
+    по_билету = False
+    if not token and request.method in ("GET", "HEAD"):
+        билет = request.query_params.get("ticket", "")
+        if билет:
+            по_билету = True
+            token = state.tickets.redeem(билет)
 
     info = state.settings.api_keys.get(token)
     if not info:
@@ -284,6 +295,10 @@ def _проверить(request: Request, x_api_key: str | None,
         session = _session_principal(request, state)
         if session is not None:
             return session
+        if по_билету and not token:
+            raise AuthError("Ссылка для скачивания устарела или уже использована.",
+                            hint="Нажмите кнопку скачивания ещё раз: ссылка "
+                                 "действует минуту и открывается один раз.")
         # «Отсутствует или недействителен» — это два разных случая с разным
         # лечением, а звучали они одинаково: тот, кто вовсе не передал ключ,
         # шёл проверять его правильность, а тот, у кого ключ отозван, —
@@ -422,6 +437,24 @@ def require_admin(principal: Principal) -> Principal:
     if not principal.is_admin:
         raise ForbiddenError("Требуется ключ с ролью администратора.")
     return principal
+
+
+def допуск_к_метрикам(request: Request) -> None:
+    """Допуск к метрикам и пробам: свободно при `monitoring_public`, иначе — как везде.
+
+    Своя проверка у метрик знала только ключи: при `monitoring_public: false`
+    вошедший логином и паролем получал 401 в разделе «Мониторинг», а при
+    выключенной аутентификации сервер требовал ключ, которого у него не
+    было. Теперь разбор общий с остальными маршрутами: ключ, билет, сессия.
+    """
+    state = get_state(request)
+    if state.settings.get("monitoring_public", True):
+        return
+    try:
+        request.state.principal = _проверить(request, request.headers.get("x-api-key"),
+                                             request.headers.get("authorization"))
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
 
 
 def error_response(exc: ASRHubError) -> HTTPException:

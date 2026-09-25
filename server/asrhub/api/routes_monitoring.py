@@ -18,9 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from ..errors import (
     ASRHubError,
-    AuthError,
     ConfigError,
-    ForbiddenError,
     MetricNotFound,
     MetricsDisabled,
 )
@@ -34,7 +32,7 @@ from .deps import (
     error_response,
     get_state,
     require_admin,
-    token_of,
+    допуск_к_метрикам,
 )
 
 router = APIRouter(prefix="/api/monitoring", tags=["Мониторинг"])
@@ -57,21 +55,13 @@ def _open_access(request: Request) -> bool:
 
 
 def _guard(request: Request) -> None:
-    """Пропускает без ключа, если это разрешено настройкой.
+    """Пропускает без ключа, если это разрешено настройкой (см. `допуск_к_метрикам`).
 
     Вызывать authenticate() напрямую нельзя: её параметры объявлены через
     Header(), и при обычном вызове туда попадут не заголовки, а объекты
-    FastAPI. Поэтому заголовки читаем сами.
+    FastAPI.
     """
-    if _open_access(request):
-        return
-    state = get_state(request)
-    token = token_of(request)
-    info = state.settings.api_keys.get(token)
-    if not info:
-        raise error_response(AuthError("Ключ доступа отсутствует или недействителен."))
-    if info.get("enabled") is False:
-        raise error_response(ForbiddenError("Ключ доступа отключён."))
+    допуск_к_метрикам(request)
 
 
 def _экспорт_включён(request: Request) -> None:
@@ -133,7 +123,8 @@ def metrics_json(request: Request,
     # (monitoring_public), то есть раскладка файловой системы уезжала
     # анониму — ровно та разведка, которую прячут GET /api/system и
     # GET /api/settings.
-    payload = exporters.json_snapshot(samples, _без_путей(request, errors))
+    payload = exporters.json_snapshot(samples, _без_путей(request, errors),
+                                      settings=get_state(request).settings)
     if group:
         payload["metrics"] = [m for m in payload["metrics"] if m.get("group") == group]
     return payload
@@ -143,9 +134,19 @@ def metrics_json(request: Request,
 # Справочник метрик
 # ---------------------------------------------------------------------------
 
-def _spec_dict(spec: MetricSpec) -> dict[str, Any]:
+def _spec_dict(spec: MetricSpec, settings: Any = None) -> dict[str, Any]:
+    """Описание метрики — с порогом, который действует на этом сервере.
+
+    Порог свободного места зависит от `disk_min_free_gb`, и тревоги,
+    Prometheus и Zabbix считают его от настройки. Справочник в интерфейсе
+    показывал порог каталога — 20 и 5 ГБ, — пока тревога горела по другим
+    числам.
+    """
     data = spec.to_dict()
     data["group_title"] = metric_catalog.GROUPS_BY_ID[spec.group]["title"]
+    if spec.threshold is not None and settings is not None:
+        действующий = metric_catalog.порог(spec, settings)
+        data["threshold"] = действующий.to_dict() if действующий else None
     return data
 
 
@@ -159,20 +160,22 @@ def catalog(request: Request,
     правила Prometheus и шаблон Zabbix.
     """
     items = [s for s in METRICS if not group or s.group == group]
+    settings = get_state(request).settings
     return {
         "groups": metric_catalog.GROUPS,
-        "metrics": [_spec_dict(s) for s in items],
+        "metrics": [_spec_dict(s, settings) for s in items],
         "stats": metric_catalog.stats(),
     }
 
 
 @router.get("/catalog/{name}", summary="Описание одной метрики")
-def catalog_item(name: str, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+def catalog_item(request: Request, name: str,
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     spec = metric_catalog.METRICS_BY_NAME.get(name)
     if spec is None:
         similar = [s.name for s in METRICS if name.lower() in s.name.lower()]
         raise error_response(MetricNotFound(name, similar))
-    return _spec_dict(spec)
+    return _spec_dict(spec, get_state(request).settings)
 
 
 # ---------------------------------------------------------------------------

@@ -161,7 +161,9 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "curl": "curl 'http://сервер:8080/api/monitoring/metrics.json?group=queue'",
         "show": f"{PREFIX}/metrics.json?group=queue", "limit": 1200,
         "note": "К каждой метрике приложены описание, рекомендация и порог — "
-                "получатель видит не только число, но и что оно значит.",
+                "получатель видит не только число, но и что оно значит. Порог — "
+                "действующий на этом сервере: у свободного места он считается "
+                "от `disk_min_free_gb`, как у встроенных тревог.",
     },
     (f"{PREFIX}/health", "get"): {
         "curl": "curl 'http://сервер:8080/api/monitoring/health'",
@@ -187,6 +189,11 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "curl": f"curl -H 'X-API-Key: {K}' "
                 "'http://сервер:8080/api/monitoring/catalog?group=queue'",
         "show": f"{PREFIX}/catalog?group=queue", "limit": 1100,
+        "note": "Порог у каждой метрики — действующий на этом сервере, со "
+                "знаком (`inclusive` — сравнение включительно). До 3.1.18 "
+                "справочник показывал пороги каталога, и у свободного места "
+                "это были 20 и 5 ГБ при тревогах, горевших по "
+                "`disk_min_free_gb`.",
     },
     (f"{PREFIX}/catalog/{{name}}", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' "
@@ -199,6 +206,9 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "curl": f"curl -H 'X-API-Key: {K}' "
                 "'http://сервер:8080/api/monitoring/alerts?only_firing=true'",
         "show": f"{PREFIX}/alerts?only_firing=true", "limit": 800,
+        "note": "У каждой тревоги — `inclusive` (порог включительно: «≥» и «≤») "
+                "и `labels` правила: две тревоги «Доля успеха» по разным "
+                "моделям различаются только метками.",
     },
     (f"{PREFIX}/alerts/rules", "put"): {
         "curl": "curl -X PUT http://сервер:8080/api/monitoring/alerts/rules \\\n"

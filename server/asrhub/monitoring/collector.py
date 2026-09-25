@@ -958,8 +958,14 @@ class Collector:
                 if summary.get(key) is not None}
 
 
-def describe(samples: list[Sample]) -> list[dict[str, Any]]:
-    """Дополняет снимок описаниями из каталога — для выгрузки в JSON."""
+def describe(samples: list[Sample], settings: Any = None) -> list[dict[str, Any]]:
+    """Дополняет снимок описаниями из каталога — для выгрузки в JSON.
+
+    Порог — действующий на этом сервере (`catalog.порог`): у свободного
+    места он считается от `disk_min_free_gb`, и снимок с порогом каталога
+    расходился с тем, по чему горят тревоги.
+    """
+    from .catalog import порог  # noqa: PLC0415
     grouped: dict[str, list[Sample]] = defaultdict(list)
     for sample in samples:
         base = sample.name
@@ -981,7 +987,8 @@ def describe(samples: list[Sample]) -> list[dict[str, Any]]:
                 "type": spec.type, "group": spec.group, "label": spec.label,
                 "unit": spec.unit, "description": spec.description,
                 "recommendation": spec.recommendation, "normal": spec.normal,
-                "threshold": spec.threshold.to_dict() if spec.threshold else None,
+                "threshold": (порог(spec, settings).to_dict()
+                              if spec.threshold else None),
             })
         result.append(entry)
     return result

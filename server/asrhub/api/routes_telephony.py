@@ -110,14 +110,22 @@ def _список_станций(state: Any) -> list[dict[str, Any]]:
 
 
 def _записать_станции(state: Any, станции: list[dict[str, Any]],
-                      событие: str) -> None:
-    """Проверяет набор целиком и сохраняет его в настройки."""
+                      событие: str) -> dict[str, Any]:
+    """Проверяет набор целиком, применяет и записывает в файл конфигурации.
+
+    Раньше набор жил только в памяти процесса: «Станция добавлена», забор
+    пошёл — а после перезапуска (хотя бы обновления) станции не было, и
+    записи с АТС молча переставали приходить. В файл пишется только набор
+    станций — не то, что на странице настроек применили на пробу.
+    Ответ — `persisted` и, если записать не удалось, `reason`.
+    """
     ошибки = stations_mod.проверить_набор(станции)
     if ошибки:
         raise error_response(ConfigError(
             "; ".join(ошибки),
             hint="Поправьте поля станции и сохраните ещё раз."))
     state.settings.set("telephony_stations", станции, source="api")
+    сохранено = state.settings.записать_ключи(["telephony_stations"])
     state.db.add_event(None, событие, f"Станций в настройке: {len(станции)}")
     # Набор сводится сразу, а не на следующем опросе: человек нажал
     # «Сохранить» и ждёт, что станция появится в списке живых — а не через
@@ -125,6 +133,7 @@ def _записать_станции(state: Any, станции: list[dict[str, 
     telephony = getattr(state, "telephony", None)
     if telephony is not None:
         telephony._свести()
+    return сохранено
 
 
 @router.get("/status", summary="Состояние забора записей со всех АТС")
@@ -378,11 +387,12 @@ def save_station(request: Request, данные: dict[str, Any] = Body(...),
             правка["id"] = f"{основа}-{счётчик}"
             счётчик += 1
         сырые.append(правка)
-    _записать_станции(state, сырые, "station_saved" if ид else "station_added")
+    сохранено = _записать_станции(state, сырые, "station_saved" if ид else "station_added")
     станция = stations_mod.найти(state.settings, str(правка.get("id") or ид))
     return {"station": станция.to_dict(for_admin=True) if станция else {},
             "stations": [с.to_dict(for_admin=True)
-                         for с in stations_mod.список(state.settings)]}
+                         for с in stations_mod.список(state.settings)],
+            **сохранено}
 
 
 @router.delete("/stations/{station_id}", summary="Убрать станцию")
@@ -402,11 +412,12 @@ def delete_station(request: Request, station_id: str,
         raise error_response(ConfigError(
             f"Станция «{station_id}» не найдена.",
             hint="Список станций: GET /api/telephony/stations."))
-    _записать_станции(state, осталось, "station_removed")
+    сохранено = _записать_станции(state, осталось, "station_removed")
     архив = state.db.call_counts(station=station_id)
     return {"removed": station_id, "kept_calls": int(архив.get("total") or 0),
             "stations": [с.to_dict(for_admin=True)
-                         for с in stations_mod.список(state.settings)]}
+                         for с in stations_mod.список(state.settings)],
+            **сохранено}
 
 
 @router.post("/stations/{station_id}/enabled", summary="Включить или выключить станцию")
@@ -429,9 +440,9 @@ def toggle_station(request: Request, station_id: str,
             f"Станция «{station_id}» не найдена.",
             hint="Список станций: GET /api/telephony/stations."))
     сырые[номер] = {**сырые[номер], "enabled": bool(enabled)}
-    _записать_станции(state, сырые,
-                      "station_enabled" if enabled else "station_disabled")
-    return {"station": station_id, "enabled": bool(enabled)}
+    сохранено = _записать_станции(state, сырые,
+                                  "station_enabled" if enabled else "station_disabled")
+    return {"station": station_id, "enabled": bool(enabled), **сохранено}
 
 
 @router.get("/calls", summary="Журнал импортированных звонков")

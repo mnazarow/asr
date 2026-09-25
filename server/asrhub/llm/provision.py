@@ -1048,7 +1048,10 @@ class Установщик:
         сохранено = ""
         try:
             цель = self.settings.config_file or (self.settings.paths.data / "config.yaml")
-            сохранено = str(self.settings.save(цель))
+            # Только три параметра слоя: полное сохранение уносило в файл и
+            # то, что администратор применил на пробу на странице настроек.
+            сохранено = str(self.settings.persist_keys(
+                ["llm_backend", "llm_url", "llm_model"], target=цель))
         except (ASRHubError, OSError, AttributeError) as exc:
             # Настройки в памяти уже применились — сервер работает. Не
             # сохранились в файл: скажем об этом, но не будем считать

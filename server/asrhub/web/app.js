@@ -125,6 +125,8 @@ const API = {
     const method = (opts.method || 'GET').toUpperCase();
     const background = opts.background === true;
     delete opts.background;
+    const noLogin = opts.noLogin === true;
+    delete opts.noLogin;
     let own = null;
     if (!opts.signal && method === 'GET' && !background) {
       own = new AbortController();
@@ -154,11 +156,15 @@ const API = {
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
     if (!response.ok) {
-      const detail = (data && data.detail) || data || {};
+      const отказ = причинаОтказа(data, response.status);
+      // Сессия истекла посреди работы: вместо стопки плашек «Ключ доступа
+      // не передан» в каждом разделе — форма входа, один раз.
+      // Ответы самих ручек входа (неверный текущий пароль при смене) — не
+      // конец сессии, а ошибка в форме: их не трогаем.
+      if (response.status === 401 && state.me && !noLogin
+          && !String(path).startsWith('/api/auth/')) сессияКончилась(отказ);
       throw {
-        code: detail.code || `http_${response.status}`,
-        message: detail.message || `Ошибка ${response.status}`,
-        hint: detail.hint || '',
+        ...отказ,
         status: response.status,
         // Тело ответа целиком — для тех, кому «плохой» код не помеха
         // (см. API.lenient): проверки состояния отдают 503 с полными
@@ -196,23 +202,107 @@ const API = {
   del(path) { return this.call(path, { method: 'DELETE' }); },
 };
 
+/**
+ * Причина отказа из ответа сервера — текстом для человека.
+ *
+ * Сервер отдаёт отказ полями верхнего уровня `{code, message, hint}` и их
+ * копией в `detail`, а FastAPI на неверный параметр — списком в `detail`.
+ * Читали это по-разному: где `body.error`, которого в ответе нет, где
+ * только `detail.message`, — и человек видел «Ошибка 422» или «сервер
+ * ответил 400» вместо причины, которую сервер прислал.
+ */
+function причинаОтказа(тело, статус) {
+  const данные = тело && typeof тело === 'object' ? тело : {};
+  const вложено = данные.detail && typeof данные.detail === 'object'
+    && !Array.isArray(данные.detail) ? данные.detail : {};
+  const code = данные.code || вложено.code;
+  const message = данные.message || вложено.message;
+  if (message) {
+    return { code: code || `http_${статус}`, message: String(message),
+             hint: String(данные.hint || вложено.hint || '') };
+  }
+  if (Array.isArray(данные.detail) && данные.detail.length) {
+    return { code: 'invalid_request', message: неверныйПараметр(данные.detail[0]),
+             hint: данные.detail.length > 1
+               ? `И ещё замечаний: ${данные.detail.length - 1}.` : '' };
+  }
+  if (typeof данные.detail === 'string' && данные.detail) {
+    return { code: `http_${статус}`, message: данные.detail, hint: '' };
+  }
+  return { code: `http_${статус}`, message: `Ошибка ${статус}`, hint: '' };
+}
+
+/** Одно замечание FastAPI о параметре — по-русски, с названием поля. */
+function неверныйПараметр(замечание) {
+  const путь = (замечание.loc || []).filter((ч) => !['query', 'body', 'path'].includes(ч));
+  const поле = путь.length ? `«${путь.join('.')}»` : 'запроса';
+  const предел = (замечание.ctx || {});
+  const суть = {
+    string_too_long: `не длиннее ${предел.max_length} знаков`,
+    string_too_short: `не короче ${предел.min_length} знаков`,
+    less_than_equal: `должен быть не больше ${предел.le}`,
+    greater_than_equal: `должен быть не меньше ${предел.ge}`,
+    less_than: `должен быть меньше ${предел.lt}`,
+    greater_than: `должен быть больше ${предел.gt}`,
+    missing: 'не передан',
+    string_pattern_mismatch: 'не из допустимых значений',
+    int_parsing: 'ожидается целое число',
+    float_parsing: 'ожидается число',
+    bool_parsing: 'ожидается «да» или «нет»',
+  }[замечание.type] || String(замечание.msg || 'не подходит');
+  return `Параметр ${поле}: ${суть}.`;
+}
+
+/**
+ * Сессия кончилась посреди работы — форма входа вместо интерфейса.
+ *
+ * Раньше истёкшая сессия выглядела как стопка красных плашек «Ключ
+ * доступа не передан» в каждом разделе по очереди: интерфейс продолжал
+ * опрашивать сервер, а о том, что надо войти заново, не говорил ничего.
+ */
+function сессияКончилась(отказ) {
+  if (state.сессияКончилась) return;
+  state.сессияКончилась = true;
+  clearInterval(state.timer);
+  stopViewTimers();
+  API.abortAll();
+  qsa('.modal-backdrop').forEach((фон) => closeModal(фон));
+  if (state.ws) { try { state.ws.close(); } catch (e) { /* уже закрыт */ } }
+  promptKey(отказ && отказ.message
+    ? `Сессия закончилась: ${отказ.message} Войдите снова.`
+    : 'Сессия закончилась — войдите снова.');
+}
+
 function h(html) {
   const tpl = document.createElement('template');
   tpl.innerHTML = html.trim();
   return tpl.content.firstElementChild;
 }
-/* Экранирование для разметки.
+/* Экранирование для разметки — текста и значений атрибутов.
  *
- * Апостроф — не украшение: половина обработчиков в этом файле написана как
- * onclick="…('${esc(id)}')", то есть значение попадает внутрь строки JS,
- * ограниченной апострофом. Кавычка там не спасает — разбор ломает именно
- * апостроф, и сегодня от этого держит только проверка имени пользователя
- * в питоне. Безопасность разметки не должна зависеть от чужой регулярки.
+ * Апостроф экранируется ради атрибутов в апострофах. Аргументы встроенных
+ * обработчиков (onclick="…") экранирует не он, а `jsArg` ниже: внутри
+ * атрибута сущности раскодируются раньше, чем браузер разберёт JS.
  */
 function esc(value) {
   return String(value === null || value === undefined ? '' : value)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/**
+ * Значение аргументом во встроенный обработчик: onclick="f(${jsArg(x)})".
+ *
+ * esc() там не защищает, как обещал комментарий выше: сущность &#39;
+ * браузер раскодирует раньше, чем разберёт JS, и апостроф в значении
+ * закрывал строку. Держалось это только на том, что идентификаторы
+ * выдаёт сервер, а логины проходят регулярку. JSON даёт настоящий литерал
+ * JS — кавычки и обратные косые экранированы, — а esc() поверх него даёт
+ * верное значение атрибута. Кавычки вокруг `${…}` не ставятся: они уже в
+ * литерале.
+ */
+function jsArg(value) {
+  return esc(JSON.stringify(String(value === null || value === undefined ? '' : value)));
 }
 function qs(sel, root) { return (root || document).querySelector(sel); }
 function qsa(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
@@ -283,7 +373,7 @@ function plural(n, одна, две, много) {
 
 function pct(value, digits) {
   if (value === null || value === undefined) return '—';
-  return (value * 100).toFixed(digits === undefined ? 1 : digits) + ' %';
+  return num(value * 100, digits === undefined ? 1 : digits) + ' %';
 }
 
 /**
@@ -334,6 +424,15 @@ async function bootstrap() {
     // рабочим, хотя очередь, результаты и настройки отвечали отказом на
     // каждый запрос. Форма входа появлялась только при недоступном сервере.
     state.me = await API.background('/api/auth/me');
+    // Обязательная смена пароля — сразу к форме. Раньше это узнавали по
+    // отказу `/api/settings`, но он глотался ради неадминистраторов, а
+    // каталог и состояние открыты всем: после F5 человек с временным
+    // паролем видел обычный интерфейс и плашку «Смените пароль» в каждом
+    // разделе по очереди.
+    if (state.me && state.me.must_change_password) {
+      promptPasswordChange(false, state.me.password_reason);
+      return;
+    }
     // Запуск идёт вне разделов, поэтому запросы фоновые: смена раздела не
     // должна их снимать. Иначе переход по меню в первую секунду после
     // загрузки отменял загрузку каталога, и вместо интерфейса появлялась
@@ -368,6 +467,7 @@ async function bootstrap() {
     applyWhoAmI();
     await Promise.all([refreshEngines(), refreshQueue()]);
     connectWs();
+    state.готов = true;
     render();
     state.timer = setInterval(tick, 4000);
   } catch (err) {
@@ -375,7 +475,10 @@ async function bootstrap() {
     // Пароль по умолчанию: интерфейс всё равно не заработает, пока его не
     // сменят, поэтому ведём прямо к форме, а не показываем ошибку в каждом
     // разделе по очереди.
-    if (err.code === 'password_change_required') { promptPasswordChange(); return; }
+    if (err.code === 'password_change_required') {
+      promptPasswordChange(false, (state.me || {}).password_reason);
+      return;
+    }
     // Отменённый запрос — не сбой связи, и рисовать по нему заглушку нельзя.
     if (err && err.silent) return;
     fail(err);
@@ -389,7 +492,7 @@ async function bootstrap() {
   }
 }
 
-function promptKey() {
+function promptKey(причина) {
   // Форма входа. Логин и пароль — обычный путь для человека; ключ доступа
   // остаётся для программ и для тех, кто уже настроил его себе, поэтому
   // спрятан под ссылкой, а не выброшен.
@@ -397,6 +500,7 @@ function promptKey() {
   content.innerHTML = '';
   const card = h(`<div class="card" style="max-width:460px;margin:60px auto">
     <div class="card-head"><h2>Вход</h2></div>
+    ${причина ? `<p class="small" id="login-reason" style="color:var(--warn)">${esc(причина)}</p>` : ''}
     <div class="stack" style="gap:10px">
       <label class="small dim" for="login-user">Логин</label>
       <input type="text" id="login-user" autocomplete="username" autofocus>
@@ -427,7 +531,10 @@ function promptKey() {
       // Ключ из прошлой жизни убираем: иначе он поедет в заголовке и
       // перекроет только что заведённую сессию — вход как будто не сработал.
       localStorage.removeItem('asrhub_key');
-      if (result && result.must_change_password) { promptPasswordChange(); return; }
+      if (result && result.must_change_password) {
+        promptPasswordChange(false, result.password_reason);
+        return;
+      }
       location.reload();
     } catch (err) {
       showError(err.message || 'Не удалось войти.', err.hint || '');
@@ -469,17 +576,24 @@ function promptApiKey() {
   qs('#key-by-login').onclick = (e) => { e.preventDefault(); promptKey(); };
 }
 
-function promptPasswordChange(optional) {
+function promptPasswordChange(optional, причина) {
   // Пока пароль по умолчанию не сменён, сервер отвечает отказом на всё,
   // кроме самой смены. Показываем форму вместо интерфейса, а не поверх
   // него: иначе за ней виден пустой каркас с ошибками в каждом разделе.
+  //
+  // Объяснение — по причине. «Пароль, заданный при первом запуске, известен
+  // всем» — правда только для admin/admin123; тому, кому администратор
+  // выдал временный пароль лично, это говорило неправду и пугало зря.
   const content = qs('#content');
   content.innerHTML = '';
+  const объяснение = причина === 'default'
+    ? `Сейчас действует пароль, заданный при первом запуске. Он известен всем,
+       у кого есть эта программа, поэтому работать с сервером до смены нельзя.`
+    : `Пароль выдан администратором и действует до первого входа: придумайте
+       свой — его будете знать только вы. После смены откроется интерфейс.`;
   const card = h(`<div class="card" style="max-width:460px;margin:60px auto">
     <div class="card-head"><h2>${optional ? 'Смена пароля' : 'Смените пароль'}</h2></div>
-    ${optional ? '' : `<p class="dim small">Сейчас действует пароль, заданный при
-      первом запуске. Он известен всем, у кого есть эта программа, поэтому
-      работать с сервером до смены нельзя.</p>`}
+    ${optional ? '' : `<p class="dim small" id="pw-reason">${объяснение}</p>`}
     <div class="stack" style="gap:10px">
       <label class="small dim" for="pw-current">Текущий пароль</label>
       <input type="password" id="pw-current" autocomplete="current-password">
@@ -591,6 +705,7 @@ async function refreshQueue() {
 }
 
 function tick() {
+  if (document.hidden || state.сессияКончилась) return;
   refreshQueue().then(() => {
     if (state.view === 'queue' || state.view === 'transcribe') renderView(true);
   });
@@ -640,7 +755,14 @@ async function connectWs() {
 function handleEvent(message) {
   switch (message.type) {
     case 'job.completed':
-      toast(`Задание готово (RTF ${num(message.rtf, 3)})`, 'ok');
+      // Откат неудачного повтора — не успех: прежний результат оставлен, а
+      // новый не получился. Раньше и на него всплывало зелёное «Задание
+      // готово (RTF —)», и массовый повтор выглядел пачкой удач.
+      if (message.reverted) {
+        toast('Повтор не удался — оставлен прежний результат', 'warn', message.reason || '');
+      } else {
+        toast(`Задание готово (RTF ${num(message.rtf, 3)})`, 'ok');
+      }
       refreshQueue(); refreshLiveViews();
       break;
     case 'job.failed':
@@ -714,6 +836,10 @@ const VIEWS = {
 };
 
 function go(view) {
+  // Открытое окно закрывается при переходе: «Использовать эту модель»
+  // оставляло карточку модели поверх «Транскрибации», а цифровые клавиши
+  // меняли раздел под окном — человек видел одно, а под ним было другое.
+  qsa('.modal-backdrop').forEach((фон) => closeModal(фон));
   state.view = view;
   qsa('.nav-item').forEach((b) => {
     const active = b.dataset.view === view;
@@ -792,6 +918,11 @@ function showRejected(errors) {
 }
 
 function renderView(soft) {
+  // Сессия кончилась или вход ещё не пройден — на месте раздела форма входа
+  // (или смены пароля), и переход по меню её не затирает. Раньше щелчок по
+  // меню под формой входа рисовал раздел без каталога и без сведений о том,
+  // кто вошёл: пустые таблицы и отказы в каждом запросе.
+  if (state.сессияКончилась || !state.готов) return;
   const content = qs('#content');
   const view = state.view;
   const renderer = RENDERERS[state.view];
@@ -836,9 +967,13 @@ function renderView(soft) {
   }
 }
 
-/** Таймеры текущего раздела: заводятся через viewTimer, гасятся при уходе. */
+/** Таймеры текущего раздела: заводятся через viewTimer, гасятся при уходе.
+ *
+ * На скрытой вкладке опрос молчит: интерфейс, оставленный открытым на ночь
+ * в фоне, продолжал раз в несколько секунд собирать с сервера снимки
+ * метрик, очередь и диагностику — ради экрана, которого никто не видит. */
 function viewTimer(fn, intervalMs) {
-  const handle = setInterval(fn, intervalMs);
+  const handle = setInterval(() => { if (!document.hidden) fn(); }, intervalMs);
   state.viewTimers.push(handle);
   return handle;
 }
@@ -862,6 +997,10 @@ function showViewFailure(content, err) {
 }
 
 window.addEventListener('hashchange', render);
+// Вкладку показали снова — догоняем то, что пропустил приостановленный опрос.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.timer) tick();
+});
 
 /** Выдвижное меню на узких экранах. */
 function toggleNav(force) {
@@ -986,9 +1125,14 @@ function mountModal(backdrop, options) {
   }
 
   backdrop.__returnFocus = document.activeElement;
-  // Пока окно открыто, остальная страница скрыта от диктора.
+  // Пока окно открыто, остальная страница скрыта от диктора. Своё окно не
+  // считаем: формы станции, сотрудника и замечаний импорта добавлялись в
+  // документ до этого вызова, находили здесь сами себя — и страница под
+  // ними оставалась видна диктору.
   const app = qs('.app');
-  if (app && qsa('.modal-backdrop').length === 0) app.setAttribute('aria-hidden', 'true');
+  if (app && qsa('.modal-backdrop').filter((фон) => фон !== backdrop).length === 0) {
+    app.setAttribute('aria-hidden', 'true');
+  }
 
   document.body.appendChild(backdrop);
   document.body.classList.add('modal-open');
@@ -1108,18 +1252,36 @@ function installHotkeys() {
 }
 
 const RENDERERS = {};
-window.__asrhub = { state, API, RENDERERS, go, toast, renderView, showHotkeys, fail };
+window.__asrhub = { state, API, RENDERERS, go, toast, renderView, showHotkeys, fail,
+                    openTab: (адрес) => открытьВкладкой(адрес) };
+// Чистые помощники разметки и чисел — для проверок в браузере и отладки из
+// консоли: сам файл завёрнут в функцию, и снаружи их иначе не достать.
+window.__asrhub.util = {
+  kpi: (...а) => kpi(...а), delta: (...а) => delta(...а), pct: (...а) => pct(...а),
+  num: (...а) => num(...а), fmtBytes: (...а) => fmtBytes(...а),
+  metricValue: (...а) => metricValue(...а), jsArg: (...а) => jsArg(...а),
+  причинаОтказа: (...а) => причинаОтказа(...а), handleEvent: (...а) => handleEvent(...а),
+};
 
 // ==========================================================================
 // Общие компоненты
 // ==========================================================================
 
+/**
+ * Плитка с числом. `trend` — объект `{dir, text}` или готовая разметка из
+ * `delta()`: сравнение с прошлым периодом передавали и так, и так, а
+ * читался только объект — у «Балла оператора» и «Индекса эмпатии»
+ * сравнения не было, вместо него пустой `<div class="kpi-trend undefined">`.
+ */
 function kpi(label, value, sub, trend) {
+  const ход = !trend ? ''
+    : typeof trend === 'string' ? trend
+      : `<div class="kpi-trend ${trend.dir || ''}">${esc(trend.text)}</div>`;
   return `<div class="kpi">
     <div class="kpi-label">${esc(label)}</div>
     <div class="kpi-value">${value}</div>
     ${sub ? `<div class="kpi-sub">${sub}</div>` : ''}
-    ${trend ? `<div class="kpi-trend ${trend.dir}">${esc(trend.text)}</div>` : ''}
+    ${ход}
   </div>`;
 }
 
@@ -1305,6 +1467,14 @@ function paramCard(spec, value, onChange) {
   return node;
 }
 
+/** Описание пресета для быстрой настройки: зачем он, для чего и на каком железе. */
+function описаниеПресета(preset) {
+  if (!preset) return '';
+  return `${esc(preset.description)}<br><b>Сценарий:</b> ${esc(preset.scenario)}` +
+    `<br><b>Железо:</b> ${esc(preset.hardware_hint)}` +
+    (preset.expected ? `<br><b>Ожидаемо:</b> ${esc(preset.expected)}` : '');
+}
+
 // ==========================================================================
 // Вид: Транскрибация
 // ==========================================================================
@@ -1369,9 +1539,11 @@ RENDERERS.transcribe = {
                 <select id="preset-select" style="margin-top:4px">
                   <option value="">— выбрать пресет —</option>
                   ${state.presets.map((p) =>
-                    `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}
+                    `<option value="${esc(p.id)}"${state.jobPreset === p.id ? ' selected' : ''}>${
+                      esc(p.name)}</option>`).join('')}
                 </select>
-                <div class="small faint" id="preset-desc" style="margin-top:6px"></div>
+                <div class="small faint" id="preset-desc" style="margin-top:6px">${
+                  описаниеПресета(state.presets.find((p) => p.id === state.jobPreset))}</div>
               </div>
               <div>
                 <label>Модель</label>
@@ -1463,13 +1635,13 @@ RENDERERS.transcribe = {
     const select = qs('#preset-select');
     select.addEventListener('change', () => {
       const preset = state.presets.find((p) => p.id === select.value);
+      // Выбор запоминается: описание пресета записывалось и тут же
+      // стиралось перерисовкой ниже, а список возвращался к «— выбрать
+      // пресет —» — будто ничего не применилось.
+      state.jobPreset = preset ? preset.id : '';
       if (!preset) { qs('#preset-desc').textContent = ''; return; }
       Object.assign(state.jobSettings, preset.values);
       Object.keys(preset.values || {}).forEach((k) => state.jobChanged.add(k));
-      qs('#preset-desc').innerHTML =
-        `${esc(preset.description)}<br><b>Сценарий:</b> ${esc(preset.scenario)}` +
-        `<br><b>Железо:</b> ${esc(preset.hardware_hint)}` +
-        (preset.expected ? `<br><b>Ожидаемо:</b> ${esc(preset.expected)}` : '');
       renderView();
       toast(`Применён пресет «${preset.name}»`, 'ok');
     });
@@ -1519,7 +1691,7 @@ RENDERERS.transcribe = {
       window.Charts.hbars(qs('#model-wer'), {
         items: wer.slice(0, 6).map((b) => ({
           label: b.dataset.length > 22 ? b.dataset.slice(0, 21) + '…' : b.dataset,
-          value: b.value, display: b.value.toFixed(1) + ' %', note: b.source })),
+          value: b.value, display: num(b.value, 1) + ' %', note: b.source })),
         labelWidth: 140, rowHeight: 22, unit: ' %',
       });
     }
@@ -1541,7 +1713,9 @@ RENDERERS.transcribe = {
         </div>
       </div>`).join('') : '<div class="empty small">Активных заданий нет</div>';
 
-    API.get('/api/jobs?status=completed,failed&limit=6').then((data) => {
+    // Облегчённый список: без него каждые четыре секунды приезжали полные
+    // расшифровки шести записей ради имени файла и длительности.
+    API.get('/api/jobs?status=completed,failed&limit=6&light=true').then((data) => {
       const host = qs('#recent-jobs');
       if (!host) return;
       host.innerHTML = data.items.length ? `<div class="table-wrap"><table>
@@ -1553,7 +1727,7 @@ RENDERERS.transcribe = {
           <td class="num">${fmtDur(job.media_duration_s)}</td>
           <td class="num">${job.rtf ? num(job.rtf, 3) : '—'}</td>
           <td>${statusChip(job.status)}</td>
-          <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(job.id)}')">
+          <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(job.id)})">
             Открыть</button></td></tr>`).join('')}
         </tbody></table></div>` : '<div class="empty small">Пока нет завершённых заданий</div>';
     }).catch((err) => {
@@ -1601,9 +1775,13 @@ function renderFileList() {
     </div>`).join('');
   const btn = qs('#btn-submit');
   if (btn) {
-    btn.disabled = state.files.length === 0;
-    btn.textContent = state.files.length > 1
-      ? `Поставить в очередь (${state.files.length})` : 'Поставить в очередь';
+    // Пока идёт отправка, кнопка занята и после перерисовки раздела: уйти и
+    // вернуться во время долгой загрузки — и новая кнопка была активна с
+    // теми же файлами, второе нажатие ставило их в очередь дважды.
+    btn.disabled = state.files.length === 0 || state.отправка;
+    btn.textContent = state.отправка ? 'Отправка…'
+      : state.files.length > 1 ? `Поставить в очередь (${state.files.length})`
+        : 'Поставить в очередь';
   }
 }
 
@@ -1619,10 +1797,9 @@ function jobOverrides() {
 }
 
 async function submitFiles() {
-  if (!state.files.length) return;
-  const btn = qs('#btn-submit');
-  btn.disabled = true;
-  btn.textContent = 'Отправка…';
+  if (!state.files.length || state.отправка) return;
+  state.отправка = true;
+  renderFileList();
   const priority = parseInt(qs('#job-priority').value, 10) || 50;
   const settings = JSON.stringify(jobOverrides());
   // Отправляем ровно тот набор, что был на момент нажатия. Список очищался
@@ -1671,8 +1848,8 @@ async function submitFiles() {
   } catch (err) {
     fail(err);
   } finally {
-    btn.disabled = state.files.length === 0;
-    btn.textContent = 'Поставить в очередь';
+    state.отправка = false;
+    renderFileList();              // кнопка текущего раздела, а не прежняя
   }
 }
 
@@ -2218,9 +2395,9 @@ RENDERERS.queue = {
       if (!spec || !host) return;
       host.appendChild(paramControl(spec, state.settings[key], async (v) => {
         try {
-          await API.put('/api/settings', { [key]: v });
-          state.settings[key] = v;
-          toast('Настройка применена', 'ok');
+          const итог = await сохранитьПараметры({ [key]: v });
+          toast(сохраненоИли(итог, 'Настройка сохранена', 'Настройка применена'),
+                persistedKind(итог), persistedHint(итог));
           if (after) after(v);
           await refreshQueue();
           renderView(true);
@@ -2300,7 +2477,10 @@ RENDERERS.queue = {
     const filter = qs('#q-filter') ? qs('#q-filter').value : 'active';
     const search = qs('#q-search') ? qs('#q-search').value.trim() : '';
     try {
-      const params = new URLSearchParams({ limit: '120' });
+      // Облегчённый список: таблица перерисовывается каждые четыре секунды,
+      // и при отборе «Все» или «Завершённые» тянула до 120 полных
+      // расшифровок, чтобы показать имя файла и полосу выполнения.
+      const params = new URLSearchParams({ limit: '120', light: 'true' });
       if (filter) params.set('status', filter);
       if (search) params.set('search', search);
       const data = await API.latest('queue-table', `/api/jobs?${params}`);
@@ -2362,19 +2542,19 @@ RENDERERS.queue = {
       <td class="small faint nowrap">${fmtAgo(job.created_at)}</td>
       <td><div class="row" style="gap:3px">
         ${active ? `<button class="ghost sm" title="Поднять наверх"
-            data-action="top" onclick="__asrhub.jobAction('${job.id}','top')">▲</button>
+            data-action="top" onclick="__asrhub.jobAction(${jsArg(job.id)},'top')">▲</button>
           <button class="ghost sm" title="Опустить"
-            data-action="bottom" onclick="__asrhub.jobAction('${job.id}','bottom')">▼</button>` : ''}
+            data-action="bottom" onclick="__asrhub.jobAction(${jsArg(job.id)},'bottom')">▼</button>` : ''}
         ${job.status === 'queued' ? `<button class="ghost sm" title="Приостановить"
-            data-action="pause" onclick="__asrhub.jobAction('${job.id}','pause')">⏸</button>` : ''}
+            data-action="pause" onclick="__asrhub.jobAction(${jsArg(job.id)},'pause')">⏸</button>` : ''}
         ${job.status === 'paused' ? `<button class="ghost sm" title="Возобновить"
-            data-action="resume" onclick="__asrhub.jobAction('${job.id}','resume')">▶</button>` : ''}
+            data-action="resume" onclick="__asrhub.jobAction(${jsArg(job.id)},'resume')">▶</button>` : ''}
         ${active ? `<button class="ghost sm danger" title="Отменить"
-            data-action="cancel" onclick="__asrhub.jobAction('${job.id}','cancel')">✕</button>` : ''}
+            data-action="cancel" onclick="__asrhub.jobAction(${jsArg(job.id)},'cancel')">✕</button>` : ''}
         ${job.status === 'failed' ? `<button class="ghost sm" title="Повторить"
-            data-action="retry" onclick="__asrhub.jobAction('${job.id}','retry')">↻</button>` : ''}
+            data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')">↻</button>` : ''}
         <button class="ghost sm" data-action="open"
-          onclick="__asrhub.openJob('${job.id}')">Открыть</button>
+          onclick="__asrhub.openJob(${jsArg(job.id)})">Открыть</button>
       </div></td>
     </tr>`;
   },
@@ -2406,41 +2586,107 @@ function parseFilename(disposition) {
   return '';
 }
 
-window.__asrhub.download = async (id, fmt) => {
-  const url = `/api/jobs/${id}/download?fmt=${encodeURIComponent(fmt)}`;
+/**
+ * Скачивание файла: запрос с ключом в заголовке, имя из ответа, отдача браузеру.
+ *
+ * Обычная ссылка заголовка не несёт, и у вошедшего по ключу она отвечала
+ * 401: так срывались «Шаблон Zabbix» и остальные готовые настройки при
+ * закрытых метриках. Все выгрузки идут здесь одним путём — и причину
+ * отказа сообщают одинаково.
+ *
+ * Имя берём из Content-Disposition. Сервер шлёт два поля: запасное
+ * filename= в ASCII (кириллица в нём заменена подчёркиваниями) и
+ * filename*= по RFC 5987 с настоящим именем. Брать надо второе.
+ */
+async function скачатьФайл(адрес, запасноеИмя) {
+  const headers = {};
+  const key = localStorage.getItem('asrhub_key');
+  if (key) headers['X-API-Key'] = key;
+  let response;
   try {
-    const headers = {};
-    const key = localStorage.getItem('asrhub_key');
-    if (key) headers['X-API-Key'] = key;
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-      let detail = {};
-      try { detail = (await response.json()).detail || {}; } catch (e) { detail = {}; }
-      throw { code: detail.code || 'http_error',
-              message: detail.message || `Не удалось скачать файл (HTTP ${response.status})`,
-              hint: detail.hint };
-    }
-    // Имя берём из Content-Disposition. Сервер шлёт два поля: запасное
-    // filename= в ASCII (кириллица в нём заменена подчёркиваниями) и
-    // filename*= по RFC 5987 с настоящим именем. Брать надо второе.
-    // Разбор «первое совпадение плюс decodeURIComponent» и портил имена,
-    // и падал целиком: у файла «отчёт 100% готово» запасное имя содержит
-    // знак процента, и декодирование бросало «URI malformed» — скачивание
-    // не начиналось вовсе.
-    const disposition = response.headers.get('Content-Disposition') || '';
-    const name = parseFilename(disposition) || `${id}.${fmt}`;
+    response = await fetch(адрес, { headers });
+  } catch (e) {
+    throw { code: 'network', message: 'Сервер недоступен',
+            hint: 'Проверьте, что служба asrhub запущена и доступна по сети.' };
+  }
+  if (!response.ok) {
+    let тело = null;
+    try { тело = await response.json(); } catch (e) { тело = null; }
+    throw { ...причинаОтказа(тело, response.status), status: response.status };
+  }
+  const blob = await response.blob();
+  const имя = parseFilename(response.headers.get('Content-Disposition') || '') || запасноеИмя;
+  отдатьФайл(blob, имя);
+  return имя;
+}
 
-    const blob = await response.blob();
-    const href = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = href;
-    link.download = name;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    // Освобождаем память не сразу: Safari отменяет загрузку, если ссылку
-    // отозвать в том же кадре.
-    setTimeout(() => URL.revokeObjectURL(href), 30000);
+/** Отдаёт браузеру готовый файл под именем. */
+function отдатьФайл(blob, имя) {
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = href;
+  link.download = имя;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  // Освобождаем память не сразу: Safari отменяет загрузку, если ссылку
+  // отозвать в том же кадре.
+  setTimeout(() => URL.revokeObjectURL(href), 30000);
+}
+
+/**
+ * Большой файл — обычной ссылкой, без выкачивания в память вкладки.
+ *
+ * Копия базы бывает в гигабайты, и держать её в памяти ради заголовка
+ * нельзя. Вошедшему логином хватает куки; вошедшему по ключу ссылка
+ * получает одноразовый билет на минуту (POST /api/auth/ticket) — ключ в
+ * адресе остался бы в истории браузера и в журнале прокси.
+ */
+async function скачатьСсылкой(адрес, имя) {
+  let итог = адрес;
+  if (localStorage.getItem('asrhub_key')) {
+    const билет = await API.post('/api/auth/ticket');
+    if (билет && билет.ticket) {
+      итог += `${адрес.includes('?') ? '&' : '?'}ticket=${encodeURIComponent(билет.ticket)}`;
+    }
+  }
+  const link = document.createElement('a');
+  link.href = итог;
+  link.download = имя || '';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+/**
+ * Открыть ответ сервера в новой вкладке — и с ключом тоже.
+ *
+ * Вкладка открывается сразу, по нажатию: открытая после ожидания ответа
+ * попадает под блокировщик всплывающих окон. Без ключа (сессия или сервер
+ * без входа) хватает обычного адреса.
+ */
+function открытьВкладкой(адрес) {
+  const key = localStorage.getItem('asrhub_key');
+  if (!key) { window.open(адрес, '_blank', 'noopener'); return; }
+  const окно = window.open('', '_blank');
+  if (!окно) { toast('Браузер не дал открыть вкладку', 'warn'); return; }
+  окно.document.title = 'ASR Hub — загрузка…';
+  fetch(адрес, { headers: { 'X-API-Key': key } }).then(async (response) => {
+    if (!response.ok) {
+      let тело = null;
+      try { тело = await response.json(); } catch (e) { тело = null; }
+      const отказ = причинаОтказа(тело, response.status);
+      окно.document.body.textContent = `${отказ.message} ${отказ.hint || ''}`;
+      return;
+    }
+    окно.location.href = URL.createObjectURL(await response.blob());
+  }).catch(() => { окно.document.body.textContent = 'Сервер недоступен'; });
+}
+
+window.__asrhub.download = async (id, fmt) => {
+  try {
+    await скачатьФайл(`/api/jobs/${encodeURIComponent(id)}/download?fmt=${encodeURIComponent(fmt)}`,
+                      `${id}.${fmt}`);
   } catch (err) {
     fail(err);
   }
@@ -2646,7 +2892,24 @@ RENDERERS.results = {
           <button class="ghost sm" id="r-bulk-clear">Снять выбор</button>
         </div>
         <div class="table-wrap" id="results-table"></div>
+        <div class="row small dim" id="results-pager" style="gap:8px;margin-top:10px" hidden>
+          <span id="results-shown"></span><span class="spacer"></span>
+          <button class="ghost sm" id="r-prev">← раньше</button>
+          <button class="ghost sm" id="r-next">дальше →</button>
+        </div>
       </section>`;
+    // Листалка: раньше показывались первые 150 записей, и ни «из скольких»,
+    // ни способа дойти до сто пятьдесят первой не было — архив за год
+    // выглядел архивом за неделю.
+    state.resultsOffset = 0;
+    qs('#r-prev').onclick = () => {
+      state.resultsOffset = Math.max(0, (state.resultsOffset || 0) - РЕЗУЛЬТАТОВ_НА_СТРАНИЦЕ);
+      this.load(true);
+    };
+    qs('#r-next').onclick = () => {
+      state.resultsOffset = (state.resultsOffset || 0) + РЕЗУЛЬТАТОВ_НА_СТРАНИЦЕ;
+      this.load(true);
+    };
     let timer;
     // Переход сюда из аналитики записей («показать разговоры про сроки»)
     // приносит запрос с собой. Забираем его один раз и гасим: иначе
@@ -2699,7 +2962,7 @@ RENDERERS.results = {
     }
   },
 
-  async load() {
+  async load(листаем) {
     const host = qs('#results-table');
     // Поиск запускается по таймеру в 300 мс, и таймер не привязан к
     // разделу: уйти сразу после набора — и обработчик срабатывает уже без
@@ -2710,8 +2973,12 @@ RENDERERS.results = {
     if (!host || !поле || !порядок) return;
     const search = поле.value.trim();
     const order = порядок.value;
+    // Смена поиска, отбора или порядка начинает с первой страницы.
+    if (!листаем) state.resultsOffset = 0;
     try {
-      const params = new URLSearchParams({ status: 'completed', limit: '150', order });
+      const params = new URLSearchParams({
+        status: 'completed', limit: String(РЕЗУЛЬТАТОВ_НА_СТРАНИЦЕ), order,
+        offset: String(state.resultsOffset || 0), light: 'true' });
       if (search) params.set('search', search);
       const содержание = (qs('#r-content') || {}).value;
       if (содержание) params.set('content', содержание);
@@ -2738,11 +3005,11 @@ RENDERERS.results = {
             ${job.match && job.match.snippet
               ? `<div class="found small truncate" style="max-width:260px"
                      title="Открыть на ${fmtDur(job.match.start_s)}"
-                     onclick="__asrhub.openAt('${job.id}', ${Number(job.match.start_s) || 0})">
+                     onclick="__asrhub.openAt(${jsArg(job.id)}, ${Number(job.match.start_s) || 0})">
                    <span class="at">${fmtDur(job.match.start_s)}</span> ${markSnippet(job.match.snippet)}
                  </div>`
               : `<div class="small faint truncate" style="max-width:260px">${
-                  esc((job.text || '').slice(0, 70))}</div>`}</td>
+                  esc((job.text || job.text_preview || '').slice(0, 70))}</div>`}</td>
           <td class="small dim">${esc(job.model || '')}</td>
           <td class="num">${fmtDur(job.media_duration_s)}</td>
           <td class="num">${num(job.words_count)}</td>
@@ -2752,18 +3019,38 @@ RENDERERS.results = {
           <td class="num">${job.speakers_count || '—'}</td>
           <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
           <td><div class="row" style="gap:3px">
-            <button class="ghost sm" onclick="__asrhub.playRecording('${job.id}')"
+            <button class="ghost sm" onclick="__asrhub.playRecording(${jsArg(job.id)})"
               title="Прослушать запись">▶</button>
             ${['txt', 'srt', 'json', 'docx'].map((f) =>
-              `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
+              `<button class="btn sm" onclick="__asrhub.download(${jsArg(job.id)},${jsArg(f)})"
                  title="Скачать в формате ${f}">${f}</button>`).join('')}
-            <button class="ghost sm" onclick="__asrhub.openJob('${job.id}')">Открыть</button>
+            <button class="ghost sm" onclick="__asrhub.openJob(${jsArg(job.id)})">Открыть</button>
           </div></td></tr>`).join('')}
-      </tbody></table>` : '<div class="empty">Завершённых заданий пока нет</div>';
+      </tbody></table>` : `<div class="empty">${search || содержание
+        ? 'По этому отбору записей нет — уточните поиск или выберите «любое содержание».'
+        : 'Завершённых заданий пока нет'}</div>`;
       Bulk.bind(host);
+      this.drawPager(data);
     } catch (err) { fail(err); }
   },
+
+  drawPager(data) {
+    const полоса = qs('#results-pager');
+    if (!полоса) return;
+    const всего = Number(data.total || 0);
+    const с = Number(data.offset || 0);
+    const строк = (data.items || []).length;
+    полоса.hidden = !всего;
+    qs('#results-shown').textContent = строк
+      ? `показаны ${num(с + 1, 0)}–${num(с + строк, 0)} из ${num(всего, 0)}`
+      : `на этой странице пусто, всего ${num(всего, 0)}`;
+    qs('#r-prev').disabled = с <= 0;
+    qs('#r-next').disabled = с + строк >= всего;
+  },
 };
+
+/** Сколько строк на странице «Результатов». */
+const РЕЗУЛЬТАТОВ_НА_СТРАНИЦЕ = 100;
 
 // ==========================================================================
 // Проигрыватель записи
@@ -2804,12 +3091,13 @@ const Player = {
         if (key) headers['X-API-Key'] = key;
         const response = await fetch(direct, { headers });
         if (!response.ok) {
-          let reason = `сервер ответил ${response.status}`;
-          try {
-            const body = await response.json();
-            reason = (body.error && (body.error.message || body.error.hint)) || reason;
-          } catch (e) { /* тело не разобралось — оставляем код ответа */ }
-          throw new Error(reason);
+          // Причина — из полей отказа сервера. Читали `body.error`, которого
+          // в ответе нет, и вместо «У задания не сохранён путь к записи»
+          // человек видел «сервер ответил 400».
+          let body = null;
+          try { body = await response.json(); } catch (e) { body = null; }
+          const отказ = причинаОтказа(body, response.status);
+          throw new Error(отказ.hint ? `${отказ.message} ${отказ.hint}` : отказ.message);
         }
         const blob = await response.blob();
         el.__blobUrl = URL.createObjectURL(blob);
@@ -2910,7 +3198,11 @@ const Player = {
           toast(`Заглушено ${num(итог.seconds, 1)} с`, 'ok',
                 `${виды}${итог.estimated
                   ? ` · ${итог.estimated} по оценке (у слов нет таймкодов)` : ''}`);
-          window.open(итог.url, '_blank');
+          // Копия отдаётся скачиванием с ключом в заголовке. Раньше она
+          // открывалась новой вкладкой без ключа — у вошедшего по ключу там
+          // был отказ 401, — а открытие после долгого ожидания ещё и
+          // попадало под блокировщик всплывающих окон.
+          if (итог.url) await скачатьФайл(итог.url, `запись-${id}.отредактировано.wav`);
         } catch (err) {
           toast(err.message || 'Не удалось отредактировать запись', 'err',
                 err.hint || '');
@@ -2953,26 +3245,12 @@ const Player = {
   /** Скачивание исходной записи — тем же способом, что и остальные файлы. */
   async save(id) {
     try {
-      const headers = {};
-      const key = localStorage.getItem('asrhub_key');
-      if (key) headers['X-API-Key'] = key;
-      const response = await fetch(Player.url(id), { headers });
-      if (!response.ok) throw new Error(`сервер ответил ${response.status}`);
-      const blob = await response.blob();
       // Разбор имени — общий с выгрузкой результатов. Своя копия здесь
       // искала только filename*= по RFC 5987, а его сервер шлёт лишь для
       // неascii-имён: файл «record.wav» сохранялся как «запись-job_….wav».
-      const disposition = response.headers.get('Content-Disposition') || '';
-      const name = parseFilename(disposition) || `запись-${id}.wav`;
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = name;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+      await скачатьФайл(Player.url(id), `запись-${id}.wav`);
     } catch (err) {
-      toast(`Не удалось скачать запись: ${err.message}`, 'err');
+      toast(`Не удалось скачать запись: ${err.message}`, 'err', err.hint || '');
     }
   },
 };
@@ -3002,31 +3280,10 @@ window.__asrhub.exportContent = (fmt) => downloadReport(
  */
 async function downloadReport(url, fmt, подпись) {
   try {
-    const headers = {};
-    const key = localStorage.getItem('asrhub_key');
-    if (key) headers['X-API-Key'] = key;
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-      let причина = `сервер ответил ${response.status}`;
-      try {
-        const тело = await response.json();
-        причина = тело.message || причина;
-        if (тело.hint) причина += ` — ${тело.hint}`;
-      } catch (e) { /* тело не разбирается: остаётся код ответа */ }
-      throw new Error(причина);
-    }
-    const blob = await response.blob();
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = parseFilename(response.headers.get('Content-Disposition') || '')
-                    || `${подпись}.${fmt === 'csv' ? 'zip' : 'xlsx'}`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    await скачатьФайл(url, `${подпись}.${fmt === 'csv' ? 'zip' : 'xlsx'}`);
     toast('Выгрузка готова', 'ok');
   } catch (err) {
-    toast(`Не удалось выгрузить: ${err.message}`, 'err');
+    toast(`Не удалось выгрузить: ${err.message}`, 'err', err.hint || '');
   }
 }
 
@@ -3052,11 +3309,22 @@ window.__asrhub.saveRecording = (id) => Player.save(id);
 // Карточка задания
 // ==========================================================================
 
+/** Карточки, которые сейчас открываются: двойной щелчок «Открыть» давал две. */
+const КАРТОЧКИ_ОТКРЫВАЮТСЯ = new Set();
+
 window.__asrhub.openJob = async (id, opts) => {
+  if (КАРТОЧКИ_ОТКРЫВАЮТСЯ.has(id)) return;
+  const открыта = qsa('.modal-backdrop').find((фон) => фон.dataset.jobId === String(id));
+  if (открыта) { closeModal(открыта); }
+  КАРТОЧКИ_ОТКРЫВАЮТСЯ.add(id);
   try {
-    const job = await API.get(`/api/jobs/${id}?with_segments=true`);
+    const job = await API.get(`/api/jobs/${encodeURIComponent(id)}?with_segments=true`);
     showJobModal(job, opts || {});
-  } catch (err) { fail(err); }
+  } catch (err) {
+    fail(err);
+  } finally {
+    КАРТОЧКИ_ОТКРЫВАЮТСЯ.delete(id);
+  }
 };
 
 function showJobModal(job, opts) {
@@ -3150,6 +3418,7 @@ function showJobModal(job, opts) {
           ? '<button data-tab="analysis">Разбор</button>' : ''}
         ${job.status === 'completed' && job.text
           ? `<button data-tab="reference">Эталон${job.wer !== null && job.wer !== undefined ? ` (WER ${pct(job.wer, 1)})` : ''}</button>` : ''}
+        ${job.qa ? `<button data-tab="qa">Проверка${job.qa.status === 'pending' ? ' · ждёт' : ''}</button>` : ''}
         <button data-tab="events">События</button>
       </div>
       <div id="job-tab-body"></div>
@@ -3157,16 +3426,17 @@ function showJobModal(job, opts) {
     <div class="modal-foot">
       <span class="small faint mono">${esc(job.id)}</span>
       <span class="spacer"></span>
-      <button class="btn sm" onclick="__asrhub.saveRecording('${job.id}')"
+      <button class="btn sm" onclick="__asrhub.saveRecording(${jsArg(job.id)})"
         title="Скачать исходную запись">запись</button>
       ${job.status === 'completed' ? ['txt', 'srt', 'vtt', 'json', 'csv', 'docx'].map((f) =>
-        `<button class="btn sm" onclick="__asrhub.download('${job.id}','${f}')"
+        `<button class="btn sm" onclick="__asrhub.download(${jsArg(job.id)},${jsArg(f)})"
            title="Скачать в формате ${f}">${f}</button>`).join('') : ''}
       ${job.status === 'failed'
-        ? `<button class="primary" data-action="retry" onclick="__asrhub.jobAction('${job.id}','retry')">
+        ? `<button class="primary" data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')">
              Повторить</button>` : ''}
     </div></div></div>`);
 
+  backdrop.dataset.jobId = String(job.id);
   mountModal(backdrop);
   const close = () => closeModal(backdrop);
   qs('#modal-close', backdrop).onclick = close;
@@ -3204,6 +3474,7 @@ function showJobModal(job, opts) {
       ${changed.length === 0 ? '<div class="empty small">Использованы значения по умолчанию</div>' : ''}`,
     analysis: () => `<div id="job-analysis"><div class="empty">Разбираем запись…</div></div>`,
     reference: () => referenceTab(job, segments),
+    qa: () => qaTab(job),
     events: () => `<div class="table-wrap"><table>
       <thead><tr><th>Время</th><th>Событие</th><th>Сообщение</th></tr></thead><tbody>
       ${(job.events || []).map((e) => `<tr>
@@ -3222,10 +3493,12 @@ function showJobModal(job, opts) {
     // бы вкладку, в которую не заходят.
     if (name === 'analysis') loadJobAnalysis(backdrop, job);
     if (name === 'reference') bindReferenceTab(backdrop, job, () => show('reference'));
+    if (name === 'qa') bindQaTab(backdrop, job, () => show('qa'));
   };
   qsa('#job-tabs button', backdrop).forEach((b) =>
     b.addEventListener('click', () => show(b.dataset.tab)));
-  show(options.tab && tabs[options.tab] ? options.tab : 'text');
+  show(options.tab && tabs[options.tab] && (options.tab !== 'qa' || job.qa)
+    ? options.tab : 'text');
 
   const player = setupJobPlayer(backdrop, job, segments, show, options);
   drawJobWaveform(backdrop, job, segments, show, player);
@@ -3233,6 +3506,80 @@ function showJobModal(job, opts) {
   // Проигрыватель продолжал бы играть из закрытого окна: узел удалён, звук
   // идёт. Поэтому останавливаем его вместе с окном.
   backdrop.addEventListener('asrhub:closed', () => { if (player) player.destroy(); });
+}
+
+/* Вкладка «Проверка» в карточке задания: оценка работы оператора человеком.
+ *
+ * Очередь «Контроль качества» вела в карточку записи, а закрыть проверку там
+ * было нечем — только запросом PUT /api/qa/{id}. Процесс, ради которого
+ * заведена калибровка проверяющих, из интерфейса не завершался. */
+function qaTab(job) {
+  const п = job.qa || {};
+  const балл = (з) => (з === null || з === undefined ? '—' : num(з, 0));
+  if (п.status !== 'pending') {
+    return `<div class="grid cols-3" style="margin-bottom:12px">
+        ${kpi('Автомат', балл(п.auto_score), 'балл оператора по разбору на момент назначения')}
+        ${kpi('Человек', балл(п.score), п.reviewer ? `проверил ${esc(п.reviewer)}` : '')}
+        ${kpi('Согласие', п.agree === null || п.agree === undefined ? '—'
+                : (п.agree ? 'согласен' : 'разошлись'), 'расхождение до 10 баллов — согласие')}
+      </div>
+      ${п.comment ? `<div class="small"><b>Комментарий:</b> ${esc(п.comment)}</div>` : ''}
+      <div class="small faint" style="margin-top:8px">Проверка закрыта ${esc(fmtTime(п.reviewed_at))}.</div>`;
+  }
+  const просрочено = п.due_at && п.due_at * 1000 < Date.now();
+  return `<div class="stack" style="gap:10px;max-width:560px">
+      <div class="small dim">Запись стоит на проверке${п.assigned_to ? ` у ${esc(п.assigned_to)}` : ''}${
+        п.due_at ? ` · срок ${esc(fmtTime(п.due_at))}${просрочено ? ' <span class="chip err">просрочено</span>' : ''}` : ''}${
+        п.agent ? ` · оператор ${esc(п.agent)}` : ''}.</div>
+      <div class="small">Автомат поставил <b>${балл(п.auto_score)}</b> из 100. Прослушайте
+        разговор и поставьте свой балл: согласие с автоматом посчитается само
+        (расхождение до 10 баллов).</div>
+      <label class="small dim" for="qa-score">Ваш балл, 0–100</label>
+      <input type="number" id="qa-score" min="0" max="100" step="1" style="width:120px" class="mono">
+      <label class="small dim" for="qa-comment">Комментарий — что было не так или что хорошо</label>
+      <textarea id="qa-comment" rows="3" maxlength="2000"></textarea>
+      <div class="row" style="gap:8px">
+        <button class="primary" id="qa-submit">Закрыть проверку</button>
+        <span class="small err" id="qa-error"></span>
+      </div>
+    </div>`;
+}
+
+function bindQaTab(backdrop, job, перерисовать) {
+  const кнопка = qs('#qa-submit', backdrop);
+  if (!кнопка) return;
+  кнопка.onclick = async () => {
+    const поле = qs('#qa-score', backdrop);
+    const ошибка = qs('#qa-error', backdrop);
+    const текст = поле.value.trim();
+    const балл = Number(текст.replace(',', '.'));
+    if (текст === '' || !Number.isFinite(балл) || балл < 0 || балл > 100) {
+      ошибка.textContent = 'Балл — число от 0 до 100.';
+      поле.focus();
+      return;
+    }
+    ошибка.textContent = '';
+    кнопка.disabled = true;
+    try {
+      await API.put(`/api/qa/${encodeURIComponent(job.qa.id)}`,
+                    { score: балл, comment: qs('#qa-comment', backdrop).value.trim() });
+      const авто = job.qa.auto_score;
+      Object.assign(job.qa, {
+        status: 'done', score: балл, comment: qs('#qa-comment', backdrop).value.trim(),
+        reviewer: (state.me || {}).name || '', reviewed_at: Date.now() / 1000,
+        agree: авто === null || авто === undefined ? null : Math.abs(авто - балл) <= 10,
+      });
+      toast('Проверка закрыта', 'ok', job.qa.agree === null ? ''
+        : (job.qa.agree ? 'Согласны с автоматом' : 'Разошлись с автоматом больше чем на 10 баллов'));
+      const вкладка = qs('#job-tabs button[data-tab="qa"]', backdrop);
+      if (вкладка) вкладка.textContent = 'Проверка';
+      перерисовать();
+      if (qs('#qa-body')) drawQaQueue();
+    } catch (err) {
+      ошибка.textContent = err.hint ? `${err.message} ${err.hint}` : (err.message || 'Не удалось');
+      кнопка.disabled = false;
+    }
+  };
 }
 
 /* Очередь ручной проверки — карточка в «Аналитике».
@@ -3287,7 +3634,6 @@ async function drawReviewQueue() {
       try {
         await API.call(`/api/review/${кнопка.dataset.reviewSkip}`, { method: 'PUT', json: { status: 'skipped' } });
         drawReviewQueue();
-  drawQaQueue();
       } catch (err) { fail(err); кнопка.disabled = false; }
     };
   });
@@ -3379,7 +3725,8 @@ async function drawQaQueue() {
     </div>` : ''}`;
 
   qsa('[data-qa-open]', тело).forEach((кнопка) =>
-    кнопка.addEventListener('click', () => window.__asrhub.openJob(кнопка.dataset.qaOpen)));
+    кнопка.addEventListener('click', () => window.__asrhub.openJob(кнопка.dataset.qaOpen,
+                                                                   { tab: 'qa' })));
   const набрать = qs('#qa-sample-now', тело);
   if (набрать) набрать.onclick = async () => {
     набрать.disabled = true;
@@ -3937,7 +4284,15 @@ function setupJobFind(backdrop, job) {
   });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { clearTimeout(таймер); искать(); }
-    if (e.key === 'Escape') { input.value = ''; искать(); }
+    // Esc с текстом в поле очищает поиск — и только его: общий обработчик
+    // ниже по документу закрывал вместе с поиском всю карточку записи.
+    // Пустое поле отпускает Esc дальше, и карточка закрывается как обычно.
+    if (e.key === 'Escape' && input.value) {
+      e.stopPropagation();
+      e.preventDefault();
+      input.value = '';
+      искать();
+    }
   });
   hits.addEventListener('click', (e) => {
     const node = e.target.closest('.found[data-start]');
@@ -4108,7 +4463,8 @@ RENDERERS.analytics = {
           title="Тот же отчёт книгой Excel: по листу на разрез">Выгрузить в Excel</button>
         <button class="ghost sm" onclick="__asrhub.exportAnalytics('csv')"
           title="Архив CSV — если Excel под рукой нет">CSV</button>
-        <a class="btn sm" href="/api/metrics" target="_blank">Метрики Prometheus</a>
+        <button class="btn sm" onclick="__asrhub.openTab('/api/metrics')"
+          title="Снимок метрик в формате Prometheus — в новой вкладке">Метрики Prometheus</button>
       </div>
       <div id="analytics-body"><div class="empty">Загрузка аналитики…</div></div>`;
 
@@ -4353,7 +4709,7 @@ RENDERERS.analytics = {
         <td class="num">${m.confidence_avg !== null ? pct(m.confidence_avg, 0) : '—'}</td>
         <td class="num">${num(m.audio_hours, 2)}</td>
         <td class="num">${m.catalog_ru_wer !== null && m.catalog_ru_wer !== undefined
-          ? m.catalog_ru_wer.toFixed(1) + ' %' : '—'}</td>
+          ? num(m.catalog_ru_wer, 1) + ' %' : '—'}</td>
         <td class="small"><span class="chip badge-license">${esc(m.license || '')}</span></td>
       </tr>`).join('')}</tbody></table>` : '<div class="empty">Нет данных за период</div>';
 
@@ -4544,7 +4900,7 @@ function drawExtraAnalytics(data) {
             <td class="small dim">${esc(з.model || '—')}</td>
             <td class="num mono">${num(з.suspect_segments)} / ${num(з.segments_count)}</td>
             <td class="small dim">${esc((з.flags || []).map((ф) => ПРИЗНАКИ_КАЧЕСТВА[ф] || ф).join(', '))}</td>
-            <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(з.id)}')">Открыть</button></td></tr>`).join('')
+            <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(з.id)})">Открыть</button></td></tr>`).join('')
             || '<tr><td colspan="5" class="empty small">Подозрительных записей нет</td></tr>'}</tbody>
         </table></div>
         <p class="small faint" style="margin-top:10px">
@@ -4662,7 +5018,7 @@ function drawExtraAnalytics(data) {
         <div>${таблица('Длительность', т.by_duration)}${(т.by_source || []).length > 1 ? `<div style="margin-top:8px">${таблица('Источник', т.by_source)}</div>` : ''}</div>
       </div>
       ${(т.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Хуже всего</b>: ${т.worst.slice(0, 5).map((з) =>
-        `<a href="#" class="link" onclick="window.__asrhub.openJob('${esc(з.id)}');return false">${esc(з.filename || з.id)}</a> — ${проц(з.wer)}`).join('; ')}</div>` : ''}
+        `<a href="#" class="link" onclick="window.__asrhub.openJob(${jsArg(з.id)});return false">${esc(з.filename || з.id)}</a> — ${проц(з.wer)}`).join('; ')}</div>` : ''}
       <p class="small faint" style="margin-top:8px">${esc(т.note || '')}${
         [...(т.by_model || []), ...(т.by_duration || [])].some((р) => !р.enough) ? ' † — срезу не хватает слов.' : ''}</p>`;
     }
@@ -4694,7 +5050,7 @@ function drawExtraAnalytics(data) {
           <td class="num">${num(п.checks)}</td><td class="num mono">${проц(п.wer_avg)}</td>
           <td class="num mono">${проц(п.mer_avg)}</td></tr>`).join('')}</tbody></table>` : ''}
       ${(сг.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Сильнее всего разошлись</b>: ${сг.worst.slice(0, 5).map((з) =>
-        `<a href="#" onclick="window.__asrhub.openJob('${esc(з.job_id)}');return false">${esc(з.filename || з.job_id)}</a> — ${проц(з.wer)}${
+        `<a href="#" onclick="window.__asrhub.openJob(${jsArg(з.job_id)});return false">${esc(з.filename || з.job_id)}</a> — ${проц(з.wer)}${
           з.snr_db !== null && з.snr_db !== undefined && з.snr_db < 10 ? ' <span class="chip warn" title="шумная запись">шум</span>' : ''}`).join('; ')}</div>` : ''}
       <p class="small faint" style="margin-top:8px">${esc(сг.note || '')}</p>`;
       const дни = сг.by_day || [];
@@ -4705,7 +5061,12 @@ function drawExtraAnalytics(data) {
       });
     }
   }
+  // Обе очереди человека рисуются вместе. Вызов контроля качества стоял по
+  // ошибке внутри «Пропустить» у очереди эталонов, и карточка «Контроль
+  // качества работы операторов» показывала «Загрузка…» бесконечно — пока
+  // кто-нибудь не пропустил запись в соседней карточке.
   drawReviewQueue();
+  drawQaQueue();
 
   const кл = data.calibration || {};
   if (qs('#calibration-body')) {
@@ -4749,12 +5110,14 @@ function drawExtraAnalytics(data) {
       <td class="num mono">${num(р.processing_p50, 1)} / ${num(р.processing_p95, 1)} / ${num(р.processing_p99, 1)}</td>
       <td class="num mono">${р.rtf_p50 === null ? '—' : num(р.rtf_p50, 3)} / ${р.rtf_p95 === null ? '—' : num(р.rtf_p95, 3)}</td>
       <td class="num mono">${р.queue_p95 === null || р.queue_p95 === undefined ? '—' : num(р.queue_p95, 1)}</td></tr>`;
-    const таблица = (заголовок, строки) => (строки || []).length ? `<table>
+    // Таблицы — в обёртке с прокруткой: на телефоне пять числовых колонок
+    // в простом div раздвигали всю страницу вбок.
+    const таблица = (заголовок, строки) => (строки || []).length ? `<div class="table-wrap"><table>
       <thead><tr><th>${заголовок}</th><th class="num">Заданий</th>
         <th class="num" title="время обработки: p50 / p95 / p99, с">Обработка, с</th>
         <th class="num" title="RTF: p50 / p95">RTF</th>
         <th class="num" title="ожидание в очереди, p95, с">Очередь p95</th></tr></thead>
-      <tbody>${строки.map(строка).join('')}</tbody></table>` : '';
+      <tbody>${строки.map(строка).join('')}</tbody></table></div>` : '';
     const поток = лт.stream || {};
     if (!общий.jobs && !поток.sessions) {
       тело.innerHTML = '<div class="empty small">За период нет заданий, посчитанных сервером самим</div>';
@@ -4767,10 +5130,10 @@ function drawExtraAnalytics(data) {
       </div>
       ${таблица('Модель', лт.by_model)}
       <div style="margin-top:8px">${таблица('Длительность', лт.by_duration)}</div>
-      ${(поток.by_model || []).length ? `<table style="margin-top:8px"><thead><tr><th>Поток: модель</th><th class="num">Сессий</th>
+      ${(поток.by_model || []).length ? `<div class="table-wrap" style="margin-top:8px"><table><thead><tr><th>Поток: модель</th><th class="num">Сессий</th>
         <th class="num" title="секунды до первого текста: p50 / p95">До первого текста, с</th></tr></thead><tbody>
         ${поток.by_model.map((м) => `<tr><td>${esc(м.key)}</td><td class="num">${num(м.sessions)}</td>
-          <td class="num mono">${num(м.first_text_p50, 1)} / ${num(м.first_text_p95, 1)}</td></tr>`).join('')}</tbody></table>` : ''}
+          <td class="num mono">${num(м.first_text_p50, 1)} / ${num(м.first_text_p95, 1)}</td></tr>`).join('')}</tbody></table></div>` : ''}
       <p class="small faint" style="margin-top:8px">${esc(лт.note || '')}</p>`;
     }
   }
@@ -4937,6 +5300,14 @@ function drawExtraAnalytics(data) {
  * заданий нет (самые долгие паузы, самая быстрая речь) — для них перехода
  * не будет, и кнопка не показывается вовсе. Молча уводить на «все записи»
  * хуже, чем не уводить никуда. */
+/** Рейтинги, у которых в «Результатах» свой порог, — и подпись с ним. */
+const ОТБОР_ПОРОГ = {
+  negative: 'Все отрицательные (ниже −0,15)',
+  script: 'Все, где скрипт выполнен меньше чем наполовину',
+  monologue: 'Все с монологом от 2,5 минуты',
+  low_score: 'Все с баллом оператора ниже 60',
+};
+
 const ОТБОР_В_РЕЗУЛЬТАТЫ = {
   negative: 'negative', downturn: 'downturn', recovered: 'recovered',
   alerts: 'alerts', open_commitments: 'open_commitments',
@@ -5386,8 +5757,11 @@ RENDERERS.trends = {
     // значение (и картина искажалась), а у показателя без данных вообще
     // вся карта заливалась одним тоном вместо честной пустоты — при
     // подписи «от — до —» под ней.
+    // Все двадцать четыре подписи: ось прореживает их сама, а подсказка
+    // клетки берёт час отсюда же — с пустыми подписями у двух третей клеток
+    // в подсказке стояло «Ср, : 0,230» без часа.
     window.Charts.grid(host, {
-      rows: д.days || [], cols: Array.from({ length: 24 }, (_, i) => (i % 3 === 0 ? String(i) : '')),
+      rows: д.days || [], cols: Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0')),
       values: д.grid || [], emptyText: 'За период нет данных' });
     const подпись = document.createElement('div');
     подпись.className = 'small faint';
@@ -5552,7 +5926,7 @@ RENDERERS.telephony = {
         <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" id="tel-queued"
           ${state.telOnlyQueued ? 'checked' : ''} style="width:auto">только распознанные</label>
         <span class="spacer"></span>
-        <input type="search" id="tel-search" placeholder="номер или идентификатор"
+        <input type="search" id="tel-search" maxlength="64" placeholder="номер или идентификатор"
           value="${esc(state.telSearch || '')}" style="width:220px">
       </div>
       <div id="tel-calls"><div class="empty">Загрузка…</div></div>`;
@@ -5736,12 +6110,16 @@ RENDERERS.telephony = {
     if (state.telOnlyQueued) пар.set('only_queued', 'true');
     let свод;
     try {
-      свод = await API.get(`/api/telephony/calls?${пар}`);
+      // Последний запрос побеждает: «Год», потом сразу «Сутки» — и медленный
+      // годовой ответ приходил позже, рисуя три звонка за год под
+      // подсвеченными «Сутками».
+      свод = await API.latest('tel-calls', `/api/telephony/calls?${пар}`);
     } catch (err) {
       if (err.code === 'aborted') return;
       коробка.innerHTML = `<div class="empty">Журнал недоступен: ${esc(err.message || '')}</div>`;
       return;
     }
+    if (!коробка.isConnected) return;
     this.drawCalls(коробка, свод);
   },
 
@@ -5757,7 +6135,7 @@ RENDERERS.telephony = {
     }
     const строки = звонки.map((з) => {
       const статус = з.job_id
-        ? `<a href="#" onclick="__asrhub.openJob('${esc(з.job_id)}');return false"
+        ? `<a href="#" onclick="__asrhub.openJob(${jsArg(з.job_id)});return false"
              title="Открыть карточку задания">${esc(STATUS_LABELS[з.job_status] || з.job_status || 'в очереди')}</a>`
         : `<span class="dim" title="почему не распознан">${esc(з.skipped || '—')}</span>`;
       const направление = з.direction
@@ -6282,7 +6660,13 @@ RENDERERS.pbx = {
     }
     if (кнопка) кнопка.disabled = true;
     try {
-      await API.post('/api/telephony/collect', тело);
+      const итог = await API.post('/api/telephony/collect', тело);
+      // Пустой список заходов — сбор не запущен ни на одной станции: нет
+      // включённых. Раньше и тогда всплывало зелёное «Сбор запущен».
+      if (итог && Array.isArray(итог.runs) && !итог.runs.length) {
+        toast('Сбор не запущен', 'warn', 'Нет включённых станций — включите станцию в списке выше.');
+        return;
+      }
       toast('Сбор запущен', 'ok');
       this.pollCollect();
     } catch (err) {
@@ -6931,11 +7315,12 @@ RENDERERS.pbx = {
     const станция = (state.pbxData.stations || []).find((с) => с.id === ид);
     if (!станция) return;
     try {
-      await API.post(`/api/telephony/stations/${encodeURIComponent(ид)}/enabled?enabled=${
+      const итог = await API.post(`/api/telephony/stations/${encodeURIComponent(ид)}/enabled?enabled=${
         станция.enabled ? 'false' : 'true'}`);
       toast(станция.enabled ? `Станция «${станция.name}» выключена`
-                            : `Станция «${станция.name}» включена`, 'ok',
-            станция.enabled ? 'Настройки и позиция чтения журнала сохранены' : '');
+                            : `Станция «${станция.name}» включена`, persistedKind(итог),
+            итог && итог.persisted === false ? persistedHint(итог)
+              : (станция.enabled ? 'Настройки и позиция чтения журнала сохранены' : ''));
       await this.load();
     } catch (err) { fail(err); }
   },
@@ -6953,8 +7338,9 @@ RENDERERS.pbx = {
     if (!ответ) return;
     try {
       const итог = await API.del(`/api/telephony/stations/${encodeURIComponent(ид)}`);
-      toast(`Станция «${станция.name}» убрана`, 'ok',
-            `Звонков осталось в архиве: ${num(итог.kept_calls || 0, 0)}`);
+      toast(`Станция «${станция.name}» убрана`, persistedKind(итог),
+            `Звонков осталось в архиве: ${num(итог.kept_calls || 0, 0)}`
+            + (итог.persisted === false ? `. ${persistedHint(итог)}` : ''));
       if (state.pbxStation === ид) state.pbxStation = '';
       await this.load();
     } catch (err) { fail(err); }
@@ -7116,9 +7502,14 @@ RENDERERS.pbx.edit = function (ид) {
     const кнопка = ев.currentTarget;
     кнопка.disabled = true;
     try {
-      await API.post('/api/telephony/stations', собрать());
-      toast(ид ? 'Станция сохранена' : 'Станция добавлена', 'ok',
-            ид ? '' : 'Первый заход пройдёт в ближайшую минуту — или нажмите «Забрать»');
+      const итог = await API.post('/api/telephony/stations', собрать());
+      // Раньше набор станций жил только в памяти: «Станция добавлена», а
+      // после перезапуска станции не было. Теперь сервер пишет его в
+      // config.yaml и говорит, если записать не удалось.
+      toast(ид ? сохраненоИли(итог, 'Станция сохранена', 'Станция изменена') : 'Станция добавлена',
+            persistedKind(итог),
+            итог && итог.persisted === false ? persistedHint(итог)
+              : (ид ? '' : 'Первый заход пройдёт в ближайшую минуту — или нажмите «Забрать»'));
       закрыть();
       // Форму станции открывают из двух мест: раздела «АТС» и настроек
       // телефонии. Обновлять надо тот, из которого пришли, — иначе вызов
@@ -7463,8 +7854,10 @@ RENDERERS.content = {
     const столбики = (место, поле, знаков, единица) => Charts.hbars(qs(место), {
       items: люди.filter((ч) => ч[поле] !== null && ч[поле] !== undefined)
         .sort((a, b) => b[поле] - a[поле]).slice(0, 10)
-        .map((ч) => ({ label: ч.label || ч.key, value: ч[поле],
-                       color: Charts.palette()[0],
+        // «—» — это записи без оператора; так их и подписываем, как в
+        // «Аналитике по сотрудникам», а не прочерком у столбика.
+        .map((ч) => ({ label: ч.key === '—' ? 'без оператора' : (ч.label || ч.key),
+                       value: ч[поле], color: Charts.palette()[0],
                        display: `${num(ч[поле], знаков)}${единица}`,
                        note: `записей ${num(ч.records, 0)}` })),
       labelWidth: 140, emptyText: 'Разбор по сотрудникам пока пуст',
@@ -7711,7 +8104,9 @@ RENDERERS.content = {
                  <th class="num" title="медиана и межквартильный размах по своему архиву за четыре недели до периода">Своя норма</th>
                  <th title="медиана периода против коридора нормы">Относительно нормы</th></tr></thead>
                <tbody>${(свод.features || []).map((f) => {
-                 const a = c[f.key], b = p[f.key];
+                 // Прошлый период без записей — не «ноль», а «не с чем
+                 // сравнивать»: иначе счётчики показывали «10 | 0 | +10».
+                 const a = c[f.key], b = Number(p.records || 0) ? p[f.key] : null;
                  if (a === null || a === undefined) return '';
                  let d = (b === null || b === undefined) ? null : a - b;
                  // Разница мельче показанной точности — это ноль, а не
@@ -7837,7 +8232,7 @@ RENDERERS.content = {
         <div class="analysis-lines">${д.action_items.slice(0, 8).map((а) => `<div class="analysis-line">
           <span class="ts mono">${fmtTime(а.created_at).slice(0, 5)}</span>
           <span class="who">${esc(а.who || '')}</span>
-          <span class="what"><a href="#" onclick="window.__asrhub.openJob('${esc(а.job_id)}', {tab: 'analysis'});return false">${esc(а.what)}</a>${а.when ? ` <span class="chip">${esc(а.when)}</span>` : ''}</span></div>`).join('')}</div>` : ''}
+          <span class="what"><a href="#" onclick="window.__asrhub.openJob(${jsArg(а.job_id)}, {tab: 'analysis'});return false">${esc(а.what)}</a>${а.when ? ` <span class="chip">${esc(а.when)}</span>` : ''}</span></div>`).join('')}</div>` : ''}
       <div class="small faint" style="margin-top:8px">Сгенерировано языковой моделью: причина и исход выбраны из закрытых списков, резюме и действия — пересказ модели, который может ошибаться. Отбор записей по исходу и причине — в «Результатах».</div>`);
     if (исходы.length) {
       Charts.donut(qs('#llm-outcomes', host), {
@@ -8081,6 +8476,10 @@ RENDERERS.content = {
       state.contentKind = b.dataset.kind;
       qsa('#content-kind button').forEach((x) =>
         x.classList.toggle('active', x.dataset.kind === state.contentKind));
+      // Пока новый отбор грузится, под подсвеченной кнопкой стояли таблица
+      // и кнопка «Все …» прежнего: чужие данные как ответ на свой выбор.
+      const место = qs('#content-records');
+      if (место) место.innerHTML = '<div class="empty">Загрузка…</div>';
       this.loadRecords();
     }));
     return this.loadRecords();
@@ -8110,10 +8509,16 @@ RENDERERS.content = {
     // поиском и листалкой. Ключи отборов там те же, поэтому переход
     // сохраняет выбор, а не сбрасывает его на «все записи».
     const весь = ОТБОР_В_РЕЗУЛЬТАТЫ[state.contentKind];
+    // Часть списков здесь — рейтинги по всем записям («самые долгие
+    // монологи»), а в «Результатах» тот же ключ — порог. Кнопка «Все такие
+    // записи» вела с тридцати строк на пустой список; теперь она называет
+    // порог, по которому отберёт.
+    const порог = ОТБОР_ПОРОГ[state.contentKind];
     const действия = весь
       ? `<button class="ghost sm" id="content-all"
-           title="Открыть тот же отбор в разделе «Результаты» — с поиском и листалкой"
-           >Все такие записи</button>` : '';
+           title="${порог ? 'Открыть в «Результатах» записи, перешедшие порог, — с поиском и листалкой'
+                            : 'Открыть тот же отбор в разделе «Результаты» — с поиском и листалкой'}"
+           >${esc(порог || 'Все такие записи')}</button>` : '';
     host.innerHTML = card(данные.title, `${items.length} записей`,
       items.length ? `<div class="table-wrap full"><table>
         <thead><tr><th>Запись</th><th>Когда</th><th>Владелец</th>
@@ -8134,7 +8539,7 @@ RENDERERS.content = {
           <td class="num mono">${num(з.interruptions)}</td>
           <td class="num mono">${з.compliance === null ? '—' : pct(з.compliance, 0)}</td>
           <td class="num mono nowrap">${fmtDur(з.media_duration_s)}</td>
-          <td><button class="ghost sm" onclick="__asrhub.openJob('${esc(з.job_id)}')"
+          <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(з.job_id)})"
                 >Открыть</button></td></tr>`).join('')}</tbody></table></div>`
       : '<div class="empty">По этому отбору записей за период нет</div>', действия);
     const кнопка = qs('#content-all');
@@ -8168,7 +8573,11 @@ RENDERERS.content.tab_agents = async function (host) {
   const [операторы, очередь, эталоны] = await Promise.all([
     API.latest('content-agents',
       `/api/content/agents?period=${период}&by=${state.contentAgentBy}`),
-    API.latest('content-coaching', `/api/content/coaching?period=${период}&limit=30`),
+    // Разобранные сервер прячет, пока не попросят: без переключателя плашка
+    // «разобрано» и кнопка «Вернуть» не появлялись никогда, и ошибочно
+    // закрытую запись вернуть в очередь было нельзя.
+    API.latest('content-coaching', `/api/content/coaching?period=${период}&limit=30${
+      state.contentCoachingDone ? '&done=true' : ''}`),
     API.latest('content-references', `/api/content/references?period=${период}&limit=10`),
   ]);
   const items = операторы.items || [];
@@ -8211,7 +8620,10 @@ RENDERERS.content.tab_agents = async function (host) {
       ${card(`Очередь коучинга (${очередь.total > (очередь.shown ?? очередь.total)
                ? `${num(очередь.shown)} из ${num(очередь.total)}` : num(очередь.total)})`,
              'записи, которые стоит разобрать с оператором, — худшие первыми; «разобрано» убирает из очереди',
-             this.coachingTable(очередь.items || []))}
+             this.coachingTable(очередь.items || []),
+             `<label class="small nowrap" title="Показать и уже разобранные — их можно вернуть в очередь">
+                <input type="checkbox" id="coaching-done" ${state.contentCoachingDone ? 'checked' : ''}>
+                с разобранными</label>`)}
       ${card('Эталонные разговоры',
              'лучшие по баллу и тональности без нарушений — и отмеченные руками «показывать новичкам»',
              this.referencesTable(эталоны.items || []))}
@@ -8225,6 +8637,11 @@ RENDERERS.content.tab_agents = async function (host) {
     state.contentAgent = el.dataset.agent;
     this.showTab();
   }));
+  const разобранные = qs('#coaching-done', host);
+  if (разобранные) разобранные.addEventListener('change', () => {
+    state.contentCoachingDone = разобранные.checked;
+    this.showTab();
+  });
   this.bindMarks(host);
 };
 
@@ -8733,14 +9150,19 @@ RENDERERS.content.checkCategories = async function () {
   if (!host || !state.contentScriptJob) return;
   let ответ;
   try {
-    ответ = await API.post('/api/content/categories/check', {
-      job_id: state.contentScriptJob,
-      categories: state.contentCategories || [],
+    // Последняя проверка побеждает: правка правила во время медленной
+    // проверки запускала вторую, и ответ первой приходил позже — под
+    // исправленным правилом стоял результат старого.
+    ответ = await API.latest('cat-check', '/api/content/categories/check', {
+      method: 'POST',
+      json: { job_id: state.contentScriptJob, categories: state.contentCategories || [] },
     });
   } catch (err) {
+    if (err && err.silent) return;
     host.innerHTML = `<div class="empty small">Проверить не удалось: ${esc(err.message)}</div>`;
     return;
   }
+  if (!host.isConnected) return;
   const итог = ответ.result || {};
   const items = итог.items || [];
   // Ошибки правил — под самими правилами в редакторе, там их и правят.
@@ -8794,10 +9216,12 @@ RENDERERS.content.saveCategories = async function (набор) {
     toast('У каждой категории должно быть название и правило', 'err');
     return;
   }
+  let итог;
   try {
-    await API.put('/api/settings', { content_categories: набор });
+    итог = await сохранитьПараметры({ content_categories: набор });
   } catch (err) { fail(err); return; }
-  toast(набор.length ? 'Набор категорий сохранён' : 'Возвращён готовый набор', 'ok');
+  toast(набор.length ? сохраненоИли(итог, 'Набор категорий сохранён', 'Набор категорий применён')
+    : 'Возвращён готовый набор', persistedKind(итог), persistedHint(итог));
   if (confirm('Набор категорий изменился — пересчитать разбор архива?\n\n' +
               'Без пересчёта старые записи останутся размечены прежним набором, ' +
               'и счёт по категориям будет смешивать два набора.')) {
@@ -9003,14 +9427,16 @@ RENDERERS.content.checkScript = async function () {
   if (!host || !state.contentScriptJob) return;
   let ответ;
   try {
-    ответ = await API.post('/api/content/script/check', {
-      job_id: state.contentScriptJob,
-      script: state.contentScript || undefined,
+    ответ = await API.latest('script-check', '/api/content/script/check', {
+      method: 'POST',
+      json: { job_id: state.contentScriptJob, script: state.contentScript || undefined },
     });
   } catch (err) {
+    if (err && err.silent) return;
     host.innerHTML = `<div class="empty small">Проверить не удалось: ${esc(err.message)}</div>`;
     return;
   }
+  if (!host.isConnected) return;
   const итог = ответ.compliance || {};
   const пункты = итог.items || [];
   host.innerHTML = `
@@ -9045,10 +9471,12 @@ RENDERERS.content.saveScript = async function (пункты) {
     toast('У каждого пункта должно быть название и хотя бы одна примета', 'err');
     return;
   }
+  let итог;
   try {
-    await API.put('/api/settings', { content_script: пункты });
+    итог = await сохранитьПараметры({ content_script: пункты });
   } catch (err) { fail(err); return; }
-  toast(пункты.length ? 'Скрипт сохранён' : 'Возвращён набор по умолчанию', 'ok');
+  toast(пункты.length ? сохраненоИли(итог, 'Скрипт сохранён', 'Скрипт применён')
+    : 'Возвращён набор по умолчанию', persistedKind(итог), persistedHint(итог));
   if (confirm('Скрипт изменился — пересчитать разбор архива?\n\n' +
               'Без пересчёта соблюдение скрипта в отчётах останется посчитанным ' +
               'по прежним пунктам, и сравнивать эти числа с новыми нельзя.')) {
@@ -9158,7 +9586,7 @@ RENDERERS.models = {
             <td class="num">${m.vram_gb ? m.vram_gb + ' ГБ' : '—'}</td>
             <td class="num">${(() => {
               const w = (m.benchmarks || []).filter((b) => b.language === 'ru' && b.metric === 'WER');
-              return w.length ? Math.min(...w.map((b) => b.value)).toFixed(1) + ' %' : '—';
+              return w.length ? num(Math.min(...w.map((b) => b.value)), 1) + ' %' : '—';
             })()}</td>
             <td><div class="row wrap" style="gap:3px">
               ${m.streaming ? '<span class="chip info">поток</span>' : ''}
@@ -9171,9 +9599,9 @@ RENDERERS.models = {
             <td><span class="chip badge-license ${m.commercial_use ? '' : 'err'}">${
               esc(m.license)}</span></td>
             <td><div class="row" style="gap:4px">
-              <button class="ghost sm" onclick="__asrhub.showModel('${esc(m.id)}')">Подробно</button>
-              <button class="ghost sm" onclick="__asrhub.useModel('${esc(m.id)}')">Выбрать</button>
-              <button class="ghost sm" onclick="__asrhub.downloadModel('${esc(m.id)}')"
+              <button class="ghost sm" onclick="__asrhub.showModel(${jsArg(m.id)})">Подробно</button>
+              <button class="ghost sm" onclick="__asrhub.useModel(${jsArg(m.id)})">Выбрать</button>
+              <button class="ghost sm" onclick="__asrhub.downloadModel(${jsArg(m.id)})"
                 title="Загрузить веса">↓</button>
             </div></td></tr>`).join('')}</tbody></table></div>
       </section>`).join('');
@@ -9223,7 +9651,7 @@ window.__asrhub.showModel = async (id) => {
           status.engine_available ? 'установлен' : 'не установлен'}</span>
         <span class="spacer"></span>
         ${!status.downloaded ? `<button class="primary sm"
-          onclick="__asrhub.downloadModel('${esc(m.id)}')">Загрузить веса</button>` : ''}
+          onclick="__asrhub.downloadModel(${jsArg(m.id)})">Загрузить веса</button>` : ''}
       </div>${!status.engine_available ? `<div class="small dim" style="margin-top:8px">${
         esc(status.engine_reason || '')}</div>` : ''}</div>` : ''}
 
@@ -9256,7 +9684,7 @@ window.__asrhub.showModel = async (id) => {
           <thead><tr><th>Набор данных</th><th>Метрика</th><th class="num">Значение</th>
             <th>Язык</th><th>Источник</th></tr></thead><tbody>
           ${bench.map((b) => `<tr><td>${esc(b.dataset)}</td><td>${esc(b.metric)}</td>
-            <td class="num"><b>${b.value.toFixed(2)}</b></td><td>${esc(b.language)}</td>
+            <td class="num"><b>${num(b.value, 2)}</b></td><td>${esc(b.language)}</td>
             <td class="small faint">${esc(b.source)}${b.note ? `<br>${esc(b.note)}` : ''}</td>
           </tr>`).join('')}</tbody></table></div>
         <div class="small faint" style="margin-top:8px">
@@ -9266,7 +9694,7 @@ window.__asrhub.showModel = async (id) => {
     <div class="modal-foot">
       <span class="small faint mono">${esc(m.source)}${m.revision ? ' · ' + esc(m.revision) : ''}</span>
       <span class="spacer"></span>
-      <button onclick="__asrhub.useModel('${esc(m.id)}')" class="primary">
+      <button onclick="__asrhub.useModel(${jsArg(m.id)})" class="primary">
         Использовать эту модель</button>
     </div></div></div>`);
   mountModal(backdrop);
@@ -9358,7 +9786,7 @@ RENDERERS.compare = {
       return m ? `<span class="chip accent">${esc(m.name)}
         <button class="ghost sm" style="padding:0 4px"
           aria-label="Убрать модель из сравнения"
-          onclick="__asrhub.cmpRemove('${esc(id)}')">✕</button></span>` : '';
+          onclick="__asrhub.cmpRemove(${jsArg(id)})">✕</button></span>` : '';
     }).join('');
 
     const models = state.compare.map(modelById).filter(Boolean);
@@ -9368,7 +9796,7 @@ RENDERERS.compare = {
       const w = (m.benchmarks || []).filter((b) => b.language === 'ru' && b.metric === 'WER');
       const avg = w.length ? w.reduce((s, b) => s + b.value, 0) / w.length : null;
       return { label: m.name.length > 22 ? m.name.slice(0, 21) + '…' : m.name,
-               value: avg, display: avg !== null ? avg.toFixed(1) + ' %' : 'нет данных',
+               value: avg, display: avg !== null ? num(avg, 1) + ' %' : 'нет данных',
                note: w.length ? `наборы: ${w.map((b) => b.dataset).join(', ')}` : '' };
     }).filter((x) => x.value !== null).sort((a, b) => a.value - b.value);
     Charts.hbars(qs('#cmp-wer'), { items: werItems, labelWidth: 190, unit: ' %' });
@@ -9403,7 +9831,7 @@ RENDERERS.compare = {
         QUALITY_LABELS[m.ru_quality]}</span>`],
       ['Лучший WER ru', (m) => {
         const w = (m.benchmarks || []).filter((b) => b.language === 'ru' && b.metric === 'WER');
-        return w.length ? `<b>${Math.min(...w.map((b) => b.value)).toFixed(1)} %</b>` : '—';
+        return w.length ? `<b>${num(Math.min(...w.map((b) => b.value)), 1)} %</b>` : '—';
       }],
       ['Параметров, млн', (m) => m.params_m ? num(m.params_m) : '—'],
       ['Размер, МБ', (m) => m.disk_mb || '—'],
@@ -9509,7 +9937,7 @@ async function renderAccessSection(host) {
         <span class="small dim" id="audit-count"></span></div>
       <div class="params" style="padding:14px 16px">
         <div class="row wrap" style="gap:6px;margin-bottom:10px">
-          <input type="search" id="audit-search" placeholder="действие, адрес или путь"
+          <input type="search" id="audit-search" maxlength="200" placeholder="действие, адрес или путь"
                  style="flex:1;min-width:180px">
           <select id="audit-actor" style="min-width:150px">
             <option value="">все участники</option></select>
@@ -9553,6 +9981,7 @@ async function renderAccessSection(host) {
         const created = await API.post('/api/keys',
           { name, role: qs('#access-new-role').value, rate_limit: 0 });
         prompt('Сохраните ключ — он показывается один раз:', created.key);
+        сообщитьОКлюче(created);
         qs('#access-new-name').value = '';
         loadAccessKeys();
       } catch (err) { fail(err); }
@@ -9581,12 +10010,26 @@ async function renderAccessSection(host) {
 /* Журнал доступа. Страницами, а не целиком: на сервере, работающем месяц,
  * это десятки тысяч строк, и «показать всё» означает переслать браузеру
  * мегабайты ради двадцати строк, которые человек прочитает. */
-const auditState = { offset: 0, total: 0, items: [] };
+const auditState = { offset: 0, total: 0, items: [], поколение: 0, идёт: false };
 
 async function loadAudit(reset) {
   const box = qs('#audit-rows');
   if (!box) return;
-  if (reset) { auditState.offset = 0; auditState.items = []; }
+  // Смещение обновлялось только по ответу: двойной щелчок «Показать ещё»
+  // запрашивал одну страницу дважды — «показано 150 из 130» и задвоенные
+  // строки, — а смена отбора во время подгрузки смешивала строки двух
+  // отборов. Теперь следующая страница не просится, пока не пришла
+  // предыдущая, а ответ устаревшего отбора выбрасывается.
+  if (!reset && auditState.идёт) return;
+  if (reset) {
+    auditState.поколение += 1;
+    auditState.offset = 0;
+    auditState.items = [];
+  }
+  const поколение = auditState.поколение;
+  auditState.идёт = true;
+  const кнопка = qs('#audit-more');
+  if (кнопка) кнопка.disabled = true;
   const пары = new URLSearchParams({ limit: '50', offset: String(auditState.offset) });
   const поиск = (qs('#audit-search') || {}).value || '';
   const участник = (qs('#audit-actor') || {}).value || '';
@@ -9595,11 +10038,18 @@ async function loadAudit(reset) {
   if ((qs('#audit-failed') || {}).checked) пары.set('failed_only', 'true');
   let данные;
   try {
-    данные = await API.get(`/api/audit?${пары}`);
+    данные = await API.latest('audit', `/api/audit?${пары}`);
   } catch (err) {
-    box.innerHTML = '<div class="empty small">Журнал доступен администратору</div>';
+    if (поколение !== auditState.поколение || (err && err.silent)) return;
+    auditState.идёт = false;
+    if (кнопка) кнопка.disabled = false;
+    box.innerHTML = `<div class="empty small">${err && err.status === 403
+      ? 'Журнал доступен администратору' : `Журнал недоступен: ${esc((err && err.message) || '')}`}</div>`;
     return;
   }
+  if (поколение !== auditState.поколение) return;
+  auditState.идёт = false;
+  if (кнопка) кнопка.disabled = false;
   auditState.total = данные.total || 0;
   auditState.items = auditState.items.concat(данные.items || []);
   auditState.offset = auditState.items.length;
@@ -9637,6 +10087,22 @@ async function loadAudit(reset) {
   if (ещё) ещё.style.display = auditState.items.length < auditState.total ? '' : 'none';
 }
 
+/**
+ * Что сервер сказал о новом ключе, кроме самого ключа.
+ *
+ * Окно показывало только ключ, а в ответе было ещё два предупреждения:
+ * «файл конфигурации недоступен — ключ действует до перезапуска» и «это
+ * имя уже носит другой ключ: они видят задания друг друга». Оба важнее
+ * самого окна.
+ */
+function сообщитьОКлюче(ответ) {
+  if (!ответ) return;
+  if (ответ.persisted === false) {
+    toast('Ключ действует только до перезапуска', 'warn', ответ.warning || '');
+  }
+  if (ответ.note) toast('Общая видимость заданий', 'warn', ответ.note);
+}
+
 async function loadAccessKeys() {
   const box = qs('#access-keys');
   if (!box) return;
@@ -9649,7 +10115,7 @@ async function loadAccessKeys() {
         <td>${esc(k.name || '')}</td>
         <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span></td>
         <td><button class="ghost sm danger"
-          onclick="__asrhub.revokeKey('${esc(k.key_id || '')}')">отозвать</button></td>
+          onclick="__asrhub.revokeKey(${jsArg(k.key_id || '')})">отозвать</button></td>
       </tr>`).join('')}</tbody></table>` : '<div class="empty small">Ключей нет</div>';
   } catch (err) {
     box.innerHTML = '<div class="empty small">Список ключей доступен администратору</div>';
@@ -10356,7 +10822,7 @@ RENDERERS.backup = {
       <td class="small dim">${esc(к.version || '—')}${
         к.schema_version ? `<div class="small dim">схема ${к.schema_version}</div>` : ''}</td>
       <td class="small dim">${esc(к.comment || '')}</td>
-      <td class="row wrap" style="gap:6px">
+      <td><div class="row wrap" style="gap:6px">
         ${к.kind !== 'database' ? `<button class="ghost sm" data-act="settings"
           data-name="${esc(к.name)}"
           title="Применить параметры из копии прямо сейчас, не трогая данные">Вернуть настройки</button>` : ''}
@@ -10367,7 +10833,7 @@ RENDERERS.backup = {
           title="Скачать файл копии. Внутри пароли и ключи — храните как пароль">Скачать</button>
         <button class="ghost sm" data-act="delete" data-name="${esc(к.name)}"
           title="Удалить эту копию">Убрать</button>
-      </td></tr>`;
+      </div></td></tr>`;
   },
 
   async create(вид, кнопка) {
@@ -10391,14 +10857,10 @@ RENDERERS.backup = {
   act(действие, имя, кнопка) {
     if (действие === 'download') {
       // Скачивание идёт обычной ссылкой: файл бывает в гигабайты, и тянуть
-      // его в память вкладки ради «сохранить как» незачем.
-      const ссылка = document.createElement('a');
-      ссылка.href = `/api/backup/${encodeURIComponent(имя)}/file`;
-      ссылка.download = имя;
-      document.body.appendChild(ссылка);
-      ссылка.click();
-      ссылка.remove();
-      return null;
+      // его в память вкладки ради «сохранить как» незачем. Вошедшему по
+      // ключу ссылка получает одноразовый билет — без него был отказ 401.
+      return скачатьСсылкой(`/api/backup/${encodeURIComponent(имя)}/file`, имя)
+        .catch((err) => fail(err));
     }
     if (действие === 'delete') return this.remove(имя);
     return this.restore(имя, действие, кнопка);
@@ -10499,9 +10961,9 @@ RENDERERS.backup = {
       if (!spec) return;
       место.appendChild(paramCard(spec, state.settings[ключ], async (значение) => {
         try {
-          await API.put('/api/settings', { [ключ]: значение });
-          state.settings[ключ] = значение;
-          toast('Настройка применена', 'ok');
+          const итог = await сохранитьПараметры({ [ключ]: значение });
+          toast(сохраненоИли(итог, 'Настройка сохранена', 'Настройка применена'),
+                persistedKind(итог), persistedHint(итог));
           await this.load();
         } catch (err) { fail(err); }
       }));
@@ -10733,7 +11195,8 @@ RENDERERS.employees = {
         <div class="table-wrap"><table class="table">
           <thead><tr><th>Сотрудник</th>${колонки.map(([к, имя, , , подсказка]) =>
             `<th class="num sortable" data-sort="${к}" title="${esc(подсказка)}"
-               style="cursor:pointer">${esc(имя)}${ключ === к ? (направление < 0 ? ' ↓' : ' ↑') : ''}</th>`
+               aria-sort="${ключ === к ? (направление < 0 ? 'descending' : 'ascending') : 'none'}"><button
+               class="plain" type="button">${esc(имя)}${ключ === к ? (направление < 0 ? ' ↓' : ' ↑') : ''}</button></th>`
             ).join('')}</tr></thead>
           <tbody>${люди.map((ч) => this.row(ч, команда, колонки)).join('')}</tbody>
         </table></div>
@@ -10773,8 +11236,11 @@ RENDERERS.employees = {
       }
       return `<td class="num ${класс}">${показать}</td>`;
     };
+    // Имя — кнопка: строка открывалась только мышью, с клавиатуры до
+    // карточки сотрудника было не добраться.
     return `<tr data-key="${esc(ч.key)}" style="cursor:pointer">
-      <td><b>${esc(ч.key === '—' ? 'без оператора' : (ч.label || ч.key))}</b>
+      <td><button class="plain" type="button" data-emp-open><b>${
+        esc(ч.key === '—' ? 'без оператора' : (ч.label || ч.key))}</b></button>
         ${ч.sparse ? '<span class="chip warn" title="меньше пяти разобранных разговоров: средние по ним ещё ни о чём не говорят">мало данных</span>' : ''}
       </td>
       ${(колонки || СОТРУДНИК_КОЛОНКИ).map(клетка).join('')}
@@ -10846,7 +11312,7 @@ RENDERERS.employees = {
           <div><h4 style="margin:0 0 8px;font-size:13px">Разобрать с сотрудником</h4>
             ${(карточка.coaching || []).length ? `<div class="stack">${
               карточка.coaching.slice(0, 8).map((з) => `<div class="row small" style="gap:8px">
-                <a href="#" onclick="__asrhub.openJob('${esc(з.job_id || з.id)}');return false"
+                <a href="#" onclick="__asrhub.openJob(${jsArg(з.job_id || з.id)});return false"
                    title="${esc(з.filename || з.job_id || '')}">${
                   esc((з.filename || з.job_id || '').slice(0, 34))}</a>
                 <span class="spacer"></span>
@@ -10857,7 +11323,7 @@ RENDERERS.employees = {
           <div><h4 style="margin:0 0 8px;font-size:13px">Лучшие разговоры</h4>
             ${(карточка.best || []).length ? `<div class="stack">${
               карточка.best.slice(0, 8).map((з) => `<div class="row small" style="gap:8px">
-                <a href="#" onclick="__asrhub.openJob('${esc(з.job_id || з.id)}');return false"
+                <a href="#" onclick="__asrhub.openJob(${jsArg(з.job_id || з.id)});return false"
                    title="${esc(з.filename || з.job_id || '')}">${
                   esc((з.filename || з.job_id || '').slice(0, 34))}</a>
                 <span class="spacer"></span>
@@ -10977,7 +11443,7 @@ RENDERERS.system = {
           <tr><td class="dim">Ядер</td><td>${hw.cpu_cores_physical} физических / ${
             hw.cpu_cores_logical} логических</td></tr>
           <tr><td class="dim">Видеокарты</td><td>${(hw.gpus || []).length
-            ? hw.gpus.map((g) => `${esc(g.name)} — ${(g.memory_total_mb / 1024).toFixed(1)} ГБ`
+            ? hw.gpus.map((g) => `${esc(g.name)} — ${num(g.memory_total_mb / 1024, 1)} ГБ`
               ).join('<br>') : 'не обнаружены'}</td></tr>
           <tr><td class="dim">CUDA / cuDNN</td><td>${esc(hw.cuda_version || '—')} / ${
             esc(hw.cudnn_version || '—')}</td></tr>
@@ -11067,9 +11533,9 @@ RENDERERS.system = {
       const values = {};
       Object.entries(sys.recommended).forEach(([k, v]) => { if (!k.startsWith('_')) values[k] = v; });
       try {
-        await API.put('/api/settings', values);
-        Object.assign(state.settings, values);
-        toast('Рекомендации применены', 'ok');
+        const итог = await сохранитьПараметры(values);
+        toast(сохраненоИли(итог, 'Рекомендации применены и сохранены', 'Рекомендации применены'),
+              persistedKind(итог), persistedHint(итог));
       } catch (err) { fail(err); }
     };
     // Кнопок обслуживания у неадминистратора нет вовсе — карточка вместо них
@@ -11084,7 +11550,7 @@ RENDERERS.system = {
         // база, а если сжатие пропущено (соседний сервер, мало места), —
         // почему.
         const уб = r.removed || {};
-        const мб = (байт) => `${(Number(байт || 0) / 1048576).toFixed(1)} МБ`;
+        const мб = (байт) => `${num(Number(байт || 0) / 1048576, 1)} МБ`;
         const части = [`заданий ${уб.jobs || 0}`, `освобождено ${мб(уб.bytes)}`];
         if (уб.orphans) части.push(`строк без задания ${уб.orphans}`);
         const сж = r.vacuum || {};
@@ -11120,6 +11586,7 @@ RENDERERS.system = {
           { name, role: qs('#key-role').value, rate_limit: 0,
             mask_pii: !!(qs('#key-mask') && qs('#key-mask').checked) });
         prompt('Сохраните ключ — он показывается один раз:', r.key);
+        сообщитьОКлюче(r);
         this.loadKeys();
       } catch (err) { fail(err); }
     };
@@ -11137,12 +11604,12 @@ RENDERERS.system = {
             ? '<div class="small faint">пароль не сменён</div>' : ''}</td>
         <td><span class="chip ${u.role === 'admin' ? 'accent' : ''}">${esc(u.role)}</span></td>
         <td>${u.enabled ? '' : '<span class="chip err">отключён</span>'}</td>
-        <td class="row" style="gap:4px">
+        <td><div class="row" style="gap:4px">
           <button class="ghost sm"
-            onclick="__asrhub.resetPassword('${esc(u.id)}','${esc(u.username)}')">пароль</button>
+            onclick="__asrhub.resetPassword(${jsArg(u.id)},${jsArg(u.username)})">пароль</button>
           <button class="ghost sm danger"
-            onclick="__asrhub.deleteUser('${esc(u.id)}','${esc(u.username)}')">удалить</button>
-        </td></tr>`).join('');
+            onclick="__asrhub.deleteUser(${jsArg(u.id)},${jsArg(u.username)})">удалить</button>
+        </div></td></tr>`).join('');
       host.innerHTML = `${data.default_password_in_use ? `<div class="banner warn small">
         Действует пароль по умолчанию (${esc(data.default_username)}/admin123).
         Смените его — сервер доступен всем, кто знает эту пару.</div>` : ''}
@@ -11166,7 +11633,7 @@ RENDERERS.system = {
           <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span>${
             k.mask_pii ? ' <span class="chip" title="персональные данные в ответах заменяются пометками">обезличен</span>' : ''}</td>
           <td><button class="ghost sm danger"
-            onclick="__asrhub.revokeKey('${esc(k.key_id || '')}')">отозвать</button>
+            onclick="__asrhub.revokeKey(${jsArg(k.key_id || '')})">отозвать</button>
           </td></tr>`).join('')}</tbody></table>`
         : '<div class="empty small">Ключей нет — аутентификация отключена</div>';
     } catch (err) {
@@ -11247,13 +11714,18 @@ RENDERERS.monitoring = {
 
     state.monitoring = { health, info, alerts, targets };
     const summary = alerts.summary || {};
-    const worstClass = summary.worst === 'critical' ? 'err'
-      : summary.worst === 'warning' ? 'warn' : 'ok';
+    // Цвет и слово — об одном и том же. Сервер называет состояние
+    // «внимание», когда горит любая тревога, а цвет брался от самой тяжёлой
+    // тревоги: выходила красная плашка «внимание». Горит критическая —
+    // так и пишем.
+    const состояние = health.status === 'warning' && summary.worst === 'critical'
+      ? 'critical_alert' : health.status;
+    const worstClass = { ok: 'ok', warning: 'warn' }[состояние] || 'err';
 
     root.innerHTML = `
       <div class="grid cols-4" style="margin-bottom:16px">
         ${kpi('Состояние', `<span class="chip ${worstClass}">${
-          esc(healthLabel(health.status))}</span>`, `работает ${fmtDur(health.uptime_s)}`)}
+          esc(healthLabel(состояние))}</span>`, `работает ${fmtDur(health.uptime_s)}`)}
         ${kpi('Тревог сейчас', summary.firing || 0,
               `${summary.critical || 0} критических, ${summary.warning || 0} предупреждений`)}
         ${kpi('Метрик в снимке', info.samples || 0, `правил: ${summary.rules || 0}`)}
@@ -11300,10 +11772,14 @@ RENDERERS.monitoring = {
       ${card('Готовые настройки для систем мониторинга',
              'собираются из каталога метрик, поэтому не расходятся с ним',
              `<div class="row" style="gap:8px;flex-wrap:wrap">
-                <a class="btn ghost" href="/api/monitoring/config/prometheus" download>Правила Prometheus</a>
-                <a class="btn ghost" href="/api/monitoring/config/prometheus-scrape" download>Блок scrape_configs</a>
-                <a class="btn ghost" href="/api/monitoring/config/grafana" download>Панель Grafana</a>
-                <a class="btn ghost" href="/api/monitoring/config/zabbix" download>Шаблон Zabbix</a>
+                <button class="ghost" data-mon-file="/api/monitoring/config/prometheus"
+                  data-name="asrhub-rules.yml">Правила Prometheus</button>
+                <button class="ghost" data-mon-file="/api/monitoring/config/prometheus-scrape"
+                  data-name="asrhub-scrape.yml">Задание для scrape_configs</button>
+                <button class="ghost" data-mon-file="/api/monitoring/config/grafana"
+                  data-name="asrhub-grafana.json">Панель Grafana</button>
+                <button class="ghost" data-mon-file="/api/monitoring/config/zabbix"
+                  data-name="asrhub-zabbix.yaml">Шаблон Zabbix</button>
               </div>
               <p class="small dim" style="margin-top:10px">Пороги в этих файлах — отправная
               точка. Подгоняйте под свой поток: очередь из ста заданий бывает и нормой,
@@ -11328,6 +11804,19 @@ RENDERERS.monitoring = {
       } catch (err) { fail(err); }
     };
     qs('#mon-add-target').onclick = () => targetDialog();
+    // Готовые настройки и адреса сбора — с ключом в заголовке: обычная
+    // ссылка при закрытых метриках отвечала 401 вошедшему по ключу.
+    qsa('[data-mon-file]').forEach((кнопка) => {
+      кнопка.onclick = async () => {
+        кнопка.disabled = true;
+        try {
+          await скачатьФайл(кнопка.dataset.monFile, кнопка.dataset.name);
+        } catch (err) { fail(err); } finally { кнопка.disabled = false; }
+      };
+    });
+    qsa('[data-mon-open]').forEach((ссылка) => {
+      ссылка.onclick = (е) => { е.preventDefault(); открытьВкладкой(ссылка.dataset.monOpen); };
+    });
     qsa('[data-drop-target]').forEach((кнопка) => {
       кнопка.onclick = async () => {
         const имя = кнопка.dataset.dropTarget;
@@ -11488,7 +11977,7 @@ RENDERERS.monitoring = {
 
 function healthLabel(status) {
   return { ok: 'норма', warning: 'внимание', degraded: 'деградация',
-           critical: 'авария' }[status] || status;
+           critical: 'авария', critical_alert: 'критическая тревога' }[status] || status;
 }
 
 function probeCard(name, probe) {
@@ -11520,11 +12009,14 @@ function metricValue(value, unit) {
   const v = Number(value);
   if (unit === 'Б' || unit === 'B') return fmtBytes(v);
   if (unit === 'с' || unit === 's') {
-    if (Math.abs(v) < 1) return `${(v * 1000).toFixed(0)} мс`;
+    if (Math.abs(v) < 1) return `${num(v * 1000, 0)} мс`;
     if (Math.abs(v) < 60) return `${num(v, v < 10 ? 2 : 1)} с`;
     return fmtDur(v);
   }
-  return `${num(v, 3)}${unit ? ' ' + unit : ''}`;
+  // Три знака — без хвостовых нулей: «1,000» при запятой читается и как
+  // «одна», и как «тысяча», а «0,930» — просто шум.
+  const текст = Number.isInteger(v) ? String(v) : num(v, 3).replace(/,?0+$/, '');
+  return `${текст}${unit ? ' ' + unit : ''}`;
 }
 
 /** Байты в КБ/МБ/ГБ/ТБ по основанию 1024. */
@@ -11537,17 +12029,28 @@ function fmtBytes(value) {
   let i = 0;
   while (rest >= 1024 && i < units.length - 1) { rest /= 1024; i += 1; }
   const digits = i === 0 ? 0 : (rest < 10 ? 2 : rest < 100 ? 1 : 0);
-  return `${sign}${rest.toFixed(digits)} ${units[i]}`;
+  return `${sign}${rest.toFixed(digits).replace('.', ',')} ${units[i]}`;
+}
+
+/** Знак порога так же, как его проверяет сервер: включительный — «≥» и «≤». */
+function знакПорога(direction, inclusive) {
+  if (direction === 'above') return inclusive ? '≥' : '>';
+  return inclusive ? '≤' : '<';
 }
 
 function alertsTable(alerts) {
   const active = alerts.filter((a) => a.state !== 'ok');
+  // Метки — рядом с именем метрики: две тревоги «Доля успеха» по разным
+  // моделям выглядели одинаково, и не понять было, какая из моделей сбоит.
+  const метки = (a) => Object.entries(a.labels || {})
+    .map(([к, з]) => `${esc(к)}=${esc(з)}`).join(', ');
   const rows = (active.length ? active : alerts.slice(0, 12)).map((a) => `<tr>
     <td><span class="chip ${ALERT_STATE_CLASS[a.state] || ''}">${
       esc(ALERT_STATE_LABEL[a.state] || a.state)}</span></td>
-    <td><b>${esc(a.label)}</b><div class="small dim">${esc(a.metric)}</div></td>
+    <td><b>${esc(a.label)}</b><div class="small dim">${esc(a.metric)}${
+      метки(a) ? ` · ${метки(a)}` : ''}</div></td>
     <td class="nowrap">${esc(metricValue(a.value, a.unit))}</td>
-    <td class="dim nowrap">${a.direction === 'above' ? '>' : '<'} ${
+    <td class="dim nowrap">${знакПорога(a.direction, a.inclusive)} ${
       esc(metricValue(a.threshold, a.unit))}</td>
     <td class="small">${esc(a.severity)}</td>
     <td class="small dim">${esc(a.hint || '')}</td></tr>`).join('');
@@ -11586,15 +12089,41 @@ function targetsTable(data) {
       </td></tr>`}</tbody></table></div>`;
 }
 
-/* Итог сохранения из раздела «Мониторинг»: записано ли в config.yaml. */
+/* Итог сохранения из раздела: записано ли в config.yaml. */
 function persistedHint(result) {
   if (!result || result.persisted !== false) return 'Записано в файл конфигурации';
   return `Действует до перезапуска: ${result.reason || 'в файл конфигурации не записано'}`;
 }
 
+/* Вид сообщения по итогу сохранения: не записалось в файл — предупреждение. */
+function persistedKind(result) {
+  return result && result.persisted === false ? 'warn' : 'ok';
+}
+
+/* Заголовок сообщения: «сохранено» — только если действительно записано в файл. */
+function сохраненоИли(result, сохранено, применено) {
+  return result && result.persisted === false ? применено : сохранено;
+}
+
+/**
+ * Параметры из раздела — применить и записать в файл конфигурации.
+ *
+ * Разделы со своими параметрами (очередь, копии, очередь модели, скрипт и
+ * категории разбора, рекомендации оборудования) слали PUT /api/settings,
+ * который действует до перезапуска, и отвечали «Сохранено». Перезапуск —
+ * хотя бы обновление — молча возвращал прежние значения. Теперь сервер
+ * записывает названные параметры в config.yaml, и только их: то, что на
+ * странице настроек применено на пробу, в файл не уходит.
+ */
+async function сохранитьПараметры(значения) {
+  const итог = await API.put('/api/settings?persist=true', значения);
+  Object.assign(state.settings, (итог && итог.applied) || значения);
+  return итог;
+}
+
 function endpointsTable() {
   const rows = [
-    ['/api/monitoring/metrics', 'Все метрики. Формат задаётся ?format=prometheus|openmetrics|json|otlp|influx|graphite|zabbix|csv'],
+    ['/api/monitoring/metrics', 'Все метрики. Формат задаётся ?format=prometheus|openmetrics|json|otlp|influx|graphite|zabbix|zabbix_sender|csv'],
     ['/api/monitoring/metrics.json', 'Снимок с описанием и порогами каждой метрики'],
     ['/api/monitoring/health', 'Сводное состояние: живость, готовность, тревоги'],
     ['/api/monitoring/live', 'Проба живости — провал означает «перезапусти контейнер»'],
@@ -11605,8 +12134,30 @@ function endpointsTable() {
   return `<div class="table-wrap"><table>
     <thead><tr><th>Адрес</th><th>Что отдаёт</th></tr></thead>
     <tbody>${rows.map(([path, what]) => `<tr>
-      <td><a href="${path}" target="_blank"><code>${path}</code></a></td>
+      <td><a href="${path}" data-mon-open="${path}"><code>${path}</code></a></td>
       <td class="small">${esc(what)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+/**
+ * Порог метрики словами — как его проверяет сервер на этой установке.
+ *
+ * Справочник писал «выше … — предупреждение, … — критично» всегда: у
+ * признака «модель доступна» критического уровня нет, и выходило
+ * «критично: —»; включительные пороги («не меньше 1») читались строгими.
+ */
+function описаниеПорога(порог, unit) {
+  const слово = порог.direction === 'above'
+    ? (порог.inclusive ? 'не меньше' : 'выше')
+    : (порог.inclusive ? 'не больше' : 'ниже');
+  const уровни = [];
+  if (порог.warning !== null && порог.warning !== undefined) {
+    уровни.push(`${слово} ${esc(metricValue(порог.warning, unit))} — предупреждение`);
+  }
+  if (порог.critical !== null && порог.critical !== undefined) {
+    уровни.push(`${слово} ${esc(metricValue(порог.critical, unit))} — критично`);
+  }
+  return `Порог: ${уровни.join(', ') || 'не задан'}; выдержка ${num(порог.for_seconds || 0, 0)} с.
+    ${порог.note ? esc(порог.note) : ''}`;
 }
 
 function metricCard(m) {
@@ -11618,11 +12169,7 @@ function metricCard(m) {
       <p>${esc(m.description)}</p>
       ${m.normal ? `<p class="dim">Обычное значение: ${esc(m.normal)}</p>` : ''}
       ${m.recommendation ? `<div class="param-rec"><b>Рекомендация.</b> ${esc(m.recommendation)}</div>` : ''}
-      ${threshold ? `<p class="dim">Порог: ${threshold.direction === 'above' ? 'выше' : 'ниже'}
-        ${esc(metricValue(threshold.warning, m.unit))} — предупреждение,
-        ${esc(metricValue(threshold.critical, m.unit))} — критично,
-        выдержка ${threshold.for_seconds} с.
-        ${threshold.note ? esc(threshold.note) : ''}</p>` : ''}
+      ${threshold ? `<p class="dim">${описаниеПорога(threshold, m.unit)}</p>` : ''}
       ${m.troubleshooting ? `<p><b>Что делать:</b> ${esc(m.troubleshooting)}</p>` : ''}
       ${(m.labels || []).length ? `<p class="dim">Метки: ${m.labels.map(
         (l) => `<code>${esc(l)}</code>`).join(', ')}</p>` : ''}
@@ -11757,9 +12304,18 @@ RENDERERS.logs = {
         API.latest('logs', `/api/logs?limit=250&level=${level}&search=${encodeURIComponent(search)}`),
         API.latest('log-events', '/api/events?limit=150'),
       ]);
-      const logsDenied = logsResult.status === 'rejected';
-      const logs = logsDenied ? { items: [], counts: {} } : logsResult.value;
-      const events = eventsResult.status === 'fulfilled' ? eventsResult.value : { items: [] };
+      // Отменённый запрос — не отказ: его сменил более свежий, и рисовать
+      // по нему «нет прав» нельзя. Про права — только на настоящий 403;
+      // прочие сбои называются своим текстом. Раньше любой сбой журнала,
+      // даже отмена при быстрой смене уровня, писал администратору «доступен
+      // только администратору», а сбой событий выглядел как «Событий нет».
+      const отменён = (р) => р.status === 'rejected' && р.reason && р.reason.silent;
+      if (отменён(logsResult) || отменён(eventsResult)) return;
+      const logsFailed = logsResult.status === 'rejected';
+      const logsDenied = logsFailed && logsResult.reason && logsResult.reason.status === 403;
+      const logs = logsFailed ? { items: [], counts: {} } : logsResult.value;
+      const eventsFailed = eventsResult.status === 'rejected';
+      const events = eventsFailed ? { items: [] } : eventsResult.value;
       const counts = qs('#log-counts');
       if (counts) {
         counts.innerHTML = Object.entries(logs.counts || {})
@@ -11770,6 +12326,9 @@ RENDERERS.logs = {
       if (table && logsDenied) {
         table.innerHTML = '<div class="empty">Журнал сервера доступен только ключу '
           + 'с ролью администратора.</div>';
+      } else if (table && logsFailed) {
+        table.innerHTML = `<div class="empty">Журнал не получен: ${
+          esc((logsResult.reason && logsResult.reason.message) || 'ошибка запроса')}</div>`;
       } else if (table) {
         table.innerHTML = logs.items.length ? `<table>
           <thead><tr><th style="width:70px">Время</th><th style="width:80px">Уровень</th>
@@ -11785,7 +12344,10 @@ RENDERERS.logs = {
           </tr>`).join('')}</tbody></table>` : '<div class="empty small">Записей нет</div>';
       }
       const eventTable = qs('#event-table');
-      if (eventTable) {
+      if (eventTable && eventsFailed) {
+        eventTable.innerHTML = `<div class="empty small">События не получены: ${
+          esc((eventsResult.reason && eventsResult.reason.message) || 'ошибка запроса')}</div>`;
+      } else if (eventTable) {
         eventTable.innerHTML = events.items.length ? `<table>
           <thead><tr><th style="width:110px">Время</th><th style="width:120px">Событие</th>
             <th>Описание</th></tr></thead><tbody>
@@ -11794,7 +12356,7 @@ RENDERERS.logs = {
             <td><span class="chip">${esc(e.kind)}</span></td>
             <td class="small">${esc(e.message || '')}
               ${e.job_id ? `<button class="ghost sm"
-                onclick="__asrhub.openJob('${esc(e.job_id)}')">задание</button>` : ''}</td>
+                onclick="__asrhub.openJob(${jsArg(e.job_id)})">задание</button>` : ''}</td>
           </tr>`).join('')}</tbody></table>` : '<div class="empty small">Событий нет</div>';
       }
     } catch (err) {
@@ -11815,7 +12377,11 @@ RENDERERS.logs = {
 
 RENDERERS.help = {
   render(root) {
-    const key = localStorage.getItem('asrhub_key') || 'ВАШ_КЛЮЧ';
+    // Примеры ссылаются на переменную, а сам ключ на экране — только маской,
+    // как в «Доступе». Раньше он стоял здесь целиком в пяти строках: снимок
+    // экрана справки для коллеги уносил и рабочий ключ.
+    const сохранённый = localStorage.getItem('asrhub_key') || '';
+    const key = '$ASRHUB_KEY';
     root.innerHTML = `
       <div class="grid cols-2">
         ${card('С чего начать', '', `<div class="small dim" style="line-height:1.75">
@@ -11852,7 +12418,10 @@ RENDERERS.help = {
 
       ${card('Программный интерфейс', 'полная документация: /api/docs', `
         <div class="small dim" style="margin-bottom:10px">Ключ передаётся заголовком
-          <span class="mono">X-API-Key</span>.</div>
+          <span class="mono">X-API-Key</span>. Примеры берут его из переменной окружения:
+          <span class="mono">export ASRHUB_KEY='${сохранённый ? esc(maskKey(сохранённый)) : 'ah_…'}'</span>${
+          сохранённый ? ` — <button class="ghost sm" id="help-copy-key"
+            title="Скопировать строку export с ключом этого браузера">скопировать с ключом</button>` : ''}</div>
         <pre class="mono" style="background:var(--bg);padding:12px;border-radius:6px;
           overflow:auto;font-size:12px;line-height:1.6"># поставить файл в очередь
 curl -X POST ${location.origin}/api/jobs \\
@@ -11895,6 +12464,18 @@ curl -H "X-API-Key: ${esc(key)}" "${location.origin}/api/analytics?period=week"<
           Каталог собран по состоянию на ${esc(state.catalog.date)}. Модели выходят
           постоянно — сверяйтесь с первоисточниками перед принятием решений.</div>`)}`;
 
+    const копировать = qs('#help-copy-key');
+    if (копировать) {
+      копировать.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(`export ASRHUB_KEY='${сохранённый}'`);
+          toast('Строка с ключом скопирована', 'ok', 'Вставьте её в терминал перед примерами');
+        } catch (e) {
+          toast('Браузер не дал доступ к буферу обмена', 'warn',
+                'Ключ этого браузера — в разделе «Настройки → Доступ»');
+        }
+      };
+    }
     qs('#help-to-access').onclick = () => {
       state.paramGroup = ACCESS_GROUP;
       state.paramSearch = '';
@@ -12036,7 +12617,11 @@ RENDERERS.llmqueue = {
         свод.max_ms ? `дольше всего ${fmtDur(свод.max_ms / 1000)}` : '')}
       ${kpi('Среднее ожидание', свод.wait_s ? fmtDur(свод.wait_s) : '—',
         'от постановки до начала разбора')}
-    </div>`;
+    </div>
+    ${клиент.enabled !== false && клиент.available === false ? `<div class="banner warn"
+      style="margin:-6px 0 16px"><b>Сервер модели не отвечает.</b> ${esc(клиент.reason || '')}
+      <div class="small" style="margin-top:4px">Записи остаются в очереди и уйдут в разбор,
+      как только сервер ответит.</div></div>` : ''}`;
   },
 
   drawCurrent() {
@@ -12046,11 +12631,25 @@ RENDERERS.llmqueue = {
     const т = д.current;
     const нстр = д.settings || {};
     if (!т) {
+      // Причина простоя — настоящая. Раньше при ждущих записях здесь всегда
+      // стояло «уступает распознаванию» — и тогда, когда очередь заданий
+      // пуста, а лежит сервер модели.
+      const клиент = д.client || {};
+      const поток = д.worker || {};
+      const ждут = Number((д.counts || {})['ждёт'] || 0);
+      const очередь = state.queue || {};
+      const занято = Number(очередь.queue_depth || 0)
+        + (очередь.workers || []).filter((w) => w.busy).length;
       const причина = нстр.paused ? 'Очередь приостановлена.'
-        : (д.client && д.client.enabled === false ? 'Языковая модель выключена в настройках.'
-          : (Number((д.counts || {})['ждёт'] || 0)
-            ? 'Записи ждут: разбор уступает распознаванию, пока очередь заданий не опустеет.'
-            : 'Очередь пуста — разбирать нечего.'));
+        : клиент.enabled === false ? 'Языковая модель выключена в настройках.'
+          : клиент.available === false
+            ? `Сервер модели не отвечает: ${клиент.reason || 'причина неизвестна'}.`
+            : !ждут ? 'Очередь пуста — разбирать нечего.'
+              : (нстр.yield_to_queue !== false && занято)
+                ? 'Записи ждут: разбор уступает распознаванию, пока очередь заданий не опустеет.'
+                : поток.last_error
+                  ? `Записи ждут. Последний разбор не удался: ${поток.last_error}`
+                  : 'Записи ждут — следующий разбор начнётся в ближайшие секунды.';
       место.innerHTML = card('Сейчас', '', `<div class="empty">${esc(причина)}</div>`);
       return;
     }
@@ -12090,7 +12689,9 @@ RENDERERS.llmqueue = {
     const среднее = Number((д.stats || {}).avg_ms || 0) / 1000 || 30;
     const доля = Math.min(0.98, прошло / (среднее * 1.5));
     полоса.style.width = `${Math.max(4, доля * 100).toFixed(1)}%`;
-    полоса.classList.toggle('warn', прошло > среднее * 3);
+    // Цвет «затянулось» задаёт класс рамки (`.progress.warn > span`), а
+    // ставился он на саму полосу — и полоса не желтела никогда.
+    полоса.parentElement.classList.toggle('warn', прошло > среднее * 3);
   },
 
   drawChart() {
@@ -12104,7 +12705,10 @@ RENDERERS.llmqueue = {
     }
     const корзин = (д.series || {}).buckets || ряд.length;
     const с_какого = (д.series || {}).since || 0;
-    const ширина = ((д.stats || {}).since ? (Date.now() / 1000 - с_какого) : 3600) / корзин;
+    // Ширину корзины называет сервер: своя, от часов браузера, уводила
+    // подписи в сторону, как только часы расходились с серверными.
+    const ширина = Number((д.series || {}).bucket_seconds) ||
+      ((д.stats || {}).since ? (Date.now() / 1000 - с_какого) : 3600) / корзин;
     const метки = [];
     const разобрано = [];
     const сбои = [];
@@ -12124,11 +12728,11 @@ RENDERERS.llmqueue = {
       ${card('Время ответа модели', 'среднее по корзине, секунды',
         '<div id="lq-c2" class="chart"></div>')}
     </div>`;
-    window.Charts.stacked(qs('#lq-c1'), {
+    window.Charts.bars(qs('#lq-c1'), {
       labels: метки,
-      series: [{ name: 'успешно', values: разобрано.map((з, i) => з - сбои[i]) },
+      series: [{ name: 'успешно', values: разобрано.map((з, i) => з - сбои[i]), color: 'ok' },
                { name: 'сбои', values: сбои, color: 'err' }],
-      height: 200,
+      height: 200, emptyText: 'за окно разборов не было',
     });
     window.Charts.line(qs('#lq-c2'), {
       labels: метки,
@@ -12173,41 +12777,46 @@ RENDERERS.llmqueue = {
             <td class="small">${ждала === null ? '—' : fmtDur(ждала)}</td>
             <td class="small">${с.latency_ms ? fmtDur(с.latency_ms / 1000) : '—'}</td>
             <td class="small">${num(с.attempts || 0)}</td>
-            <td class="row" style="gap:4px">
+            <td><div class="row" style="gap:4px">
               ${с.state === 'ждёт' ? `<button class="ghost sm" data-top="${esc(с.job_id)}"
                   title="Разобрать следующей">↑</button>
                 <button class="ghost sm" data-drop="${esc(с.job_id)}"
                   title="Убрать из очереди">×</button>` : ''}
               ${с.state === 'ошибка' ? `<button class="ghost sm" data-retry="${esc(с.job_id)}"
                   title="Поставить в очередь заново">↻</button>` : ''}
-            </td></tr>`;
+            </div></td></tr>`;
         }).join('')}
       </tbody></table></div>`);
 
     qsa('[data-open]', место).forEach((к) => {
       к.onclick = (е) => { е.preventDefault(); window.__asrhub.openJob(к.dataset.open); };
     });
-    qsa('[data-top]', место).forEach((к) => {
-      к.onclick = async () => {
-        await API.post(`/api/llm/queue/${encodeURIComponent(к.dataset.top)}/top`);
-        toast('Запись поднята в начало очереди', 'ok');
+    // Отказ сервера («Языковая модель выключена», 403) раньше не
+    // показывался никак: у «↑» и «↻» не было обработки ошибок, в консоли
+    // оставалось необработанное отклонение, а кнопка молчала.
+    const действие = (кнопка, запрос, итог) => async () => {
+      кнопка.disabled = true;
+      try {
+        await запрос();
+        if (итог) toast(итог, 'ok');
         this.load();
-      };
+      } catch (err) {
+        fail(err);
+        кнопка.disabled = false;
+      }
+    };
+    qsa('[data-top]', место).forEach((к) => {
+      к.onclick = действие(к, () => API.post(`/api/llm/queue/${encodeURIComponent(к.dataset.top)}/top`),
+                          'Запись поднята в начало очереди');
     });
     qsa('[data-retry]', место).forEach((к) => {
-      к.onclick = async () => {
-        await API.post('/api/llm/queue/add', { job_ids: [к.dataset.retry], kind: 'повтор' });
-        toast('Запись поставлена в очередь', 'ok');
-        this.load();
-      };
+      к.onclick = действие(к, () => API.post('/api/llm/queue/add',
+                                             { job_ids: [к.dataset.retry], kind: 'повтор' }),
+                          'Запись поставлена в очередь');
     });
     qsa('[data-drop]', место).forEach((к) => {
-      к.onclick = async () => {
-        try {
-          await API.del(`/api/llm/queue/${encodeURIComponent(к.dataset.drop)}`);
-          this.load();
-        } catch (err) { fail(err); }
-      };
+      к.onclick = действие(к, () => API.del(`/api/llm/queue/${encodeURIComponent(к.dataset.drop)}`),
+                          '');
     });
   },
 
@@ -12220,9 +12829,9 @@ RENDERERS.llmqueue = {
       if (!spec) return;
       место.appendChild(paramCard(spec, state.settings[ключ], async (значение) => {
         try {
-          await API.put('/api/settings', { [ключ]: значение });
-          state.settings[ключ] = значение;
-          toast('Сохранено', 'ok');
+          const итог = await сохранитьПараметры({ [ключ]: значение });
+          toast(сохраненоИли(итог, 'Сохранено', 'Применено'), persistedKind(итог),
+                persistedHint(итог));
           this.load();
         } catch (err) { fail(err); }
       }));
@@ -12233,9 +12842,11 @@ RENDERERS.llmqueue = {
     const д = state.llmQueue || {};
     const было = Boolean((д.settings || {}).paused);
     try {
-      await API.post('/api/llm/queue/pause', { paused: !было });
+      const итог = await API.post('/api/llm/queue/pause', { paused: !было });
       state.settings.llm_queue_paused = !было;
-      toast(было ? 'Очередь продолжена' : 'Очередь приостановлена', 'ok');
+      toast(было ? 'Очередь продолжена' : 'Очередь приостановлена', persistedKind(итог),
+            итог && итог.persisted === false ? persistedHint(итог)
+              : 'Состояние переживёт перезапуск сервера');
       this.drawParams();
       this.load();
     } catch (err) { fail(err); }
@@ -12342,18 +12953,33 @@ RENDERERS.rescan = {
     });
 
     // Список моделей для отбора — из того, чем архив уже распознан, а не из
-    // каталога: в каталоге семьдесят моделей, а в архиве обычно две.
-    const выбор = qs('#rs-model');
-    (state.models || []).forEach((м) => {
-      const о = document.createElement('option');
-      о.value = м.id;
-      о.textContent = м.name || м.id;
-      выбор.appendChild(о);
-    });
-
+    // каталога: в каталоге семьдесят моделей, а в архиве обычно две. Так
+    // обещал и этот комментарий, а список строился по каталогу — и выбор
+    // почти любой модели давал пустую таблицу.
+    this.drawModels();
     this.drawParams();
     await this.load();
     viewTimer(() => this.load(true), 6000);
+  },
+
+  async drawModels() {
+    const выбор = qs('#rs-model');
+    if (!выбор) return;
+    let модели = [];
+    try {
+      модели = (await API.get('/api/jobs/models')).items || [];
+    } catch (err) {
+      if (err && err.silent) return;
+      // Без списка отбор по модели просто не предлагается: остальное
+      // в разделе работает и так.
+    }
+    if (!выбор.isConnected) return;
+    модели.forEach((м) => {
+      const о = document.createElement('option');
+      о.value = м.model;
+      о.textContent = `${м.name || м.model} (${num(м.jobs, 0)})`;
+      выбор.appendChild(о);
+    });
   },
 
   drawParams() {
@@ -12386,7 +13012,11 @@ RENDERERS.rescan = {
     const п = new URLSearchParams();
     п.set('status', qs('#rs-status') ? qs('#rs-status').value : 'completed');
     п.set('limit', '200');
-    if (дней) п.set('since', String(Math.floor(Date.now() / 1000 - Number(дней) * 86400)));
+    // Список заданий понимает срок в часах (since_hours), а не отметку
+    // времени: `since` он молча пропускал. «За сутки» показывало весь архив,
+    // подтверждение спрашивало про тридцать записей — а распознавание
+    // заново, которое `since` понимает, брало двадцать четыре.
+    if (дней) п.set('since_hours', String(Number(дней) * 24));
     const модель = qs('#rs-model') ? qs('#rs-model').value : '';
     if (модель) п.set('model', модель);
     const поиск = qs('#rs-search') ? qs('#rs-search').value.trim() : '';
@@ -12521,9 +13151,10 @@ RENDERERS.rescan = {
       тело.ids = ids;
     } else {
       const п = this.параметрыОтбора();
+      const часов = Number(п.get('since_hours') || 0);
       тело.filter = {
         status: (п.get('status') || '').split(','),
-        since: п.get('since') ? Number(п.get('since')) : null,
+        since: часов ? Math.floor(Date.now() / 1000 - часов * 3600) : null,
         model: п.get('model') || '',
         search: п.get('search') || '',
       };
@@ -12564,8 +13195,14 @@ const СОСТОЯНИЕ_ВИД = {
 const ГРУППЫ_СХЕМЫ = ['основа', 'источники', 'хранение', 'работа',
                       'распознавание', 'смысл', 'наблюдение', 'обслуживание'];
 
+/** Сколько держать на экране результат глубокой проверки, прежде чем опрос сменит его быстрой. */
+const ГЛУБОКАЯ_ДЕРЖАТЬ_МС = 120000;
+
 RENDERERS.dashboard = {
-  глубоко: false,
+  /** Идёт глубокая проверка — опрос её не трогает и сам не ходит. */
+  глубокаяИдёт: false,
+  /** До какого времени на экране результат глубокой проверки. */
+  держатьДо: 0,
 
   async render(root) {
     root.innerHTML = `
@@ -12587,18 +13224,29 @@ RENDERERS.dashboard = {
       <div id="db-components"><div class="empty">Загрузка…</div></div>
       <div id="db-problems"></div>`;
 
+    this.глубокаяИдёт = false;
+    this.держатьДо = 0;
     qs('#db-deep').addEventListener('click', (е) => this.deep(е.currentTarget));
-    qs('#db-refresh').addEventListener('click', () => this.load());
+    qs('#db-refresh').addEventListener('click', () => { this.держатьДо = 0; this.load(); });
     qs('#db-since').addEventListener('change', () => this.loadProblems());
 
     await this.load();
     viewTimer(() => this.load(true), 10000);
   },
 
+  /* Быстрая проверка — по кнопке «Обновить» и опросом раз в десять секунд.
+   *
+   * Глубокая шла тем же ключом отмены, что и опрос: проверка дольше десяти
+   * секунд снималась очередным опросом, «выполнена» всплывало без
+   * результата, а признак «глубоко» оставался взведённым — и опрос сам
+   * запускал на сервере глубокие проверки одну за другой. Теперь у неё свой
+   * ключ, опрос на время неё молчит, а её результат держится на экране две
+   * минуты. */
   async load(тихо) {
+    if (тихо && (this.глубокаяИдёт || Date.now() < this.держатьДо)) return;
+    let свод;
     try {
-      state.health = await API.latest('selfcheck',
-        `/api/system/selfcheck?deep=${this.глубоко ? 1 : 0}`);
+      свод = await API.latest('selfcheck', '/api/system/selfcheck?deep=0');
     } catch (err) {
       if (err.code === 'aborted') return;
       if (!тихо) {
@@ -12609,7 +13257,14 @@ RENDERERS.dashboard = {
       }
       return;
     }
-    this.глубоко = false;        // глубокая проверка — разовая, по кнопке
+    // Пока шёл быстрый ответ, могла начаться или закончиться глубокая
+    // проверка: её результат важнее, быстрый поверх него не рисуем.
+    if (this.глубокаяИдёт || (тихо && Date.now() < this.держатьДо)) return;
+    this.показать(свод);
+  },
+
+  показать(свод) {
+    state.health = свод;
     this.drawTop();
     this.drawMap();
     this.drawComponents();
@@ -12617,13 +13272,27 @@ RENDERERS.dashboard = {
   },
 
   async deep(кнопка) {
+    if (this.глубокаяИдёт) return;
+    this.глубокаяИдёт = true;
     if (кнопка) { кнопка.disabled = true; кнопка.textContent = 'Проверяю…'; }
-    this.глубоко = true;
     try {
-      await this.load();
-      toast('Глубокая проверка выполнена', 'ok');
+      const свод = await API.latest('selfcheck-deep', '/api/system/selfcheck?deep=1');
+      this.держатьДо = Date.now() + ГЛУБОКАЯ_ДЕРЖАТЬ_МС;
+      this.глубокаяИдёт = false;
+      if (!qs('#db-top')) return;               // раздел успели сменить
+      this.показать(свод);
+      const с = свод.summary || {};
+      toast('Глубокая проверка выполнена',
+            Number(с.fail || 0) ? 'err' : Number(с.warn || 0) ? 'warn' : 'ok',
+            `неисправностей: ${num(с.fail || 0, 0)}, предупреждений: ${num(с.warn || 0, 0)}`);
+    } catch (err) {
+      if (!(err && err.silent)) fail(err);
     } finally {
-      if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Глубокая проверка'; }
+      this.глубокаяИдёт = false;
+      if (кнопка && кнопка.isConnected) {
+        кнопка.disabled = false;
+        кнопка.textContent = 'Глубокая проверка';
+      }
     }
   },
 
@@ -12921,7 +13590,11 @@ RENDERERS.voice = {
       ${kpi('Обязательств', num(действий),
         д.records_with_actions ? `в ${num(д.records_with_actions)} разговорах` : 'обещаний, данных клиентам')}
       ${kpi('Модель', esc(с.model || д.model || '—'),
-        с.enabled ? (с.reachable === false ? '<span class="err">сервер не отвечает</span>' : 'на связи')
+        // Состояние связи — поле `available` с причиной в `reason`: поля
+        // `reachable` сервер не отдаёт, и при лежащем сервере модели здесь
+        // всегда было «на связи».
+        с.enabled ? (с.available === false
+          ? `<span class="err" title="${esc(с.reason || '')}">сервер не отвечает</span>` : 'на связи')
           : '<span class="warn">слой выключен</span>')}
     </div>`;
   },
@@ -13183,18 +13856,19 @@ const СОТР_ПОЛЯ = [
 ];
 
 RENDERERS.staff = {
-  отбор: { query: '', department: '', active: '' },
+  // По умолчанию — работающие: так и подписан список. Раньше подпись
+  // «работают» стояла, а запрос уходил без отбора и приносил уволенных.
+  отбор: { query: '', department: '', active: 'true' },
 
   async render(root) {
     root.innerHTML = `
       <div class="settings-toolbar">
-        <input type="search" id="st-search" placeholder="поиск по ФИО, должности, номеру"
+        <input type="search" id="st-search" maxlength="128" placeholder="поиск по ФИО, должности, номеру"
           style="width:280px" value="${esc(this.отбор.query)}">
         <select id="st-dept" style="width:210px"><option value="">все отделы</option></select>
         <select id="st-active" style="width:150px">
-          <option value="">все</option>
-          <option value="true" selected>работают</option>
-          <option value="false">не работают</option>
+          ${[['', 'все'], ['true', 'работают'], ['false', 'не работают']].map(([з, подпись]) =>
+            `<option value="${з}"${this.отбор.active === з ? ' selected' : ''}>${подпись}</option>`).join('')}
         </select>
         <span class="spacer"></span>
         <button class="primary sm" id="st-add">Добавить</button>
@@ -13341,7 +14015,8 @@ RENDERERS.staff = {
     const ч = карточка || { active: true };
     const фон = h(`<div class="modal-backdrop"><div class="modal" style="max-width:640px">
       <div class="modal-head"><b>${новая ? 'Новый сотрудник' : 'Карточка сотрудника'}</b>
-        <span class="spacer"></span><button class="ghost icon" data-close>✕</button></div>
+        <span class="spacer"></span><button class="ghost icon" data-close
+          aria-label="Закрыть" title="Закрыть">✕</button></div>
       <div class="modal-body">
         <div class="grid cols-2" style="gap:12px">
           ${СОТР_ПОЛЯ.map(([ключ, подпись, вид]) => `
@@ -13444,13 +14119,19 @@ RENDERERS.staff = {
       и.updated ? `обновлено ${и.updated}` : '',
       и.unchanged ? `без изменений ${и.unchanged}` : '',
       и.deactivated ? `уволено ${и.deactivated}` : '',
+      и.skipped ? `пропущено ${и.skipped}` : '',
     ].filter(Boolean);
-    toast(части.length ? `Импорт: ${части.join(', ')}` : 'Импорт: изменений нет', 'ok');
-    const замечания = и.notes || и.warnings || [];
+    // Пропущенные строки — с причинами: раньше о них не говорилось ни слова,
+    // и сотрудник «без фамилии и имени» просто не появлялся в справочнике.
+    const причины = Object.entries(и.skip_reasons || {})
+      .map(([причина, сколько]) => `пропущено строк «${причина}»: ${сколько}`);
+    toast(части.length ? `Импорт: ${части.join(', ')}` : 'Импорт: изменений нет',
+          и.skipped ? 'warn' : 'ok');
+    const замечания = [...причины, ...(и.notes || и.warnings || [])];
     if (замечания.length) {
       const фон = h(`<div class="modal-backdrop"><div class="modal" style="max-width:640px">
         <div class="modal-head"><b>Замечания импорта</b><span class="spacer"></span>
-          <button class="ghost icon" data-close>✕</button></div>
+          <button class="ghost icon" data-close aria-label="Закрыть" title="Закрыть">✕</button></div>
         <div class="modal-body"><ul class="small">${замечания.slice(0, 100)
           .map((з) => `<li>${esc(String(з))}</li>`).join('')}</ul></div>
         <div class="modal-foot"><span class="spacer"></span>

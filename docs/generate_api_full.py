@@ -400,7 +400,11 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     ("/api/jobs/{job_id}", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/jobs/j_a1b2c3",
         "note": "Пока задание выполняется, в ответе есть `progress` и `stage` — "
-                "по ним рисуется полоса хода в интерфейсе.",
+                "по ним рисуется полоса хода в интерфейсе. Если запись ставили на "
+                "проверку качества, в ответе есть `qa` — последняя проверка: "
+                "`id` для `PUT /api/qa/{id}`, `status` (`pending` или `done`), "
+                "балл автомата `auto_score`, балл человека `score`, согласие "
+                "`agree`, комментарий и срок.",
     },
     ("/api/jobs/{job_id}/download", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' \\\n"
@@ -462,8 +466,12 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
                 f"     {HOST}/api/settings",
         "note": "Значения проверяются по каталогу параметров: неизвестный ключ "
                 "или значение вне диапазона отвергаются с указанием, что "
-                "именно не так. Изменения живут до перезапуска, пока не вызван "
-                "`POST /api/settings/save`.",
+                "именно не так. Без `persist` изменения живут до перезапуска, "
+                "пока не вызван `POST /api/settings/save`. С `?persist=true` "
+                "изменённые параметры сразу записываются в config.yaml — "
+                "только они, без того, что применено раньше на пробу; ответ "
+                "получает `persisted` (и `reason`, если записать не удалось). "
+                "Так сохраняют свои параметры разделы интерфейса.",
     },
     ("/api/system", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/system",
@@ -524,14 +532,37 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
                 "распознавания по записям с эталоном и по хвостам задержки; "
                 "`drift` и `control` — дрейф уверенности и контрольные карты.",
     },
+    ("/api/jobs/models", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/jobs/models",
+        "show": "/api/jobs/models", "limit": 400,
+        "note": "Для отбора по модели: только модели, которыми распознан "
+                "архив, с числом заданий. Не администратору — по его заданиям.",
+    },
     ("/api/logs", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' '{HOST}/api/logs?level=ERROR&limit=20'",
         "show": "/api/logs?level=ERROR&limit=3", "limit": 800,
     },
+    ("/api/auth/me", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/auth/me",
+        "note": "Кто вошёл: имя, роль, вид (`user` — учётная запись, `key` — "
+                "ключ), `auth_enabled`. При обязательной смене пароля — "
+                "`must_change_password` и `password_reason`: `default` — "
+                "действует пароль по умолчанию, `assigned` — временный пароль "
+                "выдал администратор. Администратору при включённом входе — "
+                "`default_password_in_use`.",
+    },
     ("/api/auth/ticket", "post"): {
         "curl": f"curl -X POST -H 'X-API-Key: {K}' {HOST}/api/auth/ticket",
-        "note": "Билет живёт минуту и тратится при первом подключении к "
-                "`/ws`. Он не открывает доступ к HTTP-маршрутам.",
+        "note": "Билет живёт минуту и тратится при первом использовании: "
+                "подключении к `/ws` или `/api/stream` либо одном запросе GET "
+                "с параметром `ticket` — так скачивают большие файлы обычной "
+                "ссылкой, не вписывая ключ в адрес:\n\n"
+                "```bash\n"
+                f"curl -OJ '{HOST}/api/backup/имя.asrhub.tar.gz/file?ticket=БИЛЕТ'\n"
+                "```\n\n"
+                "Второй запрос с тем же билетом — 401 «Ссылка для скачивания "
+                "устарела или уже использована». Запросов на изменение билет "
+                "не разрешает, права у него — ключа, на который он выдан.",
     },
     ("/api/keys", "post"): {
         "curl": f"curl -X POST -H 'X-API-Key: {K}' -H 'Content-Type: application/json' \\\n"

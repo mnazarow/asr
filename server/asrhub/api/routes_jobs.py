@@ -830,6 +830,23 @@ def list_jobs(
     }
 
 
+@router.get("/models", summary="Модели, которыми распознан архив")
+def archive_models(request: Request,
+                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Модели из архива заданий и сколько заданий у каждой — для отбора.
+
+    Отбор по модели в «Распознавании записей» предлагал весь каталог — семь
+    десятков моделей, из которых в архиве обычно две: выбор почти любой
+    давал пустой список. Не администратору — по его собственным заданиям.
+    """
+    state = get_state(request)
+    модели = state.db.archive_models(owner=scope_owner(principal))
+    for строка in модели:
+        spec = catalog.get_model(строка["model"])
+        строка["name"] = spec.name if spec else строка["model"]
+    return {"items": модели}
+
+
 @router.get("/{job_id}/search", summary="Поиск по репликам одного задания")
 def search_in_job(request: Request, job_id: str,
                   q: str = Query(min_length=1, description="Что искать в расшифровке"),
@@ -888,6 +905,11 @@ def get_job(request: Request, job_id: str,
             if not principal.is_admin:
                 звонок.pop("recording", None)
             job["call"] = звонок
+    # Проверка качества по записи — чтобы оценить работу оператора прямо в
+    # карточке, куда ведёт очередь «Контроль качества».
+    проверка = state.db.qa_for_job(job_id)
+    if проверка is not None:
+        job["qa"] = проверка
     return _без_раскладки(job, principal)
 
 

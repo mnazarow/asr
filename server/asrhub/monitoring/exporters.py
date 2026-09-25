@@ -99,18 +99,19 @@ def prometheus(samples: list[Sample], *, openmetrics: bool = False) -> str:
 
 
 def json_snapshot(samples: list[Sample], errors: list[str] | None = None,
-                  *, with_meta: bool = True) -> dict[str, Any]:
+                  *, with_meta: bool = True, settings: Any = None) -> dict[str, Any]:
     """Снимок в JSON — для систем, которые не понимают формат Prometheus.
 
     При with_meta к каждой метрике прикладывается её описание, рекомендация и
-    пороги: получатель видит не только число, но и что оно значит.
+    пороги: получатель видит не только число, но и что оно значит. Пороги —
+    действующие на этом сервере (`settings`).
     """
     from .collector import describe
 
     payload: dict[str, Any] = {
         "timestamp": time.time(),
         "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "metrics": describe(samples) if with_meta else
+        "metrics": describe(samples, settings) if with_meta else
                    [{"name": s.name, "labels": s.labels, "value": s.value} for s in samples],
     }
     if errors:
