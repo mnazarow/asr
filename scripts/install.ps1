@@ -99,6 +99,17 @@ trap { Invoke-AsrFailure $_ }
 # ---------------------------------------------------------------------------
 
 $isAdmin = Test-Administrator
+# Запуск из уже установленной копии — её install.ps1 советуют с -Force для
+# починки окружения — ставит поверх неё же, со своим каталогом данных, а не
+# в стандартный каталог рядом.
+$ownDir = Split-Path -Parent $PSScriptRoot
+if (-not $Prefix -and (Test-AsrInstallation -Path $ownDir)) {
+    $Prefix = ConvertTo-AsrFullPath $ownDir
+    if (-not $DataDir) {
+        $ownInstall = Resolve-AsrInstallation -ScriptDir $PSScriptRoot -Prefix $Prefix
+        if ($ownInstall.DataDirSource -in @('marker', 'service')) { $DataDir = $ownInstall.DataDir }
+    }
+}
 if (-not $Prefix) {
     $Prefix = if ($isAdmin) { 'C:\Program Files\ASRHub' } else { Join-Path $env:LOCALAPPDATA 'ASRHub' }
 }
@@ -106,6 +117,42 @@ if (-not $DataDir) {
     $DataDir = if ($isAdmin) { Join-Path $env:ProgramData 'ASRHub' } else { Join-Path $env:LOCALAPPDATA 'ASRHub\data' }
 }
 if (-not $Profile) { $Profile = Get-RecommendedProfile }
+
+# Адрес и порт стоящей установки, если их не задали ключами. Повторная
+# установка поверх (-Force для починки окружения) брала умолчания скрипта:
+# сервер переезжал с настроенного порта на 8080, а установка, закрытая
+# адресом 127.0.0.1, открывалась в сеть на 0.0.0.0.
+function Get-ExistingAddress {
+    # Имена не $port и $bindHost: регистр в именах переменных PowerShell не
+    # различается, и такие имена читались бы как параметры сценария.
+    $own = @(Get-AsrOwnAutostart -Prefix $script:Prefix | Where-Object { $_.Prefix })
+    $configPath = Join-Path $script:DataDir 'config.yaml'
+    $foundPort = 0; $foundHost = ''
+    foreach ($record in $own) {
+        if (-not $foundPort -and $record.Port) { $foundPort = [int]$record.Port }
+        if (-not $foundHost -and $record.BindHost) { $foundHost = $record.BindHost }
+    }
+    if (-not $foundPort) {
+        $number = 0
+        if ([int]::TryParse((Get-ConfigYamlValue -File $configPath -Key 'server_port'), [ref]$number) -and
+            $number -ge 1 -and $number -le 65535) { $foundPort = $number }
+    }
+    if (-not $foundHost) { $foundHost = Get-ConfigYamlValue -File $configPath -Key 'server_host' }
+    return [pscustomobject]@{ Port = $foundPort; BindHost = $foundHost }
+}
+$existing = Get-ExistingAddress
+if (-not $script:ExplicitArgs.Contains('Port') -and $existing.Port) {
+    $Port = $existing.Port
+    Write-Debug2 "порт стоящей установки: $Port"
+}
+if (-not $script:ExplicitArgs.Contains('BindHost') -and $existing.BindHost) {
+    $BindHost = $existing.BindHost
+    Write-Debug2 "адрес стоящей установки: $BindHost"
+}
+if ($Port -lt 1 -or $Port -gt 65535) {
+    Write-Err "Порт — число от 1 до 65535, а не $Port."
+    exit 2
+}
 
 $profileEngines = @{
     light    = 'faster_whisper'
@@ -201,7 +248,12 @@ function Invoke-InstallWizard {
     $script:DataDir = Read-WizardValue -Question 'Каталог данных' -Default $script:DataDir `
         -Note 'Здесь будут веса моделей, загруженные файлы, результаты и база заданий.'
 
-    $suggestedPort = if (Test-PortFree -Port $script:Port) { $script:Port }
+    # Порт, занятый сервером этой же установки, — свой: установщик
+    # запускают повторно при работающем сервере, и он будет перезапущен.
+    # Раньше мастер не давал его оставить и уводил на соседний.
+    $wizardPrefix = $script:Prefix
+    $suggestedPort = if ((Test-PortFree -Port $script:Port) -or
+                         (Test-AsrPortOurs -Port $script:Port -Prefix $wizardPrefix)) { $script:Port }
                      else { Find-FreePort -Start ($script:Port + 1) }
     $script:Port = [int](Read-WizardValue -Question 'Порт сервера' -Default "$suggestedPort" -Validator {
         param($value)
@@ -209,19 +261,29 @@ function Invoke-InstallWizard {
         if (-not [int]::TryParse($value, [ref]$number) -or $number -lt 1 -or $number -gt 65535) {
             Write-Warn 'Порт — число от 1 до 65535.'; return $false
         }
-        if (-not (Test-PortFree -Port $number)) {
+        if (-not (Test-PortFree -Port $number) -and -not (Test-AsrPortOurs -Port $number -Prefix $wizardPrefix)) {
             Write-Warn "Порт $number уже занят."; return $false
         }
         return $true
-    })
+    }.GetNewClosure())
 
-    $hostDefault = if ($explicit.Contains('BindHost') -and $script:BindHost -eq '127.0.0.1') { 1 } else { 2 }
-    $script:BindHost = Select-WizardOption -Question 'Кто сможет подключаться?' -DefaultIndex $hostDefault -Options @(
+    # Умолчание — то, что стоит сейчас: заданное ключом или адрес стоящей
+    # установки. Сервер, привязанный к адресу в локальной сети, получает
+    # третий пункт, чтобы мастер не отнимал его привязку.
+    $hostOptions = @(
         @{ Value = '127.0.0.1'; Label = 'Только эта машина';
            Note = 'Снаружи сервер не виден. Доступ — через туннель или прокси' }
         @{ Value = '0.0.0.0';   Label = 'Любой, кто дотянется по сети';
            Note = 'Обычный выбор для сервера. Оставьте включённой проверку ключей' }
     )
+    $hostDefault = 2
+    if ($script:BindHost -in @('127.0.0.1', 'localhost')) { $hostDefault = 1 }
+    elseif ($script:BindHost -and $script:BindHost -notin @('0.0.0.0', '::', '*')) {
+        $hostOptions += @{ Value = $script:BindHost; Label = "Только адрес $($script:BindHost) (как сейчас)";
+                           Note = 'Сервер слушает один сетевой адрес этой машины' }
+        $hostDefault = 3
+    }
+    $script:BindHost = Select-WizardOption -Question 'Кто сможет подключаться?' -DefaultIndex $hostDefault -Options $hostOptions
 
     $extrasDefault = if ($explicit.Contains('NoService') -and $script:NoService) { '' } else { '1' }
     $extras = Select-WizardMany -Question 'Что ещё включить?' -Default $extrasDefault -Options @(
@@ -306,6 +368,36 @@ if (-not $isAdmin) {
     Write-Hint 'Для установки в Program Files и создания системной службы запустите от администратора.'
 }
 
+# Число шагов — по тому, что действительно будет сделано. Раньше стояло «9»
+# на любой случай, и полная установка доходила до «[11/9]».
+$stepCount = 7
+if ($Mode -eq 'docker') { $stepCount += 1 }
+else {
+    $stepCount += 3
+    if (@('gigaam', 'faster_whisper', 'whisper', 'nemo', 'transformers', 'qwen3_asr') |
+        Where-Object { $Engines -like "*$_*" }) { $stepCount += 1 }
+    if ($Models -and -not $SkipModels) { $stepCount += 1 }
+    if (-not $NoService) { $stepCount += 1 }
+}
+Set-StepTotal $stepCount -KeepIndex
+
+# Автозапуск на Windows один на машину: служба «ASRHub» и задача «ASRHub
+# Server». Вторая установка в свой каталог пересоздавала их под себя и молча
+# отнимала автозапуск у первой. Проверяем до первого изменения на диске.
+if (-not $NoService -and $Mode -eq 'native') {
+    $foreignAutostart = @(Get-AsrAutostart | Where-Object {
+        $_.Prefix -and -not (Test-AsrSamePath $_.Prefix $Prefix) -and
+        (Test-Path -LiteralPath (Join-AsrPath $_.Prefix 'server'))
+    })
+    if ($foreignAutostart) {
+        $first = $foreignAutostart[0]
+        Write-Err "Автозапуск «$($first.Name)» уже обслуживает другую установку: $($first.Prefix)"
+        Write-Hint "Переустановить её: install.ps1 -Prefix `"$($first.Prefix)`""
+        Write-Hint 'Поставить вторую рядом: install.ps1 -Prefix <каталог> -DataDir <каталог> -NoService -Port <порт>'
+        exit 2
+    }
+}
+
 if ($Mode -eq 'native') {
     $python = Find-Python
     if (-not $python) {
@@ -321,7 +413,9 @@ if ($Mode -eq 'native') {
         Write-Hint 'Установите Docker Desktop: winget install Docker.DockerDesktop'
         exit 1
     }
-    & docker info *> $null
+    # Invoke-Native: docker info пишет предупреждения в stderr, и на Windows
+    # PowerShell 5.1 первое же из них обрывало установку исключением.
+    $null = Invoke-Native -Command 'docker' -Arguments @('info')
     if ($LASTEXITCODE -ne 0) {
         Write-Err 'Docker установлен, но не запущен.'
         Write-Hint 'Запустите Docker Desktop и повторите установку.'
@@ -338,7 +432,13 @@ if ($hw.RamGb -gt 0 -and $hw.RamGb -lt 8) {
     Write-Warn "Оперативной памяти $($hw.RamGb) ГБ — рекомендуется не менее 8 ГБ."
 }
 
-if (-not (Test-PortFree -Port $Port)) {
+if (-not (Test-PortFree -Port $Port) -and (Test-AsrPortOurs -Port $Port -Prefix $Prefix)) {
+    # Порт держит сервер этой же установки: установщик запускают повторно,
+    # чтобы доставить движок или починить окружение, а сервер работает.
+    # Раньше установщик в этом случае переезжал на соседний порт (с -Yes —
+    # молча), и служба оказывалась на 8081, а все клиенты — на 8080.
+    Write-Ok "Порт $Port занят сервером этой же установки — он будет перезапущен."
+} elseif (-not (Test-PortFree -Port $Port)) {
     Write-Warn "Порт $Port занят."
     $newPort = Find-FreePort -Start ($Port + 1)
     if (Confirm-Action "Использовать свободный порт $newPort?") {
@@ -420,6 +520,48 @@ if (-not $hw.Ffmpeg) {
     Write-Ok 'ffmpeg найден'
 }
 
+# Движки, которые ставятся прямо из репозитория (gigaam, tone, moonshine —
+# строки «пакет @ git+https://…»), требуют git. Без него pip доходил до
+# клонирования и падал, а установщик писал про движок «установка не
+# удалась» без единого слова о причине.
+if ($Mode -eq 'native' -and -not $Offline) {
+    $needsGit = @()
+    foreach ($engine in ($Engines -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $leaf = ($engine -replace '_', '-') + '.txt'
+        $engineDir = Join-Path $RepoDir 'requirements\engines'
+        foreach ($file in @((Join-Path $engineDir $leaf), (Join-Path (Join-Path $engineDir 'no-deps') $leaf))) {
+            if ((Test-Path -LiteralPath $file) -and (Select-String -LiteralPath $file -Pattern 'git\+' -Quiet)) {
+                $needsGit += $engine
+                break
+            }
+        }
+    }
+    if ($needsGit -and -not (Test-CommandExists 'git')) {
+        Write-Warn "Движки $($needsGit -join ', ') ставятся из репозитория, а git не найден."
+        if ((Test-CommandExists 'winget') -and (Confirm-Action 'Установить git через winget?')) {
+            try {
+                Invoke-Checked -Command 'winget' -Arguments @('install', '--id', 'Git.Git', '-e',
+                    '--accept-package-agreements', '--accept-source-agreements',
+                    '--disable-interactivity') -IgnoreExitCode | Out-Null
+                # Новый PATH придёт только в новую консоль — этой добавляем сами.
+                foreach ($gitDir in @((Join-AsrPath $env:ProgramFiles 'Git\cmd'),
+                                      (Join-AsrPath $env:LOCALAPPDATA 'Programs\Git\cmd'))) {
+                    if ($gitDir -and (Test-Path -LiteralPath (Join-Path $gitDir 'git.exe'))) {
+                        $env:Path = "$env:Path;$gitDir"
+                    }
+                }
+            } catch { Write-Warn 'Автоматическая установка git не удалась.' }
+        }
+        if (Test-CommandExists 'git') { Write-Ok 'git установлен' }
+        elseif (-not (Get-DryRun)) {
+            Write-Warn "Без git движки $($needsGit -join ', ') не установятся — остальные поставятся."
+            Write-Hint 'Поставьте git и повторите установку: winget install Git.Git'
+        }
+    } elseif ($needsGit) {
+        Write-Ok 'git найден'
+    }
+}
+
 # ---------------------------------------------------------------------------
 
 Write-Step 'Создание каталогов'
@@ -439,6 +581,13 @@ foreach ($dir in @($Prefix, $DataDir,
         Add-Rollback ({ Remove-Item -LiteralPath $captured -Recurse -Force `
                                     -ErrorAction SilentlyContinue }).GetNewClosure() "удалить $captured"
     }
+}
+# Каталог данных — только для администраторов, SYSTEM и того, кто ставит:
+# %ProgramData% по умолчанию читают все пользователи машины, и api-key.txt,
+# config.yaml с токеном и база со всеми расшифровками были открыты любому,
+# кто вошёл в систему. Учётной записи службы права выдаёт service.ps1.
+if ($isAdmin) {
+    if (Set-AsrPrivateAcl -Path $DataDir) { Write-Debug2 "каталог данных закрыт: $DataDir" }
 }
 Write-Ok 'Каталоги готовы'
 
@@ -472,27 +621,44 @@ Write-Ok "Файлы скопированы в $Prefix"
 if ($Mode -eq 'docker') {
     Write-Step 'Сборка и запуск контейнера'
     $envFile = Join-Path $Prefix 'docker\.env'
-    if (-not (Get-DryRun)) {
-        @(
-            "ASRHUB_PORT=$Port", "ASRHUB_HOST=$BindHost",
-            "ASRHUB_DATA=$DataDir", "ASRHUB_PROFILE=$Profile",
-            "ASRHUB_ENGINES=$Engines", "ASRHUB_ACCEL=$($hw.Accelerator)"
-        ) | Set-Content -Path $envFile -Encoding UTF8
-        # Токен дописываем отдельной строкой и только если он есть: пустое
-        # значение в .env перекрыло бы токен из окружения контейнера.
+    $envLines = @("ASRHUB_PORT=$Port", "ASRHUB_HOST=$BindHost",
+                  "ASRHUB_DATA=$DataDir", "ASRHUB_PROFILE=$Profile",
+                  "ASRHUB_ACCEL=$($hw.Accelerator)")
+    # Список движков — только заданный явно, как в install.sh. Иначе в .env
+    # попадал набор профиля из установщика, а он у образа свой: без vad,
+    # postprocess и diarization, зато в «full» с nemo и qwen3_asr, которых в
+    # образе нарочно нет. Пустой ASRHUB_ENGINES — образ берёт набор профиля.
+    if ($script:ExplicitArgs.Contains('Engines')) { $envLines += "ASRHUB_ENGINES=$Engines" }
+    # Токен — отдельной строкой и только если он есть: пустое значение в .env
+    # перекрыло бы токен из окружения контейнера.
+    if ($HfToken) { $envLines += "HF_TOKEN=$HfToken" }
+    if (Get-DryRun) {
+        Write-Host "[пробный запуск] запись $envFile ($($envLines.Count) строк)" -ForegroundColor Yellow
+        Write-Host '[пробный запуск] docker compose build && docker compose up -d' -ForegroundColor Yellow
+    } else {
+        # Без метки BOM: Set-Content -Encoding UTF8 в Windows PowerShell 5.1
+        # её ставит, и первая строка читалась как ключ «\ufeffASRHUB_PORT» —
+        # контейнер публиковался на порту по умолчанию.
+        [System.IO.File]::WriteAllLines($envFile, [string[]]$envLines, [System.Text.UTF8Encoding]::new($false))
+        # В .env — токен Hugging Face, а каталог программы в Program Files
+        # читают все пользователи машины.
+        $null = Set-AsrPrivateAcl -Path $envFile
         if ($HfToken) {
-            Add-Content -Path $envFile -Value "HF_TOKEN=$HfToken" -Encoding UTF8
             Write-Ok ("Токен Hugging Face записан ({0}…, {1} символов)" -f `
                 $HfToken.Substring(0, 6), $HfToken.Length)
         }
+        # Файл-надстройка для видеокарты подключается так же, как при
+        # обновлении: раньше его подключал только update.ps1, и контейнер
+        # после установки работал на процессоре, а после обновления — на карте.
+        $compose = Get-AsrCompose -Prefix $Prefix
+        Push-Location -LiteralPath $compose.Directory
+        try {
+            Invoke-WithRetry -Attempts 2 -Description 'сборка образа' -Action {
+                Invoke-Checked -Command $compose.Command -Arguments ($compose.Arguments + @('build'))
+            } | Out-Null
+            Invoke-Checked -Command $compose.Command -Arguments ($compose.Arguments + @('up', '-d')) | Out-Null
+        } finally { Pop-Location }
     }
-    Push-Location (Join-Path $Prefix 'docker')
-    try {
-        Invoke-WithRetry -Attempts 2 -Description 'сборка образа' -Action {
-            Invoke-Checked -Command 'docker' -Arguments @('compose', '--env-file', '.env', 'build')
-        }
-        Invoke-Checked -Command 'docker' -Arguments @('compose', '--env-file', '.env', 'up', '-d')
-    } finally { Pop-Location }
     Write-Ok 'Контейнер запущен'
 
 } else {
@@ -575,8 +741,12 @@ if ($Mode -eq 'docker') {
 
     Write-Step 'Установка движков распознавания'
     $failed = @()
+    # В пробном запуске файлы не копируются — списки требований читаем из
+    # дистрибутива, иначе пробный запуск на чистой машине сообщал «нет файла
+    # зависимостей» про каждый движок.
+    $requirementsRoot = if (Get-DryRun) { $RepoDir } else { $Prefix }
     foreach ($engine in ($Engines -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-        $req = Join-Path $Prefix ("requirements\engines\" + ($engine -replace '_', '-') + '.txt')
+        $req = Join-Path $requirementsRoot ("requirements\engines\" + ($engine -replace '_', '-') + '.txt')
         if (-not (Test-Path $req)) { Write-Warn "Нет файла зависимостей для «$engine»"; continue }
         Write-Info "Движок: $engine"
 
@@ -627,6 +797,7 @@ if ((Test-Path $configFile) -and -not $ResetConfig) {
     Write-Info 'Конфигурация уже существует — оставляем без изменений.'
     if ($Force) { Write-Hint '-Force конфигурацию не трогает. Заменить её шаблоном — ключ -ResetConfig.' }
 } elseif (-not (Get-DryRun)) {
+    $configBackup = ''
     if (Test-Path $configFile) {
         $configBackup = "$configFile.bak.$(Get-Date -Format 'yyyyMMddHHmmss')"
         Copy-Item $configFile $configBackup -Force
@@ -668,7 +839,17 @@ runtime:
   models_dir: $(($DataDir + '\models') -replace '\\', '/')
   temp_dir: $(($DataDir + '\tmp') -replace '\\', '/')
 "@ | Set-Content -Path $configFile -Encoding UTF8
-    Add-Rollback { Remove-Item $configFile -Force -ErrorAction SilentlyContinue } 'удалить config.yaml'
+    # Откат после -ResetConfig возвращает прежний файл, а не удаляет его:
+    # раньше неудачная установка с этим ключом оставляла машину вовсе без
+    # config.yaml — без ключей интеграций, токена и настроек, — хотя копия
+    # лежала рядом.
+    if ($configBackup) {
+        Add-Rollback ({ Copy-Item -LiteralPath $configBackup -Destination $configFile -Force }).GetNewClosure() `
+            'вернуть прежний config.yaml'
+    } else {
+        Add-Rollback ({ Remove-Item -LiteralPath $configFile -Force -ErrorAction SilentlyContinue }).GetNewClosure() `
+            'удалить config.yaml'
+    }
     Write-Ok "Конфигурация: $configFile"
 }
 
@@ -693,12 +874,21 @@ if ($HfToken -and $Mode -eq 'native') {
     }
 }
 
-if ($Mode -eq 'native' -and -not (Get-DryRun)) {
-    Push-Location (Join-Path $Prefix 'server')
+# Пример со всеми параметрами. Раньше вывод шёл через канал в cp1251 и
+# обрывался на первом «×» (UnicodeEncodeError), а ошибку глотал пустой
+# catch: config.example.yaml оставался пустым, и никто об этом не знал.
+if ($Mode -eq 'native' -and -not (Get-DryRun) -and (Test-Path $venvPython)) {
+    Push-Location -LiteralPath (Join-Path $Prefix 'server')
     try {
-        & $venvPython -m asrhub --print-config |
-            Set-Content -Path (Join-Path $DataDir 'config.example.yaml') -Encoding UTF8
-    } catch { } finally { Pop-Location }
+        $example = @(Invoke-Native -Command $venvPython -Arguments @('-m', 'asrhub', '--print-config'))
+        $exampleCode = $LASTEXITCODE
+    } finally { Pop-Location }
+    if ($exampleCode -eq 0 -and $example.Count -gt 0) {
+        [System.IO.File]::WriteAllLines((Join-Path $DataDir 'config.example.yaml'), [string[]]$example,
+            [System.Text.UTF8Encoding]::new($false))
+    } else {
+        Write-Warn "Пример конфигурации config.example.yaml не создан (код $exampleCode)."
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -708,8 +898,13 @@ if ($Models -and -not $SkipModels -and $Mode -eq 'native') {
     foreach ($model in ($Models -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         Write-Info "Модель: $model"
         try {
-            & (Join-Path $Prefix 'scripts\models.ps1') -Action download -Model $model `
+            # Сценарий из дистрибутива, а не из каталога установки: в пробном
+            # запуске файлы не копируются, и там лежит прежняя версия (до
+            # 3.1.12 она перезагружала модуль и сбрасывала пробный запуск).
+            $global:LASTEXITCODE = 0
+            & (Join-Path $PSScriptRoot 'models.ps1') -Action download -Model $model `
                 -Prefix $Prefix -DataDir $DataDir
+            if ($LASTEXITCODE -ne 0) { throw "models.ps1: код $LASTEXITCODE" }
         } catch {
             Write-Warn "  не удалось загрузить $model"
             Write-Hint "  Повторить: powershell -File `"$Prefix\scripts\models.ps1`" -Action download -Model $model"
@@ -719,14 +914,52 @@ if ($Models -and -not $SkipModels -and $Mode -eq 'native') {
 
 # ---------------------------------------------------------------------------
 
+$serviceCreated = $false
 if (-not $NoService -and $Mode -eq 'native') {
     Write-Step 'Настройка автозапуска'
     try {
-        & (Join-Path $Prefix 'scripts\service.ps1') -Action install `
+        & (Join-Path $PSScriptRoot 'service.ps1') -Action install `
             -Prefix $Prefix -DataDir $DataDir -Port $Port -BindHost $BindHost
+        # Код возврата здесь ничего не говорит — его оставляет последняя
+        # внешняя программа внутри; спрашиваем сам автозапуск.
+        $serviceCreated = @(Get-AsrAutostart | Where-Object {
+            $_.Prefix -and (Test-AsrSamePath $_.Prefix $Prefix) }).Count -gt 0
     } catch {
         Write-Warn 'Служба не создана.'
         Write-Hint "Запускать вручную: `"$venvPython`" -m asrhub --port $Port"
+    }
+}
+
+# Брандмауэр. Сервер, открытый в сеть (0.0.0.0 или адрес в сети), без
+# правила из сети не виден: Windows молча отбрасывает входящие. Раньше
+# правила не создавал никто, а doctor.ps1 предупреждал о нём всегда — даже у
+# сервера на 127.0.0.1, которому правило не нужно вовсе. Правило — только
+# для частных и доменных сетей; описание связывает его с установкой, чтобы
+# удаление убрало своё и не тронуло чужое.
+if ($Mode -eq 'native' -and $BindHost -notin @('127.0.0.1', 'localhost', '::1')) {
+    $ruleName = "ASR Hub ($Port)"
+    $ruleDescription = "ASR Hub: $Prefix"
+    $ruleCommand = "New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Domain,Private"
+    if (-not $isAdmin -or -not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        Write-Hint 'Чтобы сервер был виден из сети, разрешите порт в брандмауэре (от администратора):'
+        Write-Hint "  $ruleCommand"
+    } elseif (Get-DryRun) {
+        Write-Host "[пробный запуск] правило брандмауэра «$ruleName»" -ForegroundColor Yellow
+    } else {
+        try {
+            Get-NetFirewallRule -DisplayName 'ASR Hub*' -ErrorAction SilentlyContinue |
+                Where-Object { "$($_.Description)" -eq $ruleDescription } |
+                Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName $ruleName -Description $ruleDescription -Direction Inbound `
+                -Protocol TCP -LocalPort $Port -Action Allow -Profile Domain, Private -ErrorAction Stop | Out-Null
+            Add-Rollback ({ Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+                Where-Object { "$($_.Description)" -eq $ruleDescription } |
+                Remove-NetFirewallRule -ErrorAction SilentlyContinue }).GetNewClosure() "удалить правило $ruleName"
+            Write-Ok "Брандмауэр: входящие на порт $Port разрешены (частные и доменные сети)"
+        } catch {
+            Write-Warn "Правило брандмауэра не создано: $($_.Exception.Message)"
+            Write-Hint "  $ruleCommand"
+        }
     }
 }
 
@@ -744,22 +977,33 @@ if (Test-Path $venvPython) {
         -CodeDir (Join-Path $Prefix 'server') | Out-Null
 }
 
-$healthy = $false
-for ($i = 0; $i -lt 20; $i++) {
-    try {
-        $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 3 -UseBasicParsing
-        if ($response.StatusCode -eq 200) { $healthy = $true; break }
-    } catch { }
-    Start-Sleep -Seconds 2
-}
-
-if ($healthy) { Write-Ok "Сервер отвечает на http://127.0.0.1:$Port" }
-else {
+# Сервер, привязанный к одному адресу в сети, на 127.0.0.1 не отвечает
+# вовсе — проверяем по тому адресу, к которому он привязан.
+$probeHost = if ($BindHost -and $BindHost -notin @('0.0.0.0', '::', '*', 'localhost', '127.0.0.1')) {
+    if ($BindHost -match ':' -and -not $BindHost.StartsWith('[')) { "[$BindHost]" } else { $BindHost }
+} else { '127.0.0.1' }
+$probe = Wait-AsrHealth -Port $Port -HostName $probeHost -Seconds 40
+if ($probe.Status -ge 200 -and $probe.Status -lt 300) {
+    Write-Ok "Сервер отвечает на http://${probeHost}:$Port"
+} elseif ($probe.Status -gt 0) {
+    Write-Warn "Сервер отвечает, но сообщает о неисправности (код $($probe.Status))."
+    Write-Hint "Подробности: powershell -File `"$Prefix\scripts\doctor.ps1`""
+} else {
     Write-Warn 'Сервер пока не отвечает.'
     Write-Hint "Состояние службы: powershell -File `"$Prefix\scripts\service.ps1`" -Action status"
 }
 
 Clear-Rollback
+# Метка установки: по ней сценарии обслуживания из этого каталога находят
+# свои каталог данных и автозапуск, а не установку в стандартном каталоге.
+$markerService = ''
+if ($serviceCreated) {
+    $ownRecords = @(Get-AsrOwnAutostart -Prefix $Prefix | Where-Object { $_.Prefix })
+    $markerService = if ($ownRecords) { $ownRecords[0].Name }
+                     elseif ($isAdmin -and (Get-Command nssm -ErrorAction SilentlyContinue)) { Get-AsrServiceName }
+                     else { Get-AsrTaskName }
+}
+$null = Write-InstallMarker -Prefix $Prefix -DataDir $DataDir -Service $markerService -Mode $Mode
 # Новое окружение собрано и сервер проверен — отложенное прежнее больше не нужно.
 if ($Mode -eq 'native' -and $venvMoved -and (Test-Path $venvOld)) {
     Remove-Item $venvOld -Recurse -Force -ErrorAction SilentlyContinue
@@ -771,8 +1015,8 @@ $apiKey = if (Test-Path $apiKeyFile) { (Get-Content $apiKeyFile -Raw).Trim() } e
 Write-Host ''
 Write-Host 'Установка завершена' -ForegroundColor Green
 Write-Host ''
-Write-Host "  Веб-интерфейс     http://127.0.0.1:$Port"
-Write-Host "  Справочник API    http://127.0.0.1:$Port/api/reference"
+Write-Host "  Веб-интерфейс     http://${probeHost}:$Port"
+Write-Host "  Справочник API    http://${probeHost}:$Port/api/reference"
 if ($apiKey) { Write-Host "  Ключ доступа      $apiKey" -ForegroundColor White }
 Write-Host "  Каталог программы $Prefix"
 Write-Host "  Каталог данных    $DataDir"
@@ -782,7 +1026,7 @@ Write-Host 'Что дальше' -ForegroundColor White
 Write-Host "  Проверить окружение  powershell -File `"$Prefix\scripts\doctor.ps1`""
 Write-Host "  Управлять моделями   powershell -File `"$Prefix\scripts\models.ps1`" -Action list"
 Write-Host "  Управлять службой    powershell -File `"$Prefix\scripts\service.ps1`" -Action status"
-Write-Host "  Обновить             powershell -File `"$Prefix\scripts\update.ps1`""
+Write-Host "  Обновить             powershell -File `"$Prefix\scripts\update.ps1`" -Source <каталог новой версии>"
 Write-Host "  Удалить              powershell -File `"$Prefix\scripts\uninstall.ps1`""
 if ($failed) {
     Write-Host ''

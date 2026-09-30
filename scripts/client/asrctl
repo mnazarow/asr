@@ -15,14 +15,19 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="3.1.18"
+VERSION="3.1.19"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
 CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"
 SERVER="${ASRHUB_SERVER:-http://127.0.0.1:8080}"
 API_KEY="${ASRHUB_KEY:-}"
+# Ключ из файла — чтобы он не попадал ни в `ps`, ни в историю оболочки.
+KEY_FILE="${ASRHUB_KEY_FILE:-}"
 # Общий предел ожидания результата, секунды. Ноль — ждать без ограничения.
 WAIT_LIMIT="${ASRHUB_WAIT_LIMIT:-3600}"
+# Срок одного обычного запроса. Загрузка файла им не ограничивается: 2 ГБ по
+# каналу 20 Мбит/с идут дольше десяти минут, и общий срок обрывал их на
+# середине. Для загрузки — предел скорости (см. api).
 TIMEOUT=600
 QUIET=0
 
@@ -36,10 +41,40 @@ fi
 say()  { [[ "${QUIET}" == "1" ]] || printf '%s\n' "$*"; }
 ok()   { [[ "${QUIET}" == "1" ]] || printf '%s✓%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
 warn() { printf '%s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
-die()  { printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit "${2:-1}"; }
+# die СООБЩЕНИЕ [КОД]: код — вторым аргументом, в текст он не попадает.
+die()  { printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "$1" >&2; exit "${2:-1}"; }
 
 need_curl() {
   command -v curl >/dev/null 2>&1 || die "Нужен curl. Установите: apt install curl / brew install curl"
+}
+
+# Настоящий ли python3 рядом. На macOS без Command Line Tools
+# /usr/bin/python3 — заглушка: `command -v` её находит, а запуск падает (и
+# просит поставить инструменты). Клиент обещает работу на одних bash и curl,
+# а с заглушкой `send` обрывался без объяснений. Проверяем запуском, один раз.
+_HAVE_PYTHON=""
+have_python() {
+  if [[ -z "${_HAVE_PYTHON}" ]]; then
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import json' >/dev/null 2>&1; then
+      _HAVE_PYTHON=1
+    else
+      _HAVE_PYTHON=0
+    fi
+  fi
+  [[ "${_HAVE_PYTHON}" == "1" ]]
+}
+
+# Имя файла из ответа сервера — только имя, без каталогов. Прежде оно
+# подставлялось в путь как есть, и имя «../../x» записывало результат вне
+# каталога назначения.
+safe_name() {
+  local name="${1:-}"
+  name="${name//\\//}"
+  name="${name##*/}"
+  name="${name#"${name%%[!.]*}"}"
+  name="$(printf '%s' "${name}" | tr -d '\000-\037')"
+  [[ -n "${name}" ]] || name="result"
+  printf '%s' "${name}"
 }
 
 # ---------------------------------------------------------------------------
@@ -93,7 +128,7 @@ build_settings() {
 
   # Если python3 есть — пользуемся им: он корректно сольёт пользовательский
   # JSON из --settings с остальными полями.
-  if command -v python3 >/dev/null 2>&1; then
+  if have_python; then
     python3 -c '
 import json, sys
 raw, model, language, formats = sys.argv[1:5]
@@ -153,8 +188,13 @@ print(json.dumps(data, ensure_ascii=False))' "${base}" "${model}" "${language}" 
 api() {
   local method="$1" path="$2"; shift 2
   need_curl
-  local args=(-sS --max-time "${TIMEOUT}" -X "${method}"
-              -H "Accept: application/json")
+  local args=(-sS -X "${method}" -H "Accept: application/json")
+  if [[ "${ASRCTL_UPLOAD:-0}" == "1" ]]; then
+    # Загрузка: не общий срок, а «не медленнее 1 КБ/с дольше двух минут».
+    args+=(--connect-timeout 30 --speed-limit 1024 --speed-time 120)
+  else
+    args+=(--max-time "${TIMEOUT}")
+  fi
   local response status body
 
   # Ключ передаём через --config со стандартного ввода, а не аргументом:
@@ -175,10 +215,12 @@ api() {
     local reason
     reason="$(tr -d '\r' < "${errfile}" | tail -1)"
     rm -f "${errfile}"
+    # Код 3 — «сервер не ответил»: это бывает временно (перезапуск), и
+    # ожидание результата повторяет запрос, а не бросает работу.
     if [[ -n "${reason}" ]]; then
-      die "Запрос не выполнен: ${reason}"
+      die "Запрос не выполнен: ${reason}" 3
     fi
-    die "Сервер ${SERVER} недоступен. Проверьте адрес и сеть."
+    die "Сервер ${SERVER} недоступен. Проверьте адрес и сеть." 3
   fi
   rm -f "${errfile}"
   status="$(printf '%s' "${response}" | tail -1)"
@@ -192,6 +234,8 @@ api() {
     hint_text="$(printf '%s' "${body}" | sed -n 's/.*"hint"[: ]*"\([^"]*\)".*/\1/p' | head -1)"
     printf '%s✕%s %s\n' "${C_RED}" "${C_RESET}" "${message:-Ошибка ${status}}" >&2
     [[ -n "${hint_text}" ]] && printf '  %s%s%s\n' "${C_DIM}" "${hint_text}" "${C_RESET}" >&2
+    # 502–504 и 503 — прокси или сервер в перезапуске: тоже временное.
+    [[ "${status}" =~ ^50[234]$ ]] && exit 4
     exit 1
   fi
   printf '%s' "${body}"
@@ -200,7 +244,7 @@ api() {
 json_get() {
   # json_get <json> <ключ> — простое извлечение без jq
   local json="$1" key="$2"
-  if command -v python3 >/dev/null 2>&1; then
+  if have_python; then
     printf '%s' "${json}" | python3 -c "
 import json,sys
 try:
@@ -256,13 +300,20 @@ cmd_send() {
   # Имя файла берём в кавычки: curl трактует запятую как разделитель
   # нескольких файлов, а точку с запятой — как начало параметра, и запись
   # «совещание,часть1.wav» не отправлялась вовсе.
-  local args=(-F "file=@\"${file}\"" -F "settings=${settings}")
-  [[ -n "${priority}" ]] && args+=(-F "priority=${priority}")
-  [[ -n "${reference}" ]] && args+=(-F "reference_text=${reference}")
+  #
+  # Текстовые поля — через --form-string: у -F значение, начатое с «<» или
+  # «@», читается из локального файла, и `--reference '<secret.txt'`
+  # отправляло на сервер содержимое чужого файла.
+  local args=(-F "file=@\"${file}\"" --form-string "settings=${settings}")
+  if [[ -n "${priority}" ]]; then
+    [[ "${priority}" =~ ^[0-9]{1,3}$ ]] || die "Приоритет — число от 0 до 100: ${priority}" 2
+    args+=(--form-string "priority=${priority}")
+  fi
+  [[ -n "${reference}" ]] && args+=(--form-string "reference_text=${reference}")
 
   say "Отправка: $(basename "${file}") ($(du -h "${file}" | cut -f1))"
   local response job_id
-  response="$(api POST /api/jobs "${args[@]}")"
+  response="$(ASRCTL_UPLOAD=1 api POST /api/jobs "${args[@]}")"
   job_id="$(json_get "${response}" id)"
   [[ -z "${job_id}" ]] && die "Сервер не вернул идентификатор задания."
   ok "Задание создано: ${job_id}"
@@ -295,11 +346,14 @@ cmd_send_dir() {
     esac
   done
   [[ -d "${dir}" ]] || die "Каталог не найден: ${dir}"
+  # Пустые массивы — через ${a[@]+"${a[@]}"}: в bash 3.2 (штатном на macOS)
+  # "${a[@]}" пустого массива под nounset — «unbound variable», и
+  # `send-dir КАТАЛОГ --recursive` отвечал «нет файлов».
   local depth=(-maxdepth 1)
   [[ "${recursive}" -eq 1 ]] && depth=()
   local files=()
   while IFS= read -r -d '' f; do files+=("${f}"); done < <(
-    find "${dir}" "${depth[@]}" -type f \( \
+    find "${dir}" ${depth[@]+"${depth[@]}"} -type f \( \
       -iname '*.wav' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.flac' \
       -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.mp4' -o -iname '*.mkv' \
       -o -iname '*.mov' -o -iname '*.aac' -o -iname '*.wma' \) \
@@ -311,7 +365,7 @@ cmd_send_dir() {
   for f in "${files[@]}"; do
     index=$((index + 1))
     printf '%s[%d/%d]%s %s\n' "${C_BLUE}" "${index}" "${#files[@]}" "${C_RESET}" "$(basename "${f}")"
-    if ! cmd_send "${f}" "${rest[@]}" 2>&1 | sed 's/^/    /'; then
+    if ! cmd_send "${f}" ${rest[@]+"${rest[@]}"} 2>&1 | sed 's/^/    /'; then
       failed=$((failed + 1))
       warn "    не отправлен — продолжаем"
     fi
@@ -372,7 +426,7 @@ cmd_wait() {
       *) shift ;;
     esac
   done
-  local status="" progress="" spin='|/-\' i=0
+  local status="" progress="" spin='|/-\' i=0 failures=0 rc=0
 
   # Общий срок ожидания. Раньше цикл был безусловным `while true`, а
   # --timeout ограничивал только отдельный запрос curl: при остановленной
@@ -391,7 +445,20 @@ cmd_wait() {
       return 2
     fi
     local response
-    response="$(api GET "/api/jobs/${job_id}")" || return 1
+    # Сервер в перезапуске (обновление, падение службы) — не повод бросать
+    # ожидание: запрос повторяется до пяти раз подряд.
+    rc=0
+    response="$(api GET "/api/jobs/${job_id}")" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      if [[ "${rc}" -eq 3 || "${rc}" -eq 4 ]] && [[ "${failures}" -lt 5 ]]; then
+        failures=$((failures + 1))
+        warn "сервер не ответил — повтор через 5 с (${failures}/5)"
+        sleep 5
+        continue
+      fi
+      return 1
+    fi
+    failures=0
     status="$(json_get "${response}" status)"
     progress="$(json_get "${response}" progress)"
     local stage; stage="$(json_get "${response}" stage)"
@@ -400,8 +467,10 @@ cmd_wait() {
         printf '\r%s✓%s готово                                        \n' "${C_GREEN}" "${C_RESET}"
         local rtf; rtf="$(json_get "${response}" rtf)"
         say "  RTF ${rtf} · слов $(json_get "${response}" words_count)"
-        IFS=',' read -ra FMTS <<< "${formats}"
-        for fmt in "${FMTS[@]}"; do
+        IFS=',' read -ra FMTS <<< "${formats:-txt}"
+        for fmt in ${FMTS[@]+"${FMTS[@]}"}; do
+          fmt="$(printf '%s' "${fmt}" | tr -d ' ')"
+          [[ -n "${fmt}" ]] || continue
           cmd_get "${job_id}" --format "${fmt}" --output "${output_dir}"
         done
         return 0 ;;
@@ -458,10 +527,13 @@ cmd_get() {
   fi
 
   if [[ "${looks_like_dir}" -eq 1 ]]; then
-    local name
-    name="$(api GET "/api/jobs/${job_id}" | { command -v python3 >/dev/null && python3 -c "
+    local name="result"
+    if have_python; then
+      name="$(api GET "/api/jobs/${job_id}" | python3 -c "
 import json,sys,os
-d=json.load(sys.stdin); print(os.path.splitext(d.get('filename','result'))[0])" || echo result; })"
+d=json.load(sys.stdin); print(os.path.splitext(str(d.get('filename') or 'result'))[0])" || echo result)"
+    fi
+    name="$(safe_name "${name}")"
     mkdir -p "${output}"
     output="${output%/}/${name}.${format}"
   else
@@ -483,7 +555,7 @@ cmd_queue() {
     local response
     response="$(api GET /api/queue)"
     [[ "${watch}" -eq 1 ]] && printf '\033[H\033[J'
-    if command -v python3 >/dev/null 2>&1; then
+    if have_python; then
       printf '%s' "${response}" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -522,7 +594,7 @@ cmd_list() {
       *) shift ;;
     esac
   done
-  api GET "/api/jobs?limit=${limit}${status:+&status=${status}}" | { command -v python3 >/dev/null && python3 -c "
+  api GET "/api/jobs?limit=${limit}${status:+&status=${status}}" | { have_python && python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 D, RS = '\033[90m', '\033[0m'
@@ -540,14 +612,16 @@ cmd_models() {
     case "$1" in
       --language|--lang) language="$2"; shift 2 ;;
       --installed) installed=1; shift ;;
-      *) shift ;;
+      # Незнакомое — ошибка, а не пропуск: подсказки сервера советовали
+      # `asrctl models download …`, и клиент молча печатал весь каталог.
+      *) die "Неизвестный параметр: $1. Модели загружаются на сервере: раздел «Модели» или bash scripts/models.sh download <модель>" 2 ;;
     esac
   done
   # Собираем строку запроса: ключи независимы, поэтому склеиваем по одному.
   local query=""
   [[ -n "${language}" ]] && query="language=${language}"
   [[ -n "${installed}" ]] && query="${query:+${query}&}installed=true"
-  api GET "/api/models${query:+?${query}}" | { command -v python3 >/dev/null && python3 -c "
+  api GET "/api/models${query:+?${query}}" | { have_python && python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 B, D, G, Y, RS = '\033[1m', '\033[90m', '\033[32m', '\033[33m', '\033[0m'
@@ -590,6 +664,16 @@ cmd_config() {
   case "${action}" in
     add)
       local name="${1:?Укажите имя профиля}" url="${2:?Укажите адрес сервера}" key="${3:-}"
+      # Ключ в командной строке виден в `ps` и остаётся в истории
+      # оболочки. «-» — прочитать его со стандартного ввода; без ключа в
+      # терминале — спросить, не показывая набранное.
+      if [[ "${key}" == "-" ]]; then
+        IFS= read -r key || true
+      elif [[ $# -lt 3 && -t 0 ]]; then
+        printf 'Ключ доступа (Enter — без ключа): ' >&2
+        IFS= read -rs key || true
+        printf '\n' >&2
+      fi
       save_profile "${name}" "${url}" "${key}" ;;
     list)
       [[ -f "${CONFIG_FILE}" ]] || { say "Профилей нет. Добавить: asrctl config add <имя> <адрес> [ключ]"; return 0; }
@@ -600,10 +684,23 @@ cmd_config() {
       done < "${CONFIG_FILE}" ;;
     remove)
       local name="${1:?Укажите имя профиля}"
-      grep -v "^${name}|" "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+      # Удаление последнего профиля: `grep -v` без строк возвращает единицу,
+      # `mv` не выполнялся, а клиент сообщал «удалён» — ключ оставался в
+      # файле. Сравниваем имя целиком, а не образцом grep.
+      [[ -f "${CONFIG_FILE}" ]] && awk -F'|' -v n="${name}" '$1 == n { found = 1 } END { exit !found }' \
+        "${CONFIG_FILE}" || die "Профиля «${name}» нет."
+      ( umask 077; awk -F'|' -v n="${name}" '$1 != n' "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp" ) \
+        && mv -f "${CONFIG_FILE}.tmp" "${CONFIG_FILE}" && chmod 600 "${CONFIG_FILE}" \
+        || die "Не удалось переписать ${CONFIG_FILE}."
       ok "Профиль «${name}» удалён" ;;
     *) die "Неизвестная команда: ${action}" ;;
   esac
+}
+
+cmd_resume() {
+  local job_id="${1:?Укажите идентификатор задания}"
+  api POST "/api/jobs/${job_id}/resume" >/dev/null
+  ok "Задание ${job_id} продолжено"
 }
 
 cmd_health() {
@@ -630,6 +727,8 @@ asrctl — клиент ASR Hub
   list [--status ...] [-n N] список заданий
   status ИДЕНТИФИКАТОР       карточка задания
   wait ИДЕНТИФИКАТОР         ждать завершения и скачать результат
+                             (сервер в перезапуске — повтор до пяти раз)
+  resume ИДЕНТИФИКАТОР       продолжить приостановленное задание
 
 Результаты
   get ИДЕНТИФИКАТОР [--format srt] [--output файл]
@@ -639,12 +738,18 @@ asrctl — клиент ASR Hub
   health                     проверка доступности
 
 Профили и доступ
-  config add ИМЯ АДРЕС [КЛЮЧ]
+  config add ИМЯ АДРЕС [КЛЮЧ|-]
+                             «-» — ключ со стандартного ввода; без ключа в
+                             терминале клиент спросит его, не показывая
   config list | remove ИМЯ
   --profile ИМЯ              использовать профиль (или ASRCTL_PROFILE)
   --server АДРЕС             адрес сервера; перекрывает профиль
-  --key КЛЮЧ                 ключ доступа; перекрывает профиль
-  --timeout СЕКУНДЫ          срок одного запроса (по умолчанию 30)
+  --key КЛЮЧ                 ключ доступа; перекрывает профиль (виден в ps —
+                             лучше --key-file или профиль)
+  --key-file ФАЙЛ            ключ из файла (или ASRHUB_KEY_FILE)
+  --timeout СЕКУНДЫ          срок одного запроса (по умолчанию 600); загрузку
+                             файла он не ограничивает — она обрывается, только
+                             если идёт медленнее 1 КБ/с дольше двух минут
   --wait-limit СЕКУНДЫ       общий срок ожидания результата (по умолчанию 3600,
                              0 — ждать без ограничения; или ASRHUB_WAIT_LIMIT)
 
@@ -654,7 +759,7 @@ asrctl — клиент ASR Hub
   version                    версия клиента
 
 Примеры
-  asrctl config add прод https://asr.company.ru ah_xxxxx
+  asrctl config add прод https://asr.company.ru -  < ключ.txt
   asrctl --profile прод send совещание.mp3 --model gigaam-v3-e2e-rnnt --wait
   asrctl send-dir ./архив --recursive --formats srt,json --priority 10
   asrctl queue --watch
@@ -678,6 +783,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --server)  SERVER="${2%/}"; SERVER_EXPLICIT=1; shift 2 ;;
     --key)     API_KEY="$2"; KEY_EXPLICIT=1; shift 2 ;;
+    --key-file) KEY_FILE="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --wait-limit) WAIT_LIMIT="$2"; shift 2 ;;
     --quiet|-q) QUIET=1; shift ;;
@@ -687,19 +793,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 COMMAND="${COMMAND:-help}"
+if [[ -n "${KEY_FILE}" ]]; then
+  [[ -r "${KEY_FILE}" ]] || die "Файл ключа не читается: ${KEY_FILE}" 2
+  IFS= read -r API_KEY < "${KEY_FILE}" || true
+  API_KEY="${API_KEY//[$'\r\t ']/}"
+  KEY_EXPLICIT=1
+fi
 load_profile
 
 case "${COMMAND}" in
-  send)       cmd_send "${ARGS[@]}" ;;
-  send-dir)   cmd_send_dir "${ARGS[@]}" ;;
-  status)     cmd_status "${ARGS[@]}" ;;
-  wait)       cmd_wait "${ARGS[@]}" ;;
-  get)        cmd_get "${ARGS[@]}" ;;
-  queue)      cmd_queue "${ARGS[@]:-}" ;;
-  list)       cmd_list "${ARGS[@]:-}" ;;
-  models)     cmd_models "${ARGS[@]:-}" ;;
-  config)     cmd_config "${ARGS[@]:-}" ;;
-  tunnel)     cmd_tunnel "${ARGS[@]:-}" ;;
+  send)       cmd_send ${ARGS[@]+"${ARGS[@]}"} ;;
+  send-dir)   cmd_send_dir ${ARGS[@]+"${ARGS[@]}"} ;;
+  status)     cmd_status ${ARGS[@]+"${ARGS[@]}"} ;;
+  wait)       cmd_wait ${ARGS[@]+"${ARGS[@]}"} ;;
+  get)        cmd_get ${ARGS[@]+"${ARGS[@]}"} ;;
+  resume)     cmd_resume ${ARGS[@]+"${ARGS[@]}"} ;;
+  queue)      cmd_queue ${ARGS[@]+"${ARGS[@]}"} ;;
+  list)       cmd_list ${ARGS[@]+"${ARGS[@]}"} ;;
+  models)     cmd_models ${ARGS[@]+"${ARGS[@]}"} ;;
+  config)     cmd_config ${ARGS[@]+"${ARGS[@]}"} ;;
+  tunnel)     cmd_tunnel ${ARGS[@]+"${ARGS[@]}"} ;;
   health)     cmd_health ;;
   version)    printf 'asrctl %s\n' "${VERSION}" ;;
   help|-h|--help) usage ;;

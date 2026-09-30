@@ -31,6 +31,50 @@ _TTL_S = 60.0
 _cache: dict[str, tuple[float, str]] = {}
 _lock = threading.Lock()
 
+#: Короткие имена faster-whisper → репозитории на Hugging Face. Каталог
+#: называет модели faster-whisper так же, как сама библиотека («small»,
+#: «large-v3»), а на диск они ложатся по настоящему репозиторию —
+#: `models--Systran--faster-whisper-small`. Поиск весов строил путь из
+#: короткого имени (`models--small`) и не находил их никогда: скачанная
+#: модель по умолчанию лёгкого профиля показывалась незагруженной, её
+#: отпечаток был пуст, а загрузка из раздела «Модели» и `models.sh
+#: download` просили у Hugging Face несуществующий репозиторий «small» и
+#: разбирали отказ как «модель закрыта лицензией».
+#:
+#: Таблица — копия `faster_whisper.utils._MODELS` (библиотеки может не быть
+#: на машине, где считают отпечаток); поправки движка — поверх неё.
+_FASTER_WHISPER_REPOS = {
+    "tiny.en": "Systran/faster-whisper-tiny.en",
+    "tiny": "Systran/faster-whisper-tiny",
+    "base.en": "Systran/faster-whisper-base.en",
+    "base": "Systran/faster-whisper-base",
+    "small.en": "Systran/faster-whisper-small.en",
+    "small": "Systran/faster-whisper-small",
+    "medium.en": "Systran/faster-whisper-medium.en",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v1": "Systran/faster-whisper-large-v1",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large": "Systran/faster-whisper-large-v3",
+    "distil-large-v2": "Systran/faster-distil-whisper-large-v2",
+    "distil-medium.en": "Systran/faster-distil-whisper-medium.en",
+    "distil-small.en": "Systran/faster-distil-whisper-small.en",
+    # Поправки движка: эти варианты он берёт из других репозиториев.
+    "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "distil-large-v3": "distil-whisper/distil-large-v3-ct2",
+}
+
+
+def huggingface_repo(source: str) -> str:
+    """Репозиторий Hugging Face, из которого приходят веса этого источника.
+
+    Источник с «/» — уже репозиторий; прямая ссылка — не Hugging Face и
+    возвращается как есть; короткое имя — модель faster-whisper.
+    """
+    if not source or "/" in source or source.startswith("http"):
+        return source
+    return _FASTER_WHISPER_REPOS.get(source, source)
+
 
 def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None:
     """Веса модели на диске, если они уже скачаны.
@@ -62,12 +106,13 @@ def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None
             if candidate.is_dir():
                 return candidate
         return None
-    slug = "models--" + source.replace("/", "--")
+    repo = huggingface_repo(source)
+    slug = "models--" + repo.replace("/", "--")
     for base in (models_dir, models_dir / "hub"):
         candidate = base / slug
         if candidate.exists():
             return candidate
-    direct = models_dir / source.replace("/", "_")
+    direct = models_dir / repo.replace("/", "_")
     return direct if direct.exists() else None
 
 

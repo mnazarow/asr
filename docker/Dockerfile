@@ -64,6 +64,14 @@ RUN if [ "${PROFILE}" != "minimal" ]; then \
 #   qwen3_asr     веса грузятся только из сети при первом запуске.
 # Любой из них ставится явным списком: --build-arg ENGINES=nemo,whisperx.
 #
+# Файлов требований у движка до трёх, как и при обычной установке
+# (install_engine_requirements в common.sh): основной; no-deps/<движок>.txt —
+# ставится с --no-deps (там сам GigaAM: его pyproject прибивает версии, под
+# которые нет колёс, и обычная установка обрывалась); optional/<движок>.txt —
+# необязательная часть, её отказ движок не роняет. Раньше образ ставил один
+# основной файл, и GigaAM — главный движок для русского — в образ не попадал
+# вовсе: окружение ставилось, а сам пакет нет.
+#
 # ДОБАВЛЕНО-В-ОБРАЗЕ: vad postprocess diarization
 #   При обычной установке это «дополнения» из мастера, а не движки: их нет в
 #   profile_engines(), их предлагает отдельный вопрос. В образе мастера нет,
@@ -92,8 +100,20 @@ RUN set -eux; \
         continue; \
       fi; \
       echo "=== установка движка ${engine} ==="; \
-      pip install -r "requirements/engines/${engine}.txt" || \
+      if ! pip install -r "requirements/engines/${engine}.txt"; then \
         echo "ВНИМАНИЕ: движок ${engine} установить не удалось, продолжаем"; \
+        continue; \
+      fi; \
+      if [ -f "requirements/engines/no-deps/${engine}.txt" ]; then \
+        pip install --no-deps -r "requirements/engines/no-deps/${engine}.txt" || \
+          echo "ВНИМАНИЕ: движок ${engine} установился без собственного пакета"; \
+      fi; \
+      if [ -f "requirements/engines/optional/${engine}.txt" ]; then \
+        { pip install -r "requirements/engines/optional/${engine}.txt" && \
+          { [ ! -f "requirements/engines/optional/no-deps/${engine}.txt" ] || \
+            pip install --no-deps -r "requirements/engines/optional/no-deps/${engine}.txt"; }; } || \
+          echo "ВНИМАНИЕ: необязательная часть движка ${engine} не установилась"; \
+      fi; \
     done
 
 # Версии, которые мы держим вопреки требованиям движков. Ставится последним
@@ -116,7 +136,7 @@ ARG ACCEL=cpu
 # Версия образа. Значение по умолчанию обязано совпадать с файлом VERSION —
 # это проверяется тестом: раньше оно было вписано числом и тихо отставало от
 # файла на каждом выпуске, а docker inspect показывал прошлогоднюю версию.
-ARG VERSION=3.1.18
+ARG VERSION=3.1.19
 
 LABEL org.opencontainers.image.title="ASR Hub" \
       org.opencontainers.image.description="Сервер распознавания речи на свободных моделях" \

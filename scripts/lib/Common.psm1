@@ -12,17 +12,35 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+# Консоль читает вывод дочерних программ как UTF-8 (строка выше), а Python,
+# когда пишет не в консоль, а в канал, берёт кодовую страницу системы —
+# на русской Windows это cp1251. Получалась мешанина, а то и авария:
+# `python -m asrhub --print-config` падал на первом же «×» с
+# UnicodeEncodeError, и config.example.yaml оставался пустым; причины из
+# проверки видеокарты и из doctor.ps1 печатались нечитаемыми. Раньше
+# кодировку задавал только models.ps1 и только для себя. Переменные
+# процесса: наследуют их лишь программы, запущенные из этого сценария.
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
 
 # Версия — из файла VERSION рядом с деревом скриптов; вписанное число
 # расходится с файлом при первом же выпуске.
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.18'
+    $script:AsrHubVersion = '3.1.19'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
 $script:MinPython       = [version]'3.10'
+# Верхняя граница проверенных версий — та же, что ASRHUB_MAX_PYTHON в
+# common.sh. Под свежий Python колёса torch, onnxruntime и nemo выходят с
+# задержкой в месяцы: GigaAM требует onnxruntime==1.23.*, а у него колёс
+# новее cp313 нет, и установка на 3.14 разваливалась внутри pip.
+$script:MaxPython       = [version]'3.13'
+if ($env:ASRHUB_MAX_PYTHON) {
+    try { $script:MaxPython = [version]$env:ASRHUB_MAX_PYTHON } catch { }
+}
 $script:LogFile         = $null
 $script:RollbackActions = [System.Collections.ArrayList]::new()
 $script:TempPaths       = [System.Collections.ArrayList]::new()
@@ -39,6 +57,9 @@ $script:Quiet           = $false
 
 function Initialize-AsrLog {
     param([string]$Directory = $env:TEMP)
+    # TEMP бывает не задан (урезанное окружение службы, проверка вне
+    # Windows) — тогда системный каталог временных файлов.
+    if (-not $Directory) { $Directory = [System.IO.Path]::GetTempPath() }
     if (-not (Test-Path $Directory)) { New-Item -ItemType Directory -Path $Directory -Force | Out-Null }
     $name = "asrhub-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
     $script:LogFile = Join-Path $Directory $name
@@ -84,7 +105,13 @@ function Write-Step {
     Write-AsrLog STEP $Text
 }
 
-function Set-StepTotal { param([int]$Total) $script:StepTotal = $Total; $script:StepIndex = 0 }
+function Set-StepTotal {
+    # -KeepIndex меняет только знаменатель: установщик узнаёт настоящее число
+    # шагов после мастера, когда первый шаг уже пройден.
+    param([int]$Total, [switch]$KeepIndex)
+    $script:StepTotal = $Total
+    if (-not $KeepIndex) { $script:StepIndex = 0 }
+}
 
 function Show-Banner {
     if ($script:Quiet) { return }
@@ -184,6 +211,50 @@ function Invoke-Checked {
         $output | Select-Object -Last 25 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
         $reason = if ($Description) { $Description } else { 'Ошибка выполнения команды' }
         throw "$reason (код $code)"
+    }
+    return $output
+}
+
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+        Запускает внешнюю программу так, чтобы её stderr не оборвал сценарий.
+    .DESCRIPTION
+        В Windows PowerShell 5.1 при $ErrorActionPreference = 'Stop' каждая
+        строка, которую внешняя программа пишет в stderr, становится
+        терминирующей ошибкой, стоит только перенаправить поток (2>$null,
+        2>&1, *>$null). На PowerShell 7 этого нет, поэтому дефект виден
+        только на штатной для Windows версии. Так ломались: проверка
+        контейнера в update.ps1 (уже после остановки службы и замены
+        файлов), `docker compose down` при удалении («Контейнеры не
+        найдены» при живых контейнерах), `docker info` в установщике,
+        проба видеокарты (предупреждение torch → «проба не выполнилась» →
+        проверка молча пройдена) и nvidia-smi в разборе причин — там
+        исключение уходило в ловушку установщика и откатывало установку.
+
+        Возвращает строки stdout (с -MergeError — и stderr), код возврата —
+        в $LASTEXITCODE. Программы нет или её не запустить — код 127.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [string[]]$Arguments = @(),
+        [switch]$MergeError
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    $output = @()
+    try {
+        if ($MergeError) {
+            $output = @(& $Command @Arguments 2>&1 | ForEach-Object { "$_" })
+        } else {
+            $output = @(& $Command @Arguments 2>$null)
+        }
+    } catch {
+        $global:LASTEXITCODE = 127
+        $output = @()
+    } finally {
+        $ErrorActionPreference = $previous
     }
     return $output
 }
@@ -494,6 +565,69 @@ function Get-EnginePackages {
     return @($names | Select-Object -Unique)
 }
 
+function Get-EngineRemovalPlan {
+    <#
+    .SYNOPSIS
+        Какие пакеты движка можно снять, а какие нужны кому-то ещё.
+    .DESCRIPTION
+        Двойник remove-engine из models.sh. Раньше снималось всё из файлов
+        движка подряд: `remove-engine postprocess` удалял huggingface-hub, на
+        котором держатся загрузка моделей и faster-whisper, `remove-engine
+        gigaam` — soundfile и numpy из base.txt, `remove-engine
+        faster_whisper` — onnxruntime, общий с gigaam, tone и postprocess.
+
+        Оставляется, во-первых, всё, что перечислено в других файлах
+        требований (сервер и другие движки); во-вторых, всё, на чём по
+        сведениям pip держится пакет вне снимаемых, — до неподвижной точки:
+        оставленный тянет за собой свои зависимости. Не установленное не
+        снимается вовсе.
+    .OUTPUTS
+        Объект с полями Remove и Keep — имена в написании pip.
+    #>
+    param([Parameter(Mandatory)][string]$Pip, [Parameter(Mandatory)][string]$Requirements)
+    $dir = Split-Path -Parent $Requirements
+    $leaf = Split-Path -Leaf $Requirements
+    $optional = Join-Path $dir 'optional'
+    $ownFiles = @($Requirements, (Join-Path (Join-Path $dir 'no-deps') $leaf),
+                  (Join-Path $optional $leaf), (Join-Path (Join-Path $optional 'no-deps') $leaf)) |
+        ForEach-Object { [System.IO.Path]::GetFullPath($_) }
+    $own = @(Get-EnginePackages -Requirements $Requirements | ForEach-Object { ConvertTo-PipName $_ } |
+        Select-Object -Unique)
+    $shared = [System.Collections.Generic.HashSet[string]]::new()
+    $requirementsDir = Split-Path -Parent $dir
+    foreach ($file in @(Get-ChildItem -LiteralPath $requirementsDir -Recurse -Filter '*.txt' -File -ErrorAction SilentlyContinue)) {
+        if ($ownFiles -contains [System.IO.Path]::GetFullPath($file.FullName)) { continue }
+        foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
+            $name = Get-RequirementName $line
+            if ($name) { [void]$shared.Add((ConvertTo-PipName $name)) }
+        }
+    }
+    $remove = [System.Collections.Generic.List[string]]::new()
+    $keep = [System.Collections.Generic.List[string]]::new()
+    $usersOf = @{}
+    foreach ($name in $own) {
+        if ($shared.Contains($name)) { $keep.Add($name); continue }
+        $info = Get-PipPackageUsers -Pip $Pip -Name $name
+        if (-not $info.Installed) { continue }
+        $usersOf[$name] = @($info.Users)
+        $remove.Add($name)
+    }
+    do {
+        $changed = $false
+        foreach ($name in @($remove)) {
+            foreach ($user in $usersOf[$name]) {
+                if ($user -and -not $remove.Contains($user)) {
+                    [void]$remove.Remove($name)
+                    $keep.Add($name)
+                    $changed = $true
+                    break
+                }
+            }
+        }
+    } while ($changed)
+    return [pscustomobject]@{ Remove = @($remove | Sort-Object); Keep = @($keep | Sort-Object -Unique) }
+}
+
 function Confirm-Action {
     param([string]$Message, [string]$Default = 'y')
     if ($script:AssumeYes) { return $true }
@@ -523,9 +657,13 @@ function Confirm-Action {
 # ---------------------------------------------------------------------------
 
 function Test-Administrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # Вне Windows (проверка сценариев в контейнере) удостоверения Windows
+    # нет вовсе: GetCurrent бросает PlatformNotSupportedException.
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
 }
 
 function Test-CommandExists {
@@ -534,24 +672,49 @@ function Test-CommandExists {
 }
 
 function Find-Python {
+    <#
+    .SYNOPSIS
+        Интерпретатор для окружения: проверенной версии, а если такого нет —
+        новее, с предупреждением.
+    .DESCRIPTION
+        Два прохода, как check_python в common.sh. Раньше верхней границы не
+        было вовсе, и на машине, где «python» — это 3.14, установка шла на
+        нём и разваливалась внутри pip: колёс onnxruntime для GigaAM под
+        него нет.
+    #>
     $candidates = @()
     foreach ($name in 'python3.13', 'python3.12', 'python3.11', 'python3.10', 'python', 'python3') {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
         if ($cmd) { $candidates += $cmd.Source }
     }
     if (Test-CommandExists 'py') {
         foreach ($v in '3.13', '3.12', '3.11', '3.10') {
-            try {
-                $path = & py "-$v" -c "import sys; print(sys.executable)" 2>$null
-                if ($LASTEXITCODE -eq 0 -and $path) { $candidates += $path.Trim() }
-            } catch { }
+            $path = @(Invoke-Native -Command 'py' -Arguments @("-$v", '-c', 'import sys; print(sys.executable)'))
+            if ($LASTEXITCODE -eq 0 -and $path.Count -gt 0 -and "$($path[0])".Trim()) {
+                $candidates += "$($path[0])".Trim()
+            }
         }
     }
+    $tooNew = $null; $tooNewVersion = $null
     foreach ($path in ($candidates | Select-Object -Unique)) {
-        try {
-            $version = & $path -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
-            if ($LASTEXITCODE -eq 0 -and [version]$version -ge $script:MinPython) { return $path }
-        } catch { }
+        $out = @(Invoke-Native -Command $path -Arguments @('-c', "import sys;print('%d.%d'%sys.version_info[:2])"))
+        if ($LASTEXITCODE -ne 0 -or $out.Count -eq 0) { continue }
+        $version = $null
+        try { $version = [version]("$($out[0])".Trim()) } catch { continue }
+        if ($version -lt $script:MinPython) { continue }
+        if ($version -gt $script:MaxPython) {
+            if (-not $tooNew) { $tooNew = $path; $tooNewVersion = $version }
+            continue
+        }
+        return $path
+    }
+    if ($tooNew) {
+        Write-Warn "Найден только Python $tooNewVersion — он новее проверенной версии $($script:MaxPython)."
+        Write-Hint 'Часть движков под него не соберётся: колёса torch, onnxruntime и nemo'
+        Write-Hint 'выходят с задержкой в месяцы. Поставьте проверенную версию и повторите:'
+        Write-Hint "  winget install Python.Python.$($script:MaxPython)"
+        return $tooNew
     }
     return $null
 }
@@ -715,10 +878,8 @@ function Test-WingetPackage {
     # проверку можно было подменить в тестах.
     param([string]$Id)
     if (-not (Test-CommandExists 'winget')) { return $false }
-    try {
-        $null = & winget show --id $Id -e --disable-interactivity 2>$null
-        return ($LASTEXITCODE -eq 0)
-    } catch { return $false }
+    $null = Invoke-Native -Command 'winget' -Arguments @('show', '--id', $Id, '-e', '--disable-interactivity')
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Install-GpuDriver {
@@ -778,13 +939,18 @@ function Get-GpuInfo {
     $result = [ordered]@{ Accelerator = 'cpu'; Name = ''; MemoryMb = 0; CudaVersion = '' }
     if (Test-CommandExists 'nvidia-smi') {
         try {
-            $line = (& nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
-            if ($line) {
-                $parts = $line -split ','
+            # Через Invoke-Native: предупреждение nvidia-smi в stderr на
+            # Windows PowerShell 5.1 становилось исключением, и машина с
+            # исправной картой считалась машиной без неё.
+            $line = @(Invoke-Native -Command 'nvidia-smi' -Arguments @(
+                '--query-gpu=name,memory.total', '--format=csv,noheader,nounits')) |
+                Select-Object -First 1
+            if ($LASTEXITCODE -eq 0 -and $line) {
+                $parts = "$line" -split ','
                 $result.Accelerator = 'cuda'
                 $result.Name = $parts[0].Trim()
                 $result.MemoryMb = [int]($parts[1].Trim())
-                $smi = & nvidia-smi 2>$null | Out-String
+                $smi = @(Invoke-Native -Command 'nvidia-smi') | Out-String
                 if ($smi -match 'CUDA Version:\s*([\d.]+)') { $result.CudaVersion = $Matches[1] }
             }
         } catch { }
@@ -877,6 +1043,7 @@ function Set-DryRun    { param([bool]$Value) $script:DryRun = $Value }
 function Set-AssumeYes { param([bool]$Value) $script:AssumeYes = $Value }
 function Set-Quiet     { param([bool]$Value) $script:Quiet = $Value }
 function Get-DryRun    { return $script:DryRun }
+function Get-AssumeYes { return $script:AssumeYes }
 function Get-LogFile   { return $script:LogFile }
 
 
@@ -1134,9 +1301,13 @@ print(f"ok|{устройство}|" if годно else f"fail|{устройст�
     # кодировку ровно на тех машинах, где он и нужен.
     [System.IO.File]::WriteAllText($tmp, $probe, [System.Text.UTF8Encoding]::new($false))
     try {
-        $out = & $Python $tmp $CodeDir $device 2>$null
+        # Через Invoke-Native: torch при импорте любит писать предупреждения
+        # в stderr (UserWarning), и на Windows PowerShell 5.1 каждое из них
+        # становилось исключением. Проба «не выполнялась», и проверка
+        # проходила молча — ровно на машине, где карта и не работала.
+        $out = @(Invoke-Native -Command $Python -Arguments @($tmp, $CodeDir, $device))
     } catch {
-        $out = ''
+        $out = @()
     } finally {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     }
@@ -1172,7 +1343,11 @@ function Show-GpuRuntimeDiagnosis {
         Write-Hint 'Если такой карты нет, CUDA отвечает «invalid device ordinal».'
     }
     if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
-        $smi = & nvidia-smi -L 2>&1 | Out-String
+        # Раньше `nvidia-smi -L 2>&1` стоял вне всякой защиты: на Windows
+        # PowerShell 5.1 первая же строка ошибки драйвера становилась
+        # исключением, оно уходило в ловушку install.ps1 — и установка,
+        # уже законченная, откатывалась целиком.
+        $smi = @(Invoke-Native -Command 'nvidia-smi' -Arguments @('-L') -MergeError) | Out-String
         if ($LASTEXITCODE -ne 0) {
             Write-Warn 'nvidia-smi не отвечает:'
             Write-Host ('  ' + $smi.Trim())
@@ -1185,6 +1360,765 @@ function Show-GpuRuntimeDiagnosis {
     } else {
         Write-Warn 'nvidia-smi не найдена — драйвер NVIDIA не установлен.'
     }
+}
+
+# ---------------------------------------------------------------------------
+# Какая это установка
+# ---------------------------------------------------------------------------
+#
+# Двойник раздела «Какая это установка» из common.sh. Сценарии обслуживания
+# искали установку в двух стандартных каталогах, а команда удаления, которую
+# печатает установщик, — `powershell -File "<каталог>\scripts\uninstall.ps1"`
+# — ключа -Prefix не несла. Для установки в свой каталог (-Prefix D:\ASRHub)
+# это кончалось так: стандартных каталогов нет, $Prefix пуст,
+# `$_.Path.StartsWith('')` истинно для любого пути — и удаление
+# останавливало ВСЕ процессы python*.exe на машине, чужие блокноты и
+# службы. Служба при этом оставалась (service.ps1 падал на пустом пути), а
+# с -Purge каталог данных не удалялся.
+#
+# Теперь установка узнаёт себя сама: установщик и обновление кладут в
+# каталог программы метку .asrhub-install (каталог данных, автозапуск,
+# режим), а сценарий, запущенный из установки, берёт всё оттуда. Установки
+# без метки (поставлены до 3.1.19) опознаются по службе или задаче,
+# которая работает из их каталога.
+
+$script:InstallMarker = '.asrhub-install'
+$script:AsrServiceName = 'ASRHub'
+$script:AsrTaskName = 'ASRHub Server'
+
+function Join-AsrPath {
+    <#
+    .SYNOPSIS
+        Join-Path, который не спотыкается о чужой диск.
+    .DESCRIPTION
+        Join-Path проверяет, что диск из пути существует: для
+        «C:\Program Files\ASRHub» на машине без диска C: (и в проверках на
+        Linux) он бросает «Cannot find drive». Стандартный каталог, которого
+        нет, — не ошибка, а просто «не здесь».
+    #>
+    param([AllowEmptyString()][string]$Base, [AllowEmptyString()][string]$Child)
+    if (-not $Base) { return $Child }
+    try { return (Join-Path $Base $Child -ErrorAction Stop) }
+    catch { return [System.IO.Path]::Combine($Base, $Child) }
+}
+
+function Get-AsrServiceName { return $script:AsrServiceName }
+function Get-AsrTaskName    { return $script:AsrTaskName }
+
+function ConvertTo-AsrFullPath {
+    <# Полный путь без хвостовой косой черты; корень диска остаётся корнем. #>
+    param([AllowEmptyString()][AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $full = $Path.Trim().Trim('"')
+    try { $full = [System.IO.Path]::GetFullPath($full) } catch { }
+    $root = ''
+    try { $root = [System.IO.Path]::GetPathRoot($full) } catch { }
+    if ($root -and $full.Length -le $root.Length) { return $full }
+    return $full.TrimEnd('\', '/')
+}
+
+function Test-AsrSamePath {
+    <# Один ли это каталог. Регистр в путях Windows не различается. #>
+    param([AllowEmptyString()][AllowNull()][string]$Left,
+          [AllowEmptyString()][AllowNull()][string]$Right)
+    $a = ConvertTo-AsrFullPath $Left
+    $b = ConvertTo-AsrFullPath $Right
+    if (-not $a -or -not $b) { return $false }
+    return [string]::Equals($a, $b, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-AsrPathInside {
+    <#
+    .SYNOPSIS
+        Лежит ли путь внутри каталога (строго внутри, не сам каталог).
+    .DESCRIPTION
+        Пустой каталог — всегда «нет». Именно пустой каталог и был причиной
+        аварии: `$path.StartsWith('')` истинно для любой строки.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Path,
+          [AllowEmptyString()][AllowNull()][string]$Parent)
+    $p = ConvertTo-AsrFullPath $Path
+    $d = ConvertTo-AsrFullPath $Parent
+    if (-not $p -or -not $d) { return $false }
+    $d = $d.TrimEnd('\', '/')
+    if (-not $d) { return $false }
+    return ($p.StartsWith($d + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $p.StartsWith($d + '/', [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Get-InstallMarker {
+    <# Метка установки словарём: prefix, data_dir, service, mode, version.
+       Пустой словарь — метки нет. #>
+    param([AllowEmptyString()][AllowNull()][string]$Prefix)
+    $result = @{}
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return $result }
+    $file = Join-AsrPath $Prefix $script:InstallMarker
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $result }
+    try {
+        $lines = @(Get-Content -LiteralPath $file -Encoding UTF8 -ErrorAction Stop)
+    } catch { return $result }
+    foreach ($line in $lines) {
+        $text = "$line".Trim()
+        if (-not $text -or $text.StartsWith('#') -or $text -notmatch '=') { continue }
+        $pair = $text -split '=', 2
+        $result[$pair[0].Trim()] = $pair[1].Trim()
+    }
+    return $result
+}
+
+function Write-InstallMarker {
+    <#
+    .SYNOPSIS
+        Кладёт метку установки. Пробный запуск только рассказывает.
+    .PARAMETER Service
+        Имя автозапуска: ASRHub (служба Windows), «ASRHub Server» (задача
+        планировщика) или пусто, если автозапуска нет (-NoService). Пустое
+        значение и значит «ничей автозапуск не трогать», а не «ASRHub
+        наугад».
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Prefix,
+        [AllowEmptyString()][string]$DataDir = '',
+        [AllowEmptyString()][string]$Service = '',
+        [string]$Mode = 'native'
+    )
+    $file = Join-AsrPath $Prefix $script:InstallMarker
+    if ($script:DryRun) {
+        $what = if ($Service) { $Service } else { 'нет' }
+        Write-Host "  [пробный запуск] метка установки ${file}: данные $DataDir, автозапуск $what" `
+            -ForegroundColor Yellow
+        return $true
+    }
+    if (-not (Test-Path -LiteralPath $Prefix -PathType Container)) { return $false }
+    $lines = @(
+        '# Метка установки ASR Hub — по ней сценарии обслуживания находят',
+        '# свою установку. Пишется установщиком и обновлением; не правьте.',
+        "prefix=$(ConvertTo-AsrFullPath $Prefix)",
+        "data_dir=$(ConvertTo-AsrFullPath $DataDir)",
+        "service=$Service",
+        "mode=$Mode",
+        "version=$($script:AsrHubVersion)")
+    $tmp = "$file.tmp"
+    try {
+        [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tmp -Destination $file -Force
+        Write-Debug2 "метка установки: $file"
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Write-Warn "Не удалось записать метку установки $file."
+        return $false
+    }
+}
+
+function Split-AsrCommandLine {
+    <# Строка запуска → программа и остальное: «"C:\a b\python.exe" -m asrhub». #>
+    param([AllowEmptyString()][string]$CommandLine)
+    $text = "$CommandLine".Trim()
+    if ($text -match '^"([^"]+)"\s*(.*)$') { return @($Matches[1], $Matches[2]) }
+    if ($text -match '^(\S+)\s*(.*)$') { return @($Matches[1], $Matches[2]) }
+    return @('', '')
+}
+
+function ConvertTo-AsrAutostartRecord {
+    <# Запись автозапуска: откуда работает, с каким каталогом данных, адресом и портом. #>
+    param(
+        [string]$Kind, [string]$Name,
+        [AllowEmptyString()][string]$Program = '',
+        [AllowEmptyString()][string]$Arguments = '',
+        [AllowEmptyString()][string]$Directory = '',
+        [AllowEmptyCollection()][AllowNull()][string[]]$Environment = @()
+    )
+    $prefix = ''
+    $dir = "$Directory".Trim().Trim('"').TrimEnd('\', '/')
+    if ($dir -match '^(.+)[\\/]server$') { $prefix = $Matches[1] }
+    if (-not $prefix -and "$Program" -match '^"?(.+?)[\\/]venv[\\/]') { $prefix = $Matches[1] }
+    $port = 0; $bindHost = ''; $config = ''
+    if ($Arguments -match '--port[= ]+"?(\d+)') { $port = [int]$Matches[1] }
+    if ($Arguments -match '--host[= ]+"?([^"\s]+)') { $bindHost = $Matches[1] }
+    if ($Arguments -match '--config[= ]+"([^"]+)"') { $config = $Matches[1] }
+    elseif ($Arguments -match '--config[= ]+(\S+)') { $config = $Matches[1] }
+    $dataDir = ''
+    foreach ($line in @($Environment)) {
+        if ("$line" -match '^\s*ASRHUB_DATA_DIR=(.+)$') { $dataDir = $Matches[1].Trim() }
+    }
+    if (-not $dataDir -and $config) { $dataDir = Split-Path -Parent $config }
+    return [pscustomobject]@{
+        Kind = $Kind; Name = $Name; Program = "$Program"; Arguments = "$Arguments"
+        Prefix = $prefix; DataDir = $dataDir; BindHost = $bindHost; Port = $port; Config = $config
+    }
+}
+
+function Get-AsrAutostart {
+    <#
+    .SYNOPSIS
+        Автозапуск ASR Hub на этой машине: служба Windows и задача планировщика.
+    .DESCRIPTION
+        Для каждой найденной записи — объект с полями Kind (service или
+        task), Name, Program, Arguments, Prefix, DataDir, BindHost, Port,
+        Config. Prefix пуст, если по записи не понять, из какого каталога
+        она работает. Службу NSSM читаем из реестра (Parameters), службу,
+        поставленную прежними версиями через sc.exe, — по строке запуска.
+    #>
+    $found = @()
+    $service = $null
+    if (Get-Command Get-Service -ErrorAction SilentlyContinue) {
+        try { $service = Get-Service -Name $script:AsrServiceName -ErrorAction SilentlyContinue } catch { $service = $null }
+    }
+    if ($service) {
+        $program = ''; $arguments = ''; $directory = ''; $environment = @()
+        $params = $null
+        try {
+            $params = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" +
+                $script:AsrServiceName + '\Parameters') -ErrorAction SilentlyContinue
+        } catch { $params = $null }
+        if ($params) {
+            foreach ($name in 'Application', 'AppParameters', 'AppDirectory', 'AppEnvironmentExtra') {
+                if (-not ($params.PSObject.Properties.Name -contains $name)) { continue }
+                switch ($name) {
+                    'Application'         { $program = "$($params.Application)" }
+                    'AppParameters'       { $arguments = "$($params.AppParameters)" }
+                    'AppDirectory'        { $directory = "$($params.AppDirectory)" }
+                    'AppEnvironmentExtra' { $environment = @($params.AppEnvironmentExtra) }
+                }
+            }
+        }
+        if (-not $program -and (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+            try {
+                $cim = Get-CimInstance Win32_Service -Filter "Name='$($script:AsrServiceName)'" `
+                    -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($cim -and $cim.PathName) {
+                    $parts = Split-AsrCommandLine $cim.PathName
+                    $program = $parts[0]; $arguments = $parts[1]
+                }
+            } catch { }
+        }
+        $found += ConvertTo-AsrAutostartRecord -Kind 'service' -Name $script:AsrServiceName `
+            -Program $program -Arguments $arguments -Directory $directory -Environment $environment
+    }
+    $task = $null
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        try { $task = Get-ScheduledTask -TaskName $script:AsrTaskName -ErrorAction SilentlyContinue } catch { $task = $null }
+    }
+    if ($task) {
+        $action = @($task.Actions) | Select-Object -First 1
+        $program = ''; $arguments = ''; $directory = ''
+        if ($action) {
+            $program = "$($action.Execute)"; $arguments = "$($action.Arguments)"
+            $directory = "$($action.WorkingDirectory)"
+        }
+        $environment = @()
+        # Задаче без --config каталог данных передавался переменной машины.
+        $machine = [Environment]::GetEnvironmentVariable('ASRHUB_DATA_DIR', 'Machine')
+        if ($machine) { $environment = @("ASRHUB_DATA_DIR=$machine") }
+        $found += ConvertTo-AsrAutostartRecord -Kind 'task' -Name $script:AsrTaskName `
+            -Program $program -Arguments $arguments -Directory $directory -Environment $environment
+    }
+    return $found
+}
+
+function Get-AsrOwnAutostart {
+    <#
+    .SYNOPSIS
+        Записи автозапуска, которые принадлежат установке в этом каталоге.
+    .DESCRIPTION
+        По записи понятно, откуда она работает, — сравниваем каталоги. Не
+        понятно — считаем своей, если метка установки не говорит обратного
+        (метка с пустым service — установка без автозапуска: чужой автозапуск
+        она не трогает).
+    #>
+    param([AllowEmptyString()][string]$Prefix, [object[]]$Autostart = $null)
+    if (-not $Prefix) { return @() }
+    if ($null -eq $Autostart) { $Autostart = @(Get-AsrAutostart) }
+    $marker = Get-InstallMarker -Prefix $Prefix
+    $own = @()
+    foreach ($record in @($Autostart)) {
+        if (-not $record) { continue }
+        if ($record.Prefix) {
+            if (Test-AsrSamePath $record.Prefix $Prefix) { $own += $record }
+        } elseif (-not ($marker.ContainsKey('service') -and -not $marker['service'])) {
+            $own += $record
+        }
+    }
+    return $own
+}
+
+function Get-AsrStandardPrefixes {
+    <# Стандартные каталоги программы: от администратора и без прав. #>
+    $list = @()
+    if ($env:ProgramFiles) { $list += (Join-AsrPath $env:ProgramFiles 'ASRHub') }
+    $list += 'C:\Program Files\ASRHub'
+    if ($env:LOCALAPPDATA) { $list += (Join-AsrPath $env:LOCALAPPDATA 'ASRHub') }
+    return @($list | Select-Object -Unique)
+}
+
+function Get-AsrStandardDataDirs {
+    <# Стандартные каталоги данных — в паре с каталогом программы, если он известен. #>
+    param([AllowEmptyString()][string]$Prefix = '')
+    $admin = if ($env:ProgramData) { Join-AsrPath $env:ProgramData 'ASRHub' } else { '' }
+    $user = if ($env:LOCALAPPDATA) { Join-AsrPath $env:LOCALAPPDATA 'ASRHub\data' } else { '' }
+    $userPrefix = if ($env:LOCALAPPDATA) { Join-AsrPath $env:LOCALAPPDATA 'ASRHub' } else { '' }
+    $list = if ($Prefix -and $userPrefix -and (Test-AsrSamePath $Prefix $userPrefix)) { @($user, $admin) }
+            else { @($admin, $user) }
+    return @($list | Where-Object { $_ })
+}
+
+function Test-AsrInstallation {
+    <#
+    .SYNOPSIS
+        Установка ли это: код сервера на месте и есть метка, автозапуск
+        оттуда или собранное окружение.
+    .DESCRIPTION
+        Окружение (venv) без .git — признак установки прежних версий без
+        автозапуска: иначе её собственный uninstall.ps1 не узнал бы её и
+        взялся бы за установку в стандартном каталоге. Каталог с .git —
+        рабочая копия исходников, а не установка, даже с venv внутри.
+    #>
+    param([AllowEmptyString()][string]$Path, [object[]]$Autostart = $null)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-AsrPath $Path 'VERSION') -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-AsrPath $Path 'server') -PathType Container)) { return $false }
+    if (Test-Path -LiteralPath (Join-AsrPath $Path $script:InstallMarker) -PathType Leaf) { return $true }
+    if ($null -eq $Autostart) { $Autostart = @(Get-AsrAutostart) }
+    foreach ($record in @($Autostart)) {
+        if ($record -and $record.Prefix -and (Test-AsrSamePath $record.Prefix $Path)) { return $true }
+    }
+    $venv = Join-AsrPath $Path 'venv'
+    if ((Test-Path -LiteralPath $venv -PathType Container) -and
+        -not (Test-Path -LiteralPath (Join-AsrPath $Path '.git'))) { return $true }
+    return $false
+}
+
+function Get-AsrKnownInstallations {
+    <# Каталоги известных установок — по автозапуску и меткам, без повторов. #>
+    param([object[]]$Autostart = $null)
+    if ($null -eq $Autostart) { $Autostart = @(Get-AsrAutostart) }
+    $list = [System.Collections.Generic.List[string]]::new()
+    $add = {
+        param($candidate)
+        $full = ConvertTo-AsrFullPath $candidate
+        if (-not $full) { return }
+        foreach ($known in $list) { if (Test-AsrSamePath $known $full) { return } }
+        $list.Add($full)
+    }
+    foreach ($record in @($Autostart)) {
+        if ($record -and $record.Prefix -and (Test-Path -LiteralPath (Join-AsrPath $record.Prefix 'server'))) {
+            & $add $record.Prefix
+        }
+    }
+    foreach ($candidate in (Get-AsrStandardPrefixes)) {
+        if (Test-Path -LiteralPath (Join-AsrPath $candidate $script:InstallMarker) -PathType Leaf) {
+            & $add $candidate
+        }
+    }
+    return @($list)
+}
+
+function Resolve-AsrInstallation {
+    <#
+    .SYNOPSIS
+        Какая установка имеется в виду: каталог программы, каталог данных,
+        её автозапуск и режим.
+    .DESCRIPTION
+        Каталог программы — заданный ключом; иначе та установка, из которой
+        запущен сценарий; не из установки (из распакованного дистрибутива) —
+        единственная известная на машине; известных нет — прежние
+        стандартные каталоги. Известных несколько, а сценарий запущен не из
+        них, — Prefix пуст, их список в Candidates, и решает вызывающий:
+        удалять или обновлять наугад нельзя.
+
+        DataDirSource говорит, откуда каталог данных: key, marker, service
+        или guess — последний ни метка, ни автозапуск не подтвердили.
+    #>
+    param(
+        [AllowEmptyString()][string]$ScriptDir = '',
+        [AllowEmptyString()][string]$Prefix = '',
+        [AllowEmptyString()][string]$DataDir = ''
+    )
+    $autostart = @(Get-AsrAutostart)
+    $result = [ordered]@{
+        Prefix = ''; DataDir = ''; DataDirSource = ''; Candidates = @()
+        Autostart = @(); Mode = 'native'; Marker = @{}
+    }
+    if ($DataDir) { $result.DataDir = ConvertTo-AsrFullPath $DataDir; $result.DataDirSource = 'key' }
+    if ($Prefix) {
+        $result.Prefix = ConvertTo-AsrFullPath $Prefix
+    } else {
+        $own = if ($ScriptDir) { Split-Path -Parent $ScriptDir } else { '' }
+        if ($own -and (Test-AsrInstallation -Path $own -Autostart $autostart)) {
+            $result.Prefix = ConvertTo-AsrFullPath $own
+        } else {
+            $known = @(Get-AsrKnownInstallations -Autostart $autostart)
+            if ($known.Count -eq 1) {
+                $result.Prefix = $known[0]
+            } elseif ($known.Count -gt 1) {
+                $result.Candidates = $known
+                return [pscustomobject]$result
+            } else {
+                foreach ($candidate in (Get-AsrStandardPrefixes)) {
+                    if (Test-Path -LiteralPath (Join-AsrPath $candidate 'server') -PathType Container) {
+                        $result.Prefix = ConvertTo-AsrFullPath $candidate
+                        break
+                    }
+                }
+            }
+        }
+    }
+    if ($result.Prefix) {
+        $result.Marker = Get-InstallMarker -Prefix $result.Prefix
+        $result.Autostart = @(Get-AsrOwnAutostart -Prefix $result.Prefix -Autostart $autostart)
+        if ($result.Marker['mode']) {
+            $result.Mode = $result.Marker['mode']
+        } elseif (Test-Path -LiteralPath (Join-AsrPath (Join-AsrPath $result.Prefix 'docker') '.env') -PathType Leaf) {
+            $result.Mode = 'docker'
+        }
+    }
+    if (-not $result.DataDir -and $result.Prefix) {
+        if ($result.Marker['data_dir']) {
+            $result.DataDir = ConvertTo-AsrFullPath $result.Marker['data_dir']
+            $result.DataDirSource = 'marker'
+        } else {
+            foreach ($record in @($result.Autostart)) {
+                if ($record.Prefix -and $record.DataDir) {
+                    $result.DataDir = ConvertTo-AsrFullPath $record.DataDir
+                    $result.DataDirSource = 'service'
+                    break
+                }
+            }
+        }
+    }
+    if (-not $result.DataDir) {
+        foreach ($candidate in (Get-AsrStandardDataDirs -Prefix $result.Prefix)) {
+            if (Test-Path -LiteralPath $candidate -PathType Container) {
+                $result.DataDir = ConvertTo-AsrFullPath $candidate
+                $result.DataDirSource = 'guess'
+                break
+            }
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Show-AmbiguousInstallation {
+    <# Сообщение для «установок несколько, какую — не сказано». #>
+    param([string[]]$Candidates, [string]$Script)
+    Write-Err 'На машине несколько установок ASR Hub — какую именно, не сказано:'
+    foreach ($candidate in @($Candidates)) { Write-Host "    $candidate" }
+    Write-Hint "Запустите сценарий из каталога нужной установки: powershell -File `"<каталог>\scripts\$Script`""
+    Write-Hint 'или укажите её ключом -Prefix.'
+}
+
+function Get-ConfigYamlValue {
+    <#
+    .SYNOPSIS
+        Значение из config.yaml: `server_port: 8081` → 8081.
+    .DESCRIPTION
+        Двойник config_yaml_value из common.sh: установщик пишет плоские
+        «ключ: значение», и разбирать YAML целиком ради двух строк незачем.
+        Кавычки и хвостовой комментарий снимаются; пусто — ключа нет.
+    #>
+    param([AllowEmptyString()][string]$File, [Parameter(Mandatory)][string]$Key)
+    if (-not $File -or -not (Test-Path -LiteralPath $File -PathType Leaf)) { return '' }
+    try { $lines = @(Get-Content -LiteralPath $File -Encoding UTF8 -ErrorAction Stop) } catch { return '' }
+    foreach ($line in $lines) {
+        if ("$line" -match ('^\s*' + [regex]::Escape($Key) + ':\s*([^\s#][^#]*?)\s*(#.*)?$')) {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return ''
+}
+
+function Get-AsrServerAddress {
+    <#
+    .SYNOPSIS
+        На каком порту и по какому адресу стучаться в сервер установки.
+    .DESCRIPTION
+        Порт — из строки запуска автозапуска: `--port` в ней перекрывает
+        config.yaml, и они расходятся молча. Прежние проверки брали порт из
+        файла, а состояние службы — вовсе на 8080, и работающий сервер
+        объявлялся мёртвым. Для контейнера — из docker\.env.
+
+        Адрес проверки — 127.0.0.1, если сервер слушает все адреса или
+        localhost; иначе тот адрес, к которому он привязан: такой сервер на
+        127.0.0.1 не отвечает вовсе.
+    #>
+    param(
+        [AllowEmptyString()][string]$Prefix = '',
+        [AllowEmptyString()][string]$DataDir = '',
+        [string]$Mode = 'native',
+        [object[]]$Autostart = $null
+    )
+    $port = 0; $bindHost = ''
+    if ($Mode -eq 'docker' -and $Prefix) {
+        $envFile = Join-AsrPath (Join-AsrPath $Prefix 'docker') '.env'
+        if (Test-Path -LiteralPath $envFile -PathType Leaf) {
+            foreach ($line in @(Get-Content -LiteralPath $envFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+                if ("$line" -match '^\s*ASRHUB_PORT\s*=\s*"?(\d+)') { $port = [int]$Matches[1] }
+            }
+        }
+    } else {
+        if ($null -eq $Autostart) { $Autostart = @(Get-AsrOwnAutostart -Prefix $Prefix) }
+        foreach ($record in @($Autostart)) {
+            if (-not $record) { continue }
+            if (-not $port -and $record.Port) { $port = [int]$record.Port }
+            if (-not $bindHost -and $record.BindHost) { $bindHost = $record.BindHost }
+        }
+    }
+    $configFile = if ($DataDir) { Join-AsrPath $DataDir 'config.yaml' } else { '' }
+    if (-not $port) {
+        $value = Get-ConfigYamlValue -File $configFile -Key 'server_port'
+        $number = 0
+        if ([int]::TryParse($value, [ref]$number) -and $number -ge 1 -and $number -le 65535) { $port = $number }
+    }
+    if (-not $port) { $port = 8080 }
+    if (-not $bindHost -and $Mode -ne 'docker') { $bindHost = Get-ConfigYamlValue -File $configFile -Key 'server_host' }
+    $probe = '127.0.0.1'
+    if ($bindHost -and $bindHost -notin @('0.0.0.0', '::', '*', 'localhost', '127.0.0.1', '[::]')) {
+        $probe = if ($bindHost -match ':' -and -not $bindHost.StartsWith('[')) { "[$bindHost]" } else { $bindHost }
+    }
+    return [pscustomobject]@{ Port = $port; BindHost = $bindHost; ProbeHost = $probe }
+}
+
+function Invoke-AsrHealth {
+    <#
+    .SYNOPSIS
+        Один запрос к /api/health: код ответа (0 — не ответил) и тело.
+    .DESCRIPTION
+        Ответ 503 — тоже ответ: сервер жив, но сам сообщает о неисправности.
+        Invoke-WebRequest на него бросает исключение, и прежние проверки
+        путали его с «сервер не отвечает».
+    #>
+    param([Parameter(Mandatory)][string]$Url, [int]$TimeoutSec = 3)
+    try {
+        $response = Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+        return [pscustomobject]@{ Status = [int]$response.StatusCode; Body = "$($response.Content)" }
+    } catch {
+        $status = 0; $body = ''
+        $response = $null
+        try { $response = $_.Exception.Response } catch { $response = $null }
+        if ($response) {
+            try { $status = [int]$response.StatusCode } catch { $status = 0 }
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $body = "$($_.ErrorDetails.Message)"
+            } else {
+                try {
+                    $reader = [System.IO.StreamReader]::new($response.GetResponseStream())
+                    $body = $reader.ReadToEnd()
+                } catch { $body = '' }
+            }
+        }
+        return [pscustomobject]@{ Status = $status; Body = $body }
+    }
+}
+
+function Wait-AsrHealth {
+    <#
+    .SYNOPSIS
+        Ждёт ответа сервера. Объект Invoke-AsrHealth: Status 2xx — здоров,
+        другой ненулевой — отвечает, но неисправен, 0 — не ответил за срок.
+    #>
+    param([int]$Port, [string]$HostName = '127.0.0.1', [int]$Seconds = 40)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $probe = [pscustomobject]@{ Status = 0; Body = '' }
+    do {
+        $probe = Invoke-AsrHealth -Url "http://${HostName}:$Port/api/health"
+        if ($probe.Status -gt 0) { return $probe }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+    return $probe
+}
+
+function Get-PortOwnerPath {
+    <# Путь к программе, которая слушает порт; пусто — узнать нечем. #>
+    param([int]$Port)
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { return '' }
+    try {
+        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $listener) { return '' }
+        $process = Get-Process -Id ([int]$listener.OwningProcess) -ErrorAction SilentlyContinue
+        if ($process -and $process.Path) { return "$($process.Path)" }
+        if ($process) { return "$($process.Name)" }
+    } catch { }
+    return ''
+}
+
+function Test-AsrPortOurs {
+    <#
+    .SYNOPSIS
+        Занят ли порт нашим же сервером из этого каталога.
+    .DESCRIPTION
+        Чаще всего так и есть: установщик запускают повторно, чтобы
+        доставить движок или починить окружение, и сервер при этом работает.
+        Раньше установщик в этом случае переезжал на соседний порт (с -Yes —
+        молча), и служба оказывалась на 8081, а все клиенты — на 8080. Но
+        «на порту отвечает ASR Hub» ещё не значит «наш»: своим считается
+        процесс, запущенный из этого каталога, а если процесс узнать нечем —
+        порт, на который настроен автозапуск установки.
+    #>
+    param([int]$Port, [AllowEmptyString()][string]$Prefix)
+    if (-not $Prefix -or -not (Test-Path -LiteralPath $Prefix -PathType Container)) { return $false }
+    $probe = Invoke-AsrHealth -Url "http://127.0.0.1:$Port/api/health"
+    if ($probe.Status -eq 0 -or $probe.Body -notmatch '"status"') { return $false }
+    $owner = Get-PortOwnerPath -Port $Port
+    if ($owner) {
+        if (Test-AsrPathInside -Path $owner -Parent $Prefix) { return $true }
+        if ($owner -match '(?i)docker|vpnkit|wslrelay') {
+            # Порт держит Docker: наш ли контейнер — скажет .env установки.
+            $address = Get-AsrServerAddress -Prefix $Prefix -Mode 'docker'
+            return ($address.Port -eq $Port -and
+                    (Test-Path -LiteralPath (Join-AsrPath (Join-AsrPath $Prefix 'docker') '.env')))
+        }
+        return $false
+    }
+    foreach ($record in @(Get-AsrOwnAutostart -Prefix $Prefix)) {
+        if ($record -and $record.Prefix -and $record.Port -eq $Port) { return $true }
+    }
+    return $false
+}
+
+function Backup-AsrDatabase {
+    <#
+    .SYNOPSIS
+        Копия базы SQLite, годная для восстановления.
+    .DESCRIPTION
+        Двойник sqlite_backup из common.sh. База работает в режиме WAL:
+        свежие записи лежат в asrhub.db-wal, и копия одного asrhub.db их
+        теряет — на проверке в такой копии не нашлось даже таблицы jobs.
+        Порядок: интерпретатор установки и любой найденный Python (модуль
+        sqlite3 есть в любой сборке), sqlite3.exe и последним — копия базы
+        вместе с -wal и -shm, годная только при остановленном сервере.
+        Копия пишется в режиме DELETE — одним файлом, без спутников.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [AllowEmptyString()][string]$Python = ''
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return $false }
+    if ($script:DryRun) {
+        Write-Host "  [пробный запуск] копия базы $Source → $Destination" -ForegroundColor Yellow
+        return $true
+    }
+    foreach ($suffix in '', '-wal', '-shm', '-journal') {
+        Remove-Item -LiteralPath ($Destination + $suffix) -Force -ErrorAction SilentlyContinue
+    }
+    $code = @'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1], timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+try:
+    with dst:
+        src.backup(dst)
+    dst.execute("PRAGMA journal_mode=DELETE")
+    if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise SystemExit(1)
+finally:
+    dst.close()
+    src.close()
+'@
+    $candidates = @()
+    if ($Python -and (Test-Path -LiteralPath $Python)) { $candidates += $Python }
+    foreach ($name in 'python', 'python3') {
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) { $candidates += $cmd.Source }
+    }
+    $tmp = Join-AsrPath ([System.IO.Path]::GetTempPath()) ("asrhub-backup-{0}.py" -f ([guid]::NewGuid().ToString('N')))
+    [System.IO.File]::WriteAllText($tmp, $code, [System.Text.UTF8Encoding]::new($false))
+    try {
+        foreach ($candidate in ($candidates | Select-Object -Unique)) {
+            $null = Invoke-Native -Command $candidate -Arguments @($tmp, $Source, $Destination)
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Destination -PathType Leaf)) { return $true }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-CommandExists 'sqlite3') {
+        $null = Invoke-Native -Command 'sqlite3' -Arguments @($Source, ".backup '$($Destination -replace "'", "''")'")
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Destination -PathType Leaf)) { return $true }
+    }
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+        foreach ($suffix in '-wal', '-shm') {
+            if (Test-Path -LiteralPath ($Source + $suffix)) {
+                Copy-Item -LiteralPath ($Source + $suffix) -Destination ($Destination + $suffix) -Force -ErrorAction Stop
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Set-AsrPrivateAcl {
+    <#
+    .SYNOPSIS
+        Закрывает каталог (или файл) от остальных пользователей машины.
+    .DESCRIPTION
+        %ProgramData% по умолчанию читают все пользователи, и каталог данных,
+        созданный там установщиком, наследовал это право: api-key.txt,
+        config.yaml с токеном и ключами интеграций и база со всеми
+        расшифровками были открыты любому, кто вошёл в систему. То же с
+        docker\.env в Program Files — там лежит токен Hugging Face.
+
+        Оставляем администраторов, SYSTEM, того, кто ставит, и тех, кого
+        назвали в -Grant (учётная запись службы). SID, а не имена: на русской
+        Windows группа называется «Администраторы».
+    .OUTPUTS
+        $true — права выставлены; $false — нечем (не Windows) или отказ.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Grant = @()
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    if (-not (Test-CommandExists 'icacls')) { return $false }
+    $container = Test-Path -LiteralPath $Path -PathType Container
+    $inherit = if ($container) { '(OI)(CI)' } else { '' }
+    $grants = @("*S-1-5-32-544:${inherit}F", "*S-1-5-18:${inherit}F")
+    try {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if ($me) { $grants += "*${me}:${inherit}F" }
+    } catch { }
+    foreach ($extra in $Grant) { if ($extra) { $grants += $extra } }
+    if ($script:DryRun) {
+        Write-Host "  [пробный запуск] icacls $Path /inheritance:r /grant:r $($grants -join ' ')" -ForegroundColor Yellow
+        return $true
+    }
+    $null = Invoke-Native -Command 'icacls' -Arguments (@($Path, '/inheritance:r', '/grant:r') + $grants + @('/Q'))
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Не удалось закрыть $Path от остальных пользователей (icacls, код $LASTEXITCODE)."
+        return $false
+    }
+    Write-Debug2 "права закрыты: $Path"
+    return $true
+}
+
+function Get-AsrCompose {
+    <#
+    .SYNOPSIS
+        Команда docker compose для установки: программа и аргументы с файлами.
+    .DESCRIPTION
+        Файл для видеокарты подключается, если установка собрана под CUDA
+        (ASRHUB_ACCEL=cuda в docker\.env). Раньше его подключало только
+        обновление, а установщик — нет: контейнер из install.ps1 работал на
+        процессоре, а после первого же update.ps1 — на карте.
+    #>
+    param([Parameter(Mandatory)][string]$Prefix)
+    $dockerDir = Join-AsrPath $Prefix 'docker'
+    $null = Invoke-Native -Command 'docker' -Arguments @('compose', 'version')
+    $command = 'docker'; $arguments = @('compose')
+    if ($LASTEXITCODE -ne 0 -and (Test-CommandExists 'docker-compose')) {
+        $command = 'docker-compose'; $arguments = @()
+    }
+    $arguments += @('-f', 'docker-compose.yml')
+    $envFile = Join-AsrPath $dockerDir '.env'
+    $gpuFile = Join-AsrPath $dockerDir 'docker-compose.gpu.yml'
+    if ((Test-Path -LiteralPath $envFile) -and (Test-Path -LiteralPath $gpuFile) -and
+        (Select-String -LiteralPath $envFile -Pattern '^\s*ASRHUB_ACCEL\s*=\s*"?cuda' -Quiet)) {
+        $arguments += @('-f', 'docker-compose.gpu.yml')
+    }
+    if (Test-Path -LiteralPath $envFile) { $arguments += @('--env-file', '.env') }
+    return [pscustomobject]@{ Command = $command; Arguments = $arguments; Directory = $dockerDir }
 }
 
 # ---------------------------------------------------------------------------

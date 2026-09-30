@@ -25,6 +25,7 @@ set +o errexit    # диагностика не должна прерывать�
 
 PREFIX=""
 DATA_DIR=""
+SERVICE_NAME=""
 FIX=0
 ONLY=""
 PASSED=0
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix) PREFIX="${2:?}"; shift 2 ;;
     --data)   DATA_DIR="${2:?}"; shift 2 ;;
+    --name)   SERVICE_NAME="${2:?}"; shift 2 ;;
     --fix)    FIX=1; shift ;;
     --hardware) ONLY="hardware"; shift ;;
     --engines)  ONLY="engines"; shift ;;
@@ -45,22 +47,50 @@ while [[ $# -gt 0 ]]; do
 Диагностика ASR Hub
 
   bash scripts/doctor.sh [--fix] [--hardware|--engines|--network]
-                         [--prefix ПУТЬ] [--data ПУТЬ]
+                         [--prefix ПУТЬ] [--data ПУТЬ] [--name СЛУЖБА]
 
   --fix        Пытаться устранить найденные проблемы
   --hardware   Только оборудование и драйверы
   --engines    Только движки распознавания
   --network    Только сеть и доступность репозиториев
+  --prefix, --data, --name
+               Какую установку проверять (по умолчанию — ту, из которой
+               запущен сценарий)
 USAGE
       exit 0 ;;
-    *) shift ;;
+    # Незнакомый ключ — ошибка, а не пропуск: `--only hardware` из прежней
+    # документации молча запускал все проверки вместо одной.
+    *) error "Неизвестный параметр: $1"
+       hint "Справка: bash scripts/doctor.sh --help"
+       exit 2 ;;
   esac
 done
 
-[[ -z "${PREFIX}" ]] && for c in "/opt/asrhub" "${HOME}/.local/share/asrhub-app" \
-  "${HOME}/Library/Application Support/ASRHub"; do [[ -d "${c}" ]] && { PREFIX="${c}"; break; }; done
-[[ -z "${DATA_DIR}" ]] && for c in "/var/lib/asrhub" "${HOME}/.local/share/asrhub" \
-  "${HOME}/Library/Application Support/ASRHub/data"; do [[ -d "${c}" ]] && { DATA_DIR="${c}"; break; }; done
+# Какую установку проверять: ту, из которой запущен сценарий, — а не первую
+# из списка стандартных каталогов (на машине с двумя установками доктор
+# второй проверял первую).
+resolve_installation "${SCRIPT_DIR}"
+if [[ -n "${ASRHUB_INSTALLATIONS}" ]]; then
+  explain_ambiguous_installation
+  exit 2
+fi
+# Пользователь службы: права на каталоги и видеокарту проверяются от его
+# имени — от root «доступно» всё.
+SERVICE_USER_NAME=""
+if [[ -n "${SERVICE_NAME}" ]]; then
+  SERVICE_USER_NAME="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" user || true)"
+fi
+
+# Доступен ли путь на запись пользователю службы.
+writable_by_service() {
+  local path="$1"
+  if [[ -n "${SERVICE_USER_NAME}" && "${SERVICE_USER_NAME}" != "root" ]] && is_root \
+     && have runuser && id -u "${SERVICE_USER_NAME}" >/dev/null 2>&1; then
+    runuser -u "${SERVICE_USER_NAME}" -- test -w "${path}" 2>/dev/null
+  else
+    [[ -w "${path}" ]]
+  fi
+}
 
 # Выравнивание считаем по символам, а не по байтам: printf %-38s в bash
 # считает байты, и кириллица (два байта на символ) ломает колонки.
@@ -170,7 +200,7 @@ esac
 # случаях проверки выше зелёные, а распознавание стоит.
 if [[ -n "${PREFIX}" && -n "${DATA_DIR}" && -x "${PREFIX}/venv/bin/python" ]]; then
   if gpu_runtime_report "${PREFIX}/venv/bin/python" "${DATA_DIR}" \
-       "${PREFIX}/server" asrhub; then
+       "${PREFIX}/server" "${SERVICE_NAME:-asrhub}"; then
     PASSED=$((PASSED + 1))
   else
     FAILED=$((FAILED + 1))
@@ -199,12 +229,25 @@ fi
 
 if [[ -n "${DATA_DIR}" && -d "${DATA_DIR}" ]]; then
   check "Каталог данных" ok "${DATA_DIR}"
+  # Права — у пользователя службы, а не у запустившего доктора: от root
+  # доступно всё, и каталог, в который служба писать не может, объявлялся
+  # исправным. «--fix» создавал недостающее от root с правами 0750 — и
+  # служба теряла доступ к собственному каталогу окончательно.
   for sub in uploads results models logs tmp; do
-    if [[ -d "${DATA_DIR}/${sub}" && -w "${DATA_DIR}/${sub}" ]]; then
-      check "  ${sub}" ok "доступен на запись"
+    if [[ -d "${DATA_DIR}/${sub}" ]] && writable_by_service "${DATA_DIR}/${sub}"; then
+      check "  ${sub}" ok "доступен на запись${SERVICE_USER_NAME:+ пользователю ${SERVICE_USER_NAME}}"
     else
-      check "  ${sub}" fail "нет каталога или прав" "mkdir -p '${DATA_DIR}/${sub}' && chmod 750 '${DATA_DIR}/${sub}'"
-      [[ "${FIX}" -eq 1 ]] && mkdir -p "${DATA_DIR}/${sub}" 2>/dev/null && chmod 750 "${DATA_DIR}/${sub}" 2>/dev/null
+      FIX_CMD="mkdir -p '${DATA_DIR}/${sub}' && chmod 750 '${DATA_DIR}/${sub}'"
+      [[ -n "${SERVICE_USER_NAME}" && "${SERVICE_USER_NAME}" != "root" ]] && \
+        FIX_CMD="${FIX_CMD} && chown ${SERVICE_USER_NAME}: '${DATA_DIR}/${sub}'"
+      check "  ${sub}" fail "нет каталога или прав${SERVICE_USER_NAME:+ у пользователя ${SERVICE_USER_NAME}}" "${FIX_CMD}"
+      if [[ "${FIX}" -eq 1 ]]; then
+        mkdir -p "${DATA_DIR}/${sub}" 2>/dev/null && chmod 750 "${DATA_DIR}/${sub}" 2>/dev/null
+        if [[ -n "${SERVICE_USER_NAME}" && "${SERVICE_USER_NAME}" != "root" ]]; then
+          chown "${SERVICE_USER_NAME}:" "${DATA_DIR}/${sub}" 2>/dev/null \
+            || chown "${SERVICE_USER_NAME}" "${DATA_DIR}/${sub}" 2>/dev/null || true
+        fi
+      fi
     fi
   done
 else
@@ -223,20 +266,30 @@ if [[ -f "${DATA_DIR}/config.yaml" ]]; then
   check "Конфигурация" ok "${DATA_DIR}/config.yaml"
 else
   check "Конфигурация" warn "нет файла — используются значения по умолчанию" \
-    "Создать: '${PREFIX}/venv/bin/python' -m asrhub --print-config > '${DATA_DIR}/config.yaml'"
+    "Создать: cd '${PREFIX}/server' && '${PREFIX}/venv/bin/python' -m asrhub --print-config > '${DATA_DIR}/config.yaml'"
 fi
 
 if [[ -f "${DATA_DIR}/asrhub.db" ]]; then
   DB_SIZE="$(human_size "$(stat -c%s "${DATA_DIR}/asrhub.db" 2>/dev/null || stat -f%z "${DATA_DIR}/asrhub.db" 2>/dev/null || echo 0)")"
+  # Целостность спрашиваем у python из окружения, если нет sqlite3: модуль
+  # sqlite3 есть в любой сборке, а утилиты в Ubuntu по умолчанию нет — и
+  # проверка не выполнялась почти нигде.
+  DB_CHECK=""
   if have sqlite3; then
-    if sqlite3 "${DATA_DIR}/asrhub.db" "PRAGMA integrity_check" 2>/dev/null | grep -q '^ok$'; then
-      check "База заданий" ok "${DB_SIZE}, целостность в порядке"
-    else
-      check "База заданий" fail "нарушена целостность" \
-        "Восстановите из копии: ls ${DATA_DIR}/asrhub.db.bak.*"
-    fi
+    DB_CHECK="$(sqlite3 "${DATA_DIR}/asrhub.db" "PRAGMA quick_check" 2>/dev/null | head -1 || true)"
+  elif [[ -x "${PREFIX}/venv/bin/python" ]] || have python3; then
+    DB_PY="${PREFIX}/venv/bin/python"; [[ -x "${DB_PY}" ]] || DB_PY="python3"
+    DB_CHECK="$("${DB_PY}" -c 'import sqlite3,sys
+c=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True,timeout=5)
+print(c.execute("PRAGMA quick_check").fetchone()[0])' "${DATA_DIR}/asrhub.db" 2>/dev/null || true)"
+  fi
+  if [[ "${DB_CHECK}" == "ok" ]]; then
+    check "База заданий" ok "${DB_SIZE}, целостность в порядке"
+  elif [[ -n "${DB_CHECK}" ]]; then
+    check "База заданий" fail "нарушена целостность" \
+      "Восстановите из копии: bash '${PREFIX}/scripts/service.sh' restore --from ПУТЬ (копии: ls ${DATA_DIR}/asrhub.db.bak.* и ${DATA_DIR}/backups)"
   else
-    check "База заданий" ok "${DB_SIZE} (sqlite3 не установлен, целостность не проверена)"
+    check "База заданий" ok "${DB_SIZE} (целостность проверить нечем)"
   fi
 else
   check "База заданий" warn "не создана — будет создана при первом запуске"
@@ -289,7 +342,7 @@ if [[ -x "${PREFIX}/venv/bin/python" ]]; then
   # перехода в каталог сервера импорт падал, и весь раздел движков
   # объявлялся сломанным на исправной установке.
   ( cd "${PREFIX}/server" 2>/dev/null || cd "${SCRIPT_DIR}/../server" 2>/dev/null || exit 1
-    "${PREFIX}/venv/bin/python" - <<'PYEOF'
+    "${PREFIX}/venv/bin/python" - "${PREFIX}" <<'PYEOF'
 import sys
 sys.path.insert(0, ".")
 try:
@@ -305,7 +358,7 @@ for item in engine_status():
     detail = "установлен" if item["available"] else item["reason"][:70]
     print(f"  {mark} {name:<20} {detail}")
     if not item["available"] and item.get("requirements_file"):
-        print(f"      {grey}Установить: bash scripts/models.sh install-engine {name}{reset}")
+        print(f"      {grey}Установить: bash '{sys.argv[1]}/scripts/models.sh' install-engine {name}{reset}")
 PYEOF
   ) || check "Проверка движков" fail "не удалось выполнить" \
         "Проверьте, что каталог ${PREFIX}/server на месте и venv собран."
@@ -330,18 +383,21 @@ for host in pypi.org huggingface.co github.com; do
   fi
 done
 
-PORT="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null | awk '{print $2}' | head -1)"
-PORT="${PORT:-8080}"
+# Порт — у службы этой установки: `--port` в строке запуска юнита
+# перекрывает config.yaml, и проверка по файлу стучалась не туда.
+PORT="$(server_port_hint "${DATA_DIR}" "${PREFIX}" native "${SERVICE_NAME:-asrhub}")"
 if check_port_free "${PORT}"; then
   check "Порт ${PORT}" warn "свободен — сервер не запущен" \
-    "Запустить: bash scripts/service.sh start"
+    "Запустить: bash '${PREFIX:-.}/scripts/service.sh' start"
 else
-  if have curl && curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
-    VERSION="$(curl -fsS "http://127.0.0.1:${PORT}/api/health" 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+  if http_probe "http://127.0.0.1:${PORT}/api/health" 3 && [[ "${HTTP_BODY}" == *'"status"'* ]]; then
+    VERSION="$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<<"${HTTP_BODY}")"
     check "Сервер" ok "отвечает на порту ${PORT}, версия ${VERSION}"
   else
+    # У клиента нет и не было команды «config set», которую здесь
+    # советовали: порт меняется в config.yaml или ключом службы.
     check "Порт ${PORT}" fail "занят другой программой" \
-      "Освободите порт или смените: asrctl config set server_port 9000"
+      "Освободите порт или смените его: bash '${PREFIX:-.}/scripts/service.sh' install --port 9000"
   fi
 fi
 fi
@@ -362,7 +418,7 @@ STREAM_ENABLED="$(grep -E '^[[:space:]]*stream_enabled:' "${DATA_DIR}/config.yam
 STREAM_ENABLED="${STREAM_ENABLED:-true}"
 if [[ "${STREAM_ENABLED}" == "false" ]]; then
   check "Распознавание на лету" warn "выключено (stream_enabled: false)" \
-    "Раздел «Диктовка» и маршрут /api/stream отвечают отказом. Включить: asrctl config set stream_enabled true"
+    "Раздел «Диктовка» и маршрут /api/stream отвечают отказом. Включить: «Настройки» → «Потоковый режим» или stream_enabled: true в ${DATA_DIR}/config.yaml и перезапуск службы"
 elif have ffmpeg; then
   check "Распознавание на лету" ok "включено, ffmpeg на месте"
 else
@@ -405,9 +461,7 @@ PYEOF
 fi
 
 # Несколько экземпляров над одной базой: спрашиваем сам сервер.
-PORT_CAP="$(grep -E '^[[:space:]]*server_port:' "${DATA_DIR}/config.yaml" 2>/dev/null \
-            | awk '{print $2}' | head -1 || true)"
-PORT_CAP="${PORT_CAP:-8080}"
+PORT_CAP="$(server_port_hint "${DATA_DIR}" "${PREFIX}" native "${SERVICE_NAME:-asrhub}")"
 KEY_FILE="${DATA_DIR}/api-key.txt"
 if have curl && [[ -r "${KEY_FILE}" ]]; then
   # Ключ идёт в curl через --config со стандартного ввода, а не аргументом:
@@ -449,7 +503,7 @@ printf '  %s✓ пройдено: %d%s   %s! предупреждений: %d%s 
 
 if [[ ${FAILED} -gt 0 ]]; then
   printf '  %sЕсть критические проблемы — сервер может не работать.%s\n' "${C_RED}" "${C_RESET}"
-  printf '  Попробуйте автоматическое исправление: bash scripts/doctor.sh --fix\n\n'
+  printf "  Попробуйте автоматическое исправление: bash '%s/doctor.sh' --fix\n\n" "${SCRIPT_DIR}"
   exit 1
 elif [[ ${WARNED} -gt 0 ]]; then
   printf '  %sСервер работоспособен, но часть возможностей ограничена.%s\n\n' "${C_YELLOW}" "${C_RESET}"

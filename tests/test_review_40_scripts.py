@@ -58,6 +58,9 @@ def test_сценарии_windows_разбираются_как_их_прочт�
     сценарий = tmp_path / "разбор.ps1"
     сценарий.write_text(r'''
 param([string[]]$Paths)
+# `pwsh -File сценарий -Paths a b c` связывает с -Paths только «a», остальное
+# уходит в $args: без этой строки проверялся один файл из восьми.
+$Paths = @($Paths) + @($args)
 [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
 $bad = 0
 foreach ($path in $Paths) {
@@ -70,11 +73,13 @@ foreach ($path in $Paths) {
     if ($errors.Count) { $bad++; "ОШИБКИ $path : $($errors.Count) : $($errors[0].Message)" }
 }
 "ИТОГ $bad"
+"ФАЙЛОВ $($Paths.Count)"
 ''', encoding="utf-8")
     итог = subprocess.run([PWSH, "-NoProfile", "-File", str(сценарий), "-Paths",
                            *[str(п) for п in ФАЙЛЫ_PS]],
                           capture_output=True, text=True, timeout=120, check=False)
     assert "ИТОГ 0" in итог.stdout, итог.stdout + итог.stderr
+    assert f"ФАЙЛОВ {len(ФАЙЛЫ_PS)}" in итог.stdout, итог.stdout
 
 
 @нужен_pwsh
@@ -292,6 +297,10 @@ def test_сброс_конфигурации_только_отдельным_к�
 
 
 def test_значения_стоящей_службы_читаются_из_юнита_и_plist(tmp_path: Path):
+    # С захода 47 агент launchd у каждой службы свой (com.asrhub.<имя>, у
+    # службы по умолчанию — прежний com.asrhub.server), поэтому plist
+    # спрашивается по имени службы «asrhub»: её юнит здесь указывает на
+    # другой каталог, и значение берётся из plist.
     дом = tmp_path / "home"
     (дом / ".config" / "systemd" / "user").mkdir(parents=True)
     (дом / "Library" / "LaunchAgents").mkdir(parents=True)
@@ -315,7 +324,7 @@ def test_значения_стоящей_службы_читаются_из_юн
       printf 'host=%s\\n' "$(installed_service_value asrhub "/opt/asr hub" host)"
       printf 'user=%s\\n' "$(installed_service_value asrhub "/opt/asr hub" user)"
       printf 'чужой=%s\\n' "$(installed_service_value asrhub /opt/asrhub2 port || echo нет)"
-      printf 'plist=%s\\n' "$(installed_service_value nobody /Users/a/ASRHub port || echo нет)"
+      printf 'plist=%s\\n' "$(installed_service_value asrhub /Users/a/ASRHub port || echo нет)"
       printf 'yaml=%s\\n' "$(config_yaml_value "{конфиг}" server_port)"
       printf 'yamlhost=%s\\n' "$(config_yaml_value "{конфиг}" server_host)"
     ''', env={"HOME": str(дом)})

@@ -68,7 +68,12 @@ class FasterWhisperEngine(Engine):
         if ct_device == "cpu" and compute_type in ("float16", "int8_float16", "bfloat16"):
             compute_type = "int8"
 
-        name = _CT2_NAMES.get(self.spec.source, self.spec.source)
+        # Репозиторий — из той же таблицы, по которой ищутся веса на диске:
+        # загрузка здесь, в разделе «Модели» и в models.sh кладёт их в один
+        # и тот же каталог и находит одинаково.
+        from ..model_files import huggingface_repo
+
+        name = huggingface_repo(_CT2_NAMES.get(self.spec.source, self.spec.source))
         try:
             return WhisperModel(
                 name,

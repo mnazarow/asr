@@ -45,6 +45,7 @@ UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 URL=""
 KEY=""
+KEY_FILE_ARG=""
 AGENT_NAME=""
 SOURCE=""
 CDR_FILE=""
@@ -130,6 +131,8 @@ usage() {
   --url АДРЕС         адрес сервера ASR Hub (обязателен, если сервер не
                       подставил свой при выдаче файла)
   --key КЛЮЧ          ключ доступа с правом записи (начинается с ah_)
+  --key-file ФАЙЛ     ключ из файла: в командной строке он виден в `ps`
+                      любому пользователю станции и остаётся в истории
   --name ИМЯ          как станция будет называться в разделе «АТС»
                       (по умолчанию — имя хоста)
   --source ВИД        auto | cdr_csv | mysql | folder (по умолчанию auto)
@@ -158,11 +161,22 @@ need_value() {
   fi
 }
 
+read_key_file() {
+  [ -n "${KEY_FILE_ARG}" ] || return 0
+  [ -r "${KEY_FILE_ARG}" ] || die "Файл ключа ${KEY_FILE_ARG} не читается." \
+    "Проверьте путь и права: ls -l ${KEY_FILE_ARG}"
+  IFS= read -r KEY < "${KEY_FILE_ARG}" || true
+  KEY="$(printf '%s' "${KEY}" | tr -d ' \t\r')"
+  [ -n "${KEY}" ] || die "Файл ключа ${KEY_FILE_ARG} пуст." "Положите в него ключ одной строкой."
+}
+
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --url)         need_value "$1" $#; URL="$2"; shift 2 ;;
       --key)         need_value "$1" $#; KEY="$2"; shift 2 ;;
+      --key-file)    need_value "$1" $#; KEY_FILE_ARG="$2"; shift 2 ;;
+      --key-file=*)  KEY_FILE_ARG="${1#*=}"; shift ;;
       --name)        need_value "$1" $#; AGENT_NAME="$2"; shift 2 ;;
       --source)      need_value "$1" $#; SOURCE="$2"; shift 2 ;;
       --cdr-file)    need_value "$1" $#; CDR_FILE="$2"; shift 2 ;;
@@ -250,8 +264,10 @@ check_writable() {
 # программы видны каждому пользователю станции в `ps` и /proc/*/cmdline, и
 # ключ с правом записи утекал бы любому, кто зайдёт на станцию. Файл лежит
 # во временном каталоге установщика (mktemp -d — права 0700) и удаляется
-# вместе с ним. У GNU wget то же делает --config; у wget из busybox его нет,
-# и там ключ, увы, идёт аргументом — curl на станциях встречается чаще.
+# вместе с ним. У GNU wget то же делает --config. У wget из busybox его нет,
+# и прежде ключ уходил ему аргументом; теперь в этом случае качает python
+# (он у агента есть всегда), а ключ получает переменной окружения — её
+# видит только root.
 download() {
   local address="$1" dest="$2" code=""
   if have curl; then
@@ -263,18 +279,39 @@ download() {
     code="$(curl -sS --connect-timeout 10 --max-time 300 -K "${TMP_DIR}/curl.cfg" \
              -o "${dest}" -w '%{http_code}' "${address}" \
              2>"${TMP_DIR}/curl.err")" || true
-  else
-    local key_option="--header=X-API-Key: ${KEY}"
-    if wget --help 2>&1 | grep -q -- '--config'; then
-      ( umask 077; printf 'header = X-API-Key: %s\n' "${KEY}" >"${TMP_DIR}/wgetrc" )
-      key_option="--config=${TMP_DIR}/wgetrc"
-    fi
-    if wget -q --timeout=30 --tries=2 "${key_option}" \
+  elif wget --help 2>&1 | grep -q -- '--config'; then
+    ( umask 077; printf 'header = X-API-Key: %s\n' "${KEY}" >"${TMP_DIR}/wgetrc" )
+    if wget -q --timeout=30 --tries=2 "--config=${TMP_DIR}/wgetrc" \
             -O "${dest}" "${address}" 2>"${TMP_DIR}/wget.err"; then
       code="200"
     else
       code="000"
     fi
+  elif [ -n "${PYTHON_BIN}" ]; then
+    code="$(ASRHUB_AGENT_KEY="${KEY}" "${PYTHON_BIN}" - "${address}" "${dest}" \
+             2>"${TMP_DIR}/curl.err" <<'PYEOF' || true
+import os, sys
+try:
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+except ImportError:
+    print("000"); sys.exit(0)
+request = Request(sys.argv[1], headers={"X-API-Key": os.environ.get("ASRHUB_AGENT_KEY", "")})
+try:
+    response = urlopen(request, timeout=300)
+    with open(sys.argv[2], "wb") as target:
+        target.write(response.read())
+    print(response.getcode())
+except HTTPError as exc:
+    print(exc.code)
+except Exception as exc:
+    sys.stderr.write(str(exc))
+    print("000")
+PYEOF
+)"
+  else
+    die "Скачать агента нечем, не показывая ключ другим пользователям станции." \
+        "Поставьте curl: yum install -y curl (CentOS) или apt-get install -y curl."
   fi
   case "${code}" in
     ''|000*) code="000" ;;
@@ -674,6 +711,7 @@ print_summary() {
 
 main() {
   parse_args "$@"
+  read_key_file
   require_root
 
   if [ "${UNINSTALL}" -eq 1 ]; then
@@ -707,7 +745,7 @@ main() {
   if [ -z "${KEY}" ]; then
     die "Не задан ключ доступа." \
         "Заведите ключ с правом записи в разделе «Доступ» веб-интерфейса \
-и добавьте --key ah_…"
+и добавьте --key-file ФАЙЛ (или --key ah_…)"
   fi
 
   TMP_DIR="$(mktemp -d /tmp/asrhub-agent.XXXXXX)" || die \

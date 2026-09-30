@@ -872,7 +872,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:3530",
+  "instance": "vm:13411",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1460,7 +1460,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1790296009.5704074,
+    "generated_at": 1790730211.570227,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1627,8 +1627,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.18",
-  "uptime_s": 210.2,
+  "version": "3.1.19",
+  "uptime_s": 12.3,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1706,17 +1706,17 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.18",
-  "uptime_s": 210.3,
+  "version": "3.1.19",
+  "uptime_s": 12.3,
   "hardware": {
     "os_name": "Linux",
-    "os_version": "6.18.44-fc-v37",
+    "os_version": "6.18.44-fc-v50",
     "arch": "x86_64",
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.6,
+    "ram_available_gb": 7.2,
     "disk_free_gb": 14.6,
     "gpus": [],
     "accelerator": "cpu",
@@ -2629,9 +2629,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
     "total_gb": 7.8,
-    "free_gb": 6.6,
+    "free_gb": 7.2,
     "reserve_gb": 4.0,
-    "budget_gb": 2.6,
+    "budget_gb": 3.0,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -4167,14 +4167,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 210.3,
+  "uptime_s": 12.4,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 210 с",
+        "detail": "работает 12 с",
         "hint": ""
       },
       {

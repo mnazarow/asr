@@ -1432,16 +1432,17 @@ def test_missing_git_is_named_before_the_engine_step(repo_root: Path, tmp_path: 
     """
     block = _preflight_block(
         repo_root, r'(if \[\[ "\$\{MODE\}" == "native" && "\$\{OFFLINE\}" -eq 0 \]\]; then\n'
-                   r'  _needs_git=.*?\n  unset _needs_git _engine _engine_list _nodeps\nfi\n)')
+                   r'  _needs_git=.*?\n  unset _needs_git _engine _engine_list _nodeps _main\nfi\n)')
     common = repo_root / "scripts" / "lib" / "common.sh"
 
-    def probe(*, git_present: bool, install_works: bool) -> tuple[int, str]:
+    def probe(*, git_present: bool, install_works: bool,
+              engines: str = "faster_whisper,gigaam") -> tuple[int, str]:
         script = f'''
           set -Eeuo pipefail
           source "{common}"
           MODE=native
           OFFLINE=0
-          ENGINES="faster_whisper,gigaam"
+          ENGINES="{engines}"
           REPO_DIR="{repo_root}"
           have() {{ [[ "$1" == "git" ]] && return {0 if git_present else 1}; command -v "$1" >/dev/null 2>&1; }}
           install_system_packages() {{ return {0 if install_works else 1}; }}
@@ -1466,6 +1467,12 @@ def test_missing_git_is_named_before_the_engine_step(repo_root: Path, tmp_path: 
     assert code == 127, text
     assert "ДОШЛИ_ДО_КОНЦА" not in text
     assert "apt install git" in text
+
+    # Заход 47: у tone и moonshine строка «пакет @ git+https://…» в основном
+    # файле, а не в спутнике no-deps, — их проверка не замечала.
+    for движок in ("tone", "moonshine"):
+        code, text = probe(git_present=False, install_works=False, engines=движок)
+        assert code == 127 and движок in text, text
 
 
 def test_directory_that_cannot_run_programs_is_refused(repo_root: Path,
@@ -1516,51 +1523,59 @@ def test_removing_an_engine_also_removes_the_package_itself(repo_root: Path,
     """`remove-engine` снимал зависимости, а сам движок оставлял.
 
     Пакет, поставленный из репозитория, перечислен только в файле-спутнике,
-    и список к удалению собирался мимо него. Заодно `grep -v` возвращает
-    единицу, когда отбросил все строки, — на файле из одних комментариев
-    скрипт умирал бы под errexit молча, ничего не удалив.
+    и список к удалению собирался мимо него. Файл из одних комментариев не
+    должен ронять сценарий. С захода 47 проверка идёт настоящим models.sh
+    над копией дерева с поддельным pip: список к удалению теперь ещё и
+    вычитает пакеты, нужные серверу и другим движкам, — фрагментом кода
+    это уже не проверить.
     """
-    source = (repo_root / "scripts" / "models.sh").read_text(encoding="utf-8")
-    block = re.search(r'(  NODEPS="\$\(dirname "\$\{REQ\}"\)/no-deps/.*?\|\| true\)"\n)',
-                      source, re.S)
-    assert block, "не найдена сборка списка пакетов"
-
-    engines = tmp_path / "engines"
+    prog = tmp_path / "prog"
+    shutil.copytree(repo_root / "scripts", prog / "scripts")
+    engines = prog / "requirements" / "engines"
     (engines / "no-deps").mkdir(parents=True)
+    (engines / "optional").mkdir()
+    (prog / "requirements" / "base.txt").write_text("общий>=1\n", encoding="utf-8")
     (engines / "движок.txt").write_text(
-        "# комментарий\nхydra-core>=1.3,<2\nчисла>=2\n", encoding="utf-8")
+        "# комментарий\nхydra-core>=1.3,<2\nчисла>=2\nобщий>=1\n", encoding="utf-8")
     (engines / "no-deps" / "движок.txt").write_text(
         "# спутник\nсам-движок @ git+https://example.invalid/пакет.git\n", encoding="utf-8")
-
-    def packages(req: Path) -> tuple[int, str]:
-        script = f'''
-          set -Eeuo pipefail
-          REQ="{req}"
-{block.group(1)}
-          printf '%s\\n' "${{PACKAGES}}"
-        '''
-        result = run_bash(script)
-        return result.returncode, result.stdout.strip()
-
     # Необязательная часть ставится вместе с движком — значит и снимается
     # вместе с ним, иначе её пакеты остаются в окружении насовсем.
-    (engines / "optional").mkdir()
     (engines / "optional" / "движок.txt").write_text("# лишнее\nтяжёлый>=2\n",
                                                      encoding="utf-8")
-
-    code, out = packages(engines / "движок.txt")
-    assert code == 0, "сборка списка оборвалась"
-    assert "тяжёлый" in out, "необязательная часть остаётся в окружении после удаления"
-    assert "сам-движок" in out, "движок из репозитория не попал в список"
-    assert "git+" not in out, "в список попал адрес репозитория"
-    assert "хydra-core" in out and ">=" not in out
-
-    # Файл из одних комментариев не должен ронять скрипт.
     (engines / "пустой.txt").write_text("# ничего\n", encoding="utf-8")
-    code, out = packages(engines / "пустой.txt")
-    assert code == 0, "файл из одних комментариев оборвал скрипт"
-    assert out == ""
+    (prog / "VERSION").write_text("0.0.0\n", encoding="utf-8")
+    (prog / "venv" / "bin").mkdir(parents=True)
+    log = tmp_path / "pip.log"
+    pip = prog / "venv" / "bin" / "pip"
+    pip.write_text(f'''#!/bin/bash
+echo "pip $*" >> "{log}"
+case "$1" in check) echo "No broken requirements found." ;; esac
+exit 0
+''', encoding="utf-8")
+    pip.chmod(0o755)
 
+    def remove(engine: str):
+        log.write_text("", encoding="utf-8")
+        result = run_bash(f'bash "{prog}/scripts/models.sh" remove-engine {engine} '
+                          f'--prefix "{prog}" --data "{tmp_path / "data"}" --yes',
+                          env={"HOME": str(tmp_path)})
+        removed = [line for line in log.read_text(encoding="utf-8").splitlines()
+                   if line.startswith("pip uninstall") and "optimum" not in line]
+        return result, " ".join(removed)
+
+    result, removed = remove("движок")
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+    assert "тяжёлый" in removed, "необязательная часть остаётся в окружении после удаления"
+    assert "сам-движок" in removed, "движок из репозитория не попал в список"
+    assert "git+" not in removed, "в список попал адрес репозитория"
+    assert "хydra-core" in removed and ">=" not in removed
+    assert "общий" not in removed, "снят пакет, который нужен серверу (base.txt)"
+
+    # Файл из одних комментариев не должен ронять сценарий.
+    result, removed = remove("пустой")
+    assert result.returncode == 0, "файл из одних комментариев оборвал сценарий"
+    assert removed == ""
 
 def _поддельное_окружение(корень: Path, проверка: str, код: int = 1) -> Path:
     """Каталог, похожий на установленный ASR Hub, с pip-заглушкой."""

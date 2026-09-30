@@ -17,12 +17,18 @@ setup_logging "${TMPDIR:-/tmp}"
 
 ACTION="${1:-status}"; shift || true
 
-PREFIX="/opt/asrhub"
-DATA_DIR="/var/lib/asrhub"
-PORT="8080"
-HOST="0.0.0.0"
+# Каталоги, адрес, порт и имя по умолчанию не зашиты: их знает сама
+# установка (метка .asrhub-install и стоящая служба). Раньше здесь стояли
+# /opt/asrhub, /var/lib/asrhub и 0.0.0.0, и документированная команда смены
+# порта `service.sh install --port 8081` на установке с другими каталогами
+# переписывала юнит на чужую программу, пустой каталог данных (новая база,
+# новый ключ) и открывала сервер в сеть.
+PREFIX=""
+DATA_DIR=""
+PORT=""
+HOST=""
 SERVICE_USER=""
-SERVICE_NAME="asrhub"
+SERVICE_NAME=""
 FOLLOW=0
 LINES=100
 RESTORE_FROM=""
@@ -57,9 +63,56 @@ asrhub_python() {
 }
 
 OS="$(detect_os)"
-PLIST="${HOME}/Library/LaunchAgents/com.asrhub.server.plist"
-UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
-USER_UNIT="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
+
+resolve_installation "${SCRIPT_DIR}"
+if [[ -n "${ASRHUB_INSTALLATIONS}" ]]; then
+  explain_ambiguous_installation
+  exit 2
+fi
+if [[ "${ACTION}" == "install" ]]; then
+  if [[ -z "${PREFIX}" ]]; then
+    case "${OS}" in
+      macos) PREFIX="${HOME}/Library/Application Support/ASRHub" ;;
+      *) if is_root; then PREFIX="/opt/asrhub"; else PREFIX="${HOME}/.local/share/asrhub-app"; fi ;;
+    esac
+  fi
+  if [[ -z "${DATA_DIR}" ]]; then
+    case "${OS}" in
+      macos) DATA_DIR="${HOME}/Library/Application Support/ASRHub/data" ;;
+      *) if is_root; then DATA_DIR="/var/lib/asrhub"; else DATA_DIR="${HOME}/.local/share/asrhub"; fi ;;
+    esac
+  fi
+  SERVICE_NAME="${SERVICE_NAME:-asrhub}"
+  # Адрес и порт, не заданные ключами, — у стоящей службы этой установки,
+  # потом из config.yaml, и только потом умолчания.
+  [[ -z "${HOST}" ]] && HOST="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" host || true)"
+  [[ -z "${HOST}" ]] && HOST="$(config_yaml_value "${DATA_DIR}/config.yaml" server_host || true)"
+  [[ -z "${PORT}" ]] && PORT="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" port || true)"
+  [[ -z "${PORT}" ]] && PORT="$(config_yaml_value "${DATA_DIR}/config.yaml" server_port || true)"
+  HOST="${HOST:-0.0.0.0}"
+  PORT="${PORT:-${ASRHUB_DEFAULT_PORT}}"
+elif [[ -z "${SERVICE_NAME}" ]]; then
+  # Установка нашлась, а службы у неё нет (--no-service): «asrhub» по
+  # умолчанию здесь было бы чужой службой — остановка и удаление
+  # доставались бы первой установке.
+  if [[ -n "${PREFIX}" ]] && is_installation "${PREFIX}" \
+     && [[ "${ACTION}" =~ ^(start|stop|restart|status|logs|uninstall)$ ]]; then
+    error "У установки ${PREFIX} нет службы автозапуска."
+    hint "Создать: bash '${PREFIX}/scripts/service.sh' install"
+    hint "Или укажите имя чужой службы явно: --name ИМЯ"
+    exit 1
+  fi
+  SERVICE_NAME="asrhub"
+fi
+PREFIX="${PREFIX:-/opt/asrhub}"
+DATA_DIR="${DATA_DIR:-/var/lib/asrhub}"
+PORT="${PORT:-${ASRHUB_DEFAULT_PORT}}"
+HOST="${HOST:-0.0.0.0}"
+
+PLIST_LABEL="$(plist_label_for "${SERVICE_NAME}")"
+PLIST="$(plist_path_for "${SERVICE_NAME}")"
+UNIT="${ASRHUB_SYSTEMD_DIR:-/etc/systemd/system}/${SERVICE_NAME}.service"
+USER_UNIT="${ASRHUB_SYSTEMD_USER_DIR:-${HOME}/.config/systemd/user}/${SERVICE_NAME}.service"
 
 use_user_systemd() { [[ ! -w /etc/systemd/system ]] && ! is_root; }
 
@@ -242,7 +295,7 @@ install_launchd() {
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.asrhub.server</string>
+  <key>Label</key><string>${PLIST_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
     <string>${PREFIX}/venv/bin/python</string>
@@ -365,9 +418,9 @@ case "${ACTION}" in
       # WAS_RUNNING этим же вызовом и не поднимал сервер после обновления,
       # оставляя его на старом коде.
       if [[ "$(set +o pipefail; launchctl list 2>/dev/null \
-               | grep -c com.asrhub.server || true)" -gt 0 ]]; then
+               | grep -cF -- "${PLIST_LABEL}" || true)" -gt 0 ]]; then
         ok "Служба запущена"
-        launchctl list com.asrhub.server 2>/dev/null | head -12
+        launchctl list "${PLIST_LABEL}" 2>/dev/null | head -12
       else
         warn "Служба не запущена"; exit 1
       fi
@@ -394,6 +447,12 @@ case "${ACTION}" in
     # база работает в режиме WAL, рядом лежат -wal и -shm, и обычная копия
     # получается несогласованной — выглядит как копия и ею не является.
     py="$(asrhub_python)" || { error "Не найден интерпретатор ASR Hub."; exit 1; }
+    # Пакет asrhub лежит в server, а не в окружении: без PYTHONPATH копия
+    # делалась только из этого каталога, из любого другого — «No module named
+    # 'asrhub'». PYTHONPATH вызывающего не добавляется: служба работает без
+    # него, и копию должен снимать пакет этой установки, а не другой версии,
+    # случайно лежащий в окружении того, кто запустил сценарий.
+    PYTHONPATH="${PREFIX}/server" \
     ASRHUB_DATA_DIR="${DATA_DIR}" "${py}" - <<'PYCODE' || exit 1
 from pathlib import Path
 
@@ -424,12 +483,25 @@ PYCODE
     # Восстановление на работающем сервере затрёт базу под ним, и он
     # продолжит писать в файл, которого больше нет. Останавливаем сами: это
     # не тот случай, где предупреждения достаточно.
+    # Интерпретатор и пакет — до остановки службы. Раньше восстановление
+    # сначала гасило службу, а потом падало на «No module named 'asrhub'»
+    # (запуск не из каталога server): служба стояла, база не восстановлена.
+    # Только каталог установки, без PYTHONPATH вызывающего: иначе пакет из
+    # чужого окружения прикрывал сломанную установку, проверка проходила, и
+    # служба снова гасилась впустую.
+    py="$(asrhub_python)" || { error "Не найден интерпретатор ASR Hub."; exit 1; }
+    if ! PYTHONPATH="${PREFIX}/server" \
+         "${py}" -c 'import asrhub.maintenance' >/dev/null 2>&1; then
+      error "Пакет asrhub не загружается из ${PREFIX}/server — восстановление отменено, служба не тронута."
+      hint "Проверка окружения: bash '${PREFIX}/scripts/doctor.sh'"
+      exit 1
+    fi
     warn "Служба будет остановлена на время восстановления."
     # Своя служба — по имени: без --name останавливалась служба «asrhub»,
     # то есть у второй установки чужая, а своя продолжала писать в базу,
     # которую сейчас подменят.
-    bash "${BASH_SOURCE[0]}" stop --data "${DATA_DIR}" --name "${SERVICE_NAME}" \
-      >/dev/null 2>&1 || true
+    bash "${BASH_SOURCE[0]}" stop --prefix "${PREFIX}" --data "${DATA_DIR}" \
+      --name "${SERVICE_NAME}" >/dev/null 2>&1 || true
     if [[ "${OS}" != "macos" ]] && have systemctl \
        && { systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null \
             || systemctl --user is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; }; then
@@ -437,8 +509,17 @@ PYCODE
       hint "Остановите её вручную: sudo systemctl stop ${SERVICE_NAME} — и повторите."
       exit 1
     fi
-    py="$(asrhub_python)" || { error "Не найден интерпретатор ASR Hub."; exit 1; }
-    ASRHUB_DATA_DIR="${DATA_DIR}" ASRHUB_RESTORE_FROM="${RESTORE_FROM}"       "${py}" - <<'PYCODE' || exit 1
+    # На macOS проверка та же — агент launchd по своей метке.
+    if [[ "${OS}" == "macos" ]] && have launchctl \
+       && [[ "$(set +o pipefail; launchctl list 2>/dev/null \
+                | grep -cF -- "${PLIST_LABEL}" || true)" -gt 0 ]]; then
+      error "Служба ${PLIST_LABEL} не остановилась — восстановление отменено."
+      hint "Остановите её вручную: launchctl unload '${PLIST}' — и повторите."
+      exit 1
+    fi
+    PYTHONPATH="${PREFIX}/server" \
+    ASRHUB_DATA_DIR="${DATA_DIR}" ASRHUB_RESTORE_FROM="${RESTORE_FROM}" \
+      "${py}" - <<'PYCODE' || exit 1
 import os
 from pathlib import Path
 
@@ -457,7 +538,7 @@ if прежняя:
     print(f"Прежняя база сохранена рядом: {прежняя} (вместе со своим журналом) — "
           "удалите её, когда убедитесь, что всё на месте.")
 PYCODE
-    ok "Восстановление завершено. Запустите службу: bash scripts/service.sh start" ;;
+    ok "Восстановление завершено. Запустите службу: bash '${SCRIPT_DIR}/service.sh' start" ;;
 
   *)
     cat <<'USAGE'

@@ -81,17 +81,25 @@ enable_error_handling
 setup_logging "${TMPDIR:-/tmp}"
 print_banner
 
-[[ -z "${PREFIX}" ]] && for c in "/opt/asrhub" "${HOME}/.local/share/asrhub-app" \
-  "${HOME}/Library/Application Support/ASRHub"; do [[ -d "${c}" ]] && { PREFIX="${c}"; break; }; done
-[[ -z "${DATA_DIR}" ]] && for c in "/var/lib/asrhub" "${HOME}/.local/share/asrhub" \
-  "${HOME}/Library/Application Support/ASRHub/data"; do [[ -d "${c}" ]] && { DATA_DIR="${c}"; break; }; done
+# Какую установку обновлять. Раньше — первую из списка стандартных
+# каталогов: `bash /opt/asrhub2/scripts/update.sh` копировал код второй
+# установки поверх первой и перезапускал первую. Теперь — ту, из которой
+# запущен сценарий; из распакованного дистрибутива — единственную на
+# машине, а если их несколько, спрашиваем --prefix.
+resolve_installation "${SCRIPT_DIR}"
+if [[ -n "${ASRHUB_INSTALLATIONS}" ]]; then
+  explain_ambiguous_installation
+  exit 2
+fi
 
 [[ -z "${PREFIX}" ]] && { error "Установка не найдена. Укажите --prefix."; exit 2; }
+[[ -z "${DATA_DIR}" ]] && { error "Каталог данных установки ${PREFIX} не найден. Укажите --data."; exit 2; }
 
-# Имя службы ИМЕННО ЭТОЙ установки. Раньше здесь ничего не определялось, и
-# все вызовы service.sh шли с именем по умолчанию: обновление второй
-# установки останавливало и запускало службу первой.
-[[ -z "${SERVICE_NAME}" ]] && SERVICE_NAME="$(service_name_for "${PREFIX}")"
+# Имя службы ИМЕННО ЭТОЙ установки (из метки или её юнита). Пусто — службы
+# у установки нет, и чужую («asrhub» по умолчанию) обновление не трогает.
+if [[ -z "${SERVICE_NAME}" ]]; then
+  SERVICE_NAME="$(service_name_for "${PREFIX}" || true)"
+fi
 
 VENV="${PREFIX}/venv"
 # Разбору внутри библиотеки нужны и pip, и каталог требований: по спутникам
@@ -129,16 +137,30 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
       exit 2
     fi
   fi
-  info "Снимок от $(date -r "${SNAPSHOT_DIR}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+  info "Снимок от $(date -r "${SNAPSHOT_DIR}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?'), версия $(cat "${SNAPSHOT_DIR}/VERSION" 2>/dev/null || echo '?')"
   confirm "Восстановить предыдущую версию?" || exit 0
-  bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" --name "${SERVICE_NAME}" 2>/dev/null || true
-  # Только поверх: в снимке лежит код, а --delete снёс бы venv, а на macOS
-  # ещё и каталог данных внутри prefix.
+  acquire_install_lock "${PREFIX}" || exit 1
+  [[ -n "${SERVICE_NAME}" ]] && { bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" \
+    --data "${DATA_DIR}" --name "${SERVICE_NAME}" 2>/dev/null || true; }
+  # Каталог за каталогом, как при обновлении: копия поверх (`cp -a снимок/.`)
+  # оставляла файлы новой версии, которых в прежней не было, — модули,
+  # которые прежний код не ждёт. venv и данные в снимок не входят и не
+  # трогаются.
+  for item in server scripts config requirements docker examples VERSION README.md; do
+    [[ -e "${SNAPSHOT_DIR}/${item}" ]] || continue
+    if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+      printf '  [пробный запуск] %s ← снимок\n' "${PREFIX}/${item}"
+      continue
+    fi
+    staged="${PREFIX:?}/.${item}.rollback"
+    rm -rf "${staged}"
+    cp -a "${SNAPSHOT_DIR}/${item}" "${staged}" || { rm -rf "${staged}"; error "Не удалось вернуть ${item}."; exit 1; }
+    rm -rf "${PREFIX:?}/${item}"
+    mv "${staged}" "${PREFIX:?}/${item}"
+  done
   # Файл конфигурации лежит не в prefix, поэтому переносится отдельно — и
   # только если он в снимке есть. Нынешний не выбрасываем: человек мог
   # успеть поправить в нём что-то нужное.
-  run cp -a "${SNAPSHOT_DIR}/." "${PREFIX}/"
-  rm -f "${PREFIX}/config.yaml.snapshot" 2>/dev/null || true
   if [[ -f "${SNAPSHOT_DIR}/config.yaml.snapshot" ]]; then
     if [[ -f "${DATA_DIR}/config.yaml" ]] \
        && ! cmp -s "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"; then
@@ -149,8 +171,18 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
     run cp -a "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"
     ok "Конфигурация возвращена к виду до обновления"
   fi
-  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" --name "${SERVICE_NAME}" 2>/dev/null || true
+  [[ -n "${SERVICE_NAME}" ]] && { bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" \
+    --data "${DATA_DIR}" --name "${SERVICE_NAME}" 2>/dev/null || true; }
   ok "Откат выполнен: версия $(cat "${PREFIX}/VERSION" 2>/dev/null || echo '?')"
+  # Зависимости и база в снимок не входят: пакеты новой версии остаются в
+  # окружении, база — в том виде, в каком её оставила новая версия.
+  hint "Пакеты окружения остались от новой версии. Вернуть прежние:"
+  hint "  '${VPIP}' install -r '${PREFIX}/requirements/base.txt'"
+  LAST_DB_COPY="$(ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | head -1 || true)"
+  if [[ -n "${LAST_DB_COPY}" ]]; then
+    hint "База — в том виде, в каком её оставила новая версия. Копия до обновления:"
+    hint "  bash '${PREFIX}/scripts/service.sh' restore --from '${LAST_DB_COPY}'"
+  fi
   exit 0
 fi
 
@@ -199,7 +231,7 @@ else
   printf '\n'
   GPU_CODE_DIR="${SOURCE_DIR}/server"
   [[ -d "${GPU_CODE_DIR}" ]] || GPU_CODE_DIR="${PREFIX}/server"
-  gpu_runtime_report "${VPY}" "${DATA_DIR}" "${GPU_CODE_DIR}" asrhub || GPU_RC=$?
+  gpu_runtime_report "${VPY}" "${DATA_DIR}" "${GPU_CODE_DIR}" "${SERVICE_NAME:-asrhub}" || GPU_RC=$?
 fi
 
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then
@@ -219,13 +251,36 @@ if [[ "${GPU_RC}" -ne 0 ]]; then
   confirm "Обновиться всё равно?" n || { info "Отменено. Сначала карта."; exit 1; }
 fi
 
+# Понижение версии — не обновление: новая схема базы прежнему коду может
+# быть незнакома. Спрашиваем с умолчанием «нет».
+if [[ "${ENGINES_ONLY}" -eq 0 && "${CURRENT_VERSION}" =~ ^[0-9.]+$ && "${NEW_VERSION}" =~ ^[0-9.]+$ ]] \
+   && version_gt "${CURRENT_VERSION}" "${NEW_VERSION}"; then
+  warn "Источник старше установки: ${NEW_VERSION} < ${CURRENT_VERSION}."
+  hint "Вернуться к версии до обновления надёжнее откатом: bash '${PREFIX}/scripts/update.sh' --rollback"
+  confirm "Всё равно поставить более старую версию?" n || { info "Отменено."; exit 0; }
+fi
+
 confirm "Выполнить обновление?" || { info "Отменено."; exit 0; }
+
+# Два обновления (или обновление и удаление) одновременно портят друг
+# другу снимок и промежуточные каталоги — тот же замок, что у установщика.
+acquire_install_lock "${PREFIX}" || exit 1
 
 # --- Снимок -----------------------------------------------------------------
 
 set_step_total 6
 step "Снимок текущей версии"
-if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+# Повторный запуск той же версии — после неудачного обновления или ради
+# зависимостей — снимок не трогает. Раньше он переснимался всегда, и
+# второй запуск заменял рабочий снимок прежней версии копией той самой
+# сломанной, к которой откатываться бессмысленно.
+KEEP_SNAPSHOT=0
+if [[ "${CURRENT_VERSION}" == "${NEW_VERSION}" && -f "${SNAPSHOT_DIR}/VERSION" ]] \
+   && [[ "$(cat "${SNAPSHOT_DIR}/VERSION" 2>/dev/null)" != "${CURRENT_VERSION}" ]]; then
+  KEEP_SNAPSHOT=1
+  info "Версия не меняется — снимок версии $(cat "${SNAPSHOT_DIR}/VERSION") оставлен для отката."
+fi
+if [[ "${ASRHUB_DRY_RUN}" != "1" && "${KEEP_SNAPSHOT}" -eq 0 ]]; then
   rm -rf "${SNAPSHOT_DIR}"
   mkdir -p "${SNAPSHOT_DIR}"
   # README.md попадает в снимок: обновление его заменяет, а откат без него
@@ -243,7 +298,7 @@ if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
   [[ -f "${DATA_DIR}/config.yaml" ]] \
     && cp -a "${DATA_DIR}/config.yaml" "${SNAPSHOT_DIR}/config.yaml.snapshot"
   ok "Снимок: ${SNAPSHOT_DIR}"
-  hint "Откат при проблемах: bash scripts/update.sh --rollback"
+  hint "Откат при проблемах: bash '${PREFIX}/scripts/update.sh' --rollback"
 fi
 
 # --- База данных ------------------------------------------------------------
@@ -260,35 +315,33 @@ if [[ -n "${OTHERS}" ]]; then
   confirm "Продолжить обновление?" "y" || { info "Отменено."; exit 0; }
 fi
 
-step "Резервная копия базы"
-if [[ -f "${DATA_DIR}/asrhub.db" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
-  DB_BACKUP="${DATA_DIR}/asrhub.db.bak.$(date +%Y%m%d-%H%M%S)"
-  if have sqlite3; then
-    run sqlite3 "${DATA_DIR}/asrhub.db" ".backup '${DB_BACKUP}'" || cp -a "${DATA_DIR}/asrhub.db" "${DB_BACKUP}"
-  else
-    cp -a "${DATA_DIR}/asrhub.db" "${DB_BACKUP}"
-  fi
-  ok "Копия базы: $(basename "${DB_BACKUP}") ($(human_size "$(stat -c%s "${DB_BACKUP}" 2>/dev/null || stat -f%z "${DB_BACKUP}" 2>/dev/null || echo 0)"))"
-  # Держим не больше пяти копий
-  ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | tail -n +6 | while read -r old_backup; do
-    rm -f "${old_backup}"
-  done
-fi
-
 # --- Режим установки --------------------------------------------------------
 
 # Установка в контейнере обновляется иначе: файлы в образе, а не в системе,
 # и без пересборки образа новая версия просто не попадала в работу — команда
 # отрабатывала «успешно», а сервер продолжал крутить старый код.
 DOCKER_MODE=0
-# Признак — .env, который пишет только установка в контейнере, или живой
-# контейнер. Файл docker-compose.yml лежит в любой копии исходников, поэтому
-# по нему нельзя судить ни о чём: нативная установка со сломанным venv
-# принималась за докерную, зависимости молча не обновлялись, а дальше шла
-# пересборка образа на машине, где docker никогда не использовали.
-if [[ -f "${PREFIX}/docker/.env" ]] && have docker; then
+# Признак — метка установки (режим пишет установщик), без неё — .env,
+# который пишет только установка в контейнере, и последним — живой
+# контейнер у установки без окружения Python. Файл docker-compose.yml лежит
+# в любой копии исходников, поэтому по нему нельзя судить ни о чём:
+# нативная установка со сломанным venv принималась за докерную. А живой
+# контейнер «asrhub» сам по себе — ещё не наша установка: обычная установка
+# на машине, где кто-то держит такой контейнер, обновлялась пересборкой
+# чужого образа.
+MARKER_MODE="$(install_marker_value "${PREFIX}" mode || true)"
+if [[ "${MARKER_MODE}" == "docker" ]]; then
+  if ! have docker; then
+    error "Установка в контейнере, а docker не найден."
+    hint "Поставьте Docker или запустите обновление там, где он есть."
+    exit 1
+  fi
   DOCKER_MODE=1
-elif have docker && [[ "$(set +o pipefail; \
+elif [[ "${MARKER_MODE}" == "native" ]]; then
+  DOCKER_MODE=0
+elif [[ -f "${PREFIX}/docker/.env" ]] && have docker; then
+  DOCKER_MODE=1
+elif have docker && [[ ! -e "${PREFIX}/venv" ]] && [[ "$(set +o pipefail; \
        docker ps --filter "name=^asrhub$" --format '{{.Names}}' 2>/dev/null \
        | grep -c asrhub || true)" -gt 0 ]]; then
   DOCKER_MODE=1
@@ -316,12 +369,41 @@ if [[ "${DOCKER_MODE}" -eq 1 ]]; then
   fi
   info "Установка в контейнере: остановка произойдёт при пересборке."
   ok "Готово"
+elif [[ -z "${SERVICE_NAME}" ]]; then
+  info "Службы автозапуска у этой установки нет — сервер, запущенный вручную, перезапустите сами."
+  ok "Готово"
 else
-  if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" --name "${SERVICE_NAME}" >/dev/null 2>&1; then
+  if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" --data "${DATA_DIR}" \
+       --name "${SERVICE_NAME}" >/dev/null 2>&1; then
     WAS_RUNNING=1
-    bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" --name "${SERVICE_NAME}" || warn "Не удалось остановить службу."
+    bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" --data "${DATA_DIR}" \
+      --name "${SERVICE_NAME}" || warn "Не удалось остановить службу."
   fi
   ok "Служба остановлена"
+fi
+
+# Копия базы — после остановки и командой копирования SQLite: копия
+# работающей базы в режиме WAL теряет то, что лежит только в журнале, а
+# sqlite3 из командной строки стоит далеко не везде — без него делался cp.
+step "Резервная копия базы"
+if [[ -f "${DATA_DIR}/asrhub.db" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+  DB_BACKUP="${DATA_DIR}/asrhub.db.bak.$(date +%Y%m%d-%H%M%S)"
+  if sqlite_backup "${DATA_DIR}/asrhub.db" "${DB_BACKUP}" "${VPY}"; then
+    # Владелец копии — тот же, что у базы: служба её читает при restore.
+    chown "$(stat -c '%u:%g' "${DATA_DIR}/asrhub.db" 2>/dev/null \
+             || stat -f '%u:%g' "${DATA_DIR}/asrhub.db" 2>/dev/null || echo "$(id -u):$(id -g)")" \
+      "${DB_BACKUP}" 2>/dev/null || true
+    ok "Копия базы: $(basename "${DB_BACKUP}") ($(human_size "$(stat -c%s "${DB_BACKUP}" 2>/dev/null || stat -f%z "${DB_BACKUP}" 2>/dev/null || echo 0)"))"
+  else
+    error "Копию базы сделать не удалось — обновление остановлено, файлы не тронуты."
+    [[ "${WAS_RUNNING}" -eq 1 ]] && bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" \
+      --data "${DATA_DIR}" --name "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  # Держим не больше пяти копий
+  ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | tail -n +6 | while read -r old_backup; do
+    rm -f "${old_backup}"
+  done
 fi
 
 # --- Файлы ------------------------------------------------------------------
@@ -447,7 +529,13 @@ fi
 # действует». Ни при каких ответах не прерываем обновление: это сведения, а
 # не преграда.
 if [[ "${DOCKER_MODE}" -eq 0 && -x "${VPY}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
-  CFG_OUT="$(ASRHUB_DATA_DIR="${DATA_DIR}" "${VPY}" -m asrhub --check-config 2>&1 || true)"
+  # Пакет asrhub лежит в server: без PYTHONPATH проверка из любого другого
+  # каталога падала на «No module named 'asrhub'», и `|| true` прятало это —
+  # проверка конфигурации молча не выполнялась никогда. Только каталог
+  # установки: о файле должна судить новая версия, а не пакет из окружения
+  # того, кто запустил обновление.
+  CFG_OUT="$(PYTHONPATH="${PREFIX}/server" \
+             ASRHUB_DATA_DIR="${DATA_DIR}" "${VPY}" -m asrhub --check-config 2>&1 || true)"
   if grep -q "Не принято значений" <<<"${CFG_OUT}"; then
     warn "Часть значений конфигурации новая версия не приняла:"
     printf '%s\n' "${CFG_OUT}" | sed 's/^/  /' >&2
@@ -461,6 +549,8 @@ step "Запуск и проверка"
 if [[ "${NO_RESTART}" -eq 1 ]]; then
   info "Перезапуск пропущен (--no-restart)."
   checklist_skip "выбран ключ --no-restart"
+  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
+    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
   exit 0
 fi
 
@@ -481,7 +571,8 @@ if [[ "${DOCKER_MODE}" -eq 1 ]]; then
   # shellcheck disable=SC2086
   ( cd "${PREFIX}/docker" && run ${COMPOSE_LINE} --env-file .env up -d )
 elif [[ "${WAS_RUNNING}" -eq 1 ]]; then
-  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" --name "${SERVICE_NAME}" || true
+  bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" --data "${DATA_DIR}" \
+    --name "${SERVICE_NAME}" || true
 else
   info "До обновления служба не работала — не запускаем."
   checklist_skip "до обновления служба не работала"
@@ -490,7 +581,9 @@ else
   # Проверять здоровье остановленного сервера бессмысленно: раньше проверка
   # шла и в этом случае, и обновление, прошедшее без единой ошибки,
   # заканчивалось строкой «сервер не отвечает».
-  hint "Запустить: bash ${PREFIX}/scripts/service.sh start"
+  [[ -n "${SERVICE_NAME}" ]] && hint "Запустить: bash '${PREFIX}/scripts/service.sh' start"
+  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
+    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
   exit 0
 fi
 
@@ -500,7 +593,7 @@ fi
 # в файле, и объявляла работающий сервер мёртвым. Разбор порядка и очистка
 # значения — в server_port_hint.
 PORT="$(server_port_hint "${DATA_DIR}" "${PREFIX}" \
-        "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )")"
+        "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" "${SERVICE_NAME:-asrhub}")"
 
 # Адрес для проверки. Сервер, привязанный к одному адресу в локальной сети,
 # на 127.0.0.1 не отвечает вовсе — и исправное обновление заканчивалось
@@ -521,7 +614,7 @@ fi
 # уже упала. Раньше здесь молча капало сорок секунд, после чего печаталась
 # одна строка «не отвечает» — и человек оставался с ней один на один.
 HEALTH_RC=0
-wait_for_health "${PORT}" "${HEALTH_WAIT_S:-60}" asrhub "${PROBE_HOST}" || HEALTH_RC=$?
+wait_for_health "${PORT}" "${HEALTH_WAIT_S:-60}" "${SERVICE_NAME:-asrhub}" "${PROBE_HOST}" || HEALTH_RC=$?
 
 if [[ "${HEALTH_RC}" -eq 0 ]]; then
   ok "Сервер отвечает — обновление успешно"
@@ -529,13 +622,17 @@ if [[ "${HEALTH_RC}" -eq 0 ]]; then
   # заход смотрел на прежнюю установку, а обновление могло подменить torch —
   # и «до» с «после» тут расходятся в обе стороны: сломаться и починиться.
   if [[ "${SKIP_GPU_CHECK}" -eq 0 && "${ENGINES_ONLY}" -eq 0 ]]; then
-    gpu_runtime_report "${VPY}" "${DATA_DIR}" "${PREFIX}/server" asrhub || true
+    gpu_runtime_report "${VPY}" "${DATA_DIR}" "${PREFIX}/server" "${SERVICE_NAME:-asrhub}" || true
   fi
+  # Метка установки — после удачного обновления: установка, поставленная до
+  # 3.1.19, получает её здесь, и дальше сценарии обслуживания узнают её сами.
+  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
+    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
   printf '\n%s%sОбновление завершено: %s → %s%s\n\n' "${C_BOLD}" "${C_GREEN}" \
     "${CURRENT_VERSION}" "${NEW_VERSION}" "${C_RESET}"
   hint "Сплошная проверка всех частей: раздел «Дашборд» → «Глубокая проверка»"
-  hint "или из оболочки: bash ${PREFIX}/scripts/doctor.sh"
-  hint "Откат при необходимости: bash ${PREFIX}/scripts/update.sh --rollback"
+  hint "или из оболочки: bash '${PREFIX}/scripts/doctor.sh'"
+  hint "Откат при необходимости: bash '${PREFIX}/scripts/update.sh' --rollback"
 elif [[ "${HEALTH_RC}" -eq 2 ]]; then
   # Сервер поднялся, но сам сообщает о неисправности. Это не повод для
   # отката: код обновился и работает, сломано что-то под ним — чаще всего
@@ -548,16 +645,16 @@ elif [[ "${HEALTH_RC}" -eq 2 ]]; then
 else
   error "Сервер не отвечает после обновления."
   diagnose_server_down "${PORT}" "${PREFIX}" "${DATA_DIR}" \
-    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" asrhub "${PROBE_HOST}"
+    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" \
+    "${SERVICE_NAME:-asrhub}" "${PROBE_HOST}"
   if confirm "Откатиться к предыдущей версии?"; then
     # Каталог данных и имя службы передаются дальше: без них откат искал
     # config.yaml в каталоге по умолчанию и возвращал конфигурацию ЧУЖОЙ
     # установки, а службу дёргал вообще не ту. Оба значения здесь уже
     # определены — своими ключами или разбором.
     exec bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" \
-      --data "${DATA_DIR}" --name "${SERVICE_NAME}" --yes
+      --data "${DATA_DIR}" ${SERVICE_NAME:+--name "${SERVICE_NAME}"} --yes
   fi
-  hint "Откатиться позже: bash ${PREFIX}/scripts/update.sh --rollback \
-    --prefix ${PREFIX} --data ${DATA_DIR}"
+  hint "Откатиться позже: bash '${PREFIX}/scripts/update.sh' --rollback --prefix '${PREFIX}' --data '${DATA_DIR}'"
   exit 1
 fi

@@ -61,7 +61,49 @@ def _users_command(settings: object, args: object) -> int:
         db.close()
 
 
+def _потоки_без_консоли(argv: list[str] | None) -> None:
+    """Куда писать, когда консоли нет вовсе (pythonw.exe).
+
+    Задача планировщика Windows запускает сервер через pythonw.exe: у
+    python.exe при каждом входе в систему открывалось окно консоли, и
+    закрыть его значило погасить сервер. Но у pythonw нет ни stdout, ни
+    stderr — `sys.stdout` и `sys.stderr` равны None, и uvicorn падает на
+    первой же строке настройки журнала (`sys.stdout.isatty()`), а сообщение
+    об ошибке конфигурации пропадает бесследно. Направляем оба потока в
+    logs/service.log каталога данных — туда же, куда пишет служба NSSM, и
+    именно этот файл первым показывает `service.ps1 -Action logs`.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    import os
+    from pathlib import Path
+
+    доводы = list(sys.argv[1:] if argv is None else argv)
+    конфигурация = ""
+    for номер, довод in enumerate(доводы):
+        if довод == "--config" and номер + 1 < len(доводы):
+            конфигурация = доводы[номер + 1]
+        elif довод.startswith("--config="):
+            конфигурация = довод.split("=", 1)[1]
+    if конфигурация:
+        каталог = Path(конфигурация).expanduser().parent / "logs"
+    else:
+        from .config import default_data_dir
+
+        каталог = default_data_dir() / "logs"
+    try:
+        каталог.mkdir(parents=True, exist_ok=True)
+        поток = open(каталог / "service.log", "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+    except OSError:
+        поток = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    if sys.stdout is None:
+        sys.stdout = поток
+    if sys.stderr is None:
+        sys.stderr = поток
+
+
 def main(argv: list[str] | None = None) -> int:
+    _потоки_без_консоли(argv)
     parser = argparse.ArgumentParser(
         prog="asrhub", description="Сервер распознавания речи ASR Hub")
     parser.add_argument("--host", help="Адрес прослушивания (по умолчанию из конфигурации)")

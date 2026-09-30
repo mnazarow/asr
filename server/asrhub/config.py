@@ -69,7 +69,11 @@ def _parse_env_value(raw: str, kind: str) -> Any:
 
 
 def _load_structured(path: Path) -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8")
+    # utf-8-sig: Windows PowerShell 5.1 пишет UTF-8 с меткой BOM
+    # (`Set-Content -Encoding UTF8`), и файл, созданный установщиком или
+    # поправленный из консоли, начинается с U+FEFF. PyYAML метку пропускает,
+    # а запасной разбор без него принимал её за часть первого ключа.
+    text = path.read_text(encoding="utf-8-sig")
     if path.suffix in (".yaml", ".yml"):
         try:
             import yaml  # type: ignore

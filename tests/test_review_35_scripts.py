@@ -46,20 +46,21 @@ def test_имя_службы_определяется_по_каталогу_ус
         "[Service]\nWorkingDirectory=/opt/asrhub2\n"
         "ExecStart=/opt/asrhub2/venv/bin/python -m asrhub\n", encoding="utf-8")
 
-    # Подменяем каталог юнитов: функция ходит по /etc/systemd/system.
-    исходник = common.read_text(encoding="utf-8")
-    подмена = tmp_path / "common.sh"
-    подмена.write_text(исходник.replace("/etc/systemd/system/asrhub*.service",
-                                        f"{юниты}/asrhub*.service"), encoding="utf-8")
+    # Каталог юнитов подменяется переменными (с захода 47 функция ходит по
+    # ним, а не по жёсткому /etc/systemd/system).
     итог = прогнать(f'''
-      source "{подмена}"
+      export ASRHUB_SYSTEMD_DIR="{юниты}" ASRHUB_SYSTEMD_USER_DIR="{tmp_path}/нет"
+      source "{common}"
       printf 'первая=%s\\n' "$(service_name_for /opt/asrhub)"
       printf 'вторая=%s\\n' "$(service_name_for /opt/asrhub2)"
-      printf 'чужая=%s\\n' "$(service_name_for /opt/другое)"
+      printf 'чужая=%s\\n' "$(service_name_for /opt/другое || true)"
     ''')
-    assert "первая=asrhub" in итог.stdout, итог.stdout + итог.stderr
+    assert "первая=asrhub\n" in итог.stdout, итог.stdout + итог.stderr
     assert "вторая=asrhub2" in итог.stdout, итог.stdout + итог.stderr
-    assert "чужая=asrhub" in итог.stdout, "без юнита имя должно остаться прежним"
+    # С захода 47 — пусто, а не «asrhub»: у установки без своей службы
+    # «asrhub» — это служба ДРУГОЙ установки, и удаление такой установки
+    # сносило её.
+    assert "чужая=\n" in итог.stdout, "без юнита имени нет — чужую службу не трогаем"
 
 
 def test_обновление_и_удаление_передают_имя_службы(repo_root: Path):
@@ -69,7 +70,10 @@ def test_обновление_и_удаление_передают_имя_слу
 
     for имя, текст in (("update.sh", обновление), ("uninstall.sh", удаление)):
         assert "--name)" in текст, f"{имя}: нет ключа --name"
-        assert "service_name_for" in текст, f"{имя}: имя службы не определяется"
+        # С захода 47 имя службы находит resolve_installation (по метке
+        # установки и её юниту) — внутри он зовёт тот же service_name_for.
+        assert "service_name_for" in текст or "resolve_installation" in текст, \
+            f"{имя}: имя службы не определяется"
     # Каждый вызов service.sh — с именем.
     for строка in обновление.splitlines() + удаление.splitlines():
         if "service.sh" not in строка or "scripts/service.sh logs" in строка:
@@ -153,48 +157,80 @@ def test_занятый_своим_же_сервером_порт_не_меня�
     assert порядок, "проверка «это мы» должна идти до выбора нового порта"
 
 
+#: Заглушка ASR Hub отдельным процессом: отвечает на /api/health как сервер.
+ЗАГЛУШКА_СЕРВЕРА = """
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Ответчик(BaseHTTPRequestHandler):
+    def do_GET(self):
+        тело = b'{"status":"ok","version":"3.1.19"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(тело)))
+        self.end_headers()
+        self.wfile.write(тело)
+
+    def log_message(self, *_):
+        return
+
+HTTPServer(("127.0.0.1", int(sys.argv[1])), Ответчик).serve_forever()
+"""
+
+
+def _заглушка_из(каталог: Path, порт: int):
+    """Запускает заглушку python-ом из «окружения установки» каталога.
+
+    С захода 47 своим считается процесс, запущенный из этого каталога
+    программы: строка запуска называет её окружение, как у настоящей службы
+    (`<каталог>/venv/bin/python -m asrhub`). Отвечающий на порту ASR Hub
+    ДРУГОЙ установки своим больше не признаётся.
+    """
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+
+    python = каталог / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.symlink_to(sys.executable)
+    процесс = subprocess.Popen([str(python), "-c", ЗАГЛУШКА_СЕРВЕРА, str(порт)])
+    for _ in range(100):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{порт}/api/health", timeout=1).read()
+            break
+        except Exception:                                   # noqa: BLE001
+            time.sleep(0.1)
+    return процесс
+
+
 def test_порт_нашего_же_сервера_остаётся_прежним(repo_root: Path, tmp_path: Path):
     """Проверка на настоящем коде: блок из install.sh поверх живого сокета.
 
-    На порту поднимается заглушка, отвечающая как ASR Hub. Блок обязан
-    узнать своего и оставить порт, а не искать свободный.
+    На порту поднимается заглушка, отвечающая как ASR Hub, — из окружения
+    этой установки. Блок обязан узнать своего и оставить порт, а не искать
+    свободный.
     """
     import socket
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    class Ответчик(BaseHTTPRequestHandler):
-        def do_GET(self):                                    # noqa: N802
-            тело = b'{"status":"ok","service":"asrhub"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(тело)))
-            self.end_headers()
-            self.wfile.write(тело)
-
-        def log_message(self, *_а):                          # тишина в выводе
-            return
 
     with socket.socket() as гнездо:
         гнездо.bind(("127.0.0.1", 0))
         порт = гнездо.getsockname()[1]
-    сервер = HTTPServer(("127.0.0.1", порт), Ответчик)
-    поток = threading.Thread(target=сервер.serve_forever, daemon=True)
-    поток.start()
+    каталог = tmp_path / "prefix"
+    процесс = _заглушка_из(каталог, порт)
     try:
         блок = _блок_проверки_порта(repo_root)
-        каталог = tmp_path / "prefix"
-        каталог.mkdir()
         итог = прогнать(f'''
           source "{repo_root}/scripts/lib/common.sh"
           PORT={порт}
           PREFIX="{каталог}"
+          SERVICE_NAME=asrhub-проба-35
           {блок}
           printf 'ИТОГОВЫЙ_ПОРТ=%s\\n' "${{PORT}}"
         ''', env={"ASRHUB_ASSUME_YES": "1"})
     finally:
-        сервер.shutdown()
-        поток.join(timeout=5)
+        процесс.terminate()
+        процесс.wait(timeout=10)
     assert f"ИТОГОВЫЙ_ПОРТ={порт}" in итог.stdout, итог.stdout + итог.stderr
     assert "занят уже установленным" in итог.stdout + итог.stderr, \
         итог.stdout + итог.stderr
@@ -234,6 +270,7 @@ def test_порт_чужого_процесса_по_прежнему_меняе
           source "{repo_root}/scripts/lib/common.sh"
           PORT={порт}
           PREFIX="{каталог}"
+          SERVICE_NAME=asrhub-проба-35
           {блок}
           printf 'ИТОГОВЫЙ_ПОРТ=%s\\n' "${{PORT}}"
         ''', env={"ASRHUB_ASSUME_YES": "1"})

@@ -156,6 +156,35 @@ def weights_file(source: str, revision: str) -> str:
     return f"{name}.ckpt"
 
 
+def download_weights(source: str, revision: str, models_dir: str | Path) -> Path:
+    """Скачивает веса варианта GigaAM туда, где их станет искать загрузчик.
+
+    GigaAM качает веса не с Hugging Face, а со своего CDN, одним файлом
+    «<вариант>.ckpt». Раздел «Модели» качал снапшот репозитория на Hugging
+    Face — загрузчик его не открывает никогда: место занято, модель в списке
+    по-прежнему «не загружена», а движок при первом задании всё равно идёт
+    в интернет. Качать надо ровно то, что потом возьмёт движок, — поэтому
+    загрузка одна на всех: сервер и models.sh зовут эту функцию.
+    """
+    try:
+        import gigaam  # type: ignore
+    except ModuleNotFoundError as exc:
+        # Веса качает сама библиотека движка: без неё скачать их нечем.
+        raise DependencyMissing("gigaam", "gigaam", cause=exc) from exc
+    name = variant_name(source, revision)
+    root = Path(models_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    # Свои же помощники библиотеки качают только файлы. Если их переименуют —
+    # грузим модель целиком: медленнее, но верно.
+    if hasattr(gigaam, "_download_model"):
+        gigaam._download_model(name, str(root))
+        if hasattr(gigaam, "_download_tokenizer"):
+            gigaam._download_tokenizer(name, str(root))
+    else:
+        gigaam.load_model(name, device="cpu", download_root=str(root))
+    return root / weights_file(source, revision)
+
+
 def _failing_path(text: str) -> str:
     """Достаёт путь, на котором споткнулась библиотека.
 

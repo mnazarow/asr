@@ -31,24 +31,18 @@ function Test-Item {
     if ($Hint -and $Status -ne 'ok') { Write-Host "      $Hint" -ForegroundColor DarkGray }
 }
 
-# Переменные окружения могут быть не заданы (урезанный профиль, запуск из
-# службы, не-Windows). Join-Path на пустом значении бросает исключение, и
-# диагностика превращалась в простыню ошибок вместо ответа.
-function Join-IfSet([string] $base, [string] $leaf) {
-    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
-    return (Join-Path $base $leaf)
+# Установка — та же, что у остальных сценариев: заданная ключом, та, из
+# которой запущен сценарий, или единственная известная. Раньше — первая из
+# двух стандартных: диагностика установки в свой каталог проверяла
+# соседнюю (или никакую) и отчитывалась о чужом сервере.
+$resolved = Resolve-AsrInstallation -ScriptDir $PSScriptRoot -Prefix $Prefix -DataDir $DataDir
+if (-not $resolved.Prefix -and @($resolved.Candidates).Count -gt 0) {
+    Show-AmbiguousInstallation $resolved.Candidates 'doctor.ps1'
+    exit 2
 }
-if (-not $Prefix) {
-    foreach ($c in @('C:\Program Files\ASRHub', (Join-IfSet $env:LOCALAPPDATA 'ASRHub'))) {
-        if ($c -and (Test-Path $c)) { $Prefix = $c; break }
-    }
-}
-if (-not $DataDir) {
-    foreach ($c in @((Join-IfSet $env:ProgramData 'ASRHub'),
-                     (Join-IfSet $env:LOCALAPPDATA 'ASRHub\data'))) {
-        if ($c -and (Test-Path $c)) { $DataDir = $c; break }
-    }
-}
+$Prefix = $resolved.Prefix
+$DataDir = $resolved.DataDir
+$ownAutostart = @($resolved.Autostart)
 
 if (-not $Only -or $Only -eq 'hardware') {
     Write-Heading 'Оборудование'
@@ -92,7 +86,9 @@ if (-not $Only -or $Only -eq 'hardware') {
             'Работа только на процессоре. Включите int8 и берите модели полегче.'
     }
     if ($DataDir) {
-        $drive = Get-PSDrive -Name (Split-Path -Qualifier $DataDir).TrimEnd(':') -ErrorAction SilentlyContinue
+        $drive = $null
+        try { $drive = Get-PSDrive -Name (Split-Path -Qualifier $DataDir -ErrorAction Stop).TrimEnd(':') -ErrorAction SilentlyContinue }
+        catch { $drive = $null }
         if ($drive) {
             $freeGb = [math]::Round($drive.Free / 1GB, 1)
             Test-Item 'Свободное место' `
@@ -196,23 +192,40 @@ if (-not $Only -or $Only -eq 'network') {
             $(if (Test-Internet -HostName $hostName) { 'доступен' } else { 'недоступен' }) `
             'Без доступа установка движков и загрузка моделей невозможны.'
     }
-    $port = 8080
-    $configFile = Join-Path $DataDir 'config.yaml'
-    if (Test-Path $configFile) {
-        $match = Select-String -Path $configFile -Pattern 'server_port:\s*(\d+)' | Select-Object -First 1
-        if ($match) { $port = [int]$match.Matches[0].Groups[1].Value }
-    }
-    try {
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 3
-        Test-Item 'Сервер' 'ok' "отвечает на порту $port, версия $($health.version)"
-    } catch {
+    # Порт и адрес — из строки запуска автозапуска: `--port` в ней
+    # перекрывает config.yaml, а сервер, привязанный к адресу в сети, на
+    # 127.0.0.1 не отвечает вовсе. Раньше проверка шла в порт из файла и
+    # объявляла работающий сервер мёртвым.
+    $address = Get-AsrServerAddress -Prefix $Prefix -DataDir $DataDir -Mode $resolved.Mode -Autostart $ownAutostart
+    $port = $address.Port
+    $probe = Invoke-AsrHealth -Url "http://$($address.ProbeHost):$port/api/health"
+    if ($probe.Status -ge 200 -and $probe.Status -lt 300) {
+        $version = ''
+        try { $version = ($probe.Body | ConvertFrom-Json).version } catch { }
+        Test-Item 'Сервер' 'ok' "отвечает на порту $port, версия $version"
+    } elseif ($probe.Status -gt 0) {
+        Test-Item 'Сервер' 'warn' "отвечает на порту $port, но сообщает о неисправности (код $($probe.Status))" `
+            "Журнал: powershell -File `"$PSScriptRoot\service.ps1`" -Action logs -Lines 100"
+    } else {
         Test-Item "Порт $port" 'warn' 'сервер не отвечает' `
-            'Запустить: powershell -File scripts\service.ps1 -Action start'
+            "Запустить: powershell -File `"$PSScriptRoot\service.ps1`" -Action start"
     }
-    $rule = Get-NetFirewallRule -DisplayName 'ASR Hub*' -ErrorAction SilentlyContinue
-    Test-Item 'Правило брандмауэра' $(if ($rule) { 'ok' } else { 'warn' }) `
-        $(if ($rule) { 'создано' } else { 'не создано' }) `
-        "New-NetFirewallRule -DisplayName 'ASR Hub' -Direction Inbound -LocalPort $port -Protocol TCP -Action Allow"
+    # Правило брандмауэра нужно только серверу, открытому в сеть. Раньше
+    # предупреждение звучало всегда — и у сервера на 127.0.0.1, которому
+    # правило не нужно, — и приучало его не читать.
+    $bindHost = if ($address.BindHost) { $address.BindHost } else { '0.0.0.0' }
+    if ($bindHost -notin @('127.0.0.1', 'localhost', '::1') -and
+        (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        $allowed = $false
+        foreach ($rule in @(Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -ErrorAction SilentlyContinue |
+                            Where-Object { "$($_.DisplayName)" -like 'ASR Hub*' })) {
+            $ports = @($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalPort })
+            if ($ports -contains "$port" -or $ports -contains 'Any') { $allowed = $true; break }
+        }
+        Test-Item 'Правило брандмауэра' $(if ($allowed) { 'ok' } else { 'warn' }) `
+            $(if ($allowed) { "порт $port открыт" } else { "нет правила для порта $port" }) `
+            "New-NetFirewallRule -DisplayName 'ASR Hub ($port)' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow -Profile Domain,Private"
+    }
 }
 
 Write-Host ''

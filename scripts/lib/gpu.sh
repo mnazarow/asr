@@ -887,9 +887,18 @@ gpu_torch_probe() {
   #
   # Ответ берётся у torch, а не у nvidia-smi: они расходятся, и заданию
   # важен именно первый.
-  local py="$1" code_dir="$2" device="${3:-auto}"
+  local py="$1" code_dir="$2" device="${3:-auto}" run_as="${4:-}"
   [[ -x "${py}" ]] || { printf 'skip|%s|нет интерпретатора: %s' "${device}" "${py}"; return 0; }
-  "${py}" - "${code_dir}" "${device}" 2>/dev/null <<'PYEOF' || printf 'skip|%s|проба не выполнилась' "${device}"
+  # От пользователя службы, если он известен: проба от root проходила там,
+  # где у службы нет доступа к /dev/kfd или /dev/dri (группы render и
+  # video), — в config.yaml записывалось «rocm», а служба роняла каждое
+  # задание.
+  local runner=()
+  if [[ -n "${run_as}" && "${run_as}" != "root" ]] && is_root && have runuser \
+     && id -u "${run_as}" >/dev/null 2>&1; then
+    runner=(runuser -u "${run_as}" --)
+  fi
+  ${runner[@]+"${runner[@]}"} "${py}" - "${code_dir}" "${device}" 2>/dev/null <<'PYEOF' || printf 'skip|%s|проба не выполнилась' "${device}"
 import sys
 
 sys.path.insert(0, sys.argv[1])
@@ -971,11 +980,13 @@ gpu_runtime_report() {
   # процесса нет. Второе сознательно не считается «просто предупреждением»:
   # на таком сервере падает каждое задание.
   local py="$1" data_dir="$2" code_dir="$3" service="${4:-asrhub}"
-  local device probe state shown detail
+  local device probe state shown detail run_as=""
   device="$(config_device "${data_dir}")"
   [[ -z "${device}" ]] && device="auto"
+  # Спрашиваем от имени пользователя службы — того, кто будет считать.
+  run_as="$(installed_service_value "${service}" "" user 2>/dev/null || true)"
 
-  probe="$(gpu_torch_probe "${py}" "${code_dir}" "${device}")"
+  probe="$(gpu_torch_probe "${py}" "${code_dir}" "${device}" "${run_as}")"
   state="$(printf '%s' "${probe}" | cut -d'|' -f1)"
   shown="$(printf '%s' "${probe}" | cut -d'|' -f2)"
   detail="$(printf '%s' "${probe}" | cut -d'|' -f3-)"

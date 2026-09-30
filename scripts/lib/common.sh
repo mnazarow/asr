@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.18"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.19"
 # Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
 # пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
 # сменить каталог, и относительный путь указывал бы в никуда. Те же
@@ -76,6 +76,10 @@ ASRHUB_DEFAULT_PORT="8080"
 # службу.
 export ASRHUB_DRY_RUN
 : "${ASRHUB_ASSUME_YES:=0}"
+# Тоже переживает дочерний сценарий: `install.sh --alignment whisperx --yes`
+# звал models.sh, тот без терминала отвечал на свой вопрос «нет», выходил с
+# нулём — и выравнивание молча не ставилось.
+export ASRHUB_ASSUME_YES
 : "${ASRHUB_QUIET:=0}"
 : "${ASRHUB_NO_COLOR:=0}"
 
@@ -393,7 +397,15 @@ enable_error_handling() {
   # Чек-лист печатается из ловушки, а не в конце сценария: до конца доходят
   # не все запуски, а итог нужен как раз тогда, когда не дошли. Код выхода
   # передаём внутрь — по нему видно, закрылся последний шаг или оборвался.
-  trap 'checklist_print "$?"; cleanup_temp' EXIT
+  #
+  # Откат — и на явный `exit` с ошибкой. Ловушка ERR видит только упавшую
+  # команду, а сценарии, назвав причину своими словами, выходят сами
+  # (`error …; exit 1`) — и откат, обещанный шапкой установщика, не
+  # выполнялся: `install.sh --force` с упавшим `python -m venv` оставлял
+  # установку без окружения, а прежнее лежало отложенным без подсказки.
+  # Удачный конец сценария чистит список сам (clear_rollback), поэтому
+  # поздние выходы с ошибкой ничего не откатывают.
+  trap '_asrhub_rc=$?; [[ ${_asrhub_rc} -ne 0 ]] && run_rollback; checklist_print "${_asrhub_rc}"; cleanup_temp' EXIT
 }
 
 # ---------------------------------------------------------------------------
@@ -487,6 +499,13 @@ acquire_install_lock() {
     return 0
   fi
   owner="$(cat "${lock}" 2>/dev/null || true)"
+  # Свой же замок: обновление после неудачной проверки делает `exec` в откат
+  # с тем же номером процесса, и без этой строки откат упирался в замок,
+  # поставленный им самим.
+  if [[ "${owner}" == "$$" ]]; then
+    register_temp "${lock}"
+    return 0
+  fi
   if [[ "${owner}" =~ ^[0-9]+$ ]] && kill -0 "${owner}" 2>/dev/null; then
     error "В каталоге ${dir} уже идёт установка (процесс ${owner})."
     hint "Дождитесь её окончания или остановите: kill ${owner}"
@@ -960,6 +979,26 @@ required_packages() {
       [[ -n "${name}" ]] && names="${names}${name}"$'\n'
     done < "${file}"
   done < <(find "${root}" -name '*.txt' 2>/dev/null)
+  printf '%s' "${names}" | tr '_.' '--' | tr '[:upper:]' '[:lower:]' | sort -u
+}
+
+# Имена пакетов из перечисленных файлов требований — по одному на строку,
+# в написании pip, без повторов. Несуществующие файлы пропускаются.
+#
+#   requirement_names ФАЙЛ…
+requirement_names() {
+  local file line name names=""
+  for file in "$@"; do
+    [[ -f "${file}" ]] || continue
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line%%#*}"
+      line="${line%%@*}"
+      line="${line%%[<>=!~;[]*}"
+      name="$(printf '%s' "${line}" | tr -d '[:space:]')"
+      [[ "${name}" == -* ]] && continue
+      [[ -n "${name}" ]] && names="${names}${name}"$'\n'
+    done < "${file}"
+  done
   printf '%s' "${names}" | tr '_.' '--' | tr '[:upper:]' '[:lower:]' | sort -u
 }
 
@@ -1784,10 +1823,11 @@ server_port_hint() {
 #
 #   service_state [ИМЯ_СЛУЖБЫ]
 service_state() {
-  local name="${1:-asrhub}" state=""
+  local name="${1:-asrhub}" state="" label=""
   if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && have launchctl; then
+    label="$(plist_label_for "${name}")"
     if [[ "$(set +o pipefail; launchctl list 2>/dev/null \
-             | grep -c com.asrhub.server || true)" -gt 0 ]]; then
+             | grep -cF -- "${label}" || true)" -gt 0 ]]; then
       printf 'running'; return 0
     fi
     printf 'inactive'; return 1
@@ -1853,7 +1893,14 @@ import_probe() {
   [[ -x "${python}" ]] || return 2
   # Импорт, а не запуск: сервер уже, возможно, пытается стартовать в фоне, и
   # второй настоящий запуск занял бы тот же порт и добавил путаницы.
-  out="$(PYTHONPATH="${src}${src:+:}${PYTHONPATH:-}" "${python}" -c 'import asrhub.api.app' 2>&1)" || status=$?
+  # С каталогом исходников — только он, как у службы: PYTHONPATH вызывающего
+  # с пакетом другой версии прикрывал сломанную установку, и разбор отвечал
+  # «пакет импортируется — дело не в зависимостях».
+  if [[ -n "${src}" ]]; then
+    out="$(PYTHONPATH="${src}" "${python}" -c 'import asrhub.api.app' 2>&1)" || status=$?
+  else
+    out="$("${python}" -c 'import asrhub.api.app' 2>&1)" || status=$?
+  fi
   if [[ ${status} -ne 0 ]]; then
     STARTUP_TRACEBACK="${out}"
     return 1
@@ -1953,7 +2000,9 @@ diagnose_startup_failure() {
   if [[ -n "${cfg_line}" ]]; then
     error "Сервер отверг значение из файла конфигурации."
     printf '  %s\n' "${cfg_line}" >&2
-    [[ -n "${python}" ]] && hint "Все несогласия с файлом: ${python} -m asrhub --check-config"
+    # Из каталога server: пакет asrhub лежит там, а не в окружении, и из
+    # любого другого каталога команда отвечала «No module named 'asrhub'».
+    [[ -n "${python}" ]] && hint "Все несогласия с файлом: cd '${prefix}/server' && ASRHUB_DATA_DIR='${data_dir:-КАТАЛОГ_ДАННЫХ}' '${python}' -m asrhub --check-config"
     hint "Запись прежней версии текущая принимает сама; если сообщение осталось, параметр придётся поправить руками."
     hint "Файл: ${data_dir:-КАТАЛОГ_ДАННЫХ}/config.yaml"
     return 0
@@ -2099,10 +2148,77 @@ diagnose_server_down() {
   diagnose_startup_failure "${probe_text}" "${python}" "${prefix}" "${data_dir}" || {
     error "Причину назвать не удалось."
     hint "Полный журнал: bash ${prefix}/scripts/service.sh logs -n 200"
-    hint "Запуск вручную (покажет ошибку целиком): ${python} -m asrhub --port ${port}"
+    hint "Запуск вручную (покажет ошибку целиком): cd '${prefix}/server' && ASRHUB_DATA_DIR='${data_dir}' '${python}' -m asrhub --port ${port}"
     hint "Состояние службы: bash ${prefix}/scripts/service.sh status"
     hint "Проверка окружения: bash ${prefix}/scripts/doctor.sh"
   }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Копия базы
+# ---------------------------------------------------------------------------
+
+# Согласованная копия базы SQLite — через её собственное копирование, а не cp.
+#
+#   sqlite_backup БАЗА КОПИЯ [ИНТЕРПРЕТАТОР]
+#
+# База работает в режиме WAL: закоммиченные задания могут лежать только в
+# файле -wal, и копия одного asrhub.db их теряет. Удаление и обновление
+# копировали базу обычным cp — на проверке в такой копии не нашлось даже
+# таблицы jobs: всё жило в журнале на 2,5 МБ, а удаление с --purge тут же
+# стирало и журнал. Порядок: python (модуль sqlite3 есть в любой сборке),
+# sqlite3 из командной строки и последним — копия базы вместе с -wal и
+# -shm, годная только при остановленном сервере. Копия пишется в режиме
+# DELETE — одним файлом, без спутников.
+sqlite_backup() {
+  local src="$1" dst="$2" py_hint="${3:-}" candidate
+  [[ -f "${src}" ]] || return 1
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '  [пробный запуск] копия базы %s → %s\n' "${src}" "${dst}"
+    return 0
+  fi
+  rm -f "${dst}" "${dst}-wal" "${dst}-shm" 2>/dev/null || true
+  for candidate in "${py_hint}" python3 python; do
+    [[ -n "${candidate}" ]] || continue
+    [[ -x "${candidate}" ]] || have "${candidate}" || continue
+    if "${candidate}" - "${src}" "${dst}" <<'PYEOF' 2>/dev/null; then
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1], timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+try:
+    with dst:
+        src.backup(dst)
+    dst.execute("PRAGMA journal_mode=DELETE")
+    if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise SystemExit(1)
+finally:
+    dst.close()
+    src.close()
+PYEOF
+      _sqlite_backup_owner "${src}"
+      return 0
+    fi
+  done
+  if have sqlite3 && sqlite3 "${src}" ".backup '${dst}'" 2>/dev/null; then
+    _sqlite_backup_owner "${src}"
+    return 0
+  fi
+  cp -a "${src}" "${dst}" 2>/dev/null || return 1
+  [[ -f "${src}-wal" ]] && { cp -a "${src}-wal" "${dst}-wal" 2>/dev/null || return 1; }
+  [[ -f "${src}-shm" ]] && { cp -a "${src}-shm" "${dst}-shm" 2>/dev/null || return 1; }
+  return 0
+}
+
+# Спутники базы, которые могло создать открытие от root, — владельцу базы:
+# иначе служба под своим пользователем не откроет их («readonly database»).
+_sqlite_backup_owner() {
+  local db="$1" owner="" f
+  owner="$(stat -c '%u:%g' "${db}" 2>/dev/null || stat -f '%u:%g' "${db}" 2>/dev/null || true)"
+  [[ -n "${owner}" ]] || return 0
+  for f in "${db}-wal" "${db}-shm"; do
+    [[ -e "${f}" ]] && chown "${owner}" "${f}" 2>/dev/null || true
+  done
   return 0
 }
 
@@ -2241,39 +2357,278 @@ setup_logging() {
   local dir="${1:-/tmp}"
   mkdir -p "${dir}" 2>/dev/null || dir="/tmp"
   ASRHUB_LOG_FILE="${dir}/asrhub-$(basename "${0%.sh}")-$(date +%Y%m%d-%H%M%S).log"
-  : > "${ASRHUB_LOG_FILE}" 2>/dev/null || ASRHUB_LOG_FILE=""
+  # Только владельцу: в журнал попадают хвосты журнала службы, а в них имена
+  # файлов записей — в колл-центре это номера телефонов. С правами 0644 в
+  # общем /tmp их читал любой пользователь машины.
+  ( umask 077; : > "${ASRHUB_LOG_FILE}" ) 2>/dev/null || ASRHUB_LOG_FILE=""
+  [[ -n "${ASRHUB_LOG_FILE}" ]] && chmod 0600 "${ASRHUB_LOG_FILE}" 2>/dev/null || true
   [[ -n "${ASRHUB_LOG_FILE}" ]] && debug "журнал: ${ASRHUB_LOG_FILE}"
   export ASRHUB_LOG_FILE
 }
 
-# Имя службы ЭТОЙ установки.
+# ---------------------------------------------------------------------------
+# Какая это установка
+# ---------------------------------------------------------------------------
+#
+# Установок на машине бывает несколько: вторую заводят ключами
+# `--prefix /opt/asrhub2 --data /var/lib/asrhub2 --name asrhub2`. Сценарии
+# обслуживания искали установку по списку стандартных каталогов, и команда
+# из «Что дальше» ВТОРОЙ установки — `bash /opt/asrhub2/scripts/uninstall.sh
+# --purge` — удаляла ПЕРВУЮ: /opt/asrhub, её базу и модели, а вторая
+# оставалась. Обновление так же копировало код второй установки поверх
+# первой и перезапускало первую.
+#
+# Теперь установка узнаёт себя сама. Установщик и обновление кладут в
+# каталог программы метку .asrhub-install — каталог данных, имя службы,
+# режим, — и сценарий, запущенный из установки, берёт всё оттуда. Установки
+# без метки (поставлены до 3.1.19 и ещё не обновлялись) опознаются по
+# службе, которая работает из их каталога.
+
+ASRHUB_INSTALL_MARKER=".asrhub-install"
+
+# Каталоги юнитов systemd и агентов launchd. Переменные — для проверок: так
+# им не нужно подменять /etc.
+asrhub_unit_dirs() {
+  printf '%s\n' "${ASRHUB_SYSTEMD_DIR:-/etc/systemd/system}" \
+                "${ASRHUB_SYSTEMD_USER_DIR:-${HOME}/.config/systemd/user}"
+}
+asrhub_launchagents_dir() { printf '%s' "${ASRHUB_LAUNCHAGENTS_DIR:-${HOME}/Library/LaunchAgents}"; }
+
+# Метка агента launchd для службы. У службы по умолчанию — прежняя
+# com.asrhub.server; у остальных своя: одна метка на всех значила, что вторая
+# установка на macOS затирала агента первой.
+plist_label_for() {
+  local name="${1:-asrhub}"
+  if [[ "${name}" == "asrhub" ]]; then printf 'com.asrhub.server'
+  else printf 'com.asrhub.%s' "${name}"; fi
+}
+plist_path_for() { printf '%s/%s.plist' "$(asrhub_launchagents_dir)" "$(plist_label_for "${1:-asrhub}")"; }
+
+# Службы ASR Hub на этой машине, по строке на службу:
+#   имя<TAB>каталог_программы<TAB>каталог_данных<TAB>файл
+# Службой ASR Hub считается юнит, который запускает `-m asrhub`, и агент
+# launchd с меткой com.asrhub.*. Каталог программы — рабочий каталог без
+# /server (или путь к python без /venv/bin/…); каталог данных — из
+# переменной ASRHUB_DATA_DIR, пусто, если её нет.
+asrhub_services() {
+  local dir unit name wd exec_line prefix data flat plist label
+  while IFS= read -r dir; do
+    [[ -d "${dir}" ]] || continue
+    for unit in "${dir}"/*.service; do
+      [[ -f "${unit}" ]] || continue
+      exec_line="$(grep -E '^ExecStart=' "${unit}" 2>/dev/null | head -1 || true)"
+      [[ "${exec_line}" =~ -m[[:space:]]+asrhub([[:space:]]|$) ]] || continue
+      name="${unit##*/}"; name="${name%.service}"
+      wd="$(sed -n 's/^WorkingDirectory=//p' "${unit}" 2>/dev/null | head -1 || true)"
+      wd="${wd//\\x20/ }"; wd="${wd%\"}"; wd="${wd#\"}"
+      if [[ -n "${wd}" ]]; then
+        prefix="${wd%/}"; prefix="${prefix%/server}"
+      else
+        prefix="$(sed -E 's/^ExecStart=["]?//; s/["]?[[:space:]].*$//' <<<"${exec_line}")"
+        prefix="${prefix%/venv/*}"
+      fi
+      data="$(sed -n 's/^Environment="ASRHUB_DATA_DIR=\(.*\)"$/\1/p' "${unit}" 2>/dev/null \
+              | head -1 || true)"
+      printf '%s\t%s\t%s\t%s\n' "${name}" "${prefix}" "${data}" "${unit}"
+    done
+  done < <(asrhub_unit_dirs)
+  dir="$(asrhub_launchagents_dir)"
+  [[ -d "${dir}" ]] || return 0
+  for plist in "${dir}"/com.asrhub.*.plist; do
+    [[ -f "${plist}" ]] || continue
+    flat="$(tr -d '\n\r\t' < "${plist}" 2>/dev/null || true)"
+    label="$(sed -nE 's/.*<key>Label<\/key>[[:space:]]*<string>([^<]*)<\/string>.*/\1/p' <<<"${flat}")"
+    case "${label}" in
+      com.asrhub.server) name="asrhub" ;;
+      com.asrhub.*)      name="${label#com.asrhub.}" ;;
+      *) continue ;;
+    esac
+    wd="$(sed -nE 's/.*<key>WorkingDirectory<\/key>[[:space:]]*<string>([^<]*)<\/string>.*/\1/p' <<<"${flat}")"
+    prefix="${wd%/}"; prefix="${prefix%/server}"
+    data="$(sed -nE 's/.*<key>ASRHUB_DATA_DIR<\/key>[[:space:]]*<string>([^<]*)<\/string>.*/\1/p' <<<"${flat}")"
+    printf '%s\t%s\t%s\t%s\n' "${name}" "${prefix}" "${data}" "${plist}"
+  done
+}
+
+# Значение из метки установки: prefix, data_dir, service, mode, version.
+#
+#   install_marker_value КАТАЛОГ_ПРОГРАММЫ КЛЮЧ
+install_marker_value() {
+  local prefix="${1%/}" key="${2:-}" value=""
+  [[ -n "${key}" && -r "${prefix}/${ASRHUB_INSTALL_MARKER}" ]] || return 1
+  value="$(sed -n "s/^${key}=//p" "${prefix}/${ASRHUB_INSTALL_MARKER}" 2>/dev/null \
+           | head -1 || true)"
+  [[ -n "${value}" ]] || return 1
+  printf '%s' "${value}"
+}
+
+# Кладёт метку установки. Пробный запуск только рассказывает.
+#
+#   write_install_marker КАТАЛОГ_ПРОГРАММЫ КАТАЛОГ_ДАННЫХ ИМЯ_СЛУЖБЫ РЕЖИМ
+#
+# Имя службы пустое, если службы нет (--no-service): тогда обслуживание не
+# трогает ничью службу, а не «asrhub» наугад.
+write_install_marker() {
+  local prefix="${1%/}" data_dir="${2:-}" service="${3:-}" mode="${4:-native}"
+  local file="${prefix}/${ASRHUB_INSTALL_MARKER}"
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '  [пробный запуск] метка установки %s: данные %s, служба %s\n' \
+      "${file}" "${data_dir}" "${service:-нет}"
+    return 0
+  fi
+  [[ -d "${prefix}" ]] || return 1
+  {
+    printf '# Метка установки ASR Hub — по ней сценарии обслуживания находят\n'
+    printf '# свою установку. Пишется установщиком и обновлением; не правьте.\n'
+    printf 'prefix=%s\n' "${prefix}"
+    printf 'data_dir=%s\n' "${data_dir}"
+    printf 'service=%s\n' "${service}"
+    printf 'mode=%s\n' "${mode}"
+    printf 'version=%s\n' "${ASRHUB_VERSION}"
+  } > "${file}.tmp" 2>/dev/null && mv -f "${file}.tmp" "${file}" 2>/dev/null \
+    || { rm -f "${file}.tmp" 2>/dev/null; warn "Не удалось записать метку установки ${file}."; return 1; }
+  chmod 0644 "${file}" 2>/dev/null || true
+  return 0
+}
+
+# Установка ли это: код сервера на месте и есть метка, служба оттуда или
+# собранное окружение. Окружение без .git — установка прежних версий без
+# службы (--no-service): иначе её собственный uninstall.sh её не узнавал и
+# брался за установку в стандартном каталоге. Каталог с .git — рабочая
+# копия исходников, а не установка, даже с venv внутри.
+is_installation() {
+  local dir="${1%/}" line
+  [[ -n "${dir}" && -f "${dir}/VERSION" && -d "${dir}/server" ]] || return 1
+  [[ -f "${dir}/${ASRHUB_INSTALL_MARKER}" ]] && return 0
+  while IFS=$'\t' read -r _ line _ _; do
+    [[ "${line}" == "${dir}" ]] && return 0
+  done < <(asrhub_services)
+  [[ -d "${dir}/venv" && ! -e "${dir}/.git" ]] && return 0
+  return 1
+}
+
+# Каталоги известных установок — по службам и меткам, без повторов.
+known_installations() {
+  local c
+  {
+    asrhub_services | cut -f2
+    for c in /opt/asrhub* "${HOME}/.local/share/asrhub-app"* \
+             "${HOME}/Library/Application Support/ASRHub"*; do
+      [[ -f "${c}/${ASRHUB_INSTALL_MARKER}" ]] && printf '%s\n' "${c%/}"
+    done
+  } | awk 'NF && !seen[$0]++'
+}
+
+# Имя службы ЭТОЙ установки: из метки или по юниту (plist), который
+# работает из её каталога. Пусто и код 1 — службы нет.
 #
 #   service_name_for ПУТЬ_УСТАНОВКИ
 #
-# Служб на машине бывает несколько: установщик принимает --name, и вторую
-# установку заводят именно так (`--prefix /opt/asrhub2 --name asrhub2`).
-# Обновление и удаление про этот ключ не знали вовсе и всегда работали со
-# службой «asrhub»: обслуживание второй установки гасило и сносило службу
-# ПЕРВОЙ, продолжая при этом бодро сообщать об успехе. Заметить это можно
-# было только по остановившемуся распознаванию на другом сервере.
-#
-# Имя ищется по юниту, чей ExecStart или WorkingDirectory указывает на этот
-# каталог установки, — так человеку не нужно помнить, как он назвал службу
-# полгода назад. Не нашли — «asrhub», как было.
+# Раньше не нашли — «asrhub». Для установки без службы (--no-service) это
+# было имя ЧУЖОЙ службы: удаление такой установки сносило службу первой.
 service_name_for() {
-  local prefix="${1:-}" unit name
-  [[ -n "${prefix}" ]] || { printf 'asrhub'; return 0; }
+  local prefix="${1:-}" name=""
   prefix="${prefix%/}"
-  for unit in /etc/systemd/system/asrhub*.service \
-              "${HOME}/.config/systemd/user/asrhub"*.service; do
-    [[ -f "${unit}" ]] || continue
-    if grep -qE "^(ExecStart|WorkingDirectory)=.*${prefix}(/|[[:space:]]|$)" "${unit}" 2>/dev/null; then
-      name="$(basename "${unit}" .service)"
-      printf '%s' "${name}"
-      return 0
+  [[ -n "${prefix}" ]] || return 1
+  if [[ -f "${prefix}/${ASRHUB_INSTALL_MARKER}" ]]; then
+    name="$(install_marker_value "${prefix}" service || true)"
+    [[ -n "${name}" ]] && { printf '%s' "${name}"; return 0; }
+  fi
+  service_unit_for "${prefix}"
+}
+
+# Имя службы, которая работает из каталога установки, — только по юнитам и
+# агентам launchd, без метки.
+service_unit_for() {
+  local prefix="${1:-}" name line_prefix
+  prefix="${prefix%/}"
+  [[ -n "${prefix}" ]] || return 1
+  while IFS=$'\t' read -r name line_prefix _ _; do
+    if [[ "${line_prefix}" == "${prefix}" ]]; then printf '%s' "${name}"; return 0; fi
+  done < <(asrhub_services)
+  return 1
+}
+
+# Каталог данных установки: из метки или из переменной её службы.
+data_dir_for() {
+  local prefix="${1%/}" value="" line_prefix data
+  value="$(install_marker_value "${prefix}" data_dir || true)"
+  [[ -n "${value}" ]] && { printf '%s' "${value}"; return 0; }
+  while IFS=$'\t' read -r _ line_prefix data _; do
+    if [[ "${line_prefix}" == "${prefix}" && -n "${data}" ]]; then
+      printf '%s' "${data}"; return 0
     fi
-  done
-  printf 'asrhub'
+  done < <(asrhub_services)
+  return 1
+}
+
+# Заполняет PREFIX, DATA_DIR и SERVICE_NAME, не заданные ключами.
+#
+#   resolve_installation КАТАЛОГ_СЦЕНАРИЯ
+#
+# Установка — та, из которой запущен сценарий; не из установки (из
+# распакованного дистрибутива) — единственная известная на машине; нет
+# известных — прежний список стандартных каталогов. Известных несколько, а
+# сценарий запущен не из них — PREFIX остаётся пустым, их список лежит в
+# ASRHUB_INSTALLATIONS, и решает вызывающий: удалять или обновлять наугад
+# нельзя. ASRHUB_DATA_DIR_SOURCE говорит, откуда взят каталог данных:
+# key, marker, service или guess — последний ни метка, ни служба не
+# подтвердили.
+resolve_installation() {
+  local script_dir="${1:-}" own="" list="" count=0 c
+  ASRHUB_INSTALLATIONS=""
+  [[ -n "${DATA_DIR:-}" ]] && ASRHUB_DATA_DIR_SOURCE="key" || ASRHUB_DATA_DIR_SOURCE=""
+  if [[ -z "${PREFIX:-}" ]]; then
+    own="$(cd "${script_dir}/.." 2>/dev/null && pwd || true)"
+    if [[ -n "${own}" ]] && is_installation "${own}"; then
+      PREFIX="${own}"
+    else
+      list="$(known_installations || true)"
+      [[ -n "${list}" ]] && count="$(printf '%s\n' "${list}" | grep -c . || true)"
+      if [[ "${count}" -eq 1 ]]; then
+        PREFIX="${list}"
+      elif [[ "${count}" -gt 1 ]]; then
+        ASRHUB_INSTALLATIONS="${list}"
+        return 0
+      else
+        for c in "/opt/asrhub" "${HOME}/.local/share/asrhub-app" \
+                 "${HOME}/Library/Application Support/ASRHub"; do
+          [[ -d "${c}/server" ]] && { PREFIX="${c}"; break; }
+        done
+      fi
+    fi
+  fi
+  PREFIX="${PREFIX%/}"
+  if [[ -z "${DATA_DIR:-}" && -n "${PREFIX}" ]]; then
+    if DATA_DIR="$(install_marker_value "${PREFIX}" data_dir)"; then
+      ASRHUB_DATA_DIR_SOURCE="marker"
+    elif DATA_DIR="$(data_dir_for "${PREFIX}")"; then
+      ASRHUB_DATA_DIR_SOURCE="service"
+    else
+      DATA_DIR=""
+    fi
+  fi
+  if [[ -z "${DATA_DIR:-}" ]]; then
+    for c in "/var/lib/asrhub" "${HOME}/.local/share/asrhub" \
+             "${HOME}/Library/Application Support/ASRHub/data"; do
+      [[ -d "${c}" ]] && { DATA_DIR="${c}"; ASRHUB_DATA_DIR_SOURCE="guess"; break; }
+    done
+  fi
+  if [[ -z "${SERVICE_NAME:-}" && -n "${PREFIX}" ]]; then
+    SERVICE_NAME="$(service_name_for "${PREFIX}" || true)"
+  fi
+  return 0
+}
+
+# Сообщение для «установок несколько, какую — не сказано».
+explain_ambiguous_installation() {
+  local line
+  error "На машине несколько установок ASR Hub — какую именно, не сказано:"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && printf '    %s\n' "${line}" >&2
+  done <<<"${ASRHUB_INSTALLATIONS}"
+  hint "Запустите сценарий из каталога нужной установки (bash <каталог>/scripts/$(basename "$0"))"
+  hint "или укажите её ключом --prefix."
 }
 
 # Адрес, порт или пользователь службы, которая уже стоит для этого каталога.
@@ -2287,11 +2642,11 @@ service_name_for() {
 # `--host 127.0.0.1` после повторного запуска открывалась в сеть. Юнит чужой
 # установки (другой каталог программы) не в счёт. Пусто — ничего не нашли.
 installed_service_value() {
-  local name="${1:-asrhub}" prefix="${2:-}" what="${3:-}" unit="" value="" line=""
+  local name="${1:-asrhub}" prefix="${2:-}" what="${3:-}" unit="" value="" line="" dir
   prefix="${prefix%/}"
   case "${what}" in host|port|user) ;; *) return 1 ;; esac
-  for unit in "/etc/systemd/system/${name}.service" \
-              "${HOME}/.config/systemd/user/${name}.service"; do
+  while IFS= read -r dir; do
+    unit="${dir}/${name}.service"
     [[ -r "${unit}" ]] || continue
     if [[ -n "${prefix}" ]] && ! grep -qF -- "${prefix}/" "${unit}" 2>/dev/null \
        && ! grep -qF -- "${prefix// /\\x20}/" "${unit}" 2>/dev/null; then
@@ -2305,9 +2660,10 @@ installed_service_value() {
                | sed -E "s/^--${what}[= ]+//" || true)"
     fi
     [[ -n "${value}" ]] && { printf '%s' "${value}"; return 0; }
-  done
+  done < <(asrhub_unit_dirs)
   # macOS: строка запуска лежит в plist по одному аргументу на <string>.
-  local plist="${HOME}/Library/LaunchAgents/com.asrhub.server.plist"
+  local plist
+  plist="$(plist_path_for "${name}")"
   if [[ "${what}" != "user" && -r "${plist}" ]] \
      && { [[ -z "${prefix}" ]] || grep -qF -- "${prefix}/" "${plist}" 2>/dev/null; }; then
     value="$(tr -d '\n\r\t' < "${plist}" 2>/dev/null \
@@ -2318,22 +2674,66 @@ installed_service_value() {
   return 1
 }
 
+# Процесс, который слушает TCP-порт: номер. Пусто — выяснить нечем (ss без
+# прав не показывает чужие процессы).
+listener_pid() {
+  local port="$1" line="" pid=""
+  if have ss; then
+    line="$(set +o pipefail; ss -ltnp 2>/dev/null \
+            | awk -v p=":${port}" 'substr($4, length($4) - length(p) + 1) == p' | head -1 || true)"
+    pid="$(grep -oE 'pid=[0-9]+' <<<"${line}" | head -1 | cut -d= -f2 || true)"
+  elif have lsof; then
+    pid="$(set +o pipefail; lsof -nP -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+  fi
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${pid}"
+}
+
+# Строка запуска процесса.
+process_command() {
+  local pid="$1"
+  if [[ -r "/proc/${pid}/cmdline" ]]; then
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true
+  else
+    ps -o command= -p "${pid}" 2>/dev/null || true
+  fi
+}
+
 # Занят ли порт нашим же сервером из этого каталога.
 #
-#   port_is_ours ПОРТ [КАТАЛОГ_ПРОГРАММЫ]
+#   port_is_ours ПОРТ [КАТАЛОГ_ПРОГРАММЫ] [ИМЯ_СЛУЖБЫ]
 #
 # Чаще всего так и есть: установщик запускают повторно, чтобы доставить
-# движок или починить окружение, и сервер при этом работает. Порт
-# спрашивается прямо (http_probe): отвечает ASR Hub, а каталог установки уже
-# есть — значит, это мы, и переезжать на соседний порт незачем.
+# движок или починить окружение, и сервер при этом работает — переезжать на
+# соседний порт незачем. Но «на порту отвечает ASR Hub» ещё не значит «наш»:
+# прежняя проверка признавала своим и сервер соседней установки, и мастер
+# второй установки оставлял ей порт первой — две службы на одном порту.
+# Поэтому своим считается процесс, запущенный из этого каталога программы,
+# а если процесс узнать нечем — порт, на который настроена служба установки.
 port_is_ours() {
-  local port="${1:-}" prefix="${2:-${PREFIX:-}}"
-  [[ -n "${prefix}" && -d "${prefix}" ]] || return 1
+  local port="${1:-}" prefix="${2:-${PREFIX:-}}" name="${3:-${SERVICE_NAME:-}}"
+  local pid="" command_line="" configured=""
+  prefix="${prefix%/}"
+  [[ -n "${prefix}" && -d "${prefix}" && "${port}" =~ ^[0-9]{1,5}$ ]] || return 1
   http_probe "http://127.0.0.1:${port}/api/health" 3 || return 1
-  case "${HTTP_BODY}" in
-    *asrhub*|*ASR*|*'"status"'*) return 0 ;;
-  esac
-  return 1
+  case "${HTTP_BODY}" in *'"status"'*) ;; *) return 1 ;; esac
+  if pid="$(listener_pid "${port}")"; then
+    command_line="$(process_command "${pid}")"
+    case "${command_line}" in
+      *"${prefix}/"*) return 0 ;;
+      *docker-proxy*|*com.docker*|*vpnkit*)
+        # Порт держит Docker: наш ли контейнер — скажет .env установки.
+        [[ "$(grep -E '^ASRHUB_PORT=' "${prefix}/docker/.env" 2>/dev/null \
+              | cut -d= -f2 | tr -d "\"' \r" | head -1)" == "${port}" ]] && return 0
+        return 1 ;;
+      "") ;;
+      *) return 1 ;;
+    esac
+  fi
+  [[ -n "${name}" ]] || name="$(service_name_for "${prefix}" || true)"
+  [[ -n "${name}" ]] || return 1
+  configured="$(installed_service_value "${name}" "${prefix}" port || true)"
+  [[ "${configured}" == "${port}" ]]
 }
 
 # Значение верхнего уровня или секции из config.yaml: `server_port: 8081`.

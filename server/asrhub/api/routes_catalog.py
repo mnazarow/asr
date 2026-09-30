@@ -151,12 +151,23 @@ def download_model(request: Request, model_id: str,
                 engine = VoskEngine(spec, {})
                 entry["message"] = "загрузка архива"
                 engine.download({"models_dir": str(models_dir)})
+            elif spec.engine == "gigaam":
+                # Веса GigaAM — файл .ckpt с CDN библиотеки. Снапшот
+                # репозитория на Hugging Face, который качался здесь раньше,
+                # загрузчик не открывает: модель оставалась «не загружена».
+                from ..engines.gigaam_engine import download_weights
+
+                entry["message"] = "загрузка весов GigaAM"
+                download_weights(spec.source, spec.revision or "", models_dir)
             else:
                 from huggingface_hub import snapshot_download  # type: ignore
 
                 entry["message"] = "загрузка с Hugging Face"
+                # Репозиторий, а не короткое имя: у faster-whisper источник
+                # «small» — это Systran/faster-whisper-small.
                 snapshot_download(
-                    repo_id=spec.source, revision=spec.revision or None,
+                    repo_id=model_files.huggingface_repo(spec.source),
+                    revision=spec.revision or None,
                     cache_dir=str(models_dir),
                     token=state.settings.hf_token or None)
             entry.update(status="completed", progress=1.0, message="готово")

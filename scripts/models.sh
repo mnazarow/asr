@@ -54,11 +54,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "${PREFIX}" ]] && for c in "/opt/asrhub" "${HOME}/.local/share/asrhub-app" \
-  "${HOME}/Library/Application Support/ASRHub" "$(cd "${SCRIPT_DIR}/.." && pwd)"; do
-  [[ -d "${c}/server" ]] && { PREFIX="${c}"; break; }; done
-[[ -z "${DATA_DIR}" ]] && for c in "/var/lib/asrhub" "${HOME}/.local/share/asrhub" \
-  "${HOME}/Library/Application Support/ASRHub/data"; do [[ -d "${c}" ]] && { DATA_DIR="${c}"; break; }; done
+# Какую установку обслуживать: ту, из которой запущен сценарий (её каталог
+# данных — из метки установки или её службы). Раньше — первую из списка
+# стандартных каталогов, и `models.sh download` второй установки качал через
+# окружение первой в её каталог моделей.
+resolve_installation "${SCRIPT_DIR}"
+if [[ -n "${ASRHUB_INSTALLATIONS}" ]]; then
+  case "${ACTION}" in
+    list|info|disk) : ;;
+    *) explain_ambiguous_installation; exit 2 ;;
+  esac
+fi
+# Запуск из исходников без установки — работаем по ним самим: каталог и
+# справочник моделей есть и там.
+[[ -z "${PREFIX}" ]] && PREFIX="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_DIR="${DATA_DIR:-${HOME}/.local/share/asrhub}"
 MODELS_DIR="${DATA_DIR}/models"
 
@@ -67,7 +76,7 @@ PY="${PREFIX}/venv/bin/python"
 
 run_python() {
   ( cd "${PREFIX}/server" 2>/dev/null || cd "${SCRIPT_DIR}/../server" ; \
-    ASRHUB_MODELS_DIR="${MODELS_DIR}" PYTHONPATH="." "${PY}" - "$@" )
+    ASRHUB_MODELS_DIR="${MODELS_DIR}" PYTHONPATH=".${PYTHONPATH:+:${PYTHONPATH}}" "${PY}" - "$@" )
 }
 
 # ---------------------------------------------------------------------------
@@ -236,33 +245,25 @@ if spec.gated:
 # download_root. То есть команда отрабатывала успешно, место занимала, а
 # движок потом всё равно шёл в интернет — или падал, если интернета нет.
 if spec.engine == "gigaam":
-    try:
-        import gigaam
-    except ModuleNotFoundError:
-        print("Движок gigaam не установлен.")
-        print("Установите: bash scripts/models.sh install-engine gigaam")
-        raise SystemExit(1)
-    from asrhub.engines.gigaam_engine import variant_name, weights_file
-    name = variant_name(spec.source, spec.revision or "")
-    root = str(models_dir)
+    # Загрузка — та же функция, что у раздела «Модели»: качается ровно тот
+    # файл, который потом возьмёт движок.
+    from asrhub.engines.gigaam_engine import download_weights, variant_name, weights_file
+    from asrhub.errors import DependencyMissing
     target = models_dir / weights_file(spec.source, spec.revision or "")
     if target.exists() and not force:
         print(f"Уже загружено: {target}")
         raise SystemExit(0)
-    print(f"Скачивание варианта «{name}» в {root}")
+    print(f"Скачивание варианта «{variant_name(spec.source, spec.revision or '')}» в {models_dir}")
     try:
-        # Свои же помощники библиотеки качают только файлы. Если их
-        # переименуют — грузим модель целиком: медленнее, но верно.
-        if hasattr(gigaam, "_download_model"):
-            gigaam._download_model(name, root)
-            if hasattr(gigaam, "_download_tokenizer"):
-                gigaam._download_tokenizer(name, root)
-        else:
-            gigaam.load_model(name, device="cpu", download_root=root)
+        target = download_weights(spec.source, spec.revision or "", models_dir)
+    except DependencyMissing:
+        print("Движок gigaam не установлен.")
+        print("Установите: bash scripts/models.sh install-engine gigaam")
+        raise SystemExit(1)
     except Exception as exc:
         print(f"\nОшибка загрузки: {exc}")
         raise SystemExit(1)
-    print(f"Готово: {target if target.exists() else root}")
+    print(f"Готово: {target if target.exists() else models_dir}")
     raise SystemExit(0)
 
 if spec.source.startswith("http"):
@@ -274,7 +275,7 @@ if spec.source.startswith("http"):
     def hook(block, block_size, total):
         if total > 0:
             done = min(100, block * block_size * 100 // total)
-            print(f"\\r  {done:3d} %", end="", flush=True)
+            print(f"\r  {done:3d} %", end="", flush=True)
     urllib.request.urlretrieve(spec.source, archive, reporthook=hook)
     print()
     print("Распаковка…")
@@ -290,27 +291,33 @@ except ModuleNotFoundError:
     print("Не установлен huggingface_hub. Установите: pip install huggingface_hub")
     raise SystemExit(1)
 
-print(f"Скачивание {spec.source}" + (f" (ветка {spec.revision})" if spec.revision else ""))
+# Репозиторий — из той же таблицы, по которой сервер ищет веса: у
+# faster-whisper источник — короткое имя («small»), а качать надо
+# Systran/faster-whisper-small. Раньше запрашивался репозиторий «small»,
+# и отказ Hugging Face разбирался как «модель закрыта лицензией».
+from asrhub.model_files import huggingface_repo
+repo = huggingface_repo(spec.source)
+print(f"Скачивание {repo}" + (f" (ветка {spec.revision})" if spec.revision else ""))
 print(f"Ожидаемый размер: примерно {spec.disk_mb or '?'} МБ")
 try:
     path = snapshot_download(
-        repo_id=spec.source, revision=spec.revision or None,
+        repo_id=repo, revision=spec.revision or None,
         cache_dir=str(models_dir), force_download=force,
         token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
 except Exception as exc:
     text = str(exc).lower()
-    print(f"\\nОшибка загрузки: {exc}")
+    print(f"\nОшибка загрузки: {exc}")
     if "401" in text or "gated" in text or "authenticated" in text:
-        print("\\nМодель закрыта лицензией. Что делать:")
-        print(f"  1. Откройте https://huggingface.co/{spec.source} и примите условия")
+        print("\nМодель закрыта лицензией. Что делать:")
+        print(f"  1. Откройте https://huggingface.co/{repo} и примите условия")
         print("  2. Создайте токен: https://huggingface.co/settings/tokens")
         print("  3. export HF_TOKEN=hf_xxxxx и повторите")
     elif "connection" in text or "timeout" in text or "resolve" in text:
-        print("\\nПроблема с сетью. Проверьте доступ к huggingface.co.")
+        print("\nПроблема с сетью. Проверьте доступ к huggingface.co.")
         print("Если сервер закрыт, скачайте модель на другой машине и перенесите")
         print(f"каталог {models_dir} целиком.")
     elif "space" in text or "no space" in text:
-        print("\\nНа диске не хватает места.")
+        print("\nНа диске не хватает места.")
     raise SystemExit(1)
 print(f"Готово: {path}")
 PYEOF
@@ -518,6 +525,9 @@ remove-engine)
   ENGINE="${ARGS[0]:?Укажите движок}"
   REQ="${SCRIPT_DIR}/../requirements/engines/${ENGINE//_/-}.txt"
   [[ -f "${REQ}" ]] || { error "Нет файла зависимостей для «${ENGINE}»."; exit 2; }
+  # Путь без «scripts/..»: ниже он сравнивается со списком find, и в
+  # ненормализованном виде свои файлы попали бы в «чужие».
+  REQ="$(cd "$(dirname "${REQ}")" && pwd)/$(basename "${REQ}")"
   VPIP="${PREFIX}/venv/bin/pip"
   # Читаем и файл-спутник: движок, поставленный из репозитория, перечислен
   # только в нём, и без этого «remove-engine gigaam» снимал зависимости, а
@@ -535,13 +545,71 @@ remove-engine)
   # этой строки движок снимался без собственной нормализации чисел — её
   # пакет оставался в окружении сиротой.
   OPTIONAL_NODEPS="$(dirname "${REQ}")/optional/no-deps/$(basename "${REQ}")"
-  PACKAGES="$(cat "${REQ}" "${NODEPS}" "${OPTIONAL}" "${OPTIONAL_NODEPS}" 2>/dev/null \
-    | grep -vE '^\s*(#|$|-)' \
-    | sed -e 's/#.*//' -e 's/[[:space:]]*@.*//' -e 's/[[<>=!~;].*//' -e 's/[[:space:]]*$//' \
-    | tr '\n' ' ' || true)"
+  OWN_NAMES="$(requirement_names "${REQ}" "${NODEPS}" "${OPTIONAL}" "${OPTIONAL_NODEPS}")"
+  # Пакеты, которые нужны кому-то ещё — серверу (base.txt) и другим движкам,
+  # — не трогаем. Раньше снималось всё из файлов движка подряд:
+  # `remove-engine postprocess` удалял huggingface-hub, на котором держатся
+  # загрузка моделей и faster-whisper, `remove-engine gigaam` — soundfile и
+  # numpy из base.txt, `remove-engine faster_whisper` — onnxruntime, общий с
+  # gigaam, tone и postprocess.
+  REQ_ALL="$(cd "$(dirname "${REQ}")/.." && pwd)"
+  SHARED_FILES=()
+  while IFS= read -r _file; do
+    case "${_file}" in
+      "${REQ}"|"${NODEPS}"|"${OPTIONAL}"|"${OPTIONAL_NODEPS}") continue ;;
+    esac
+    SHARED_FILES+=("${_file}")
+  done < <(find "${REQ_ALL}" -name '*.txt' 2>/dev/null | LC_ALL=C sort)
+  SHARED_NAMES="$(requirement_names ${SHARED_FILES[@]+"${SHARED_FILES[@]}"})"
+  PACKAGES=""
+  KEPT=""
+  while IFS= read -r _name; do
+    [[ -n "${_name}" ]] || continue
+    if grep -qxF -- "${_name}" <<<"${SHARED_NAMES}"; then
+      KEPT="${KEPT} ${_name}"
+    else
+      PACKAGES="${PACKAGES} ${_name}"
+    fi
+  done <<<"${OWN_NAMES}"
+  PACKAGES="${PACKAGES# }"
+  # Нужные не по спискам, а по факту: numpy, regex и им подобные в файлах
+  # движка стоят, а держатся на них onnxruntime, soundfile, torch —
+  # транзитивно, и никакой файл требований этого не называет. Спрашиваем
+  # pip, кто их требует, и оставляем всё, что нужно пакету вне удаляемых —
+  # до неподвижной точки: оставленный тянет за собой свои зависимости.
+  if [[ -n "${PACKAGES}" && -x "${VPIP}" ]]; then
+    # shellcheck disable=SC2086
+    REQUIRED_BY="$("${VPIP}" show ${PACKAGES} 2>/dev/null | awk '
+      /^Name:/        { name = tolower($2); gsub(/[_.]/, "-", name) }
+      /^Required-by:/ { sub(/^Required-by:[ ]*/, ""); gsub(/,/, " "); print name ":" tolower($0) }' || true)"
+    CHANGED=1
+    while [[ "${CHANGED}" -eq 1 ]]; do
+      CHANGED=0
+      NEXT=""
+      for _name in ${PACKAGES}; do
+        _users="$(sed -n "s/^${_name}://p" <<<"${REQUIRED_BY}" | tr '_.' '--' | head -1)"
+        _keep=0
+        for _user in ${_users}; do
+          [[ " ${PACKAGES} " == *" ${_user} "* ]] || { _keep=1; break; }
+        done
+        if [[ "${_keep}" -eq 1 ]]; then
+          KEPT="${KEPT} ${_name}"; CHANGED=1
+        else
+          NEXT="${NEXT} ${_name}"
+        fi
+      done
+      PACKAGES="${NEXT# }"
+    done
+  fi
+  KEPT="${KEPT# }"
+  [[ -n "${KEPT}" ]] && info "Остаются — нужны серверу или другим пакетам: ${KEPT}"
+  if [[ -z "${PACKAGES}" ]]; then
+    ok "Своих пакетов у движка «${ENGINE}» нет — удалять нечего."
+    exit 0
+  fi
   info "Будут удалены пакеты: ${PACKAGES}"
-  warn "Некоторые пакеты могут использоваться другими движками."
   confirm "Продолжить?" "n" || exit 0
+  # shellcheck disable=SC2086  # список пакетов — через пробел
   run "${VPIP}" uninstall -y ${PACKAGES} || warn "Часть пакетов удалить не удалось."
   ok "Движок «${ENGINE}» удалён"
   # Удаление ломает окружение не реже установки: предупреждение выше говорит

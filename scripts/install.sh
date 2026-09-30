@@ -48,6 +48,7 @@ RESET_CONFIG=0
 # установке берутся у стоящей службы, а не из умолчаний.
 PORT_EXPLICIT=""
 HOST_EXPLICIT=""
+NAME_EXPLICIT=""
 SKIP_MODELS=0
 # Заполняется только в нативном режиме, а читается в самом конце для обоих.
 # Без этой строки docker-режим падал под `set -o nounset` уже после слов
@@ -193,7 +194,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)     ASRHUB_DRY_RUN=1; shift ;;
     # Имя службы. Нужно, когда на машине больше одной установки: без него
     # вторая переписывала юнит первой (/etc/systemd/system/asrhub.service).
-    --name)        SERVICE_NAME="$2"; shift 2 ;;
+    --name)        SERVICE_NAME="${2:?нужно имя службы}"; NAME_EXPLICIT=1; shift 2 ;;
     --no-stream)   STREAM_ENABLED="false"; shift ;;
     # Не ставить Python самим, даже если найденный слишком новый.
     --no-python-install) PYTHON_INSTALL=0; shift ;;
@@ -217,6 +218,19 @@ enable_error_handling
 setup_logging "${TMPDIR:-/tmp}"
 print_banner
 
+# Ключи, которые уходят в юнит службы, проверяем сразу: `--port abc`
+# проходил молча и попадал в строку запуска — служба падала при старте, а
+# установка отчитывалась об успехе.
+if [[ -n "${PORT_EXPLICIT}" ]] && { ! [[ "${PORT}" =~ ^[0-9]{1,5}$ ]] || (( PORT < 1 || PORT > 65535 )); }; then
+  error "Неверный порт: ${PORT} — нужно число от 1 до 65535."
+  exit 2
+fi
+if [[ -n "${NAME_EXPLICIT}" && ! "${SERVICE_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]; then
+  error "Неверное имя службы: ${SERVICE_NAME}"
+  hint "Латинские буквы, цифры и знаки «_.@-», не длиннее 64 символов: --name asrhub2"
+  exit 2
+fi
+
 OS="$(detect_os)"
 ARCH="$(detect_arch)"
 ACCEL="$(detect_gpu)"
@@ -227,11 +241,34 @@ GPU_PENDING_DRIVER=0
 [[ "${GPU_DRIVER}" != "none" && "${OS}" == "linux" ]] && GPU_PENDING_DRIVER=1
 [[ -z "${PROFILE}" ]] && PROFILE="$(recommend_profile "${GPU_PENDING_DRIVER}")"
 
+# Установщик, запущенный из стоящей установки, ставит поверх НЕЁ. Подсказки
+# для починки окружения печатают «bash <каталог>/scripts/install.sh --force»,
+# а без этой проверки такая команда для второй установки (/opt/asrhub2)
+# переустанавливала первую — каталог по умолчанию.
+if [[ -z "${PREFIX}" ]]; then
+  _OWN="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  if is_installation "${_OWN}"; then
+    PREFIX="${_OWN}"
+    [[ -z "${DATA_DIR}" ]] && DATA_DIR="$(data_dir_for "${PREFIX}" || true)"
+    [[ -z "${SERVICE_NAME:-}" ]] && SERVICE_NAME="$(service_name_for "${PREFIX}" || true)"
+    info "Установка поверх той, из которой запущен установщик: ${PREFIX}"
+  fi
+  unset _OWN
+fi
 if [[ -z "${PREFIX}" ]]; then
   case "${OS}" in
     macos) PREFIX="${HOME}/Library/Application Support/ASRHub" ;;
     *)     if is_root; then PREFIX="/opt/asrhub"; else PREFIX="${HOME}/.local/share/asrhub-app"; fi ;;
   esac
+fi
+PREFIX="${PREFIX%/}"
+# Установка поверх стоящей без --data и --name: каталог данных и служба —
+# её собственные, из метки или юнита, а не умолчания.
+if [[ -z "${DATA_DIR}" && -d "${PREFIX}" ]]; then
+  DATA_DIR="$(data_dir_for "${PREFIX}" || true)"
+fi
+if [[ -z "${SERVICE_NAME:-}" && -d "${PREFIX}" ]]; then
+  SERVICE_NAME="$(service_name_for "${PREFIX}" || true)"
 fi
 if [[ -z "${DATA_DIR}" ]]; then
   case "${OS}" in
@@ -430,7 +467,7 @@ run_wizard() {
   # Порт, занятый нашим же сервером, — не повод предлагать соседний: Enter
   # переносил повторно устанавливаемый сервер на другой порт, мимо всех
   # настроенных клиентов и агентов на станциях.
-  check_port_free "${PORT}" || port_is_ours "${PORT}" "${PREFIX}" \
+  check_port_free "${PORT}" || port_is_ours "${PORT}" "${PREFIX}" "${SERVICE_NAME}" \
     || suggested_port="$(find_free_port "${PORT}")"
   wizard_ask PORT "Порт сервера" "${suggested_port}" wizard_valid_port
 
@@ -616,6 +653,22 @@ else
   ok "Docker доступен"
 fi
 
+# Служба с этим именем уже стоит и работает из ДРУГОГО каталога — это чужая
+# установка. Без этой проверки вторая установка без --name переписывала
+# юнит первой (asrhub.service) на свой каталог, порт и адрес, и первая
+# после перезагрузки больше не поднималась.
+if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
+  _OTHER="$(asrhub_services | awk -F'\t' -v n="${SERVICE_NAME}" -v p="${PREFIX}" \
+            '$1 == n && $2 != p { print $2; exit }' || true)"
+  if [[ -n "${_OTHER}" ]]; then
+    error "Служба «${SERVICE_NAME}» уже обслуживает другую установку: ${_OTHER}"
+    hint "Для этой установки (${PREFIX}) задайте своё имя службы: --name ${SERVICE_NAME}2"
+    hint "Переустановить ту — запустите установщик из неё: bash '${_OTHER}/scripts/install.sh' --force"
+    exit 2
+  fi
+  unset _OTHER
+fi
+
 check_disk_space "${DATA_DIR}" "$(profile_disk_gb "${PROFILE}")"
 check_memory 8
 
@@ -632,7 +685,7 @@ if ! check_port_free "${PORT}"; then
   PORT_IS_OURS=0
   # Спрашиваем сам порт (http_probe внутри port_is_ours): если там отвечает
   # ASR Hub и установка идёт в тот же каталог — это мы.
-  port_is_ours "${PORT}" "${PREFIX}" && PORT_IS_OURS=1
+  port_is_ours "${PORT}" "${PREFIX}" "${SERVICE_NAME}" && PORT_IS_OURS=1
   if [[ "${PORT_IS_OURS}" -eq 1 ]]; then
     info "Порт ${PORT} занят уже установленным ASR Hub — так и должно быть."
     hint "Служба будет перезапущена на том же порту в конце установки."
@@ -723,8 +776,13 @@ if [[ "${MODE}" == "native" && "${OFFLINE}" -eq 0 ]]; then
   for _engine in "${_engine_list[@]}"; do
     _engine="$(printf '%s' "${_engine}" | tr -d ' ')"
     [[ -z "${_engine}" ]] && continue
+    # Строка «пакет @ git+https://…» бывает и в основном файле движка (tone,
+    # moonshine), и в спутнике no-deps (gigaam). Раньше смотрели только
+    # спутник, и tone с moonshine падали на клонировании без git.
     _nodeps="${REPO_DIR}/requirements/engines/no-deps/${_engine//_/-}.txt"
-    if [[ -f "${_nodeps}" ]] && grep -q 'git+' "${_nodeps}" 2>/dev/null; then
+    _main="${REPO_DIR}/requirements/engines/${_engine//_/-}.txt"
+    if { [[ -f "${_nodeps}" ]] && grep -q 'git+' "${_nodeps}" 2>/dev/null; } \
+       || { [[ -f "${_main}" ]] && grep -q 'git+' "${_main}" 2>/dev/null; }; then
       _needs_git="${_needs_git:+${_needs_git}, }${_engine}"
     fi
   done
@@ -736,7 +794,7 @@ if [[ "${MODE}" == "native" && "${OFFLINE}" -eq 0 ]]; then
       exit 127
     fi
   fi
-  unset _needs_git _engine _engine_list _nodeps
+  unset _needs_git _engine _engine_list _nodeps _main
 fi
 
 # Каталог для временных файлов: pip распаковывает и собирает пакеты в нём, а
@@ -1034,7 +1092,13 @@ else
       info "Окружение собрано на Python ${VENV_PY_VERSION}, а ставим на ${WANT_PY_VERSION}."
       hint "Пакеты придётся установить заново — иначе движки останутся от прошлой версии."
       if [[ "${FORCE}" -eq 1 ]] || confirm "Пересобрать окружение?" "y"; then
-        run rm -rf "${VENV}"
+        # Не удаляем сразу, а откладываем, как при --force: сорвётся сборка
+        # нового — откат вернёт прежнее, а не оставит установку без окружения.
+        VENV_OLD="${VENV}.before-force"
+        run rm -rf "${VENV_OLD}"
+        run mv "${VENV}" "${VENV_OLD}"
+        add_rollback "rm -rf '${VENV}' && mv '${VENV_OLD}' '${VENV}'"
+        hint "Прежнее отложено в ${VENV_OLD} и удалится в конце установки."
       else
         warn "Оставляем окружение на Python ${VENV_PY_VERSION}."
         hint "Движки, которых нет под эту версию, так и не установятся."
@@ -1355,7 +1419,7 @@ fi
 if [[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" && "${MODE}" == "native" ]]; then
   info "Установка выравнивания «${ALIGNMENT}»…"
   if ! ASRHUB_DATA_DIR="${DATA_DIR}" run bash "${PREFIX}/scripts/models.sh" \
-       install-engine "${ALIGNMENT}" --prefix "${PREFIX}"; then
+       install-engine "${ALIGNMENT}" --prefix "${PREFIX}" --data "${DATA_DIR}"; then
     warn "Выравнивание не установлено — распознавание это не затронет."
     hint "Повторить позже: bash ${PREFIX}/scripts/models.sh install-engine ${ALIGNMENT}"
   fi
@@ -1372,9 +1436,13 @@ if [[ -n "${MODELS}" && "${SKIP_MODELS}" -eq 0 && "${MODE}" == "native" ]]; then
     model="$(printf '%s' "${model}" | tr -d ' ')"
     [[ -z "${model}" ]] && continue
     info "Модель: ${model}"
-    if ! ASRHUB_DATA_DIR="${DATA_DIR}" run bash "${PREFIX}/scripts/models.sh" download "${model}"; then
+    # Каталог программы и данных — явно: без --prefix models.sh искал
+    # установку сам, и на машине со второй установкой загрузка шла через
+    # окружение первой.
+    if ! ASRHUB_DATA_DIR="${DATA_DIR}" run bash "${PREFIX}/scripts/models.sh" download "${model}" \
+         --prefix "${PREFIX}" --data "${DATA_DIR}"; then
       warn "  не удалось загрузить ${model} — можно повторить позже:"
-      hint "  bash ${PREFIX}/scripts/models.sh download ${model}"
+      hint "  bash '${PREFIX}/scripts/models.sh' download ${model}"
     fi
   done
 else
@@ -1443,6 +1511,29 @@ if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
     fi
   fi
 
+  # Доступ к видеокартам AMD и Intel идёт через группы render и video
+  # (/dev/kfd, /dev/dri/renderD*). Установка драйвера добавляла в них того,
+  # кто запустил sudo, а пользователь службы заводится позже и оставался без
+  # доступа: проба от root проходила, в config.yaml писалось «rocm», а
+  # служба роняла каждое задание.
+  if [[ -n "${SERVICE_USER}" && "${SERVICE_USER}" != "root" && "${OS}" == "linux" ]] && is_root \
+     && { [[ -e /dev/kfd ]] || compgen -G '/dev/dri/renderD*' >/dev/null; } && have usermod; then
+    _GPU_GROUPS=""
+    for _g in render video; do
+      getent group "${_g}" >/dev/null 2>&1 || continue
+      id -nG "${SERVICE_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "${_g}" && continue
+      _GPU_GROUPS="${_GPU_GROUPS:+${_GPU_GROUPS},}${_g}"
+    done
+    if [[ -n "${_GPU_GROUPS}" ]]; then
+      if run usermod -a -G "${_GPU_GROUPS}" "${SERVICE_USER}"; then
+        ok "Пользователь ${SERVICE_USER} добавлен в группы ${_GPU_GROUPS} — для доступа к видеокарте."
+      else
+        warn "Не удалось добавить ${SERVICE_USER} в группы ${_GPU_GROUPS}: видеокарта службе может быть недоступна."
+      fi
+    fi
+    unset _GPU_GROUPS _g
+  fi
+
   bash "${SCRIPT_DIR}/service.sh" install \
     --prefix "${PREFIX}" --data "${DATA_DIR}" \
     --port "${PORT}" --host "${HOST}" --name "${SERVICE_NAME}" \
@@ -1470,7 +1561,7 @@ fi
 # на машине, где распознавание не работает вовсе: /api/health не спрашивает
 # видеокарту, а первое задание спросит.
 if [[ "${MODE}" == "native" && -x "${VENV}/bin/python" ]]; then
-  gpu_runtime_report "${VENV}/bin/python" "${DATA_DIR}" "${PREFIX}/server" asrhub || true
+  gpu_runtime_report "${VENV}/bin/python" "${DATA_DIR}" "${PREFIX}/server" "${SERVICE_NAME}" || true
 fi
 
 HEALTH_RC=0
@@ -1489,10 +1580,13 @@ else
   esac
   # Служба уже поставлена — спрашиваем порт у неё: если установка выбрала
   # другой (занятый порт, ручной ключ), файл и служба могут разойтись.
+  # Имя службы — этой установки: без него порт и состояние спрашивались у
+  # службы «asrhub», то есть у первой установки, и проверка второй
+  # сообщала «сервер отвечает», даже если та не поднялась.
   PROBE_PORT="$(server_port_hint "${DATA_DIR}" "${PREFIX}" \
-                "$( [[ "${MODE}" == "docker" ]] && echo docker || echo native )")"
+                "$( [[ "${MODE}" == "docker" ]] && echo docker || echo native )" "${SERVICE_NAME}")"
   [[ "${PROBE_PORT}" =~ ^[0-9]{1,5}$ ]] || PROBE_PORT="${PORT}"
-  wait_for_health "${PROBE_PORT}" 60 asrhub "${PROBE_HOST}" || HEALTH_RC=$?
+  wait_for_health "${PROBE_PORT}" 60 "${SERVICE_NAME}" "${PROBE_HOST}" || HEALTH_RC=$?
 fi
 
 if [[ "${HEALTH_RC}" -eq 0 ]]; then
@@ -1508,10 +1602,21 @@ elif [[ "${HEALTH_RC}" -ne 3 ]]; then
   # сценарий. Поэтому здесь разбор, а не выход с ошибкой.
   diagnose_server_down "${PROBE_PORT:-${PORT}}" "${PREFIX}" "${DATA_DIR}" \
     "$( [[ "${MODE}" == "docker" ]] && echo docker || echo native )" \
-    asrhub "${PROBE_HOST:-127.0.0.1}" || true
+    "${SERVICE_NAME}" "${PROBE_HOST:-127.0.0.1}" || true
 fi
 
 clear_rollback
+# Метка установки: по ней update.sh, uninstall.sh, doctor.sh, models.sh и
+# service.sh, запущенные из этого каталога, находят свои данные и свою
+# службу — и не трогают чужие.
+if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
+  MARKER_SERVICE="${SERVICE_NAME}"
+else
+  # Службы не создавали: в метку — только ту, что уже работает отсюда.
+  MARKER_SERVICE="$(service_unit_for "${PREFIX}" || true)"
+fi
+write_install_marker "${PREFIX}" "${DATA_DIR}" "${MARKER_SERVICE}" "${MODE}" || true
+unset MARKER_SERVICE
 # Новое окружение собрано и сервер проверен — отложенное прежнее больше не нужно.
 if [[ -n "${VENV_OLD:-}" && -d "${VENV_OLD}" ]]; then
   run rm -rf "${VENV_OLD}" || warn "Не удалось удалить ${VENV_OLD} — удалите вручную."
@@ -1530,11 +1635,14 @@ printf '  Каталог данных    %s\n' "${DATA_DIR}"
 printf '  Конфигурация      %s\n' "${CONFIG_FILE}"
 printf '  Журнал установки  %s\n' "${ASRHUB_LOG_FILE}"
 printf '\n%sЧто дальше%s\n' "${C_BOLD}" "${C_RESET}"
-printf '  Проверить окружение     bash %s/scripts/doctor.sh\n' "${PREFIX}"
-printf '  Управлять моделями      bash %s/scripts/models.sh list\n' "${PREFIX}"
-printf '  Управлять службой       bash %s/scripts/service.sh {start|stop|status|logs}\n' "${PREFIX}"
-printf '  Обновить                bash %s/scripts/update.sh\n' "${PREFIX}"
-printf '  Удалить                 bash %s/scripts/uninstall.sh\n' "${PREFIX}"
+# Команды — из каталога установки: по метке .asrhub-install каждая находит
+# свои данные и службу сама, и на машине с двумя установками команда второй
+# не тронет первую. Путь в кавычках: на macOS в нём «Application Support».
+printf "  Проверить окружение     bash '%s/scripts/doctor.sh'\n" "${PREFIX}"
+printf "  Управлять моделями      bash '%s/scripts/models.sh' list\n" "${PREFIX}"
+printf "  Управлять службой       bash '%s/scripts/service.sh' {start|stop|status|logs}\n" "${PREFIX}"
+printf "  Обновить                bash '%s/scripts/update.sh' --source /путь/к/новой/версии\n" "${PREFIX}"
+printf "  Удалить                 bash '%s/scripts/uninstall.sh'\n" "${PREFIX}"
 if [[ ${#FAILED_ENGINES[@]} -gt 0 ]]; then
   printf '\n%sНе установились движки: %s%s\n' "${C_YELLOW}" "${FAILED_ENGINES[*]}" "${C_RESET}"
   # Если окружение собрано на слишком новом Python, причина почти наверняка

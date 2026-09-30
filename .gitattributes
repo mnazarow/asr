@@ -1,0 +1,45 @@
+# Концы строк при клонировании на Windows.
+#
+# Git для Windows по умолчанию ставится с core.autocrlf=true и превращает LF
+# в CRLF во всех текстовых файлах. Для сценариев bash это смертельно: строка
+# «#!/usr/bin/env bash\r» ищет интерпретатор «bash\r», а каждая строка
+# кончается лишним \r — «$'\r': command not found». Хуже всего с
+# entrypoint.sh: его копирует в образ Dockerfile, и контейнер, собранный из
+# клона на Windows (Docker Desktop), не стартовал вовсе. Поэтому всё, что
+# исполняет bash или sh, — всегда с LF, на любой машине.
+*.sh                    text eol=lf
+scripts/client/asrctl   text eol=lf
+docker/entrypoint.sh    text eol=lf
+docker/Dockerfile       text eol=lf
+docker/*.yml            text eol=lf
+docker/nginx.conf       text eol=lf
+agent/*.py              text eol=lf
+
+# Остальной текст — как решит git (сценарии PowerShell читают и LF, и CRLF).
+*.py    text
+*.md    text
+*.txt   text
+*.yaml  text
+*.yml   text
+*.json  text
+*.js    text
+*.css   text
+*.html  text
+*.ps1   text
+*.psm1  text
+
+# Двоичное — без всякой правки концов строк.
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.docx  binary
+*.pdf   binary
+*.gz    binary
+*.zip   binary
+*.wav   binary
+*.mp3   binary
+*.ogg   binary
+*.flac  binary
