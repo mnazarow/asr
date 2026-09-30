@@ -135,7 +135,7 @@ usage() {
   cpu        Для сервера без видеокарты: faster-whisper + int8 + GigaAM ONNX
   standard   GigaAM v3 + faster-whisper (рекомендуется, около 8 ГБ)
   full       Все движки и основные модели (свыше 60 ГБ)
-  apple      whisper.cpp с Metal и Core ML для Apple Silicon
+  apple      whisper.cpp на Metal для Apple Silicon
   russian    Только русские модели: GigaAM v3, T-one, Vosk
 
 Примеры
@@ -436,7 +436,7 @@ run_wizard() {
     "cpu|Сервер без видеокарты|~4 ГБ. int8-квантизация. Час записи обрабатывается за час-полтора" \
     "standard|Стандартный набор|~8 ГБ. GigaAM v3 + faster-whisper. Лучший выбор для машины с GPU" \
     "russian|Только русский язык|~3 ГБ. GigaAM v3, T-one, Vosk. Ничего лишнего" \
-    "apple|MacBook на Apple Silicon|~3 ГБ. whisper.cpp с Metal и Core ML, работает от батареи" \
+    "apple|MacBook на Apple Silicon|~3 ГБ. whisper.cpp на Metal, работает от батареи" \
     "full|Всё сразу|60+ ГБ и час установки. Для сравнения моделей между собой"
 
   # Явно заданные --engines и --models мастер не перетирает.

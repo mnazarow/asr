@@ -43,6 +43,17 @@ def format_timestamp(seconds: float, style: str = "srt") -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
+def _время(seconds: float, settings: dict[str, Any]) -> str:
+    """Отметка времени в Markdown и Word — в формате `timestamp_format`.
+
+    Параметр был в каталоге, а выгрузки писали «ЧЧ:ММ:СС.мс» всегда. В
+    субтитрах формат задан их стандартом, в таблицах и JSON время — числом
+    секунд, поэтому параметр действует только здесь.
+    """
+    стиль = str(settings.get("timestamp_format") or "hms")
+    return format_timestamp(seconds, стиль if стиль in ("hms", "seconds", "srt") else "hms")
+
+
 def wrap_subtitle(text: str, max_width: int = 42, max_lines: int = 2) -> str:
     """Аккуратно разбивает реплику на строки субтитра по границам слов.
 
@@ -127,14 +138,14 @@ def to_markdown(result: dict[str, Any], settings: dict[str, Any]) -> str:
     lines.append(f"- **Язык:** {meta.get('language', '')}")
     dur = meta.get("duration_s")
     if dur:
-        lines.append(f"- **Длительность:** {format_timestamp(dur, 'hms')}")
+        lines.append(f"- **Длительность:** {_время(dur, settings)}")
     if meta.get("created_at"):
         lines.append(f"- **Обработано:** {meta['created_at']}")
     if result.get("summary"):
         lines += ["", "## Краткое содержание", "", result["summary"]]
     lines += ["", "## Текст", ""]
     for seg in result.get("segments", []):
-        stamp = format_timestamp(seg.get("start", 0), "hms")
+        stamp = _время(seg.get("start", 0), settings)
         prefix = _speaker_prefix(seg, settings)
         lines.append(f"**[{stamp}]** {prefix}{seg.get('text', '')}")
         lines.append("")
@@ -359,7 +370,7 @@ def to_docx(result: dict[str, Any], settings: dict[str, Any], path: Path) -> Pat
     info.add_run(f"{meta.get('language', '')}    ")
     if meta.get("duration_s"):
         info.add_run("Длительность: ").bold = True
-        info.add_run(format_timestamp(meta["duration_s"], "hms"))
+        info.add_run(_время(meta["duration_s"], settings))
     stamp = doc.add_paragraph()
     stamp.add_run(f"Обработано: {meta.get('created_at', datetime.now().strftime('%d.%m.%Y %H:%M'))}")
     for run in stamp.runs:
@@ -380,10 +391,10 @@ def to_docx(result: dict[str, Any], settings: dict[str, Any], path: Path) -> Pat
         para = doc.add_paragraph()
         if settings.get("include_speaker_labels", True) and speaker and speaker != prev_speaker:
             para.add_run(f"{speaker}").bold = True
-            para.add_run(f"  [{format_timestamp(seg.get('start', 0), 'hms')}]").font.size = Pt(8)
+            para.add_run(f"  [{_время(seg.get('start', 0), settings)}]").font.size = Pt(8)
             para = doc.add_paragraph()
         elif not speaker:
-            mark = para.add_run(f"[{format_timestamp(seg.get('start', 0), 'hms')}] ")
+            mark = para.add_run(f"[{_время(seg.get('start', 0), settings)}] ")
             mark.font.size = Pt(8)
             mark.font.color.rgb = RGBColor(0x90, 0x90, 0x90)
         para.add_run(text)

@@ -333,7 +333,7 @@ class Settings:
         # руками. Интерфейс, API и восстановление из копии приходят сюда же,
         # и каждому из них незачем знать про тип каталога.
         value = catalog.coerce_value(key, value)
-        ok, msg = catalog.validate_value(key, value)
+        ok, msg = catalog.validate_server_value(key, value)
         if not ok:
             raise ConfigError(msg)
         self.values[key] = value
@@ -833,7 +833,8 @@ def find_config_file(explicit: str | os.PathLike[str] | None = None) -> Path | N
         if not path.exists():
             raise ConfigError(
                 f"Файл конфигурации не найден: {path}",
-                hint="Создайте его командой: asrctl config init",
+                hint=("Пример со всеми параметрами и описаниями: "
+                      "python -m asrhub --print-config > config.yaml"),
             )
         return path
     env = os.environ.get(f"{ENV_PREFIX}CONFIG")
@@ -935,16 +936,23 @@ def load(config_path: str | os.PathLike[str] | None = None,
         # умолчание. Молчать об этом нельзя — иначе «я поправил настройку, а
         # она не работает». Проблемы кричат в трёх местах: ошибкой в журнале
         # при старте, красной полосой в интерфейсе и провалом `--check`.
+        for ключ in sorted(k for k in flat if k in catalog.УБРАННЫЕ):
+            flat.pop(ключ, None)
+            log.info("%s: параметр %s больше не существует и пропущен (%s)",
+                     cfg_file.name, ключ, catalog.УБРАННЫЕ[ключ])
         неизвестные = sorted(k for k in flat if k not in catalog.PARAMS_BY_KEY)
         if неизвестные:
+            # Подсказка — на то, что есть: раньше она отправляла к команде
+            # клиента «config schema», которой не было никогда.
             problems.append(
                 f"{cfg_file.name}: неизвестные параметры — {', '.join(неизвестные)}. "
-                "Они пропущены; полный список: asrctl config schema")
+                "Они пропущены; полный список параметров с описаниями: "
+                "GET /api/params или python -m asrhub --print-config")
             for ключ in неизвестные:
                 flat.pop(ключ, None)
         flat = catalog.coerce_all(flat)
         for key, value in flat.items():
-            ok, msg = catalog.validate_value(key, value)
+            ok, msg = catalog.validate_server_value(key, value)
             if not ok:
                 problems.append(
                     f"{cfg_file.name}: {msg}; записано «{_видимое(key, value)}». "
@@ -976,7 +984,7 @@ def load(config_path: str | os.PathLike[str] | None = None,
                             f"«{_видимое(name, env_val)}» ({exc}). Переменная пропущена")
             continue
         parsed = catalog.coerce_value(name, parsed)
-        ok, msg = catalog.validate_value(name, parsed)
+        ok, msg = catalog.validate_server_value(name, parsed)
         if not ok:
             problems.append(f"Переменная {env_key}: {msg}; "
                             f"записано «{_видимое(name, env_val)}». Переменная пропущена")

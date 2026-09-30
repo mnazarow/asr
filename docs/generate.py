@@ -219,7 +219,7 @@ def generate_models() -> str:
         "| Совещания с говорящими | `moss-transcribe-diarize` | ASR и диаризация в одной модели, 50+ языков |",
         "| Перевод речи | `canary-1b-v2` | ASR и перевод между английским и 24 языками |",
         "| Сервер без видеокарты | `faster-whisper-small` + int8 | Единственный практичный режим на процессоре |",
-        "| macOS на Apple Silicon | `whispercpp-large-v3-turbo-q5_0` | Metal и Core ML, 574 МБ на диске |",
+        "| macOS на Apple Silicon | `whispercpp-large-v3-turbo-q5_0` | Metal, 574 МБ на диске |",
         "| Редкие языки | `omnilingual-ctc-1b` | 1600+ языков, Apache-2.0 на код и веса |",
         "| Проверка установки | `demo-simulator` | Встроенный симулятор без загрузки весов |",
         "",

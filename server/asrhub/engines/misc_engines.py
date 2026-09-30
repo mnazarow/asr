@@ -141,11 +141,12 @@ class OmnilingualEngine(Engine):
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:
         info = probe(audio_path)
-        lang = str(settings.get("lang_code") or "")
-        if not lang:
-            base = self.language_for(settings) or "ru"
-            lang = {"ru": "rus_Cyrl", "en": "eng_Latn", "uk": "ukr_Cyrl",
-                    "kk": "kaz_Cyrl"}.get(base, "rus_Cyrl")
+        # Код языка Omnilingual — из общего параметра `language`. Прежде
+        # сначала читался `lang_code`, которого в каталоге нет и задать его
+        # было негде, а языки вне четырёх известных — немецкий, французский,
+        # испанский, итальянский, китайский, японский, которые `language`
+        # разрешает, — молча распознавались как русский.
+        lang = _ЯЗЫКИ_OMNILINGUAL.get(self.language_for(settings) or "ru", "rus_Cyrl")
         self.report(progress, 0.2, "распознавание")
         try:
             out = self._model.transcribe([str(audio_path)], lang=[lang],
@@ -156,6 +157,16 @@ class OmnilingualEngine(Engine):
         return TranscriptionResult(segments=_single(text, info.duration_s, lang[:3]),
                                    language=lang, duration=info.duration_s,
                                    meta={"lang_code": lang})
+
+
+#: Коды языков Omnilingual — код ISO 639-3 и письменность — для значений
+#: параметра `language`. Определять язык сам движок не умеет, поэтому при
+#: «auto» запись считается русской, как и прежде.
+_ЯЗЫКИ_OMNILINGUAL = {
+    "ru": "rus_Cyrl", "en": "eng_Latn", "uk": "ukr_Cyrl", "kk": "kaz_Cyrl",
+    "de": "deu_Latn", "fr": "fra_Latn", "es": "spa_Latn", "it": "ita_Latn",
+    "zh": "cmn_Hans", "ja": "jpn_Jpan",
+}
 
 
 class VoxtralEngine(Engine):
@@ -337,7 +348,8 @@ class SherpaOnnxEngine(Engine):
         if not base.exists():
             raise EngineError(
                 f"Каталог модели sherpa-onnx не найден: {base}",
-                hint="Скачайте модель: asrctl models download " + self.spec.id)
+                hint="Скачайте модель на сервере: bash scripts/models.sh download "
+                     + self.spec.id)
         model_file = next(iter(base.glob("model*.onnx")), None)
         tokens = base / "tokens.txt"
         if model_file is None or not tokens.exists():

@@ -13,7 +13,9 @@ bash scripts/doctor.sh --fix    # попытаться исправить най
 
 ## Установка
 
-### «Python 3.9 или новее не найден»
+### «Не найден Python 3.10 или новее»
+
+Нужен Python от 3.10 до 3.13: на 3.9 сервер не запускается, под 3.14 ещё нет колёс части движков. Установщик ищет подходящий сам; если его нет — поставьте:
 
 ```bash
 python3 --version
@@ -168,7 +170,7 @@ venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_availab
 Первым делом посмотрите, что видит установщик:
 
 ```bash
-bash scripts/doctor.sh --only hardware
+bash scripts/doctor.sh --hardware
 ```
 
 Он различает случаи, которые легко спутать.
@@ -367,7 +369,7 @@ curl -s -X POST -H "X-API-Key: ah_…" \
 
 Три повода увидеть такое сообщение:
 
-* **опечатка в имени параметра.** Полный список: `asrctl config schema` или раздел «Параметры» в интерфейсе;
+* **опечатка в имени параметра.** Полный список с описаниями — раздел «Настройки», глава [04. Справочник параметров](04-parameters.md), `GET /api/params` или `python -m asrhub --print-config`;
 * **значение не из списка** — «дебаг» вместо `DEBUG`, число вне допустимого диапазона;
 * **запись прежней версии, которую и текущая не понимает.** Редкость: одинаковые по смыслу записи (`5` и `"5"`, `info` и `INFO`, `"8081"` и `8081`) сервер приводит сам и молчит об этом.
 
@@ -474,11 +476,12 @@ dmesg | grep -i 'killed process'
 Порядок действий, от простого к сложному:
 
 ```yaml
-batch_size: 4              # было 16
-compute_type: int8_float16 # было float16
-model: gigaam-v3-ctc       # вместо large-моделей
-max_concurrent_jobs: 1
+max_concurrent_jobs: 1     # одно задание за раз
+batch_size: 4              # было 16 — для faster-whisper, WhisperX, NeMo, transformers
+compute_type: int8_float16 # было float16 — для faster-whisper, WhisperX, transformers
 ```
+
+Если и этого мало — модель поменьше: `gigaam-v3-ctc` вместо large-моделей Whisper на русском или `faster-whisper-small`. У GigaAM нет ни пакетов, ни выбора точности весов, поэтому `batch_size` и `compute_type` на её память не влияют: помогают только меньшая модель и `max_concurrent_jobs: 1`.
 
 Сервер и сам уменьшит пакет вдвое при повторе, но лучше не полагаться на это в потоке.
 
@@ -486,7 +489,7 @@ max_concurrent_jobs: 1
 
 ```bash
 nvidia-smi
-curl -H "X-API-Key: ключ" http://127.0.0.1:8080/api/system | jq .gpu
+curl -H "X-API-Key: ключ" http://127.0.0.1:8080/api/system | jq .hardware.gpus
 ```
 
 ⚠️ Память может занимать не ASR Hub. Оставшийся от прошлого запуска процесс Python держит видеопамять до своего завершения; `nvidia-smi` покажет, кто именно.
@@ -862,7 +865,7 @@ pyannote.audio 4.x (его ставит требование `pyannote.audio>=3.
 Первым делом убедитесь, что задействован ускоритель:
 
 ```bash
-curl -H "X-API-Key: ключ" http://127.0.0.1:8080/api/system | jq '.device, .gpu'
+curl -H "X-API-Key: ключ" http://127.0.0.1:8080/api/system | jq '.hardware.accelerator, .hardware.gpus'
 ```
 
 Ориентировочные RTF для часовой записи на `gigaam-v3-rnnt`:
@@ -918,7 +921,7 @@ proxy_set_header Upgrade    $http_upgrade;
 proxy_set_header Connection "upgrade";
 ```
 
-Интерфейс при этом работает: он переходит на опрос раз в три секунды. Индикатор внизу боковой панели показывает реальное состояние соединения.
+Интерфейс при этом работает: очередь он и так опрашивает раз в четыре секунды, а соединение для событий восстанавливает сам — с паузой, растущей до 30 секунд. Индикатор внизу боковой панели показывает реальное состояние соединения.
 
 ### Обрыв на длинных заданиях
 

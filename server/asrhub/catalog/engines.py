@@ -78,7 +78,7 @@ ENGINES: list[EngineSpec] = [
         id="whisper_cpp",
         name="whisper.cpp",
         description=(
-            "Реализация на C++ без зависимостей Python. Metal и Core ML на Apple Silicon, "
+            "Реализация на C++ без зависимостей Python. Metal на Apple Silicon, "
             "CUDA, Vulkan, ROCm, OpenVINO на остальных платформах. Лучший выбор для "
             "серверов без GPU и для macOS."
         ),
@@ -89,8 +89,10 @@ ENGINES: list[EngineSpec] = [
         supports_mps=True,
         external_binaries=["whisper-cli"],
         install_notes=(
-            "Собирается из исходников через CMake. Установщик ASR Hub определяет платформу "
-            "и включает нужный бэкенд: Metal и Core ML на macOS, CUDA или Vulkan на Linux и Windows."
+            "Собирается из исходников через CMake: установщик или bash scripts/models.sh "
+            "install-engine whisper_cpp. Бэкенд выбирается по платформе: Metal на macOS "
+            "(Core ML — только если рядом с моделью лежит сконвертированный энкодер "
+            ".mlmodelc), CUDA или Vulkan на Linux. На Windows whisper-cli ставится вручную."
         ),
         known_issues=[
             "Значения VAD по умолчанию сильно отличаются от faster-whisper "

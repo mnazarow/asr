@@ -15,7 +15,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="3.1.19"
+VERSION="3.1.20"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
 CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"
@@ -325,12 +325,27 @@ cmd_send() {
   fi
 }
 
+# Отправленный файл — в каталог «отправленных», с тем же путём внутри.
+# Занятое имя не затирается: к нему добавляется время переноса.
+move_sent() {
+  local file="$1" source_dir="$2" target_dir="$3" rel target
+  rel="${file#"${source_dir%/}/"}"
+  target="${target_dir%/}/${rel}"
+  mkdir -p "$(dirname "${target}")" || return 1
+  if [[ -e "${target}" ]]; then
+    target="${target%.*}.$(date +%Y%m%d-%H%M%S).${target##*.}"
+  fi
+  mv "${file}" "${target}"
+}
+
 cmd_send_dir() {
-  local dir="" recursive=0 pattern="" rest=()
+  local dir="" recursive=0 pattern="" move_to="" rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --recursive|-r) recursive=1; shift ;;
       --pattern) pattern="$2"; shift 2 ;;
+      --move-to) move_to="${2:-}"; [[ -n "${move_to}" ]] || die "Укажите каталог: --move-to КАТАЛОГ"
+                 shift 2 ;;
       # Часть флагов идёт без значения. Раньше любой «-*» съедал следующее
       # слово: `send-dir КАТАЛОГ --wait --formats txt` пожирал --formats, и
       # каталогом становилось «txt», а `send-dir КАТАЛОГ --wait` вылетал
@@ -346,6 +361,19 @@ cmd_send_dir() {
     esac
   done
   [[ -d "${dir}" ]] || die "Каталог не найден: ${dir}"
+  # Каталог отправленных — чтобы повторный запуск (из cron) не слал те же
+  # файлы снова: дедупликация на сервере пересчёта не делает, но каждый
+  # повтор всё равно заводил задание-копию и тратил квоту.
+  if [[ -n "${move_to}" ]]; then
+    mkdir -p "${move_to}" || die "Не удалось создать каталог: ${move_to}"
+    local abs_dir abs_move
+    abs_dir="$(cd "${dir}" && pwd -P)"
+    abs_move="$(cd "${move_to}" && pwd -P)"
+    [[ "${abs_move}" != "${abs_dir}" ]] || die "--move-to не может совпадать с каталогом отправки"
+    if [[ "${recursive}" -eq 1 && "${abs_move}/" == "${abs_dir}/"* ]]; then
+      die "С --recursive каталог --move-to не может лежать внутри отправляемого: перенесённое найдётся снова"
+    fi
+  fi
   # Пустые массивы — через ${a[@]+"${a[@]}"}: в bash 3.2 (штатном на macOS)
   # "${a[@]}" пустого массива под nounset — «unbound variable», и
   # `send-dir КАТАЛОГ --recursive` отвечал «нет файлов».
@@ -368,6 +396,8 @@ cmd_send_dir() {
     if ! cmd_send "${f}" ${rest[@]+"${rest[@]}"} 2>&1 | sed 's/^/    /'; then
       failed=$((failed + 1))
       warn "    не отправлен — продолжаем"
+    elif [[ -n "${move_to}" ]] && ! move_sent "${f}" "${dir}" "${move_to}"; then
+      warn "    отправлен, но не перенесён в ${move_to}: следующий запуск отправит его снова"
     fi
   done
   ok "Отправлено: $(( ${#files[@]} - failed )) из ${#files[@]}"
@@ -720,7 +750,9 @@ asrctl — клиент ASR Hub
 Отправка
   send ФАЙЛ [--model M] [--language ru] [--formats srt,txt]
             [--priority N] [--wait] [--output КАТАЛОГ]
-  send-dir КАТАЛОГ [--recursive] [--pattern '*.mp3'] [те же параметры]
+  send-dir КАТАЛОГ [--recursive] [--pattern '*.mp3'] [--move-to КАТАЛОГ]
+            [те же параметры] --move-to — куда переносить отправленное,
+                             чтобы запуск из cron не слал его снова
 
 Наблюдение
   queue [--watch]            состояние очереди (--watch — обновлять)

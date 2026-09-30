@@ -773,6 +773,13 @@ function handleEvent(message) {
     case 'job.retry':
       toast(`Повтор ${message.attempt} через ${message.delay_s} с`, 'warn', message.error);
       break;
+    case 'job.fallback':
+      // Основная модель не справилась, задание ушло на резервную
+      // (параметр model_fallback): это не отказ, но и не обычный ход дела.
+      toast(`Модель ${message.from} не справилась — задание переведено на ${message.to}`,
+            'warn', (message.error && message.error.message) || '');
+      refreshQueue();
+      break;
     case 'job.progress':
       updateProgress(message);
       break;
@@ -865,6 +872,15 @@ function go(view) {
 function render() {
   if (state.hashGoing) { state.hashGoing = false; return; }
   const hash = location.hash.replace('#', '');
+  // Ссылка на запись снаружи — из примечания в CRM (public_url): #/jobs/<id>.
+  // Раздела с таким именем нет, и ссылка открывала главную страницу, а не
+  // расшифровку, ради которой по ней шли.
+  const запись = /^\/?jobs\/([\w-]+)$/.exec(hash);
+  if (запись) {
+    go('results');
+    window.__asrhub.openJob(запись[1]);
+    return;
+  }
   go(VIEWS[hash] ? hash : 'transcribe');
 }
 

@@ -87,8 +87,9 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 
 Сообщения приходят типизированными: `hello` при подключении (в нём состояние
 очереди и последние события), `job.progress` по ходу распознавания,
-`job.completed`, `job.failed`, `job.retry`, `job.queued`, `queue`. Клиент
-может отправить `ping` (ответ `pong`) и `status` (ответ — состояние очереди).
+`job.completed`, `job.failed`, `job.retry`, `job.fallback`, `job.queued`,
+`queue`. Клиент может отправить `ping` (ответ `pong`) и `status` (ответ —
+состояние очереди).
 
 ## Распознавание на лету
 
@@ -872,7 +873,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:13411",
+  "instance": "vm:23057",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -985,6 +986,7 @@ curl -X POST -H 'X-API-Key: $КЛЮЧ' -H 'Content-Type: application/json' \
 | `streaming` | в адресе | boolean | — | — |
 | `diarization` | в адресе | boolean | — | — |
 | `commercial_only` | в адресе | boolean | `False` | — |
+| `license` | в адресе | string | — | — |
 | `installed` | в адресе | boolean | — | — |
 | `search` | в адресе | string | — | — |
 
@@ -1262,11 +1264,11 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/presets
         "audio_normalize": true,
         "audio_highpass_hz": 80,
         "audio_trim_silence": true,
-        "batch_size": 8,
         "word_timestamps": true,
         "include_confidence": true,
         "punctuation_enabled": false,
         "itn_enabled": false,
+        "merge_short_segments": true,
 …
 ```
 
@@ -1336,9 +1338,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/settings
     "no_speech_threshold": 0.6,
     "hallucination_silence_threshold": 2.0,
     "hallucination_filter": true,
+    "hallucination_phrases": "",
     "multilingual_detection": false,
     "language_detection_segments": 1,
-    "language_detection_threshold": 0.5,
 …
 ```
 
@@ -1460,7 +1462,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1790730211.570227,
+    "generated_at": 1790762422.514604,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1627,8 +1629,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.19",
-  "uptime_s": 12.3,
+  "version": "3.1.20",
+  "uptime_s": 12.7,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1672,7 +1674,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/logs?level=ERROR&li
 {
   "items": [],
   "counts": {
-    "INFO": 2
+    "INFO": 4,
+    "WARNING": 2
   }
 }
 ```
@@ -1706,8 +1709,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.19",
-  "uptime_s": 12.3,
+  "version": "3.1.20",
+  "uptime_s": 12.8,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v50",
@@ -1717,7 +1720,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 7.2,
-    "disk_free_gb": 14.6,
+    "disk_free_gb": 14.4,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -1728,7 +1731,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "python_version": "3.11.15",
     "warnings": [
       "Всего 7.8 ГБ оперативной памяти. Для моделей уровня large рекомендуется минимум 16 ГБ; выберите модель поменьше или включите int8.",
-      "На диске свободно 14.6 ГБ. Полный набор моделей занимает свыше 100 ГБ."
+      "На диске свободно 14.4 ГБ. Полный набор моделей занимает свыше 100 ГБ."
     ],
     "cpu_limit": 0.0,
     "memory_limit_gb": 0.0,
@@ -4167,14 +4170,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 12.4,
+  "uptime_s": 12.8,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 12 с",
+        "detail": "работает 13 с",
         "hint": ""
       },
       {
@@ -4203,7 +4206,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 14.6 ГБ",
+        "detail": "свободно 14.4 ГБ",
         "hint": ""
       },
       {

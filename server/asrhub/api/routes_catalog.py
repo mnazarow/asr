@@ -34,6 +34,9 @@ def list_models(
     streaming: bool | None = None,
     diarization: bool | None = None,
     commercial_only: bool = False,
+    #: Лицензия весов: MIT, Apache-2.0, CC-BY-4.0… Документация обещала
+    #: такой отбор, а сервер молча отдавал весь каталог.
+    license: str | None = None,
     #: Только те модели, чьи веса лежат на диске. Клиент командной строки
     #: принимал такой ключ и молча его игнорировал: `asrctl models
     #: --installed` печатал весь каталог из семидесяти с лишним моделей.
@@ -60,6 +63,8 @@ def list_models(
         items = [m for m in items if m.diarization == diarization]
     if commercial_only:
         items = [m for m in items if m.commercial_use]
+    if license:
+        items = [m for m in items if m.license.lower() == license.strip().lower()]
     if installed is not None:
         state = get_state(request)
         models_dir = Path(state.settings.get("models_dir") or state.settings.paths.models)
@@ -159,6 +164,20 @@ def download_model(request: Request, model_id: str,
 
                 entry["message"] = "загрузка весов GigaAM"
                 download_weights(spec.source, spec.revision or "", models_dir)
+            elif spec.engine == "whisper_cpp":
+                # Файл ggml из репозитория whisper.cpp. Общая дорога ниже
+                # принимала «large-v3-turbo» за модель faster-whisper и
+                # клала на диск чужие веса.
+                from ..engines import whisper_cpp_engine
+
+                entry["message"] = "загрузка весов whisper.cpp"
+
+                def ход(доля: float) -> None:
+                    entry["progress"] = round(доля, 3)
+
+                whisper_cpp_engine.download_weights(
+                    spec.source, models_dir, token=state.settings.hf_token or None,
+                    progress=ход)
             else:
                 from huggingface_hub import snapshot_download  # type: ignore
 
@@ -176,7 +195,11 @@ def download_model(request: Request, model_id: str,
             model_files.forget(models_dir)
             state.db.add_event(None, "model_downloaded", f"Загружена модель {model_id}")
         except Exception as exc:
-            entry.update(status="failed", message=str(exc)[:500])
+            # Подсказка — туда же, где её увидят: в ответ о ходе загрузки.
+            текст = str(exc)
+            if isinstance(exc, ASRHubError):
+                текст = exc.message + (f" {exc.hint}" if exc.hint else "")
+            entry.update(status="failed", message=текст[:500])
             log.error("Загрузка модели %s не удалась: %s", model_id, exc)
 
     threading.Thread(target=worker, name=f"download-{model_id}", daemon=True).start()
@@ -196,7 +219,18 @@ def remove_model(request: Request, model_id: str,
     if not found:
         return {"model": model_id, "removed": False, "message": "веса не найдены на диске"}
     freed = model_files.directory_size(found)
-    shutil.rmtree(found, ignore_errors=True)
+    # Веса GigaAM и whisper.cpp — один файл, а не каталог. rmtree на файле
+    # падает, ignore_errors это глотал — и ответ «удалено, освобождено
+    # столько-то» приходил про файл, который остался на месте.
+    try:
+        if found.is_file() or found.is_symlink():
+            found.unlink()
+        else:
+            shutil.rmtree(found)
+    except OSError as exc:
+        raise error_response(ASRHubError(
+            f"Не удалось удалить веса модели «{model_id}»: {exc}",
+            hint="Проверьте права службы на каталог моделей.")) from exc
     model_files.forget(models_dir)
     state.db.add_event(None, "model_removed", f"Удалены веса модели {model_id}")
     return {"model": model_id, "removed": True, "freed_mb": round(freed / 1024 / 1024, 1)}

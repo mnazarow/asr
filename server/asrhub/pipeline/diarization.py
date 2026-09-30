@@ -53,7 +53,17 @@ def diarize_segments(audio_path: Path, segments: list[Segment],
                                                        "retryable": "true"})
         return _by_pauses(segments, settings)
 
-    failure = ""
+    # «По каналам» и «встроенная в модель» своего механизма здесь не имеют:
+    # говорящих расставляют раздельная обработка каналов и сама модель. Раз
+    # дошли сюда без говорящих — этого не случилось, и разбивка по паузам
+    # идёт ВМЕСТО выбранного, а не как выбранное. Раньше она шла молча, и
+    # протокол, расставленный по паузам, выглядел как разделение по каналам.
+    failure = {
+        "channels": "каналов для разделения нет: запись одноканальная или "
+                    "в «Сведении каналов» выбран один канал",
+        "builtin": f"модель «{settings.get('model') or '?'}» не расставляет "
+                   "говорящих сама",
+    }.get(backend, "")
     for name in order:
         try:
             if name == "pyannote":
@@ -61,7 +71,9 @@ def diarize_segments(audio_path: Path, segments: list[Segment],
             elif name == "sortformer":
                 turns = _sortformer(audio_path, settings)
             else:
-                # До разбивки по паузам дошли штатно — она и была выбрана.
+                # Дошли до разбивки по паузам: причина — отказ механизмов
+                # выше или, для «channels» и «builtin», то, что говорящих
+                # не расставили ни каналы, ни модель.
                 return fallback(failure)
         except (DependencyMissing, GatedModelError):
             if backend not in ("auto",):
@@ -72,7 +84,8 @@ def diarize_segments(audio_path: Path, segments: list[Segment],
             log.warning("Диаризация «%s» не удалась: %s", name, exc)
             continue
         if turns:
-            return _assign(segments, turns)
+            return _assign(segments, turns,
+                           пословно=bool(settings.get("diarization_assign_words", True)))
         failure = failure or "механизм не нашёл ни одного говорящего"
     return fallback(failure)
 
@@ -185,9 +198,26 @@ def _sortformer(audio_path: Path, settings: dict[str, Any]) -> list[tuple[float,
     return turns
 
 
-def _assign(segments: list[Segment], turns: list[tuple[float, float, str]]) -> list[Segment]:
-    """Присваивает сегменту говорящего с максимальным перекрытием по времени."""
+def _assign(segments: list[Segment], turns: list[tuple[float, float, str]], *,
+            пословно: bool = True) -> list[Segment]:
+    """Присваивает сегменту говорящего с максимальным перекрытием по времени.
+
+    `пословно` (параметр `diarization_assign_words`) — говорящий ещё и у
+    каждого слова, а реплика, внутри которой он сменился, режется на части
+    (см. `разделить_по_словам`). Раньше слова размечались всегда, а реплика
+    не резалась никогда: перебившего собеседника реплика отдавала целиком
+    тому, кто говорил дольше, и параметр ничего не менял.
+    """
     mapping: dict[str, str] = {}
+
+    def имя(label: str) -> str:
+        # Слову может достаться говорящий, которому не досталось ни одной
+        # реплики целиком. Раньше у такого слова оставалась сырая метка
+        # движка («SPEAKER_02») рядом с «Говорящий 1» у реплик.
+        if label not in mapping:
+            mapping[label] = f"Говорящий {len(mapping) + 1}"
+        return mapping[label]
+
     for segment in segments:
         best_label, best_overlap = None, 0.0
         for start, end, label in turns:
@@ -195,16 +225,124 @@ def _assign(segments: list[Segment], turns: list[tuple[float, float, str]]) -> l
             if overlap > best_overlap:
                 best_overlap, best_label = overlap, label
         if best_label is not None:
-            if best_label not in mapping:
-                mapping[best_label] = f"Говорящий {len(mapping) + 1}"
-            segment.speaker = mapping[best_label]
+            segment.speaker = имя(best_label)
+        if not пословно:
+            continue
         for word in segment.words:
             wstart = float(word.get("start", segment.start))
             for start, end, label in turns:
                 if start <= wstart < end:
-                    word["speaker"] = mapping.get(label, label)
+                    word["speaker"] = имя(label)
                     break
+    if not пословно:
+        return segments
+    return _по_порядку(разделить_по_словам(segments))
+
+
+def _по_порядку(segments: list[Segment]) -> list[Segment]:
+    """Номера говорящих — по порядку первого появления в записи.
+
+    Имена раздаются по ходу разметки, а пословная идёт после реплик: тот,
+    кто только перебивал, получал номер после всех, даже заговорив первым.
+    """
+    номера: dict[str, str] = {}
+    for segment in sorted(segments, key=lambda s: s.start):
+        for метка in [segment.speaker, *(с.get("speaker") for с in segment.words or [])]:
+            if метка and метка not in номера:
+                номера[метка] = f"Говорящий {len(номера) + 1}"
+    for segment in segments:
+        if segment.speaker:
+            segment.speaker = номера.get(segment.speaker, segment.speaker)
+        for слово in segment.words or []:
+            if слово.get("speaker"):
+                слово["speaker"] = номера.get(слово["speaker"], слово["speaker"])
     return segments
+
+
+#: Меньше этого — не смена говорящего, а шум на границе реплик: разметка
+#: голосов на стыке двух реплик уверенно ошибается на слово-другое, и
+#: резать по каждому такому слову значило бы плодить обрывки.
+МИН_СЛОВ_ЧАСТИ = 2
+МИН_СЕКУНД_ЧАСТИ = 0.6
+
+
+def разделить_по_словам(segments: list[Segment]) -> list[Segment]:
+    """Режет реплику там, где по словам сменился говорящий.
+
+    Реплика движка — отрезок звука между паузами, а не высказывание одного
+    человека: перебивание, короткое «да-да» собеседника, ответ без паузы
+    попадают в неё целиком. Когда говорящий известен у каждого слова,
+    реплика делится на части по сменам — у каждой свой говорящий, свои
+    слова и время. Короткие пробеги (меньше двух слов и 0,6 секунды)
+    приклеиваются к соседям. Реплики без пословной разметки не трогаются.
+    """
+    итог: list[Segment] = []
+    for segment in segments:
+        слова = list(segment.words or [])
+        if len(слова) < 2 or not all(с.get("speaker") for с in слова):
+            итог.append(segment)
+            continue
+        части = _пробеги(слова)
+        if len(части) < 2:
+            if segment.speaker != части[0][0]:
+                segment.speaker = части[0][0]
+            итог.append(segment)
+            continue
+        for говорящий, свои in части:
+            уверенность = [float(с["confidence"]) for с in свои
+                           if isinstance(с.get("confidence"), (int, float))]
+            итог.append(Segment(
+                start=float(свои[0].get("start", segment.start)),
+                end=float(свои[-1].get("end", segment.end)),
+                text=" ".join(str(с.get("word") or "").strip() for с in свои).strip(),
+                speaker=говорящий,
+                confidence=(round(sum(уверенность) / len(уверенность), 4)
+                            if уверенность else segment.confidence),
+                no_speech_prob=segment.no_speech_prob,
+                compression_ratio=segment.compression_ratio,
+                temperature=segment.temperature,
+                language=segment.language,
+                words=свои))
+    return итог
+
+
+def _пробеги(слова: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Подряд идущие слова одного говорящего; короткие — к соседу."""
+    части: list[tuple[str, list[dict[str, Any]]]] = []
+    for слово in слова:
+        if части and части[-1][0] == слово["speaker"]:
+            части[-1][1].append(слово)
+        else:
+            части.append((str(слово["speaker"]), [слово]))
+
+    def короткий(свои: list[dict[str, Any]]) -> bool:
+        длина = float(свои[-1].get("end", 0) or 0) - float(свои[0].get("start", 0) or 0)
+        return len(свои) < МИН_СЛОВ_ЧАСТИ and длина < МИН_СЕКУНД_ЧАСТИ
+
+    # Короткий пробег уходит к соседу — предыдущему, а у первого к
+    # следующему. Говорящего части это не меняет: он — у длинного соседа.
+    изменилось = True
+    while изменилось and len(части) > 1:
+        изменилось = False
+        for индекс, (_, свои) in enumerate(части):
+            if not короткий(свои):
+                continue
+            if индекс > 0:
+                части[индекс - 1][1].extend(свои)
+            else:
+                части[1] = (части[1][0], свои + части[1][1])
+            del части[индекс]
+            изменилось = True
+            break
+        # Соседи одного говорящего после склейки — одна часть.
+        склеенные: list[tuple[str, list[dict[str, Any]]]] = []
+        for говорящий, свои in части:
+            if склеенные and склеенные[-1][0] == говорящий:
+                склеенные[-1][1].extend(свои)
+            else:
+                склеенные.append((говорящий, свои))
+        части = склеенные
+    return части
 
 
 def _by_pauses(segments: list[Segment], settings: dict[str, Any]) -> list[Segment]:

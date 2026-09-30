@@ -39,6 +39,7 @@ param(
     [int]$Priority = -1,
     [string]$Reference = '',
     [string]$Pattern = '',
+    [string]$MoveTo = '',
     [int]$Limit = 25,
     [int]$TimeoutSec = 600,
     [int]$WaitLimitSec = -1,
@@ -53,7 +54,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '3.1.19'
+$Version = '3.1.20'
 # APPDATA есть только в Windows; в WSL и PowerShell для Linux берём ~/.config
 $ConfigBase = if ($env:APPDATA) { $env:APPDATA }
               elseif ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME }
@@ -468,6 +469,22 @@ switch ($Command) {
     if ($PSBoundParameters.ContainsKey('Priority') -and ($Priority -lt 0 -or $Priority -gt 100)) {
         Stop-Client "Приоритет — число от 0 до 100: $Priority" 2
     }
+    # Каталог отправленных — чтобы повторный запуск (из планировщика) не слал
+    # те же файлы снова: сервер их не пересчитывает, но каждый повтор
+    # заводил задание-копию и тратил квоту.
+    $root = (Resolve-Path -LiteralPath $dir).ProviderPath.TrimEnd('\', '/')
+    if ($MoveTo) {
+        if (-not (Test-Path -LiteralPath $MoveTo)) {
+            try { New-Item -ItemType Directory -Path $MoveTo -Force | Out-Null }
+            catch { Stop-Client "Не удалось создать каталог: $MoveTo" 2 }
+        }
+        $moveRoot = (Resolve-Path -LiteralPath $MoveTo).ProviderPath.TrimEnd('\', '/')
+        if ($moveRoot -eq $root) { Stop-Client '-MoveTo не может совпадать с каталогом отправки' 2 }
+        if ($Recurse -and ($moveRoot + [IO.Path]::DirectorySeparatorChar).StartsWith(
+                $root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            Stop-Client 'С -Recurse каталог -MoveTo не может лежать внутри отправляемого: перенесённое найдётся снова' 2
+        }
+    }
     # Отбор по расширению, а не -Include: без -Recurse и без маски в пути
     # -Include не находит ничего, и `send-dir КАТАЛОГ` отвечал «нет файлов».
     $extensions = @('.wav', '.mp3', '.m4a', '.flac', '.ogg', '.opus', '.mp4', '.mkv', '.mov', '.aac', '.wma')
@@ -486,6 +503,21 @@ switch ($Command) {
             $failed++
             if ($sent.Code -gt $worst) { $worst = $sent.Code }
             continue
+        }
+        if ($MoveTo) {
+            $relative = $file.FullName.Substring($root.Length).TrimStart('\', '/')
+            $target = Join-Path $moveRoot $relative
+            try {
+                $parent = Split-Path -Parent $target
+                if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                if (Test-Path -LiteralPath $target) {
+                    $target = Join-Path $parent ("{0}.{1}{2}" -f [IO.Path]::GetFileNameWithoutExtension($target),
+                        (Get-Date -Format 'yyyyMMdd-HHmmss'), [IO.Path]::GetExtension($target))
+                }
+                Move-Item -LiteralPath $file.FullName -Destination $target
+            } catch {
+                Write-Warn2 "  отправлен, но не перенесён в ${MoveTo}: следующий запуск отправит его снова"
+            }
         }
         if ($Wait) {
             $code = Wait-Job -JobId $sent.Id
@@ -670,7 +702,9 @@ switch ($Command) {
 Команды
   send ФАЙЛ [-Model M] [-Language ru] [-Formats srt,txt] [-Priority 0..100]
             [-Reference ЭТАЛОН] [-Wait] [-Output КАТАЛОГ]
-  send-dir КАТАЛОГ [-Recurse] [-Pattern '*.mp3'] [те же параметры]
+  send-dir КАТАЛОГ [-Recurse] [-Pattern '*.mp3'] [-MoveTo КАТАЛОГ]
+            [те же параметры]  -MoveTo — куда переносить отправленное,
+                               чтобы запуск из планировщика не слал его снова
   queue [-Watch]                 состояние очереди
   list [-Status ...] [-Limit N]  список заданий
   status ИДЕНТИФИКАТОР           карточка задания

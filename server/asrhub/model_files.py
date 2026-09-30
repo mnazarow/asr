@@ -85,6 +85,12 @@ def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None
     с Hugging Face, а со своего CDN. Без последнего случая скачанная модель
     GigaAM показывалась незагруженной навсегда.
     """
+    if source.startswith("ggml-") and source.endswith(".bin"):
+        # Веса whisper.cpp — один файл ggml в `<каталог моделей>/whisper.cpp`.
+        # Проверяется и каталог из ASRHUB_WHISPER_CPP_MODELS: движок берёт
+        # веса и оттуда, и «не загружена» про рабочую модель — неправда.
+        from .engines.whisper_cpp_engine import файл_весов
+        return файл_весов(models_dir, source)
     if not models_dir.exists():
         return None
     if source.startswith("ai-sage/GigaAM"):

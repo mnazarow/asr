@@ -54,6 +54,30 @@ from .processor import cleanup_workdir, process_job, safe_workdir, settings_dige
 log = get_logger("queue")
 
 
+def _отпечаток_каталога(путь: Path) -> tuple[int, int] | None:
+    """Номер узла и время изменения каталога — чтобы узнать «тот же самый»."""
+    try:
+        сведения = путь.stat()
+    except OSError:
+        return None
+    return (сведения.st_ino, сведения.st_mtime_ns) if путь.is_dir() else None
+
+
+def движок_задания(settings: dict[str, Any]) -> str:
+    """Движок, которым задание будет распознано, — для колонки таблицы.
+
+    В параметрах движок обычно «auto»: его выбирает модель. В колонку так
+    и писалось «auto», и разрез аналитики «по движкам» показывал на весь
+    архив один столбец «auto», а статистика моделей — движок «auto» у
+    каждой.
+    """
+    движок = str(settings.get("engine") or "").strip()
+    if движок and движок != "auto":
+        return движок
+    spec = get_model(str(settings.get("model") or ""))
+    return spec.engine if spec is not None else ""
+
+
 #: Кто мы такие среди серверов на общей базе (см. `instance`). Имя
 #: сохранено здесь же: на него ссылается и код, и тесты.
 INSTANCE_ID = _INSTANCE_ID
@@ -557,7 +581,7 @@ class JobQueue:
             "file_size": path.stat().st_size if path.exists() else 0,
             "file_hash": digest,
             "media_duration_s": duration,
-            "engine": str(settings.get("engine") or (spec.engine if spec else "")),
+            "engine": движок_задания(settings),
             "model": str(settings.get("model") or ""),
             "language": str(settings.get("language") or ""),
             "params": payload,
@@ -841,6 +865,12 @@ class JobQueue:
                      "исходник после обработки» или сама АТС. Прежний результат "
                      "остаётся на месте; чтобы распознать заново, загрузите файл ещё раз.")
         params = Settings.для_задания(job.get("params"))
+        # Ручной повтор — обычный запуск той модели, что стоит в задании
+        # сейчас. Пометка о прежнем переходе на резервную модель к нему уже
+        # не относится: с ней повтор снова писал бы в результат «основная
+        # не справилась».
+        params.pop("_fallback_from", None)
+        params.pop("_fallback_reason", None)
         if overrides:
             params.update(overrides)
         params.pop("_hash", None)
@@ -853,10 +883,18 @@ class JobQueue:
         # Счётчик повторов — заново: ручной повтор начинает новую попытку.
         # Без сброса первая же нехватка памяти после ручного повтора давала
         # «ошибку» сразу — без автоповтора и без уменьшения пакета.
+        #
+        # Модель и движок в колонках — те, что будут считать. Повтор другой
+        # моделью («Распознать заново» с выбором модели) менял только
+        # параметры: карточка, статистика моделей и метрики приписывали
+        # новую расшифровку прежней модели.
         self.db.update_job(job_id, status=STATUS_QUEUED, error_code=None,
                            error_message=None, error_hint=None, progress=0.0,
                            stage="", started_at=None, finished_at=None,
-                           retries=0, params=params, queued_at=now())
+                           retries=0, params=params, queued_at=now(),
+                           model=str(params.get("model") or job.get("model") or ""),
+                           engine=движок_задания(
+                               {**params, "model": params.get("model") or job.get("model")}))
         self.db.add_event(job_id, "retry", "Задание поставлено в очередь повторно")
         with self._lock:
             self._cancelled.discard(job_id)
@@ -1195,6 +1233,12 @@ class JobQueue:
         merged = self.settings.merged(params)
         merged["reference_text"] = job.get("reference_text") or ""
         merged.setdefault("hf_token", self.settings.hf_token)
+        # Задание переведено на резервную модель (см. `_на_резервную`).
+        # Служебных ключей каталога `merged` не пропускает, поэтому причину
+        # несём в конвейер отдельно: она уходит в предупреждения результата.
+        if params.get("_fallback_from"):
+            merged["_fallback_from"] = str(params["_fallback_from"])
+            merged["_fallback_reason"] = str(params.get("_fallback_reason") or "")
 
         paths = self.settings.paths
         workdir = safe_workdir(paths.tmp, job_id)
@@ -1284,6 +1328,9 @@ class JobQueue:
                          progress: Callable[[float, str], None],
                          cancelled: Callable[[], bool]) -> None:
         job_id = job["id"]
+        # Какой прежний результат отложен перед этим прогоном (повтор готового
+        # задания): убрать в конце можно только его — см. ниже.
+        отложенный = _отпечаток_каталога(self._прежний_путь(job_id))
         try:
             outcome = process_job(
                 Path(job["file_path"]), merged, self.registry,
@@ -1333,6 +1380,13 @@ class JobQueue:
             expected_instance=INSTANCE_ID,
             status=STATUS_COMPLETED, finished_at=now(), progress=1.0, stage="готово",
             instance_id=None, heartbeat_at=None,
+            # Ошибка прошлой попытки уходит вместе с неудачей. Повтор и
+            # переход на резервную модель пишут её в задание, чтобы в
+            # очереди было видно, почему оно ждёт, — а удачное завершение её
+            # не стирало: готовое задание показывало красную карточку
+            # «engine_error», а `asrctl status` — «Ошибка». Причина остаётся
+            # в событиях задания.
+            error_code=None, error_message=None, error_hint=None,
             text=outcome.text,
             result_path=str(outdir),
             segments_count=len(outcome.segments),
@@ -1446,6 +1500,13 @@ class JobQueue:
 
         log.info("Задание %s: готово за %.1f с, RTF %.3f", job_id, elapsed, outcome.rtf,
                  extra={"job_id": job_id, "model": job.get("model")})
+        # Текст разговора в журнал — только с явного разрешения
+        # администратора (параметр сервера `log_transcript_text`, задание
+        # его не переопределяет). Каталог обещал такой переключатель для
+        # отладки, а журнал текста не получал ни при каком значении.
+        if merged.get("log_transcript_text") and outcome.text:
+            log.info("Задание %s: текст расшифровки: %s", job_id, outcome.text,
+                     extra={"job_id": job_id})
         # Дальше — только уведомление, и оно тоже не должно ронять готовое
         # задание: сбой здесь уходил в общий обработчик, а тот пытался
         # записать «ошибка» поверх «готово», не мог и не писал ничего —
@@ -1456,11 +1517,17 @@ class JobQueue:
                                      "duration_s": elapsed})
         self._send_webhook(job_id)
 
-        # Повтор удался — отложенный прежний результат больше не нужен.
+        # Повтор удался — отложенный прежний результат больше не нужен. Но
+        # только тот, что отложен перед ЭТИМ прогоном. Пока после отметки
+        # «готово» шли разбор содержания, уведомление и прочее, человек мог
+        # уже нажать «Распознать заново» — и новый повтор отложил на то же
+        # место только что готовый результат. Прежде он удалялся здесь же, и
+        # неудачный новый повтор откатывать было не к чему: расшифровка
+        # пропадала целиком.
         прежний = self._прежний_путь(job_id)
-        if прежний.is_dir():
+        if отложенный is not None and _отпечаток_каталога(прежний) == отложенный:
             shutil.rmtree(прежний, ignore_errors=True)
-        self._забыть_прежние_параметры(job_id)
+            self._забыть_прежние_параметры(job_id)
 
         if merged.get("delete_source_after"):
             self._удалить_исходник(job)
@@ -1508,8 +1575,11 @@ class JobQueue:
         if not текущий.is_dir():
             return
         try:
+            # Модель и движок — вместе с параметрами: повтор другой моделью
+            # меняет и колонки задания, и откат обязан вернуть их тоже.
             self.db.set_kv(f"{self.ПРЕЖНИЕ_ПАРАМЕТРЫ}{job['id']}",
-                           {"params": job.get("params") or {}})
+                           {"params": job.get("params") or {},
+                            "model": job.get("model"), "engine": job.get("engine")})
         except Exception as exc:                            # noqa: BLE001
             log.debug("Прежние параметры %s не отложены: %s", job["id"], exc)
         прежний = self._прежний_путь(str(job["id"]))
@@ -1541,6 +1611,12 @@ class JobQueue:
         отложено = self.db.get_kv(f"{self.ПРЕЖНИЕ_ПАРАМЕТРЫ}{job_id}")
         if isinstance(отложено, dict) and isinstance(отложено.get("params"), dict):
             поля["params"] = отложено["params"]
+            # Отложенное прежней версией — без колонок: берём их из параметров.
+            модель = отложено.get("model") or отложено["params"].get("model")
+            if модель:
+                поля["model"] = str(модель)
+                поля["engine"] = str(отложено.get("engine") or движок_задания(
+                    {**отложено["params"], "model": модель}))
         if ожидаемые is None:
             записалось = self._write_own(job_id, **поля)
         else:
@@ -1592,6 +1668,78 @@ class JobQueue:
                      "(его перехватил другой экземпляр или оно уже завершено)",
                      job_id, extra={"job_id": job_id})
         return записалось
+
+    #: Отказы, при которых задание переходит на резервную модель: беда в
+    #: самой модели или в том, что ей нужно (пакет движка, веса, память,
+    #: видеокарта, лицензия), — а не в записи, не в очереди и не в отмене.
+    РЕЗЕРВ_ПРИ = frozenset({
+        "dependency_missing", "binary_missing", "out_of_memory", "model_not_found",
+        "model_not_downloaded", "model_load_error", "gated_model", "engine_error",
+        "hardware_error",
+    })
+
+    def _на_резервную(self, job: dict[str, Any], error: ASRHubError,
+                      merged: dict[str, Any], outdir: Path | None = None) -> bool:
+        """Ставит задание в очередь заново — с резервной моделью.
+
+        Параметр `model_fallback` обещал «превратить отказ в замедление
+        вместо потери задания», а очередь его не читала: задание с
+        неустановленным движком, нескачанными весами или нехваткой памяти
+        просто падало. Теперь окончательный отказ модели — повторы, если они
+        положены, уже исчерпаны — отправляет задание на резервную модель со
+        свежим счётчиком повторов. Причина остаётся событием задания и
+        предупреждением в результате.
+
+        Не переключаем: без резервной модели; когда резервная — та же самая
+        (так и петли нет: у задания, уже переведённого на резервную, она
+        совпадает с основной); при отказе не из-за модели; у повтора готового
+        задания — там при неудаче возвращается прежний результат, а подменять
+        модель, выбранную для повтора, нельзя.
+
+        Возвращает True, когда исход задания решён здесь.
+        """
+        резервная = str(merged.get("model_fallback") or "").strip()
+        основная = str(merged.get("model") or job.get("model") or "")
+        job_id = str(job.get("id") or "")
+        if (not резервная or резервная == основная or error.code not in self.РЕЗЕРВ_ПРИ
+                or not job_id or self._прежний_путь(job_id).is_dir()):
+            return False
+        spec = get_model(резервная)
+        if spec is None:
+            log.warning("Задание %s: резервной модели «%s» нет в каталоге — "
+                        "переключения не будет", job_id, резервная,
+                        extra={"job_id": job_id})
+            return False
+        params = dict(job.get("params") or {})
+        params.update(model=spec.id, engine="auto",
+                      _fallback_from=основная, _fallback_reason=error.message)
+        params.pop("_hash", None)
+        # Отпечаток — уже для резервной модели: иначе кеш отдавал бы её
+        # расшифровку новой загрузке с основной моделью.
+        params["_hash"] = settings_digest(params, weights=self._отпечаток_весов(spec))
+        if not self._write_own(
+                job_id, status=STATUS_QUEUED, retries=0, model=spec.id,
+                engine=spec.engine, params=params, error_code=error.code,
+                error_message=error.message, error_hint=error.hint,
+                stage=f"резервная модель {spec.id}", progress=0.0,
+                instance_id=None, heartbeat_at=None, started_at=None, queued_at=now()):
+            self._discard_unless_taken(outdir, job_id)
+            return True
+        self._discard_results(outdir)
+        # Отказ основной модели — в её статистику: иначе раздел моделей
+        # показывал бы её безупречной, а все её неудачи доставались бы
+        # резервной как успехи.
+        self.db.bump_model_stats(основная, str(job.get("engine") or ""), ok=False)
+        RUNTIME.note_error(error.code, error.retryable)
+        сообщение = (f"Модель {основная} не справилась ({error.message}) — задание "
+                     f"поставлено в очередь с резервной моделью {spec.id}")
+        self.db.add_event(job_id, "model_fallback", сообщение, error.to_dict())
+        log.warning("Задание %s: %s", job_id, сообщение,
+                    extra={"job_id": job_id, "error_code": error.code})
+        self._emit("job.fallback", {"id": job_id, "from": основная, "to": spec.id,
+                                    "error": error.to_dict()})
+        self._wake.set()
+        return True
 
     def _fail_unexpected(self, job: dict[str, Any], exc: Exception) -> None:
         """Отметить задание неудавшимся после сбоя вне конвейера.
@@ -1681,6 +1829,11 @@ class JobQueue:
             RUNTIME.inc("asrhub_retries_total")
             self._emit("job.retry", {"id": job_id, "attempt": retries + 1,
                                      "delay_s": round(delay, 1), "error": error.message})
+            return
+
+        # Повторы не помогли (или отказ из тех, что повтором не лечатся), а
+        # у задания есть резервная модель — отказ становится замедлением.
+        if self._на_резервную(job, error, merged, outdir):
             return
 
         # Не удался повтор уже готового задания — возвращаем прежний

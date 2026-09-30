@@ -642,7 +642,7 @@ class PushManager:
                 state.last_error = _без_секретов(f"{type(exc).__name__}: {exc}", target)
                 # Первая неудача — вслух, дальше не чаще раза в час. Само
                 # состояние никуда не девается: оно целиком видно в
-                # /api/monitoring/push и в разделе наблюдения.
+                # GET /api/monitoring/targets и в разделе наблюдения.
                 complain = now - state.last_complaint > COMPLAIN_INTERVAL_S
                 if complain:
                     state.last_complaint = now
@@ -652,7 +652,7 @@ class PushManager:
                             state.last_error)
                 if failures > 1:
                     log.warning("Это %s-я неудача подряд; следующая жалоба — не раньше "
-                                "чем через час. Состояние: /api/monitoring/push",
+                                "чем через час. Состояние: GET /api/monitoring/targets",
                                 failures)
             return {"ok": False, "error": state.last_error}
         with self._lock:

@@ -266,6 +266,28 @@ if spec.engine == "gigaam":
     print(f"Готово: {target if target.exists() else models_dir}")
     raise SystemExit(0)
 
+# whisper.cpp — один файл ggml из репозитория ggerganov/whisper.cpp. Общая
+# дорога ниже принимала «large-v3-turbo» за модель faster-whisper и клала на
+# диск чужие веса CTranslate2, а варианты «…-q5_0» не находила вовсе.
+if spec.engine == "whisper_cpp":
+    from asrhub.engines.whisper_cpp_engine import download_weights
+    from asrhub.errors import ASRHubError
+    def ход(доля):
+        print(f"\r  {доля * 100:5.1f} %", end="", flush=True)
+    print(f"Скачивание {spec.source} (примерно {spec.disk_mb or '?'} МБ)")
+    try:
+        target = download_weights(spec.source, models_dir, force=force,
+                                  token=os.environ.get("HF_TOKEN")
+                                  or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+                                  progress=ход)
+    except ASRHubError as exc:
+        print(f"\nОшибка загрузки: {exc.message}")
+        if exc.hint:
+            print(exc.hint)
+        raise SystemExit(1)
+    print(f"\nГотово: {target}")
+    raise SystemExit(0)
+
 if spec.source.startswith("http"):
     import zipfile, urllib.request
     target = models_dir / "vosk"
@@ -417,6 +439,21 @@ PYEOF
 
 install-engine)
   ENGINE="${ARGS[0]:?Укажите движок: bash scripts/models.sh install-engine <движок>}"
+  # whisper.cpp — не пакет Python, а программа, её собирают из исходников.
+  # Раньше команда ставила пустой список зависимостей и отвечала «установлен»,
+  # а сервер по-прежнему не находил whisper-cli — и подсказка ошибки
+  # отправляла ровно сюда же.
+  if [[ "${ENGINE}" == "whisper_cpp" || "${ENGINE}" == "whisper-cpp" ]]; then
+    # shellcheck source=lib/whispercpp.sh
+    source "${SCRIPT_DIR}/lib/whispercpp.sh"
+    if ! build_whisper_cpp; then
+      error "whisper.cpp собрать не удалось."
+      hint "Нужны cmake, git и компилятор C++: apt install cmake git build-essential / xcode-select --install"
+      exit 1
+    fi
+    hint "Перезапустите сервер, чтобы он увидел whisper-cli: bash scripts/service.sh restart"
+    exit 0
+  fi
   REQ="${PREFIX}/requirements/engines/${ENGINE//_/-}.txt"
   [[ -f "${REQ}" ]] || REQ="${SCRIPT_DIR}/../requirements/engines/${ENGINE//_/-}.txt"
   if [[ ! -f "${REQ}" ]]; then
@@ -642,6 +679,8 @@ disk)
 
 *)
   error "Неизвестная команда: ${ACTION}"
-  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+  # Та же справка, что по --help. Раньше здесь печатались строки 2–20 файла
+  # целиком — шапка к тому времени стала короче, и в справку попадал код.
+  usage >&2
   exit 2 ;;
 esac

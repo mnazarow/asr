@@ -18,7 +18,7 @@
 | Совещания с говорящими | `moss-transcribe-diarize` | ASR и диаризация в одной модели, 50+ языков |
 | Перевод речи | `canary-1b-v2` | ASR и перевод между английским и 24 языками |
 | Сервер без видеокарты | `faster-whisper-small` + int8 | Единственный практичный режим на процессоре |
-| macOS на Apple Silicon | `whispercpp-large-v3-turbo-q5_0` | Metal и Core ML, 574 МБ на диске |
+| macOS на Apple Silicon | `whispercpp-large-v3-turbo-q5_0` | Metal, 574 МБ на диске |
 | Редкие языки | `omnilingual-ctc-1b` | 1600+ языков, Apache-2.0 на код и веса |
 | Проверка установки | `demo-simulator` | Встроенный симулятор без загрузки весов |
 
@@ -2792,7 +2792,7 @@
 |---|---|
 | Идентификатор | `whispercpp-tiny` |
 | Движок | `whisper_cpp` |
-| Источник | `tiny` |
+| Источник | `ggml-tiny.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | слабое |
@@ -2813,8 +2813,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 
 **Ограничения**
@@ -2824,7 +2824,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp base
 
@@ -2832,7 +2832,7 @@
 |---|---|
 | Идентификатор | `whispercpp-base` |
 | Движок | `whisper_cpp` |
-| Источник | `base` |
+| Источник | `ggml-base.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | слабое |
@@ -2853,8 +2853,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 
 **Ограничения**
@@ -2864,7 +2864,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp small
 
@@ -2872,7 +2872,7 @@
 |---|---|
 | Идентификатор | `whispercpp-small` |
 | Движок | `whisper_cpp` |
-| Источник | `small` |
+| Источник | `ggml-small.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | слабое |
@@ -2893,8 +2893,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 
 **Ограничения**
@@ -2904,7 +2904,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp medium
 
@@ -2912,7 +2912,7 @@
 |---|---|
 | Идентификатор | `whispercpp-medium` |
 | Движок | `whisper_cpp` |
-| Источник | `medium` |
+| Источник | `ggml-medium.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | слабое |
@@ -2933,8 +2933,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 
 **Ограничения**
@@ -2944,7 +2944,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp large-v3
 
@@ -2952,7 +2952,7 @@
 |---|---|
 | Идентификатор | `whispercpp-large-v3` |
 | Движок | `whisper_cpp` |
-| Источник | `large-v3` |
+| Источник | `ggml-large-v3.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | среднее |
@@ -2973,8 +2973,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 
 **Ограничения**
@@ -2984,7 +2984,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp large-v3 q5_0
 
@@ -2992,7 +2992,7 @@
 |---|---|
 | Идентификатор | `whispercpp-large-v3-q5_0` |
 | Движок | `whisper_cpp` |
-| Источник | `large-v3-q5_0` |
+| Источник | `ggml-large-v3-q5_0.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | среднее |
@@ -3013,8 +3013,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 - Квантизация уменьшает файл в 2–5 раз при небольшой потере качества
 
@@ -3025,7 +3025,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp large-v3-turbo
 
@@ -3033,7 +3033,7 @@
 |---|---|
 | Идентификатор | `whispercpp-large-v3-turbo` |
 | Движок | `whisper_cpp` |
-| Источник | `large-v3-turbo` |
+| Источник | `ggml-large-v3-turbo.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | среднее |
@@ -3054,8 +3054,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 
 **Ограничения**
@@ -3065,7 +3065,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp large-v3-turbo q5_0
 
@@ -3073,7 +3073,7 @@
 |---|---|
 | Идентификатор | `whispercpp-large-v3-turbo-q5_0` |
 | Движок | `whisper_cpp` |
-| Источник | `large-v3-turbo-q5_0` |
+| Источник | `ggml-large-v3-turbo-q5_0.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | среднее |
@@ -3094,8 +3094,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 - Квантизация уменьшает файл в 2–5 раз при небольшой потере качества
 
@@ -3106,7 +3106,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### whisper.cpp large-v3-turbo q8_0
 
@@ -3114,7 +3114,7 @@
 |---|---|
 | Идентификатор | `whispercpp-large-v3-turbo-q8_0` |
 | Движок | `whisper_cpp` |
-| Источник | `large-v3-turbo-q8_0` |
+| Источник | `ggml-large-v3-turbo-q8_0.bin` |
 | Лицензия | MIT — коммерческое использование разрешено |
 | Языки | multi-99 |
 | Качество на русском | среднее |
@@ -3135,8 +3135,8 @@
 
 **Сильные стороны**
 
-- Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO
-- Core ML переносит энкодер на Neural Engine — ускорение более чем втрое
+- Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO
+- С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine
 - Один бинарник без зависимостей Python
 - Квантизация уменьшает файл в 2–5 раз при небольшой потере качества
 
@@ -3147,7 +3147,7 @@
 
 **Рекомендуется для:** Apple Silicon, Серверы без GPU, Встраивание без Python
 
-> Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.
+> Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними скачивается модель поиска речи ggml-silero.
 
 #### WhisperX large-v3 (выравнивание + диаризация)
 

@@ -237,6 +237,14 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     timer = Timer()
     outcome = ProcessOutcome()
     spec = get_model(str(settings.get("model") or ""))
+    # Задание переведено очередью на резервную модель: об этом — первым
+    # предупреждением, иначе расшифровку приняли бы за работу основной.
+    основная = str(settings.get("_fallback_from") or "")
+    if основная:
+        причина = str(settings.get("_fallback_reason") or "").strip().rstrip(".")
+        outcome.warnings.append(
+            f"Распознано резервной моделью {settings.get('model')}: основная модель "
+            f"{основная} не справилась" + (f" — {причина}" if причина else "") + ".")
 
     # ---- 1. Подготовка аудио -------------------------------------------
     report(0.01, "анализ файла")
@@ -346,6 +354,11 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         timer.values["model_load"] = timer.values.get("model_load", 0.0) + result.model_load_s
 
         engine_meta = dict(result.meta)
+        # Что движок хочет сказать человеку, — в предупреждения задания, а не
+        # в служебные сведения о движке, где их никто не увидит.
+        for замечание in engine_meta.pop("warnings", None) or []:
+            if замечание and str(замечание) not in outcome.warnings:
+                outcome.warnings.append(str(замечание))
         if result.language:
             languages.append(result.language)
         свои: list[Segment] = []
@@ -613,6 +626,19 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     outcome.timings = {k: round(v, 4) for k, v in timer.snapshot().items()}
 
     result_payload = outcome.to_result(meta)
+    # Краткое содержание — поле, которого выгрузки Markdown и Word ждали
+    # всегда, а заполнять его было некому (см. pipeline/summary.py).
+    if settings.get("summary_enabled"):
+        try:
+            from .pipeline.summary import выжимка  # noqa: PLC0415
+
+            краткое = выжимка(processed)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Краткое содержание не составлено: %s", exc)
+            outcome.warnings.append(f"Краткое содержание не составлено: {exc}")
+            краткое = ""
+        if краткое:
+            result_payload["summary"] = краткое
     outcome.files = export.write_all(result_payload, settings, outdir, basename)
 
     # Окончательные замеры — уже со временем записи файлов; они уходят в базу

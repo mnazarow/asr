@@ -112,6 +112,23 @@ def collapse_repeats(text: str) -> str:
 # 2. Слова-паразиты
 # --------------------------------------------------------------------------
 
+def строки(значение: Any, *, запятые: bool = True) -> list[str]:
+    """Список из параметра-текста: по строке на элемент, а с `запятые` — и через запятую.
+
+    Строку раньше отдавали как есть, а перебор строки идёт по буквам: свой
+    список «слов-паразитов» превращался в набор одиночных букв.
+    """
+    if not значение:
+        return []
+    if isinstance(значение, (list, tuple, set)):
+        части = [str(э) for э in значение]
+    else:
+        части = str(значение).splitlines()
+        if запятые:
+            части = [к for ч in части for к in ч.split(",")]
+    return [ч.strip() for ч in части if ч.strip()]
+
+
 def remove_fillers(text: str, fillers: Iterable[str] = ()) -> str:
     words = list(fillers) or FILLER_WORDS_RU
     pattern = re.compile(
@@ -1038,7 +1055,7 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
     галлюцинации_возможны = _к_движку("hallucination_filter", engine)
     if settings.get("hallucination_filter", True) and галлюцинации_возможны:
         segments, removed = filter_hallucinations(
-            segments, settings.get("hallucination_phrases") or ())
+            segments, строки(settings.get("hallucination_phrases"), запятые=False))
         stats["hallucinations_removed"] = removed
 
     for seg in segments:
@@ -1049,7 +1066,7 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
 
     if settings.get("remove_filler_words"):
         for seg in segments:
-            seg["text"] = remove_fillers(seg["text"], settings.get("filler_words") or ())
+            seg["text"] = remove_fillers(seg["text"], строки(settings.get("filler_words")))
 
     if settings.get("punctuation_enabled", True) and not model_has_punctuation:
         model_name = str(settings.get("punctuation_model") or "auto")

@@ -8,8 +8,9 @@
     python3 examples/stream_microphone.py --file запись.wav
     python3 examples/stream_microphone.py --mic          # нужен sounddevice
 
-Переменные окружения: ASRHUB_URL (по умолчанию ws://127.0.0.1:8080),
-ASRHUB_API_KEY.
+Переменные окружения — те же, что у остальных примеров: ASRHUB_SERVER
+(по умолчанию http://127.0.0.1:8080; годится и ws://) и ASRHUB_KEY.
+Прежние имена ASRHUB_URL и ASRHUB_API_KEY тоже понимаются.
 
 Зависимость одна: websocket-client (pip install websocket-client). Для
 режима микрофона дополнительно sounddevice.
@@ -23,8 +24,12 @@ import sys
 import time
 import wave
 
-DEFAULT_URL = os.environ.get("ASRHUB_URL", "ws://127.0.0.1:8080")
-API_KEY = os.environ.get("ASRHUB_API_KEY", "")
+# Имена переменных — как у остальных примеров и в examples/README.md. Раньше
+# этот пример один читал ASRHUB_URL и ASRHUB_API_KEY: заданные по README
+# переменные он не видел и шёл без ключа на 127.0.0.1.
+DEFAULT_URL = (os.environ.get("ASRHUB_SERVER") or os.environ.get("ASRHUB_URL")
+               or "http://127.0.0.1:8080")
+API_KEY = os.environ.get("ASRHUB_KEY") or os.environ.get("ASRHUB_API_KEY", "")
 RATE = 16000
 CHUNK_S = 0.25
 
@@ -59,6 +64,19 @@ def read_microphone(chunk_s: float = CHUNK_S):
             yield bytes(data)
 
 
+def addresses(server: str) -> tuple[str, str]:
+    """Адреса HTTP и WebSocket по адресу сервера в любом виде."""
+    server = server.strip().rstrip("/")
+    if server.startswith(("ws://", "wss://")):
+        http = "http" + server[2:]
+    elif "://" in server:
+        http = server
+    else:
+        http = "http://" + server
+    # http:// → ws://, https:// → wss://
+    return http, "ws" + http[4:]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -77,20 +95,28 @@ def main() -> int:
         sys.exit("Нужен websocket-client: pip install websocket-client")
 
     # Ключ в адресе оседает в журналах прокси, поэтому берём одноразовый билет.
-    address = f"{args.url.rstrip('/')}/api/stream"
+    http, ws = addresses(args.url)
+    address = f"{ws}/api/stream"
     if API_KEY:
+        import urllib.error
         import urllib.request
 
-        http = args.url.replace("ws://", "http://").replace("wss://", "https://")
-        request = urllib.request.Request(f"{http.rstrip('/')}/api/auth/ticket",
-                                         method="POST",
+        request = urllib.request.Request(f"{http}/api/auth/ticket", method="POST",
                                          headers={"X-API-Key": API_KEY})
-        with urllib.request.urlopen(request, timeout=10) as response:
-            ticket = json.load(response).get("ticket", "")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                ticket = json.load(response).get("ticket", "")
+        except urllib.error.HTTPError as exc:
+            sys.exit(f"Сервер не выдал билет (HTTP {exc.code}): проверьте ключ ASRHUB_KEY.")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            sys.exit(f"Сервер {http} недоступен: {exc}")
         if ticket:
             address += f"?ticket={ticket}"
 
-    connection = websocket.create_connection(address, timeout=30)
+    try:
+        connection = websocket.create_connection(address, timeout=30)
+    except Exception as exc:                                # noqa: BLE001
+        sys.exit(f"Не удалось подключиться к {ws}/api/stream: {exc}")
 
     config: dict[str, object] = {"type": "config", "format": "pcm_s16le"}
     if args.model:

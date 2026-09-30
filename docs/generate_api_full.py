@@ -289,8 +289,9 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 
 Сообщения приходят типизированными: `hello` при подключении (в нём состояние
 очереди и последние события), `job.progress` по ходу распознавания,
-`job.completed`, `job.failed`, `job.retry`, `job.queued`, `queue`. Клиент
-может отправить `ping` (ответ `pong`) и `status` (ответ — состояние очереди).
+`job.completed`, `job.failed`, `job.retry`, `job.fallback`, `job.queued`,
+`queue`. Клиент может отправить `ping` (ответ `pong`) и `status` (ответ —
+состояние очереди).
 
 ## Распознавание на лету
 

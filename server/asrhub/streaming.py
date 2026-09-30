@@ -71,6 +71,13 @@ _WRITE_CHUNK = 1 << 15
 #: ждёт итог, поэтому здесь терпения больше, но не бесконечно.
 ОЖИДАНИЕ_ИТОГА_С = 120.0
 
+#: Уровни для конца фразы в режиме окна — средняя абсолютная величина
+#: отсчёта за 0,1 секунды. Ниже ТИШИНЫ (около −40 дБ) — пауза, выше РЕЧИ
+#: (около −30 дБ) — голос. Между ними — ни то ни другое: шум линии не
+#: должен ни закреплять фразу, ни считаться речью.
+ТИШИНА = 330
+РЕЧЬ = 1000
+
 
 @dataclass(slots=True)
 class StreamEvent:
@@ -252,6 +259,24 @@ class StreamSession:
         self._first_text_at: float | None = None
 
         self.window_s = max(1.0, float(settings.get("stream_window_s") or DEFAULT_WINDOW_S))
+        #: Промежуточные гипотезы (`streaming_partial_results`). Выключены —
+        #: клиенту уходят только закреплённые фразы, а в режиме окна окно и
+        #: не пересчитывается: гипотеза, которую никто не увидит, — лишний
+        #: прогон модели.
+        self.partials = bool(settings.get("streaming_partial_results", True))
+        #: Сколько тишины после речи закрепляет фразу в режиме окна
+        #: (`streaming_endpoint_silence_ms`); ноль — не закреплять по паузам.
+        #: Раньше фраза закреплялась только тридцатисекундным хвостом, и
+        #: сказанное полминуты висело черновиком, который ещё может
+        #: измениться.
+        try:
+            пауза_мс = float(settings.get("streaming_endpoint_silence_ms") or 0)
+        except (TypeError, ValueError):
+            пауза_мс = 0.0
+        self.endpoint_s = max(0.0, пауза_мс / 1000.0)
+        #: Была ли речь в хвосте после последнего закрепления: без неё
+        #: тишина фразы не заканчивает — заканчивать нечего.
+        self._речь = False
 
         #: Подсказки оператору прямо в разговоре. Собираются теми же
         #: правилами, что и разбор после разговора: разойдись они — живая
@@ -295,6 +320,10 @@ class StreamSession:
             "model": str(self.settings.get("model") or ""),
             "sample_rate": SAMPLE_RATE,
             "window_s": None if mode == "native" else self.window_s,
+            "partials": self.partials,
+            # Конец фразы по паузе — забота сессии только в режиме окна:
+            # движок с настоящим потоком определяет его сам.
+            "endpoint_silence_s": None if mode == "native" else self.endpoint_s,
             "note": ("Движок держит состояние между кусками: гипотеза уточняется "
                      "после каждого." if mode == "native" else
                      f"Движок потока не держит, поэтому накопленный звук "
@@ -327,6 +356,18 @@ class StreamSession:
         self._pcm.extend(pcm)
         self._since_flush += len(pcm)
 
+        # Пауза после речи — конец фразы: закрепляем сразу, не дожидаясь
+        # ни окна, ни тридцатисекундного хвоста.
+        пауза_с = getattr(self, "endpoint_s", 0.0)
+        if пауза_с > 0:
+            if not self._речь and any(у > РЕЧЬ for у in _уровни(pcm)):
+                self._речь = True
+            пауза = int(пауза_с * SAMPLE_RATE) * 2
+            if (self._речь and len(self._pcm) > пауза
+                    and all(у < ТИШИНА for у in _уровни(self._pcm[-пауза:]))):
+                self._since_flush = 0
+                return self._commit(до_конца=True)
+
         need = int(self.window_s * SAMPLE_RATE * 2)
         if self._since_flush < need:
             return []
@@ -343,6 +384,8 @@ class StreamSession:
         # подряд прогона одного и того же куска.
         if len(self._pcm) >= int(MAX_TAIL_S * SAMPLE_RATE * 2):
             return self._commit()
+        if not getattr(self, "partials", True):
+            return []
 
         try:
             text = self._recognize(bytes(self._pcm))
@@ -418,8 +461,11 @@ class StreamSession:
             return None
         return round(max(0.0, self._first_text_at - self._started), 3)
 
-    def _commit(self) -> list[StreamEvent]:
+    def _commit(self, *, до_конца: bool = False) -> list[StreamEvent]:
         """Закрепляет распознанный хвост и освобождает под ним звук.
+
+        `до_конца` — хвост кончается паузой (конец фразы), и закрепляется он
+        целиком: самое тихое место искать незачем, оно в конце.
 
         Режем не по счётчику байт, а по самому тихому месту в конце хвоста:
         разрыв посреди слова стоил бы обеих его половин. Закреплённый текст
@@ -432,7 +478,7 @@ class StreamSession:
         расшифровке это выглядело как повтор последних слов каждые
         полминуты.
         """
-        cut = _quiet_split(self._pcm)
+        cut = (len(self._pcm) - len(self._pcm) % 2) if до_конца else _quiet_split(self._pcm)
         if not cut:
             return []
         try:
@@ -456,6 +502,7 @@ class StreamSession:
         del self._pcm[:cut]
         self._committed_s = end
         self._last_partial = ""
+        self._речь = False
         события = self._освободилась()
         if not text:
             return события
@@ -547,6 +594,8 @@ class StreamSession:
         kind, text = result
         if not text or (kind == "partial" and text == self._last_partial):
             return []
+        if kind == "partial" and not getattr(self, "partials", True):
+            return []
         self._note_first_text()
         # Начало куска — там, где кончился прошлый закреплённый: прежде у
         # каждого `final` стояло start=0.0, и клиент, раскладывающий текст
@@ -621,6 +670,20 @@ class StreamSession:
         finally:
             path.unlink(missing_ok=True)
         return " ".join(s.text.strip() for s in result.segments if s.text).strip()
+
+
+def _уровни(pcm: bytes | bytearray, frame_s: float = 0.1) -> list[float]:
+    """Средняя абсолютная величина отсчёта по кадрам в `frame_s` секунд."""
+    import array
+
+    total = len(pcm) - len(pcm) % 2
+    samples = array.array("h")
+    samples.frombytes(bytes(pcm[:total]))
+    if sys.byteorder == "big":             # PCM в потоке всегда little-endian
+        samples.byteswap()
+    frame = max(1, int(frame_s * SAMPLE_RATE))
+    return [sum(abs(v) for v in samples[i:i + frame]) / len(samples[i:i + frame])
+            for i in range(0, len(samples), frame) if len(samples[i:i + frame])]
 
 
 def _quiet_split(pcm: bytes | bytearray, look_s: float = 2.0,

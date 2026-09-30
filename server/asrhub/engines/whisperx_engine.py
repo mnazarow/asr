@@ -16,6 +16,20 @@ _ALIGN_MODELS = {
 }
 
 
+def имя_говорящего(метка: Any) -> str:
+    """«SPEAKER_00» pyannote — «Говорящий 1», «SPEAKER_01» — «Говорящий 2».
+
+    Раньше номер получался срезанием ведущих нулей: у «SPEAKER_00» —
+    пусто, и подставлялась единица, у «SPEAKER_01» — тоже «1». Первые два
+    собеседника становились одним «Говорящий 1», и диалог двух человек
+    выходил у WhisperX монологом.
+    """
+    цифры = "".join(с for с in str(метка).rsplit("_", 1)[-1] if с.isdigit())
+    if not цифры:
+        return str(метка)
+    return f"Говорящий {int(цифры) + 1}"
+
+
 class WhisperXEngine(Engine):
     id = "whisperx"
     supports_word_timestamps = True
@@ -133,30 +147,41 @@ class WhisperXEngine(Engine):
             except Exception as exc:
                 self.log.error("Диаризация не выполнена: %s", exc)
 
+        пословно = bool(settings.get("diarization_assign_words", True))
         segments: list[Segment] = []
         for item in raw.get("segments", []):
             text = str(item.get("text", "")).strip()
             if not text:
                 continue
-            words = [{
-                "word": str(w.get("word", "")).strip(),
-                "start": round(float(w.get("start", item.get("start", 0.0))), 3),
-                "end": round(float(w.get("end", item.get("end", 0.0))), 3),
-                "confidence": round(float(w.get("score", 0.0)), 4),
-                "speaker": w.get("speaker"),
-            } for w in (item.get("words") or []) if w.get("word")]
+            words = []
+            for w in item.get("words") or []:
+                if not w.get("word"):
+                    continue
+                слово = {
+                    "word": str(w.get("word", "")).strip(),
+                    "start": round(float(w.get("start", item.get("start", 0.0))), 3),
+                    "end": round(float(w.get("end", item.get("end", 0.0))), 3),
+                    "confidence": round(float(w.get("score", 0.0)), 4),
+                }
+                if пословно and w.get("speaker"):
+                    слово["speaker"] = имя_говорящего(w["speaker"])
+                words.append(слово)
             speaker = item.get("speaker")
-            if speaker:
-                speaker = f"Говорящий {str(speaker).split('_')[-1].lstrip('0') or '1'}"
             scores = [w["confidence"] for w in words if w["confidence"]]
             segments.append(Segment(
                 start=float(item.get("start", 0.0)),
                 end=float(item.get("end", 0.0)),
-                text=text, speaker=speaker,
+                text=text, speaker=имя_говорящего(speaker) if speaker else None,
                 confidence=round(sum(scores) / len(scores), 4) if scores else None,
                 language=language,
                 words=words,
             ))
+        if пословно:
+            # Реплика, внутри которой сменился говорящий, — на части, как и
+            # у остальных движков (см. diarization_assign_words).
+            from ..pipeline.diarization import разделить_по_словам  # noqa: PLC0415
+
+            segments = разделить_по_словам(segments)
 
         self.report(progress, 0.98, "сборка результата")
         return TranscriptionResult(

@@ -16,9 +16,29 @@ python3 benchmarks/run.py ./эталон --models gigaam-v3-e2e-rnnt,faster-whis
 python3 benchmarks/run.py ./эталон --reference ./эталон/тексты
 ```
 
+Адрес сервера и ключ берутся из `ASRHUB_SERVER` и `ASRHUB_KEY`, как у
+примеров в `examples/`.
+
 Результат кладётся сюда же: `benchmarks/<дата>-<машина>.json` и сводная
-таблица в Markdown рядом. Формат JSON совпадает с тем, что отдаёт
-`GET /api/analytics/models`, поэтому его можно сравнивать между прогонами.
+таблица в Markdown рядом. JSON — свой, а не ответ `GET /api/analytics/models`:
+
+```json
+{
+  "generated_at": "2026-09-30T10:15:00+00:00",
+  "host": "asr-01",
+  "platform": "Linux x86_64",
+  "files": 20,
+  "results": [
+    {"model": "gigaam-v3-e2e-rnnt", "files": 20, "rtf_avg": 0.041, "rtf_median": 0.038,
+     "confidence_avg": 0.93, "wer_avg": 0.071, "audio_seconds": 3600.0,
+     "compute_seconds": 147.6,
+     "runs": [{"file": "a.wav", "duration_s": 180.0, "rtf": 0.04,
+               "processing_time_s": 7.2, "words": 412, "confidence": 0.94, "wer": 0.06}]}
+  ]
+}
+```
+
+Файлы разных прогонов одного вида — их и сравнивают между собой.
 
 ## Что нужно для честного замера
 

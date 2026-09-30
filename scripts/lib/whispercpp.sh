@@ -14,7 +14,10 @@ build_whisper_cpp() {
     ( cd "${target}" && run git pull --ff-only ) || warn "Не удалось обновить — собираем текущую версию."
   else
     info "Загрузка исходников whisper.cpp…"
-    retry 3 run git clone --depth 1 https://github.com/ggml-org/whisper.cpp "${target}"
+    # Без «|| return 1» неудачный clone не останавливал сборку: функцию
+    # зовут из условия, а там errexit не действует, и дальше cmake дважды
+    # падал на несуществующем каталоге с невнятным «сборка не удалась».
+    retry 3 run git clone --depth 1 https://github.com/ggml-org/whisper.cpp "${target}" || return 1
     add_rollback "rm -rf '${target}'"
   fi
 
@@ -22,7 +25,14 @@ build_whisper_cpp() {
   case "${accel}" in
     cuda) flags=(-DGGML_CUDA=1); info "Бэкенд: CUDA" ;;
     rocm) flags=(-DGGML_HIPBLAS=1); info "Бэкенд: ROCm" ;;
-    mps)  flags=(-DWHISPER_COREML=1); info "Бэкенд: Metal + Core ML" ;;
+    # Core ML требует рядом с весами сконвертированный энкодер
+    # «ggml-<модель>-encoder.mlmodelc», которого не скачивает никто. Без
+    # разрешения отступить whisper.cpp на его отсутствии отказывался
+    # запускаться вовсе — движок, ради которого ставят профиль apple, не
+    # работал ни с одной моделью. С отступлением: есть энкодер — Neural
+    # Engine, нет — Metal.
+    mps)  flags=(-DWHISPER_COREML=1 -DWHISPER_COREML_ALLOW_FALLBACK=1)
+          info "Бэкенд: Metal (Core ML — если рядом с моделью лежит энкодер .mlmodelc)" ;;
     *)
       if have pkg-config && pkg-config --exists vulkan 2>/dev/null; then
         flags=(-DGGML_VULKAN=1); info "Бэкенд: Vulkan"

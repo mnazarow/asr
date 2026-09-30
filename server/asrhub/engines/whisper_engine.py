@@ -80,6 +80,19 @@ class WhisperEngine(Engine):
         threshold = S.num(settings, "hallucination_silence_threshold", 0.0)
         if threshold > 0 and options["word_timestamps"]:
             options["hallucination_silence_threshold"] = threshold
+        # Подавление пустого вывода и служебных токенов. Оба параметра
+        # числились в каталоге за этим движком, а в transcribe не шли: у
+        # openai-whisper работали только умолчания библиотеки. Пустой список
+        # токенов — «ничего не подавлять»: сам whisper пустую строку не
+        # разбирает (int("") падает), поэтому ей соответствует None.
+        options["suppress_blank"] = bool(settings.get("suppress_blank", True))
+        подавить = settings.get("suppress_tokens")
+        подавить = "-1" if подавить is None else str(подавить).strip()
+        try:
+            options["suppress_tokens"] = ",".join(
+                str(int(x)) for x in подавить.split(",") if x.strip()) or None
+        except ValueError:
+            options["suppress_tokens"] = "-1"
 
         self.report(progress, 0.1, "распознавание")
         try:

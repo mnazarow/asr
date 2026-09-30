@@ -71,7 +71,8 @@ def process_call(request: Request, body: ProcessCallBody,
     if not state.settings.get("phone_compat_enabled", True):
         raise error_response(ForbiddenError(
             "Приём разговоров по схеме phone_asr выключен.",
-            hint="Включить: asrctl config set phone_compat_enabled true"))
+            hint="Включить: «Настройки», параметр phone_compat_enabled, или "
+                 "строкой phone_compat_enabled: true в config.yaml."))
     require_write(principal)
 
     call = phone_compat.PhoneRequest(

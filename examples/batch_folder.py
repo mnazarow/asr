@@ -37,11 +37,15 @@ def submit(path: Path, data: dict[str, str]) -> tuple[Path, str | None, str]:
     except requests.RequestException as exc:
         return path, None, str(exc)
     if not response.ok:
+        # Поля ошибки — на верхнем уровне ответа; detail есть не у каждой.
         try:
-            detail = response.json().get("detail", {})
+            body = response.json()
         except ValueError:
-            detail = {}
-        return path, None, detail.get("message") or f"HTTP {response.status_code}"
+            body = {}
+        message = body.get("message") if isinstance(body, dict) else ""
+        if not message and isinstance(body, dict):
+            message = str(body.get("detail") or "")
+        return path, None, message or f"HTTP {response.status_code}"
     return path, response.json()["id"], ""
 
 

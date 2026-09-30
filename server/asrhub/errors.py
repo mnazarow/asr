@@ -18,7 +18,8 @@ class ASRHubError(Exception):
     code = "internal_error"
     http_status = 500
     retryable = False
-    hint = "Проверьте журнал сервера: asrctl logs --tail 200"
+    hint = ("Проверьте журнал сервера: раздел «Журнал» в интерфейсе или на сервере "
+            "bash scripts/service.sh logs -n 200")
 
     def __init__(self, message: str = "", *, hint: str | None = None,
                  details: dict[str, Any] | None = None, cause: BaseException | None = None):
@@ -55,7 +56,7 @@ class ConfigError(ASRHubError):
 
     code = "config_error"
     http_status = 400
-    hint = "Проверьте config.yaml и запустите: asrctl doctor"
+    hint = "Проверьте config.yaml; разбор окружения на сервере — bash scripts/doctor.sh"
 
 
 class DependencyMissing(ASRHubError):
@@ -63,7 +64,7 @@ class DependencyMissing(ASRHubError):
 
     code = "dependency_missing"
     http_status = 503
-    hint = "Установите движок: asrctl engines install <движок>"
+    hint = "Установите движок на сервере: bash scripts/models.sh install-engine <движок>"
 
     def __init__(self, engine: str, package: str = "", cause: BaseException | None = None):
         pkg = package or engine
@@ -98,7 +99,7 @@ class HardwareError(ASRHubError):
     code = "hardware_error"
     http_status = 503
     retryable = True
-    hint = "Проверьте доступность устройства: asrctl doctor --hardware"
+    hint = "Проверьте устройство на сервере: bash scripts/doctor.sh --hardware"
 
 
 class OutOfMemoryError(ASRHubError):
@@ -136,7 +137,7 @@ class ModelNotFound(ASRHubError):
             sug = " Возможно, вы имели в виду: " + ", ".join(suggestions[:5]) + "."
         super().__init__(
             f"Модель «{model_id}» отсутствует в каталоге.{sug}",
-            hint="Список доступных моделей: asrctl models list",
+            hint="Список доступных моделей: раздел «Модели», GET /api/models или asrctl models",
             details={"model": model_id, "suggestions": suggestions or []},
         )
 
@@ -152,7 +153,8 @@ class ModelNotDownloaded(ASRHubError):
         size = f" (примерно {size_mb} МБ)" if size_mb else ""
         super().__init__(
             f"Веса модели «{model_id}» не загружены{size}.",
-            hint=f"Загрузите заранее: asrctl models download {model_id}",
+            hint=(f"Скачайте её в разделе «Модели» или на сервере: "
+                  f"bash scripts/models.sh download {model_id}"),
             details={"model": model_id, "size_mb": size_mb},
         )
 
@@ -164,7 +166,7 @@ class ModelLoadError(ASRHubError):
     http_status = 503
     retryable = True
     hint = ("Проверьте целостность весов и свободное место. "
-            "Повторная загрузка: asrctl models download <модель> --force")
+            "Скачать заново на сервере: bash scripts/models.sh download <модель> --force")
 
 
 class GatedModelError(ASRHubError):
@@ -178,7 +180,8 @@ class GatedModelError(ASRHubError):
             f"Для модели «{model_id}» нужно принять лицензию и указать токен Hugging Face.",
             hint=(f"1. Откройте {url or 'страницу модели на huggingface.co'} и примите условия.\n"
                   "2. Создайте токен на huggingface.co/settings/tokens.\n"
-                  "3. Пропишите его: asrctl config set hf_token <токен>"),
+                  "3. Задайте его: «Настройки → Токен Hugging Face» в интерфейсе "
+                  "или строкой hf_token: в config.yaml."),
             details={"model": model_id, "url": url},
         )
 

@@ -157,7 +157,7 @@ case "${ACCEL}" in
           "На ROCm стабильно работают transformers и gigaam; faster-whisper — только на CPU." ;;
   mps)  check "Ускоритель" ok "Apple Silicon (Metal)"
         check "Поддержка движков" warn "NeMo и faster-whisper на GPU недоступны" \
-          "На macOS используйте whisper_cpp с Core ML — это самый быстрый путь." ;;
+          "На macOS используйте whisper_cpp — он считает на Metal." ;;
   *)
     # «Не обнаружена» — неверный ответ, если карта в машине есть, а драйвера
     # нет: чинить надо драйвер, а не искать модель поменьше. Поэтому сначала

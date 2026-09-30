@@ -130,12 +130,15 @@ class FasterWhisperEngine(Engine):
         if max_new > 0:
             opts["max_new_tokens"] = max_new
 
-        raw_suppress = str(settings.get("suppress_tokens") or "-1").strip()
-        if raw_suppress:
-            try:
-                opts["suppress_tokens"] = [int(x) for x in raw_suppress.split(",") if x.strip()]
-            except ValueError:
-                opts["suppress_tokens"] = [-1]
+        # Пустое значение — «ничего не подавлять» (пример каталога «Без
+        # подавления»). Раньше `or "-1"` превращал пустую строку обратно в
+        # набор по умолчанию, и выключить подавление было нельзя.
+        raw_suppress = settings.get("suppress_tokens")
+        raw_suppress = "-1" if raw_suppress is None else str(raw_suppress).strip()
+        try:
+            opts["suppress_tokens"] = [int(x) for x in raw_suppress.split(",") if x.strip()]
+        except ValueError:
+            opts["suppress_tokens"] = [-1]
 
         if self.language_for(settings) is None:
             opts["language_detection_threshold"] = S.num(

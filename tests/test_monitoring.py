@@ -728,7 +728,7 @@ def test_a_dead_target_does_not_flood_the_log(caplog):
     За ночь это полторы тысячи одинаковых строк, в которых тонет всё
     остальное — включая ту причину, ради которой в журнал и пришли. Само
     состояние приёмника при этом никуда не девается: оно целиком видно в
-    /api/monitoring/push.
+    GET /api/monitoring/targets.
     """
     import logging
 

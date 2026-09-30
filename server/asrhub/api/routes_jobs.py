@@ -32,6 +32,7 @@ from ..errors import (
     ConfigError,
     FileTooLarge,
     JobNotFound,
+    ModelNotFound,
     QuotaExceeded,
     StorageError,
     UnsupportedFormat,
@@ -77,6 +78,34 @@ def content_disposition(filename: str) -> str:
     ascii_name = чистое.encode("ascii", "replace").decode("ascii").replace("?", "_")
     quoted = quote(чистое, safe="")
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
+
+
+def _известные_модель_и_движок(значения: dict[str, Any]) -> None:
+    """Модель и движок задания существуют — иначе отказ сразу.
+
+    Раньше опечатка в имени модели принималась ответом 200 «в очереди», а
+    через минуту задание падало с model_not_found: интеграция, которая
+    смотрит только на ответ постановки, считала запись принятой. Проверка —
+    здесь, на входе, а не в общей проверке значений: та же проверка при
+    повторном разборе сохранённых параметров не давала бы скачать результат
+    задания, чья модель ушла из каталога, и отнимала бы у него переход на
+    резервную модель.
+    """
+    if "model" in значения:
+        модель = str(значения.get("model") or "").strip()
+        if not модель:
+            raise error_response(ConfigError(
+                "Модель задания пуста.",
+                hint="Не передавайте поле model, чтобы взять модель сервера, "
+                     "или укажите модель из GET /api/models."))
+        if catalog.get_model(модель) is None:
+            raise error_response(ModelNotFound(модель, catalog.suggest_models(модель)))
+    движок = str(значения.get("engine") or "").strip()
+    if движок and движок != "auto" and движок not in catalog.ENGINES_BY_ID:
+        raise error_response(ConfigError(
+            f"Движка «{движок}» нет.",
+            hint="Возможные: auto (движок модели), "
+                 + ", ".join(sorted(catalog.ENGINES_BY_ID)) + "."))
 
 
 def _parse_settings(raw: str | None) -> dict[str, Any]:
@@ -591,6 +620,7 @@ async def create_job(
         # Значения из settings перекрывают одноимённые поля формы: явный JSON
         # выражает намерение точнее, чем разрозненные поля.
         overrides = {**await _form_overrides(request), **_parse_settings(settings)}
+        _известные_модель_и_движок(overrides)
         merged = state.settings.merged(overrides)
         job = await asyncio.to_thread(functools.partial(
             state.queue.submit,
@@ -661,6 +691,7 @@ async def create_batch(
     created: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     overrides = {**await _form_overrides(request), **_parse_settings(settings)}
+    _известные_модель_и_движок(overrides)
     merged = state.settings.merged(overrides)
     # Данные звонка разбираются один раз на весь пакет: поля общие, и
     # повторять разбор (а с ним и предупреждения) на каждый файл незачем.
@@ -1045,8 +1076,7 @@ def redact_audio(request: Request, job_id: str,
         mode=mode or str(state.settings.get("redact_mode") or "beep"),
         kinds=выбранные,
         padding_ms=S.integer(state.settings, "redact_padding_ms",
-                             redact_mod.ЗАПАС_МС),
-        ffmpeg=str(state.settings.get("ffmpeg_path") or "ffmpeg"))
+                             redact_mod.ЗАПАС_МС))
     ответ = итог.to_dict()
     ответ["found"] = bool(итог.path)
     ответ["url"] = f"/api/jobs/{job_id}/redacted" if итог.path else None
@@ -1272,6 +1302,7 @@ def _проверенные_переопределения(сырые: Any, *, �
     ошибки = catalog.validate_all(свои)
     if ошибки:
         raise error_response(ConfigError("; ".join(ошибки)))
+    _известные_модель_и_движок(свои)
     return свои
 
 

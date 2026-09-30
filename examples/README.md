@@ -16,6 +16,9 @@ export ASRHUB_KEY="$(cat /var/lib/asrhub/api-key.txt)"
 | `batch_folder.py` | Каталог целиком, с ограничением одновременных отправок |
 | `live_events.py` | Подписка на события WebSocket вместо опроса |
 | `monitoring_pull.py` | Снятие метрик и разбор порогов из справочника |
+| `stream_microphone.py` | Распознавание на лету: звук кусками, текст по ходу речи |
 
-Зависимости: только `requests` (и `websockets` для `live_events.py`).
-Ставится одной строкой: `pip install requests websockets`.
+Зависимости: `requests`, `websockets` для `live_events.py` и
+`websocket-client` для `stream_microphone.py` (в режиме микрофона — ещё
+`sounddevice`). Ставится одной строкой:
+`pip install requests websockets websocket-client`.

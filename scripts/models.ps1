@@ -228,6 +228,22 @@ if spec.engine == "gigaam":
         print(f"\nОшибка загрузки: {exc}"); raise SystemExit(1)
     print(f"Готово: {target if target.exists() else models_dir}"); raise SystemExit(0)
 
+# whisper.cpp — один файл ggml из репозитория ggerganov/whisper.cpp. Общая
+# дорога ниже принимала «large-v3-turbo» за модель faster-whisper и клала на
+# диск чужие веса, а варианты «…-q5_0» не находила вовсе.
+if spec.engine == "whisper_cpp":
+    from asrhub.engines.whisper_cpp_engine import download_weights
+    from asrhub.errors import ASRHubError
+    print(f"Скачивание {spec.source} (примерно {spec.disk_mb or '?'} МБ)")
+    try:
+        target = download_weights(spec.source, models_dir, force=force, token=token)
+    except ASRHubError as exc:
+        print(f"Ошибка загрузки: {exc.message}")
+        if exc.hint:
+            print(exc.hint)
+        raise SystemExit(1)
+    print(f"Готово: {target}"); raise SystemExit(0)
+
 if spec.source.startswith("http"):
     import zipfile, urllib.request
     target = models_dir / "vosk"; target.mkdir(parents=True, exist_ok=True)

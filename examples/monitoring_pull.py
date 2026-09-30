@@ -35,6 +35,32 @@ def human(value: float, unit: str) -> str:
     return f"{value:g}{(' ' + unit) if unit else ''}"
 
 
+def level_of(value: float, threshold: dict) -> str:
+    """«авария», «внимание» или пусто — по порогу из справочника метрики.
+
+    Порог бывает включительным (`inclusive`): у метрик, где он стоит на краю
+    шкалы, — например у уровня дрейфа (0, 1, 2) критический порог 2, и
+    строгое «больше двух» не сработало бы никогда.
+    """
+    direction = threshold.get("direction")
+    inclusive = bool(threshold.get("inclusive"))
+
+    def past(limit) -> bool:
+        if limit is None:
+            return False
+        if direction == "above":
+            return value >= limit if inclusive else value > limit
+        return value <= limit if inclusive else value < limit
+
+    if not direction:
+        return ""
+    if past(threshold.get("critical")):
+        return "авария"
+    if past(threshold.get("warning")):
+        return "внимание"
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Снимок метрик с разбором порогов")
     parser.add_argument("--group", default="", help="только одна группа метрик")
@@ -58,33 +84,35 @@ def main() -> int:
 
     warned = 0
     for metric in payload.get("metrics", []):
+        # У гистограммы порога нет: её ведра сравнивать не с чем.
+        if metric.get("type") == "histogram":
+            continue
         threshold = metric.get("threshold") or {}
-        value = metric.get("value")
-        if value is None:
-            continue
-        direction = threshold.get("direction")
-        critical = threshold.get("critical")
-        warning = threshold.get("warning")
-
-        level = ""
-        if direction and critical is not None:
-            above = direction == "above"
-            if (value > critical) if above else (value < critical):
-                level = "авария"
-            elif warning is not None and ((value > warning) if above else (value < warning)):
-                level = "внимание"
-
-        if not level and not args.all:
-            continue
-        if level:
-            warned += 1
-        mark = {"авария": "✕", "внимание": "!"}.get(level, " ")
         unit = metric.get("unit") or ""
-        print(f"{mark} {metric['label']}: {human(float(value), unit)}")
-        if level:
-            print(f"    порог: {'выше' if direction == 'above' else 'ниже'} {critical}")
-            if metric.get("troubleshooting"):
-                print(f"    что делать: {metric['troubleshooting']}")
+        # У метрики не одно значение, а по значению на каждый набор меток:
+        # по модели, по диску, по очереди.
+        for sample in metric.get("values") or []:
+            value = sample.get("value")
+            if value is None:
+                continue
+            level = level_of(float(value), threshold)
+            if not level and not args.all:
+                continue
+            if level:
+                warned += 1
+            labels = sample.get("labels") or {}
+            name = metric.get("label") or metric["name"]
+            if labels:
+                name += " (" + ", ".join(f"{k}={v}" for k, v in labels.items()) + ")"
+            mark = {"авария": "✕", "внимание": "!"}.get(level, " ")
+            print(f"{mark} {name}: {human(float(value), unit)}")
+            if level:
+                limit = threshold.get("critical") if level == "авария" else threshold.get("warning")
+                sign = (">" if threshold.get("direction") == "above" else "<") + \
+                    ("=" if threshold.get("inclusive") else "")
+                print(f"    порог: {sign} {human(float(limit), unit)}")
+                if metric.get("recommendation"):
+                    print(f"    что делать: {metric['recommendation']}")
 
     if not warned:
         print("Отклонений от порогов нет.")

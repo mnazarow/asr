@@ -831,7 +831,10 @@ for _sid, _name, _disk in _WCPP:
         name=_name,
         family="Whisper",
         engine="whisper_cpp",
-        source=_sid,
+        # Источник — имя файла весов в репозитории ggerganov/whisper.cpp.
+        # Короткое «large-v3-turbo» совпадало с именем модели faster-whisper,
+        # и загрузка тянула чужие веса CTranslate2 вместо файла ggml.
+        source=f"ggml-{_sid}.bin",
         license="MIT",
         commercial_use=True,
         languages=_WHISPER_LANGS,
@@ -844,13 +847,15 @@ for _sid, _name, _disk in _WCPP:
         tags=["мультиязычный", "cpu", "apple-silicon", "ggml", "mit"] + (["квантованная"] if _q else []),
         recommended_for=["Apple Silicon", "Серверы без GPU", "Встраивание без Python"],
         strengths=[
-            "Работа на Metal, CoreML, CUDA, Vulkan, ROCm, OpenVINO",
-            "Core ML переносит энкодер на Neural Engine — ускорение более чем втрое",
+            "Работа на Metal, CUDA, Vulkan, ROCm, OpenVINO",
+            "С энкодером Core ML (его конвертируют отдельно) энкодер уходит на Neural Engine",
             "Один бинарник без зависимостей Python",
         ] + (["Квантизация уменьшает файл в 2–5 раз при небольшой потере качества"] if _q else []),
         weaknesses=["Требуется компиляция под конкретную платформу",
                     "Параметры VAD по умолчанию отличаются от faster-whisper"],
-        notes="Модели скачиваются скриптом models/download-ggml-model.sh из репозитория whisper.cpp.",
+        notes=("Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: "
+               "раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними "
+               "скачивается модель поиска речи ggml-silero."),
         default_params={"beam_size": 5, "threads": 0, "flash_attn": True},
     ))
 

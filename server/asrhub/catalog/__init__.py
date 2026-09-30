@@ -21,6 +21,7 @@ from .params import (
     GROUPS_BY_ID,
     PARAMS,
     PARAMS_BY_KEY,
+    УБРАННЫЕ,
     coerce_all,
     coerce_value,
     defaults,
@@ -29,6 +30,7 @@ from .params import (
     params_for_group,
     translate_key,
     validate_all,
+    validate_server_value,
     validate_value,
 )
 from .params import stats as params_stats
@@ -47,14 +49,15 @@ from .schema import (
 
 __all__ = [
     "CATALOG_DATE", "EXCLUDED_MODELS", "MODELS", "MODELS_BY_ID", "SOURCES",
-    "ENGINES", "ENGINES_BY_ID", "PARAMS", "PARAMS_BY_KEY", "GROUPS", "GROUPS_BY_ID",
+    "ENGINES", "ENGINES_BY_ID", "PARAMS", "PARAMS_BY_KEY", "УБРАННЫЕ", "GROUPS", "GROUPS_BY_ID",
     "PRESETS", "PRESETS_BY_ID",
     "Benchmark", "EngineSpec", "Maturity", "ModelSpec", "ParamExample", "ParamSpec",
     "PresetSpec", "Quality", "Timestamps",
     "catalog_summary", "get_model", "get_engine", "get_param", "get_preset", "suggest_models",
     "mean_ru_wer", "models_for_engine", "suggest_models", "models_for_language", "recommended_ru",
     "defaults", "params_for_engine", "params_for_group", "translate_key",
-    "validate_all", "validate_value", "coerce_all", "coerce_value", "params_stats",
+    "validate_all", "validate_value", "validate_server_value", "coerce_all", "coerce_value",
+    "params_stats",
 ]
 
 

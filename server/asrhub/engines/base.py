@@ -125,6 +125,44 @@ def device_for(settings: dict[str, Any]) -> str:
     return "cpu"
 
 
+_log = get_logger("engine")
+
+
+def ограничить_видеопамять(устройство: str, settings: dict[str, Any]) -> float | None:
+    """Доля видеопамяти процесса — параметр `gpu_memory_fraction`.
+
+    Параметр был в каталоге, а в `torch` не передавался никогда: процесс
+    занимал карту сколько хотел, и совет «0,5 на общей карте» ничего не
+    давал. Действует на память, которую выделяет PyTorch, — GigaAM,
+    Whisper, NeMo, Transformers, pyannote; CTranslate2 (faster-whisper),
+    whisper.cpp и onnxruntime берут память мимо него и доли не слушаются.
+    Ставится при каждой загрузке модели, так что изменённое значение
+    действует со следующей. Возвращает поставленную долю или None.
+    """
+    if not str(устройство or "").startswith("cuda"):
+        return None
+    try:
+        доля = float(settings.get("gpu_memory_fraction") or 0.9)
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 < доля <= 1.0:
+        return None
+    try:
+        import torch  # type: ignore
+    except Exception:                                       # noqa: BLE001
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        _, _, номер = str(устройство).partition(":")
+        карта = int(номер) if номер.strip().isdigit() else torch.cuda.current_device()
+        torch.cuda.set_per_process_memory_fraction(доля, карта)
+    except Exception as exc:                                # noqa: BLE001
+        _log.warning("Долю видеопамяти %.2f поставить не удалось: %s", доля, exc)
+        return None
+    return доля
+
+
 class Engine(ABC):
     """Общий интерфейс всех движков."""
 
@@ -194,6 +232,7 @@ class Engine(ABC):
                 "драйвер, обновлённый без перезагрузки. Пока карта чинится, "
                 "приём держит device=cpu."
             )
+        ограничить_видеопамять(устройство, settings)
         started = time.perf_counter()
         try:
             self._model = self._load(settings)

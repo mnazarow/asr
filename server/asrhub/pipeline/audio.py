@@ -426,6 +426,12 @@ def нужна_очистка(src: Path, settings: dict[str, Any]) -> tuple[bool
     return True, ""
 
 
+def модель_arnndn() -> str | None:
+    """Файл модели RNNoise для `audio_denoise: arnndn`, если он задан и есть."""
+    model = os.environ.get("ASRHUB_ARNNDN_MODEL", "").strip()
+    return model if model and Path(model).is_file() else None
+
+
 def build_filter_chain(settings: dict[str, Any]) -> str:
     """Собирает цепочку фильтров ffmpeg по настройкам задания."""
     filters: list[str] = []
@@ -438,10 +444,12 @@ def build_filter_chain(settings: dict[str, Any]) -> str:
     if denoise == "afftdn":
         filters.append("afftdn=nf=-25")
     elif denoise == "arnndn":
-        model = os.environ.get("ASRHUB_ARNNDN_MODEL", "")
-        if model and Path(model).exists():
+        model = модель_arnndn()
+        if model:
             filters.append(f"arnndn=m={model}")
         else:
+            # В задание это пишет `prepare`: журнал сервера человек, выбравший
+            # шумоподавление, не читает.
             log.warning("arnndn выбран, но файл модели не задан — шумоподавление пропущено")
     # deepfilternet в цепочку фильтров не попадает: он работает отдельным
     # проходом до неё (см. `очистить_deepfilter`). Причина в частоте: модель
@@ -476,11 +484,15 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
             duration_s: float | None = None) -> Path:
     """Приводит файл к WAV 16 бит с нужной частотой и каналом.
 
-    channel: None — по настройке audio_channels; «left»/«right» — конкретный канал.
+    channel: None — по настройке audio_channels; «left»/«right» — конкретный
+    канал; «c<N>» — канал с номером N от нуля (многоканальная запись).
     """
     exe = _ffmpeg()
     rate = int(settings.get("audio_sample_rate") or 16000)
     mode = channel or str(settings.get("audio_channels") or "mono")
+    номер_канала = {"left": 0, "right": 1}.get(mode)
+    if номер_канала is None and mode[:1] == "c" and mode[1:].isdigit():
+        номер_канала = int(mode[1:])
 
     cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if start_s is not None:
@@ -492,10 +504,9 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     cmd += ["-i", str(src)]
 
     chain = build_filter_chain(settings)
-    if mode == "left":
-        chain = ("pan=mono|c0=c0," + chain) if chain else "pan=mono|c0=c0"
-    elif mode == "right":
-        chain = ("pan=mono|c0=c1," + chain) if chain else "pan=mono|c0=c1"
+    if номер_канала is not None:
+        выбор = f"pan=mono|c0=c{номер_канала}"
+        chain = f"{выбор},{chain}" if chain else выбор
     if chain:
         cmd += ["-af", chain]
 
@@ -767,6 +778,13 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
             if беда:
                 замечания.append(беда)
     settings = настройки
+    if str(settings.get("audio_denoise") or "none") == "arnndn" and модель_arnndn() is None:
+        # Раньше об этом знал только журнал сервера: запись уходила без
+        # шумоподавления, а в задании стояло «arnndn» — как будто оно было.
+        замечания.append(
+            "Шумоподавление arnndn не выполнено: не задан файл модели RNNoise — "
+            "переменная окружения ASRHUB_ARNNDN_MODEL с путём к файлу .rnnn. "
+            "Без файла подойдёт audio_denoise: afftdn.")
 
     # Тишина по краям отмеряется один раз на исходном файле и одинаково
     # применяется ко всем каналам: иначе левый и правый разъехались бы во
@@ -776,6 +794,15 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
     speed = float(settings.get("audio_speed") or 1.0)
 
     mode = str(settings.get("audio_channels") or "mono")
+    # «Разделение по аудиоканалам» в диаризации — это и есть раздельная
+    # обработка каналов. Раньше выбор ничего не включал: каналы сводились в
+    # моно, а говорящие молча расставлялись по паузам — ровно там, где
+    # справочник обещал «безошибочно для стереозаписей».
+    по_каналам = (bool(settings.get("diarization_enabled"))
+                  and str(settings.get("diarization_backend") or "") == "channels")
+    раздельно_явно = mode == "split"
+    if по_каналам and mode == "mono":
+        mode = "split"
 
     if mode in ("left", "right") and info.channels < 2:
         # Второго канала нет. `pan=mono|c0=c1` на одноканальном файле даёт
@@ -788,11 +815,25 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
             f"единственный.")
         mode = "mono"
 
+    if mode == "split" and info.channels < 2 and раздельно_явно:
+        # Каналов для раздельной обработки нет — запись обрабатывается как
+        # есть, но молчать об этом нельзя: человек ждал две расшифровки.
+        # (Для диаризации «по каналам» то же самое скажет сама диаризация.)
+        замечания.append("Запись одноканальная — обрабатывать каналы раздельно нечего.")
+
     if mode == "split" and info.channels >= 2:
         outputs: list[tuple[str, Path]] = []
         молчат: list[str] = []
         первый_отказ: ASRHubError | None = None
-        for label, channel in (("Канал 1", "left"), ("Канал 2", "right")):
+        # Все каналы, а не два первых: запись совещания «по каналу на
+        # человека» несёт их четыре и больше, и раньше всё, что после
+        # второго, молча выбрасывалось вместе с речью этих людей. У
+        # стереозаписи имена прежние — left и right.
+        if info.channels == 2:
+            каналы = [("Канал 1", "left"), ("Канал 2", "right")]
+        else:
+            каналы = [(f"Канал {i + 1}", f"c{i}") for i in range(info.channels)]
+        for label, channel in каналы:
             dst = workdir / f"{src.stem}.{channel}.wav"
             try:
                 convert(src, dst, settings, channel=channel, start_s=offset or None,
@@ -811,7 +852,7 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
                 continue
             outputs.append((label, dst))
         if not outputs:
-            # Молчат оба — вот это уже отказ, и текст у него точный.
+            # Молчат все — вот это уже отказ, и текст у него точный.
             raise первый_отказ or AudioError(
                 f"В записи «{src.name}» не осталось звука ни в одном канале.")
         if молчат:

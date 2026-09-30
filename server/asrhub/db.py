@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -1356,11 +1356,36 @@ class Database:
                 if current < 28:
                     self._разделить_названный_nps(conn)
                     self._снять_качество_с_переписки(conn)
+                if current < 31:
+                    self._движок_вместо_auto(conn)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:
                 conn.execute("ROLLBACK")
                 raise StorageError(f"Не удалось применить миграции: {exc}") from exc
+
+    def _движок_вместо_auto(self, conn: sqlite3.Connection) -> None:
+        """«auto» в колонке движка заменяется движком модели.
+
+        До версии 31 задание записывало в колонку движок из параметров, а
+        там почти всегда «auto»: разрез аналитики «по движкам» показывал
+        один столбец «auto» на весь архив, статистика моделей — движок
+        «auto» у каждой. Настоящий движок однозначно следует из модели по
+        каталогу; модели, которой в каталоге уже нет, не трогаются.
+        """
+        from .catalog import get_model  # noqa: PLC0415
+
+        for таблица in ("jobs", "model_stats"):
+            модели = [str(строка[0]) for строка in conn.execute(
+                f"SELECT DISTINCT model FROM {таблица} "
+                "WHERE model IS NOT NULL AND (engine IS NULL OR engine IN ('', 'auto'))")]
+            for модель in модели:
+                spec = get_model(модель)
+                if spec is None:
+                    continue
+                conn.execute(
+                    f"UPDATE {таблица} SET engine=? WHERE model=? "
+                    "AND (engine IS NULL OR engine IN ('', 'auto'))", (spec.engine, модель))
 
     def _починка_ключей_звонков(self, conn: sqlite3.Connection) -> None:
         """Ключ звонка в архиве приводится к виду «станция:идентификатор».

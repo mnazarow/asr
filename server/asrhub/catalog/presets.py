@@ -29,7 +29,7 @@ PRESETS: list[PresetSpec] = [
             "vad_enabled": True, "vad_backend": "silero", "vad_threshold": 0.45,
             "vad_min_silence_ms": 700, "vad_max_speech_s": 22.0, "vad_speech_pad_ms": 300,
             "audio_normalize": True, "audio_highpass_hz": 80, "audio_trim_silence": True,
-            "batch_size": 8, "word_timestamps": True, "include_confidence": True,
+            "word_timestamps": True, "include_confidence": True,
             "punctuation_enabled": False, "itn_enabled": False,
             "merge_short_segments": True, "paragraph_mode": "speaker",
             "output_formats": ["txt", "json", "docx", "srt"],
@@ -40,9 +40,9 @@ PRESETS: list[PresetSpec] = [
         name="Русский: массовая обработка архива",
         scenario="Тысячи файлов, важна пропускная способность",
         description=(
-            "GigaAM v3 CTC и крупный пакет: CTC декодируется за один проход, без "
-            "поиска по гипотезам. Потеря точности относительно максимального режима — "
-            "менее одного процентного пункта, выигрыш по времени — в три-четыре раза."
+            "GigaAM v3 CTC: декодируется за один проход, без поиска по гипотезам. "
+            "Потеря точности относительно максимального режима — менее одного "
+            "процентного пункта, выигрыш по времени — в три-четыре раза."
         ),
         hardware_hint="GPU от 12 ГБ",
         expected="RTF около 0.03–0.05 на RTX 3090; WER на чистой речи около 3–4 %",
@@ -51,7 +51,7 @@ PRESETS: list[PresetSpec] = [
             "vad_enabled": True, "vad_threshold": 0.5, "vad_min_silence_ms": 500,
             "vad_max_speech_s": 22.0, "vad_speech_pad_ms": 150,
             "audio_normalize": True, "audio_trim_silence": True,
-            "batch_size": 24, "word_timestamps": False, "include_confidence": True,
+            "word_timestamps": False, "include_confidence": True,
             "punctuation_enabled": True, "punctuation_model": "rupunct", "itn_enabled": True,
             "priority": 10, "max_concurrent_jobs": 1,
             "output_formats": ["txt", "json"],
@@ -200,8 +200,8 @@ PRESETS: list[PresetSpec] = [
         name="macOS на Apple Silicon",
         scenario="Локальная обработка на MacBook или Mac mini",
         description=(
-            "whisper.cpp с ускорением Metal и Core ML: энкодер выполняется на Neural Engine, "
-            "что даёт более чем трёхкратное ускорение относительно чистого CPU."
+            "whisper.cpp с ускорением Metal: модель считается на видеоядре, в разы "
+            "быстрее, чем на одном процессоре."
         ),
         hardware_hint="Apple M1 и новее, от 16 ГБ объединённой памяти",
         expected="Квантованная large-v3-turbo занимает 574 МБ и работает быстрее реального времени",
@@ -219,14 +219,16 @@ PRESETS: list[PresetSpec] = [
         name="Реальное время",
         scenario="Живые субтитры, голосовые интерфейсы, мониторинг эфира",
         description=(
-            "Потоковое распознавание с настраиваемой задержкой и промежуточными "
-            "результатами. Для русского языка на телефонии лучший выбор — T-one."
+            "Распознавание на лету (/api/stream) с промежуточными результатами и "
+            "закреплением фразы по паузе. T-one потока не держит и работает скользящим "
+            "окном: гипотеза каждые две секунды, фраза закрепляется после 0,6 секунды "
+            "тишины. Настоящий поток с задержкой в доли секунды — у Vosk."
         ),
-        hardware_hint="CPU от 4 ядер для T-one; GPU для Nemotron",
-        expected="Задержка около 1 секунды, работа в реальном времени",
+        hardware_hint="CPU от 4 ядер для T-one",
+        expected="Черновик — каждые 2 секунды, закреплённая фраза — через 0,6 с после паузы",
         values={
             "engine": "tone", "model": "tone-ru", "language": "ru",
-            "streaming_latency_ms": 560, "streaming_chunk_ms": 300,
+            "stream_window_s": 2.0,
             "streaming_partial_results": True, "streaming_endpoint_silence_ms": 600,
             "vad_enabled": True, "vad_threshold": 0.4,
             "punctuation_enabled": True, "itn_enabled": False,

@@ -200,26 +200,25 @@ curl http://сервер:8080/api/metrics
 ```
 
 ```
-asrhub_jobs_current{status="queued"} 6
-asrhub_jobs_current{status="running"} 2
-asrhub_jobs_current{status="completed"} 1284
-asrhub_jobs_current{status="failed"} 37
-asrhub_audio_seconds_day 68606.9
-asrhub_words_day 156196
-asrhub_rtf_avg 0.1348
-asrhub_rtf_p95 0.3848
-asrhub_queue_time_p95 89.9
-asrhub_confidence_avg 0.9228
-asrhub_success_rate 0.9136
-asrhub_model_rtf_avg{model="gigaam-v3-rnnt"} 0.1183
+asrhub_up 1
+asrhub_queue_depth 6
+asrhub_jobs_by_status{status="running"} 2
+asrhub_jobs_by_status{status="completed"} 1284
+asrhub_jobs_by_status{status="failed"} 37
+asrhub_jobs_total{status="completed"} 311
+asrhub_audio_seconds_total 68606.9
+asrhub_words_total 156196
+asrhub_rtf_p95_by_model{model="gigaam-v3-e2e-rnnt"} 0.3848
+asrhub_model_success_rate{model="gigaam-v3-e2e-rnnt"} 0.9136
+asrhub_confidence 0.9228
 asrhub_cpu_percent 41.2
-asrhub_gpu_percent 78.0
-asrhub_disk_free_gb 412.7
+asrhub_gpu_percent{gpu="0"} 78.0
+asrhub_disk_free_bytes 443134582784
 ```
 
-Метрики за сутки (`audio_seconds_day`, `words_day`, перцентили) плюс разрез по моделям и последний замер загрузки железа. Точка `/api/metrics` доступна без ключа — её обычно закрывают на уровне прокси, а не приложения.
+Это вывод подсистемы мониторинга — тот же, что у `/api/monitoring/metrics`: полный перечень с описаниями и порогами — в главе [16. Мониторинг](16-monitoring.md). `asrhub_jobs_by_status` — сколько заданий в каждом состоянии сейчас, `asrhub_jobs_total` — счётчик с запуска сервера, к нему применяют `rate()` и `increase()`. Доступ без ключа — только при `monitoring_public: true`; иначе нужен ключ, как ко всему остальному.
 
-Имена здесь намеренно другие, чем у подсистемы мониторинга. Это запасной путь — он отвечает, когда подсистема не поднялась, — и величины у него другого рода: `asrhub_jobs_current` это «сколько заданий в статусе сейчас», а не счётчик с момента запуска. Пока имена совпадали, Prometheus видел под одним рядом то накопительный счётчик, то убывающую величину, и `rate()` считал каждое снижение сбросом счётчика, завышая поток в разы.
+Если подсистема мониторинга не поднялась, `/api/metrics` отвечает запасным срезом из аналитики — полтора десятка величин под своими именами (`asrhub_jobs_current`, `asrhub_rtf_p95`, `asrhub_success_rate` и подобными). Имена там намеренно другие: это «сколько сейчас» и «за сутки», а не счётчики, и совпади они с именами подсистемы, `rate()` принял бы каждое снижение за сброс счётчика. Правила тревог стоит писать по основным именам — запасной срез на то и запасной.
 
 Пример правил оповещения:
 
@@ -228,15 +227,17 @@ groups:
   - name: asrhub
     rules:
       - alert: ОчередьРастёт
-        expr: asrhub_jobs_current{status="queued"} > 50
+        expr: asrhub_queue_depth > 50
         for: 15m
       - alert: МалоМестаНаДиске
-        expr: asrhub_disk_free_gb < 20
+        expr: asrhub_disk_free_bytes < 20e9
         for: 5m
       - alert: МногоОшибок
-        expr: increase(asrhub_jobs_current{status="failed"}[30m]) > 20
+        expr: increase(asrhub_jobs_total{status="failed"}[30m]) > 20
         for: 10m
 ```
+
+Готовые правила по всем порогам каталога отдаёт сам сервер: `GET /api/monitoring/config/prometheus`.
 
 ## Выгрузка в таблицу
 

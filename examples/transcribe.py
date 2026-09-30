@@ -26,19 +26,33 @@ HEADERS = {"X-API-Key": KEY} if KEY else {}
 def fail(response: requests.Response) -> None:
     """Печатает ошибку так, как её описывает сервер, и выходит.
 
-    Формат ответа об ошибке одинаков у всех маршрутов: code для машины,
-    message и hint — для человека. Разбирать его стоит именно так, а не
-    показывать пользователю голый код состояния.
+    Формат ответа об ошибке одинаков у всех маршрутов: поля верхнего
+    уровня, code — для машины, message и hint — для человека. Разбирать его
+    стоит именно так, а не показывать пользователю голый код состояния.
+    Поле detail есть не у каждой ошибки (это копия для прежних клиентов),
+    поэтому на него не опираемся.
     """
-    try:
-        detail = response.json().get("detail", {})
-    except ValueError:
-        detail = {}
-    print(f"Ошибка {response.status_code}: {detail.get('message') or response.text[:200]}",
+    error = error_of(response)
+    print(f"Ошибка {response.status_code}: {error.get('message') or response.text[:200]}",
           file=sys.stderr)
-    if detail.get("hint"):
-        print(f"  {detail['hint']}", file=sys.stderr)
+    if error.get("hint"):
+        print(f"  {error['hint']}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def error_of(response: requests.Response) -> dict:
+    """Поля ошибки: code, message, hint — с верхнего уровня ответа."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    if "code" in body:
+        return body
+    # 422 от проверки полей запроса: detail — список замечаний по полям.
+    detail = body.get("detail")
+    return detail if isinstance(detail, dict) else {"message": str(detail or "")}
 
 
 def main() -> int:

@@ -20,7 +20,7 @@
 
 ## Приоритеты и порядок
 
-Приоритет — число от 1 до 100, по умолчанию 50; больше значит раньше. При равном приоритете работает порядок поступления.
+Приоритет — число от 0 до 100, по умолчанию 50; больше значит раньше. При постановке значение вне этих пределов приводится к ближайшему краю; «наверх» и «вниз» в очереди — это приоритет 100 и 0. При равном приоритете работает порядок поступления.
 
 ```bash
 curl -X POST http://сервер:8080/api/jobs/job_ab12/priority \
@@ -30,7 +30,7 @@ curl -X POST http://сервер:8080/api/jobs/job_ab12/priority \
 curl -X POST http://сервер:8080/api/jobs/job_ab12/top -H "X-API-Key: ключ"
 ```
 
-В интерфейсе то же самое делается перетаскиванием строки.
+В интерфейсе — кнопками ▲ и ▼ в строке задания раздела «Очередь»: приоритет 100 и 0. Произвольное значение задаётся только через API.
 
 ## Политики планирования
 
@@ -93,7 +93,7 @@ curl -X POST http://сервер:8080/api/jobs/batch \
   -F 'settings={"model":"gigaam-v3-ctc"}'
 ```
 
-По `group_id` фильтруются списки и выгружаются результаты целиком. Консольный клиент отправляет каталог одной командой:
+По `group_id` фильтруется список заданий — `GET /api/jobs?group_id=…`; результаты забираются по каждому заданию. Консольный клиент отправляет каталог одной командой:
 
 ```bash
 asrctl send-dir ./архив --recursive --pattern '*.mp3' --formats txt,json --priority 30
@@ -148,7 +148,8 @@ const ws = new WebSocket('ws://сервер:8080/ws?ticket=…');
 ws.onmessage = (e) => {
   const event = JSON.parse(e.data);
   // event.type: job.queued, job.cached, job.started, job.progress,
-  //             job.completed, job.retry, job.failed, job.cancelled,
+  //             job.completed, job.retry, job.fallback, job.failed,
+  //             job.cancelled,
   //             queue.paused, queue.resumed
   if (event.type === 'job.progress') {
     console.log(event.id, event.progress, event.stage);
