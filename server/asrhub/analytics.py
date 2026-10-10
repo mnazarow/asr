@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+from bisect import bisect_right
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -43,6 +44,21 @@ PERIODS = {
 def _since(period: str) -> float:
     seconds = PERIODS.get(period, 86400)
     return 0.0 if seconds == 0 else time.time() - seconds
+
+
+def _корзина(нижние: list[float], момент: float) -> int:
+    """Номер корзины ряда по её точным нижним границам.
+
+    Корзину считали делением: `int((момент - начало) / шаг)`. Числу это
+    безразлично, а раскрытию — нет: список под точкой графика спрашивает
+    базу условием «от границы до границы», и на самой границе деление и
+    сравнение расходятся на последнем знаке. Поэтому корзина выбирается
+    сравнением с теми же числами, которые уходят в ответ (`edges`) и
+    возвращаются границами списка: одно правило на число и на список.
+    Момент раньше первой границы и позже последней — в крайние корзины,
+    как и было.
+    """
+    return min(max(bisect_right(нижние, момент) - 1, 0), len(нижние) - 1)
 
 
 def _escape_label(value: Any) -> str:
@@ -206,10 +222,25 @@ class Analytics:
                 "confidence": M.summarize(conf_values),
                 "wer": M.summarize(wer_values) if wer_values else None,
                 "low_confidence_jobs": sum(1 for c in conf_values if c < НИЗКАЯ_УВЕРЕННОСТЬ),
-                "confidence_distribution": M.confidence_buckets(conf_values) if conf_values else [],
+                "confidence_distribution": self._корзины_уверенности(conf_values),
             },
             "stages": self._stage_breakdown(done),
         }
+
+    @staticmethod
+    def _корзины_уверенности(значения: list[float]) -> list[dict[str, Any]]:
+        """Корзины уверенности с пометкой, у какой из них верх входит.
+
+        Верх последней корзины в ответе — ровно единица: так его и пишут на
+        оси. Считается же она до 1,0001, то есть задание с уверенностью
+        ровно 1,0 в неё входит. Раскрытию столбца в список это надо знать:
+        по условию «меньше единицы» такие задания из списка выпали бы, и
+        список оказался бы короче столбца.
+        """
+        корзины = M.confidence_buckets(значения) if значения else []
+        if корзины:
+            корзины[-1]["inclusive"] = True
+        return корзины
 
     def _stage_breakdown(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
         keys = {
@@ -233,6 +264,9 @@ class Analytics:
                                       "inference_s", "postprocess_s")}
         grand = sum(totals.values()) or 1.0
         return {
+            # Колонки заданий в том же порядке, что подписи: по ним доля
+            # раскрывается в список заданий, у которых этот этап был.
+            "keys": list(keys),
             "labels": [keys[k] for k in keys],
             "seconds": [round(totals[k], 2) for k in keys],
             "share": [round(totals[k] / grand, 4) for k in keys],
@@ -247,6 +281,11 @@ class Analytics:
         span = max(time.time() - since, 60.0)
         width = span / buckets
         jobs = self._jobs(since=since, limit=100000, owner=owner)
+        # Границы корзин — одни на подсчёт и на раскрытие точки в список.
+        # Последняя корзина закрывается моментом после выборки: в неё, как
+        # и раньше, попадает всё, что создано позже расчётного конца окна.
+        нижние = [since + slot * width for slot in range(buckets)]
+        конец = max(time.time(), нижние[-1])
 
         series = {
             "labels": [], "completed": [], "failed": [], "audio_minutes": [],
@@ -254,8 +293,7 @@ class Analytics:
         }
         grid: dict[int, dict[str, list[float] | int]] = {}
         for job in jobs:
-            slot = int((float(job["created_at"]) - since) / width)
-            slot = max(0, min(buckets - 1, slot))
+            slot = _корзина(нижние, float(job["created_at"]))
             cell = grid.setdefault(slot, {"completed": 0, "failed": 0, "audio": 0.0,
                                           "rtf": [], "queue": [], "words": 0})
             if job["status"] == "completed":
@@ -275,8 +313,7 @@ class Analytics:
         for slot in range(buckets):
             cell = grid.get(slot, {"completed": 0, "failed": 0, "audio": 0.0,
                                    "rtf": [], "queue": [], "words": 0})
-            stamp = since + slot * width
-            series["labels"].append(stamp)
+            series["labels"].append(нижние[slot])
             series["completed"].append(cell["completed"])
             series["failed"].append(cell["failed"])
             series["audio_minutes"].append(round(float(cell["audio"]) / 60, 2))
@@ -299,6 +336,10 @@ class Analytics:
         }
         series["bucket_seconds"] = round(width, 1)
         series["since"] = since
+        # Корзина i — от `edges[i]` включительно до `edges[i + 1]`; без
+        # округления: по этим числам список режет базу, и округлённая
+        # граница отдала бы задание соседней точке.
+        series["edges"] = [*нижние, конец]
         return series
 
     # --- сравнение моделей -------------------------------------------------
@@ -440,7 +481,10 @@ class Analytics:
                 if edges[idx] <= value < edges[idx + 1]:
                     counts[idx] += 1
                     break
-        return {"labels": labels, "counts": counts,
+        # Границы корзин уходят в ответ: столбец раскрывается в список
+        # записей этой длины, и считать границы заново на экране — значит
+        # однажды разойтись с этим перечнем.
+        return {"labels": labels, "counts": counts, "edges": edges,
                 "total": len(durations), "summary": M.summarize(durations)}
 
     def slowest(self, period: str = "month", limit: int = 15,
@@ -591,7 +635,10 @@ class Analytics:
             ключ = str(job.get("file_hash") or job.get("cached_from") or "")
             if not ключ:
                 continue
-            запись = повторы.setdefault(ключ, {"hits": 0, "filename": job.get("filename") or "",
+            # Ключ уходит в ответ: по нему строка «файл пришёл N раз»
+            # раскрывается в сами эти N заданий.
+            запись = повторы.setdefault(ключ, {"key": ключ, "hits": 0,
+                                               "filename": job.get("filename") or "",
                                                "audio_hours": 0.0})
             запись["hits"] += 1
             запись["audio_hours"] += float(job.get("media_duration_s") or 0) / 3600
@@ -767,6 +814,14 @@ class Analytics:
             }
 
         плохие = [j for j in измеренные if AP.is_bad(j)]
+        # Границы корзины — рядом с подписью: строка раскрывается в записи
+        # с таким отношением речи к шуму. Нижняя входит, верхняя нет;
+        # `None` — граница открыта.
+        границы: dict[str, tuple[float | None, float | None]] = {}
+        низ: float | None = None
+        for верх, подпись in AP.КОРЗИНЫ_SNR:
+            границы[подпись] = (низ, верх)
+            низ = верх
         return {
             "measured_jobs": len(измеренные),
             "snr_db": M.summarize([float(j["snr_db"]) for j in измеренные]),
@@ -781,7 +836,8 @@ class Analytics:
             "noisy_jobs": sum(1 for j in измеренные if float(j["snr_db"]) < AP.SNR_ПЛОХОЙ),
             "bad_audio_jobs": len(плохие),
             "bad_audio_share": round(len(плохие) / len(измеренные), 4) if измеренные else None,
-            "snr_bands": [{"key": подпись, **свод(корзины.get(подпись, []))}
+            "snr_bands": [{"key": подпись, "from": границы[подпись][0],
+                           "to": границы[подпись][1], **свод(корзины.get(подпись, []))}
                           for _, подпись in AP.КОРЗИНЫ_SNR],
             "bad_audio_by_source": sorted(
                 ({"key": имя, "jobs": n, "bad": b, "share": round(b / n, 4)}
@@ -873,19 +929,19 @@ class Analytics:
                                    owner=owner)
                 if j["status"] == "completed"]
         if not jobs:
-            return {"period": period, "buckets": [], "bucket_seconds": 0,
+            return {"period": period, "buckets": [], "edges": [], "bucket_seconds": 0,
                     "confidence": [], "wer": [], "jobs": [],
                     "low_confidence_share": []}
 
         начало = since or min(float(j["created_at"]) for j in jobs)
         конец = time.time()
         шаг = max(1.0, (конец - начало) / buckets)
+        нижние = [начало + i * шаг for i in range(buckets)]
 
         корзины: list[dict[str, list[float]]] = [
             {"conf": [], "wer": [], "low": []} for _ in range(buckets)]
         for job in jobs:
-            i = int((float(job["created_at"]) - начало) / шаг)
-            i = min(max(i, 0), buckets - 1)
+            i = _корзина(нижние, float(job["created_at"]))
             c = job.get("avg_confidence")
             if c is not None:
                 корзины[i]["conf"].append(float(c))
@@ -898,6 +954,10 @@ class Analytics:
         return {
             "period": period,
             "buckets": [round(начало + i * шаг) for i in range(buckets)],
+            # `buckets` округлены до секунды — это подписи оси. Точные
+            # границы — здесь: корзина i от `edges[i]` до `edges[i + 1]`,
+            # по ним точка графика раскрывается в список своих заданий.
+            "edges": [*нижние, max(конец, нижние[-1])],
             # Ширина корзины — чтобы подписать ось. За час она в минутах, за
             # год — в датах; без неё все подписи печатались как «день.месяц»
             # и на часовом окне читались как одна и та же дата двадцать
@@ -961,6 +1021,11 @@ class Analytics:
             "period": period, "baseline_days": self.БАЗА_ДНЕЙ,
             "baseline_from": round(база_от, 1) if база_от is not None else None,
             "baseline_to": round(конец_базы, 1) if since else None,
+            # То же окно базы без округления: по нему число «заданий в
+            # базе» раскрывается в список. Округлённая до десятой секунды
+            # граница для подписи годится, для отбора — нет.
+            "baseline_window": ({"since": база_от, "until": конец_базы}
+                                if база_от is not None else None),
             "overall": общий, "models": модели,
             "worst": min((м["verdict"] for м in [общий, *модели]),
                          key=lambda v: порядок.get(v, 4), default="unknown"),
@@ -990,15 +1055,19 @@ class Analytics:
         # рисуем, а вердикты не выносим.
         короткий_период = (конец - начало) < 0.75 * 86400
 
-        def по_дням(от: float, до: float, n: int) -> list[dict[str, list[float]]]:
+        def границы_дней(от: float, до: float, n: int) -> list[float]:
             шаг = max(1.0, (до - от) / n)
+            return [от + i * шаг for i in range(n)]
+
+        def по_дням(от: float, до: float, n: int) -> list[dict[str, list[float]]]:
+            нижние = границы_дней(от, до, n)
             корзины: list[dict[str, list[float]]] = [
                 {"conf": [], "low": [], "suspect": [], "jobs": []} for _ in range(n)]
             for j in все:
                 t = float(j["created_at"])
                 if not от <= t < до:
                     continue
-                i = min(max(int((t - от) / шаг), 0), n - 1)
+                i = _корзина(нижние, t)
                 c = j.get("avg_confidence")
                 if c is not None:
                     корзины[i]["conf"].append(float(c))
@@ -1039,6 +1108,10 @@ class Analytics:
                              default=None),
             })
         return {"period": period, "baseline_days": self.БАЗА_ДНЕЙ, "step_s": round(шаг, 1),
+                # Точные границы точек всех трёх карт: точка i — задания от
+                # `edges[i]` до `edges[i + 1]`. `ts` у точек округлён до
+                # десятой — для подписи; список по нему не сошёлся бы.
+                "edges": [*границы_дней(начало, конец, дней), конец],
                 "verdicts": not короткий_период,
                 "note_short": ("Период короче суток: карта показана, вердикты не выносятся — "
                                "пределы посчитаны по суточным точкам."
@@ -1056,6 +1129,23 @@ class Analytics:
     #: около часа речи (Speechmatics). Меньше — число показывается, но
     #: помечается как «мало слов».
     ЗНАЧИМО_СЛОВ = 10000
+
+    @classmethod
+    def _с_границами(cls, строки: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Строки разреза по длительности — с границами своей корзины.
+
+        Подпись «5–20 мин» человеку понятна, а раскрытию строки в список
+        нужны секунды: нижняя граница входит, верхняя нет, `None` — граница
+        открыта. Берутся из того же перечня, по которому запись попала в
+        корзину, а не пишутся на экране второй раз.
+        """
+        границы: dict[str, tuple[float | None, float | None]] = {}
+        низ: float | None = None
+        for верх, подпись in cls.ДЛИТЕЛЬНОСТИ:
+            границы[подпись] = (низ, верх)
+            низ = верх
+        return [{**строка, "from": границы[строка["key"]][0],
+                 "to": границы[строка["key"]][1]} for строка in строки]
 
     @classmethod
     def _корзина_длительности(cls, секунд: float) -> str:
@@ -1118,10 +1208,10 @@ class Analytics:
             "period": period, "enough_words": self.ЗНАЧИМО_СЛОВ,
             "overall": self._свод_точности(jobs),
             "by_model": срез(lambda j: str(j.get("model") or "—")),
-            "by_duration": sorted(
+            "by_duration": self._с_границами(sorted(
                 срез(lambda j: self._корзина_длительности(
                     float(j.get("media_duration_s") or 0))),
-                key=lambda r: [п for _, п in self.ДЛИТЕЛЬНОСТИ].index(r["key"])),
+                key=lambda r: [п for _, п in self.ДЛИТЕЛЬНОСТИ].index(r["key"]))),
             "by_source": срез(lambda j: str(j.get("source") or "api")),
             "by_language": срез(lambda j: str(j.get("language") or "—")),
             "worst": [{"id": j["id"], "filename": j.get("filename"), "model": j.get("model"),
@@ -1213,10 +1303,10 @@ class Analytics:
             "period": period,
             "overall": свод(jobs),
             "by_model": срез(lambda j: str(j.get("model") or "—")),
-            "by_duration": sorted(
+            "by_duration": self._с_границами(sorted(
                 срез(lambda j: self._корзина_длительности(
                     float(j.get("media_duration_s") or 0))),
-                key=lambda r: [п for _, п in self.ДЛИТЕЛЬНОСТИ].index(r["key"])),
+                key=lambda r: [п for _, п in self.ДЛИТЕЛЬНОСТИ].index(r["key"]))),
             "stream": {
                 "sessions": len(сессии),
                 "first_text_p50": round(M.percentile(все_первые, 0.5), 2) if все_первые else None,
@@ -1395,7 +1485,11 @@ class Analytics:
         jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         собрано: dict[str, dict[str, Any]] = {}
         for job in jobs:
-            метки = [t.strip() for t in str(job.get("tags") or "").split(",") if t.strip()]
+            # Без повторов: «срочно, срочно» — одна метка, а не две. Иначе
+            # задание входило в строку метки дважды — и числом заданий, и
+            # часами звука, — а в списке под этим числом стояло один раз.
+            метки = list(dict.fromkeys(
+                t.strip() for t in str(job.get("tags") or "").split(",") if t.strip()))
             for метка in метки or ["без метки"]:
                 запись = собрано.setdefault(метка, {
                     "tag": метка, "jobs": 0, "completed": 0, "failed": 0,
@@ -1458,10 +1552,14 @@ class Analytics:
             for k, v in sorted(d.items(), key=lambda kv: -len(kv[1]))]
 
         все = [float(j["queue_time_s"]) for j in jobs]
+        # Подпись группы — для человека, ключ — для раскрытия строки в
+        # список: по скобкам в подписи отбор не выбирают.
+        ключи = {"высокий (>50)": "high", "обычный (50)": "normal", "низкий (<50)": "low"}
         return {
             "period": period,
             "overall": M.summarize(все),
-            "by_priority": разрез(по_приоритету),
+            "by_priority": [{**строка, "key": ключи[строка["name"]]}
+                            for строка in разрез(по_приоритету)],
             "by_source": разрез(по_источнику),
             "waited_over_minute": sum(1 for v in все if v > 60),
             "waited_over_10_minutes": sum(1 for v in все if v > 600),
@@ -1478,6 +1576,17 @@ class Analytics:
             return self._full_report(period, owner)
 
     def _full_report(self, period: str, owner: str | None) -> dict[str, Any]:
+        отчёт = self._разрезы(period, owner)
+        # Окно, по которому всё это посчитано. Интерфейс раскрывает любое
+        # число отчёта в список записей (`GET /api/drill`), и границы обязан
+        # взять отсюда: посчитай он «неделю до сейчас» сам, через минуту это
+        # была бы уже другая неделя, и список разошёлся бы с числом. Верхняя
+        # граница — конец сборки: задания, созданные позже, в отчёт не вошли.
+        начало = self._since(period)
+        отчёт["window"] = {"since": начало or None, "until": time.time()}
+        return отчёт
+
+    def _разрезы(self, period: str, owner: str | None) -> dict[str, Any]:
         return {
             "overview": self.overview(period, owner),
             "timeseries": self.timeseries(period, owner=owner),

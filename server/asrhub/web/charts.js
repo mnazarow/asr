@@ -136,6 +136,41 @@ function fmtNum(value, digits) {
     node.addEventListener('mouseleave', () => tip.hide());
   }
 
+  // ---- щелчок по метке ----------------------------------------------------
+
+  /* Что дописать в подсказку, когда метку можно раскрыть.
+   *
+   * Столбец, по которому можно щёлкнуть, ничем не отличается от столбца,
+   * по которому нельзя, — кроме курсора, а его видно только наведя. Строка
+   * в подсказке говорит это словами там же, где человек уже читает число.
+   */
+  function pickNote(config) {
+    if (typeof config.onPick !== 'function') return '';
+    return '\n' + (config.pickHint || 'щелчок — список записей');
+  }
+
+  /* Делает метку графика кнопкой: `config.onPick(номер, что)`.
+   *
+   * Номер — в порядке входных данных (точка ряда, столбец, строка, доля),
+   * `что` — уточнение там, где номера мало: ряд составного столбца, сама
+   * доля кольца, клетка карты. График не знает, что откроется по щелчку, —
+   * он только сообщает, по чему щёлкнули. С клавиатуры то же делают Enter
+   * и пробел: иначе раскрытие существовало бы только для мыши.
+   */
+  function pickable(node, config, index, extra) {
+    if (typeof config.onPick !== 'function') return;
+    node.classList.add('pick');
+    node.setAttribute('tabindex', '0');
+    node.setAttribute('role', 'button');
+    const выбрать = (event) => { tip.hide(); config.onPick(index, extra, event); };
+    node.addEventListener('click', выбрать);
+    node.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      выбрать(event);
+    });
+  }
+
   // ---- каркас графика ---------------------------------------------------
 
   function frame(host, opts) {
@@ -291,12 +326,15 @@ function fmtNum(value, digits) {
     const cross = el('line', { y1: ctx.pad.top, y2: ctx.pad.top + ctx.ih,
                                stroke: faint(), 'stroke-width': 1,
                                'stroke-dasharray': '3 3', opacity: 0 }, ctx.svg);
-    overlay.addEventListener('mousemove', (event) => {
+    const точкаПод = (event) => {
       const box = ctx.svg.getBoundingClientRect();
       const scale = ctx.width / box.width;
       const x = (event.clientX - box.left) * scale;
       const index = Math.round(((x - ctx.pad.left) / ctx.iw) * count);
-      const clamped = Math.max(0, Math.min(count, index));
+      return Math.max(0, Math.min(count, index));
+    };
+    overlay.addEventListener('mousemove', (event) => {
+      const clamped = точкаПод(event);
       cross.setAttribute('x1', xAt(clamped));
       cross.setAttribute('x2', xAt(clamped));
       cross.setAttribute('opacity', 0.7);
@@ -306,9 +344,18 @@ function fmtNum(value, digits) {
         const v = s.values[clamped];
         lines.push(`  ${s.name}: ${v === null || v === undefined ? '—' : fmtNum(v) + (config.unit || '')}`);
       });
-      tip.show(lines.join('\n'), event);
+      tip.show(lines.join('\n') + pickNote(config), event);
     });
     overlay.addEventListener('mouseleave', () => { cross.setAttribute('opacity', 0); tip.hide(); });
+    if (typeof config.onPick === 'function') {
+      // Слой перекрестия лежит поверх точек, поэтому выбор — по нему: та же
+      // вертикаль, что в подсказке, а не попадание в кружок радиусом 4.
+      overlay.classList.add('pick');
+      overlay.addEventListener('click', (event) => {
+        tip.hide();
+        config.onPick(точкаПод(event), null, event);
+      });
+    }
 
     if (series.length >= 2) legend(host, series.map((s, i) => ({
       name: s.name, color: s.color || colors[i % colors.length] })));
@@ -378,7 +425,8 @@ function fmtNum(value, digits) {
               : `M${x},${низ - h}h${barWidth}v${высота}h${-barWidth}Z`,
             fill: seriesColor(кусок.ряд.color, кусок.k),
           }, ctx.svg);
-          attachTip(path, `${подпись ? подпись + ': ' : ''}${кусок.ряд.name} — ${fmtNum(кусок.v)}${config.unit || ''}`);
+          attachTip(path, `${подпись ? подпись + ': ' : ''}${кусок.ряд.name} — ${fmtNum(кусок.v)}${config.unit || ''}${pickNote(config)}`);
+          pickable(path, config, index, { series: кусок.k, name: кусок.ряд.name });
           низ -= h;
         });
       } else {
@@ -387,7 +435,17 @@ function fmtNum(value, digits) {
           d: roundedTop(x, y, barWidth, Math.max(height, v > 0 ? 2 : 0), radius),
           fill: color,
         }, ctx.svg);
-        attachTip(path, `${подпись ? подпись + ': ' : ''}${fmtNum(v)}${config.unit || ''}`);
+        const подсказка = `${подпись ? подпись + ': ' : ''}${fmtNum(v)}${config.unit || ''}`;
+        attachTip(path, подсказка);
+        if (v > 0 && typeof config.onPick === 'function') {
+          // Цель щелчка — вся колонка: столбец высотой в два пикселя рядом
+          // с соседом на весь график мышью не выбрать.
+          const колонка = el('rect', { x: ctx.pad.left + index * slot, y: ctx.pad.top,
+                                       width: slot, height: ctx.ih, fill: 'transparent' },
+                             ctx.svg);
+          attachTip(колонка, подсказка + pickNote(config));
+          pickable(колонка, config, index, null);
+        }
       }
       if (config.showValues !== false && values.length <= 14 && v > 0) {
         el('text', { x: x + barWidth / 2, y: y - 5, 'text-anchor': 'middle',
@@ -484,8 +542,9 @@ function fmtNum(value, digits) {
       const rect = el('rect', {
         x, y: y + 4, width: длина, height: rowHeight - 10, rx: 4, fill: цвет,
       }, ctx.svg);
-      attachTip(rect, `${item.label}: ${fmtNum(значение)}${config.unit || ''}` +
-        (item.note ? `\n${item.note}` : ''));
+      const подсказка = `${item.label}: ${fmtNum(значение)}${config.unit || ''}` +
+        (item.note ? `\n${item.note}` : '');
+      attachTip(rect, подсказка);
       // Подпись значения всегда снаружи столбца, со стороны его роста:
       // внутри короткого столбца она не помещается, а поверх соседнего
       // читается как его подпись.
@@ -503,6 +562,14 @@ function fmtNum(value, digits) {
         'text-anchor': влево && !тесно ? 'end' : 'start',
         fill: ink(), 'font-size': 11.5,
       }, ctx.svg).textContent = подпись;
+      if (typeof config.onPick === 'function' && item.pick !== false) {
+        // Цель щелчка — вся строка с именем, а не столбец: у малого значения
+        // он шириной в два пикселя, и попасть в него нельзя.
+        const строка = el('rect', { x: 0, y, width: ctx.width, height: rowHeight,
+                                    fill: 'transparent' }, ctx.svg);
+        attachTip(строка, подсказка + pickNote(config));
+        pickable(строка, config, index, item);
+      }
     });
     return ctx.svg;
   }
@@ -527,12 +594,17 @@ function fmtNum(value, digits) {
         fill: part.color || colors[index % colors.length],
       }, svg);
       attachTip(rect, `${part.label}: ${fmtNum(part.value)}${config.unit || ''} ` +
-        `(${fmtNum((part.value / total) * 100, 1)} %)`);
+        `(${fmtNum((part.value / total) * 100, 1)} %)${pickNote(config)}`);
+      if (part.pick !== false) pickable(rect, config, index, part);
       offset += width;
     });
+    // Узкую долю в полосе не поймать, поэтому раскрывается и её строка в
+    // легенде — она есть у каждой доли, какой бы малой та ни была.
     legend(host, parts.map((p, i) => ({
       name: `${p.label} — ${fmtNum(p.value)}${config.unit || ''}`,
-      color: p.color || colors[i % colors.length] })));
+      color: p.color || colors[i % colors.length] })),
+      (i) => ((parts[i].value || 0) > 0 && parts[i].pick !== false
+        ? (node) => pickable(node, config, i, parts[i]) : null));
     return svg;
   }
 
@@ -542,6 +614,9 @@ function fmtNum(value, digits) {
     const parts = (config.parts || []).filter((p) => (p.value || 0) > 0);
     const total = parts.reduce((sum, p) => sum + p.value, 0);
     if (!total) return empty(host, config.emptyText);
+    // Номер для `onPick` — в исходном списке: пустые доли отсеяны выше, и
+    // номер в отсеянном списке указывал бы вызывающему на соседнюю.
+    const исходный = (part) => (config.parts || []).indexOf(part);
     const size = config.size || 180;
     host.innerHTML = '';
     const wrap = document.createElement('div');
@@ -570,7 +645,9 @@ function fmtNum(value, digits) {
            `A${inner},${inner} 0 ${large} 0 ${cx + inner * Math.cos(a0)},${cy + inner * Math.sin(a0)}Z`,
         fill: part.color || colors[index % colors.length],
       }, svg);
-      attachTip(path, `${part.label}: ${fmtNum(part.value)} (${(share * 100).toFixed(1)} %)`);
+      attachTip(path, `${part.label}: ${fmtNum(part.value)} (${(share * 100).toFixed(1)} %)${
+        part.pick === false ? '' : pickNote(config)}`);
+      if (part.pick !== false) pickable(path, config, исходный(part), part);
       angle += sweep;
     });
 
@@ -591,6 +668,7 @@ function fmtNum(value, digits) {
         `<span class="dim">${escText(part.label)}</span><span class="spacer"></span>` +
         `<b class="mono">${fmtNum(part.value)}</b>` +
         `<span class="faint mono">${((part.value / total) * 100).toFixed(0)} %</span>`;
+      if (part.pick !== false) pickable(row, config, исходный(part), part);
       list.appendChild(row);
     });
     wrap.appendChild(list);
@@ -645,7 +723,8 @@ function fmtNum(value, digits) {
       const x = 30 + index * cell;
       const rect = el('rect', { x, y: 4, width: cell - 2, height: cell - 2, rx: 3,
                                 fill: value ? ramp[level] : gridColor() }, svg);
-      attachTip(rect, `${config.labels[index]}: ${fmtNum(value)}`);
+      attachTip(rect, `${config.labels[index]}: ${fmtNum(value)}${value ? pickNote(config) : ''}`);
+      if (value) pickable(rect, config, index, null);
       if (index % 3 === 0) {
         el('text', { x: x + (cell - 2) / 2, y: cell + 16, 'text-anchor': 'middle',
                      fill: faint(), 'font-size': 9.5 }, svg).textContent = config.labels[index];
@@ -728,7 +807,15 @@ function fmtNum(value, digits) {
         }, svg);
         const extra = config.secondary && config.secondary[r]
           ? ` · ${fmtNum(config.secondary[r][c], 2)} ${config.secondaryUnit || ''}` : '';
-        attachTip(rect, `${rowLabel}, ${cols[c]}: ${fmtNum(value)}${extra}`);
+        // `canPick(строка, столбец, значение)` — какие клетки раскрываются.
+        // У счётной карты ноль — «записей не было», и кнопкой такая клетка
+        // быть не должна; у карты средних ноль — законное значение, и
+        // решает здесь не график, а тот, кто знает, что в клетке.
+        const можно = есть(value) && (typeof config.canPick !== 'function'
+          || Boolean(config.canPick(r, c, value)));
+        attachTip(rect, `${rowLabel}, ${cols[c]}: ${fmtNum(value)}${extra}${
+          можно ? pickNote(config) : ''}`);
+        if (можно) pickable(rect, config, r, { row: r, col: c, value });
       });
     });
     return svg;
@@ -879,10 +966,10 @@ function fmtNum(value, digits) {
 
   // ---- вспомогательное ------------------------------------------------------------
 
-  function legend(host, items) {
+  function legend(host, items, каждой) {
     const box = document.createElement('div');
     box.className = 'chart-legend';
-    items.forEach((item) => {
+    items.forEach((item, номер) => {
       const span = document.createElement('span');
       // Имя вставляем текстом: в легенду попадают имена говорящих, а их
       // задаёт пользователь настройкой speaker_names.
@@ -890,6 +977,8 @@ function fmtNum(value, digits) {
       swatch.style.background = item.color;
       span.appendChild(swatch);
       span.appendChild(document.createTextNode(item.name));
+      const доделать = typeof каждой === 'function' ? каждой(номер) : null;
+      if (доделать) доделать(span);
       box.appendChild(span);
     });
     host.appendChild(box);

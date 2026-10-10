@@ -416,6 +416,8 @@ def список_агентов(request: Request,
                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
+    # Верх окна для раскрытия «прислал N звонков» в список: берётся до счёта.
+    верх = state.db.call_horizon()
     агенты = state.db.agent_list()
     for агент in агенты:
         станция = str(агент.get("station") or "")
@@ -426,7 +428,8 @@ def список_агентов(request: Request,
             агент["state"] = json.loads(агент.get("state") or "{}")
         except ValueError:
             агент["state"] = {}
-    return {"agents": агенты, "at": time.time()}
+    return {"agents": агенты, "at": time.time(),
+            "window": {"since": None, "until": верх}}
 
 
 @управление.post("/agents/{agent_id}/command", summary="Задание агенту")

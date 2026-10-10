@@ -53,6 +53,26 @@ def _период(period: str) -> float | None:
     return None if сколько is None else time.time() - сколько
 
 
+def _окно(db: Any, period: str) -> tuple[float | None, float]:
+    """Окно сводов раздела: начало периода и верхняя граница, обе заморожены.
+
+    Раньше граница была одна — начало, и считалась она в каждом запросе от
+    своего «сейчас». Теперь любое число раздела раскрывается в список звонков
+    (`GET /api/drill`), и список обязан получить то же окно, что и число:
+    посчитай он «неделю до сейчас» сам, через минуту это была бы уже другая
+    неделя. Поэтому окно берётся один раз на ответ, передаётся во все своды и
+    отдаётся в ответе полем `window`.
+
+    Верх окна — не просто «сейчас», см. `Database.call_horizon`: звонок с
+    временем начала из будущего в своды входил всегда, и окно не должно его
+    терять.
+    """
+    сейчас = time.time()
+    сколько = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400,
+               "quarter": 92 * 86400, "year": 365 * 86400}.get(period)
+    return (None if сколько is None else сейчас - сколько), db.call_horizon(сейчас)
+
+
 def _корзина(period: str) -> str:
     """Шаг линии нагрузки под период: сутки по часам, год по неделям.
 
@@ -145,8 +165,16 @@ def status(request: Request,
     адреса, пути и имя учётной записи — только администратору: по ним
     строится вход в телефонию организации, а не понимание своей работы.
     """
-    return _телефония(request).status(for_admin=principal.is_admin,
+    # Верх окна берётся ДО счёта: звонок, сохранённый между двумя запросами,
+    # тогда либо посчитан и попадает в список, либо не посчитан и не попадает.
+    верх = get_state(request).db.call_horizon()
+    свод = _телефония(request).status(for_admin=principal.is_admin,
                                       owner=scope_owner(principal))
+    # Счётчики здесь — за всё время, поэтому нижней границы нет. Верхняя
+    # нужна раскрытию числа в список звонков: список открывают позже, и
+    # звонки, начавшиеся после этого ответа, в него попасть не должны.
+    свод["window"] = {"since": None, "until": верх}
+    return свод
 
 
 @router.get("/stations", summary="Список станций")
@@ -309,43 +337,53 @@ def overview(request: Request,
     запросов подряд — это восемь разборов одного и того же отбора в базе и
     восемь поводов увидеть на экране части картины от разных моментов
     времени.
+
+    `window` — границы, по которым посчитано всё «за период»: с ними любое
+    число ответа раскрывается в список звонков (`GET /api/drill?base=calls`).
+    У точки `timeline` свои границы — `t` и `until`, у корзины `durations` —
+    `from` и `to` в секундах.
     """
     состояние = get_state(request)
     db = состояние.db
     владелец = scope_owner(principal)
-    начало = _период(period)
+    # Окно одно на весь ответ: и начало, и верх уходят в каждый свод ниже.
+    начало, верх = _окно(db, period)
     корзина = bucket or _корзина(period)
     свод = _телефония(request).status(for_admin=principal.is_admin, owner=владелец)
     разрезы = {поле: db.call_tops(поле, owner=владелец, station=station,
-                                  since=начало, limit=15)
+                                  since=начало, until=верх, limit=15)
                for поле in ("queue", "agent", "skipped", "src", "dst",
                             "context", "disposition")}
-    по_станциям = db.call_by_station(owner=владелец, since=начало)
+    по_станциям = db.call_by_station(owner=владелец, since=начало, until=верх)
     свои = ([с for с in по_станциям if с["station"] == station]
             if station else по_станциям)
     return {
         "period": period, "bucket": корзина, "station": station,
         "since": начало, "now": time.time(),
+        # Границы, по которым посчитано всё, что ниже считается «за период».
+        # Числа «за всё время» (`calls`, `stations[].calls`) нижней границы
+        # не имеют, верхняя у них та же.
+        "window": {"since": начало, "until": верх},
         "enabled": свод["enabled"], "running": свод["running"],
         "configured": свод["configured"], "stations": свод["stations"],
         "calls": db.call_counts(owner=владелец, station=station),
         "period_calls": _свести_период(свои),
         "by_station": по_станциям,
         "timeline": db.call_timeline(owner=владелец, station=station,
-                                     since=начало, bucket=корзина),
+                                     since=начало, until=верх, bucket=корзина),
         "station_timelines": db.call_timeline_by_station(
-            owner=владелец, since=начало, bucket=корзина, points=28),
+            owner=владелец, since=начало, until=верх, bucket=корзина, points=28),
         "heatmap": db.call_load_heatmap(owner=владелец, station=station,
-                                        since=начало),
+                                        since=начало, until=верх),
         "durations": db.call_duration_histogram(owner=владелец, station=station,
-                                                since=начало),
+                                                since=начало, until=верх),
         "tops": разрезы,
         # Показатели, по которым заказчик сравнивает системы между собой:
         # среднее время разговора, доля потерянных, уровень обслуживания,
         # решение с первого обращения. Всё — из того же журнала звонков,
         # который и так лежит в базе.
         "kpi": db.call_kpi(
-            owner=владелец, station=station, since=начало,
+            owner=владелец, station=station, since=начало, until=верх,
             service_level_s=S.num(состояние.settings, "telephony_service_level_s", 20.0),
             repeat_window_days=S.num(состояние.settings,
                                      "telephony_repeat_window_days", 7.0)),

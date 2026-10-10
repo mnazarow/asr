@@ -423,6 +423,73 @@ def _индекс_nps(промоутеров: Any, критиков: Any, все
     return int(round((int(промоутеров or 0) - int(критиков or 0)) * 100 / знаменатель))
 
 
+def _по_категориям(строки: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Счёт категории — по всем её совпадениям, какого бы вида они ни были.
+
+    База считает группами «категория + вид»: вид хранится у совпадения. Пока
+    вид категории не меняли, группа у неё одна. Сменили вид в наборе, а
+    архив не пересчитали — в нём лежат совпадения двух видов, и в таблицу
+    попадала одна из групп: та, что пришла из базы последней, то есть
+    меньшая. «Про сроки — 5 записей» при девятнадцати в архиве.
+
+    Запись в категории одна (ключ таблицы совпадений — запись и категория),
+    так что группы не пересекаются и просто складываются. Вид остаётся от
+    большей группы: строки приходят по убыванию числа записей.
+    """
+    слитые: dict[str, dict[str, Any]] = {}
+    for строка in строки:
+        имя = str(строка["category"])
+        есть = слитые.get(имя)
+        if есть is None:
+            слитые[имя] = dict(строка)
+            continue
+        было, стало = int(есть.get("records") or 0), int(строка.get("records") or 0)
+        # Среднее время первого упоминания — взвешенно по записям групп.
+        if строка.get("first_s") is not None:
+            есть["first_s"] = (строка["first_s"] if есть.get("first_s") is None else
+                               (есть["first_s"] * было + строка["first_s"] * стало)
+                               / max(1, было + стало))
+        for поле in ("records", "mentions", "negative", "scored"):
+            есть[поле] = int(есть.get(поле) or 0) + int(строка.get(поле) or 0)
+    return list(слитые.values())
+
+
+def _границы_корзин(начало: float, шаг: float, корзин: int,
+                    конец: float) -> list[tuple[float, float]]:
+    """Границы корзин ряда — ровно те, по которым записи разложила база.
+
+    Точка ряда раскрывается в список записей отдельным запросом, и окно
+    этого списка обязано совпасть с корзиной до последней записи. База
+    считает номер как `CAST((created_at − начало) / шаг AS INTEGER)`, а
+    «начало + номер × шаг», посчитанное заново, из-за округления может
+    встать на соседнее число с плавающей точкой: запись ровно на стыке
+    попала бы в точку одной корзины и в список другой. Поэтому граница не
+    вычисляется, а находится: наименьшее время, которому то же выражение
+    даёт номер не меньше нужного. Арифметика у Python и SQLite одна —
+    двойная точность, — так что ответ совпадает с базой бит в бит.
+
+    У первой корзины нижняя граница — начало окна, у последней верхняя —
+    его конец: за ними ряд записей не берёт (`created_at >= ? AND < ?`).
+    """
+    def нижняя(номер: int) -> float:
+        if номер <= 0:
+            return начало
+        x = начало + номер * шаг
+        for _ in range(8):                      # ошибка округления — один-два шага
+            if (x - начало) / шаг >= номер:
+                break
+            x = math.nextafter(x, math.inf)
+        for _ in range(8):
+            ниже = math.nextafter(x, -math.inf)
+            if (ниже - начало) / шаг < номер:
+                break
+            x = ниже
+        return x
+
+    края = [нижняя(n) for n in range(корзин)] + [min(нижняя(корзин), конец)]
+    return [(края[n], края[n + 1]) for n in range(корзин)]
+
+
 def _округлить(значение: Any, знаков: int = 4) -> Any:
     if значение is None:
         return None
@@ -761,8 +828,13 @@ class Insights:
         суммы: dict[str, dict[str, Any]] = {}
         средние = {и for и, выр in Database.CONTENT_METRICS if выр.startswith("AVG")}
         for строка in строки:
-            метки = [м.strip() for м in str(строка.get("group_key") or "").split(",")
-                     if м.strip()] or ["без метки"]
+            # Без повторов: «vip, vip» — одна метка, а не две. Строку меток
+            # набирают руками, и запись с повтором входила в свою группу
+            # дважды — число записей группы оказывалось больше списка,
+            # в который оно раскрывается.
+            метки = list(dict.fromkeys(
+                м.strip() for м in str(строка.get("group_key") or "").split(",")
+                if м.strip())) or ["без метки"]
             n = float(строка.get("records") or 0)
             for метка in метки:
                 цель = суммы.setdefault(метка, {"records": 0})
@@ -848,11 +920,15 @@ class Insights:
         buckets, шаг, строки = self.db.content_series(
             since=начало, until=конец, buckets=buckets, owner=owner)
         по_корзинам = {int(с["bucket"]): с for с in строки}
+        границы = _границы_корзин(начало, шаг, buckets, конец)
         точки = []
         for n in range(buckets):
             с = по_корзинам.get(n) or {}
             точки.append({
                 "ts": round(начало + n * шаг, 1),
+                # Точные границы корзины — для списка записей под точкой.
+                # `ts` округлён для подписи оси и окном списка быть не может.
+                "since": границы[n][0], "until": границы[n][1],
                 "records": int(с.get("records") or 0),
                 "sentiment": _округлить(с.get("sentiment"), 3),
                 "negative_share": _процент(с.get("negative"), с.get("scored")),
@@ -901,7 +977,14 @@ class Insights:
             # процентов записей («здравствуйте») — это фон, а не тема.
             тема["weight"] = round(
                 math.log((всего + 1) / (тема["records"] + 1)) + 1.0, 3)
-        return {"corpus": всего, "period": period, "items": темы}
+        return {"corpus": всего, "period": period, "items": темы,
+                # По каким записям посчитано «в скольких записях». С окном
+                # или владельцем `top_terms` соединяет основы с заданиями и
+                # берёт только завершённые; без них — считает по таблице
+                # основ как есть, и запись, отправленную на повтор (разбор
+                # у неё остался), тоже. Список, в который число
+                # раскрывается, обязан брать тот же набор.
+                "completed_only": bool(от or owner)}
 
     def topic_trend(self, period: str = "week",
                     owner: str | list[str] | None = None,
@@ -994,10 +1077,10 @@ class Insights:
         начало, прошлое = self.window(period)
         набор = (self.index.categories() if self.index
                  else категории_модуль.compile(категории_модуль.ГОТОВЫЕ))
-        сейчас = {с["category"]: с for с in self.db.category_counts(
-            since=начало, owner=owner)}
-        раньше = ({с["category"]: с for с in self.db.category_counts(
-            since=прошлое, until=начало, owner=owner)} if начало is not None else {})
+        сейчас = {с["category"]: с for с in _по_категориям(self.db.category_counts(
+            since=начало, owner=owner))}
+        раньше = ({с["category"]: с for с in _по_категориям(self.db.category_counts(
+            since=прошлое, until=начало, owner=owner))} if начало is not None else {})
         n_сейчас = self.db.content_window_size(since=начало, owner=owner)
         n_раньше = (self.db.content_window_size(since=прошлое, until=начало, owner=owner)
                     if начало is not None else 0)
@@ -1081,7 +1164,7 @@ class Insights:
         оценено = int(свод.get("scored") or 0)
         отрицательных = int(свод.get("negative") or 0)
         подписи = self._подписи_категорий()
-        строки = self.db.category_counts(since=начало, owner=owner)
+        строки = _по_категориям(self.db.category_counts(since=начало, owner=owner))
         items = []
         for с in строки:
             n = int(с.get("scored") or 0)
@@ -1202,6 +1285,9 @@ class Insights:
                                                         buckets=дней, owner=owner, agent=agent)
         по_б = {int(с["bucket"]): с for с in база}
         по_т = {int(с["bucket"]): с for с in период_ряд}
+        # Точные границы каждой точки периода — по ним точка карты
+        # раскрывается в записи своих суток.
+        границы = _границы_корзин(начало, шаг_т, n_т, конец)
 
         def значение(с: dict[str, Any] | None, ключ: str) -> float | None:
             if not с or not int(с.get("records") or 0):
@@ -1223,6 +1309,7 @@ class Insights:
                 "baseline": [{"ts": round(база_от + k * шаг_б, 1), "value": ряд_базы[k]}
                              for k in range(n_б)],
                 "points": [{"ts": round(начало + k * шаг_т, 1), "value": точки[k],
+                            "since": границы[k][0], "until": границы[k][1],
                             "records": int((по_т.get(k) or {}).get("records") or 0)}
                            for k in range(n_т)],
                 "flags": отметки,
@@ -1357,6 +1444,12 @@ class Insights:
         for k in range(n):
             с = по_корзинам.get(k) or {}
             ход.append({"ts": round(от + k * шаг, 1), "records": int(с.get("records") or 0),
+                        # Границы корзины — как есть, без округления: по ним
+                        # точка графика раскрывается в список записей, и
+                        # округлённая до десятых граница переложила бы
+                        # запись у края в соседнюю неделю.
+                        "since": от + k * шаг,
+                        "until": конец if k == n - 1 else от + (k + 1) * шаг,
                         "agent_score": _округлить(с.get("agent_score"), 1),
                         "sentiment": _округлить(с.get("sentiment"), 3),
                         "empathy": _округлить(с.get("empathy"), 1),
@@ -1384,6 +1477,10 @@ class Insights:
         return {
             "by": by, "key": key, "period": period,
             "summary": свой, "team": команда, "previous": прошлый_свой,
+            # Окно столбца «Прошлый период» — чтобы и его числа раскрывались
+            # в свои записи, а не в записи текущего окна.
+            "previous_window": ({"since": прошлое, "until": начало}
+                                if начало is not None else None),
             "compare": сравнение, "timeline": ход, "step_s": round(шаг, 1),
             "violations": нарушения, "worst": худшие, "best": лучшие,
             "coaching": очередь["items"], "coaching_total": очередь["total"],
@@ -1515,10 +1612,15 @@ class Insights:
         отбор = ОТБОРЫ.get(kind)
         if отбор is None:
             return {"kind": kind, "title": kind, "items": []}
+        # На одну больше, чем просили: по лишней строке видно, что отбор
+        # длиннее показанного. «50 записей» под списком из пятидесяти
+        # читалось как «их пятьдесят», хотя это был предел выдачи; считать
+        # же весь отбор ради подписи — второй проход по тому же окну.
         строки = self.db.content_top(
             отбор["order"], since=self.window(period)[0], owner=owner,
-            where=отбор["where"], limit=limit)
-        return {"kind": kind, "title": отбор["title"], "items": строки}
+            where=отбор["where"], limit=limit + 1)
+        return {"kind": kind, "title": отбор["title"], "items": строки[:limit],
+                "more": len(строки) > limit}
 
     @staticmethod
     def kinds() -> list[dict[str, str]]:

@@ -1313,6 +1313,559 @@ function statusChip(status) {
   return `<span class="chip ${STATUS_CLASS[status] || ''}">${STATUS_LABELS[status] || status}</span>`;
 }
 
+// ==========================================================================
+// Раскрытие числа в список записей
+// ==========================================================================
+
+/**
+ * Раскрытие: по щелчку на числе, строке или столбце — список записей, из
+ * которых оно сложилось, со ссылкой на каждую.
+ *
+ * Разделы аналитики показывают числа, и следующий вопрос к любому из них
+ * один: «какие именно?» Раньше ответом был раздел «Результаты» и отбор
+ * руками — если такой отбор там вообще был.
+ *
+ * Список не должен тормозить ни на каком объёме, поэтому:
+ *   - пока число не раскрыли, не запрашивается ничего: сто чисел на странице
+ *     — это ноль запросов, а не сто;
+ *   - приходит страница в полсотни строк, продолжение — по указателю, а не
+ *     по смещению: тысячная страница стоит серверу столько же, сколько
+ *     первая;
+ *   - «всего» сервер считает до десяти тысяч и на этом останавливается;
+ *   - в разметке одной панели не больше тысячи строк: дальше человек не
+ *     листает, а сужает период — и ему это сказано;
+ *   - строки добавляются одним куском разметки на страницу, обработчик
+ *     щелчка один на весь документ, а не по одному на строку;
+ *   - ответ, пришедший после того как панель свернули или раздел
+ *     перерисовали, выбрасывается.
+ *
+ * Чтобы список сошёлся с числом, окно берётся у самого свода (`window` в
+ * его ответе) и передаётся явно: «неделя до сейчас» через минуту — уже
+ * другая неделя.
+ *
+ * Разметка: `Drill.num(разметка, окно, что)` — число-кнопка;
+ * `Drill.attr(окно, что)` — атрибут для своей кнопки; `Drill.open(узел,
+ * описание)` — открыть под графиком из его `onPick`. `что`:
+ *   f      — отборы строками, как в `GET /api/drill` (`['model:x', 'retried']`);
+ *   base   — `jobs` (по умолчанию), `content`, `llm` или `calls`;
+ *   sort   — `duration:desc`: список по величине, она же встанет столбцом;
+ *   title  — заголовок панели; value — подпись столбца величины;
+ *   fmt    — как её писать: `dur`, `pct`, `ms`, `int` или число как есть.
+ */
+const Drill = {
+  СТРАНИЦА: 50,
+  ПОТОЛОК: 1000,
+
+  /** Описание раскрытия из окна свода и того, что раскрываем. */
+  spec(окно, что) {
+    const о = окно || {};
+    const описание = Object.assign({ base: 'jobs', f: [] }, что || {});
+    if (о.since !== null && о.since !== undefined) описание.since = о.since;
+    if (о.until !== null && о.until !== undefined) описание.until = о.until;
+    return описание;
+  },
+
+  /** Атрибут `data-drill` для элемента, который раскрывает список. */
+  attr(окно, что) {
+    return ` data-drill="${esc(JSON.stringify(this.spec(окно, что)))}"`;
+  },
+
+  /** Число-кнопка: выглядит числом, раскрывает список. */
+  num(разметка, окно, что) {
+    const подсказка = (что || {}).base === 'calls' ? 'Показать звонки' : 'Показать записи';
+    return `<button type="button" class="drill" aria-expanded="false" title="${подсказка}"${
+      this.attr(окно, что)}>${разметка}</button>`;
+  },
+
+  /** Пустое значение разреза: свод пишет «—» или «аноним», в базе там пусто. */
+  val(значение, ...заглушки) {
+    const текст = значение === null || значение === undefined ? '' : String(значение);
+    return заглушки.includes(текст) ? '' : текст;
+  },
+
+  /** Открывает список под узлом (графиком): для `onPick`. Повтор — сворачивает. */
+  open(узел, описание) {
+    if (!узел || !описание) return;
+    const ключ = JSON.stringify(описание);
+    const панель = this._panel(описание, null);
+    панель.dataset.key = ключ;
+    // Под каким узлом стоит: по нему панель вернётся на место после
+    // перерисовки раздела (см. `keep`).
+    панель.dataset.at = узел.id || '';
+    const прежняя = this._поставить(узел, панель, ключ);
+    if (прежняя === ключ) return;
+    this._start(панель);
+    this._показать(панель);
+  },
+
+  /**
+   * Ставит панель туда, где её место, убрав прежнюю оттуда же.
+   *
+   * Карточки графиков стоят по две-три в ряд, и список внутри карточки был
+   * бы шириной в треть экрана. Поэтому под карточкой в ряду панель встаёт
+   * под всем рядом, во всю ширину; под одиночной карточкой — внутри неё.
+   * Возвращает ключ убранной панели: повторный щелчок по тому же столбцу —
+   * это «свернуть», а не «открыть заново».
+   */
+  _поставить(узел, панель, ключ) {
+    const явное = узел.closest('[data-drill-host]');
+    // `data-drill-out` — «список ставить снаружи»: карточкой считается та, в
+    // которой лежит помеченный узел, а не ближайшая к числу. Иначе число во
+    // вложенной карточке (ошибка по коду внутри карточки «Ошибки»)
+    // открывало список внутри неё — шириной в полколонки.
+    const карточка = (узел.closest('[data-drill-out]') || узел).closest('.card')
+      || узел.closest('.kpi');
+    const ряд = !явное && карточка && карточка.parentElement
+      && карточка.parentElement.classList.contains('grid') ? карточка.parentElement : null;
+    let прежняя = null;
+    if (ряд) {
+      const следом = ряд.nextElementSibling;
+      if (следом && следом.classList.contains('drill-panel')) прежняя = следом;
+    } else {
+      const куда = явное || карточка || узел.parentElement;
+      прежняя = Array.from(куда.children).find((р) => р.classList.contains('drill-panel')) || null;
+    }
+    const был = прежняя ? (прежняя.dataset.key || '') : null;
+    if (прежняя) this._close(прежняя);
+    if (ключ !== undefined && был === ключ) return был;
+    if (ряд) ряд.after(панель);
+    else (явное || карточка || узел.parentElement).appendChild(панель);
+    return был;
+  },
+
+  /**
+   * Тесно ли списку в таблице, где стоит число.
+   *
+   * Строкой под своей список встаёт во всю ширину таблицы. Но таблица в
+   * карточке, каких в ряду две-три, вдвое уже списка: он раздвигал её, и
+   * прокручивать приходилось уже саму карточку — вместе с числом, которое
+   * раскрыли, и правыми столбцами списка, то есть с величиной, по которой
+   * он упорядочен. Раздел помечает такие места `data-drill-out`, и список
+   * встаёт как у плитки: под рядом карточек, во всю ширину. На узком экране
+   * карточки идут в один столбец и таблица не уже ряда — там список
+   * остаётся строкой под своей.
+   */
+  _наружу(кнопка) {
+    const отметка = кнопка.closest('[data-drill-out]');
+    const таблица = кнопка.closest('table');
+    if (!отметка || !таблица) return Boolean(отметка);
+    const карточка = отметка.closest('.card');
+    const ряд = карточка && карточка.parentElement
+      && карточка.parentElement.classList.contains('grid') ? карточка.parentElement : null;
+    const место = кнопка.closest('[data-drill-host]') || ряд || карточка;
+    return Boolean(место) && таблица.clientWidth < место.clientWidth * 0.8;
+  },
+
+  /** Щелчок по элементу с `data-drill`: открыть его список или свернуть. */
+  toggle(кнопка) {
+    if (кнопка._панель && кнопка._панель.isConnected) { this._close(кнопка._панель); return; }
+    let описание;
+    try { описание = JSON.parse(кнопка.dataset.drill); } catch (e) { return; }
+    const панель = this._panel(описание, кнопка);
+    const строка = кнопка.closest('tr');
+    const наружу = this._наружу(кнопка);
+    if (строка && строка.parentElement && !наружу) {
+      // В таблице список встаёт строкой под своей: так видно, чьё это.
+      const следом = строка.nextElementSibling;
+      if (следом && следом.classList.contains('drill-row')) this._close(qs('.drill-panel', следом));
+      const обёртка = document.createElement('tr');
+      обёртка.className = 'drill-row';
+      const ячейка = document.createElement('td');
+      ячейка.colSpan = Math.max(1, Array.from(строка.cells || [])
+        .reduce((сумма, я) => сумма + (я.colSpan || 1), 0));
+      ячейка.appendChild(панель);
+      обёртка.appendChild(ячейка);
+      строка.after(обёртка);
+    } else {
+      this._поставить(кнопка, панель);
+    }
+    кнопка._панель = панель;
+    кнопка.classList.add('drill-on');
+    кнопка.setAttribute('aria-expanded', 'true');
+    this._start(панель);
+    // Строка под своей видна и так; список под рядом карточек мог встать
+    // за краем окна.
+    if (!панель.closest('tr.drill-row')) this._показать(панель);
+  },
+
+  /**
+   * Подвинуть страницу к списку, если он встал за нижним краем окна.
+   *
+   * Список под рядом карточек, а число могло стоять в верху высокой
+   * карточки: без прокрутки щелчок выглядел бы как «ничего не произошло».
+   * Двигаем ровно настолько, чтобы под заголовком списка поместилось
+   * несколько строк, — число, по которому щёлкнули, по возможности остаётся
+   * на экране. Запас задаётся отступом прокрутки: панель в этот миг ещё
+   * пуста, и «показать её целиком» означало бы показать один заголовок.
+   */
+  _показать(панель) {
+    if (панель.getBoundingClientRect().top <= window.innerHeight - 260) return;
+    панель.style.scrollMarginBottom = '300px';
+    панель.scrollIntoView({ block: 'nearest' });
+  },
+
+  /**
+   * Переносит раскрытые списки через перерисовку раздела.
+   *
+   * Раздел, который пересобирает свою разметку целиком на каждую галочку
+   * (в «Трендах» — выбор показателя, поиск, смена шкалы), сносил бы вместе
+   * с ней и список, который человек только что раскрыл и читает. Зовётся
+   * ДО перерисовки и отдаёт «вернуть» — её зовут ПОСЛЕ, в том же обработчике:
+   *
+   *     const вернуть = Drill.keep(host);
+   *     host.innerHTML = …;        // раздел рисует себя заново
+   *     вернуть();
+   *
+   * Переезжает сам узел панели — со строками, порядком и прокруткой; новых
+   * запросов нет. Панель числа возвращается к числу с дословно тем же
+   * описанием (`data-drill`: то же окно, тот же отбор) в том же блоке
+   * (ближайший предок с `id`); панель графика — под узел графика с тем же
+   * `id`. Не нашлось — панель закрывается: список про прежнее окно под
+   * новым числом был бы неправдой. По той же причине после загрузки новых
+   * данных `keep` не зовут вовсе.
+   */
+  keep(корень) {
+    const блок = (узел) => { const предок = узел.closest('[id]'); return предок ? предок.id : ''; };
+    const такие = (где, описание) => qsa('[data-drill]', корень)
+      .filter((к) => к.dataset.drill === описание && блок(к) === где);
+    const записи = qsa('.drill-panel', корень).map((панель) => {
+      const { кнопка } = панель._ход;
+      const тело = qs('.drill-body', панель);
+      const запись = { панель, тело, прокрутка: тело ? тело.scrollTop : 0,
+                       узел: панель.dataset.at || '' };
+      if (кнопка) {
+        запись.описание = кнопка.dataset.drill;
+        запись.где = блок(кнопка);
+        запись.номер = такие(запись.где, запись.описание).indexOf(кнопка);
+      }
+      return запись;
+    });
+    // Вынимаем после обхода: номер кнопки считается по ещё целой разметке.
+    записи.forEach(({ панель }) => (панель.closest('tr.drill-row') || панель).remove());
+    return () => записи.forEach((запись) => {
+      const { панель } = запись;
+      if (запись.описание !== undefined) {
+        const кнопка = такие(запись.где, запись.описание)[запись.номер];
+        const строка = кнопка ? кнопка.closest('tr') : null;
+        const обёртка = панель.closest('tr.drill-row');
+        // Число было в строке таблицы — и осталось в строке; иначе это уже
+        // другая разметка, и прежняя панель в неё не встанет.
+        if (!кнопка || Boolean(строка) !== Boolean(обёртка)) { this._close(панель); return; }
+        if (обёртка) строка.after(обёртка);
+        else this._поставить(кнопка, панель);
+        панель._ход.кнопка = кнопка;
+        кнопка._панель = панель;
+        кнопка.classList.add('drill-on');
+        кнопка.setAttribute('aria-expanded', 'true');
+      } else {
+        const узел = запись.узел ? document.getElementById(запись.узел) : null;
+        if (!узел || !корень.contains(узел)) { this._close(панель); return; }
+        this._поставить(узел, панель);
+      }
+      if (запись.тело) запись.тело.scrollTop = запись.прокрутка;
+    });
+  },
+
+  _panel(описание, кнопка) {
+    const звонки = описание.base === 'calls';
+    const панель = h(`<div class="drill-panel">
+      <div class="drill-head">
+        <b class="drill-title">${esc(описание.title || (звонки ? 'Звонки' : 'Записи'))}</b>
+        <span class="drill-count faint small"></span>
+        <span class="spacer"></span>
+        <select class="drill-sort" aria-label="Порядок списка"></select>
+        <button type="button" class="ghost sm drill-close">Свернуть</button>
+      </div>
+      <div class="drill-body table-wrap"><table class="drill-table">
+        <thead></thead><tbody></tbody></table>
+        <div class="drill-foot small"></div></div>
+    </div>`);
+    const величина = String(описание.sort || '').split(':')[0];
+    const порядки = [['time:desc', 'сначала новые'], ['time:asc', 'сначала старые']];
+    if (величина && величина !== 'time') {
+      const имя = описание.value || 'величина';
+      порядки.unshift([`${величина}:desc`, `${имя}: по убыванию`],
+                      [`${величина}:asc`, `${имя}: по возрастанию`]);
+    }
+    const выбор = qs('.drill-sort', панель);
+    выбор.innerHTML = порядки.map(([к, п]) => `<option value="${esc(к)}">${esc(п)}</option>`).join('');
+    const начальный = описание.sort
+      ? (описание.sort.includes(':') ? описание.sort : `${описание.sort}:desc`) : 'time:desc';
+    выбор.value = порядки.some(([к]) => к === начальный) ? начальный : порядки[0][0];
+    панель._ход = { описание, кнопка, sort: выбор.value, next: null, строк: 0,
+                    всего: null, потолок: false, грузим: false, запрос: null };
+    выбор.onchange = () => { панель._ход.sort = выбор.value; this._start(панель); };
+    qs('.drill-close', панель).onclick = () => this._close(панель);
+    return панель;
+  },
+
+  _close(панель) {
+    if (!панель) return;
+    const ход = панель._ход || {};
+    if (ход.запрос) ход.запрос.abort();
+    if (ход.страж) ход.страж.disconnect();
+    if (ход.кнопка) {
+      ход.кнопка.classList.remove('drill-on');
+      ход.кнопка.setAttribute('aria-expanded', 'false');
+      ход.кнопка._панель = null;
+    }
+    const обёртка = панель.closest('tr.drill-row');
+    (обёртка || панель).remove();
+  },
+
+  /** Список заново: первая страница в выбранном порядке. */
+  _start(панель) {
+    const ход = панель._ход;
+    if (ход.запрос) ход.запрос.abort();
+    Object.assign(ход, { next: null, строк: 0, всего: null, потолок: false, грузим: false });
+    qs('thead', панель).innerHTML = this._шапка(ход);
+    qs('tbody', панель).innerHTML = '';
+    qs('.drill-count', панель).textContent = '';
+    this._load(панель);
+    if (!ход.страж && 'IntersectionObserver' in window) {
+      // Докрутили до низа — подгружаем сами. Кнопка «Показать ещё» остаётся:
+      // с клавиатуры и там, где наблюдателя нет, продолжение — по ней.
+      ход.страж = new IntersectionObserver((записи) => {
+        if (!панель.isConnected) { ход.страж.disconnect(); return; }
+        if (записи.some((з) => з.isIntersecting) && ход.next && !ход.грузим
+            && ход.строк < this.ПОТОЛОК) this._load(панель);
+      }, { root: qs('.drill-body', панель), rootMargin: '120px' });
+      ход.страж.observe(qs('.drill-foot', панель));
+    }
+  },
+
+  async _load(панель) {
+    const ход = панель._ход;
+    if (ход.грузим) return;
+    const { описание } = ход;
+    const запрос = new URLSearchParams();
+    запрос.set('base', описание.base || 'jobs');
+    if (описание.since !== undefined) запрос.set('since', описание.since);
+    if (описание.until !== undefined) запрос.set('until', описание.until);
+    (описание.f || []).forEach((отбор) => запрос.append('f', отбор));
+    if (ход.sort && ход.sort !== 'time:desc') запрос.set('sort', ход.sort);
+    запрос.set('limit', this.СТРАНИЦА);
+    if (ход.next) запрос.set('cursor', ход.next);
+    const отмена = new AbortController();
+    ход.запрос = отмена;
+    ход.грузим = true;
+    // Свой сигнал — чтобы снять запрос, когда панель свернули; в общий
+    // набор — чтобы его сняла и смена раздела.
+    API._pending.add(отмена);
+    this._подвал(панель, '<span class="faint">Загружаем…</span>');
+    try {
+      const ответ = await API.call(`/api/drill?${запрос}`, { signal: отмена.signal });
+      if (!панель.isConnected || ход.запрос !== отмена) return;
+      ход.грузим = false;
+      if (ответ.timed_out) {
+        // Порядок по величине — это сортировка всего окна: на миллионах
+        // записей она и есть то, что не укладывается. По времени тот же
+        // список идёт по указателю и отдаётся сразу.
+        const по_величине = Boolean(this._величина(ход));
+        this._подвал(панель, `<span class="warn">Список не уложился в срок: под этот отбор
+          приходится читать слишком большой архив.</span>
+          ${по_величине ? `Упорядочить по величине такой объём не выходит —
+            <button type="button" class="ghost sm drill-by-time">Показать по времени</button> или`
+            : ''} ${по_величине ? 'сузьте' : 'Сузьте'} период и раскройте снова.
+          <button type="button" class="ghost sm drill-more">Повторить</button>`);
+        return;
+      }
+      const строки = ответ.items || [];
+      if (строки.length) {
+        qs('tbody', панель).insertAdjacentHTML('beforeend',
+          строки.map((с) => this._строка(ход, с)).join(''));
+      }
+      ход.строк += строки.length;
+      ход.next = ответ.next || null;
+      if (ответ.total !== null && ответ.total !== undefined) {
+        ход.всего = ответ.total;
+        ход.потолок = Boolean(ответ.total_capped);
+      }
+      this._счёт(панель);
+    } catch (err) {
+      if (!панель.isConnected || ход.запрос !== отмена) return;
+      ход.грузим = false;
+      if (err && err.silent) return;
+      this._подвал(панель, `<span class="warn">${esc((err && err.message) || 'Список не загрузился')}</span>
+        ${err && err.hint ? `<span class="faint">${esc(err.hint)}</span>` : ''}
+        <button type="button" class="ghost sm drill-more">Повторить</button>`);
+    } finally {
+      API._pending.delete(отмена);
+    }
+  },
+
+  _счёт(панель) {
+    const ход = панель._ход;
+    const звонки = ход.описание.base === 'calls';
+    const всего = ход.всего === null ? ''
+      : ` из ${ход.потолок ? `${num(ход.всего)}+` : num(ход.всего)}`;
+    qs('.drill-count', панель).textContent = ход.строк ? `показано ${num(ход.строк)}${всего}` : '';
+    if (!ход.строк) {
+      this._подвал(панель, `<span class="faint">${звонки ? 'Звонков' : 'Записей'} по этому
+        отбору сейчас нет — возможно, их удалили после того, как отчёт был построен.</span>`);
+    } else if (ход.next && ход.строк >= this.ПОТОЛОК) {
+      this._подвал(панель, `<span class="faint">Показана первая тысяча. Дальше список
+        не листают, а сужают: выберите период короче или раскройте более узкое число.</span>`);
+    } else if (ход.next) {
+      this._подвал(панель, '<button type="button" class="ghost sm drill-more">Показать ещё</button>');
+    } else {
+      this._подвал(панель, '');
+    }
+  },
+
+  _подвал(панель, разметка) {
+    const подвал = qs('.drill-foot', панель);
+    подвал.innerHTML = разметка;
+    подвал.style.display = разметка ? '' : 'none';
+  },
+
+  _шапка(ход) {
+    const { описание } = ход;
+    if (описание.base === 'calls') {
+      const своя = this._величинаЗвонка(ход);
+      return `<tr><th>Когда</th><th>Направление</th><th>Кто → кому</th><th>Очередь</th>
+        <th>Оператор</th><th class="num">Разговор</th>
+        ${своя ? `<th class="num">${esc(описание.value || 'Величина')}</th>` : ''}
+        <th>Итог</th><th>Запись</th></tr>`;
+    }
+    const величина = this._величина(ход);
+    return `<tr><th>Когда</th><th>Запись</th><th class="num">Длительность</th><th>Модель</th>
+      <th>Владелец</th><th>Статус</th>
+      ${this._нужен(ход, 'sentiment') ? '<th>Тональность</th>' : ''}
+      ${this._нужен(ход, 'agent_score') ? '<th class="num">Балл</th>' : ''}
+      ${описание.base === 'llm' ? '<th>Причина</th><th>Исход</th>' : ''}
+      ${величина ? `<th class="num">${esc(описание.value || 'Величина')}</th>` : ''}</tr>`;
+  },
+
+  /** Время записи; год — только когда он не нынешний, иначе он шум. */
+  _когда(секунды) {
+    if (!секунды) return '—';
+    const д = new Date(секунды * 1000);
+    if (д.getFullYear() === new Date().getFullYear()) return fmtTime(секунды);
+    return д.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: '2-digit',
+      hour: '2-digit', minute: '2-digit' });
+  },
+
+  /** Имя величины, по которой упорядочен список; пусто — по времени. */
+  _величина(ход) {
+    const имя = String(ход.sort || '').split(':')[0];
+    return имя && имя !== 'time' ? имя : '';
+  },
+
+  /**
+   * Нужен ли списку разобранных записей постоянный столбец.
+   *
+   * Тональность и балл оператора у него стоят всегда. Но список,
+   * упорядоченный по одной из них, показывает её ещё и столбцом величины —
+   * одно число дважды, под двумя одинаковыми заголовками. Тогда постоянный
+   * столбец уступает: величина точнее и стоит там, где её ждут, — справа.
+   */
+  _нужен(ход, имя) {
+    return ход.описание.base === 'content' && this._величина(ход) !== имя;
+  },
+
+  /**
+   * Величина, по которой упорядочен список звонков, если у неё нет своего
+   * столбца. Разговор (`billsec`) в списке есть всегда; ожидание до ответа
+   * — нет, и список «сначала ждавшие дольше» без него был бы упорядочен по
+   * числу, которого не видно.
+   */
+  _величинаЗвонка(ход) {
+    const имя = this._величина(ход);
+    return имя && имя !== 'billsec' ? имя : '';
+  },
+
+  _значение(описание, значение) {
+    if (значение === null || значение === undefined) return '—';
+    switch (описание.fmt) {
+      case 'dur': return fmtDur(значение);
+      case 'pct': return pct(значение, 1);
+      case 'ms': return `${num(Math.round(значение))} мс`;
+      case 'int': return num(Math.round(значение));
+      default: return num(Number(значение));
+    }
+  },
+
+  _строка(ход, с) {
+    const { описание } = ход;
+    if (описание.base === 'calls') {
+      const запись = с.job_id
+        ? `<a class="drill-open" href="#/jobs/${encodeURIComponent(с.job_id)}"
+            data-open="${esc(с.job_id)}" title="${esc(с.filename || с.job_id)}">Открыть</a>`
+        : `<span class="faint">${esc(с.skipped || 'записи нет')}</span>`;
+      const своя = this._величинаЗвонка(ход);
+      return `<tr><td class="nowrap">${this._когда(с.started_at)}</td>
+        <td>${esc(с.direction || '—')}</td>
+        <td class="mono small">${esc(с.src || '—')} → ${esc(с.dst || '—')}</td>
+        <td>${esc(с.queue || '—')}</td><td>${esc(с.agent || '—')}</td>
+        <td class="num">${fmtDur(с.billsec)}</td>
+        ${своя ? `<td class="num">${this._значение(описание, с.value)}</td>` : ''}
+        <td>${с.answered ? '<span class="chip ok">отвечен</span>'
+          : `<span class="chip">${esc(с.disposition || 'без ответа')}</span>`}</td>
+        <td>${запись}</td></tr>`;
+    }
+    const величина = this._величина(ход);
+    const вкладка = описание.tab || (описание.base === 'jobs' ? '' : 'analysis');
+    return `<tr><td class="nowrap">${this._когда(с.created_at)}</td>
+      <td><a class="drill-open" href="#/jobs/${encodeURIComponent(с.id)}" data-open="${esc(с.id)}"
+        ${вкладка ? `data-tab="${esc(вкладка)}"` : ''}>${esc(с.filename || с.id)}</a>
+        ${с.error_code ? `<span class="chip err">${esc(с.error_code)}</span>` : ''}</td>
+      <td class="num">${с.media_duration_s ? fmtDur(с.media_duration_s) : '—'}</td>
+      <td>${esc(с.model || '—')}</td><td>${esc(с.owner || '—')}</td>
+      <td>${statusChip(с.status)}</td>
+      ${this._нужен(ход, 'sentiment') ? `<td>${toneChip(с.sentiment, '')}</td>` : ''}
+      ${this._нужен(ход, 'agent_score') ? `<td class="num">${
+        с.agent_score === null || с.agent_score === undefined
+          ? '—' : num(Math.round(с.agent_score))}</td>` : ''}
+      ${описание.base === 'llm' ? `<td>${esc(с.reason || '—')}</td><td>${esc(с.outcome || '—')}</td>` : ''}
+      ${величина ? `<td class="num">${this._значение(описание, с.value)}</td>` : ''}</tr>`;
+  },
+};
+
+// Один обработчик на весь документ: разделы перерисовываются целиком, и
+// вешать по обработчику на каждое число значило бы вешать их заново при
+// каждой смене периода.
+document.addEventListener('click', (событие) => {
+  const цель = событие.target;
+  if (!цель || !цель.closest) return;
+  const ссылка = цель.closest('a.drill-open');
+  if (ссылка) {
+    // Обычный щелчок открывает карточку поверх раздела: список остаётся
+    // раскрытым, и после закрытия карточки можно идти к следующей записи.
+    // Щелчок с Ctrl или колесом — обычная ссылка, в новой вкладке.
+    if (событие.button || событие.ctrlKey || событие.metaKey || событие.shiftKey) return;
+    событие.preventDefault();
+    window.__asrhub.openJob(ссылка.dataset.open,
+      ссылка.dataset.tab ? { tab: ссылка.dataset.tab } : undefined);
+    return;
+  }
+  const по_времени = цель.closest('.drill-by-time');
+  if (по_времени) {
+    const панель = по_времени.closest('.drill-panel');
+    if (панель) {
+      const выбор = qs('.drill-sort', панель);
+      выбор.value = 'time:desc';
+      панель._ход.sort = 'time:desc';
+      Drill._start(панель);
+    }
+    return;
+  }
+  const ещё = цель.closest('.drill-more');
+  if (ещё) {
+    const панель = ещё.closest('.drill-panel');
+    if (панель) Drill._load(панель);
+    return;
+  }
+  const кнопка = цель.closest('[data-drill]');
+  if (!кнопка) return;
+  // Число стоит в строке таблицы, а у строки бывает свой щелчок (карточка
+  // сотрудника): раскрытие — действие числа, до строки оно не доходит.
+  событие.preventDefault();
+  событие.stopPropagation();
+  Drill.toggle(кнопка);
+}, true);
+window.__asrhub.Drill = Drill;
+
 function modelById(id) { return state.models.find((m) => m.id === id); }
 function paramByKey(key) { return (state.params || []).find((p) => p.key === key); }
 
@@ -4464,6 +5017,79 @@ function drawJobWaveform(backdrop, job, segments, show, player) {
 const PERIOD_LABELS = { hour: 'час', day: 'сутки', week: 'неделя',
                         month: 'месяц', quarter: 'квартал', year: 'год', all: 'всё время' };
 
+/**
+ * Раскрытие в «Аналитике»: общие отборы и подписи.
+ *
+ * Отбор обязан повторять условие свода дословно, иначе под числом окажется
+ * не тот список. Свод отбрасывает нули («истинно») у RTF, уверенности и
+ * длительности — это `nz:`; а ожидание в очереди и WER берёт «не пусто» —
+ * это `has:`. Здесь эти пары записаны один раз, чтобы плитка, строка
+ * таблицы и точка графика про одно и то же раскрывались одинаково.
+ */
+const РАСКРЫТИЕ = {
+  ГОТОВЫЕ: 'status:completed',
+  rtf: (отборы, заголовок) => ({ f: ['status:completed', 'nz:rtf', ...(отборы || [])],
+    sort: 'rtf:desc', value: 'RTF', title: заголовок }),
+  уверенность: (отборы, заголовок) => ({
+    f: ['status:completed', 'nz:confidence', ...(отборы || [])],
+    sort: 'confidence:asc', value: 'Уверенность', fmt: 'pct', title: заголовок }),
+  звук: (отборы, заголовок) => ({ f: ['status:completed', 'nz:duration', ...(отборы || [])],
+    sort: 'duration:desc', value: 'Длительность', fmt: 'dur', title: заголовок }),
+  /** Диапазон «от..до» для отбора; `null` — граница открыта. */
+  диапазон: (от, до) => `${от === null || от === undefined ? '' : от}..${
+    до === null || до === undefined ? '' : до}`,
+  /** Окно корзины ряда по точным границам из ответа свода. */
+  корзина: (границы, номер) => ({ since: границы[номер], until: границы[номер + 1] }),
+  /** Промежуток корзины словами — в заголовок списка. */
+  когда: (границы, номер) => `${fmtTime(границы[номер])} — ${fmtTime(границы[номер + 1])}`,
+  /**
+   * Открыть список под графиком — и показать его.
+   *
+   * Список встаёт под рядом карточек, а ряд бывает выше окна: щёлкнули по
+   * верхней из трёх контрольных карт, а список открылся под нижней, за
+   * краем экрана — выглядит как «ничего не произошло». Если панель за
+   * нижним краем, страница подвигается ровно настолько, чтобы под её
+   * заголовком поместилось несколько строк: график, по которому щёлкнули,
+   * по возможности остаётся на экране.
+   */
+  открыть(узел, описание) {
+    Drill.open(узел, описание);
+    const ключ = JSON.stringify(описание);
+    const панель = qsa('.drill-panel').find((п) => п.dataset.key === ключ);
+    if (!панель) return;                              // тот же щелчок — свернули
+    if (панель.getBoundingClientRect().top <= window.innerHeight - 260) return;
+    // Панель ещё пуста: запас под строки задаётся отступом прокрутки.
+    панель.style.scrollMarginBottom = '300px';
+    панель.scrollIntoView({ block: 'nearest' });
+  },
+};
+
+/**
+ * Что раскрывать у линии с двумя рядами.
+ *
+ * Щелчок по линейному графику сообщает точку, но не ряд: под одной
+ * вертикалью лежат оба. А задания за ними разные — средний RTF сложился из
+ * одних, среднее ожидание в очереди из других. Поэтому ряд выбирается
+ * переключателем под графиком, и список открывается по нему. Возвращает
+ * функцию «номер выбранного ряда».
+ */
+function выборРяда(узел, подписи) {
+  let выбран = 0;
+  const строка = h(`<div class="row small faint" style="gap:8px;margin-top:6px">
+    <span>По щелчку на точке — задания:</span>
+    <div class="group-nav">${подписи.map((подпись, номер) =>
+      `<button type="button" data-series="${номер}" class="${номер ? '' : 'active'}">${
+        esc(подпись)}</button>`).join('')}</div></div>`);
+  строка.addEventListener('click', (событие) => {
+    const кнопка = событие.target.closest('button[data-series]');
+    if (!кнопка) return;
+    выбран = Number(кнопка.dataset.series);
+    qsa('button', строка).forEach((b) => b.classList.toggle('active', b === кнопка));
+  });
+  узел.after(строка);
+  return () => выбран;
+}
+
 RENDERERS.analytics = {
   async render(root) {
     root.innerHTML = `
@@ -4509,20 +5135,43 @@ RENDERERS.analytics = {
     const perf = o.performance;
     const quality = o.quality;
 
+    // Раскрытие: любое число раздела — в список заданий за то же окно.
+    const окно = data.window;
+    const Р = (разметка, что) => Drill.num(разметка, окно, что);
+    // Ноль не раскрывается: список под ним заведомо пуст, а кнопка, за
+    // которой ничего нет, учит не щёлкать и по соседним.
+    const Ч = (число, разметка, что) => (число ? Р(разметка, что) : разметка);
+    const { ГОТОВЫЕ } = РАСКРЫТИЕ;
+
     host.innerHTML = `
       <div class="grid cols-6" style="margin-bottom:16px">
-        ${kpi('Заданий', num(o.jobs.total),
-              `готово ${o.jobs.completed} · ошибок ${o.jobs.failed}`)}
-        ${kpi('Успешность', o.jobs.success_rate !== null ? pct(o.jobs.success_rate, 1) : '—',
-              o.jobs.cached ? `из кеша: ${o.jobs.cached}` : 'доля завершённых')}
-        ${kpi('Аудио', `${num(o.volume.audio_hours)} ч`,
-              `${num(o.volume.words)} слов`)}
-        ${kpi('Средний RTF', num(perf.rtf.avg, 3),
+        ${kpi('Заданий', Р(num(o.jobs.total), { title: 'Задания за период' }),
+              `готово ${Р(o.jobs.completed, { f: ['status:completed'], title: 'Готовые задания' })
+              } · ошибок ${Р(o.jobs.failed, { f: ['status:failed'], title: 'Задания с ошибкой' })}`)}
+        ${kpi('Успешность', o.jobs.success_rate !== null
+                ? Ч(o.jobs.completed, pct(o.jobs.success_rate, 1),
+                    { f: [ГОТОВЫЕ], title: 'Успешно завершённые задания' }) : '—',
+              o.jobs.cached ? `из кеша: ${Р(o.jobs.cached, { f: ['cached'],
+                title: 'Задания, результат которых взят из кеша' })}` : 'доля завершённых')}
+        ${kpi('Аудио', Ч(o.volume.audio_seconds, `${num(o.volume.audio_hours)} ч`,
+                РАСКРЫТИЕ.звук([], 'Готовые задания: сверху самые длинные записи')),
+              `${Ч(o.volume.words, num(o.volume.words), { f: [ГОТОВЫЕ, 'nz:words'],
+                sort: 'words:desc', value: 'Слов', fmt: 'int',
+                title: 'Готовые задания: сверху самые многословные' })} слов`)}
+        ${kpi('Средний RTF', Ч(perf.rtf.count, num(perf.rtf.avg, 3),
+                РАСКРЫТИЕ.rtf([], 'Готовые задания по RTF: сверху самые медленные')),
               `p95: ${num(perf.rtf.p95, 3)}`)}
-        ${kpi('Ускорение', perf.speedup ? `×${num(perf.speedup, 1)}` : '—',
+        ${kpi('Ускорение', perf.speedup
+                ? Р(`×${num(perf.speedup, 1)}`, { f: [ГОТОВЫЕ], sort: 'processing:desc',
+                    value: 'Обработка', fmt: 'dur',
+                    title: 'Готовые задания: сверху самые долгие в обработке' }) : '—',
               'аудио / машинное время')}
-        ${kpi('Уверенность', quality.confidence.count ? pct(quality.confidence.avg, 1) : '—',
-              `низких: ${quality.low_confidence_jobs}`)}
+        ${kpi('Уверенность', quality.confidence.count
+                ? Р(pct(quality.confidence.avg, 1),
+                    РАСКРЫТИЕ.уверенность([], 'Готовые задания по уверенности: сверху самые неуверенные'))
+                : '—',
+              `низких: ${Ч(quality.low_confidence_jobs, quality.low_confidence_jobs,
+                РАСКРЫТИЕ.уверенность(['low_confidence'], 'Задания с уверенностью ниже 0,75'))}`)}
       </div>
 
       <div class="grid cols-2">
@@ -4557,11 +5206,15 @@ RENDERERS.analytics = {
       ${card('Сравнение по моделям', 'фактические показатели за период, а не заявленные',
              '<div class="table-wrap full" id="table-models"></div>')}
 
+      ${/* `data-drill-out` у карточек, стоящих по две в ряд: таблица в такой
+            вдвое уже списка, и он встаёт под рядом карточек, а не строкой
+            внутри неё. У таблиц во всю ширину (модели, метки, звук) —
+            строкой под своей, как обычно. */ ''}
       <div class="grid cols-2">
         ${card('Ошибки', 'по коду, с подсказками по устранению',
-               '<div id="errors-body"></div>')}
+               '<div id="errors-body" data-drill-out></div>')}
         ${card('Эффективность', 'ресурсы на час аудио',
-               '<div id="efficiency-body"></div>')}
+               '<div id="efficiency-body" data-drill-out></div>')}
       </div>
 
       <div class="grid cols-3">
@@ -4576,7 +5229,7 @@ RENDERERS.analytics = {
 
       <div class="grid cols-2">
         ${card('Ожидание в очереди', 'среднее скрывает хвост, а жалуются именно на него',
-               '<div id="queue-body"></div>')}
+               '<div id="queue-body" data-drill-out></div>')}
         ${card('Уверенность во времени', 'провал означает, что что-то поменялось: источник, модель или параметры',
                '<div id="chart-quality"></div>')}
       </div>
@@ -4585,7 +5238,7 @@ RENDERERS.analytics = {
         ${card('Ошибки распознавания во времени', 'WER и доля заданий с низкой уверенностью',
                '<div id="chart-quality2"></div>')}
         ${card('Расход ресурсов', 'память моделей и разрез по устройствам',
-               '<div id="resources-body"></div>')}
+               '<div id="resources-body" data-drill-out></div>')}
       </div>
 
       ${card('Подозрительные расшифровки',
@@ -4595,7 +5248,7 @@ RENDERERS.analytics = {
       <div class="grid cols-2">
         ${card('Дрейф уверенности',
                'распределение уверенности за период против четырёх недель до него — по моделям; критерий Колмогорова — Смирнова',
-               '<div id="drift-body"></div>')}
+               '<div id="drift-body" data-drill-out></div>')}
         ${card('Контрольные карты распознавания',
                'по дням: уверенность, доля заданий с низкой уверенностью, доля подозрительных сегментов; пределы 2σ и 3σ по базе',
                '<div id="control-body"></div>')}
@@ -4621,17 +5274,17 @@ RENDERERS.analytics = {
       <div class="grid cols-2">
         ${card('Калибровка уверенности',
                'верны ли слова, которым модель дала такую уверенность: диаграмма надёжности, ECE и AUC по записям с эталоном',
-               '<div id="calibration-body"></div>')}
+               '<div id="calibration-body" data-drill-out></div>')}
         ${card('Латентность',
                'p50 / p95 / p99 времени обработки и RTF по моделям и по длительности; для потока — секунды до первого текста',
-               '<div id="latency-body"></div>')}
+               '<div id="latency-body" data-drill-out></div>')}
       </div>
 
       <div class="grid cols-2">
         ${card('Надёжность', 'что происходит между приёмом и выдачей результата',
-               '<div id="reliability-body"></div>')}
+               '<div id="reliability-body" data-drill-out></div>')}
         ${card('Повторы и экономия', 'сколько работы сняло узнавание уже виденных файлов',
-               '<div id="cache-body"></div>')}
+               '<div id="cache-body" data-drill-out></div>')}
       </div>
 
       ${card('Каким бывает звук', 'разрез не про сервер, а про материал',
@@ -4643,20 +5296,41 @@ RENDERERS.analytics = {
     const ts = data.timeseries;
     const labels = (ts.labels || []).map((t) => подписьВремени(t, ts.bucket_seconds));
 
+    // Точка ряда — корзина времени. Её границы берутся из ответа (`edges`),
+    // а не считаются здесь заново: «сорок восьмая часть недели до сейчас»
+    // через минуту — уже другой промежуток, и список разошёлся бы с точкой.
+    const края = ts.edges || [];
     Charts.line(qs('#chart-flow'), {
       labels, height: 210, area: true,
       series: [
         { name: 'Готово', values: ts.completed },
         { name: 'Ошибки', values: ts.failed },
       ],
+      onPick: (номер) => {
+        // Оба ряда — в одном списке: статус в нём стоит столбцом.
+        if (!((ts.completed[номер] || 0) + (ts.failed[номер] || 0))) return;
+        РАСКРЫТИЕ.открыть(qs('#chart-flow'), Drill.spec(РАСКРЫТИЕ.корзина(края, номер), {
+          f: ['status:completed,failed'],
+          title: `Готовые и упавшие задания, созданные ${РАСКРЫТИЕ.когда(края, номер)}` }));
+      },
     });
 
+    const рядСкорости = выборРяда(qs('#chart-rtf'), ['по RTF', 'по ожиданию в очереди']);
     Charts.line(qs('#chart-rtf'), {
       labels, height: 210, unit: '',
       series: [
         { name: 'RTF', values: ts.rtf },
         { name: 'Ожидание в очереди, с', values: ts.queue_time },
       ],
+      onPick: (номер) => {
+        const ожидание = рядСкорости() === 1;
+        if ((ожидание ? ts.queue_time : ts.rtf)[номер] === null) return;
+        const когда = РАСКРЫТИЕ.когда(края, номер);
+        РАСКРЫТИЕ.открыть(qs('#chart-rtf'), Drill.spec(РАСКРЫТИЕ.корзина(края, номер), ожидание
+          ? { f: [ГОТОВЫЕ, 'has:wait'], sort: 'wait:desc', value: 'Ожидание, с',
+              title: `Готовые задания по ожиданию в очереди, созданные ${когда}` }
+          : РАСКРЫТИЕ.rtf([], `Готовые задания по RTF, созданные ${когда}`)));
+      },
     });
 
     const statusColors = Charts.status();
@@ -4668,11 +5342,24 @@ RENDERERS.analytics = {
         { label: 'В работе', value: o.jobs.in_progress, color: statusColors.info },
         { label: 'Отменено', value: o.jobs.cancelled, color: statusColors.idle },
       ],
+      onPick: (номер, доля) => РАСКРЫТИЕ.открыть(qs('#chart-status'), Drill.spec(окно, {
+        f: [`status:${['completed', 'failed', 'active', 'cancelled'][номер]}`],
+        title: `Задания: ${доля.label.toLowerCase()}` })),
     });
 
     Charts.stacked(qs('#chart-stages'), {
       unit: ' с',
       parts: o.stages.labels.map((label, i) => ({ label, value: o.stages.seconds[i] })),
+      // Доля — сумма секунд этапа по готовым заданиям; раскрывается в те,
+      // у кого этап был, и сверху — те, кому он стоил дороже всего.
+      // Колонка `inference_s` в списке называется величиной `inference`.
+      onPick: (номер, доля) => {
+        const этап = String((o.stages.keys || [])[номер] || '').replace(/_s$/, '');
+        if (!этап) return;
+        РАСКРЫТИЕ.открыть(qs('#chart-stages'), Drill.spec(окно, {
+          f: [ГОТОВЫЕ, `nz:${этап}`], sort: `${этап}:desc`, value: 'Секунд',
+          title: `Этап «${доля.label}»: сверху задания, где он занял больше всего` }));
+      },
     });
 
     const buckets = quality.confidence_distribution || [];
@@ -4681,6 +5368,14 @@ RENDERERS.analytics = {
       labels: buckets.map((b) => `${(b.from * 100).toFixed(0)}–${(b.to * 100).toFixed(0)}%`),
       values: buckets.map((b) => b.count),
       colors: buckets.map((b) => b.from < 0.7 ? statusColors.warn : Charts.palette()[0]),
+      // Верх последней корзины входит в неё (уверенность ровно 100 %) —
+      // свод помечает это сам, и диапазон тогда сверху открыт.
+      onPick: (номер) => {
+        const b = buckets[номер];
+        РАСКРЫТИЕ.открыть(qs('#chart-conf'), Drill.spec(окно, РАСКРЫТИЕ.уверенность(
+          [`confidence:${РАСКРЫТИЕ.диапазон(b.from, b.inclusive ? null : b.to)}`],
+          `Готовые задания с уверенностью ${(b.from * 100).toFixed(0)}–${(b.to * 100).toFixed(0)} %`)));
+      },
     });
 
     const sys = ts.system || {};
@@ -4703,11 +5398,21 @@ RENDERERS.analytics = {
       ],
     });
 
+    const длины = data.durations.edges || [];
     Charts.bars(qs('#chart-dur'), {
       height: 200, labels: data.durations.labels, values: data.durations.counts,
+      onPick: (номер) => РАСКРЫТИЕ.открыть(qs('#chart-dur'), Drill.spec(окно, РАСКРЫТИЕ.звук(
+        [`duration:${РАСКРЫТИЕ.диапазон(длины[номер], длины[номер + 1])}`],
+        `Готовые записи длиной ${data.durations.labels[номер]}`))),
     });
     Charts.heat(qs('#chart-hours'), {
       values: data.profile.hours, labels: data.profile.hour_labels, cell: 24,
+      // Час — по часам сервера, как и в своде: «09» у человека в другом
+      // поясе и у сервера — разные девять утра.
+      onPick: (час) => РАСКРЫТИЕ.открыть(qs('#chart-hours'), Drill.spec(окно, {
+        f: [`hour:${час}`],
+        title: `Задания, созданные с ${data.profile.hour_labels[час]}:00 до ${
+          data.profile.hour_labels[час]}:59 по часам сервера` })),
     });
 
     qs('#table-models').innerHTML = data.models.length ? `<table>
@@ -4715,44 +5420,71 @@ RENDERERS.analytics = {
         <th class="num">RTF ср.</th><th class="num">RTF p90</th><th class="num">Ускорение</th>
         <th class="num">Уверенность</th><th class="num">Аудио, ч</th>
         <th class="num">WER (каталог)</th><th>Лицензия</th></tr></thead><tbody>
-      ${data.models.map((m) => `<tr>
+      ${data.models.map((m) => {
+        // «—» в своде — задания без модели; в базе там пусто.
+        const модель = `model:${Drill.val(m.model, '—')}`;
+        return `<tr>
         <td><b>${esc(m.name)}</b><div class="small faint mono">${esc(m.model)}</div></td>
-        <td class="num">${m.jobs}</td>
-        <td class="num">${m.success_rate !== null ? pct(m.success_rate, 0) : '—'}</td>
-        <td class="num">${m.rtf_avg !== null ? num(m.rtf_avg, 3) : '—'}</td>
+        <td class="num">${Р(m.jobs, { f: [модель],
+          title: `Задания на модели ${m.name}` })}</td>
+        <td class="num">${m.success_rate !== null
+          ? Ч(m.completed, pct(m.success_rate, 0), { f: [модель, ГОТОВЫЕ],
+              title: `Успешно завершённые задания на модели ${m.name}` }) : '—'}</td>
+        <td class="num">${m.rtf_avg !== null ? Р(num(m.rtf_avg, 3), РАСКРЫТИЕ.rtf([модель],
+          `Модель ${m.name}: готовые задания по RTF, сверху самые медленные`)) : '—'}</td>
         <td class="num">${m.rtf_p90 !== null ? num(m.rtf_p90, 3) : '—'}</td>
         <td class="num">${m.speedup ? '×' + num(m.speedup, 1) : '—'}</td>
-        <td class="num">${m.confidence_avg !== null ? pct(m.confidence_avg, 0) : '—'}</td>
-        <td class="num">${num(m.audio_hours, 2)}</td>
+        <td class="num">${m.confidence_avg !== null
+          ? Р(pct(m.confidence_avg, 0), РАСКРЫТИЕ.уверенность([модель],
+              `Модель ${m.name}: готовые задания по уверенности, сверху самые неуверенные`)) : '—'}</td>
+        <td class="num">${Ч(m.audio_hours, num(m.audio_hours, 2), РАСКРЫТИЕ.звук([модель],
+          `Модель ${m.name}: готовые задания, сверху самые длинные записи`))}</td>
         <td class="num">${m.catalog_ru_wer !== null && m.catalog_ru_wer !== undefined
           ? num(m.catalog_ru_wer, 1) + ' %' : '—'}</td>
         <td class="small"><span class="chip badge-license">${esc(m.license || '')}</span></td>
-      </tr>`).join('')}</tbody></table>` : '<div class="empty">Нет данных за период</div>';
+      </tr>`; }).join('')}</tbody></table>` : '<div class="empty">Нет данных за период</div>';
 
     const errors = data.errors;
     qs('#errors-body').innerHTML = errors.by_code.length ? `
       <div class="row" style="margin-bottom:10px">
-        <span class="chip err">неудач: ${errors.total_failed}</span>
+        <span class="chip err">неудач: ${Ч(errors.total_failed, errors.total_failed,
+          { f: ['status:failed'], title: 'Задания с ошибкой' })}</span>
         <span class="chip">доля: ${pct(errors.failure_rate, 2)}</span></div>
-      ${errors.by_code.map((e) => `<div class="card tight" style="margin-bottom:8px">
+      ${errors.by_code.map((e) => {
+        // Код «unknown» — отказы без кода: в базе у них пусто.
+        const код = ['status:failed', `error:${Drill.val(e.code, 'unknown')}`];
+        return `<div class="card tight" style="margin-bottom:8px">
         <div class="row"><b class="mono">${esc(e.code)}</b>
-          <span class="spacer"></span><span class="chip err">${e.count}</span></div>
+          <span class="spacer"></span><span class="chip err">${Р(e.count,
+            { f: код, title: `Задания с ошибкой ${e.code}` })}</span></div>
         <div class="small dim" style="margin-top:4px">${esc(e.message)}</div>
         ${e.hint ? `<div class="small faint" style="margin-top:6px;white-space:pre-wrap">${
           esc(e.hint)}</div>` : ''}
         <div class="small faint" style="margin-top:6px">Модели: ${
-          Object.entries(e.models).map(([m, c]) => `${esc(m)} (${c})`).join(', ')}</div>
-      </div>`).join('')}` : '<div class="empty small">Ошибок за период не было</div>';
+          Object.entries(e.models).map(([m, c]) => `${esc(m)} (${Р(c,
+            { f: [...код, `model:${Drill.val(m, '—')}`],
+              title: `Ошибка ${e.code} на модели ${m}` })})`).join(', ')}</div>
+      </div>`; }).join('')}` : '<div class="empty small">Ошибок за период не было</div>';
 
     const eff = data.efficiency;
     qs('#efficiency-body').innerHTML = `<table>
-      <tr><td class="dim">Обработано аудио</td><td class="num">${num(eff.audio_hours, 2)} ч</td></tr>
-      <tr><td class="dim">Машинное время</td><td class="num">${num(eff.compute_hours, 2)} ч</td></tr>
+      <tr><td class="dim">Обработано аудио</td><td class="num">${
+        Ч(eff.audio_hours, `${num(eff.audio_hours, 2)} ч`,
+          РАСКРЫТИЕ.звук([], 'Готовые задания: сверху самые длинные записи'))}</td></tr>
+      <tr><td class="dim">Машинное время</td><td class="num">${
+        Ч(eff.compute_hours, `${num(eff.compute_hours, 2)} ч`, { f: [ГОТОВЫЕ, 'nz:processing'],
+          sort: 'processing:desc', value: 'Обработка', fmt: 'dur',
+          title: 'Готовые задания: сверху самые долгие в обработке' })}</td></tr>
       <tr><td class="dim">Машинных часов на час аудио</td><td class="num">${
         eff.compute_per_audio_hour !== null ? num(eff.compute_per_audio_hour, 3) : '—'}</td></tr>
       <tr><td class="dim">Доля времени на загрузку моделей</td><td class="num">${
-        eff.model_load_share !== null ? pct(eff.model_load_share, 1) : '—'}</td></tr>
-      <tr><td class="dim">Попаданий в кеш</td><td class="num">${eff.cache_hits} (${
+        eff.model_load_share !== null
+          ? Ч(eff.model_load_seconds, pct(eff.model_load_share, 1), { f: [ГОТОВЫЕ, 'nz:model_load'],
+              sort: 'model_load:desc', value: 'Загрузка модели, с',
+              title: 'Готовые задания, ждавшие загрузки модели: сверху самые долгие' }) : '—'}</td></tr>
+      <tr><td class="dim">Попаданий в кеш</td><td class="num">${
+        Ч(eff.cache_hits, eff.cache_hits, { f: [ГОТОВЫЕ, 'cached'],
+          title: 'Готовые задания, результат которых взят из кеша' })} (${
         pct(eff.cache_hit_rate, 1)})</td></tr>
       <tr><td class="dim">Сэкономлено кешем</td><td class="num">${
         num(eff.saved_compute_hours, 3)} ч</td></tr></table>
@@ -4760,25 +5492,43 @@ RENDERERS.analytics = {
         Доля времени на загрузку моделей выше 15 % означает, что кеш моделей слишком мал
         либо задания слишком часто чередуют разные модели.</div>`;
 
+    // Строка графика несёт ключ разреза (`key`), а не подпись: подпись
+    // владельца обрезана до тринадцати знаков и отбором служить не может.
     Charts.hbars(qs('#chart-lang'), {
       items: data.languages.slice(0, 8).map((l) => ({
-        label: l.key, value: l.jobs, note: `аудио: ${num(l.audio_hours, 2)} ч` })),
+        label: l.key, value: l.jobs, note: `аудио: ${num(l.audio_hours, 2)} ч`, key: l.key })),
       labelWidth: 90, rowHeight: 24,
+      onPick: (номер, строка) => РАСКРЫТИЕ.открыть(qs('#chart-lang'), Drill.spec(окно, {
+        f: [`language:${Drill.val(строка.key, 'Язык не определён')}`],
+        title: `Задания: ${строка.key === 'Язык не определён' ? 'язык не определён' : `язык ${строка.key}`}` })),
     });
     Charts.hbars(qs('#chart-owner'), {
       items: data.owners.slice(0, 8).map((o2) => ({
         label: o2.key.length > 14 ? o2.key.slice(0, 13) + '…' : o2.key,
-        value: o2.jobs, note: `аудио: ${num(o2.audio_hours, 2)} ч` })),
+        value: o2.jobs, note: `аудио: ${num(o2.audio_hours, 2)} ч`, key: o2.key })),
       labelWidth: 110, rowHeight: 24,
+      onPick: (номер, строка) => РАСКРЫТИЕ.открыть(qs('#chart-owner'), Drill.spec(окно, {
+        f: [`owner:${Drill.val(строка.key, 'аноним')}`],
+        title: `Задания пользователя ${строка.key}` })),
     });
 
+    // Здесь уже список записей, а не число: раскрывать нечего, но раньше из
+    // него некуда было идти — имя файла стояло текстом. Теперь это ссылка на
+    // карточку, той же разметкой, что в списках раскрытия; а «все» под
+    // таблицей продолжает десятку до всего периода.
     qs('#table-slow').innerHTML = data.slowest.length ? `<table>
       <thead><tr><th>Файл</th><th class="num">RTF</th><th class="num">Длит.</th></tr></thead>
       <tbody>${data.slowest.slice(0, 10).map((j) => `<tr>
-        <td class="truncate" style="max-width:150px">${esc(j.filename)}</td>
+        <td class="truncate" style="max-width:150px"><a class="drill-open"
+          href="#/jobs/${encodeURIComponent(j.id)}" data-open="${esc(j.id)}"
+          title="${esc(j.filename || j.id)}">${esc(j.filename || j.id)}</a></td>
         <td class="num">${num(j.rtf, 3)}</td>
         <td class="num">${fmtDur(j.duration_s)}</td></tr>`).join('')}
-      </tbody></table>` : '<div class="empty small">Нет данных</div>';
+      </tbody></table>
+      <div class="small faint" style="margin-top:8px">Дальше по списку: ${
+        Р('все готовые задания по RTF', РАСКРЫТИЕ.rtf([],
+          'Готовые задания по RTF: сверху самые медленные'))}</div>`
+      : '<div class="empty small">Нет данных</div>';
 
     drawExtraAnalytics(data);
   },
@@ -4792,18 +5542,35 @@ RENDERERS.analytics = {
  * прошедшее с первой попытки, от прошедшего с третьей.
  */
 function drawExtraAnalytics(data) {
+  // Раскрытие — как в основной части раздела: окно свода и число-кнопка.
+  // У дрейфа кроме окна периода есть окно базы, поэтому окно можно задать.
+  const окно = data.window;
+  const Р = (разметка, что, своё) => Drill.num(разметка, своё || окно, что);
+  const Ч = (число, разметка, что, своё) => (число ? Р(разметка, что, своё) : разметка);
+  const { ГОТОВЫЕ } = РАСКРЫТИЕ;
+  const модель = (ключ) => `model:${Drill.val(ключ, '—')}`;
+
   const weekly = data.weekly || {};
   if (qs('#chart-weekly') && (weekly.jobs || []).length) {
+    const час = (номер) => String((weekly.hours || [])[номер]).padStart(2, '0');
+    const клетка = (день, номер) => ({
+      f: [`weekday:${день}`, `hour:${(weekly.hours || [])[номер]}`],
+      title: `Задания: ${weekly.days[день]}, с ${час(номер)}:00 до ${час(номер)}:59 по часам сервера` });
     Charts.grid(qs('#chart-weekly'), {
       rows: weekly.days, cols: (weekly.hours || []).map((h) => String(h).padStart(2, '0')),
       values: weekly.jobs, secondary: weekly.audio_hours, secondaryUnit: 'ч аудио',
       emptyText: 'Нет заданий за период',
+      // Клетка с нулём — тоже клетка, но раскрывать в ней нечего.
+      canPick: (день, час, сколько) => сколько > 0,
+      onPick: (день, что) => {
+        РАСКРЫТИЕ.открыть(qs('#chart-weekly'), Drill.spec(окно, клетка(что.row, что.col)));
+      },
     });
     const p = weekly.peak || {};
     if (p.jobs) {
       qs('#chart-weekly').insertAdjacentHTML('beforeend',
         `<div class="small faint" style="margin-top:8px">Пик: ${esc(weekly.days[p.day])}, ${
-          String(p.hour).padStart(2, '0')}:00 — ${p.jobs} заданий. Всего за период: ${
+          String(p.hour).padStart(2, '0')}:00 — ${Р(p.jobs, клетка(p.day, p.hour))} заданий. Всего за период: ${
           num(weekly.total)}.</div>`);
     }
   }
@@ -4811,21 +5578,32 @@ function drawExtraAnalytics(data) {
   const q = data.queue || {};
   if (qs('#queue-body') && q.overall) {
     const строка = (s) => `${num(s.p50, 1)} / ${num(s.p90, 1)} / ${num(s.p95, 1)} / ${num(s.p99, 1)}`;
+    // Ожидание свод берёт у всех заданий, где оно записано, — и нулевое
+    // тоже (`has:`, а не `nz:`): задание из кеша ждало ноль секунд, и это
+    // законное ожидание. Список — по убыванию: сверху тот самый хвост.
+    const ждали = (отборы, заголовок) => ({ f: ['has:wait', ...(отборы || [])],
+      sort: 'wait:desc', value: 'Ожидание, с', title: заголовок });
+    const все = ждали([], 'Задания по ожиданию в очереди: сверху ждавшие дольше всех');
     qs('#queue-body').innerHTML = `
       <div class="grid cols-3" style="margin-bottom:10px">
-        ${kpi('Медиана', `${num(q.overall.p50, 1)} с`, 'половина ждала меньше')}
-        ${kpi('p95', `${num(q.overall.p95, 1)} с`, 'каждое двадцатое — дольше')}
-        ${kpi('Максимум', `${num(q.overall.max, 1)} с`, `дольше минуты: ${q.waited_over_minute}`)}
+        ${kpi('Медиана', Ч(q.overall.count, `${num(q.overall.p50, 1)} с`, все), 'половина ждала меньше')}
+        ${kpi('p95', Ч(q.overall.count, `${num(q.overall.p95, 1)} с`, все), 'каждое двадцатое — дольше')}
+        ${kpi('Максимум', Ч(q.overall.count, `${num(q.overall.max, 1)} с`, все),
+              `дольше минуты: ${Ч(q.waited_over_minute, q.waited_over_minute,
+                ждали(['waited_minute'], 'Задания, ждавшие в очереди дольше минуты'))}`)}
       </div>
       <table><thead><tr><th>Разрез</th><th class="num">Заданий</th>
         <th class="num">p50 / p90 / p95 / p99, с</th></tr></thead><tbody>
       ${(q.by_priority || []).map((r) => `<tr><td>${esc(r.name)}</td>
-        <td class="num">${r.jobs}</td><td class="num mono">${строка(r)}</td></tr>`).join('')}
+        <td class="num">${Р(r.jobs, ждали([`priority_${r.key}`],
+          `Ожидание в очереди, приоритет ${r.name}`))}</td><td class="num mono">${строка(r)}</td></tr>`).join('')}
       ${(q.by_source || []).map((r) => `<tr><td class="dim">источник: ${esc(r.name)}</td>
-        <td class="num">${r.jobs}</td><td class="num mono">${строка(r)}</td></tr>`).join('')}
+        <td class="num">${Р(r.jobs, ждали([`source_api:${r.name}`],
+          `Ожидание в очереди, источник ${r.name}`))}</td><td class="num mono">${строка(r)}</td></tr>`).join('')}
       </tbody></table>
       ${q.waited_over_10_minutes ? `<div class="small faint" style="margin-top:8px">
-        Дольше десяти минут ждали ${q.waited_over_10_minutes} заданий — стоит посмотреть,
+        Дольше десяти минут ждали ${Р(q.waited_over_10_minutes,
+          ждали(['waited_long'], 'Задания, ждавшие в очереди дольше десяти минут'))} заданий — стоит посмотреть,
         не совпадает ли это с пиком на карте нагрузки выше.</div>` : ''}`;
   }
 
@@ -4852,6 +5630,15 @@ function drawExtraAnalytics(data) {
         labels: метки,
         series: [{ name: 'Средняя уверенность', values: уверенность }],
         yMin: Math.max(0, Math.floor(мин - 3)), yMax: 100, unit: ' %',
+        // Ход считает уверенность у всех готовых, где она записана, — и
+        // нулевую тоже (`has:`), в отличие от плитки «Уверенность» вверху.
+        onPick: (номер) => {
+          if (уверенность[номер] === null) return;
+          РАСКРЫТИЕ.открыть(qs('#chart-quality'), Drill.spec(РАСКРЫТИЕ.корзина(qt.edges, номер), {
+            f: [ГОТОВЫЕ, 'has:confidence'], sort: 'confidence:asc', value: 'Уверенность',
+            fmt: 'pct', title: `Готовые задания по уверенности, созданные ${
+              РАСКРЫТИЕ.когда(qt.edges, номер)}` }));
+        },
       });
     } else {
       Charts.empty(qs('#chart-quality'), 'Уверенность за период не считалась');
@@ -4862,13 +5649,31 @@ function drawExtraAnalytics(data) {
       const ряды = [];
       if ((qt.low_confidence_share || []).some((v) => v !== null)) {
         ряды.push({ name: 'Доля заданий с низкой уверенностью',
-                    values: qt.low_confidence_share.map((v) => v === null ? null : v * 100) });
+                    values: qt.low_confidence_share.map((v) => v === null ? null : v * 100),
+                    // Доля «X из N» раскрывается в X: сами неуверенные.
+                    выбор: 'с низкой уверенностью', пусто: (v) => !v,
+                    что: { f: [ГОТОВЫЕ, 'has:confidence', 'low_confidence'], sort: 'confidence:asc',
+                           value: 'Уверенность', fmt: 'pct' },
+                    заголовок: 'Задания с уверенностью ниже 0,75' });
       }
       if ((qt.wer || []).some((v) => v !== null)) {
-        ряды.push({ name: 'WER', values: qt.wer.map((v) => v === null ? null : v * 100) });
+        ряды.push({ name: 'WER', values: qt.wer.map((v) => v === null ? null : v * 100),
+                    выбор: 'с эталоном, по WER', пусто: (v) => v === null,
+                    что: { f: [ГОТОВЫЕ, 'has:wer'], sort: 'wer:desc', value: 'WER', fmt: 'pct' },
+                    заголовок: 'Задания с эталоном по WER' });
       }
       if (ряды.length) {
-        Charts.line(второй, { labels: метки, series: ряды, unit: ' %' });
+        const выбранный = ряды.length > 1
+          ? выборРяда(второй, ряды.map((ряд) => ряд.выбор)) : () => 0;
+        Charts.line(второй, { labels: метки, series: ряды, unit: ' %',
+          onPick: (номер) => {
+            const ряд = ряды[выбранный()];
+            // Пустая точка и нулевая доля — список под ними пуст; а
+            // нулевой WER — нет: это записи, распознанные без ошибок.
+            if (ряд.пусто(ряд.values[номер])) return;
+            РАСКРЫТИЕ.открыть(второй, Drill.spec(РАСКРЫТИЕ.корзина(qt.edges, номер), Object.assign(
+              { title: `${ряд.заголовок}, созданные ${РАСКРЫТИЕ.когда(qt.edges, номер)}` }, ряд.что)));
+          } });
       } else {
         Charts.empty(второй, 'Эталонных текстов за период не задавали — WER не считался');
       }
@@ -4883,31 +5688,53 @@ function drawExtraAnalytics(data) {
         ? 'Признаки считаются с этой версии: у записей периода их ещё нет — они появятся по мере фонового разбора архива'
         : 'За период нет завершённых заданий'}</div>`;
     } else {
+      // Основа всех чисел карточки — готовые задания с сегментами
+      // (`nz:segments`): пустую расшифровку свод не оценивает. «Проверено» —
+      // у кого признаки посчитаны (пустая строка — «проверено, чисто»),
+      // «с признаками» — у кого строка не пуста.
+      const основа = [ГОТОВЫЕ, 'nz:segments'];
+      // Источник здесь без подмены пустого на «api» — свод пишет «—».
+      const группы = [
+        ...(п.by_model || []).map((м) => ({ ...м, подпись: м.key, отбор: модель(м.key) })),
+        ...(п.by_source || []).map((и) => ({ ...и, подпись: `источник: ${и.key}`,
+                                            отбор: `source:${Drill.val(и.key, '—')}` })),
+      ];
+      // Плитки и графики стоят внутри одной карточки: без явного места
+      // список встал бы в самый её низ, под таблицу худших записей.
       тело.innerHTML = `
-        <div class="grid cols-4" style="margin-bottom:12px">
-          ${kpi('Записей с признаками', num(п.flagged),
+        <div data-drill-host><div class="grid cols-4" style="margin-bottom:12px">
+          ${kpi('Записей с признаками', Ч(п.flagged, num(п.flagged),
+                  { f: [...основа, 'flagged'], title: 'Записи с признаками подозрительной расшифровки' }),
                 `${num(п.flagged_share, 1)}% из ${num(п.assessed)} проверенных`)}
-          ${kpi('Подозрительных сегментов', num(п.suspect_segments),
+          ${kpi('Подозрительных сегментов', Ч(п.suspect_segments, num(п.suspect_segments),
+                  { f: [...основа, 'assessed', 'suspect_segments'], sort: 'suspect_count:desc',
+                    value: 'Подозрительных сегментов', fmt: 'int',
+                    title: 'Записи с подозрительными сегментами: сверху те, где их больше' }),
                 `${num(п.suspect_share, 2)}% из ${num(п.segments)}`)}
-          ${kpi('Проверено записей', num(п.assessed),
-                п.jobs > п.assessed ? `ещё ${num(п.jobs - п.assessed)} сделаны до появления признаков` : 'все записи периода')}
+          ${kpi('Проверено записей', Р(num(п.assessed),
+                  { f: [...основа, 'assessed'], title: 'Записи, проверенные на подозрительность' }),
+                п.jobs > п.assessed ? `ещё ${Р(num(п.jobs - п.assessed), { f: [...основа, 'unassessed'],
+                  title: 'Записи, сделанные до появления признаков' })} сделаны до появления признаков` : 'все записи периода')}
           ${kpi('Худшая модель',
                 (п.by_model || []).length && п.by_model[0].suspect_share ? esc(п.by_model[0].key) : '—',
                 (п.by_model || []).length && п.by_model[0].suspect_share
                   ? `${num(п.by_model[0].suspect_share, 2)}% подозрительных сегментов` : 'подозрительных сегментов нет')}
-        </div>
-        <div class="grid cols-2">
+        </div></div>
+        <div data-drill-host data-drill-out><div class="grid cols-2">
           <div><div class="small dim" style="margin-bottom:6px">По признакам, записей</div>
             <div id="chart-suspect-flags"></div></div>
           <div><div class="small dim" style="margin-bottom:6px">По моделям и источникам</div>
             <div class="table-wrap"><table>
               <thead><tr><th>Модель / источник</th><th class="num">Записей</th><th class="num">С признаками</th><th class="num">Сегментов</th></tr></thead>
-              <tbody>${[...(п.by_model || []), ...(п.by_source || []).map((и) => ({ ...и, key: `источник: ${и.key}` }))].map((м) => `<tr><td>${esc(м.key)}</td>
-                <td class="num mono">${num(м.jobs)}</td>
-                <td class="num mono">${м.flagged_share === null ? '—' : num(м.flagged_share, 1) + '%'}</td>
+              <tbody>${группы.map((м) => `<tr><td>${esc(м.подпись)}</td>
+                <td class="num mono">${Р(num(м.jobs), { f: [...основа, 'assessed', м.отбор],
+                  title: `Проверенные записи — ${м.подпись}` })}</td>
+                <td class="num mono">${м.flagged_share === null ? '—'
+                  : Ч(м.flagged, num(м.flagged_share, 1) + '%', { f: [...основа, 'flagged', м.отбор],
+                      title: `Записи с признаками — ${м.подпись}` })}</td>
                 <td class="num mono">${м.suspect_share === null ? '—' : num(м.suspect_share, 2) + '%'}</td></tr>`).join('')}</tbody>
             </table></div></div>
-        </div>
+        </div></div>
         <div class="small dim" style="margin:12px 0 6px">Самые подозрительные записи</div>
         <div class="table-wrap full"><table>
           <thead><tr><th>Файл</th><th>Модель</th><th class="num">Подозрительных сегментов</th><th>Признаки</th><th></th></tr></thead>
@@ -4927,8 +5754,13 @@ function drawExtraAnalytics(data) {
       // виды признаков, а это одно и то же число записей.
       const цвет = Charts.palette()[0];
       Charts.hbars(qs('#chart-suspect-flags'), {
-        items: (п.by_flag || []).map((ф) => ({ label: ф.title, value: ф.jobs, color: цвет })),
+        items: (п.by_flag || []).map((ф) => ({ label: ф.title, value: ф.jobs, color: цвет,
+                                              key: ф.key })),
         labelWidth: 210, emptyText: 'признаков нет',
+        // Запись с двумя признаками стоит в двух строках — и в двух списках.
+        onPick: (номер, строка) => РАСКРЫТИЕ.открыть(qs('#chart-suspect-flags'), Drill.spec(окно, {
+          f: [...основа, `flag:${строка.key}`],
+          title: `Записи с признаком «${строка.label}»` })),
       });
     }
   }
@@ -4939,15 +5771,31 @@ function drawExtraAnalytics(data) {
     const вердикт = (v) => ({ critical: '<span class="chip err">критично</span>',
       warning: '<span class="chip warn">предупреждение</span>', ok: '<span class="chip ok">без дрейфа</span>' }[v]
       || '<span class="chip">мало данных</span>');
+    // Дрейф сравнивает два окна: период (окно отчёта) и четыре недели до
+    // него. Границы базы свод отдаёт без округления (`baseline_window`):
+    // по округлённым до десятой секунды список не сошёлся бы с числом.
+    const базовое = д.baseline_window || null;
+    const срез = (м, отборы, заголовок) => ({
+      f: [ГОТОВЫЕ, 'has:confidence', ...(м.key === 'all' ? [] : [модель(м.key)]), ...(отборы || [])],
+      sort: 'confidence:asc', value: 'Уверенность', fmt: 'pct',
+      title: `${заголовок}${м.key === 'all' ? '' : ` — ${м.key}`}` });
     const строка = (м) => `<tr><td>${м.key === 'all' ? '<b>все модели</b>' : esc(м.key)}</td>
       <td>${вердикт(м.verdict)}</td>
-      <td class="num mono">${num((м.baseline || {}).n)} / ${num((м.current || {}).n)}</td>
+      <td class="num mono">${базовое
+        ? Ч((м.baseline || {}).n, num((м.baseline || {}).n),
+            срез(м, [], 'Задания базы: четыре недели до периода'), базовое)
+        : num((м.baseline || {}).n)} / ${Ч((м.current || {}).n, num((м.current || {}).n),
+          срез(м, [], 'Задания периода с уверенностью'))}</td>
       <td class="num mono">${(м.baseline || {}).p50 === null || (м.baseline || {}).p50 === undefined ? '—' : num(м.baseline.p50, 3)}
         → ${(м.current || {}).p50 === null || (м.current || {}).p50 === undefined ? '—' : num(м.current.p50, 3)}</td>
       <td class="num mono">${м.shift_relative === null || м.shift_relative === undefined ? '—' : (м.shift_relative > 0 ? '+' : '') + num(м.shift_relative * 100, 1) + '%'}</td>
       <td class="num mono">${(м.ks || {}).p === null || (м.ks || {}).p === undefined ? '—' : num(м.ks.p, 3)}</td>
-      <td class="num mono">${м.low_share === null || м.low_share === undefined ? '—' : num(м.low_share, 1) + '%'}${
-        м.low_share_baseline !== null && м.low_share_baseline !== undefined ? ` <span class="faint">/ ${num(м.low_share_baseline, 1)}%</span>` : ''}</td></tr>`;
+      <td class="num mono">${м.low_share === null || м.low_share === undefined ? '—'
+        : Ч(м.low_share, num(м.low_share, 1) + '%',
+            срез(м, ['low_confidence'], 'Задания периода с уверенностью ниже 0,75'))}${
+        м.low_share_baseline !== null && м.low_share_baseline !== undefined
+          ? ` <span class="faint">/ ${Ч(базовое && м.low_share_baseline, num(м.low_share_baseline, 1) + '%',
+              срез(м, ['low_confidence'], 'Задания базы с уверенностью ниже 0,75'), базовое)}</span>` : ''}</td></tr>`;
     const общий = д.overall || {};
     if (!(общий.current || {}).n) {
       тело.innerHTML = '<div class="empty small">За период нет заданий с уверенностью</div>';
@@ -4979,10 +5827,25 @@ function drawExtraAnalytics(data) {
         ${(к.flags || []).length ? `<div class="small dim" style="margin-top:4px">${(к.flags || []).slice(0, 3).map((ф) =>
           `${fmtTime((к.points[ф.index] || {}).ts).slice(0, 5)}: ${num(ф.value, 3)} — ${esc(ф.why)}`).join('; ')}</div>` : ''}
       </div>`).join('');
+      // Точка карты — сутки; раскрывается в задания, из которых сложилось
+      // её значение. У каждой карты свои: уверенность — где она записана,
+      // доля низких — сами низкие, подозрительные сегменты — проверенные
+      // записи с сегментами (сверху те, где доля выше).
+      const чтоРаскрыть = {
+        confidence: { f: [ГОТОВЫЕ, 'has:confidence'], sort: 'confidence:asc',
+                      value: 'Уверенность', fmt: 'pct', подпись: 'Готовые задания по уверенности' },
+        low_confidence_share: { f: [ГОТОВЫЕ, 'has:confidence', 'low_confidence'],
+                                sort: 'confidence:asc', value: 'Уверенность', fmt: 'pct',
+                                подпись: 'Задания с уверенностью ниже 0,75', пустоНоль: true },
+        suspect_share: { f: [ГОТОВЫЕ, 'assessed', 'nz:segments'], sort: 'suspect_pct:desc',
+                         value: 'Подозрительных сегментов, %',
+                         подпись: 'Проверенные записи по доле подозрительных сегментов' },
+      };
       карты.forEach((к) => {
         const точки = к.points || [];
         const пределы = к.limits || {};
         const ряд = (v) => точки.map(() => v);
+        const { подпись, пустоНоль, ...что } = чтоРаскрыть[к.key] || {};
         Charts.line(qs(`#spc-a-${к.key}`), {
           height: 140, labels: точки.map((т) => fmtTime(т.ts).slice(0, 5)),
           series: [
@@ -4994,6 +5857,12 @@ function drawExtraAnalytics(data) {
             ] : []),
           ],
           emptyText: 'нет данных',
+          onPick: !подпись || !(кк.edges || []).length ? undefined : (номер) => {
+            const значение = (точки[номер] || {}).value;
+            if (значение === null || значение === undefined || (пустоНоль && !значение)) return;
+            РАСКРЫТИЕ.открыть(qs(`#spc-a-${к.key}`), Drill.spec(РАСКРЫТИЕ.корзина(кк.edges, номер),
+              Object.assign({ title: `${подпись}, созданные ${РАСКРЫТИЕ.когда(кк.edges, номер)}` }, что)));
+          },
         });
       });
     }
@@ -5004,8 +5873,22 @@ function drawExtraAnalytics(data) {
     const тело = qs('#accuracy-body');
     const общий = т.overall || {};
     const проц = (v, d) => (v === null || v === undefined ? '—' : num(v * 100, d === undefined ? 1 : d) + '%');
-    const строка = (р) => `<tr><td>${esc(String(р.key))}</td>
-      <td class="num">${num(р.jobs)}</td><td class="num${р.enough ? '' : ' faint'}" title="${р.enough ? 'слов эталона достаточно' : 'меньше десяти тысяч слов эталона — около часа речи; число показано, но значит мало'}">${num(р.words)}${р.enough ? '' : ' <span class="faint">†</span>'}</td>
+    // Точность считается по готовым записям, у которых есть WER (`has:`:
+    // нулевой WER — тоже результат). Список — по убыванию WER: сверху те,
+    // из-за кого срез плох.
+    const сЭталоном = (отборы, заголовок) => ({ f: [ГОТОВЫЕ, 'has:wer', ...(отборы || [])],
+      sort: 'wer:desc', value: 'WER', fmt: 'pct', title: заголовок });
+    // Чем строка каждого среза отбирает свои записи. У языка пустое
+    // значение свод пишет «—», у источника пустой считается «api».
+    const срезы = {
+      'Модель': (р) => модель(р.key),
+      'Язык': (р) => `language:${Drill.val(р.key, '—')}`,
+      'Длительность': (р) => `duration:${РАСКРЫТИЕ.диапазон(р.from, р.to)}`,
+      'Источник': (р) => `source_api:${р.key}`,
+    };
+    const строка = (р, заголовок) => `<tr><td>${esc(String(р.key))}</td>
+      <td class="num">${Р(num(р.jobs), сЭталоном([срезы[заголовок](р)],
+        `Записи с эталоном — ${заголовок.toLowerCase()} ${р.key}: сверху с наибольшим WER`))}</td><td class="num${р.enough ? '' : ' faint'}" title="${р.enough ? 'слов эталона достаточно' : 'меньше десяти тысяч слов эталона — около часа речи; число показано, но значит мало'}">${num(р.words)}${р.enough ? '' : ' <span class="faint">†</span>'}</td>
       <td class="num mono">${проц(р.wer)}</td><td class="num mono">${проц(р.mer)}</td>
       <td class="num mono">${проц(р.wil)}</td>
       <td class="num mono">${р.gap === null || р.gap === undefined ? '—' : (р.gap > 0.02 ? '<span class="warn">' : '') + проц(р.gap) + (р.gap > 0.02 ? '</span>' : '')}</td>
@@ -5017,22 +5900,23 @@ function drawExtraAnalytics(data) {
         <th class="num" title="потерянная информация: 1 − H²/(N·M)">WIL</th>
         <th class="num" title="разрыв WER − MER: избыток вставок, то есть галлюцинации">WER − MER</th>
         <th class="num" title="вставок на слово эталона">Вставок</th></tr></thead>
-      <tbody>${строки.map(строка).join('')}</tbody></table></div>` : '';
+      <tbody>${строки.map((р) => строка(р, заголовок)).join('')}</tbody></table></div>` : '';
     if (!общий.jobs) {
       тело.innerHTML = `<div class="empty small">За период нет записей с эталоном.
         Эталон приходит полем reference_text при постановке задания или задаётся в карточке записи —
         по нему считаются WER, MER, WIL и калибровка уверенности.</div>`;
     } else {
-      тело.innerHTML = `<div class="grid cols-4" style="margin-bottom:10px">
-        ${kpi('WER', проц(общий.wer), `${num(общий.jobs)} записей · ${num(общий.words)} слов${общий.enough ? '' : ' · мало слов'}`)}
+      тело.innerHTML = `<div data-drill-host><div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('WER', проц(общий.wer), `${Р(num(общий.jobs), сЭталоном([],
+          'Записи с эталоном: сверху с наибольшим WER'))} записей · ${num(общий.words)} слов${общий.enough ? '' : ' · мало слов'}`)}
         ${kpi('MER', проц(общий.mer), 'ограничен единицей')}
         ${kpi('WIL', проц(общий.wil), 'потерянная информация')}
         ${kpi('Вставок', проц(общий.insertion_share), общий.gap > 0.02 ? 'разрыв WER − MER заметен' : 'разрыв WER − MER мал')}
-      </div>
-      <div class="grid cols-2">
+      </div></div>
+      <div data-drill-host data-drill-out><div class="grid cols-2">
         <div>${таблица('Модель', т.by_model)}${(т.by_language || []).length > 1 ? `<div style="margin-top:8px">${таблица('Язык', т.by_language)}</div>` : ''}</div>
         <div>${таблица('Длительность', т.by_duration)}${(т.by_source || []).length > 1 ? `<div style="margin-top:8px">${таблица('Источник', т.by_source)}</div>` : ''}</div>
-      </div>
+      </div></div>
       ${(т.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Хуже всего</b>: ${т.worst.slice(0, 5).map((з) =>
         `<a href="#" class="link" onclick="window.__asrhub.openJob(${jsArg(з.id)});return false">${esc(з.filename || з.id)}</a> — ${проц(з.wer)}`).join('; ')}</div>` : ''}
       <p class="small faint" style="margin-top:8px">${esc(т.note || '')}${
@@ -5093,18 +5977,27 @@ function drawExtraAnalytics(data) {
       const корзины = (кл.bins || []).filter((к) => к.words);
       const пункты = (v) => (v === null || v === undefined ? '—'
         : Math.abs(v) < 0.0005 ? '0 п.' : (v > 0 ? '+' : '−') + num(Math.abs(v) * 100, 1) + ' п.');
+      // ECE и AUC сложены из слов, а слова — из записей с корзинами
+      // калибровки; в записи они и раскрываются. Диаграмма надёжности —
+      // нет: одна запись даёт слова во все десять её корзин сразу.
+      const откалиброваны = (отборы, заголовок) => ({
+        f: [ГОТОВЫЕ, 'calibrated', ...(отборы || [])], title: заголовок });
       тело.innerHTML = `<div class="grid cols-3" style="margin-bottom:10px">
         ${kpi('ECE', num(кл.ece, 3), кл.ece < 0.05 ? 'уверенности можно верить' : кл.ece < 0.1 ? 'небольшое расхождение' : 'уверенность врёт')}
         ${kpi('Переоценка', пункты(кл.overconfidence), Math.abs(кл.overconfidence) < 0.0005 ? 'обещает ровно столько, сколько даёт' : кл.overconfidence > 0 ? 'обещает больше, чем даёт' : 'скромнее, чем есть')}
         ${kpi('AUC', кл.auc === null || кл.auc === undefined ? '—' : num(кл.auc, 3), 'верные от неверных')}
       </div>
       <div id="chart-calibration"></div>
-      ${(кл.by_model || []).length > 1 ? `<table style="margin-top:8px"><thead><tr><th>Модель</th><th class="num">Слов</th>
+      ${(кл.by_model || []).length > 1 ? `<table style="margin-top:8px"><thead><tr><th>Модель</th>
+        <th class="num">Записей</th><th class="num">Слов</th>
         <th class="num">ECE</th><th class="num">Переоценка</th><th class="num">AUC</th></tr></thead><tbody>
-        ${кл.by_model.map((м) => `<tr><td>${esc(м.key)}</td><td class="num">${num(м.words)}</td>
+        ${кл.by_model.map((м) => `<tr><td>${esc(м.key)}</td>
+          <td class="num">${Ч(м.jobs, num(м.jobs), откалиброваны([модель(м.key)],
+            `Записи с калибровкой — модель ${м.key}`))}</td><td class="num">${num(м.words)}</td>
           <td class="num mono">${num(м.ece, 3)}</td><td class="num mono">${пункты(м.overconfidence)}</td>
           <td class="num mono">${м.auc === null ? '—' : num(м.auc, 3)}</td></tr>`).join('')}</tbody></table>` : ''}
-      <p class="small faint" style="margin-top:8px">${esc(кл.note || '')} Слов: ${num(кл.words)}, записей: ${num(кл.jobs)}${
+      <p class="small faint" style="margin-top:8px">${esc(кл.note || '')} Слов: ${num(кл.words)}, записей: ${
+        Ч(кл.jobs, num(кл.jobs), откалиброваны([], 'Записи, по которым посчитана калибровка'))}${
         (кл.sources || {}).word && (кл.sources || {}).segment ? `; уверенность по словам у ${num(кл.sources.word)} записей, по сегментам у ${num(кл.sources.segment)}`
         : (кл.sources || {}).word ? '; уверенность по словам' : '; уверенность по сегментам'}.</p>`;
       Charts.line(qs('#chart-calibration'), {
@@ -5122,7 +6015,19 @@ function drawExtraAnalytics(data) {
   if (qs('#latency-body')) {
     const тело = qs('#latency-body');
     const общий = лт.overall || {};
-    const строка = (р) => `<tr><td>${esc(String(р.key))}</td><td class="num">${num(р.jobs)}</td>
+    // Латентность считается по готовым заданиям, которые сервер считал
+    // сам (не из кеша) и у которых записано время обработки. Список — по
+    // убыванию этого времени: p95 и p99 — это его верх.
+    const свои = [ГОТОВЫЕ, 'computed', 'has:processing'];
+    const поВремени = (отборы, заголовок) => ({ f: [...свои, ...(отборы || [])],
+      sort: 'processing:desc', value: 'Обработка', fmt: 'dur', title: заголовок });
+    const срезы = {
+      'Модель': (р) => модель(р.key),
+      'Длительность': (р) => `duration:${РАСКРЫТИЕ.диапазон(р.from, р.to)}`,
+    };
+    const строка = (р, заголовок) => `<tr><td>${esc(String(р.key))}</td><td class="num">${
+      Р(num(р.jobs), поВремени([срезы[заголовок](р)],
+        `Задания, посчитанные сервером, — ${заголовок.toLowerCase()} ${р.key}: сверху самые долгие`))}</td>
       <td class="num mono">${num(р.processing_p50, 1)} / ${num(р.processing_p95, 1)} / ${num(р.processing_p99, 1)}</td>
       <td class="num mono">${р.rtf_p50 === null ? '—' : num(р.rtf_p50, 3)} / ${р.rtf_p95 === null ? '—' : num(р.rtf_p95, 3)}</td>
       <td class="num mono">${р.queue_p95 === null || р.queue_p95 === undefined ? '—' : num(р.queue_p95, 1)}</td></tr>`;
@@ -5133,14 +6038,19 @@ function drawExtraAnalytics(data) {
         <th class="num" title="время обработки: p50 / p95 / p99, с">Обработка, с</th>
         <th class="num" title="RTF: p50 / p95">RTF</th>
         <th class="num" title="ожидание в очереди, p95, с">Очередь p95</th></tr></thead>
-      <tbody>${строки.map(строка).join('')}</tbody></table></div>` : '';
+      <tbody>${строки.map((р) => строка(р, заголовок)).join('')}</tbody></table></div>` : '';
     const поток = лт.stream || {};
     if (!общий.jobs && !поток.sessions) {
       тело.innerHTML = '<div class="empty small">За период нет заданий, посчитанных сервером самим</div>';
     } else {
       тело.innerHTML = `<div class="grid cols-3" style="margin-bottom:10px">
-        ${kpi('Обработка p95', общий.processing_p95 === null || общий.processing_p95 === undefined ? '—' : fmtDur(общий.processing_p95), `p50 ${fmtDur(общий.processing_p50 || 0)} · p99 ${fmtDur(общий.processing_p99 || 0)}`)}
-        ${kpi('RTF p95', общий.rtf_p95 === null || общий.rtf_p95 === undefined ? '—' : num(общий.rtf_p95, 3), `p50 ${общий.rtf_p50 === null || общий.rtf_p50 === undefined ? '—' : num(общий.rtf_p50, 3)}`)}
+        ${kpi('Обработка p95', общий.processing_p95 === null || общий.processing_p95 === undefined ? '—'
+            : Р(fmtDur(общий.processing_p95), поВремени([], 'Задания, посчитанные сервером: сверху самые долгие')),
+          `p50 ${fmtDur(общий.processing_p50 || 0)} · p99 ${fmtDur(общий.processing_p99 || 0)}`)}
+        ${kpi('RTF p95', общий.rtf_p95 === null || общий.rtf_p95 === undefined ? '—'
+            : Р(num(общий.rtf_p95, 3), { f: [...свои, 'nz:rtf'], sort: 'rtf:desc', value: 'RTF',
+                title: 'Задания, посчитанные сервером, по RTF: сверху самые медленные' }),
+          `p50 ${общий.rtf_p50 === null || общий.rtf_p50 === undefined ? '—' : num(общий.rtf_p50, 3)}`)}
         ${kpi('Поток: первый текст', поток.first_text_p95 === null || поток.first_text_p95 === undefined ? '—' : `${num(поток.first_text_p95, 1)} с`,
               поток.sessions ? `p95 · p50 ${num(поток.first_text_p50, 1)} с · сессий ${num(поток.sessions)}` : 'сессий не было')}
       </div>
@@ -5156,22 +6066,37 @@ function drawExtraAnalytics(data) {
 
   const r = data.reliability || {};
   if (qs('#reliability-body') && r.total !== undefined) {
+    // «С повторами» — любые задания, где повтор был; «дошло со второй» —
+    // только готовые из них. Список с повторами идёт по их числу: сумма
+    // этого столбца и есть «повторов всего».
+    const сПовторами = (отборы, заголовок) => ({ f: [...(отборы || []), 'retried'],
+      sort: 'retries:desc', value: 'Повторов', fmt: 'int', title: заголовок });
     qs('#reliability-body').innerHTML = `<table>
-      <tr><td class="dim">Заданий всего</td><td class="num">${num(r.total)}</td></tr>
+      <tr><td class="dim">Заданий всего</td><td class="num">${
+        Ч(r.total, num(r.total), { title: 'Задания за период' })}</td></tr>
       <tr><td class="dim">Прошло с первой попытки</td><td class="num">${
-        num(r.first_attempt_success)}${r.first_attempt_rate !== null
+        Ч(r.first_attempt_success, num(r.first_attempt_success), { f: [ГОТОВЫЕ, 'first_try'],
+          title: 'Готовые задания, прошедшие с первой попытки' })}${r.first_attempt_rate !== null
           ? ` (${pct(r.first_attempt_rate, 1)})` : ''}</td></tr>
       <tr><td class="dim">Дошло со второй и далее</td><td class="num">${
-        num(r.completed_after_retry)}</td></tr>
+        Ч(r.completed_after_retry, num(r.completed_after_retry),
+          сПовторами([ГОТОВЫЕ], 'Готовые задания, дошедшие не с первой попытки'))}</td></tr>
       <tr><td class="dim">Заданий с повторами</td><td class="num">${
-        num(r.jobs_with_retries)}</td></tr>
-      <tr><td class="dim">Повторов всего</td><td class="num">${num(r.retry_total)}</td></tr>
-      <tr><td class="dim">Отменено</td><td class="num">${num(r.cancelled)}</td></tr>
+        Ч(r.jobs_with_retries, num(r.jobs_with_retries),
+          сПовторами([], 'Задания с повторами: сверху те, что повторялись чаще'))}</td></tr>
+      <tr><td class="dim">Повторов всего</td><td class="num">${
+        Ч(r.retry_total, num(r.retry_total),
+          сПовторами([], 'Откуда взялись повторы: задания по числу повторов'))}</td></tr>
+      <tr><td class="dim">Отменено</td><td class="num">${
+        Ч(r.cancelled, num(r.cancelled), { f: ['status:cancelled'], title: 'Отменённые задания' })}</td></tr>
       </table>
       ${(r.cancelled_by || []).length ? `<div class="small faint" style="margin-top:8px">
-        Кто отменял: ${r.cancelled_by.map((c) => `${esc(c.who)} — ${c.jobs}`).join(', ')}</div>` : ''}
+        Кто отменял: ${r.cancelled_by.map((c) => `${esc(c.who)} — ${Р(c.jobs,
+          { f: ['status:cancelled', `cancelled_by:${Drill.val(c.who, 'неизвестно')}`],
+            title: `Отменённые задания — отменил ${c.who}` })}`).join(', ')}</div>` : ''}
       ${(r.webhooks || []).length ? `<div class="small faint" style="margin-top:6px">
-        Уведомления: ${r.webhooks.map((w) => `${esc(w.status)} — ${w.jobs}`).join(', ')}</div>` : ''}
+        Уведомления: ${r.webhooks.map((w) => `${esc(w.status)} — ${Р(w.jobs,
+          { f: [`webhook:${w.status}`], title: `Задания с уведомлением «${w.status}»` })}`).join(', ')}</div>` : ''}
       <div class="small faint" style="margin-top:8px">«Прошло с первой попытки» отличается от
         доли успеха: задание, дошедшее с третьего раза, для доли успеха такое же, как
         безупречное, — а для состояния сервера это разные вещи.</div>`;
@@ -5181,15 +6106,21 @@ function drawExtraAnalytics(data) {
   if (qs('#cache-body') && c.hits !== undefined) {
     qs('#cache-body').innerHTML = `
       <div class="grid cols-3" style="margin-bottom:10px">
-        ${kpi('Повторов', num(c.hits), c.hit_rate !== null ? `доля: ${pct(c.hit_rate, 1)}` : '')}
-        ${kpi('Сэкономлено аудио', `${num(c.audio_hours_saved, 2)} ч`, 'не считалось заново')}
+        ${kpi('Повторов', Ч(c.hits, num(c.hits), { f: ['cached'],
+                title: 'Задания, результат которых взят из кеша' }),
+              c.hit_rate !== null ? `доля: ${pct(c.hit_rate, 1)}` : '')}
+        ${kpi('Сэкономлено аудио', Ч(c.audio_hours_saved, `${num(c.audio_hours_saved, 2)} ч`,
+                { f: ['cached', 'nz:duration'], sort: 'duration:desc', value: 'Длительность',
+                  fmt: 'dur', title: 'Повторы: сверху самые длинные записи' }),
+              'не считалось заново')}
         ${kpi('Машинного времени', `${num(c.processing_seconds_saved / 3600, 2)} ч`,
               c.assumed_rtf ? `по RTF ${num(c.assumed_rtf, 3)}` : '')}
       </div>
       ${(c.repeats || []).length ? `<table><thead><tr><th>Файл</th>
         <th class="num">Повторов</th><th class="num">Аудио, ч</th></tr></thead><tbody>
       ${c.repeats.map((x) => `<tr><td class="truncate" style="max-width:200px">${
-        esc(x.filename || '—')}</td><td class="num">${x.hits}</td>
+        esc(x.filename || '—')}</td><td class="num">${x.key ? Р(x.hits,
+          { f: ['cached', `same_file:${x.key}`], title: `Повторы файла ${x.filename || '—'}` }) : x.hits}</td>
         <td class="num">${num(x.audio_hours, 2)}</td></tr>`).join('')}</tbody></table>
       <div class="small faint" style="margin-top:8px">Один и тот же файл, приходящий десятки раз,
         обычно означает не бережливость, а ошибку в очереди на стороне клиента.</div>`
@@ -5199,54 +6130,114 @@ function drawExtraAnalytics(data) {
   const a = data.audio || {};
   if (qs('#audio-body') && a.formats) {
     const s = a.speech_rate_wpm || {};
+    // Темп, битрейт и плотность реплик свод считает по готовым записям
+    // длиннее секунды, у которых есть слова, размер или сегменты. Список
+    // идёт по самой величине записи — той, что усреднена в плитке.
+    const длинные = [ГОТОВЫЕ, 'longer_second'];
+    // Профиль звука есть не у всех: всё про шум и громкость — по записям,
+    // где он измерен (`has:snr`); сверху списка — самые шумные.
+    const измерены = (отборы, заголовок) => ({ f: [ГОТОВЫЕ, 'has:snr', ...(отборы || [])],
+      sort: 'snr:asc', value: 'Речь к шуму, дБ', title: заголовок });
+    // Карточка одна на всю ширину и длинная: у плиток и строк с числами —
+    // своё место для списка (`data-drill-host`), иначе он встал бы в самый
+    // её низ, за два экрана от числа, по которому щёлкнули.
+    // Таблицы — в обёртках с прокруткой: карточка шириной в экран телефона,
+    // а шесть числовых столбцов без обёртки раздвигали всю страницу вбок.
+    // Правило для таблиц без обёртки сюда не доставало: таблицы лежат
+    // глубже, чем прямо в теле карточки.
     qs('#audio-body').innerHTML = `
-      <div class="grid cols-3" style="margin-bottom:10px">
-        ${kpi('Темп речи', s.count ? `${num(s.avg, 0)} сл/мин` : '—',
+      <div data-drill-host><div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Темп речи', s.count ? Р(`${num(s.avg, 0)} сл/мин`, { f: [...длинные, 'nz:words'],
+                sort: 'speech_rate:desc', value: 'Слов в минуту', fmt: 'int',
+                title: 'Готовые записи по темпу речи: сверху самые быстрые' }) : '—',
               s.count ? `p50 ${num(s.p50, 0)} · p95 ${num(s.p95, 0)}` : '')}
-        ${kpi('Битрейт', (a.bitrate_kbps || {}).count ? `${num(a.bitrate_kbps.avg, 0)} кбит/с` : '—',
+        ${kpi('Битрейт', (a.bitrate_kbps || {}).count
+                ? Р(`${num(a.bitrate_kbps.avg, 0)} кбит/с`, { f: [...длинные, 'nz:size'],
+                    sort: 'bitrate:asc', value: 'Битрейт, кбит/с', fmt: 'int',
+                    title: 'Готовые записи по битрейту: сверху самые сжатые' }) : '—',
               'средний по записям')}
         ${kpi('Реплик в минуту', (a.segments_per_minute || {}).count
-              ? num(a.segments_per_minute.avg, 1) : '—', 'плотность разговора')}
-      </div>
-      ${a.formats.length ? `<table><thead><tr><th>Формат</th><th class="num">Файлов</th>
+              ? Р(num(a.segments_per_minute.avg, 1), { f: [...длинные, 'nz:segments'],
+                  sort: 'segment_rate:desc', value: 'Реплик в минуту',
+                  title: 'Готовые записи по плотности реплик: сверху самые плотные' })
+              : '—', 'плотность разговора')}
+      </div></div>
+      ${a.formats.length ? `<div class="table-wrap full"><table><thead><tr><th>Формат</th><th class="num">Файлов</th>
         <th class="num">Аудио, ч</th><th class="num">Средний размер</th></tr></thead><tbody>
       ${a.formats.map((f) => `<tr><td class="mono">${esc(f.format)}</td>
-        <td class="num">${f.jobs}</td><td class="num">${num(f.audio_hours, 2)}</td>
-        <td class="num">${num(f.avg_mb, 1)} МБ</td></tr>`).join('')}</tbody></table>` : ''}
-      ${(a.speakers || []).length ? `<div class="small faint" style="margin-top:8px">
-        Говорящих в записи: ${a.speakers.map((x) => `${x.speakers} — ${x.jobs}`).join(', ')}</div>` : ''}
+        <td class="num">${Р(f.jobs, {
+          f: [ГОТОВЫЕ, f.format === 'без расширения' ? 'no_format' : `format:${f.format}`],
+          title: f.format === 'без расширения' ? 'Готовые записи без расширения в имени файла'
+            : `Готовые записи формата ${f.format}` })}</td><td class="num">${num(f.audio_hours, 2)}</td>
+        <td class="num">${num(f.avg_mb, 1)} МБ</td></tr>`).join('')}</tbody></table></div>` : ''}
+      ${(a.speakers || []).length ? `<div data-drill-host><div class="small faint" style="margin-top:8px">
+        Говорящих в записи: ${a.speakers.map((x) => `${x.speakers} — ${Р(x.jobs,
+          { f: [ГОТОВЫЕ, `speakers:${x.speakers}`],
+            title: `Готовые записи, где говорящих: ${x.speakers}` })}`).join(', ')}</div></div>` : ''}
       ${a.measured_jobs ? `<div style="margin-top:12px">
-        <div class="grid cols-4" style="margin-bottom:10px">
-          ${kpi('Речь к шуму', `${num((a.snr_db || {}).p50, 0)} дБ`, `p10 ${num((a.snr_db || {}).p10, 0)} · p90 ${num((a.snr_db || {}).p90, 0)} дБ`)}
-          ${kpi('Плохой звук', a.bad_audio_share === null ? '—' : pct(a.bad_audio_share, 0),
-                `шумных ${num(a.noisy_jobs)}, с клиппингом ${num(a.clipped_jobs)} из ${num(a.measured_jobs)}`)}
-          ${kpi('Громкость', (a.loudness_lufs || {}).count ? `${num(a.loudness_lufs.p50, 0)} LUFS` : '—',
+        <div data-drill-host><div class="grid cols-4" style="margin-bottom:10px">
+          ${kpi('Речь к шуму', Р(`${num((a.snr_db || {}).p50, 0)} дБ`,
+                  измерены([], 'Записи с измеренным звуком: сверху самые шумные')),
+                `p10 ${num((a.snr_db || {}).p10, 0)} · p90 ${num((a.snr_db || {}).p90, 0)} дБ`)}
+          ${kpi('Плохой звук', a.bad_audio_share === null ? '—'
+                  : Ч(a.bad_audio_jobs, pct(a.bad_audio_share, 0),
+                      измерены(['bad_audio'], 'Записи с плохим звуком: шум ниже 10 дБ или клиппинг')),
+                `шумных ${Ч(a.noisy_jobs, num(a.noisy_jobs),
+                  измерены(['noisy'], 'Шумные записи: речь к шуму ниже 10 дБ'))}, с клиппингом ${
+                  Ч(a.clipped_jobs, num(a.clipped_jobs), { f: [ГОТОВЫЕ, 'has:snr', 'clipped'],
+                    sort: 'clipping:desc', value: 'Клиппинг', fmt: 'pct',
+                    title: 'Записи с клиппингом: сверху те, где его больше' })} из ${
+                  Р(num(a.measured_jobs), измерены([], 'Записи с измеренным звуком: сверху самые шумные'))}`)}
+          ${kpi('Громкость', (a.loudness_lufs || {}).count
+                  ? Р(`${num(a.loudness_lufs.p50, 0)} LUFS`, { f: [ГОТОВЫЕ, 'has:snr', 'has:loudness'],
+                      sort: 'loudness:asc', value: 'Громкость, LUFS',
+                      title: 'Записи по громкости: сверху самые тихие' }) : '—',
                 (a.loudness_lufs || {}).count ? `p10 ${num(a.loudness_lufs.p10, 0)} · p90 ${num(a.loudness_lufs.p90, 0)}` : '')}
-          ${kpi('Тишины', (a.silence_share || {}).count ? pct(a.silence_share.avg, 0) : '—', 'в среднем по записи')}
-        </div>
-        <table><thead><tr><th title="отношение речи к шуму, оценка по кадрам">Речь к шуму</th><th class="num">Записей</th>
+          ${kpi('Тишины', (a.silence_share || {}).count
+                  ? Р(pct(a.silence_share.avg, 0), { f: [ГОТОВЫЕ, 'has:snr', 'has:audio_silence'],
+                      sort: 'audio_silence:desc', value: 'Тишины', fmt: 'pct',
+                      title: 'Записи по доле тишины: сверху самые пустые' }) : '—',
+                'в среднем по записи')}
+        </div></div>
+        <div class="table-wrap full"><table><thead><tr><th title="отношение речи к шуму, оценка по кадрам">Речь к шуму</th><th class="num">Записей</th>
           <th class="num" title="средняя уверенность модели">Уверенность</th>
           <th class="num" title="доля записей с уверенностью ниже 0,75">Низкой</th>
           <th class="num" title="WER по записям с эталоном">WER</th>
           <th class="num" title="средняя доля подозрительных сегментов">Подозр.</th></tr></thead><tbody>
-          ${(a.snr_bands || []).map((б) => `<tr><td>${esc(б.key)}</td><td class="num">${num(б.jobs)}</td>
+          ${(a.snr_bands || []).map((б) => {
+            // Границы корзины — из ответа свода: нижняя входит, верхняя нет.
+            const корзина = [`snr:${РАСКРЫТИЕ.диапазон(б.from, б.to)}`];
+            return `<tr><td>${esc(б.key)}</td><td class="num">${Ч(б.jobs, num(б.jobs),
+              измерены(корзина, `Записи с отношением речи к шуму ${б.key}`))}</td>
             <td class="num mono">${б.confidence_avg === null ? '—' : pct(б.confidence_avg, 1)}</td>
             <td class="num mono">${б.low_confidence_share === null ? '—' : pct(б.low_confidence_share, 0)}</td>
-            <td class="num mono">${б.wer_avg === null ? '—' : pct(б.wer_avg, 1) + `<span class="faint"> (${num(б.wer_jobs)})</span>`}</td>
-            <td class="num mono">${б.suspect_share_avg === null ? '—' : pct(б.suspect_share_avg, 1)}</td></tr>`).join('')}</tbody></table>
-        ${(a.bad_audio_by_source || []).some((и) => и.bad) ? `<div class="small faint" style="margin-top:8px">Плохой звук по источникам: ${
-          a.bad_audio_by_source.filter((и) => и.bad).map((и) => `${esc(и.key)} — ${pct(и.share, 0)} (${num(и.bad)} из ${num(и.jobs)})`).join(', ')}</div>` : ''}
+            <td class="num mono">${б.wer_avg === null ? '—' : pct(б.wer_avg, 1) + `<span class="faint"> (${
+              Р(num(б.wer_jobs), { f: [ГОТОВЫЕ, 'has:snr', ...корзина, 'has:wer'], sort: 'wer:desc',
+                value: 'WER', fmt: 'pct',
+                title: `Записи с эталоном, речь к шуму ${б.key}: сверху с наибольшим WER` })})</span>`}</td>
+            <td class="num mono">${б.suspect_share_avg === null ? '—' : pct(б.suspect_share_avg, 1)}</td></tr>`; }).join('')}</tbody></table></div>
+        ${(a.bad_audio_by_source || []).some((и) => и.bad) ? `<div data-drill-host><div class="small faint" style="margin-top:8px">Плохой звук по источникам: ${
+          a.bad_audio_by_source.filter((и) => и.bad).map((и) => `${esc(и.key)} — ${pct(и.share, 0)} (${
+            Р(num(и.bad), измерены(['bad_audio', `source_api:${и.key}`],
+              `Записи с плохим звуком — источник ${и.key}`))} из ${
+            Р(num(и.jobs), измерены([`source_api:${и.key}`],
+              `Записи с измеренным звуком — источник ${и.key}`))})`).join(', ')}</div></div>` : ''}
         <div class="small faint" style="margin-top:6px">SNR — оценка по кадрам без эталона: громкие кадры считаются речью, тихие — шумом; плохой звук — ниже 10 дБ или клиппинг от 1 % отсчётов (пороги Deepgram). WER при 20 дБ обычно около 3–4 %, при 10 дБ — 15 %, при 5 дБ — за 30 %.</div>
       </div>` : ''}`;
   }
 
   const res = data.resources || {};
   if (qs('#resources-body') && res.devices) {
+    // Память — по готовым заданиям, у которых пик записан и не ноль.
+    // Список идёт по пику: его верхняя строка и есть «Пик» таблицы.
+    const поПамяти = (отборы, заголовок) => ({ f: [ГОТОВЫЕ, 'nz:memory', ...(отборы || [])],
+      sort: 'memory:desc', value: 'Пик памяти, МБ', fmt: 'int', title: заголовок });
     qs('#resources-body').innerHTML = `
       ${res.devices.length ? `<table><thead><tr><th>Устройство</th><th class="num">Заданий</th>
         <th class="num">Аудио, ч</th><th class="num">RTF</th></tr></thead><tbody>
       ${res.devices.map((d) => `<tr><td class="mono">${esc(d.device)}</td>
-        <td class="num">${d.jobs}</td><td class="num">${num(d.audio_hours, 2)}</td>
+        <td class="num">${Р(d.jobs, { f: [ГОТОВЫЕ, `device:${Drill.val(d.device, 'неизвестно')}`],
+          title: `Готовые задания на устройстве ${d.device}` })}</td><td class="num">${num(d.audio_hours, 2)}</td>
         <td class="num">${d.rtf !== null ? num(d.rtf, 3) : '—'}</td></tr>`).join('')}
       </tbody></table>` : ''}
       ${(res.models || []).length ? `<table style="margin-top:10px"><thead><tr><th>Модель</th>
@@ -5254,7 +6245,8 @@ function drawExtraAnalytics(data) {
         </tr></thead><tbody>
       ${res.models.slice(0, 10).map((m) => `<tr><td class="mono truncate"
         style="max-width:180px">${esc(m.model)}</td>
-        <td class="num">${fmtBytes(m.peak_mb * 1024 * 1024)}</td>
+        <td class="num">${Р(fmtBytes(m.peak_mb * 1024 * 1024), поПамяти([модель(m.model)],
+          `Модель ${m.model}: задания по пику памяти`))}</td>
         <td class="num">${fmtBytes(m.p95_mb * 1024 * 1024)}</td>
         <td class="num">${fmtBytes(m.avg_mb * 1024 * 1024)}</td></tr>`).join('')}</tbody></table>
       ${(res.concurrency || []).length > 1 ? `<table style="margin-top:10px"><thead><tr>
@@ -5262,7 +6254,8 @@ function drawExtraAnalytics(data) {
         <th class="num">p95</th><th class="num">Среднее</th></tr></thead><tbody>
       ${res.concurrency.map((c) => `<tr>
         <td>${c.jobs_at_once} ${plural(c.jobs_at_once, 'задание', 'задания', 'заданий')}</td>
-        <td class="num">${c.measurements}</td>
+        <td class="num">${Р(c.measurements, поПамяти([`at_once:${c.jobs_at_once}`],
+          `Задания, шедшие по ${c.jobs_at_once} разом: по пику памяти`))}</td>
         <td class="num">${fmtBytes(c.peak_mb * 1024 * 1024)}</td>
         <td class="num">${fmtBytes(c.p95_mb * 1024 * 1024)}</td>
         <td class="num">${fmtBytes(c.avg_mb * 1024 * 1024)}</td></tr>`).join('')}
@@ -5282,12 +6275,20 @@ function drawExtraAnalytics(data) {
         <th class="num">Ошибок</th><th class="num">Аудио, ч</th>
         <th class="num">Машинное время</th><th class="num">RTF</th>
         <th class="num">Слов</th></tr></thead><tbody>
-      ${tags.map((t) => `<tr><td><b>${esc(t.tag)}</b></td>
-        <td class="num">${t.jobs}</td><td class="num">${t.completed}</td>
-        <td class="num">${t.failed || 0}</td><td class="num">${num(t.audio_hours, 2)}</td>
+      ${tags.map((t) => {
+        // Задание с двумя метками стоит в двух строках; строка «без метки»
+        // — это задания, у которых меток нет вовсе, а не метка с таким именем.
+        const метка = t.tag === 'без метки' ? 'untagged' : `tag:${t.tag}`;
+        const подпись = t.tag === 'без метки' ? 'без метки' : `с меткой «${t.tag}»`;
+        return `<tr><td><b>${esc(t.tag)}</b></td>
+        <td class="num">${Р(t.jobs, { f: [метка], title: `Задания ${подпись}` })}</td>
+        <td class="num">${Ч(t.completed, t.completed, { f: [метка, ГОТОВЫЕ],
+          title: `Готовые задания ${подпись}` })}</td>
+        <td class="num">${Ч(t.failed, t.failed || 0, { f: [метка, 'status:failed'],
+          title: `Задания с ошибкой ${подпись}` })}</td><td class="num">${num(t.audio_hours, 2)}</td>
         <td class="num">${fmtDur(t.processing_s)}</td>
         <td class="num">${t.rtf !== null ? num(t.rtf, 3) : '—'}</td>
-        <td class="num">${num(t.words)}</td></tr>`).join('')}</tbody></table>`
+        <td class="num">${num(t.words)}</td></tr>`; }).join('')}</tbody></table>`
       : '<div class="empty small">Метки заданиям не присваивались</div>';
   }
 }
@@ -5341,11 +6342,14 @@ const ОТБОР_В_РЕЗУЛЬТАТЫ = {
  * же видом, что и остальные карточки раздела. Пусто показывается прочерком,
  * а не нулём: «не считали» и «ноль» — разные утверждения, и для стресса
  * второе значит «спокойно», то есть прямо противоположное первому. */
-function пкпи(имя, сейчас, раньше, ключ, знаков, признак) {
+function пкпи(имя, сейчас, раньше, ключ, знаков, признак, раскрыть) {
   const значение = сейчас[ключ];
   const есть = значение !== null && значение !== undefined;
   const единица = (признак || {}).unit || '';
-  return kpi(имя, есть ? num(значение, знаков) : '—',
+  // Среднее раскрывается в записи, по которым оно посчитано; прочерк — нет:
+  // «не считали» раскрывать не во что.
+  const число = есть ? num(значение, знаков) : '—';
+  return kpi(имя, есть && раскрыть ? раскрыть(число, признак) : число,
              `${esc(единица)}${(признак || {}).hint
                ? `<span class="hint" title="${esc(признак.hint)}"> ⓘ</span>` : ''}`
              + delta(значение, (раньше || {})[ключ], признак));
@@ -5354,16 +6358,20 @@ function пкпи(имя, сейчас, раньше, ключ, знаков, п
 /* Полоса «сколько из скольких» с долей. Доля и знаменатель рядом с числом
  * обязательны: «42 записи» не говорит ничего, пока не сказано, из скольких,
  * а показатель считается не по всякой записи. */
-function полоса(имя, сколько, из, вид) {
+function полоса(имя, сколько, из, вид, раскрыть) {
   const всего = Number(из || 0);
   const часть = Number(сколько || 0);
   const доля = всего > 0 ? (часть / всего) * 100 : null;
   const цвет = вид === 'ok' ? 'var(--ok)' : доля >= 25 ? 'var(--warn)' : 'var(--accent)';
+  // `раскрыть` — `{часть, целое}`: чем обернуть числитель и знаменатель,
+  // чтобы они раскрывались в записи. Ноль не оборачивается.
+  const обернуть = (как, сколько_, разметка) => (как && сколько_ ? как(разметка) : разметка);
   return `<div style="margin-bottom:10px">
     <div class="row small" style="gap:8px">
       <span>${esc(имя)}</span><span class="spacer"></span>
       <b>${доля === null ? '—' : `${num(доля, 1)} %`}</b>
-      <span class="dim">${num(часть, 0)} из ${num(всего, 0)}</span>
+      <span class="dim">${обернуть((раскрыть || {}).часть, часть, num(часть, 0))} из ${
+        обернуть((раскрыть || {}).целое, всего, num(всего, 0))}</span>
     </div>
     <div style="height:6px;border-radius:3px;background:var(--border-soft);margin-top:4px">
       <div style="height:6px;border-radius:3px;width:${Math.max(0, Math.min(100, доля || 0))}%;
@@ -5379,6 +6387,106 @@ const ЭМОЦИЯ_РАЗРЕЗЫ = [
   ['category', 'По категориям'], ['direction', 'По направлению'],
   ['hour', 'По часам'], ['weekday', 'По дням недели'], ['owner', 'По владельцу'],
 ];
+
+/* Раскрытие чисел разбора в список записей — для вкладок «Свод», «Эмоции»,
+ * «Понятность», «NPS» и «Категории».
+ *
+ * Числа этих вкладок посчитаны по разобранным записям окна (основа списка
+ * `content`), и окно у каждого ответа своё: вкладка собирается из нескольких
+ * запросов — свод, ряд по времени, разрез, — и границы их расходятся на
+ * миллисекунды. Поэтому помощник заводится на ответ:
+ * `раскрытиеРазбора(ответ.window)`, и число раскрывается окном того ответа,
+ * из которого оно взято.
+ *
+ * `Р(разметка, что, сколько)` — число-кнопка; `Р.под(узел, что, окно)` —
+ * список под графиком, окном корзины или точки. Кнопкой не становятся:
+ *   - ноль и прочерк (`сколько` передан и пуст) — за ними нет записей;
+ *   - число без описания (`что` пусто) — сервер не знает, чем его раскрыть;
+ *   - число из ответа без окна: список «за период до сейчас» разошёлся бы с
+ *     числом, а молча неверный список хуже, чем никакого.
+ */
+function раскрытиеРазбора(окно, основа) {
+  const есть = Boolean(окно) && typeof окно === 'object';
+  const описание = (что) => Object.assign({ base: основа || 'content' }, что);
+  const Р = (разметка, что, сколько) => {
+    if (!есть || !что) return разметка;
+    if (сколько !== undefined && !Number(сколько)) return разметка;
+    return Drill.num(разметка, окно, описание(что));
+  };
+  Р.есть = есть;
+  Р.под = (узел, что, своё) => {
+    // Третий довод — окно корзины. Передан, но пуст (сервер границ не
+    // прислал) — не раскрываем: окно всего ответа под точкой ряда показало
+    // бы весь период вместо её корзины.
+    const границы = своё === undefined ? (есть ? окно : null) : своё;
+    if (!узел || !что || !границы) return null;
+    const готовое = Drill.spec(границы, описание(что));
+    Drill.open(узел, готовое);
+    return готовое;
+  };
+  return Р;
+}
+
+/* Чем раскрыть показатель свода. Отбор и порядок прислал сервер (`drill` у
+ * признака): что стоит за показателем — среднее по измеренным записям,
+ * сумма или доля, — знает он, и копии соответствий в интерфейсе нет.
+ * `значение` — само число показателя: у суммы и доли ноль значит «записей
+ * нет», и раскрывать нечего. */
+function показательЧто(признак, значение, ещё) {
+  const чем = (признак || {}).drill;
+  if (!чем || значение === null || значение === undefined) return null;
+  if (чем.zero_is_empty && !Number(значение)) return null;
+  return Object.assign({ f: чем.f, sort: чем.sort, value: чем.value || признак.title,
+                         title: `${признак.title}: записи, по которым посчитано` }, ещё || {});
+}
+
+/* Отбор списка по группе разреза: ключ группы свода → отбор `GET /api/drill`.
+ * Пустую группу свод подписывает «—», а в базе там пусто; дни недели свод
+ * считает от воскресенья (`%w`), отбор списка — от понедельника. Разрез,
+ * которого здесь нет, не раскрывается. */
+function отборГруппыРазбора(разрез, ключ) {
+  switch (разрез) {
+    case 'agent': case 'queue': case 'station': case 'direction':
+    case 'owner': case 'speaker':
+      return [`${разрез}:${Drill.val(ключ, '—')}`];
+    case 'category': return [`category:${ключ}`];
+    case 'hour': return Number.isInteger(Number(ключ)) ? [`hour:${Number(ключ)}`] : null;
+    case 'weekday':
+      return Number.isInteger(Number(ключ)) ? [`weekday:${(Number(ключ) + 6) % 7}`] : null;
+    default: return null;
+  }
+}
+
+/* Счётчики, которые стоят сразу на нескольких вкладках, — одним описанием.
+ *
+ * Порядок здесь по времени, и это выбор, а не недосмотр. Список «по
+ * величине» серверу приходится собирать, прочитав все записи окна, — так
+ * раскрываются средние, где порядок и есть ответ («кто тянет показатель»).
+ * У счётчика «записей с признаком» величина — единица-двойка на запись, и
+ * платить за неё полным проходом окна незачем: по времени первая страница
+ * находится сразу, сколько бы записей ни было в архиве. */
+const РАЗДРАЖЁН = { f: ['frustrated'], title: 'Разговоры, где клиент раздражён' };
+const ПОВТОРНЫЕ = { f: ['repeat'], title: 'Повторные обращения' };
+
+/** Окно корзины ряда или точки карты — границы прислал сервер, точные. */
+function окноКорзины(т) {
+  return т && т.since !== undefined && т.until !== undefined
+    ? { since: т.since, until: т.until } : null;
+}
+
+/** «с … по …» для заголовка списка под точкой ряда. */
+function периодКорзины(т) {
+  return `${fmtTime(т.since)} — ${fmtTime(т.until)}`;
+}
+
+/* Сворачивает список, раскрытый из графика, когда сам график перерисован
+ * под другой разрез: строки под ним были бы уже про другое. Повторный
+ * `Drill.open` с тем же описанием и есть «свернуть». */
+function свернутьРаскрытие(узел, описание) {
+  if (!узел || !описание) return;
+  const ключ = JSON.stringify(описание);
+  if (qsa('.drill-panel').some((п) => п.dataset.key === ключ)) Drill.open(узел, описание);
+}
 
 const CONTENT_TABS = [
   { key: 'summary',    title: 'Свод' },
@@ -5440,10 +6548,11 @@ function g_роль(кто, стороны) {
   return кто === (стороны || {}).customer ? ' <span class="faint small">клиент</span>' : '';
 }
 
-/** Полоска долей: отрицательные / нейтральные / положительные. */
-function toneBar(host, свод) {
+/** Полоска долей: отрицательные / нейтральные / положительные.
+ *  `выбрать(имя)` — раскрыть долю в записи; имя — как у отбора списка. */
+function toneBar(host, свод, выбрать) {
   const s = window.Charts.status();
-  window.Charts.stacked(host, {
+  window.Charts.stacked(host, Object.assign({
     height: 26,
     parts: [
       { label: 'отрицательные', value: свод.negative || 0, color: s.err },
@@ -5451,7 +6560,7 @@ function toneBar(host, свод) {
       { label: 'положительные', value: свод.positive || 0, color: s.ok },
     ],
     emptyText: 'нет оценённых записей',
-  });
+  }, выбрать ? { onPick: (номер) => выбрать(['negative', 'neutral', 'positive'][номер]) } : {}));
 }
 
 /** Изменение показателя к прошлому периоду — со знаком и направлением. */
@@ -5575,7 +6684,8 @@ RENDERERS.trends = {
     if (!host.isConnected) return;
     // Соседние карточки наполняет сам draw(): он пересоздаёт их разметку,
     // и звать их отсюда значило бы делать по два запроса на каждый заход.
-    this.draw();
+    // Данные новые — и окно новое: раскрытые списки были про прежнее.
+    this.draw(true);
   },
 
   /* Сглаживание и приведение к общей шкале — в интерфейсе, а не на сервере:
@@ -5621,10 +6731,33 @@ RENDERERS.trends = {
     return ряд;
   },
 
-  draw() {
+  /* Раскрытие числа в записи: границы корзины ряда — из ответа свода, а не
+   * от «сейчас». Корзина i — это [buckets[i], buckets[i] + step_s),
+   * последняя обрезана концом окна: при шаге, не делящем период нацело
+   * (год по неделям), она неполная. */
+  корзина(д, i) {
+    const начало = д.buckets[i];
+    return { since: начало, until: Math.min(начало + д.step_s, д.window.until) };
+  },
+
+  /* Что спросить у списка под числом показателя: отбор, порядок и столбец
+   * величины приходят в своде рядом с показателем (`drill`) — тем же
+   * условием, по которому он посчитан; здесь добавляется только «где». */
+  список(показатель, где) {
+    return Object.assign({}, показатель.drill, { title: `${показатель.drill.title} · ${где}` });
+  },
+
+  /* `свежие` — данные только что загружены: окно новое, и раскрытые списки
+   * были про прежнее. Во всех остальных случаях (галочка показателя, поиск,
+   * шкала, сглаживание) данные те же, а разметка пересобирается целиком —
+   * и список, который человек раскрыл и читает, исчезал бы от галочки в
+   * соседней строке. `Drill.keep` переносит панели через перерисовку. */
+  draw(свежие) {
     const host = qs('#trends-body');
     const д = state.trendsData;
     if (!host || !д) return;
+    if (свежие) state.trendsPick = null;
+    const вернуть = свежие ? null : Drill.keep(host);
     const поиск = (state.trendsSearch || '').toLowerCase();
     const все = д.summary || [];
     const выбраны = state.trendsSelected.filter((и) => все.some((с) => с.id === и));
@@ -5646,6 +6779,7 @@ RENDERERS.trends = {
           <span class="chip">${num(выбраны.length)} из ${num(все.length)}</span></div>
         <div id="tr-main"></div>
         <div id="tr-legend" class="row wrap" style="gap:10px"></div>
+        <div id="tr-pick" class="row wrap small" style="gap:4px 14px;margin-top:8px"></div>
         ${выбраны.length ? '' : '<div class="empty small">Отметьте показатели ниже — они появятся здесь.</div>'}
       </section>
 
@@ -5670,9 +6804,12 @@ RENDERERS.trends = {
 
       <section class="card">
         <div class="card-head"><h3>Все показатели за период</h3>
-          <span class="hint">среднее по корзинам, крайние значения и изменение к прошлому периоду</span></div>
+          <span class="hint">среднее по корзинам, крайние значения и изменение к прошлому периоду;
+            «Записей» — сколько записей стоит за показателем, число раскрывается списком</span></div>
         <div class="table-wrap full"><table><thead><tr>
-          <th></th><th>Показатель</th><th>Группа</th><th class="num">Среднее</th>
+          <th></th><th>Показатель</th><th>Группа</th>
+          <th class="num" title="Записи, из которых показатель сложился за период: знаменатель среднего, числитель доли, слагаемые суммы">Записей</th>
+          <th class="num">Среднее</th>
           <th class="num">Минимум</th><th class="num">Максимум</th><th class="num">Последнее</th>
           <th class="num">Изменение</th><th>Куда идёт</th></tr></thead><tbody id="tr-table"></tbody></table></div>
       </section>`;
@@ -5689,7 +6826,13 @@ RENDERERS.trends = {
       // рисует 220 пикселей по умолчанию и не растягивается под контейнер,
       // поэтому «height:300px» на обёртке давал не большой график, а
       // прежний график и восемьдесят пикселей пустоты под ним.
-      window.Charts.line(место, { series: серии, labels: метки, tip: true, height: 300 });
+      // Точка ряда раскрывается в записи своей корзины. Если на графике
+      // одно железо — раскрывать нечего, и подсказка щелчка не обещает.
+      const естьЗаписи = выбраны.some((и) => (ряды.get(и) || {}).drill);
+      window.Charts.line(место, Object.assign(
+        { series: серии, labels: метки, tip: true, height: 300 },
+        естьЗаписи ? { onPick: (номер) => this.pick(номер),
+                       pickHint: 'щелчок — записи за этой точкой' } : {}));
       // Своей легенды здесь нет: Charts.line рисует её сам для двух рядов и
       // больше. Вторая — та, что стояла тут раньше, — просто дублировала
       // первую под графиком, и на снимке это выглядело как ошибка вёрстки.
@@ -5701,6 +6844,7 @@ RENDERERS.trends = {
     } else {
       window.Charts.empty(место, 'Показатели не выбраны');
     }
+    this.drawPick(false);
 
     // Мелкие графики по группам — то, ради чего раздел и заводится: полсотни
     // рядов рядом, каждый со своим направлением «лучше».
@@ -5710,7 +6854,8 @@ RENDERERS.trends = {
       (группы[с.group] = группы[с.group] || []).push(с);
     });
     const коробка = qs('#tr-groups', host);
-    заполнитьГруппы(коробка, группы, ряды, выбраны, (id) => this.toggle(id), (р) => this.prepare(р));
+    заполнитьГруппы(коробка, группы, ряды, выбраны, (id) => this.toggle(id), (р) => this.prepare(р),
+      (с) => this.tileValue(с, ряды.get(с.id)));
     if (!Object.keys(группы).length) {
       коробка.innerHTML = '<div class="card"><div class="empty">Ничего не нашлось по этому запросу.</div></div>';
     }
@@ -5731,6 +6876,7 @@ RENDERERS.trends = {
           ${выбраны.includes(с.id) ? 'checked' : ''} style="width:auto"></td>
         <td><b>${esc(с.label)}</b>${с.hint ? `<div class="small faint">${esc(с.hint)}</div>` : ''}</td>
         <td class="small dim">${esc(с.group)}</td>
+        <td class="num mono">${this.records(с)}</td>
         <td class="num mono">${значение(с, с.avg)}</td>
         <td class="num mono">${значение(с, с.min)}</td>
         <td class="num mono">${значение(с, с.max)}</td>
@@ -5742,6 +6888,83 @@ RENDERERS.trends = {
     });
     const выбор = qs('#tr-heat-metric', host);
     if (выбор) выбор.onchange = () => { state.trendsHeat = выбор.value; this.loadHeatmap(); };
+    // Разметка собрана заново — раскрытые списки возвращаются к своим числам.
+    if (вернуть) вернуть();
+  },
+
+  /* «Записей» в своде: сколько записей стоит за показателем за период — и
+   * они же списком. У среднего это записи, по которым оно посчитано, у доли
+   * — её числитель, у суммы — записи с ненулевым вкладом. Число здесь равно
+   * длине списка у любого показателя; «Среднее» по соседству таким числом
+   * не является («заданий в среднем 3,2 на корзину» — это не 3,2 записи). */
+  records(с) {
+    if (!с.drill) return `<span class="faint" title="${esc(ТРЕНД_БЕЗ_СПИСКА)}">—</span>`;
+    if (!(с.n > 0)) return '0';
+    return Drill.num(num(с.n), state.trendsData.window, this.список(с, 'за период'));
+  },
+
+  /* Число на плитке — значение последней непустой корзины, и раскрывается
+   * оно в записи этой корзины: «С ошибкой 4 шт» — какие четыре. Номер
+   * корзины свод отдаёт сам (`last_at`): последняя непустая — не
+   * обязательно последняя по времени. Щелчок мимо числа, как и раньше,
+   * выносит ряд на главный график. */
+  tileValue(с, ряд) {
+    const д = state.trendsData;
+    const разметка = значение(с, с.last === null ? с.avg : с.last);
+    const i = с.last_at;
+    if (!с.drill || с.last === null || i === null || i === undefined) return разметка;
+    if (!(ряд && ряд.n && ряд.n[i] > 0)) return разметка;
+    const окно = this.корзина(д, i);
+    return Drill.num(разметка, окно, this.список(с, промежутокКорзины(окно)));
+  },
+
+  /* Щелчок по точке графика: какие записи стоят за ней.
+   *
+   * На графике до восьми рядов разных показателей, а точка у них общая —
+   * корзина времени. Какой ряд имелся в виду, по щелчку не узнать, а ответ
+   * у каждого свой: за «Заданий» — все задания корзины, за «RTF» — те, у
+   * кого он измерен. Поэтому под графиком встаёт строка: границы корзины и
+   * число записей по каждому выбранному показателю. Каждое число
+   * раскрывается своим списком, первый открывается сразу. Повторный щелчок
+   * по той же точке убирает строку вместе со списком.
+   */
+  pick(номер) {
+    const д = state.trendsData;
+    if (!д || !(д.buckets || []).length) return;
+    // У ряда из одной корзины график различает «левее» и «правее» — корзина одна.
+    const i = Math.min(номер, д.buckets.length - 1);
+    state.trendsPick = state.trendsPick === i ? null : i;
+    this.drawPick(true);
+  },
+
+  drawPick(открыть) {
+    const узел = qs('#tr-pick');
+    const д = state.trendsData;
+    if (!узел || !д) return;
+    // Раскрытый список — про прежнюю точку: сворачиваем вместе с его числом.
+    qsa('button.drill-on', узел).forEach((кнопка) => Drill.toggle(кнопка));
+    const i = state.trendsPick;
+    if (i === null || i === undefined || i >= (д.buckets || []).length) {
+      узел.innerHTML = '';
+      return;
+    }
+    const окно = this.корзина(д, i);
+    const когда = промежутокКорзины(окно);
+    const ряды = new Map((д.series || []).map((р) => [р.id, р]));
+    const части = state.trendsSelected.map((и) => ряды.get(и)).filter(Boolean).map((р) => {
+      if (!р.drill) {
+        return `<span class="faint" title="${esc(ТРЕНД_БЕЗ_СПИСКА)}">${esc(р.label)}: списка нет</span>`;
+      }
+      const записей = (р.n || [])[i] || 0;
+      return `<span>${esc(р.label)}: ${записей > 0
+        ? Drill.num(num(записей), окно, this.список(р, когда))
+        : '<span class="faint">0</span>'}</span>`;
+    });
+    узел.innerHTML = `<span class="dim">Записей за точкой ${esc(когда)} —</span> ${части.join(' ')}`;
+    if (открыть) {
+      const первая = qs('button.drill', узел);
+      if (первая) Drill.toggle(первая);
+    }
   },
 
   toggle(id) {
@@ -5776,9 +6999,24 @@ RENDERERS.trends = {
     // Все двадцать четыре подписи: ось прореживает их сама, а подсказка
     // клетки берёт час отсюда же — с пустыми подписями у двух третей клеток
     // в подсказке стояло «Ср, : 0,230» без часа.
-    window.Charts.grid(host, {
+    // Клетка раскрывается в записи своего часа и дня недели за всё окно
+    // карты. Окно у карты своё (`window` в её ответе): она запрошена позже
+    // рядов. У счётного показателя в клетке — среднее за такой час недели,
+    // а в списке — все такие часы периода; сколько это записей, сервер
+    // отдаёт рядом (`n`), и пустую клетку (доля 0 %) раскрывать не во что.
+    const есть_записи = (день, час) => Boolean(д.n && д.n[день] && д.n[день][час] > 0);
+    const раскрыть = д.drill && д.window ? (строка, клетка) => {
+      const час = String(клетка.col).padStart(2, '0');
+      Drill.open(host, Drill.spec(д.window, Object.assign({}, д.drill, {
+        f: [...(д.drill.f || []), `weekday:${клетка.row}`, `hour:${клетка.col}`],
+        title: `${д.drill.title} · ${(д.days || [])[клетка.row]}, ${час}:00–${час}:59, за период`,
+      })));
+    } : null;
+    window.Charts.grid(host, Object.assign({
       rows: д.days || [], cols: Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0')),
-      values: д.grid || [], emptyText: 'За период нет данных' });
+      values: д.grid || [], emptyText: 'За период нет данных' },
+      раскрыть ? { onPick: раскрыть, canPick: есть_записи,
+                   pickHint: 'щелчок — записи этого часа недели за период' } : {}));
     const подпись = document.createElement('div');
     подпись.className = 'small faint';
     подпись.style.marginTop = '6px';
@@ -5844,6 +7082,22 @@ function fmtNumSafe(value) {
   return (value === null || value === undefined) ? '—' : num(value, 2);
 }
 
+/* Почему у показателя нет списка записей: за замерами железа записей нет, а
+ * контрольные прогоны считаются по времени прогона — список же режет окно
+ * по времени записи, и под числом «прогонов за сутки» показал бы другое. */
+const ТРЕНД_БЕЗ_СПИСКА = 'За показателем нет списка записей: это замеры сервера либо '
+  + 'контрольные прогоны, которые считаются по времени прогона, а не записи';
+
+/* Границы корзины словами — для заголовка списка записей.
+ *
+ * Подпись точки на оси («12.09») называет только начало корзины, а корзины
+ * идут шагом от начала окна и с календарными сутками не совпадают: «12.09»
+ * — это с 12.09 14:23 по 13.09 14:23. Под заголовком «12.09» запись от
+ * тринадцатого выглядела бы ошибкой, поэтому в заголовке — обе границы. */
+function промежутокКорзины(окно) {
+  return `${fmtTime(окно.since)} — ${fmtTime(окно.until)}`;
+}
+
 function периодПодпись(д) {
   const шаги = { hour: 'по часам', day: 'по суткам', week: 'по неделям', month: 'по месяцам' };
   return `${(д.buckets || []).length} точек ${шаги[д.bucket] || ''}`;
@@ -5868,7 +7122,7 @@ function вердикт(с) {
 
 /* Мелкие графики по группам: строка на показатель, спарклайн, последнее
  * значение и изменение. Клик добавляет ряд на главный график. */
-function заполнитьГруппы(коробка, группы, ряды, выбраны, переключить, готовить) {
+function заполнитьГруппы(коробка, группы, ряды, выбраны, переключить, готовить, число) {
   if (!коробка) return;
   коробка.innerHTML = '';
   Object.entries(группы).forEach(([имя, элементы]) => {
@@ -5882,7 +7136,7 @@ function заполнитьГруппы(коробка, группы, ряды, 
         <div class="row"><span class="kpi-label">${esc(с.label)}</span><span class="spacer"></span>
           ${выбраны.includes(с.id) ? '<span class="chip ok">на графике</span>' : ''}</div>
         <div class="row" style="align-items:baseline;gap:8px">
-          <span class="kpi-value">${значение(с, с.last === null ? с.avg : с.last)}</span>
+          <span class="kpi-value">${число(с)}</span>
           <span class="kpi-trend ${с.change_percent > 0 ? 'up' : с.change_percent < 0 ? 'down' : ''}">${изменение(с)}</span>
         </div>
         <div data-spark style="height:34px"></div></div>`);
@@ -6005,8 +7259,17 @@ RENDERERS.telephony = {
     const станции = свод.stations || [];
     const беда = станции.filter((с) => с.enabled && свод.enabled
                                        && (с.last_error || !с.running));
+    // Раскрытие: число шапки — в список звонков, из которых оно сложилось.
+    // Шапка считает архив целиком («за всё время»), поэтому и окно у списка
+    // без нижней границы; панель периода над журналом на неё не влияет.
+    // Верхнюю границу отдаёт сам свод: звонки, начавшиеся после него, в
+    // числе не учтены и в списке появиться не должны.
+    const окно = свод.window || {};
+    const Р = (сколько, разметка, что) => (сколько
+      ? Drill.num(разметка, окно, Object.assign({ base: 'calls' }, что)) : разметка);
     const причины = Object.entries(архив.reasons || {})
-      .map(([п, n]) => `<span class="chip" title="звонков пропущено по этой причине">${esc(п)}: ${n}</span>`)
+      .map(([п, n]) => `<span class="chip" title="звонков пропущено по этой причине">${esc(п)}: ${
+        Р(n, n, { f: [`reason:${п}`], title: `Пропущено: ${п}` })}</span>`)
       .join(' ');
     // Шапка журнала отвечает коротко: доезжают ли записи вообще. Подробности
     // по каждой станции — в разделе «АТС», и вести туда честнее, чем
@@ -6031,18 +7294,25 @@ RENDERERS.telephony = {
         </div>
         <div class="grid cols-4" style="padding:14px 16px">
           <div class="kpi"><span class="kpi-label">Всего звонков</span>
-            <span class="kpi-value">${num(архив.total || 0, 0)}</span>
+            <span class="kpi-value">${Р(архив.total, num(архив.total || 0, 0),
+              { title: 'Все звонки архива' })}</span>
             <span class="small dim">за всё время</span></div>
           <div class="kpi"><span class="kpi-label">Распознано</span>
-            <span class="kpi-value">${num(архив.queued || 0, 0)}</span>
+            <span class="kpi-value">${Р(архив.queued, num(архив.queued || 0, 0),
+              { f: ['recognized'], title: 'Звонки, поставленные на распознавание' })}</span>
             <span class="small dim">поставлено в очередь</span></div>
           <div class="kpi"><span class="kpi-label">Пропущено</span>
-            <span class="kpi-value">${num(архив.skipped || 0, 0)}</span>
+            <span class="kpi-value">${Р(архив.skipped, num(архив.skipped || 0, 0),
+              { f: ['skipped'], title: 'Пропущенные звонки' })}</span>
             <span class="small dim">короткие, без ответа, без записи</span></div>
           <div class="kpi"><span class="kpi-label">Наговорено</span>
-            <span class="kpi-value">${fmtDur(архив.talk_s || 0)}</span>
-            <span class="small dim">${num(архив.inbound || 0, 0)} вх · ${
-              num(архив.outbound || 0, 0)} исх</span></div>
+            <span class="kpi-value">${Р(архив.talk_s, fmtDur(архив.talk_s || 0),
+              { f: ['billsec:1..'], sort: 'billsec:desc', value: 'Разговор',
+                title: 'Звонки с разговором: сначала самые долгие' })}</span>
+            <span class="small dim">${Р(архив.inbound, num(архив.inbound || 0, 0),
+              { f: ['direction:входящий'], title: 'Входящие звонки' })} вх · ${
+              Р(архив.outbound, num(архив.outbound || 0, 0),
+                { f: ['direction:исходящий'], title: 'Исходящие звонки' })} исх</span></div>
         </div>
         ${причины ? `<div class="row wrap" style="padding:0 16px 12px;gap:6px">${причины}</div>` : ''}
         ${станции.length ? `<div class="row wrap" style="padding:0 16px 14px;gap:6px">${
@@ -6075,10 +7345,19 @@ RENDERERS.telephony = {
       const итог = await API.post('/api/telephony/scan');
       const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
       const сбои = (итог.errors || []).map((о) => `${о.name || о.station}: ${о.error}`).join('; ');
+      // Заход длится секунды, а на большом журнале и минуты, и за это время
+      // под числом шапки успевают раскрыть список звонков. Перерисовка шапки
+      // по окончании захода снесла бы его из-под рук — как фоновое
+      // обновление, которого в эту секунду никто не просил. Поэтому при
+      // раскрытом списке шапка остаётся прежней (и итог захода об этом
+      // говорит), а журнал под ней перечитывается: списков в нём нет.
+      const раскрыто = Boolean(qs('#tel-status .drill-panel'));
       toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
             сбои ? 'warn' : итог.imported ? 'ok' : '',
-            [сбои, чужие_станции(итог), причины].filter(Boolean).join('; '));
-      await this.loadStatus();
+            [сбои, чужие_станции(итог), причины, раскрыто
+              ? 'числа шапки прежние, пока раскрыт список: сверните его и обновите раздел' : '']
+              .filter(Boolean).join('; '));
+      if (!раскрыто) await this.loadStatus();
       await this.loadCalls();
     } catch (err) {
       toast(err.message || 'Заход не удался', 'err', err.hint || '');
@@ -6473,6 +7752,52 @@ RENDERERS.pbx = {
         ид === state.pbxStation ? ' selected' : ''}>${esc(имя)}</option>`).join('');
   },
 
+  /**
+   * Раскрытие чисел раздела в список звонков.
+   *
+   * Всё в разделе считается по журналу звонков, и любое число здесь — это
+   * звонки: за период, по станции, по очереди, в такой-то час. Чтобы список
+   * сошёлся с числом, он берёт то же, что и свод:
+   *   - окно — из ответа (`window`): начало периода и верх, замороженные на
+   *     один ответ. У чисел «за всё время» (архив станции, заходы) нижней
+   *     границы нет, верхняя та же;
+   *   - станцию — ту, по которой свод посчитан (`д.station`), а не ту, что
+   *     сейчас выбрана в списке: пока ответ ехал, выбор мог смениться.
+   *
+   * `Р(сколько, разметка, что, чьё)` — число-кнопка; ноль кнопкой не
+   * делается: раскрывать нечего. `что.f` дополняет отбор станции; `чьё` —
+   * другое окно (`весь`). `что.станция` — отбор по этой станции вместо
+   * выбранной: карточка станции и строка сравнения станций всегда про свою
+   * (`call_by_station` выбранную станцию не учитывает). Пустая строка —
+   * звонки без станции. `О(что, чьё)` — описание для графиков, в `Drill.open`.
+   */
+  раскрытие(д) {
+    const окно = (д || {}).window || {};
+    const весь = { until: окно.until };
+    const выбранная = (д || {}).station ? [`station:${д.station}`] : [];
+    const собрать = (что) => {
+      const описание = Object.assign({ base: 'calls' }, что);
+      const станция = что.станция === undefined ? выбранная : [`station:${что.станция}`];
+      описание.f = [...станция, ...(что.f || [])];
+      delete описание.станция;
+      return описание;
+    };
+    const О = (что, чьё) => Drill.spec(чьё || окно, собрать(что));
+    const Р = (сколько, разметка, что, чьё) => (сколько
+      ? Drill.num(разметка, чьё || окно, собрать(что)) : разметка);
+    // Два набора встречаются и на плитках, и в таблицах, и на графиках —
+    // и раскрываться обязаны одинаково. Сумма разговора складывается из
+    // звонков, где он был (`billsec` от секунды); средний разговор считается
+    // по отвеченным (`AVG(CASE WHEN c.answered=1 …)`). И там и там сверху —
+    // самые долгие: это они делают число.
+    const поДлине = { sort: 'billsec:desc', value: 'Разговор' };
+    const наговорено = (title, что) => Object.assign({}, что, поДлине,
+      { f: [...((что || {}).f || []), 'billsec:1..'], title });
+    const средний = (title, что) => Object.assign({}, что, поДлине,
+      { f: [...((что || {}).f || []), 'answered'], title });
+    return { окно, весь, О, Р, наговорено, средний };
+  },
+
   /* Шапка: сколько станций и что с ними прямо сейчас. Она одна и та же на
    * всех вкладках — это ответ на вопрос «всё ли работает», а его задают
    * независимо от того, какой график открыт. */
@@ -6481,6 +7806,7 @@ RENDERERS.pbx = {
     const д = state.pbxData || {};
     if (!место) return;
     const за = д.period_calls || {};
+    const { Р, весь, наговорено, средний } = this.раскрытие(д);
     const станции = д.stations || [];
     // «Требует внимания» — только то, что чинится на уровне станции.
     // При общем выключателе не работает вообще ничего, и об этом говорит
@@ -6508,20 +7834,35 @@ RENDERERS.pbx = {
               || state.pbxStation)}` : ''}</span>
         </div>
         <div class="grid cols-6" style="padding:14px 16px">
-          ${kpi('Звонков за период', num(за.total || 0, 0),
-                `всего в архиве ${num((д.calls || {}).total || 0, 0)}`)}
-          ${kpi('Ответили', `${num(ответ, 1)} %`,
+          ${kpi('Звонков за период',
+                Р(за.total, num(за.total || 0, 0), { title: 'Звонки за период' }),
+                `всего в архиве ${Р((д.calls || {}).total, num((д.calls || {}).total || 0, 0),
+                  { title: 'Все звонки архива' }, весь)}`)}
+          ${kpi('Ответили',
+                Р(за.answered, `${num(ответ, 1)} %`,
+                  { f: ['answered'], title: 'Отвеченные звонки за период' }),
                 `${num(за.answered || 0, 0)} из ${num(за.total || 0, 0)}`)}
-          ${kpi('Распознано', `${num(доля, 1)} %`,
+          ${kpi('Распознано',
+                Р(за.queued, `${num(доля, 1)} %`,
+                  { f: ['recognized'], title: 'Звонки, поставленные на распознавание' }),
                 `${num(за.queued || 0, 0)} ${plural(за.queued || 0, 'задание', 'задания', 'заданий')}`)}
-          ${kpi('Наговорено', fmtDur(за.talk_s || 0),
-                `в среднем ${fmtDur(среднее)} на разговор`)}
-          ${kpi('Ожидание', fmtDur(за.answered ? (за.wait_s || 0) / за.answered : 0),
+          ${kpi('Наговорено',
+                Р(за.talk_s, fmtDur(за.talk_s || 0),
+                  наговорено('Звонки за период: сначала самые долгие разговоры')),
+                `в среднем ${Р(за.answered, fmtDur(среднее),
+                  средний('Отвеченные за период: сначала самые долгие'))} на разговор`)}
+          ${kpi('Ожидание',
+                Р(за.answered, fmtDur(за.answered ? (за.wait_s || 0) / за.answered : 0),
+                  { f: ['answered'], sort: 'wait:desc', value: 'Ожидание', fmt: 'dur',
+                    title: 'Отвеченные звонки: сначала ждавшие дольше' }),
                 'среднее до ответа')}
-          ${kpi('Пропущено', num(за.skipped || 0, 0), 'короткие, без ответа, без записи')}
+          ${kpi('Пропущено',
+                Р(за.skipped, num(за.skipped || 0, 0),
+                  { f: ['skipped'], title: 'Пропущенные звонки за период' }),
+                'короткие, без ответа, без записи')}
         </div>
       </section>
-      ${this.kpiCard(д.kpi || {})}`;
+      ${this.kpiCard(д.kpi || {}, д)}`;
   },
 
   /* Показатели контакт-центра — те, по которым заказчик сравнивает системы
@@ -6530,9 +7871,22 @@ RENDERERS.pbx = {
    * это не полный AHT, а оценка решения с первого раза — не опрос. Молчать
    * об этом нельзя: показатель с чужим названием и своим смыслом хуже
    * отсутствующего. */
-  kpiCard(k) {
+  kpiCard(k, д) {
     if (!k || !k.total) return '';
     const доля = (з) => (з === null || з === undefined ? '—' : `${num(з * 100, 1)} %`);
+    const { Р, средний } = this.раскрытие(д);
+    // Доля раскрывается в свой числитель: «потеряно 4 из 60 входящих» — в
+    // эти четыре звонка. Условия — те же, что в `call_kpi`.
+    //
+    // Ожидание — целое число секунд (разность двух целых колонок), поэтому
+    // «не дольше 20,5 с» и «не дольше 20 с» — один и тот же набор звонков.
+    const порог = Math.max(0, Math.min(86400, Math.floor(Number(k.service_level_s) || 0)));
+    const входящие = ['direction:входящий', 'answered'];
+    const ожидание = { sort: 'wait:desc', value: 'Ожидание', fmt: 'dur' };
+    // Окно повторного обращения — в секундах, как его считал сервер.
+    const окноПовтора = k.repeat_window_s;
+    const естьПовторы = окноПовтора !== undefined && окноПовтора !== null;
+    const безПовтора = (k.fcr_base || 0) - (k.repeated || 0);
     return `
       <section class="card" style="margin-bottom:12px">
         <div class="card-head">
@@ -6542,23 +7896,37 @@ RENDERERS.pbx = {
         </div>
         <div class="grid cols-4" style="padding:14px 16px">
           ${kpi('Среднее время разговора', k.aht_s === null || k.aht_s === undefined
-                  ? '—' : fmtDur(k.aht_s),
+                  ? '—' : Р(k.answered, fmtDur(k.aht_s),
+                      средний('Отвеченные за период: сначала самые долгие')),
                 `по ${num(k.answered || 0, 0)} ${plural(k.answered || 0,
                   'отвеченному', 'отвеченным', 'отвеченным')}; удержание и
                  постобработка в журнале не отражены`)}
-          ${kpi('Потерянные вызовы', доля(k.abandoned_share),
+          ${kpi('Потерянные вызовы',
+                Р(k.abandoned, доля(k.abandoned_share),
+                  { f: ['abandoned'], title: 'Потерянные вызовы: входящие без ответа' }),
                 `${num(k.abandoned || 0, 0)} из ${num(k.inbound || 0, 0)} входящих`)}
-          ${kpi('Уровень обслуживания', доля(k.service_level),
+          ${kpi('Уровень обслуживания',
+                Р(k.in_time, доля(k.service_level), Object.assign({
+                  f: [...входящие, `wait_within:${порог}`],
+                  title: `Входящие, снятые не позже чем через ${num(порог, 0)} с` }, ожидание)),
                 `сняли быстрее ${num(k.service_level_s || 0, 0)} с; в среднем ждали ${
                   k.wait_avg_s === null || k.wait_avg_s === undefined
-                    ? '—' : fmtDur(k.wait_avg_s)}`)}
-          ${kpi('Решение с первого раза', доля(k.fcr),
+                    ? '—' : Р(k.inbound_answered, fmtDur(k.wait_avg_s), Object.assign({
+                      f: входящие, title: 'Отвеченные входящие: сначала ждавшие дольше' },
+                      ожидание))}`)}
+          ${kpi('Решение с первого раза',
+                естьПовторы ? Р(безПовтора, доля(k.fcr), {
+                  f: ['fcr_base', `not_repeated:${окноПовтора}`],
+                  title: 'Обращения, после которых номер не перезвонил' }) : доля(k.fcr),
                 k.fcr === null || k.fcr === undefined
                   ? 'нужен номер звонящего в журнале'
                   : `оценка: по ${num(k.fcr_base || 0, 0)} ${plural(k.fcr_base || 0,
                       'обращению', 'обращениям', 'обращениям')} без повторного
                      звонка за ${num(k.repeat_window_days || 0, 0)} ${plural(
-                      k.repeat_window_days || 0, 'день', 'дня', 'дней')}`)}
+                      k.repeat_window_days || 0, 'день', 'дня', 'дней')}${
+                      естьПовторы && k.repeated ? `; с повторным — ${Р(k.repeated,
+                        num(k.repeated, 0), { f: ['fcr_base', `repeated:${окноПовтора}`],
+                          title: 'Обращения, после которых номер перезвонил' })}` : ''}`)}
         </div>
       </section>`;
   },
@@ -6752,6 +8120,10 @@ RENDERERS.pbx = {
     }
     if (state.pbxTab !== своя) return;
     const агенты = (данные || {}).agents || [];
+    // «Прислал N звонков» — архив станции агента за всё время; раскрывается
+    // только настоящий счёт по журналу, а не счётчик самого агента
+    // (`calls_sent`), за которым строк в журнале может и не быть.
+    const окноАгентов = (данные || {}).window || {};
     const адрес = `${location.protocol}//${location.host}`;
     const команда = `curl -fsSL '${адрес}/api/telephony/agent/install.sh' \\
 `
@@ -6791,7 +8163,10 @@ RENDERERS.pbx = {
               <div class="small dim">${esc(а.asterisk || '')}</div></td>
             <td class="small ${давно > 86400 ? 'err' : ''}">${
               а.last_seen ? fmtAgo(а.last_seen) : 'ни разу'}</td>
-            <td class="small">${num((а.calls || {}).total || а.calls_sent || 0)} звонков
+            <td class="small">${(а.calls || {}).total && а.station
+              ? Drill.num(num(а.calls.total), окноАгентов, { base: 'calls',
+                f: [`station:${а.station}`], title: `Звонки, присланные агентом ${а.name || а.id}` })
+              : num((а.calls || {}).total || а.calls_sent || 0)} звонков
               <div class="small dim">${num(а.files_sent || 0)} записей</div></td>
             <td class="nowrap">
               <button class="ghost sm" data-cmd="all" data-agent="${esc(а.id)}"
@@ -6839,6 +8214,7 @@ RENDERERS.pbx = {
     const архивные = (д.by_station || []).filter((с) =>
       с.station && !станции.some((н) => н.id === с.station));
     const карточки = станции.map((с) => this.stationCard(с, д)).join('');
+    const { Р, О } = this.раскрытие(д);
     тело.innerHTML = `
       ${станции.length ? `<div class="grid cols-3" id="pbx-cards">${карточки}</div>`
         : `<div class="empty">Ни одной АТС не подключено.
@@ -6849,7 +8225,9 @@ RENDERERS.pbx = {
         <div class="card-head"><h3>Станции только в архиве</h3>
           <span class="hint">этих АТС нет в настройках, но их разговоры сохранились</span></div>
         <div class="row wrap" style="padding:12px 16px;gap:6px">${архивные.map((с) =>
-          `<span class="chip" title="звонков в архиве">${esc(с.station)}: ${num(с.total, 0)}</span>`)
+          `<span class="chip" title="звонков за период">${esc(с.station)}: ${
+            Р(с.total, num(с.total, 0), { станция: с.station,
+              title: `Звонки станции ${с.station} за период` })}</span>`)
           .join('')}</div></section>` : ''}
       <div class="grid cols-2" style="margin-top:14px">
         <section class="card"><div class="card-head"><h3>Вклад станций</h3>
@@ -6880,21 +8258,32 @@ RENDERERS.pbx = {
       items: по_станциям.slice(0, 12).map((с) => ({
         label: имя(с.station), value: с.total, color: цвет,
         display: `${num(с.total, 0)} · ${fmtDur(с.talk_s)}`,
+        ключ: с.station,
       })),
       emptyText: 'За период звонков не было',
+      pickHint: 'щелчок — список звонков',
+      // Сравнение станций от выбранной не зависит, поэтому и список — по
+      // станции своей строки.
+      onPick: (номер, строка) => Drill.open(qs('#pbx-by-station'), О({
+        станция: строка.ключ, title: `Звонки за период: ${строка.label}` })),
     });
     const за = д.period_calls || {};
     Charts.donut(qs('#pbx-directions'), {
       parts: [
-        { label: "входящие", value: за.inbound || 0 },
-        { label: "исходящие", value: за.outbound || 0 },
-        { label: "внутренние", value: за.internal || 0 },
-        { label: 'без направления',
+        { label: "входящие", value: за.inbound || 0, f: ['direction:входящий'] },
+        { label: "исходящие", value: за.outbound || 0, f: ['direction:исходящий'] },
+        { label: "внутренние", value: за.internal || 0, f: ['direction:внутренний'] },
+        // Остаток — не «пустое направление», а всё, что не одно из трёх:
+        // так он и считается, вычитанием.
+        { label: 'без направления', f: ['no_direction'],
           value: Math.max(0, (за.total || 0) - (за.inbound || 0)
                              - (за.outbound || 0) - (за.internal || 0)) },
       ],
       centerLabel: 'звонков за период',
       emptyText: 'За период звонков не было',
+      pickHint: 'щелчок — список звонков',
+      onPick: (номер, доля) => Drill.open(qs('#pbx-directions'), О({
+        f: доля.f, title: `Звонки за период: ${доля.label}` })),
     });
   },
 
@@ -6906,6 +8295,9 @@ RENDERERS.pbx = {
     const админ = (state.me || {}).role === 'admin';
     const свои = (д.by_station || []).find((x) => x.station === с.id) || {};
     const звонки = с.calls || {};
+    const { Р, весь, наговорено } = this.раскрытие(д);
+    // Карточка — всегда про свою станцию, что бы ни было выбрано в списке.
+    const её = { станция: с.id };
     // Когда забор выключен целиком, «поток стоит» у каждой станции — правда,
     // но не ответ: чинить нужно один общий выключатель, а не три станции.
     const состояние = !с.enabled ? ['', 'выключена']
@@ -6923,20 +8315,26 @@ RENDERERS.pbx = {
       <div style="padding:10px 14px 4px">
         <div class="row" style="gap:16px;align-items:flex-end">
           <div><div class="kpi-label">За период</div>
-            <div class="kpi-value" style="font-size:22px">${num(свои.total || 0, 0)}</div></div>
+            <div class="kpi-value" style="font-size:22px">${Р(свои.total, num(свои.total || 0, 0),
+              { ...её, title: `${с.name}: звонки за период` })}</div></div>
           <div><div class="kpi-label">Распознано</div>
-            <div class="kpi-value" style="font-size:22px">${num(свои.queued || 0, 0)}</div></div>
+            <div class="kpi-value" style="font-size:22px">${Р(свои.queued, num(свои.queued || 0, 0),
+              { ...её, f: ['recognized'], title: `${с.name}: поставлено на распознавание` })}</div></div>
           <div><div class="kpi-label">Наговорено</div>
-            <div class="kpi-value" style="font-size:22px">${fmtDur(свои.talk_s || 0)}</div></div>
+            <div class="kpi-value" style="font-size:22px">${Р(свои.talk_s, fmtDur(свои.talk_s || 0),
+              наговорено(`${с.name}: сначала самые долгие разговоры`, её))}</div></div>
           <span class="spacer"></span>
           <div class="pbx-spark" data-station="${esc(с.id)}"></div>
         </div>
         <div class="row wrap small dim" style="gap:6px;margin-top:8px">
-          <span title="всего в архиве этой станции">архив: ${num(звонки.total || 0, 0)}</span>
+          <span title="всего в архиве этой станции">архив: ${Р(звонки.total,
+            num(звонки.total || 0, 0), { ...её, title: `${с.name}: весь архив` }, весь)}</span>
           ${звонки.skipped ? `<span title="пропущено: короткие, без ответа, без записи">
-            · пропущено ${num(звонки.skipped, 0)}</span>` : ''}
+            · пропущено ${Р(звонки.skipped, num(звонки.skipped, 0),
+              { ...её, f: ['skipped'], title: `${с.name}: пропущено за всё время` }, весь)}</span>` : ''}
           ${звонки.deferred ? `<span title="записи ещё дописываются — вернёмся к ним">
-            · отложено ${num(звонки.deferred, 0)}</span>` : ''}
+            · отложено ${Р(звонки.deferred, num(звонки.deferred, 0),
+              { ...её, f: ['deferred'], title: `${с.name}: отложено` }, весь)}</span>` : ''}
           ${с.last_run ? `<span>· заход ${esc(fmtTime(с.last_run))}</span>`
             : '<span>· заходов ещё не было</span>'}
         </div>
@@ -6962,9 +8360,13 @@ RENDERERS.pbx = {
     const станции = д.stations || [];
     const строки = (д.by_station || []).slice().sort((a, b) => b.total - a.total);
     if (!строки.length) return '<tr><td colspan="9" class="dim">За период звонков не было</td></tr>';
+    const { Р, наговорено, средний } = this.раскрытие(д);
     return строки.map((с) => {
       const настроена = станции.find((н) => н.id === с.station);
       const среднее = с.answered ? с.talk_s / с.answered : 0;
+      const чьё = (настроена || {}).name || с.station || 'без станции';
+      // Строка — про свою станцию; пустой идентификатор — звонки без станции.
+      const её = { станция: с.station };
       const состояние = !настроена ? '<span class="dim">только в архиве</span>'
         : !настроена.enabled ? '<span class="chip">выключена</span>'
         : настроена.last_error ? `<span class="chip err" title="${esc(настроена.last_error)}">ошибка</span>`
@@ -6972,14 +8374,20 @@ RENDERERS.pbx = {
         : !д.enabled ? '<span class="chip">забор выключен</span>'
         : '<span class="chip warn">поток стоит</span>';
       return `<tr>
-        <td>${esc((настроена || {}).name || с.station || 'без станции')}</td>
+        <td>${esc(чьё)}</td>
         <td class="small dim">${esc(ПАТС_ИСТОЧНИКИ[(настроена || {}).source] || '—')}</td>
-        <td class="num">${num(с.total, 0)}</td>
-        <td class="num">${с.total ? num((с.answered / с.total) * 100, 1) + ' %' : '—'}</td>
-        <td class="num">${с.total ? num((с.queued / с.total) * 100, 1) + ' %' : '—'}</td>
-        <td class="num">${fmtDur(с.talk_s)}</td>
-        <td class="num">${fmtDur(среднее)}</td>
-        <td class="num">${num(с.skipped, 0)}</td>
+        <td class="num">${Р(с.total, num(с.total, 0),
+          { ...её, title: `${чьё}: звонки за период` })}</td>
+        <td class="num">${с.total ? Р(с.answered, num((с.answered / с.total) * 100, 1) + ' %',
+          { ...её, f: ['answered'], title: `${чьё}: отвеченные` }) : '—'}</td>
+        <td class="num">${с.total ? Р(с.queued, num((с.queued / с.total) * 100, 1) + ' %',
+          { ...её, f: ['recognized'], title: `${чьё}: поставлено на распознавание` }) : '—'}</td>
+        <td class="num">${Р(с.talk_s, fmtDur(с.talk_s),
+          наговорено(`${чьё}: сначала самые долгие разговоры`, её))}</td>
+        <td class="num">${Р(с.answered, fmtDur(среднее),
+          средний(`${чьё}: отвеченные, сначала самые долгие`, её))}</td>
+        <td class="num">${Р(с.skipped, num(с.skipped, 0),
+          { ...её, f: ['skipped'], title: `${чьё}: пропущено` })}</td>
         <td>${состояние}</td></tr>`;
     }).join('');
   },
@@ -7034,38 +8442,57 @@ RENDERERS.pbx = {
           <div id="pbx-days" style="padding:12px 16px"></div></section>
       </div>`;
 
-    const лента = д.timeline || [];
-    const шагСек = { hour: 3600, day: 86400, week: 604800, month: 2592000 }[д.bucket] || 86400;
-    const ряды = state.pbxLoadTalk
-      ? [{ name: 'наговорено, мин', values: лента.map((т) => Math.round(т.talk_s / 60)) }]
-      : [
-        { name: 'входящие', values: лента.map((т) => т.inbound) },
-        { name: 'исходящие', values: лента.map((т) => т.outbound) },
-        { name: 'внутренние', values: лента.map((т) => т.internal) },
-      ];
-    Charts.line(qs('#pbx-timeline'), {
-      labels: лента.map((т) => fmtBucket(т.t, шагСек)), series: ряды, height: 260, yMin: 0,
-      emptyText: 'За период звонков не было',
-    });
+    this.drawTimeline(д);
     const переключатель = qs('#pbx-load-talk');
     if (переключатель) переключатель.addEventListener('change', () => {
       state.pbxLoadTalk = переключатель.checked;
-      this.draw();
+      // Перерисовывается одна линия, а не вкладка: под соседним графиком
+      // может быть раскрыт список звонков, и переключатель чужой карточки
+      // не должен его сносить.
+      this.drawTimeline(state.pbxData || д);
     });
 
+    const { О } = this.раскрытие(д);
+    const звонки = 'щелчок — список звонков';
     const карта = д.heatmap || {};
+    const дни = карта.days || [];
+    // Карта и оба столбчатых графика под ней считают только звонки с
+    // известным временем начала (`c.started_at>0`); за «всё время» остальные
+    // своды считают и звонки без времени, отсюда признак `timed` в отборе.
     Charts.grid(qs('#pbx-heat'), {
-      rows: карта.days || [], cols: (карта.hours || []).map((ч) => String(ч).padStart(2, '0')),
+      rows: дни, cols: (карта.hours || []).map((ч) => String(ч).padStart(2, '0')),
       values: карта.calls || [], cell: 20,
       secondary: (карта.talk_s || []).map((строка) =>
         (строка || []).map((с) => Math.round((с || 0) / 60))),
       secondaryUnit: 'мин разговора',
       emptyText: 'За период звонков не было',
+      pickHint: звонки,
+      // Пустая клетка — «звонков не было»: раскрывать нечего.
+      canPick: (день, час, сколько) => сколько > 0,
+      onPick: (номер, клетка) => {
+        Drill.open(qs('#pbx-heat'), О({
+          f: ['timed', `weekday:${клетка.row}`, `hour:${клетка.col}`],
+          title: `Звонки: ${дни[клетка.row] || ''}, ${String(клетка.col).padStart(2, '0')}:00–${
+            String(клетка.col + 1).padStart(2, '0')}:00` }));
+      },
     });
+    const корзины = д.durations || [];
     Charts.bars(qs('#pbx-durations'), {
-      labels: (д.durations || []).map((к) => к.label),
-      values: (д.durations || []).map((к) => к.count),
+      labels: корзины.map((к) => к.label),
+      values: корзины.map((к) => к.count),
       height: 220, emptyText: 'За период отвеченных разговоров не было',
+      pickHint: звонки,
+      // Границы корзины отдаёт сервер (`from`, `to`, секунды): нижняя входит,
+      // верхняя нет, как в самом счёте. Гистограмма — только по отвеченным.
+      onPick: (номер) => {
+        const к = корзины[номер];
+        if (!к) return;
+        Drill.open(qs('#pbx-durations'), О({
+          f: ['answered', `billsec:${к.from === null || к.from === undefined ? '' : к.from}..${
+            к.to === null || к.to === undefined ? '' : к.to}`],
+          sort: 'billsec:desc', value: 'Разговор',
+          title: `Отвеченные звонки длительностью ${к.label}` }));
+      },
     });
 
     const по_часам = new Array(24).fill(0);
@@ -7077,10 +8504,65 @@ RENDERERS.pbx = {
     Charts.bars(qs('#pbx-hours'), {
       labels: по_часам.map((_, ч) => String(ч)), values: по_часам, height: 200,
       showValues: false, emptyText: 'За период звонков не было',
+      pickHint: звонки,
+      onPick: (час) => Drill.open(qs('#pbx-hours'), О({
+        f: ['timed', `hour:${час}`],
+        title: `Звонки с ${String(час).padStart(2, '0')}:00 до ${
+          String(час + 1).padStart(2, '0')}:00, все дни периода` })),
     });
     Charts.bars(qs('#pbx-days'), {
-      labels: карта.days || [], values: по_дням, height: 200,
+      labels: дни, values: по_дням, height: 200,
       emptyText: 'За период звонков не было',
+      pickHint: звонки,
+      onPick: (день) => Drill.open(qs('#pbx-days'), О({
+        f: ['timed', `weekday:${день}`], title: `Звонки: ${дни[день] || ''}, все недели периода` })),
+    });
+  },
+
+  /* Линия нагрузки. Отдельно от вкладки: её перерисовывает переключатель
+   * «показывать наговоренное время», и трогать при этом остальные графики
+   * (и раскрытые под ними списки) незачем. */
+  drawTimeline(д) {
+    const место = qs('#pbx-timeline');
+    if (!место) return;
+    const лента = д.timeline || [];
+    const шагСек = { hour: 3600, day: 86400, week: 604800, month: 2592000 }[д.bucket] || 86400;
+    // Звонки без направления (пропущенные станцией до его определения) в
+    // три ряда не попадали вовсе, а в корзине они есть: точка раскрывается
+    // во все звонки корзины, и сумма рядов обязана с этим списком сходиться.
+    // Ряд появляется, только когда такие звонки за период были.
+    const прочие = лента.map((т) => Math.max(0, (т.total || 0) - (т.inbound || 0)
+                                               - (т.outbound || 0) - (т.internal || 0)));
+    const ряды = state.pbxLoadTalk
+      ? [{ name: 'наговорено, мин', values: лента.map((т) => Math.round(т.talk_s / 60)) }]
+      : [
+        { name: 'входящие', values: лента.map((т) => т.inbound) },
+        { name: 'исходящие', values: лента.map((т) => т.outbound) },
+        { name: 'внутренние', values: лента.map((т) => т.internal) },
+        ...(прочие.some((n) => n > 0) ? [{ name: 'без направления', values: прочие }] : []),
+      ];
+    const { О, окно } = this.раскрытие(д);
+    Charts.line(место, {
+      labels: лента.map((т) => fmtBucket(т.t, шагСек)), series: ряды, height: 260, yMin: 0,
+      emptyText: 'За период звонков не было',
+      pickHint: 'щелчок — список звонков',
+      onPick: (номер) => {
+        // Линия из одной точки: щелчок правее неё даёт номер за концом ряда.
+        const т = лента[Math.min(номер, лента.length - 1)];
+        if (!т) return;
+        // Границы корзины — от сервера (`t`, `until`), а не «начало плюс
+        // шаг»: месяц календарный, сутки режутся по местному времени. Крайние
+        // корзины обрезаны окном периода — как и при счёте: в первый час
+        // недели попали только звонки после её начала.
+        const с = окно.since === null || окно.since === undefined ? т.t : Math.max(т.t, окно.since);
+        const по = окно.until === null || окно.until === undefined
+          ? т.until : Math.min(т.until, окно.until);
+        Drill.open(место, О(Object.assign({
+          title: `Звонки: ${fmtBucket(т.t, шагСек)}${
+            { hour: '', day: ', сутки', week: ', неделя', month: ', месяц' }[д.bucket] || ''}` },
+          state.pbxLoadTalk ? { sort: 'billsec:desc', value: 'Разговор' } : {}),
+          { since: с, until: по }));
+      },
     });
   },
 
@@ -7117,7 +8599,7 @@ RENDERERS.pbx = {
           <thead><tr><th>Оператор</th><th class="num">Звонков</th><th class="num">Ответили</th>
             <th class="num">Наговорено</th><th class="num">Средний разговор</th>
             <th class="num">Доля периода</th></tr></thead>
-          <tbody>${this.peopleRows(операторы, (д.period_calls || {}).total)}</tbody></table></div>
+          <tbody>${this.peopleRows(операторы, (д.period_calls || {}).total, 'agent', д)}</tbody></table></div>
       </section>
       <section class="card" style="margin-top:14px">
         <div class="card-head"><h3>Очереди: всё вместе</h3></div>
@@ -7125,44 +8607,66 @@ RENDERERS.pbx = {
           <thead><tr><th>Очередь</th><th class="num">Звонков</th><th class="num">Ответили</th>
             <th class="num">Наговорено</th><th class="num">Средний разговор</th>
             <th class="num">Доля периода</th></tr></thead>
-          <tbody>${this.peopleRows(очереди, (д.period_calls || {}).total)}</tbody></table></div>
+          <tbody>${this.peopleRows(очереди, (д.period_calls || {}).total, 'queue', д)}</tbody></table></div>
       </section>`;
 
     const цвет = Charts.palette()[0];
-    const столбики = (место, данные, поле, формат) => Charts.hbars(qs(место), {
+    const { О, средний } = this.раскрытие(д);
+    // `ось` — имя отбора списка: `queue` или `agent`. Столбик числа звонков
+    // раскрывается во все звонки очереди (оператора); столбик среднего
+    // разговора — в отвеченные, по которым среднее и посчитано, самые
+    // долгие сверху. У кого отвеченных нет, там и раскрывать нечего.
+    const столбики = (место, данные, поле, формат, ось) => Charts.hbars(qs(место), {
       items: данные.slice(0, 12).map((з) => ({
         label: з.value, value: поле === 'count' ? з.count : з.avg_s,
         display: формат(з), color: цвет,
         note: `ответили ${з.count ? num((з.answered / з.count) * 100, 1) : 0} % · `
             + `наговорено ${fmtDur(з.talk_s)}`,
+        pick: поле === 'count' ? з.count > 0 : з.answered > 0,
       })),
       labelWidth: 150, emptyText: 'За период данных нет',
+      pickHint: 'щелчок — список звонков',
+      onPick: (номер, строка) => Drill.open(qs(место), О(поле === 'count'
+        ? { f: [`${ось}:${строка.label}`], title: `Звонки за период: ${строка.label}` }
+        : средний(`${строка.label}: отвеченные, сначала самые долгие`,
+                  { f: [`${ось}:${строка.label}`] }))),
     });
     столбики('#pbx-queues', очереди, 'count',
-             (з) => `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`);
+             (з) => `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`, 'queue');
     столбики('#pbx-agents', операторы, 'count',
-             (з) => `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`);
+             (з) => `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`, 'agent');
     столбики('#pbx-queue-avg', очереди.slice().sort((a, b) => b.avg_s - a.avg_s),
-             'avg', (з) => fmtDur(з.avg_s));
+             'avg', (з) => fmtDur(з.avg_s), 'queue');
     столбики('#pbx-agent-avg', операторы.slice().sort((a, b) => b.avg_s - a.avg_s),
-             'avg', (з) => fmtDur(з.avg_s));
+             'avg', (з) => fmtDur(з.avg_s), 'agent');
   },
 
-  peopleRows(строки, всего_периода) {
+  peopleRows(строки, всего_периода, ось, д) {
     if (!строки.length) return '<tr><td colspan="6" class="dim">За период данных нет</td></tr>';
+    const { Р, наговорено, средний } = this.раскрытие(д);
     // Знаменатель — все звонки периода, а не сумма показанных строк: сервер
     // отдаёт только верхушку (пятнадцать), и доли по ней всегда складывались
     // ровно в сто процентов, завышая вклад каждого.
     const всего = Number(всего_периода) > 0
       ? Number(всего_периода)
       : (строки.reduce((с, з) => с + з.count, 0) || 1);
-    return строки.map((з) => `<tr>
+    // Каждое число строки — звонки этой очереди (оператора): все, отвеченные
+    // либо те, из которых сложилось время. «Доля периода» — то же число
+    // звонков, поделённое на период; отдельного списка у неё нет.
+    return строки.map((з) => {
+      const её = { f: [`${ось}:${з.value}`] };
+      return `<tr>
       <td>${esc(з.value)}</td>
-      <td class="num">${num(з.count, 0)}</td>
-      <td class="num">${з.count ? num((з.answered / з.count) * 100, 1) + ' %' : '—'}</td>
-      <td class="num">${fmtDur(з.talk_s)}</td>
-      <td class="num">${fmtDur(з.avg_s)}</td>
-      <td class="num">${num((з.count / всего) * 100, 1)} %</td></tr>`).join('');
+      <td class="num">${Р(з.count, num(з.count, 0),
+        { ...её, title: `Звонки за период: ${з.value}` })}</td>
+      <td class="num">${з.count ? Р(з.answered, num((з.answered / з.count) * 100, 1) + ' %',
+        { f: [...её.f, 'answered'], title: `${з.value}: отвеченные` }) : '—'}</td>
+      <td class="num">${Р(з.talk_s, fmtDur(з.talk_s),
+        наговорено(`${з.value}: сначала самые долгие разговоры`, её))}</td>
+      <td class="num">${Р(з.answered, fmtDur(з.avg_s),
+        средний(`${з.value}: отвеченные, сначала самые долгие`, её))}</td>
+      <td class="num">${num((з.count / всего) * 100, 1)} %</td></tr>`;
+    }).join('');
   },
 
   /* --- Номера и направления ------------------------------------------- */
@@ -7187,18 +8691,25 @@ RENDERERS.pbx = {
           <div id="pbx-disposition" style="padding:12px 16px"></div></section>
       </div>`;
     const цвет = Charts.palette()[0];
-    const нарисовать = (место, данные, подпись) => Charts.hbars(qs(место), {
+    const { О } = this.раскрытие(д);
+    // `ось` — имя отбора списка. Значение для него — как в журнале (`ключ`),
+    // а не подпись: «не ответили» на графике — это `NO ANSWER` в базе.
+    const нарисовать = (место, данные, ось, подпись) => Charts.hbars(qs(место), {
       items: (данные || []).slice(0, 12).map((з) => ({
         label: подпись ? подпись(з.value) : з.value, value: з.count, color: цвет,
         display: `${num(з.count, 0)} · ${fmtDur(з.talk_s)}`,
         note: `средний разговор ${fmtDur(з.avg_s)}`,
+        ключ: з.value,
       })),
       labelWidth: 150, emptyText: 'За период данных нет',
+      pickHint: 'щелчок — список звонков',
+      onPick: (номер, строка) => Drill.open(qs(место), О({
+        f: [`${ось}:${строка.ключ}`], title: `Звонки за период: ${строка.label}` })),
     });
-    нарисовать('#pbx-src', топ.src);
-    нарисовать('#pbx-dst', топ.dst);
-    нарисовать('#pbx-context', топ.context);
-    нарисовать('#pbx-disposition', топ.disposition,
+    нарисовать('#pbx-src', топ.src, 'src');
+    нарисовать('#pbx-dst', топ.dst, 'dst');
+    нарисовать('#pbx-context', топ.context, 'context');
+    нарисовать('#pbx-disposition', топ.disposition, 'disposition',
                (з) => ИТОГ_ЗВОНКА[з] || String(з).toLowerCase());
   },
 
@@ -7207,6 +8718,7 @@ RENDERERS.pbx = {
   drawIntake(тело, д) {
     const станции = д.stations || [];
     const причины = (д.tops || {}).skipped || [];
+    const { Р, О, весь } = this.раскрытие(д);
     тело.innerHTML = `
       <div class="grid cols-2">
         <section class="card"><div class="card-head"><h3>Почему звонок не распознан</h3>
@@ -7233,6 +8745,9 @@ RENDERERS.pbx = {
             <th>Что мешает</th><th></th></tr></thead>
           <tbody>${станции.length ? станции.map((с) => {
             const з = с.calls || {};
+            // Счётчики заходов — по архиву станции за всё время, а не за
+            // период (`call_counts`): у списка то же окно без нижней границы.
+            const её = { станция: с.id };
             return `<tr>
               <td>${esc(с.name)}<div class="small dim mono">${esc(с.id)}</div></td>
               <td class="small">${esc(ПАТС_ИСТОЧНИКИ[с.source] || с.source || '—')}
@@ -7242,9 +8757,12 @@ RENDERERS.pbx = {
               <td class="small">${с.last_run ? esc(fmtTime(с.last_run)) : '<span class="dim">не было</span>'}
                 ${(с.last_scan || {}).at ? `<div class="small dim">осмотр ${
                   esc(fmtAgo(с.last_scan.at))}</div>` : ''}</td>
-              <td class="num">${num(з.queued || 0, 0)}</td>
-              <td class="num">${num(з.skipped || 0, 0)}</td>
-              <td class="num">${num(з.deferred || 0, 0)}</td>
+              <td class="num">${Р(з.queued, num(з.queued || 0, 0),
+                { ...её, f: ['recognized'], title: `${с.name}: взято за всё время` }, весь)}</td>
+              <td class="num">${Р(з.skipped, num(з.skipped || 0, 0),
+                { ...её, f: ['skipped'], title: `${с.name}: пропущено за всё время` }, весь)}</td>
+              <td class="num">${Р(з.deferred, num(з.deferred || 0, 0),
+                { ...её, f: ['deferred'], title: `${с.name}: отложено` }, весь)}</td>
               <td class="small">${с.last_error
                 ? `<span class="chip err" title="${esc(с.last_error)}">${
                     esc(String(с.last_error).slice(0, 42))}</span>`
@@ -7262,16 +8780,25 @@ RENDERERS.pbx = {
       items: причины.slice(0, 12).map((п) => ({
         label: п.value, value: п.count, color: Charts.status().warn })),
       labelWidth: 170, emptyText: 'Все звонки периода доехали до распознавания',
+      pickHint: 'щелчок — список звонков',
+      onPick: (номер, строка) => Drill.open(qs('#pbx-reasons'), О({
+        f: [`reason:${строка.label}`], title: `Не распознано: ${строка.label}` })),
     });
     const за = д.period_calls || {};
     const пропущено = за.skipped || 0;
     Charts.stacked(qs('#pbx-funnel'), {
       parts: [
-        { label: 'распознано', value: за.queued || 0 },
-        { label: 'пропущено', value: пропущено },
-        { label: 'остальное', value: Math.max(0, (за.total || 0) - (за.queued || 0) - пропущено) },
+        { label: 'распознано', value: за.queued || 0, f: ['recognized'] },
+        { label: 'пропущено', value: пропущено, f: ['skipped'] },
+        // Остаток: ни задания, ни причины пропуска — отложенные и те, до
+        // кого забор ещё не дошёл.
+        { label: 'остальное', f: ['pending'],
+          value: Math.max(0, (за.total || 0) - (за.queued || 0) - пропущено) },
       ],
       emptyText: 'За период звонков не было',
+      pickHint: 'щелчок — список звонков',
+      onPick: (номер, доля) => Drill.open(qs('#pbx-funnel'), О({
+        f: доля.f, title: `Звонки за период: ${доля.label}` })),
     });
     const заход = qs('#pbx-scan-2');
     if (заход) заход.addEventListener('click', () => this.scan(''));
@@ -7316,10 +8843,19 @@ RENDERERS.pbx = {
       const итог = await API.post(`/api/telephony/scan${пар}`);
       const причины = Object.entries(итог.reasons || {}).map(([п, n]) => `${п}: ${n}`).join(', ');
       const сбои = (итог.errors || []).map((о) => `${о.name || о.station}: ${о.error}`).join('; ');
+      // Заход длится секунды, а на большом журнале и минуты, и за это время
+      // под каким-нибудь числом успевают раскрыть список звонков. Раздел
+      // перерисовывается целиком, и список пропал бы из-под рук — как при
+      // фоновом обновлении, которого в эту секунду никто не просил. Поэтому
+      // при раскрытом списке раздел остаётся как есть, а итог захода
+      // говорит, что числа на экране прежние и как их обновить.
+      const раскрыто = Boolean(qs('#pbx-top .drill-panel') || qs('#pbx-body .drill-panel'));
       toast(`Просмотрено ${итог.seen}, поставлено ${итог.imported}, пропущено ${итог.skipped}`,
             сбои ? 'warn' : итог.imported ? 'ok' : '',
-            [сбои, чужие_станции(итог), причины].filter(Boolean).join('; '));
-      await this.load();
+            [сбои, чужие_станции(итог), причины, раскрыто
+              ? 'числа раздела прежние, пока раскрыт список: нажмите «Обновить»' : '']
+              .filter(Boolean).join('; '));
+      if (!раскрыто) await this.load();
     } catch (err) {
       toast(err.message || 'Заход не удался', 'err', err.hint || '');
     } finally {
@@ -7717,11 +9253,27 @@ RENDERERS.content = {
       ['stress', 'Напряжение', 0], ['effort', 'Усилие клиента', 1],
       ['fatigue', 'Усталость оператора', 0],
     ];
+    // Раскрытие: числа свода — окном свода, точки ряда — своими корзинами.
+    const Р = раскрытиеРазбора(свод.window);
+    const среднее = (k) => (разметка) => Р(разметка, показательЧто(признак(k), c[k]));
+    const П = (имя, сколько, из, что, вид, целое) => полоса(имя, сколько, из, вид, {
+      часть: (разметка) => Р(разметка, что),
+      целое: целое ? (разметка) => Р(разметка, целое) : null });
+    const СДВИГ = [
+      { f: ['mood_up'], sort: 'mood_shift:desc', value: 'Сдвиг настроения',
+        title: 'Разговор выправился к концу' },
+      { f: ['mood_down'], sort: 'mood_shift:asc', value: 'Сдвиг настроения',
+        title: 'Разговор испортился к концу' },
+      // «Ровно» — всё остальное, включая записи, где сдвиг не измерен:
+      // так считает кольцо, поэтому и порядок здесь по времени.
+      { f: ['mood_flat'], title: 'Разговор закончился ровно или сдвиг не измерен' },
+    ];
     host.innerHTML = `
-      <div class="grid cols-5">
-        ${шкалы.map(([k, имя, знаков]) => пкпи(имя, c, p, k, знаков, признак(k))).join('')}
+      <div class="grid cols-5" style="margin-bottom:14px">
+        ${шкалы.map(([k, имя, знаков]) =>
+          пкпи(имя, c, p, k, знаков, признак(k), среднее(k))).join('')}
       </div>
-      <div class="grid cols-2" style="margin-top:14px">
+      <div class="grid cols-2">
         <section class="card"><div class="card-head"><h3>Настроение и напряжение во времени</h3>
           <span class="hint">по корзинам периода</span></div>
           <div id="emo-line" style="padding:12px 16px"></div></section>
@@ -7743,12 +9295,18 @@ RENDERERS.content = {
         <section class="card"><div class="card-head"><h3>Разговоры на нервах</h3>
           <span class="hint">напряжение 55 и выше</span></div>
           <div style="padding:12px 16px">
-            ${полоса('С высоким напряжением', c.stress_high, c.stress_checked)}
-            ${полоса('Клиенту пришлось пробиваться', c.effort_high, c.records)}
-            ${полоса('Клиент раздражён', c.frustrated, c.records)}
-            ${полоса('Повторное обращение', c.repeat, c.records)}
-            ${полоса('Разговор выправился к концу', c.recovered, c.records, 'ok')}
-            ${полоса('Разговор испортился к концу', c.worsened, c.records)}
+            ${П('С высоким напряжением', c.stress_high, c.stress_checked,
+                { f: ['stress_high'], sort: 'stress:desc', value: 'Напряжение',
+                  title: 'Разговоры с напряжением 55 и выше' }, '',
+                { f: ['has:stress'], sort: 'stress:desc', value: 'Напряжение',
+                  title: 'Записи, где напряжение измерено' })}
+            ${П('Клиенту пришлось пробиваться', c.effort_high, c.records,
+                { f: ['effort_high'], sort: 'effort:asc', value: 'Усилие клиента',
+                  title: 'Клиенту пришлось пробиваться' })}
+            ${П('Клиент раздражён', c.frustrated, c.records, РАЗДРАЖЁН)}
+            ${П('Повторное обращение', c.repeat, c.records, ПОВТОРНЫЕ)}
+            ${П('Разговор выправился к концу', c.recovered, c.records, СДВИГ[0], 'ok')}
+            ${П('Разговор испортился к концу', c.worsened, c.records, СДВИГ[1])}
           </div></section>
       </div>`;
 
@@ -7761,6 +9319,16 @@ RENDERERS.content = {
         { name: 'напряжение', values: точки.map((т) => т.stress ?? null) },
       ],
       height: 250, emptyText: 'За период разобранных записей нет',
+      // Точка — корзина ряда: её записи, сверху самые напряжённые. Где
+      // напряжение не измерено ни у одной, список идёт по времени.
+      onPick: (номер) => {
+        const т = точки[номер];
+        if (!т || !т.records) return;
+        const измерено = т.stress !== null && т.stress !== undefined;
+        Р.под(qs('#emo-line'), Object.assign(
+          { title: `Разговоры за ${периодКорзины(т)}` },
+          измерено ? { sort: 'stress:desc', value: 'Напряжение' } : {}), окноКорзины(т));
+      },
     });
     Charts.donut(qs('#emo-shift'), {
       parts: [
@@ -7770,12 +9338,15 @@ RENDERERS.content = {
                                              - (c.worsened || 0)) },
       ],
       centerLabel: 'разговоров', emptyText: 'За период разобранных записей нет',
+      ...(Р.есть ? { onPick: (номер) => Р.под(qs('#emo-shift'), СДВИГ[номер]) } : {}),
     });
+    let раскрыто = null;                 // список под столбцом разреза, если открыт
     const нарисовать = async () => {
+      const измерение = state.emoDim;
       let разрез;
       try {
         разрез = await API.latest('content-emo-dim',
-          `/api/content/breakdown/${state.emoDim}?period=${период}`);
+          `/api/content/breakdown/${измерение}?period=${период}`);
       } catch (err) {
         if (!err || err.code !== 'aborted') fail(err);
         return;
@@ -7784,6 +9355,12 @@ RENDERERS.content = {
       // в него — это TypeError в консоли и пустое место на экране.
       const место = qs('#emo-breakdown');
       if (!место) return;
+      // Список под прежним разрезом — про его группу: с новым разрезом он
+      // остался бы висеть под чужими столбцами.
+      свернутьРаскрытие(место, раскрыто);
+      раскрыто = null;
+      // У разреза свой ответ и своё окно — им и раскрываем его столбцы.
+      const Рр = раскрытиеРазбора(разрез.window);
       Charts.hbars(место, {
         items: (разрез.items || []).filter((и) => и.stress !== null && и.stress !== undefined)
           .slice(0, 12).map((и) => ({
@@ -7791,8 +9368,17 @@ RENDERERS.content = {
             color: Charts.status().warn,
             display: `${num(и.stress, 0)} · ${num(и.records, 0)} зап.`,
             note: `настроение ${fmtNumSafe(и.mood)} · усилие ${fmtNumSafe(и.effort)}`,
+            группа: отборГруппыРазбора(измерение, и.key),
+            pick: Boolean(отборГруппыРазбора(измерение, и.key)),
           })),
         labelWidth: 150, emptyText: 'В этом разрезе напряжение не считалось',
+        // Столбец — среднее напряжение группы: записи группы, где оно
+        // измерено, сверху самые напряжённые.
+        ...(Рр.есть ? { onPick: (номер, строка) => {
+          раскрыто = Рр.под(место, {
+            f: [...строка.группа, 'has:stress'], sort: 'stress:desc', value: 'Напряжение',
+            title: `Напряжение: ${строка.label === '—' ? 'группа без значения' : строка.label}` });
+        } } : {}),
       });
     };
     const выбор = qs('#emo-dim');
@@ -7819,20 +9405,33 @@ RENDERERS.content = {
       ['rhythm', 'Ритмичность речи', 0], ['politeness', 'Вежливость', 0],
       ['personalization', 'Персонализация', 0],
     ];
+    const Р = раскрытиеРазбора(свод.window);
+    const среднее = (k) => (разметка) => Р(разметка, показательЧто(признак(k), c[k]));
+    const П = (имя, сколько, из, что, целое) => полоса(имя, сколько, из, '', {
+      часть: (разметка) => Р(разметка, что),
+      целое: целое ? (разметка) => Р(разметка, целое) : null });
     host.innerHTML = `
-      <div class="grid cols-5">
-        ${шкалы.map(([k, имя, знаков]) => пкпи(имя, c, p, k, знаков, признак(k))).join('')}
+      <div class="grid cols-5" style="margin-bottom:14px">
+        ${шкалы.map(([k, имя, знаков]) =>
+          пкпи(имя, c, p, k, знаков, признак(k), среднее(k))).join('')}
       </div>
-      <div class="grid cols-2" style="margin-top:14px">
+      <div class="grid cols-2">
         <section class="card"><div class="card-head"><h3>Понятность и точность во времени</h3></div>
           <div id="clr-line" style="padding:12px 16px"></div></section>
         <section class="card"><div class="card-head"><h3>Что мешает слушать</h3>
           <span class="hint">доли записей с признаком</span></div>
           <div style="padding:12px 16px">
-            ${полоса('Речь тяжело слушать (понятность ниже 35)', c.clarity_low, c.clarity_checked)}
-            ${полоса('Уменьшительно-ласкательные', c.diminutive_records, c.records)}
-            ${полоса('Долгий монолог оператора', c.long_monologues, c.records)}
-            ${полоса('Клиент раздражён', c.frustrated, c.records)}
+            ${П('Речь тяжело слушать (понятность ниже 35)', c.clarity_low, c.clarity_checked,
+                { f: ['clarity_low'], sort: 'clarity:asc', value: 'Понятность',
+                  title: 'Записи с понятностью ниже 35' },
+                { f: ['has:clarity'], sort: 'clarity:asc', value: 'Понятность',
+                  title: 'Записи, где понятность измерена' })}
+            ${П('Уменьшительно-ласкательные', c.diminutive_records, c.records,
+                { f: ['diminutives'], title: 'Записи с уменьшительно-ласкательными' })}
+            ${П('Долгий монолог оператора', c.long_monologues, c.records,
+                { f: ['monologue'], sort: 'monologue_s:desc', value: 'Монолог', fmt: 'dur',
+                  title: 'Записи с монологом оператора от 2,5 минуты' })}
+            ${П('Клиент раздражён', c.frustrated, c.records, РАЗДРАЖЁН)}
           </div>
           <div class="small dim" style="padding:0 16px 14px">
             Понятность считается по речи оператора: длина фраз, канцелярит, темп и
@@ -7861,13 +9460,27 @@ RENDERERS.content = {
       ],
       height: 250, yMin: 0, yMax: 100,
       emptyText: 'За период разобранных записей нет',
+      // Точка — корзина ряда: её записи, сверху те, чью речь слушать труднее.
+      onPick: (номер) => {
+        const т = точки[номер];
+        if (!т || !т.records) return;
+        const измерено = т.clarity !== null && т.clarity !== undefined;
+        Р.под(qs('#clr-line'), Object.assign(
+          { title: `Разговоры за ${периодКорзины(т)}` },
+          измерено ? { sort: 'clarity:asc', value: 'Понятность' } : {}), окноКорзины(т));
+      },
     });
+    const по_кому = state.contentAgentBy || 'agent';
     const по_людям = await API.latest('content-clarity-agents',
-      `/api/content/employees?by=${state.contentAgentBy || 'agent'}&period=${период}`)
+      `/api/content/employees?by=${по_кому}&period=${период}`)
       .catch(() => ({ items: [] }));
     if (!qs('#clr-fillers')) return;          // вкладку сменили, пока ответ ехал
     const люди = (по_людям.items || []).filter((ч) => (ч.records || 0) > 0);
-    const столбики = (место, поле, знаков, единица) => Charts.hbars(qs(место), {
+    // Столбики по людям — из своего ответа: и окно его, и разрез тот, по
+    // которому он на самом деле посчитан (сервер называет его в `by`).
+    const Рл = раскрытиеРазбора(по_людям.window);
+    const разрез = по_людям.by || по_кому;
+    const столбики = (место, поле, знаков, единица, имя) => Charts.hbars(qs(место), {
       items: люди.filter((ч) => ч[поле] !== null && ч[поле] !== undefined)
         .sort((a, b) => b[поле] - a[поле]).slice(0, 10)
         // «—» — это записи без оператора; так их и подписываем, как в
@@ -7875,12 +9488,19 @@ RENDERERS.content = {
         .map((ч) => ({ label: ч.key === '—' ? 'без оператора' : (ч.label || ч.key),
                        value: ч[поле], color: Charts.palette()[0],
                        display: `${num(ч[поле], знаков)}${единица}`,
-                       note: `записей ${num(ч.records, 0)}` })),
+                       note: `записей ${num(ч.records, 0)}`,
+                       группа: отборГруппыРазбора(разрез, ч.key),
+                       pick: Boolean(отборГруппыРазбора(разрез, ч.key)) })),
       labelWidth: 140, emptyText: 'Разбор по сотрудникам пока пуст',
+      // Столбик — среднее по записям человека: они и раскрываются, сверху
+      // те, где показатель выше.
+      ...(Рл.есть ? { onPick: (номер, строка) => Рл.под(qs(место), {
+        f: [...строка.группа, `has:${поле}`], sort: `${поле}:desc`, value: имя,
+        title: `${имя}: ${строка.label}` }) } : {}),
     });
-    столбики('#clr-fillers', 'filler_rate', 4, '');
-    столбики('#clr-dim', 'diminutive_rate', 4, '');
-    столбики('#clr-rhythm', 'rhythm', 0, '');
+    столбики('#clr-fillers', 'filler_rate', 4, '', 'Слова-паразиты');
+    столбики('#clr-dim', 'diminutive_rate', 4, '', 'Уменьшительно-ласкательные');
+    столбики('#clr-rhythm', 'rhythm', 0, '', 'Ритмичность');
   },
 
   // --- NPS ----------------------------------------------------------------
@@ -7896,6 +9516,21 @@ RENDERERS.content = {
     const всего = c.nps_checked || 0;
     const индекс = c.nps_index;
     const пусто = (v) => v === null || v === undefined;
+    // Раскрытие. Индекс и средний балл посчитаны по разговорам, где было
+    // что оценивать, — они и раскрываются, сверху самые низкие баллы.
+    // Предсказанное и названное — разные списки, как и разные числа.
+    const Р = раскрытиеРазбора(свод.window);
+    const Рп = раскрытиеРазбора(свод.window_previous);
+    const ОЦЕНЁННЫЕ = { f: ['has:nps'], sort: 'nps:asc', value: 'NPS разговора',
+                        title: 'Разговоры с предсказанным баллом NPS' };
+    const НАЗВАВШИЕ = { f: ['has:nps_said'], sort: 'nps_said:asc', value: 'Названный балл',
+                        fmt: 'int', title: 'Разговоры, где клиент назвал балл' };
+    const ГРУППЫ = [['промоутер', 'Промоутеры'], ['нейтрал', 'Нейтралы'], ['критик', 'Критики']]
+      .map(([группа, имя]) => ({ f: [`nps_group:${группа}`],
+                                 title: `${имя} — по предсказанному баллу` }));
+    const НАЗВАННЫЕ = [['stated_promoter', 'назвали 9–10'], ['stated_passive', 'назвали 7–8'],
+                       ['stated_detractor', 'назвали 6 и ниже']]
+      .map(([отбор, имя]) => ({ f: [отбор], title: `Разговоры, где клиенты ${имя}` }));
     host.innerHTML = `
       <section class="card">
         <div class="card-head"><h3>Индекс NPS</h3>
@@ -7906,24 +9541,35 @@ RENDERERS.content = {
           <span class="chip" title="по скольким разговорам было что оценивать; ровные разговоры без окрашенных реплик клиента балла не получают">${
             num(всего, 0)} ${plural(всего, 'разговор', 'разговора', 'разговоров')}</span>
         </div>
+        <div data-drill-host>
         <div class="grid cols-4" style="padding:14px 16px">
-          ${kpi('Индекс NPS', пусто(индекс) ? '—' : num(индекс, 0),
-                !пусто(p.nps_index) ? `было ${num(p.nps_index, 0)}` : 'предсказанный, от −100 до +100')}
-          ${kpi('Средний балл', пусто(c.nps) ? '—' : num(c.nps, 1),
+          ${kpi('Индекс NPS', пусто(индекс) ? '—' : Р(num(индекс, 0), ОЦЕНЁННЫЕ, всего),
+                !пусто(p.nps_index) ? `было ${Рп(num(p.nps_index, 0), Object.assign({}, ОЦЕНЁННЫЕ,
+                  { title: 'Разговоры с предсказанным баллом NPS: прошлый период' }))}`
+                  : 'предсказанный, от −100 до +100')}
+          ${kpi('Средний балл', пусто(c.nps) ? '—' : Р(num(c.nps, 1), ОЦЕНЁННЫЕ, всего),
                 'предсказанный, по шкале 0–10')}
-          ${kpi('Названный балл', пусто(c.nps_stated_avg) ? '—' : num(c.nps_stated_avg, 1),
+          ${kpi('Названный балл', пусто(c.nps_stated_avg) ? '—'
+                  : Р(num(c.nps_stated_avg, 1), НАЗВАВШИЕ, c.nps_stated_count),
                 c.nps_stated_count ? `индекс ${c.nps_stated_index ?? '—'} по ${
                   num(c.nps_stated_count, 0)} ответам` : 'клиентов не спрашивали')}
-          ${kpi('Промоутеры', num(c.promoters || 0, 0),
-                `нейтралы ${num(c.passives || 0, 0)} · критики ${num(c.detractors || 0, 0)}`)}
+          ${kpi('Промоутеры', Р(num(c.promoters || 0, 0), ГРУППЫ[0], c.promoters),
+                `нейтралы ${Р(num(c.passives || 0, 0), ГРУППЫ[1], c.passives)} · критики ${
+                  Р(num(c.detractors || 0, 0), ГРУППЫ[2], c.detractors)}`)}
         </div>
         ${c.csat_count ? `<div class="grid cols-4" style="padding:0 16px 14px">
-          ${kpi('Оценка из пяти', num(c.csat_avg, 2),
+          ${kpi('Оценка из пяти', Р(num(c.csat_avg, 2), { f: ['has:csat_said'],
+                  sort: 'csat_said:asc', value: 'Оценка из пяти', fmt: 'int',
+                  title: 'Разговоры с оценкой по пятибалльной шкале' }, c.csat_count),
                 `названа ${num(c.csat_count, 0)} ${plural(c.csat_count, 'раз', 'раза', 'раз')} на вопрос по пятибалльной шкале — это не NPS`)}
-          ${kpi('Названный: промоутеры', num(c.promoters_stated || 0, 0),
-                `нейтралы ${num(c.passives_stated || 0, 0)} · критики ${num(c.detractors_stated || 0, 0)}`)}
+          ${kpi('Названный: промоутеры',
+                Р(num(c.promoters_stated || 0, 0), НАЗВАННЫЕ[0], c.promoters_stated),
+                `нейтралы ${Р(num(c.passives_stated || 0, 0), НАЗВАННЫЕ[1], c.passives_stated)
+                } · критики ${Р(num(c.detractors_stated || 0, 0), НАЗВАННЫЕ[2], c.detractors_stated)}`)}
         </div>` : ''}
-        <div style="padding:0 16px 16px"><div id="nps-bar"></div></div>
+        <div style="padding:0 16px"><div id="nps-bar"></div></div>
+        </div>
+        <div style="height:16px"></div>
         <div class="banner" style="margin:0 16px 16px">
           <b>Предсказанный балл — не опрос.</b> Индекс, средний балл и промоутеры
           выше — предсказанные: сервер считает их из настроения клиента к концу
@@ -7954,6 +9600,7 @@ RENDERERS.content = {
         { label: 'критики', value: c.detractors || 0, color: Charts.status().err },
       ],
       height: 30, emptyText: 'За период оценок нет',
+      ...(Р.есть ? { onPick: (номер) => Р.под(qs('#nps-bar'), ГРУППЫ[номер]) } : {}),
     });
     const точки = лента.buckets || [];
     Charts.line(qs('#nps-line'), {
@@ -7966,18 +9613,33 @@ RENDERERS.content = {
           : [])],
       height: 250, yMin: 0, yMax: 10,
       emptyText: 'За период разобранных записей нет',
+      // Точка — корзина ряда: разговоры с баллом за неё, сверху самые низкие.
+      // Корзина без единого балла раскрывается всеми своими записями.
+      onPick: (номер) => {
+        const т = точки[номер];
+        if (!т || !т.records) return;
+        const оценено = т.nps !== null && т.nps !== undefined;
+        Р.под(qs('#nps-line'), оценено
+          ? Object.assign({}, ОЦЕНЁННЫЕ, { title: `NPS: разговоры за ${периодКорзины(т)}` })
+          : { title: `Разговоры за ${периодКорзины(т)}` }, окноКорзины(т));
+      },
     });
+    let раскрыто = null;                 // список под столбцом разреза, если открыт
     const нарисовать = async () => {
+      const измерение = state.npsDim;
       let разрез;
       try {
         разрез = await API.latest('content-nps-dim',
-          `/api/content/breakdown/${state.npsDim}?period=${период}`);
+          `/api/content/breakdown/${измерение}?period=${период}`);
       } catch (err) {
         if (!err || err.code !== 'aborted') fail(err);
         return;
       }
       const место = qs('#nps-breakdown');
       if (!место) return;
+      свернутьРаскрытие(место, раскрыто);
+      раскрыто = null;
+      const Рр = раскрытиеРазбора(разрез.window);
       Charts.hbars(место, {
         items: (разрез.items || []).filter((и) => и.nps_index !== null
                                                   && и.nps_index !== undefined)
@@ -7986,11 +9648,19 @@ RENDERERS.content = {
             label: и.label || и.key, value: и.nps_index,
             display: `${num(и.nps_index, 0)} · ${num(и.records, 0)} зап.`,
             note: `промоутеров ${num(и.promoters, 0)}, критиков ${num(и.detractors, 0)}`,
+            группа: отборГруппыРазбора(измерение, и.key),
+            pick: Boolean(отборГруппыРазбора(измерение, и.key)),
           })),
         // Двусторонний вид не навязываем: когда критиков больше везде,
         // все значения отрицательные, и деление оси пополам оставляет
         // половину картинки пустой.
         labelWidth: 160, emptyText: 'В этом разрезе оценок нет',
+        // Столбец — индекс группы: её разговоры с баллом, сверху самые низкие.
+        ...(Рр.есть ? { onPick: (номер, строка) => {
+          раскрыто = Рр.под(место, Object.assign({}, ОЦЕНЁННЫЕ, {
+            f: [...строка.группа, 'has:nps'],
+            title: `NPS: ${строка.label === '—' ? 'группа без значения' : строка.label}` }));
+        } } : {}),
       });
     };
     const выбор = qs('#nps-dim');
@@ -8023,24 +9693,58 @@ RENDERERS.content = {
       return;
     }
 
+    /* Раскрытие чисел свода в записи. У каждого ответа окно своё: числа
+     * периода — окном свода, прошлого периода — его прошлым окном, точки
+     * графиков — границами своих корзин (их прислал сервер).
+     *
+     * Среднее раскрывается в записи, по которым оно посчитано, счётчик
+     * записей — в сами записи. Две плитки показывают не записи, а суммы по
+     * ним: «Обещаний без срока» и «Возражений без отработки». Под ними —
+     * записи, из которых сумма сложилась, и столбец величины говорит,
+     * сколько внесла каждая: строк в списке меньше, чем число на плитке. */
+    const Р = раскрытиеРазбора(свод.window);
+    const Рп = раскрытиеРазбора(свод.window_previous);
+    const среднее = (k, ещё) => показательЧто(признак(k), c[k], ещё);
+    const ТОН = {
+      negative: { f: ['negative'], sort: 'sentiment:asc', value: 'Тональность',
+                  title: 'Отрицательные разговоры (тональность ниже −0,15)' },
+      neutral: { f: ['neutral'], sort: 'sentiment:asc', value: 'Тональность',
+                 title: 'Нейтральные разговоры' },
+      positive: { f: ['positive'], sort: 'sentiment:desc', value: 'Тональность',
+                  title: 'Положительные разговоры (тональность выше 0,15)' },
+      mixed: { f: ['mixed'], title: 'Противоречивые разговоры' },
+    };
+    const ВОЗРАЖЕНИЯ = { f: ['objection'], sort: 'objections:desc', value: 'Возражений',
+                         fmt: 'int', title: 'Записи с возражениями клиента' };
+
     host.innerHTML = `
       <div class="grid cols-6" style="margin-bottom:16px">
-        ${kpi('Записей', num(c.records), `${num(c.hours)} ч звука`,
-              p.records ? { dir: c.records >= p.records ? 'up' : 'down',
-                            text: `было ${num(p.records)}` } : null)}
-        ${kpi('Тональность', num(c.sentiment, 2),
-              `разворот ${num(c.sentiment_shift, 2)}` +
+        ${kpi('Записей', Р(num(c.records), { title: 'Разобранные записи за период' }, c.records),
+              `${num(c.hours)} ч звука`,
+              p.records ? `<div class="kpi-trend ${c.records >= p.records ? 'up' : 'down'}">было ${
+                Рп(num(p.records), { title: 'Разобранные записи за прошлый период' }, p.records)
+              }</div>` : null)}
+        ${kpi('Тональность', Р(num(c.sentiment, 2), среднее('sentiment')),
+              `разворот ${Р(num(c.sentiment_shift, 2), среднее('sentiment_shift'))}` +
               delta(c.sentiment, p.sentiment, признак('sentiment')))}
         ${kpi('Отрицательных',
-              c.negative_share === null ? '—' : `${num(c.negative_share, 1)}%`,
-              `${num(c.negative)} из ${num(c.scored)}` +
+              c.negative_share === null ? '—'
+                : Р(`${num(c.negative_share, 1)}%`, ТОН.negative, c.negative),
+              `${num(c.negative)} из ${Р(num(c.scored), { f: ['scored'],
+                title: 'Записи с оценкой тональности' }, c.scored)}` +
               delta(c.negative_share, p.negative_share, { good: -1, digits: 1 }))}
-        ${kpi('Тревожных', num(c.alert_records),
+        ${kpi('Тревожных', Р(num(c.alert_records), { f: ['alerts'],
+                title: 'Записи с тревожными упоминаниями' }, c.alert_records),
               c.alert_share === null ? 'записей с упоминанием суда и жалоб'
                 : `${num(c.alert_share, 1)}% записей — суд, жалобы, огласка`)}
-        ${kpi('Обещаний без срока', num(c.commitments_open),
-              `всего обещаний ${num(c.commitments)}`)}
-        ${kpi('Скрипт', c.compliance !== null ? pct(c.compliance, 0) : '—',
+        ${kpi('Обещаний без срока', Р(num(c.commitments_open), { f: ['open_commitments'],
+                sort: 'commitments_open:desc', value: 'Без срока', fmt: 'int',
+                title: 'Записи с обещаниями без срока' }, c.commitments_open),
+              `всего обещаний ${Р(num(c.commitments), { f: ['nz:commitments'],
+                sort: 'commitments:desc', value: 'Обещаний', fmt: 'int',
+                title: 'Записи с обещаниями' }, c.commitments)}`)}
+        ${kpi('Скрипт', c.compliance !== null
+                ? Р(pct(c.compliance, 0), среднее('compliance', { fmt: 'pct' })) : '—',
               'средняя доля выполненных пунктов' +
               delta(c.compliance, p.compliance, признак('compliance')))}
       </div>
@@ -8048,45 +9752,54 @@ RENDERERS.content = {
       ${card('Как распределились разговоры', 'по оценке тональности',
              `<div id="tone-bar"></div>
               <div class="row small dim" style="margin-top:10px;gap:16px">
-                <span>отрицательных: <b>${num(c.negative)}</b></span>
-                <span>нейтральных: <b>${num(c.neutral)}</b></span>
-                <span>положительных: <b>${num(c.positive)}</b></span>
-                ${c.mixed ? `<span title="и резкие, и тёплые реплики — средняя по ним ничего не говорит">из нейтральных противоречивых: <b>${num(c.mixed)}</b></span>` : ''}
+                <span>отрицательных: <b>${Р(num(c.negative), ТОН.negative, c.negative)}</b></span>
+                <span>нейтральных: <b>${Р(num(c.neutral), ТОН.neutral, c.neutral)}</b></span>
+                <span>положительных: <b>${Р(num(c.positive), ТОН.positive, c.positive)}</b></span>
+                ${c.mixed ? `<span title="и резкие, и тёплые реплики — средняя по ним ничего не говорит">из нейтральных противоречивых: <b>${Р(num(c.mixed), ТОН.mixed, c.mixed)}</b></span>` : ''}
               </div>`)}
 
       <div class="grid cols-4" style="margin-bottom:16px">
-        ${kpi('Балл оператора', c.agent_score === null || c.agent_score === undefined ? '—' : num(c.agent_score, 0),
+        ${kpi('Балл оператора', c.agent_score === null || c.agent_score === undefined ? '—'
+                : Р(num(c.agent_score, 0), среднее('agent_score', { fmt: 'int' })),
               c.agent_score === null || c.agent_score === undefined
                 ? 'скрипт с весами минус штрафы; без пунктов скрипта балла нет'
                 : `из 100 по ${num(c.scored_agents)} записям — скрипт с весами минус штрафы стоп-слов`,
               delta(c.agent_score, p.agent_score, признак('agent_score')))}
-        ${kpi('Нарушения оператора', num(c.violation_records),
+        ${kpi('Нарушения оператора', Р(num(c.violation_records), { f: ['violation'],
+                title: 'Записи с нарушениями оператора' }, c.violation_records),
               c.violation_share === null || c.violation_share === undefined ? 'стоп-слова и другие категории вида «нарушение»'
                 : `${num(c.violation_share, 1)}% записей — стоп-слова и другие категории вида «нарушение»`)}
-        ${kpi('Индекс эмпатии', c.empathy === null || c.empathy === undefined ? '—' : `${c.empathy > 0 ? '+' : ''}${num(c.empathy, 0)}`,
+        ${kpi('Индекс эмпатии', c.empathy === null || c.empathy === undefined ? '—'
+                : Р(`${c.empathy > 0 ? '+' : ''}${num(c.empathy, 0)}`, среднее('empathy', { fmt: 'int' })),
               '(вежливых − невежливых) ÷ сумму по репликам оператора; от −100 до +100',
               delta(c.empathy, p.empathy, признак('empathy')))}
         ${kpi('Возражений без отработки',
               c.objections_unhandled_share === null || c.objections_unhandled_share === undefined
-                ? '—' : num(c.objections_unhandled),
+                ? '—' : Р(num(c.objections_unhandled), { f: ['objection_unhandled'],
+                    sort: 'objections_unhandled:desc', value: 'Без отработки', fmt: 'int',
+                    title: 'Записи с возражениями без отработки' }, c.objections_unhandled),
               c.objections_unhandled_share === null || c.objections_unhandled_share === undefined
-                ? (c.objections ? `возражений ${num(c.objections)}; отработку считать нечем — в наборе нет категорий «отработка»`
+                ? (c.objections ? `возражений ${Р(num(c.objections), ВОЗРАЖЕНИЯ, c.objections)}; отработку считать нечем — в наборе нет категорий «отработка»`
                                 : 'возражений клиента за период нет')
-                : `${num(c.objections_unhandled_share, 1)}% из ${num(c.objections)} — за «дорого» и «подумаю» не последовало отработки`)}
+                : `${num(c.objections_unhandled_share, 1)}% из ${Р(num(c.objections), ВОЗРАЖЕНИЯ, c.objections)} — за «дорого» и «подумаю» не последовало отработки`)}
       </div>
       <div class="grid cols-4" style="margin-bottom:16px">
-        ${kpi('Клиент раздражён', num(c.frustrated),
+        ${kpi('Клиент раздражён', Р(num(c.frustrated), РАЗДРАЖЁН, c.frustrated),
               c.frustrated_share === null ? 'по репликам клиента'
                 : `${num(c.frustrated_share, 1)}% записей — «сколько можно», «позовите руководителя»`)}
-        ${kpi('Повторные обращения', num(c.repeat),
+        ${kpi('Повторные обращения', Р(num(c.repeat), ПОВТОРНЫЕ, c.repeat),
               c.repeat_share === null ? 'по репликам клиента'
                 : `${num(c.repeat_share, 1)}% записей — «уже звонил», «до сих пор не»`)}
-        ${kpi('Противоречивых', num(c.mixed),
+        ${kpi('Противоречивых', Р(num(c.mixed), ТОН.mixed, c.mixed),
               'и резкие, и тёплые реплики в одном разговоре')}
         ${kpi('Мат у сотрудника',
-              c.profanity_checked ? num(c.profanity_agent_records) : '—',
+              c.profanity_checked ? Р(num(c.profanity_agent_records), { f: ['profanity_agent'],
+                title: 'Записи с нецензурной лексикой у сотрудника' }, c.profanity_agent_records) : '—',
               c.profanity_checked
-                ? `в разговоре вообще: ${num(c.profanity_records)} из ${num(c.profanity_checked)} проверенных`
+                ? `в разговоре вообще: ${Р(num(c.profanity_records), { f: ['profanity'],
+                    title: 'Записи с нецензурной лексикой' }, c.profanity_records)} из ${
+                    Р(num(c.profanity_checked), { f: ['has:profanity'],
+                      title: 'Записи, проверенные словарём' }, c.profanity_checked)} проверенных`
                 : 'словарь выключен — настройка content_profanity')}
       </div>
 
@@ -8104,12 +9817,13 @@ RENDERERS.content = {
                '<div id="chart-vol-time"></div>')}
       </div>
 
-      ${c.mono ? `<div class="finding info" style="margin-bottom:14px">
-        В ${num(c.mono_share, 1)} % записей периода (${num(c.mono)} из ${num(c.records)})
+      ${c.mono ? `<div data-drill-host style="margin-bottom:14px"><div class="finding info">
+        В ${num(c.mono_share, 1)} % записей периода (${Р(num(c.mono), { f: ['mono'],
+          title: 'Записи, где говорящий не разделён' }, c.mono)} из ${num(c.records)})
         говорящий не разделён. Перебивания, монологи, разрез по операторам и ход
         тональности по ним не считаются — ноль в этих строках означает «нечем
         считать», а не «этого не было». Включается настройкой диаризации.
-      </div>` : ''}
+      </div></div>` : ''}
 
       ${card('Речь и разговор',
              `усреднённые характеристики записей периода; норма — медиана и коридор половины записей за ${
@@ -8131,8 +9845,10 @@ RENDERERS.content = {
                  const н = норма(f.key);
                  return `<tr><td${f.hint ? ` title="${esc(f.hint)}"` : ''}>${esc(f.title)}${f.unit ? ` <span class="faint small">${esc(f.unit)}</span>` : ''}${
                    f.hint ? `<div class="faint small">${esc(f.hint)}</div>` : ''}</td>
-                   <td class="num mono">${num(a, f.digits)}</td>
-                   <td class="num mono faint">${b === null || b === undefined ? '—' : num(b, f.digits)}</td>
+                   <td class="num mono">${Р(num(a, f.digits), показательЧто(f, a))}</td>
+                   <td class="num mono faint">${b === null || b === undefined ? '—'
+                     : Рп(num(b, f.digits), показательЧто(f, b, {
+                         title: `${f.title}: записи прошлого периода` }))}</td>
                    <td class="num mono ${d && f.good ? (Math.sign(d) * f.good > 0 ? 'ok-text' : 'err-text') : ''}">${
                      d === null ? '—' : d === 0 ? 'без изменений'
                        : (d > 0 ? '+' : '') + num(d, f.digits)}</td>
@@ -8155,8 +9871,17 @@ RENDERERS.content = {
               `${fmtTime((к.points[ф.index] || {}).ts).slice(0, 5)}: ${num(ф.value, 2)} — ${esc(ф.why)}`).join('; ')}</div>` : ''}
           </div>`).join('')}</div>`) : ''}`;
 
-    toneBar(qs('#tone-bar'), c);
+    toneBar(qs('#tone-bar'), c, Р.есть ? (имя) => Р.под(qs('#tone-bar'), ТОН[имя]) : null);
     // Контрольные карты: значение по дням и пределы 2σ/3σ плоскими линиями.
+    // Точка карты — сутки, и раскрывается она в записи этих суток: у доли
+    // отрицательных — в отрицательные, у остальных — в те, по которым
+    // среднее дня посчитано. Линии пределов — статистика базы, не записи.
+    const КАРТА_ЧТО = {
+      negative_share: ТОН.negative,
+      agent_score: среднее('agent_score', { fmt: 'int' }),
+      sentiment: среднее('sentiment'),
+      compliance: среднее('compliance', { fmt: 'pct' }),
+    };
     (карты.charts || []).forEach((к) => {
       const узел = qs(`#spc-${к.key}`);
       if (!узел) return;
@@ -8164,6 +9889,7 @@ RENDERERS.content = {
       const метки = точки.map((т) => fmtTime(т.ts).slice(0, 5));
       const пределы = к.limits || {};
       const ряд = (v) => точки.map(() => (v === null || v === undefined ? null : v));
+      const что = КАРТА_ЧТО[к.key];
       window.Charts.line(узел, {
         height: 180, labels: метки,
         series: [
@@ -8175,14 +9901,33 @@ RENDERERS.content = {
           ] : []),
         ],
         emptyText: 'нет данных за период',
+        ...(что ? { onPick: (номер) => {
+          const т = точки[номер];
+          if (!т || !т.records || т.value === null || т.value === undefined) return;
+          if (к.key === 'negative_share' && !т.value) return;      // ни одной отрицательной
+          Р.под(узел, Object.assign({}, что, {
+            title: `${к.title}: записи за ${периодКорзины(т)}` }), окноКорзины(т));
+        } } : {}),
       });
     });
     const точки = (лента.buckets || []).filter((т) => т.records);
     const метки = точки.map((т) => fmtTime(т.ts).slice(0, 5));
+    // Точка ряда — корзина времени: её границы прислал сервер, и список под
+    // точкой берётся ровно по ним, а не «по подписи на оси».
+    // `есть(точка)` — есть ли под точкой что раскрывать: корзина без единой
+    // оценённой записи или с нулём отрицательных дала бы пустой список.
+    const подТочкой = (узел, что, заголовок, есть) => (номер) => {
+      const т = точки[номер];
+      if (!т || !что || (есть && !есть(т))) return;
+      Р.под(узел, Object.assign({}, что, { title: `${заголовок} за ${периодКорзины(т)}` }),
+            окноКорзины(т));
+    };
     window.Charts.line(qs('#chart-tone-time'), {
       height: 220, labels: метки, yMin: -1, yMax: 1,
       series: [{ name: 'тональность', values: точки.map((т) => т.sentiment) }],
       emptyText: 'нет данных за период',
+      onPick: подТочкой(qs('#chart-tone-time'), среднее('sentiment'), 'Тональность: записи',
+                        (т) => т.sentiment !== null && т.sentiment !== undefined),
     });
     // Проценты и штуки — на разных графиках. На одной оси это вторая шкала
     // в маскировке: кривые сходятся и расходятся не потому, что связаны, а
@@ -8192,10 +9937,13 @@ RENDERERS.content = {
       series: [{ name: 'доля отрицательных, %',
                  values: точки.map((т) => т.negative_share) }],
       emptyText: 'нет данных за период',
+      onPick: подТочкой(qs('#chart-neg-time'), ТОН.negative, 'Отрицательные разговоры',
+                        (т) => Boolean(т.negative_share)),
     });
     window.Charts.bars(qs('#chart-vol-time'), {
       height: 220, values: точки.map((т) => т.records), labels: метки,
       emptyText: 'нет данных за период',
+      onPick: подТочкой(qs('#chart-vol-time'), {}, 'Разобранные записи'),
     });
     host.insertAdjacentHTML('beforeend', '<div id="llm-summary"></div>');
     this.drawLlmSummary(qs('#llm-summary', host), период);
@@ -8226,23 +9974,48 @@ RENDERERS.content = {
     }
     const исходы = д.outcomes || [];
     const причины = д.reasons || [];
+    /* Раскрытие. Свод модели считается не по разбору содержания, а по
+     * ответам модели (основа списка `llm`), и условия у него свои: готовые
+     * задания без контрольных прогонов, ответ без сбоя. Они и стоят в каждом
+     * отборе — иначе в список попали бы записи, которых свод не считал. */
+    const Р = раскрытиеРазбора(д.window, 'llm');
+    const РАЗОБРАНО = ['status:completed', 'no_control', 'llm_ok'];
+    const ответы = (отбор, заголовок, ещё) => Object.assign(
+      { f: [...РАЗОБРАНО, ...отбор], title: заголовок }, ещё || {});
+    const метка = (т) => т.label || т.id;
     host.innerHTML = card('По ответам языковой модели',
       `${esc(д.model || '')} · разобрано ${num(д.analyzed)} из ${num(д.records)} записей периода${д.stale ? ` · ${num(д.stale)} по прежним подсказкам` : ''}${д.errors ? ` · ошибок ${num(д.errors)}` : ''}${д.off_list ? ` · ${num(д.off_list)} ответов мимо списка` : ''}`,
-      `<div class="grid cols-4" style="margin-bottom:10px">
-        ${kpi('Вопрос решён', проц(д.resolved_share), 'по оценке модели')}
-        ${kpi('Действий к исполнению', num(д.actions || 0), `в ${num(д.records_with_actions || 0)} записях`)}
-        ${kpi('Покрытие', д.coverage === null ? '—' : pct(д.coverage, 0), 'записей с ответом')}
-        ${kpi('Ответ модели', д.avg_latency_ms ? `${num(д.avg_latency_ms / 1000, 1)} с` : '—', 'на запись, в среднем')}
-      </div>
-      <div class="grid cols-2">
+      `<div data-drill-host><div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('Вопрос решён', Р(проц(д.resolved_share),
+                ответы(['resolved:1'], 'Вопрос решён — по оценке модели'), д.resolved_share),
+              'по оценке модели')}
+        ${kpi('Действий к исполнению', num(д.actions || 0),
+              `в ${Р(num(д.records_with_actions || 0), ответы(['with_actions'],
+                'Записи с действиями к исполнению'), д.records_with_actions)} записях`)}
+        ${kpi('Покрытие', д.coverage === null ? '—'
+                : Р(pct(д.coverage, 0), ответы([], 'Записи с ответом модели'), д.analyzed),
+              'записей с ответом')}
+        ${kpi('Ответ модели', д.avg_latency_ms
+                ? Р(`${num(д.avg_latency_ms / 1000, 1)} с`, ответы([], 'Записи по времени ответа модели',
+                    { sort: 'llm_latency:desc', value: 'Ответ модели', fmt: 'ms' }))
+                : '—', 'на запись, в среднем')}
+      </div></div>
+      <div data-drill-host><div class="grid cols-2" style="margin-bottom:10px">
         <div><div class="small dim" style="margin-bottom:6px"><b>Исходы</b></div><div id="llm-outcomes"></div></div>
         <div><div class="small dim" style="margin-bottom:6px"><b>Причины обращений</b></div><div id="llm-reasons"></div></div>
-      </div>
+      </div></div>
       ${(д.trackers || []).length ? `<table style="margin-top:10px"><thead><tr><th>Умный трекер</th><th class="num">Проверено</th><th class="num">Сработал</th><th class="num">Доля</th><th></th></tr></thead><tbody>
-        ${д.trackers.map((т) => `<tr><td>${esc(т.label || т.id)}</td><td class="num">${num(т.checked)}</td><td class="num">${num(т.fired)}</td>
+        ${д.trackers.map((т) => `<tr><td>${esc(метка(т))}</td>
+          <td class="num">${Р(num(т.checked), ответы([`tracker_checked:${т.id}`],
+            `Трекер «${метка(т)}»: где проверялся`), т.checked)}</td>
+          <td class="num">${Р(num(т.fired), ответы([`tracker:${т.id}`],
+            `Трекер «${метка(т)}»: где сработал`), т.fired)}</td>
           <td class="num mono">${т.checked ? pct(т.fired / т.checked, 0) : '—'}</td><td></td></tr>`).join('')}</tbody></table>` : ''}
       ${(д.scorecard || []).length ? `<table style="margin-top:10px"><thead><tr><th>Вопрос скоркарты</th><th class="num">Да</th><th class="num">Нет</th><th class="num">Н/п</th><th class="num">Доля «да»</th></tr></thead><tbody>
-        ${д.scorecard.map((в) => `<tr><td>${esc(в.question || в.id)}</td><td class="num">${num(в['да'])}</td><td class="num">${num(в['нет'])}</td><td class="num">${num(в['н/п'])}</td>
+        ${д.scorecard.map((в) => `<tr><td>${esc(в.question || в.id)}</td>
+          ${[['да', 'score_yes'], ['нет', 'score_no'], ['н/п', 'score_na']].map(([ответ, отбор]) =>
+            `<td class="num">${Р(num(в[ответ]), ответы([`${отбор}:${в.id}`],
+              `«${в.question || в.id}» — ${ответ}`), в[ответ])}</td>`).join('')}
           <td class="num mono">${(в['да'] + в['нет']) ? pct(в['да'] / (в['да'] + в['нет']), 0) : '—'}</td></tr>`).join('')}</tbody></table>` : ''}
       ${(д.action_items || []).length ? `<div class="small dim" style="margin-top:10px"><b>Действия к исполнению</b> — последние</div>
         <div class="analysis-lines">${д.action_items.slice(0, 8).map((а) => `<div class="analysis-line">
@@ -8254,12 +10027,16 @@ RENDERERS.content = {
       Charts.donut(qs('#llm-outcomes', host), {
         size: 150, centerLabel: 'записей', emptyText: 'исходы не спрашивались',
         parts: исходы.map((и) => ({ label: и.key, value: и.records })),
+        ...(Р.есть ? { onPick: (номер, доля) => Р.под(qs('#llm-outcomes', host),
+          ответы([`outcome:${доля.label}`], `Исход: ${доля.label}`)) } : {}),
       });
     } else { qs('#llm-outcomes', host).innerHTML = '<div class="empty small">исходы не спрашивались</div>'; }
     if (причины.length) {
       Charts.hbars(qs('#llm-reasons', host), {
         items: причины.map((п) => ({ label: п.key, value: п.records })), labelWidth: 200,
         emptyText: 'причины не спрашивались',
+        ...(Р.есть ? { onPick: (номер, строка) => Р.под(qs('#llm-reasons', host),
+          ответы([`reason:${строка.label}`], `Причина обращения: ${строка.label}`)) } : {}),
       });
     } else { qs('#llm-reasons', host).innerHTML = '<div class="empty small">причины не спрашивались</div>'; }
   },
@@ -8274,9 +10051,15 @@ RENDERERS.content = {
         .catch(() => ({ items: [] }))));
     const по_ключу = Object.fromEntries(разрезы.map((d, i) => [d, данные[i]]));
 
+    // Раскрытие: у каждого разреза свой ответ и своё окно — число строки
+    // раскрывается окном того ответа, из которого оно взято.
+    const Р = РаскрытиеЗаписей;
     const таблица = (данные) => {
       const items = данные.items || [];
       if (!items.length) return '<div class="empty small">Групп с достаточным числом записей нет</div>';
+      const окно = данные.window;
+      const Ч = (разметка, г, показатель) => Р.число(разметка, окно,
+        Р.группа(данные.dimension, г.key), показатель, `${данные.title} «${г.label}»`, г);
       return `<div class="table-wrap full"><table>
         <thead><tr><th>${esc(данные.title)}</th><th class="num">Записей</th>
           <th class="num">Тональность</th><th class="num">Отрицательных</th>
@@ -8291,20 +10074,20 @@ RENDERERS.content = {
         <tbody>${items.map((г) => `<tr>
           <td>${esc(г.label)}${г.kind && г.kind !== 'topic'
             ? ` <span class="chip ${КАТЕГОРИЯ_ЦВЕТ[г.kind] || ''}">${esc(КАТЕГОРИЯ_ВИД[г.kind] || г.kind)}</span>` : ''}</td>
-          <td class="num mono">${num(г.records)}</td>
-          <td class="num">${toneChip(г.sentiment)}</td>
+          <td class="num mono">${Ч(num(г.records), г, 'records')}</td>
+          <td class="num">${Ч(toneChip(г.sentiment), г, 'sentiment')}</td>
           <td class="num mono">${г.negative_share === null ? '—'
-            : num(г.negative_share, 1) + '%'}</td>
-          <td class="num mono">${num(г.alert_records)}</td>
-          <td class="num mono">${г.compliance === null ? '—' : pct(г.compliance, 0)}</td>
-          <td class="num mono">${num(г.wpm, 0)}</td>
-          <td class="num mono">${num(г.interruptions, 1)}</td>
-          <td class="num mono">${г.silence_share === null ? '—' : pct(г.silence_share, 0)}</td>
-          <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : pct(г.talk_share, 0)}</td>
-          <td class="num mono">${г.monologue_s === null || г.monologue_s === undefined ? '—' : num(г.monologue_s, 0) + ' с'}</td>
-          <td class="num mono">${г.agent_score === null || г.agent_score === undefined ? '—' : num(г.agent_score, 0)}</td>
-          <td class="num mono">${г.empathy === null || г.empathy === undefined ? '—' : num(г.empathy, 0)}</td>
-          <td class="num mono">${num(г.violation_records)}</td></tr>`).join('')}</tbody></table>
+            : Ч(num(г.negative_share, 1) + '%', г, 'negative_share')}</td>
+          <td class="num mono">${Ч(num(г.alert_records), г, 'alert_records')}</td>
+          <td class="num mono">${г.compliance === null ? '—' : Ч(pct(г.compliance, 0), г, 'compliance')}</td>
+          <td class="num mono">${Ч(num(г.wpm, 0), г, 'wpm')}</td>
+          <td class="num mono">${Ч(num(г.interruptions, 1), г, 'interruptions')}</td>
+          <td class="num mono">${г.silence_share === null ? '—' : Ч(pct(г.silence_share, 0), г, 'silence_share')}</td>
+          <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : Ч(pct(г.talk_share, 0), г, 'talk_share')}</td>
+          <td class="num mono">${г.monologue_s === null || г.monologue_s === undefined ? '—' : Ч(num(г.monologue_s, 0) + ' с', г, 'monologue_s')}</td>
+          <td class="num mono">${г.agent_score === null || г.agent_score === undefined ? '—' : Ч(num(г.agent_score, 0), г, 'agent_score')}</td>
+          <td class="num mono">${г.empathy === null || г.empathy === undefined ? '—' : Ч(num(г.empathy, 0), г, 'empathy')}</td>
+          <td class="num mono">${Ч(num(г.violation_records), г, 'violation_records')}</td></tr>`).join('')}</tbody></table>
         ${данные.hidden ? `<p class="small faint" style="margin:8px 12px">
           Скрыто групп с числом записей меньше пяти: ${данные.hidden}. На двух
           разговорах группа всегда либо лучшая, либо худшая, и оба раза
@@ -8350,7 +10133,15 @@ RENDERERS.content = {
           note: `${num(г.records)} записей` + (г.negative_share === null ? ''
             : ` · отрицательных ${num(г.negative_share, 1)} %`),
         })),
+        // Столбец — среднее по группе: под ним записи группы, у которых
+        // тональность оценена, самые тяжёлые первыми.
+        onPick: (номер) => раскрыть(узел, данные, items[номер], поле),
       });
+    };
+    const раскрыть = (узел, данные, г, показатель) => {
+      const что = г && Р.что(Р.группа(данные.dimension, г.key), показатель,
+                             `${данные.title} «${г.label}»`, г);
+      if (что && данные.window) Drill.open(qs(узел), Drill.spec(данные.window, что));
     };
     столбики('#chart-by-owner', по_ключу.owner, 'sentiment');
     столбики('#chart-by-tag', по_ключу.tag, 'sentiment');
@@ -8359,12 +10150,14 @@ RENDERERS.content = {
       height: 220, labels: часы.map((г) => г.label), yMin: -1, yMax: 1,
       series: [{ name: 'тональность', values: часы.map((г) => г.sentiment) }],
       emptyText: 'нет данных',
+      onPick: (номер) => раскрыть('#chart-by-hour', по_ключу.hour, часы[номер], 'sentiment'),
     });
     const дни = (по_ключу.weekday.items || []);
     window.Charts.bars(qs('#chart-by-weekday'), {
       height: 220, values: дни.map((г) => г.records),
       labels: дни.map((г) => г.label.slice(0, 2)),
       emptyText: 'нет данных',
+      onPick: (номер) => раскрыть('#chart-by-weekday', по_ключу.weekday, дни[номер], 'records'),
     });
   },
 
@@ -8381,8 +10174,30 @@ RENDERERS.content = {
         встретилась в двух записях. Появятся, когда разберётся архив.</div>`;
       return;
     }
+    // Раскрытие. Тема — это основа слова, а «записей» у неё — в скольких
+    // записях окна основа встретилась; список берёт те же записи отбором
+    // `stem`. Свод считает по завершённым заданиям — кроме одного случая:
+    // за всё время и без разреза по владельцу он не заглядывает в задания
+    // вовсе (соединение с ними на большом архиве недёшево), и запись,
+    // отправленную на повтор, тоже считает. Какой случай наш, говорит сам
+    // ответ (`completed_only`), и основа списка выбирается по нему.
+    const окно = данные.window;
+    const тема = (т) => ({
+      base: данные.completed_only === false ? 'jobs' : 'content', f: [`stem:${т.stem}`],
+      title: `Тема «${т.word}»` });
+    // У хода тем и новых слов окна свои: «сейчас» и «было», а при «всё
+    // время» это месяц, а не весь архив. Их границы ответ отдаёт отдельно.
+    const ход = данные.trend_window || {};
+    const сейчас = { since: ход.since, until: ход.until };
+    const было = { since: ход.before_since, until: ход.since };
+    const вОкне = (т, уточнение) => ({ base: 'content', f: [`stem:${т.stem}`],
+      title: `Тема «${т.word}»: ${уточнение}` });
+    const доля = (значение, сколько, границы, т, уточнение) => (сколько && ход.since
+      ? Drill.num(`${num(значение, 1)}%`, границы, вОкне(т, уточнение)) : `${num(значение, 1)}%`);
+    const Р = РаскрытиеЗаписей;
     host.innerHTML = `
-      ${card('О чём говорят', `по ${num(данные.corpus)} разобранным записям периода`,
+      ${Р.карточка('О чём говорят', `по ${Drill.num(num(данные.corpus), окно,
+               { base: 'content', title: 'Разобранные записи периода' })} разобранным записям периода`,
              '<div id="chart-topics"></div>')}
       <div class="grid cols-2">
         ${card('Стали звучать чаще', 'сравнение с предыдущим таким же периодом',
@@ -8391,8 +10206,8 @@ RENDERERS.content = {
                    <th class="num">Было</th><th class="num">Изменение</th></tr></thead>
                  <tbody>${тренд.filter((т) => т.delta > 0).slice(0, 12).map((т) => `<tr>
                    <td>${esc(т.word)}</td>
-                   <td class="num mono">${num(т.share_now, 1)}%</td>
-                   <td class="num mono faint">${num(т.share_before, 1)}%</td>
+                   <td class="num mono">${доля(т.share_now, т.now, сейчас, т, 'сейчас')}</td>
+                   <td class="num mono faint">${доля(т.share_before, т.before, было, т, 'в прошлом периоде')}</td>
                    <td class="num mono ok-text">+${num(т.delta, 1)} п.п.</td></tr>`).join('')
                  || '<tr><td colspan="4" class="small dim">Заметного роста нет</td></tr>'}
                  </tbody></table></div>`)}
@@ -8402,8 +10217,8 @@ RENDERERS.content = {
                    <th class="num">Было</th><th class="num">Изменение</th></tr></thead>
                  <tbody>${тренд.filter((т) => т.delta < 0).slice(0, 12).map((т) => `<tr>
                    <td>${esc(т.word)}</td>
-                   <td class="num mono">${num(т.share_now, 1)}%</td>
-                   <td class="num mono faint">${num(т.share_before, 1)}%</td>
+                   <td class="num mono">${доля(т.share_now, т.now, сейчас, т, 'сейчас')}</td>
+                   <td class="num mono faint">${доля(т.share_before, т.before, было, т, 'в прошлом периоде')}</td>
                    <td class="num mono err-text">${num(т.delta, 1)} п.п.</td></tr>`).join('')
                  || '<tr><td colspan="4" class="small dim">Заметного спада нет</td></tr>'}
                  </tbody></table></div>`)}
@@ -8412,7 +10227,8 @@ RENDERERS.content = {
              'в прошлом таком же периоде не звучали вовсе — новая акция, новый сбой, новая модель; сырьё для категорий',
              `<div class="chips">${(данные.new || []).map((т) =>
                `<span class="chip" title="в ${т.now} записях; найти в результатах" data-search="${esc(т.word)}"
-                      style="cursor:pointer">${esc(т.word)} <span class="faint">${num(т.now)}</span></span>`).join('')}</div>`) : ''}
+                      style="cursor:pointer">${esc(т.word)} <span class="faint">${ход.since
+                        ? Drill.num(num(т.now), сейчас, вОкне(т, 'записи периода')) : num(т.now)}</span></span>`).join('')}</div>`) : ''}
       ${card('Все темы периода', 'вес — редкость темы: слово из девяти записей ' +
              'из десяти это фон, а не тема',
              `<div class="table-wrap full"><table>
@@ -8421,7 +10237,7 @@ RENDERERS.content = {
                  <th>Найти</th></tr></thead>
                <tbody>${темы.map((т) => `<tr>
                  <td>${esc(т.word)}<span class="faint small mono"> ${esc(т.stem)}</span></td>
-                 <td class="num mono">${num(т.records)}</td>
+                 <td class="num mono">${Drill.num(num(т.records), окно, тема(т))}</td>
                  <td class="num mono">${num(т.share, 1)}%</td>
                  <td class="num mono">${num(т.mentions)}</td>
                  <td class="num mono">${num(т.weight, 2)}</td>
@@ -8433,12 +10249,15 @@ RENDERERS.content = {
     // слово), поэтому и цвет один: разные цвета читались бы как разные
     // виды тем, которых нет.
     const цвет = window.Charts.palette()[0];
+    const верхние = темы.slice(0, 18);
     window.Charts.hbars(qs('#chart-topics'), {
-      items: темы.slice(0, 18).map((т) => ({
+      items: верхние.map((т) => ({
         label: т.word, value: т.records, color: цвет,
         display: `${num(т.records)} · ${num(т.share, 1)} %`,
         note: `упоминаний: ${num(т.mentions)}` })),
       labelWidth: 150, emptyText: 'нет тем',
+      onPick: (номер) => Drill.open(qs('#chart-topics'),
+        Drill.spec(окно, тема(верхние[номер]))),
     });
     qsa('#content-body [data-search]').forEach((b) =>
       b.addEventListener('click', () => {
@@ -8453,8 +10272,25 @@ RENDERERS.content = {
     const данные = await API.latest('content-corr',
       `/api/content/correlations?period=${state.contentPeriod}`);
     const items = данные.items || [];
-    host.innerHTML = card('Связи между признаками',
-      `посчитано по ${num(данные.sampled)} записям`,
+    // Раскрытие. Коэффициент — не набор записей, а «записей» у связи — это
+    // записи, где измерены оба признака: они и раскрываются, от большего
+    // значения первого признака к меньшему (рядом в списке — тональность и
+    // балл, так что связь видно глазами). Но только пока выборка — весь
+    // период: дальше предела связи считаются по самым свежим записям, и
+    // «все записи периода с обоими признаками» — уже другое, большее число.
+    const окно = данные.window;
+    const целиком = Boolean(окно) && данные.sampled < данные.limit;
+    // Признак связи → величина списка. Имена те же, кроме числа говорящих:
+    // `speakers` у списка — говорящие задания, а связь считана по разбору.
+    const величина = (признак) => ({ speakers: 'content_speakers' }[признак] || признак);
+    const пара = (с) => ({ base: 'content',
+      f: [`has:${величина(с.x)}`, `has:${величина(с.y)}`],
+      sort: `${величина(с.x)}:desc`, value: с.x_title,
+      title: `${с.x_title} ↔ ${с.y_title}: записи с обоими признаками` });
+    host.innerHTML = РаскрытиеЗаписей.карточка('Связи между признаками',
+      `посчитано по ${целиком && данные.sampled
+        ? Drill.num(num(данные.sampled), окно, { base: 'content', title: 'Записи, по которым посчитаны связи' })
+        : num(данные.sampled)} записям`,
       items.length ? `<div class="table-wrap full"><table>
         <thead><tr><th>Наблюдение</th>
           <th class="num" title="Знак — направление связи, а не оценка: «чем длиннее разговор, тем меньше перебиваний» — тоже минус">Коэффициент</th>
@@ -8463,8 +10299,10 @@ RENDERERS.content = {
           <td>${esc(с.text)}<div class="small faint">${esc(с.x_title)} ↔ ${esc(с.y_title)}</div></td>
           <td class="num mono">${с.r > 0 ? '+' : ''}${num(с.r, 2)}</td>
           <td><span class="chip">${esc(с.strength)}</span></td>
-          <td class="num mono">${num(с.n)}</td></tr>`).join('')}</tbody></table></div>
-        <p class="small dim" style="margin:12px">${esc(данные.note)}</p>`
+          <td class="num mono">${целиком ? Drill.num(num(с.n), окно, пара(с)) : num(с.n)}</td></tr>`).join('')}</tbody></table></div>
+        <p class="small dim" style="margin:12px">${esc(данные.note)}${целиком ? ''
+          : ` Связи посчитаны по ${num(данные.sampled)} самым свежим записям периода, а не по
+             всем, поэтому число записей у связи в список не раскрывается: выберите период короче.`}</p>`
       : `<div class="empty">Заметных связей за период не нашлось.<br>
          <span class="small">Пары со слабой связью (меньше 0,2) и посчитанные
          меньше чем по пятидесяти записям не показываются: отличить такую
@@ -8535,7 +10373,20 @@ RENDERERS.content = {
            title="${порог ? 'Открыть в «Результатах» записи, перешедшие порог, — с поиском и листалкой'
                             : 'Открыть тот же отбор в разделе «Результаты» — с поиском и листалкой'}"
            >${esc(порог || 'Все такие записи')}</button>` : '';
-    host.innerHTML = card(данные.title, `${items.length} записей`,
+    // Раскрытие. Таблица ниже — верхушка отбора, не больше полусотни строк;
+    // полный список за тот же период открывается здесь же, тем же условием
+    // и в том же порядке (их отдаёт сам ответ — `drill`). Если отбор весь
+    // уместился в таблицу, раскрывается его число; если нет — честно
+    // сказано «первые 50», а сколько всего, покажет сам список.
+    const весьОтбор = данные.drill && данные.window && items.length
+      ? Object.assign({ title: `${данные.title}: все записи периода` }, данные.drill) : null;
+    const сколько = !весьОтбор ? `${items.length} записей`
+      : данные.more
+        ? `первые ${items.length} · <button type="button" class="drill" aria-expanded="false"
+            title="Показать все записи отбора за период"${Drill.attr(данные.window, весьОтбор)
+            }>весь список</button>`
+        : `${Drill.num(num(items.length), данные.window, весьОтбор)} записей`;
+    host.innerHTML = РаскрытиеЗаписей.карточка(esc(данные.title), сколько,
       items.length ? `<div class="table-wrap full"><table>
         <thead><tr><th>Запись</th><th>Когда</th><th>Владелец</th>
           <th class="num">Тональность</th><th class="num">Разворот</th>
@@ -8557,12 +10408,157 @@ RENDERERS.content = {
           <td class="num mono nowrap">${fmtDur(з.media_duration_s)}</td>
           <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(з.job_id)})"
                 >Открыть</button></td></tr>`).join('')}</tbody></table></div>`
-      : '<div class="empty">По этому отбору записей за период нет</div>', действия);
+      : '<div class="empty">По этому отбору записей за период нет</div>', действия, true);
     const кнопка = qs('#content-all');
     if (кнопка) кнопка.addEventListener('click', () => {
       state.resultsContent = весь;
       go('results');
     });
+  },
+};
+
+/* Раскрытие чисел «Операторов», «Разрезов», «Тем», «Связей» и «Что
+ * послушать»: какой группе и какому показателю какой отбор списка.
+ *
+ * Строка любого разреза — это значение выражения группировки в базе, и
+ * список под её числом обязан отобрать записи тем же выражением: иначе
+ * «у Анны 19 записей» раскроется в восемнадцать. Соответствие «измерение →
+ * отбор» записано один раз здесь, а не в каждой таблице: у дня недели
+ * своя нумерация, у меток — группа «без метки», у пустого значения —
+ * прочерк вместо пустоты, и забыть любое из трёх в одном из шести мест
+ * проще, чем кажется.
+ *
+ * Показатели двух видов. Счётчик или доля («отрицательных 25 %») —
+ * раскрывается числитель: те записи, которых столько. Среднее («балл
+ * 62») — записи, по которым оно посчитано, упорядоченные по этой величине
+ * худшими вперёд: среднее складывается из всех, а вопрос к нему один —
+ * «кто его тянет».
+ */
+const РаскрытиеЗаписей = {
+  ИЗМЕРЕНИЯ: {
+    owner: (к) => `owner:${Drill.val(к, '—')}`,
+    speaker: (к) => `speaker:${Drill.val(к, '—')}`,
+    agent: (к) => `agent:${Drill.val(к, '—')}`,
+    queue: (к) => `queue:${Drill.val(к, '—')}`,
+    station: (к) => `station:${Drill.val(к, '—')}`,
+    direction: (к) => `direction:${Drill.val(к, '—')}`,
+    model: (к) => `model:${Drill.val(к, '—')}`,
+    engine: (к) => `engine:${Drill.val(к, '—')}`,
+    language: (к) => `language:${Drill.val(к, '—')}`,
+    source: (к) => `source:${Drill.val(к, '—')}`,
+    label: (к) => `label:${Drill.val(к, '—')}`,
+    // Метки свод разворачивает сам: запись входит в каждую свою метку, а
+    // записи без единой собраны в группу с этой подписью.
+    tag: (к) => (к === 'без метки' ? 'untagged' : `tag:${к}`),
+    category: (к) => `category:${к}`,
+    // База считает дни недели с воскресенья, список — с понедельника.
+    weekday: (к) => `weekday:${(Number(к) + 6) % 7}`,
+    hour: (к) => `hour:${Number(к)}`,
+    date: (к) => `date:${к}`,
+  },
+
+  /** Отборы группы разреза; `null` — измерение списку неизвестно. */
+  группа(измерение, ключ) {
+    const отбор = this.ИЗМЕРЕНИЯ[измерение];
+    return отбор ? [отбор(String(ключ))] : null;
+  },
+
+  /* Показатель свода → чем он раскрывается. `f` — отбор числителя,
+   * `счёт` — поле свода с самим числителем (ноль не раскрываем: списка под
+   * ним нет); `sort` — величина, по которой посчитано среднее: записи без
+   * неё в такой список не входят, как не входят и в среднее. */
+  ПОКАЗАТЕЛИ: {
+    records: { счёт: 'records', имя: 'все записи' },
+    negative_share: { f: ['negative'], счёт: 'negative', имя: 'отрицательные' },
+    alert_records: { f: ['alerts'], счёт: 'alert_records', имя: 'с тревожными упоминаниями' },
+    violation_records: { f: ['violation'], счёт: 'violation_records', имя: 'с нарушениями оператора' },
+    violation_share: { f: ['violation'], счёт: 'violation_records', имя: 'с нарушениями оператора' },
+    named_share: { f: ['named'], счёт: 'named', имя: 'оператор обратился по имени' },
+    frustrated_share: { f: ['frustrated'], счёт: 'frustrated', имя: 'клиент раздражён' },
+    sentiment: { sort: 'sentiment:asc', value: 'Тональность', имя: 'по тональности' },
+    agent_score: { sort: 'agent_score:asc', value: 'Балл', fmt: 'int', имя: 'по баллу оператора' },
+    compliance: { sort: 'compliance:asc', value: 'Скрипт', fmt: 'pct', имя: 'по соблюдению скрипта' },
+    empathy: { sort: 'empathy:asc', value: 'Эмпатия', fmt: 'int', имя: 'по индексу эмпатии' },
+    wpm: { sort: 'wpm:desc', value: 'Темп, слов/мин', fmt: 'int', имя: 'по темпу речи' },
+    interruptions: { sort: 'interruptions:desc', value: 'Перебиваний', fmt: 'int', имя: 'по перебиваниям' },
+    silence_share: { sort: 'silence_share:desc', value: 'Тишина', fmt: 'pct', имя: 'по доле тишины' },
+    talk_share: { sort: 'talk_share:desc', value: 'Речь оператора', fmt: 'pct', имя: 'по доле речи оператора' },
+    monologue_s: { sort: 'monologue_s:desc', value: 'Монолог', fmt: 'dur', имя: 'по самому долгому монологу' },
+    reply_delay_s: { sort: 'reply_delay_s:desc', value: 'Пауза перед ответом, с', имя: 'по паузе перед ответом' },
+    duration_s: { sort: 'duration_s:desc', value: 'Длительность', fmt: 'dur', имя: 'по длительности' },
+    mood: { sort: 'mood:asc', value: 'Настроение', имя: 'по настроению клиента' },
+    stress: { sort: 'stress:desc', value: 'Напряжение', fmt: 'int', имя: 'по напряжению' },
+    effort: { sort: 'effort:asc', value: 'Усилие клиента', имя: 'по усилию клиента' },
+    fatigue: { sort: 'fatigue:desc', value: 'Усталость', fmt: 'int', имя: 'по усталости к концу' },
+    clarity: { sort: 'clarity:asc', value: 'Понятность', fmt: 'int', имя: 'по понятности речи' },
+    accuracy: { sort: 'accuracy:asc', value: 'Точность', fmt: 'int', имя: 'по точности ответов' },
+    politeness: { sort: 'politeness:asc', value: 'Вежливость', fmt: 'int', имя: 'по вежливости' },
+    personalization: { sort: 'personalization:asc', value: 'Персонализация', fmt: 'int', имя: 'по персонализации' },
+    rhythm: { sort: 'rhythm:asc', value: 'Ритмичность', fmt: 'int', имя: 'по ритмичности речи' },
+    filler_rate: { sort: 'filler_rate:desc', value: 'Слова-паразиты', fmt: 'pct', имя: 'по словам-паразитам' },
+    diminutive_rate: { sort: 'diminutive_rate:desc', value: 'Уменьшительные', fmt: 'pct', имя: 'по уменьшительно-ласкательным' },
+    nps: { sort: 'nps:asc', value: 'NPS разговора', имя: 'по NPS разговора' },
+  },
+
+  /**
+   * Описание раскрытия показателя для группы `кто` (её отборы; команда —
+   * []). `свод` — строка свода, откуда число: по ней видно, есть ли что
+   * раскрывать. Нечего (ноль, прочерк, неизвестное измерение) — `null`.
+   */
+  что(кто, показатель, подпись, свод) {
+    const п = this.ПОКАЗАТЕЛИ[показатель];
+    if (!п || !кто) return null;
+    const значение = (свод || {})[п.счёт || показатель];
+    if (значение === null || значение === undefined || (п.счёт && !значение)) return null;
+    return { base: 'content', f: кто.concat(п.f || []), sort: п.sort, value: п.value,
+             fmt: п.fmt, title: `${подпись}: ${п.имя}` };
+  },
+
+  /** Число-кнопка показателя; раскрывать нечего — остаётся просто числом. */
+  число(разметка, окно, кто, показатель, подпись, свод) {
+    const что = this.что(кто, показатель, подпись, свод);
+    return что && окно ? Drill.num(разметка, окно, что) : разметка;
+  },
+
+  /**
+   * Число-кнопка, чей список встаёт в названное место страницы, а не рядом
+   * с самим числом. Нужна числам липкой панели: по ним щёлкают, уже
+   * пролистав карточку вниз, а список встал бы под исходным местом панели,
+   * за верхним краем экрана — щелчок выглядел бы пустым. Поэтому место
+   * названо явно, и после щелчка страница к нему подъезжает. Обработчик —
+   * `привязать()`, по одному на такое число; их на карточке два.
+   */
+  вМесто(разметка, окно, что, место) {
+    if (!что || !окно) return разметка;
+    return `<button type="button" class="drill" title="Показать записи" data-drill-into="${
+      esc(место)}" data-drill-what="${esc(JSON.stringify(Drill.spec(окно, что)))}">${разметка}</button>`;
+  },
+
+  привязать(host) {
+    qsa('[data-drill-into]', host).forEach((кнопка) => кнопка.addEventListener('click', () => {
+      const место = qs(кнопка.dataset.drillInto);
+      if (!место) return;
+      Drill.open(место, JSON.parse(кнопка.dataset.drillWhat));
+      const панель = qs('.drill-panel', место);
+      if (!панель) return;                      // тот же щелчок второй раз — свернули
+      // Запас сверху — под шапку страницы и саму липкую панель.
+      панель.style.scrollMarginTop = '130px';
+      панель.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }));
+  },
+
+  /**
+   * Карточка, у которой в заголовке или в пояснении стоит число-кнопка.
+   * Общая `card()` экранирует оба — и правильно делает; здесь разметку
+   * собирает сам раздел. `место` — поставить список сразу под шапкой, а не
+   * в конец карточки: под таблицей в полсотни строк его никто не увидит.
+   */
+  карточка(заголовок, пояснение, тело, действия, место) {
+    const шапка = `<div class="card-head"><h3>${заголовок}</h3>
+      ${пояснение ? `<span class="hint">${пояснение}</span>` : ''}
+      <span class="spacer"></span>${действия || ''}</div>`;
+    return `<section class="card">${место ? `<div data-drill-host>${шапка}</div>` : шапка}
+      ${тело}</section>`;
   },
 };
 
@@ -8597,6 +10593,20 @@ RENDERERS.content.tab_agents = async function (host) {
     API.latest('content-references', `/api/content/references?period=${период}&limit=10`),
   ]);
   const items = операторы.items || [];
+  // Раскрытие. Три ответа — три окна: числа таблицы раскрываются окном
+  // ответа про операторов, счётчик очереди — окном ответа про очередь.
+  // Щелчок по числу до строки не доходит, так что карточку оператора он
+  // не открывает: строка — карточка, число — список.
+  const Р = РаскрытиеЗаписей;
+  const Ч = (разметка, г, показатель) => Р.число(разметка, операторы.window,
+    Р.группа(операторы.by || state.contentAgentBy, г.key), показатель, `Оператор «${г.label}»`, г);
+  // Ширины колонок заданы, чтобы середина строки приходилась на поле между
+  // «Отрицательных» и «Эмпатией», а не на число: по строке щёлкают, чтобы
+  // открыть карточку, и чаще всего — посередине. Окажись под курсором
+  // число, щелчок раскрыл бы список вместо карточки.
+  const колонки = `<colgroup><col style="width:15%"><col style="width:7%"><col style="width:7%">
+    <col style="width:9.5%"><col style="width:10.5%"><col span="5" style="width:8.2%">
+    <col style="width:10%"></colgroup>`;
   host.innerHTML = `
     <div class="settings-toolbar">
       <span class="small dim">Оператор — это:</span>
@@ -8610,6 +10620,7 @@ RENDERERS.content.tab_agents = async function (host) {
     ${card('Операторы за период',
            'щелчок по строке открывает карточку: показатели против команды, ход по неделям, что послушать',
            items.length ? `<div class="table-wrap full"><table id="agents-table">
+        ${колонки}
         <thead><tr><th>Оператор</th><th class="num">Записей</th>
           <th class="num" title="средний балл из 100">Балл</th>
           <th class="num">Тональность</th><th class="num">Отрицательных</th>
@@ -8619,27 +10630,28 @@ RENDERERS.content.tab_agents = async function (host) {
           <th class="num">Скрипт</th><th class="num" title="доля речи оператора">Речь</th><th></th></tr></thead>
         <tbody>${items.map((г) => `<tr class="clickable" data-agent="${esc(г.key)}">
           <td><b>${esc(г.label)}</b></td>
-          <td class="num mono">${num(г.records)}</td>
-          <td class="num mono">${г.agent_score === null || г.agent_score === undefined ? '—' : num(г.agent_score, 0)}</td>
-          <td class="num">${toneChip(г.sentiment)}</td>
-          <td class="num mono">${г.negative_share === null ? '—' : num(г.negative_share, 1) + '%'}</td>
-          <td class="num mono">${г.empathy === null || г.empathy === undefined ? '—' : num(г.empathy, 0)}</td>
-          <td class="num mono">${num(г.violation_records)}</td>
-          <td class="num mono">${г.named_share === null || г.named_share === undefined ? '—' : num(г.named_share, 0) + '%'}</td>
-          <td class="num mono">${г.compliance === null ? '—' : pct(г.compliance, 0)}</td>
-          <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : pct(г.talk_share, 0)}</td>
+          <td class="num mono">${Ч(num(г.records), г, 'records')}</td>
+          <td class="num mono">${г.agent_score === null || г.agent_score === undefined ? '—' : Ч(num(г.agent_score, 0), г, 'agent_score')}</td>
+          <td class="num">${Ч(toneChip(г.sentiment), г, 'sentiment')}</td>
+          <td class="num mono">${г.negative_share === null ? '—' : Ч(num(г.negative_share, 1) + '%', г, 'negative_share')}</td>
+          <td class="num mono">${г.empathy === null || г.empathy === undefined ? '—' : Ч(num(г.empathy, 0), г, 'empathy')}</td>
+          <td class="num mono">${Ч(num(г.violation_records), г, 'violation_records')}</td>
+          <td class="num mono">${г.named_share === null || г.named_share === undefined ? '—' : Ч(num(г.named_share, 0) + '%', г, 'named_share')}</td>
+          <td class="num mono">${г.compliance === null ? '—' : Ч(pct(г.compliance, 0), г, 'compliance')}</td>
+          <td class="num mono">${г.talk_share === null || г.talk_share === undefined ? '—' : Ч(pct(г.talk_share, 0), г, 'talk_share')}</td>
           <td><button class="ghost sm" data-agent="${esc(г.key)}">Карточка</button></td></tr>`).join('')}
         </tbody></table></div>${операторы.hidden ? `<p class="small faint" style="margin:8px 12px">
           Скрыто операторов с числом записей меньше пяти: ${операторы.hidden}.</p>` : ''}`
            : '<div class="empty small">За период нет операторов с пятью и более записями</div>')}
     <div class="grid cols-2">
-      ${card(`Очередь коучинга (${очередь.total > (очередь.shown ?? очередь.total)
-               ? `${num(очередь.shown)} из ${num(очередь.total)}` : num(очередь.total)})`,
+      ${Р.карточка(`Очередь коучинга (${очередь.total > (очередь.shown ?? очередь.total)
+               ? `${num(очередь.shown)} из ${this.coachingCount(очередь, [], state.contentCoachingDone)}`
+               : this.coachingCount(очередь, [], state.contentCoachingDone)})`,
              'записи, которые стоит разобрать с оператором, — худшие первыми; «разобрано» убирает из очереди',
              this.coachingTable(очередь.items || []),
              `<label class="small nowrap" title="Показать и уже разобранные — их можно вернуть в очередь">
                 <input type="checkbox" id="coaching-done" ${state.contentCoachingDone ? 'checked' : ''}>
-                с разобранными</label>`)}
+                с разобранными</label>`, true)}
       ${card('Эталонные разговоры',
              'лучшие по баллу и тональности без нарушений — и отмеченные руками «показывать новичкам»',
              this.referencesTable(эталоны.items || []))}
@@ -8659,6 +10671,24 @@ RENDERERS.content.tab_agents = async function (host) {
     this.showTab();
   });
   this.bindMarks(host);
+};
+
+/**
+ * Счётчик очереди коучинга числом-кнопкой: под ним вся очередь, а не
+ * первые тридцать строк таблицы.
+ *
+ * В очереди то, что осталось: записи с причиной и без отметки
+ * «разобрано». С флажком «с разобранными» сервер считает и отмеченные —
+ * тогда и список их не отсеивает. `кто` — отборы оператора в его
+ * карточке; на вкладке — пустой перечень.
+ */
+RENDERERS.content.coachingCount = function (очередь, кто, сРазобранными, всего) {
+  const число = всего === undefined ? очередь.total : всего;
+  if (!число || !очередь.window || !кто) return num(число);
+  return Drill.num(num(число), очередь.window, {
+    base: 'content',
+    f: кто.concat(['coaching'], сРазобранными ? [] : ['coaching_open']),
+    title: `Очередь коучинга${сРазобранными ? ' вместе с разобранными' : ''}` });
 };
 
 /** Таблица очереди коучинга — общая для вкладки и карточки оператора. */
@@ -8734,24 +10764,40 @@ RENDERERS.content.drawAgentCard = async function (host) {
       <th class="num">Тон.</th><th class="num">Наруш.</th></tr></thead>
     <tbody>${items.map(строка).join('')}</tbody></table></div>`
     : '<div class="empty small">Записей нет</div>';
+  // Раскрытие. Всё на карточке — про одного оператора за окно ответа:
+  // его отбор (`кто`) добавляется к отбору показателя. Столбец «Команда» —
+  // то же без оператора, «Прошлый период» — тот же оператор в прошлом
+  // окне, границы которого отдаёт ответ. Разница и два составных
+  // показателя (доля возражений без отработки — отношение сумм, индекс
+  // NPS — разность долей) набором записей не являются и остаются числами.
+  const Р = РаскрытиеЗаписей;
+  const окно = к.window;
+  const кто = Р.группа(к.by || state.contentAgentBy, state.contentAgent);
+  const имя = `Оператор «${state.contentAgent}»`;
+  const Ч = (разметка, показатель) => Р.число(разметка, окно, кто, показатель, имя, с);
+  const прошлый = к.previous || {};
   host.innerHTML = `
     <div class="settings-toolbar">
       <button class="ghost sm" id="agent-back">← все операторы</button>
       <span class="small dim">${state.contentAgentBy === 'owner' ? 'владелец' : 'говорящий'}:</span>
       <b>${esc(state.contentAgent)}</b>
       <span class="spacer"></span>
-      <span class="small dim">записей за период: ${num(с.records)} из ${num(т.records)} у команды</span>
+      <span class="small dim">записей за период: ${
+        Р.вМесто(num(с.records), окно, Р.что(кто, 'records', имя, с), '#agent-head-drill')} из ${
+        Р.вМесто(num(т.records), окно, Р.что([], 'records', 'Команда', т), '#agent-head-drill')
+        } у команды</span>
     </div>
+    <div id="agent-head-drill" data-drill-host></div>
     <div class="grid cols-4" style="margin-bottom:16px">
-      ${kpi('Балл оператора', с.agent_score === null || с.agent_score === undefined ? '—' : num(с.agent_score, 0),
+      ${kpi('Балл оператора', с.agent_score === null || с.agent_score === undefined ? '—' : Ч(num(с.agent_score, 0), 'agent_score'),
             т.agent_score === null || т.agent_score === undefined ? 'у команды — нет' : `у команды ${num(т.agent_score, 0)}`,
             delta(с.agent_score, (к.previous || {}).agent_score, { good: 1, digits: 0 }))}
-      ${kpi('Тональность', num(с.sentiment, 2), `у команды ${num(т.sentiment, 2)}`,
+      ${kpi('Тональность', Ч(num(с.sentiment, 2), 'sentiment'), `у команды ${num(т.sentiment, 2)}`,
             delta(с.sentiment, (к.previous || {}).sentiment, { good: 1, digits: 2 }))}
-      ${kpi('Индекс эмпатии', с.empathy === null || с.empathy === undefined ? '—' : num(с.empathy, 0),
+      ${kpi('Индекс эмпатии', с.empathy === null || с.empathy === undefined ? '—' : Ч(num(с.empathy, 0), 'empathy'),
             т.empathy === null || т.empathy === undefined ? '' : `у команды ${num(т.empathy, 0)}`,
             delta(с.empathy, (к.previous || {}).empathy, { good: 1, digits: 0 }))}
-      ${kpi('С нарушениями', num(с.violation_records),
+      ${kpi('С нарушениями', Ч(num(с.violation_records), 'violation_records'),
             с.violation_share === null || с.violation_share === undefined ? ''
               : `${num(с.violation_share, 1)}% записей, у команды ${num(т.violation_share, 1)}%`)}
     </div>
@@ -8761,11 +10807,13 @@ RENDERERS.content.drawAgentCard = async function (host) {
           <th class="num">Разница</th><th class="num">Прошлый период</th></tr></thead>
         <tbody>${(к.compare || []).map((п) => `<tr>
           <td>${esc(п.title)}</td>
-          <td class="num mono">${п.agent === null || п.agent === undefined ? '—' : num(п.agent, п.digits)}</td>
-          <td class="num mono">${п.team === null || п.team === undefined ? '—' : num(п.team, п.digits)}</td>
+          <td class="num mono">${п.agent === null || п.agent === undefined ? '—' : Ч(num(п.agent, п.digits), п.key)}</td>
+          <td class="num mono">${п.team === null || п.team === undefined ? '—'
+            : Р.число(num(п.team, п.digits), окно, [], п.key, 'Команда', т)}</td>
           <td class="num mono ${п.verdict === 'better' ? 'ok' : п.verdict === 'worse' ? 'err' : ''}">${
             п.delta === null || п.delta === undefined ? '—' : (п.delta > 0 ? '+' : '') + num(п.delta, п.digits)}</td>
-          <td class="num mono faint">${п.previous === null || п.previous === undefined ? '—' : num(п.previous, п.digits)}</td></tr>`).join('')}
+          <td class="num mono faint">${п.previous === null || п.previous === undefined ? '—'
+            : Р.число(num(п.previous, п.digits), к.previous_window, кто, п.key, `${имя}, прошлый период`, прошлый)}</td></tr>`).join('')}
         </tbody></table></div>`)}
     <div class="grid cols-2">
       ${card('Балл по неделям', '', '<div id="agent-score-chart"></div>')}
@@ -8773,32 +10821,50 @@ RENDERERS.content.drawAgentCard = async function (host) {
     </div>
     ${(к.violations || []).length ? card('Нарушения по категориям', 'записей с категорией и совпадений всего',
       `<div class="chips">${(к.violations || []).map((н) =>
-        `<span class="chip err">${esc(н.label)} <b>${num(н.records)}</b> <span class="faint">/ ${num(н.mentions)}</span></span>`).join('')}</div>`) : ''}
+        `<span class="chip err">${esc(н.label)} <b>${кто && окно && н.records
+          ? Drill.num(num(н.records), окно, { base: 'content',
+              f: кто.concat([`violation_category:${н.category}`]),
+              title: `${имя}: нарушение «${н.label}»` })
+          : num(н.records)}</b> <span class="faint">/ ${num(н.mentions)}</span></span>`).join('')}</div>`) : ''}
     <div class="grid cols-2">
       ${card('Лучшие записи', 'по баллу и тональности', список(к.best || []))}
       ${card('Худшие записи', 'по баллу и тональности', список(к.worst || []))}
     </div>
-    ${card(`Очередь коучинга оператора (${к.coaching_total > (к.coaching || []).length
-             ? `${num((к.coaching || []).length)} из ${num(к.coaching_total)}` : num(к.coaching_total)})`,
+    ${Р.карточка(`Очередь коучинга оператора (${к.coaching_total > (к.coaching || []).length
+             ? `${num((к.coaching || []).length)} из ${this.coachingCount(к, кто, false, к.coaching_total)}`
+             : this.coachingCount(к, кто, false, к.coaching_total)})`,
            'разобрать с оператором',
-           this.coachingTable(к.coaching || []))}`;
+           this.coachingTable(к.coaching || []), '', true)}`;
   qs('#agent-back').addEventListener('click', () => {
     state.contentAgent = '';
     this.showTab();
   });
+  Р.привязать(host);
   this.bindMarks(host);
   const точки = к.timeline || [];
   const метки = точки.map((т) => new Date(т.ts * 1000).toLocaleDateString('ru-RU',
     { day: 'numeric', month: 'short' }));
+  // Точка графика — среднее по неделе: под ней записи оператора за эту
+  // неделю, по которым оно посчитано. Границы недели — из ответа, как их
+  // резала база: посчитай их здесь заново, запись у края ушла бы в соседнюю.
+  const неделя = (узел, показатель) => (номер) => {
+    const точка = точки[номер];
+    const что = точка && Р.что(кто, показатель, `${имя}, неделя с ${метки[номер]}`, точка);
+    if (что && точка.since !== undefined) {
+      Drill.open(qs(узел), Drill.spec({ since: точка.since, until: точка.until }, что));
+    }
+  };
   window.Charts.line(qs('#agent-score-chart'), {
     height: 200, labels: метки, yMin: 0, yMax: 100,
     series: [{ name: 'балл', values: точки.map((т) => т.agent_score) }],
     emptyText: 'нет данных за период',
+    onPick: неделя('#agent-score-chart', 'agent_score'),
   });
   window.Charts.line(qs('#agent-tone-chart'), {
     height: 200, labels: метки, yMin: -1, yMax: 1,
     series: [{ name: 'тональность', values: точки.map((т) => т.sentiment) }],
     emptyText: 'нет данных за период',
+    onPick: неделя('#agent-tone-chart', 'sentiment'),
   });
 };
 
@@ -8871,6 +10937,27 @@ RENDERERS.content.drawDiscovered = function (host) {
       const итог = await API.get(
         `/api/content/discover?period=${state.contentPeriod}`);
       const темы = итог.topics || [];
+      // Раскрытие. Кучка собирается по похожести в памяти одного запроса:
+      // условия, которым её можно было бы отобрать в базе, у неё нет, а
+      // повторный расчёт может собрать её иначе. Зато первые записи кучки
+      // ответ отдаёт сам — они и раскрываются, по номерам. Кучка целиком
+      // уместилась в отданное — раскрывается её число; не уместилась —
+      // рядом с числом стоит «примеры» со своим, меньшим.
+      const записи = (т) => {
+        let номера = (т.jobs || []).filter((номер) => !String(номер).includes(','));
+        // Отбор списка — не длиннее трёхсот знаков; обычные номера заданий
+        // входят десятком с запасом, а длинные свои — сколько поместится.
+        while (номера.length && номера.join(',').length > 280) номера = номера.slice(0, -1);
+        if (!номера.length || !итог.window) return num(т.size, 0);
+        // Основа — задания, а не разбор: по перечню номеров база идёт
+        // прямо к записям, а условие «завершено», которое добавляет основа
+        // разбора, увело бы её в проход по всем завершённым заданиям.
+        const что = { f: [`ids:${номера.join(',')}`], title: `Тема «${т.title}»` };
+        if (номера.length >= т.size) return Drill.num(num(т.size, 0), итог.window, что);
+        что.title += `: первые ${номера.length} из ${num(т.size, 0)}`;
+        return `${num(т.size, 0)} <span class="faint small">· примеры:
+          ${Drill.num(num(номера.length, 0), итог.window, что)}</span>`;
+      };
       тело.innerHTML = темы.length ? `
         <p class="small dim">Разобрано записей: ${num(итог.records, 0)} ·
           тем: ${темы.length} · без правил: <b>${итог.uncovered}</b>${
@@ -8881,7 +10968,7 @@ RENDERERS.content.drawDiscovered = function (host) {
           <tbody>${темы.map((т) => `<tr>
             <td>${т.uncovered ? '<span class="chip warn">без правил</span> ' : ''}${
               esc(т.title)}</td>
-            <td class="mono">${num(т.size, 0)}</td>
+            <td class="mono nowrap">${записи(т)}</td>
             <td class="mono">${pct(т.share, 1)}</td>
             <td class="mono">${pct(т.covered_share, 0)}${
               (т.categories || []).length
@@ -8907,6 +10994,20 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
   const угасают = new Set(свод.fading || []);
   const сКатегорией = свод.corpus && без.records !== undefined
     ? свод.corpus - без.records : null;
+  /* Раскрытие счёта по категориям в записи. Ответов два — счёт и драйверы,
+   * и окно у каждого своё; колонка «Было» посчитана по прошлому окну.
+   * У драйверов «записей» — это записи категории с оценкой тональности,
+   * поэтому к отбору добавлено «оценена».
+   * Кнопка «Записи» справа ведёт в «Результаты» и периода не знает: там
+   * записи категории за всё время, а не те, что сосчитаны в строке. */
+  const Р = раскрытиеРазбора(свод.window);
+  const Рп = раскрытиеРазбора(свод.window_previous);
+  const Рд = раскрытиеРазбора(драйверы.window);
+  const записиКатегории = (id, заголовок, ещё) => Object.assign(
+    { f: [`category:${id}`, ...((ещё || {}).f || [])], title: заголовок },
+    (ещё || {}).sort ? { sort: ещё.sort, value: ещё.value } : {});
+  const ОЦЕНЁННЫЕ = { f: ['scored'], sort: 'sentiment:asc', value: 'Тональность' };
+  const ОТРИЦАТЕЛЬНЫЕ = { f: ['negative'], sort: 'sentiment:asc', value: 'Тональность' };
   host.innerHTML = `
     <div class="settings-toolbar">
       <span class="small dim">Проверить на записи:</span>
@@ -8942,9 +11043,14 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
     </div>`}
 
     <div class="grid cols-4" style="margin-bottom:14px">
-      ${kpi('Записей с категорией', сКатегорией === null ? '—' : num(сКатегорией),
-            свод.corpus ? `из ${num(свод.corpus)} разобранных за период` : 'за период записей нет')}
-      ${kpi('Без категории', без.records === undefined ? '—' : num(без.records),
+      ${kpi('Записей с категорией', сКатегорией === null ? '—'
+              : Р(num(сКатегорией), { f: ['categorized'],
+                  title: 'Записи с категорией обращения' }, сКатегорией),
+            свод.corpus ? `из ${Р(num(свод.corpus), { title: 'Разобранные записи за период' },
+              свод.corpus)} разобранных за период` : 'за период записей нет')}
+      ${kpi('Без категории', без.records === undefined ? '—'
+              : Р(num(без.records), { f: ['uncategorized'],
+                  title: 'Записи без категории обращения' }, без.records),
             без.share === undefined || без.share === null ? '' :
               `${num(без.share, 1)} % — довод завести новую категорию`)}
       ${kpi('Растут', num(растут.size), 'доля выросла на 5 п.п. и больше')}
@@ -8968,9 +11074,11 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
           <td class="small"><span class="chip ${КАТЕГОРИЯ_ЦВЕТ[к.kind] || ''}">${
             esc(КАТЕГОРИЯ_ВИД[к.kind] || к.kind)}</span></td>
           <td class="small dim">${esc(КАТЕГОРИЯ_КТО[к.who] || к.who || '—')}</td>
-          <td class="num mono">${num(к.records)}</td>
+          <td class="num mono">${Р(num(к.records), записиКатегории(к.id,
+            `Категория «${к.label}»: записи периода`), к.records)}</td>
           <td class="num mono">${к.share === null || к.share === undefined ? '—' : `${num(к.share, 1)} %`}</td>
-          <td class="num mono faint">${num(к.previous)}</td>
+          <td class="num mono faint">${Рп(num(к.previous), записиКатегории(к.id,
+            `Категория «${к.label}»: записи прошлого периода`), к.previous)}</td>
           <td class="num mono">${к.delta === null || к.delta === undefined ? '—' :
             `<span class="${к.delta > 0 ? (к.kind === 'violation' ? 'err' : '') : ''}">${
               к.delta > 0 ? '+' : ''}${num(к.delta, 1)}</span>`}</td>
@@ -8992,8 +11100,10 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
                    <tbody>${(драйверы.down || []).map((д) => `<tr>
                      <td>${esc(д.label)}${д.kind !== 'topic'
                        ? ` <span class="chip ${КАТЕГОРИЯ_ЦВЕТ[д.kind] || ''}">${esc(КАТЕГОРИЯ_ВИД[д.kind] || '')}</span>` : ''}</td>
-                     <td class="num mono">${num(д.records)}</td>
-                     <td class="num mono">${num(д.negative)}</td>
+                     <td class="num mono">${Рд(num(д.records), записиКатегории(д.id,
+                       `«${д.label}»: записи с оценкой тональности`, ОЦЕНЁННЫЕ), д.records)}</td>
+                     <td class="num mono">${Рд(num(д.negative), записиКатегории(д.id,
+                       `«${д.label}»: отрицательные разговоры`, ОТРИЦАТЕЛЬНЫЕ), д.negative)}</td>
                      <td class="num mono">${num(д.negative_share, 1)}% <span class="faint">/ ${num(драйверы.negative_share, 1)}%</span></td>
                      <td class="num mono"><b>×${num(д.lift, 2)}</b></td></tr>`).join('')}</tbody></table></div>
                   <p class="small faint" style="margin:8px 0 0">${esc(драйверы.note || '')}</p>`
@@ -9008,8 +11118,10 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
                      <th class="num">Отрицательных</th><th class="num">Подъём</th></tr></thead>
                    <tbody>${(драйверы.up || []).map((д) => `<tr>
                      <td>${esc(д.label)}</td>
-                     <td class="num mono">${num(д.records)}</td>
-                     <td class="num mono">${num(д.negative_share, 1)}%</td>
+                     <td class="num mono">${Рд(num(д.records), записиКатегории(д.id,
+                       `«${д.label}»: записи с оценкой тональности`, ОЦЕНЁННЫЕ), д.records)}</td>
+                     <td class="num mono">${Рд(`${num(д.negative_share, 1)}%`, записиКатегории(д.id,
+                       `«${д.label}»: отрицательные разговоры`, ОТРИЦАТЕЛЬНЫЕ), д.negative)}</td>
                      <td class="num mono">×${num(д.lift, 2)}</td></tr>`).join('')}</tbody></table></div>`
                : '<div class="empty small">Таких категорий за период нет</div>')}
     </div>
@@ -11059,6 +13171,81 @@ const СОТРУДНИК_РАДАР = [
   ['rhythm', 'Ритмичность'],
 ];
 
+//: Чем раскрывается среднее по сотруднику: величина списка, порядок,
+//: подпись её столбца и как её писать. Среднее складывается из значений, а
+//: не из счёта, поэтому список — это записи, у которых величина измерена,
+//: и стоят они по ней. Порядок — «сначала те, с кем разбираться»: у
+//: показателя «больше — лучше» сверху худшие, у «меньше — лучше» —
+//: наибольшие. Человек открывает балл 64 не чтобы посмотреть на сотни, а
+//: чтобы понять, какие разговоры его уронили.
+const СОТРУДНИК_ВЕЛИЧИНЫ = {
+  agent_score: ['agent_score', 'asc', 'Балл', 'int'],
+  sentiment: ['sentiment', 'asc', 'Тональность'],
+  compliance: ['compliance', 'asc', 'Скрипт'],
+  empathy: ['empathy', 'asc', 'Эмпатия', 'int'],
+  talk_share: ['talk_share', 'desc', 'Доля речи'],
+  monologue_s: ['monologue_s', 'desc', 'Монолог, с', 'int'],
+  reply_delay_s: ['reply_delay_s', 'desc', 'Пауза, с'],
+  interruptions: ['interruptions', 'desc', 'Перебиваний', 'int'],
+  // Своя величина, а не общая `duration`: та подставляет ноль вместо
+  // пустоты, а среднее записи без длительности не считает.
+  duration_s: ['duration_s', 'desc', 'Длительность', 'dur'],
+  mood: ['mood', 'asc', 'Настроение'],
+  stress: ['stress', 'desc', 'Напряжение', 'int'],
+  effort: ['effort', 'asc', 'Усилие'],
+  fatigue: ['fatigue', 'desc', 'Усталость', 'int'],
+  clarity: ['clarity', 'asc', 'Понятность', 'int'],
+  accuracy: ['accuracy', 'asc', 'Точность', 'int'],
+  politeness: ['politeness', 'asc', 'Вежливость', 'int'],
+  personalization: ['personalization', 'asc', 'Персонализация', 'int'],
+  rhythm: ['rhythm', 'asc', 'Ритмичность', 'int'],
+  filler_rate: ['filler_rate', 'desc', 'Паразиты'],
+  diminutive_rate: ['diminutive_rate', 'desc', 'Уменьшительные'],
+  nps: ['nps', 'asc', 'NPS'],
+};
+
+//: Доли раскрываются числителем: «с нарушениями 12 %» — это записи с
+//: нарушениями, а не все, от которых доля считалась. Отбор — тот же, каким
+//: числитель считает сервер (`CONTENT_FILTERS`, `c.name_uses > 0`).
+const СОТРУДНИК_ДОЛИ = {
+  negative_share: ['negative', 'Отрицательные разговоры'],
+  violation_share: ['violation', 'Разговоры с нарушениями'],
+  named_share: ['named', 'Обратился по имени'],
+  frustrated_share: ['frustrated', 'Клиент раздражён'],
+};
+
+//: Что раскрывается прямо в таблице сотрудников. Не всё подряд: двадцать
+//: кнопок в строке — это строка, по которой уже не попасть, чтобы открыть
+//: карточку. В таблице — счётные столбцы и два средних, с которых начинают
+//: разговор о человеке; остальное раскрывается в карточке, где у каждого
+//: показателя своя строка.
+const СОТРУДНИК_В_ТАБЛИЦЕ = ['records', 'agent_score', 'sentiment', 'violation_share'];
+
+/**
+ * Описание раскрытия показателя разбора: записи, из которых он сложился.
+ *
+ * `кто` — отбор сотрудника (`agent:101`) или пусто для всей команды; `чьё` —
+ * хвост заголовка панели. Индексы NPS и «возражений без отработки» сюда не
+ * попадают нарочно: первое — разность двух долей, второе — доля возражений,
+ * а не записей; одного списка, равного такому числу, не существует.
+ */
+function сотрудникРаскрытие(ключ, кто, чьё) {
+  const свои = кто ? [кто] : [];
+  if (ключ === 'records') {
+    return { base: 'content', f: свои, title: `Разговоры — ${чьё}` };
+  }
+  const доля = СОТРУДНИК_ДОЛИ[ключ];
+  if (доля) return { base: 'content', f: [...свои, доля[0]], title: `${доля[1]} — ${чьё}` };
+  const величина = СОТРУДНИК_ВЕЛИЧИНЫ[ключ];
+  if (!величина) return null;
+  const [имя, порядок, подпись, вид] = величина;
+  // `has:` рядом с порядком не лишнее: порядок по величине и сам отсекает
+  // записи без неё, но человек может переключить список на «сначала
+  // новые» — и набор обязан остаться тем же, по которому считалось среднее.
+  return { base: 'content', f: [...свои, `has:${имя}`], sort: `${имя}:${порядок}`,
+           value: подпись, fmt: вид, title: `${подпись} — ${чьё}` };
+}
+
 RENDERERS.employees = {
   async render(root) {
     if (!state.employeePeriod) state.employeePeriod = 'month';
@@ -11147,6 +13334,14 @@ RENDERERS.employees = {
     if (!место) return;
     const люди = д.items || [];
     const сравнимые = люди.filter((ч) => !ч.sparse);
+    // Плитки команды раскрываются в записи всей команды за окно свода.
+    // Индекс NPS — нет: это разность двух долей, а не набор записей.
+    const плитка = (ключ, знаков) => {
+      const значение = к[ключ];
+      if (значение === null || значение === undefined) return '—';
+      return Drill.num(num(значение, знаков), д.window,
+                       сотрудникРаскрытие(ключ, '', 'вся команда'));
+    };
     место.innerHTML = `
       <section class="card" style="margin-bottom:12px">
         <div class="card-head"><h3>Команда</h3>
@@ -11159,15 +13354,12 @@ RENDERERS.employees = {
           <span class="small dim">средние по команде — опора для сравнения</span>
         </div>
         <div class="grid cols-6" style="padding:14px 16px">
-          ${kpi('Разговоров', num(к.records || 0, 0), `${num(к.hours || 0, 1)} ч звука`)}
-          ${kpi('Балл оператора', к.agent_score === null || к.agent_score === undefined
-                  ? '—' : num(к.agent_score, 0), 'среднее по команде')}
-          ${kpi('Настроение клиента', к.mood === null || к.mood === undefined
-                  ? '—' : num(к.mood, 2), 'от −1 до +1')}
-          ${kpi('Напряжение', к.stress === null || к.stress === undefined
-                  ? '—' : num(к.stress, 0), 'чем меньше, тем спокойнее')}
-          ${kpi('Понятность речи', к.clarity === null || к.clarity === undefined
-                  ? '—' : num(к.clarity, 0), 'из 100')}
+          ${kpi('Разговоров', к.records ? плитка('records', 0) : num(0, 0),
+                `${num(к.hours || 0, 1)} ч звука`)}
+          ${kpi('Балл оператора', плитка('agent_score', 0), 'среднее по команде')}
+          ${kpi('Настроение клиента', плитка('mood', 2), 'от −1 до +1')}
+          ${kpi('Напряжение', плитка('stress', 0), 'чем меньше, тем спокойнее')}
+          ${kpi('Понятность речи', плитка('clarity', 0), 'из 100')}
           ${kpi('Индекс NPS', к.nps_index === null || к.nps_index === undefined
                   ? '—' : num(к.nps_index, 0), 'предсказанный: промоутеры минус критики')}
         </div>
@@ -11214,7 +13406,7 @@ RENDERERS.employees = {
                aria-sort="${ключ === к ? (направление < 0 ? 'descending' : 'ascending') : 'none'}"><button
                class="plain" type="button">${esc(имя)}${ключ === к ? (направление < 0 ? ' ↓' : ' ↑') : ''}</button></th>`
             ).join('')}</tr></thead>
-          <tbody>${люди.map((ч) => this.row(ч, команда, колонки)).join('')}</tbody>
+          <tbody>${люди.map((ч) => this.row(ч, команда, колонки, д.window)).join('')}</tbody>
         </table></div>
       </section>`;
     qsa('#emp-body th[data-sort]').forEach((з) => з.addEventListener('click', () => {
@@ -11238,11 +13430,41 @@ RENDERERS.employees = {
       .filter(Boolean);
   },
 
-  row(ч, команда, колонки) {
+  /* Отбор «этот сотрудник» для списка раскрытия. Имя отбора — тот же
+   * разрез, что выбран в разделе: и у записей, и у звонков они называются
+   * одинаково. «—» свод пишет там, где в базе пусто. */
+  who(ключ) {
+    return `${state.employeeBy}:${Drill.val(ключ, '—')}`;
+  },
+
+  /* Чем раскрывается клетка таблицы. Разбор — записями, телефония —
+   * звонками из журнала АТС: «Звонков» считает и нераспознанные, у которых
+   * записи нет вовсе, так что списком записей это число не раскрыть. */
+  cellDrill(к, ч) {
+    const чьё = ч.key === '—' ? 'без оператора' : (ч.label || ч.key);
+    if (к === 'calls') {
+      return { base: 'calls', f: [this.who(ч.key)], title: `Звонки — ${чьё}` };
+    }
+    if (к === 'talk_s') {
+      // Сумма по тем же звонкам; сверху — самые долгие, из них она и сложилась.
+      return { base: 'calls', f: [this.who(ч.key)], sort: 'billsec:desc',
+               value: 'разговор', title: `Наговорено — ${чьё}` };
+    }
+    // Доля ноль — раскрывать нечего: пустой список под нулём читался бы
+    // как «записи пропали».
+    if (!СОТРУДНИК_В_ТАБЛИЦЕ.includes(к) || (СОТРУДНИК_ДОЛИ[к] && !ч[к])) return null;
+    return сотрудникРаскрытие(к, this.who(ч.key), чьё);
+  },
+
+  row(ч, команда, колонки, окно) {
     const клетка = ([к, , знаков, лучше]) => {
       const значение = ч[к];
       if (значение === null || значение === undefined) return '<td class="num dim">—</td>';
-      const показать = к === 'talk_s' ? fmtDur(значение) : num(значение, знаков);
+      const текст = к === 'talk_s' ? fmtDur(значение) : num(значение, знаков);
+      // Число-кнопка строку не открывает: щелчок по нему — список, щелчок
+      // мимо него — по-прежнему карточка сотрудника.
+      const что = this.cellDrill(к, ч);
+      const показать = что ? Drill.num(текст, окно, что) : текст;
       const общее = команда[к];
       let класс = '';
       if (лучше && общее !== null && общее !== undefined && !ч.sparse) {
@@ -11283,25 +13505,48 @@ RENDERERS.employees = {
     }
     const свой = карточка.summary || {};
     const строка = (state.employeeData.items || []).find((ч) => ч.key === ключ) || {};
+    // Раскрытие. У карточки своё окно — она считается своим запросом, позже
+    // таблицы; звонки в шапке взяты из строки таблицы, и окно у них её же.
+    // «Прошлый период» раскрывается в записи прошлого окна, «Команда» — в
+    // записи всей команды; «Разница» — разность средних, списка за ней нет.
+    const окно = карточка.window;
+    const окноТаблицы = state.employeeData.window;
+    const кто = this.who(ключ);
+    const чьё = ключ === '—' ? 'без оператора' : (строка.label || ключ);
+    const число = (с, значение, границы, отбор, хвост) => {
+      if (значение === null || значение === undefined) return '—';
+      const текст = num(значение, с.digits);
+      // Нулевая доля и окно, которого нет («за всё время» прошлого периода
+      // не бывает), не раскрываются.
+      const что = границы !== null && !(СОТРУДНИК_ДОЛИ[с.key] && !значение)
+        ? сотрудникРаскрытие(с.key, отбор, хвост) : null;
+      return что ? Drill.num(текст, границы, что) : текст;
+    };
     место.innerHTML = `
       <section class="card" style="margin-top:14px">
+        <div data-drill-host>
         <div class="card-head">
           <h3>${esc(строка.label || ключ)}</h3>
           ${строка.sparse ? '<span class="chip warn">мало данных</span>' : ''}
-          <span class="chip">${num(свой.records || 0, 0)} ${
+          <span class="chip">${свой.records ? Drill.num(num(свой.records, 0), окно,
+              сотрудникРаскрытие('records', кто, чьё)) : '0'} ${
             plural(свой.records || 0, 'разговор', 'разговора', 'разговоров')}</span>
-          ${строка.calls ? `<span class="chip">${num(строка.calls, 0)} звонков · ${
+          ${строка.calls ? `<span class="chip">${Drill.num(num(строка.calls, 0), окноТаблицы,
+              this.cellDrill('calls', строка))} звонков · ${
             fmtDur(строка.talk_s || 0)}</span>` : ''}
           <span class="spacer"></span>
           ${state.employeeBy === 'agent' ? `<button class="ghost sm" id="emp-calls"
             title="Звонки этого сотрудника в журнале">Звонки</button>` : ''}
           <button class="ghost icon" id="emp-close" aria-label="Закрыть" title="Закрыть карточку">✕</button>
         </div>
+        </div>
+        <div data-drill-host>
         <div class="grid cols-2" style="padding:14px 16px">
           <div><h4 style="margin:0 0 8px;font-size:13px">Против команды</h4>
             <div id="emp-radar"></div></div>
           <div><h4 style="margin:0 0 8px;font-size:13px">Ход по неделям</h4>
             <div id="emp-line"></div></div>
+        </div>
         </div>
         <div class="table-wrap"><table class="table">
           <thead><tr><th>Показатель</th><th class="num">Сотрудник</th>
@@ -11309,21 +13554,21 @@ RENDERERS.employees = {
             <th class="num">Разница</th></tr></thead>
           <tbody>${(карточка.compare || []).map((с) => `<tr>
             <td>${esc(с.title)}</td>
-            <td class="num"><b>${с.agent === null || с.agent === undefined
-              ? '—' : num(с.agent, с.digits)}</b></td>
-            <td class="num dim">${с.team === null || с.team === undefined
-              ? '—' : num(с.team, с.digits)}</td>
-            <td class="num dim">${с.previous === null || с.previous === undefined
-              ? '—' : num(с.previous, с.digits)}</td>
+            <td class="num"><b>${число(с, с.agent, окно, кто, чьё)}</b></td>
+            <td class="num dim">${число(с, с.team, окно, '', 'вся команда')}</td>
+            <td class="num dim">${число(с, с.previous, карточка.previous_window || null, кто,
+                                        `${чьё}, прошлый период`)}</td>
             <td class="num ${с.verdict === 'better' ? 'good' : с.verdict === 'worse' ? 'bad' : ''}">${
               с.delta === null || с.delta === undefined ? '—'
                 : `${с.delta > 0 ? '+' : '−'}${num(Math.abs(с.delta), с.digits)}`}</td>
           </tr>`).join('')}</tbody>
         </table></div>
         ${(карточка.violations || []).length ? `
-          <div style="padding:12px 16px"><h4 style="margin:0 0 8px;font-size:13px">Нарушения</h4>
+          <div style="padding:12px 16px" data-drill-host><h4 style="margin:0 0 8px;font-size:13px">Нарушения</h4>
           <div class="row wrap" style="gap:6px">${карточка.violations.map((н) =>
-            `<span class="chip err">${esc(н.label || н.category)}: ${num(н.records, 0)}</span>`).join('')}</div></div>` : ''}
+            `<span class="chip err">${esc(н.label || н.category)}: ${Drill.num(num(н.records, 0), окно, {
+              base: 'content', f: [кто, `violation_category:${н.category}`],
+              title: `Нарушение «${н.label || н.category}» — ${чьё}` })}</span>`).join('')}</div></div>` : ''}
         <div class="grid cols-2" style="padding:12px 16px">
           <div><h4 style="margin:0 0 8px;font-size:13px">Разобрать с сотрудником</h4>
             ${(карточка.coaching || []).length ? `<div class="stack">${
@@ -11372,6 +13617,15 @@ RENDERERS.employees = {
         { name: 'напряжение', values: ход.map((т) => т.stress ?? null) },
       ],
       height: 220, yMin: 0, emptyText: 'Истории пока нет',
+      // Точка — это неделя сотрудника: её записи и открываются. Границы
+      // недели присылает сервер точными; пустую неделю раскрывать не во что.
+      onPick: (номер) => {
+        const т = ход[номер];
+        if (!т || !т.records || т.since === undefined) return;
+        Drill.open(qs('#emp-line'), Drill.spec({ since: т.since, until: т.until }, {
+          base: 'content', f: [кто],
+          title: `Разговоры ${fmtTime(т.since)} – ${fmtTime(т.until)} — ${чьё}` }));
+      },
     });
     const закрыть = qs('#emp-close');
     if (закрыть) закрыть.addEventListener('click', () => {
@@ -12429,6 +14683,10 @@ RENDERERS.help = {
           Если на распознавание — уменьшите ширину луча до 1 и увеличьте пакет.</p>
           <p><b>Плохо распознаются имена и термины.</b> Заполните начальную подсказку
           и ключевые слова, а систематические ошибки исправьте словарём замен.</p>
+          <p><b>Из каких записей сложилось число.</b> В разделах аналитики число с
+          пунктиром и уголком раскрывается щелчком: под ним встаёт список записей или
+          звонков за тот же период, со ссылкой на каждую. Столбцы, точки и клетки
+          графиков раскрываются так же; повторный щелчок сворачивает список.</p>
         </div>`)}
       </div>
 
@@ -12563,9 +14821,11 @@ RENDERERS.llmqueue = {
     qs('#lq-pending').addEventListener('click', (е) => this.add('pending', е.currentTarget));
     qs('#lq-failed').addEventListener('click', (е) => this.add('failed', е.currentTarget));
     qs('#lq-clear').addEventListener('click', () => this.clear());
-    qs('#lq-refresh').addEventListener('click', () => this.load());
+    // «Обновить» и смена окна — просьба пересчитать всё, в том числе то,
+    // что придержано раскрытым списком (см. `load`).
+    qs('#lq-refresh').addEventListener('click', () => this.load(false, true));
     qs('#lq-state').addEventListener('change', () => this.load());
-    qs('#lq-hours').addEventListener('change', () => this.load());
+    qs('#lq-hours').addEventListener('change', () => this.load(false, true));
 
     this.drawParams();
     await this.load();
@@ -12577,7 +14837,7 @@ RENDERERS.llmqueue = {
     viewTimer(() => this.tickCurrent(), 1000);
   },
 
-  async load(тихо) {
+  async load(тихо, заново) {
     const состояние = qs('#lq-state') ? qs('#lq-state').value : '';
     const часы = qs('#lq-hours') ? qs('#lq-hours').value : '24';
     try {
@@ -12592,10 +14852,38 @@ RENDERERS.llmqueue = {
       }
       return;
     }
-    this.drawTop();
+    // Раздел перерисовывается сам, раз в две с половиной секунды, и
+    // раскрытый под плиткой список исчезал бы, не дав себя прочитать.
+    // Поэтому, пока список раскрыт, его часть раздела (плитки или график)
+    // не перерисовывается: числа стоят на том же окне, что и список под
+    // ними, и одно с другим сходится. Свернули список — со следующим
+    // опросом часть снова живая. Очередь и «сейчас разбирается» идут своим
+    // чередом; «Обновить» и смена окна (`заново`) пересчитывают всё.
+    const держит = (узел) => {
+      if (заново || !узел || !qs('.drill-panel', узел)) return false;
+      if (!qs('.lq-held', узел)) {
+        узел.insertAdjacentHTML('beforeend', `<div class="small faint lq-held"
+          style="margin:0 0 14px">Числа над списком стоят на том моменте, когда его раскрыли, —
+          так они сходятся со списком. Сверните список, и они пойдут снова.</div>`);
+      }
+      return true;
+    };
+    if (!держит(qs('#lq-top'))) this.drawTop();
     this.drawCurrent();
-    this.drawChart();
+    if (!держит(qs('#lq-chart'))) this.drawChart();
     this.drawTable();
+  },
+
+  /* Раскрытие числа очереди в список записей.
+   *
+   * Числа раздела — это строки очереди, и окно у них по концу разбора, а
+   * не по времени записи: за сутки разбирают и годовалый архив. Общее окно
+   * списка (оно режет время записи) сюда не годится, поэтому промежуток
+   * передаётся значением отбора — теми границами, что прислал сервер.
+   * `вид`: done — разбор закончен, ok — успешно, failed — со сбоем.
+   */
+  раскрыть(вид, от, до, заголовок) {
+    return Drill.spec(null, { f: [`llmq_${вид}:${от}..${до}`], title: заголовок });
   },
 
   drawTop() {
@@ -12606,9 +14894,16 @@ RENDERERS.llmqueue = {
     const свод = д.stats || {};
     const нстр = д.settings || {};
     const клиент = д.client || {};
-    const всего = Number(свод.n || 0);
+    const успешно = Number(свод.ok || 0);
     const сбоев = Number(свод.failed || 0);
+    // «Разобрано» — это успешные и сбойные. В `n` сервер считает ещё и
+    // снятые с очереди (у отмены тоже есть время конца): запись, которую
+    // убрали крестиком, числилась разобранной и разбавляла долю сбоев.
+    const всего = успешно + сбоев;
     const доля = всего ? сбоев / всего : 0;
+    const число = (значение, вид, заголовок) => (значение && свод.until
+      ? Drill.num(num(значение), null, this.раскрыть(вид, свод.since, свод.until, заголовок))
+      : num(значение));
     // Значок в меню: очередь, о которой не знаешь, — это очередь, которая
     // стоит. Счётчик виден из любого раздела.
     const значок = qs('#badge-llmq');
@@ -12624,9 +14919,9 @@ RENDERERS.llmqueue = {
             : `не больше ${нстр.max_concurrent || 1} за раз`))}
       ${kpi('Ждут разбора', num(счёт['ждёт'] || 0),
         `${num(счёт['идёт'] || 0)} в работе`)}
-      ${kpi('Разобрано за окно', num(всего),
-        `${num(свод.ok || 0)} успешно`)}
-      ${kpi('Сбоев', num(сбоев),
+      ${kpi('Разобрано за окно', число(всего, 'done', 'Разобрано за окно'),
+        `${число(успешно, 'ok', 'Разобрано успешно')} успешно`)}
+      ${kpi('Сбоев', число(сбоев, 'failed', 'Сбои разбора за окно'),
         всего ? `${pct(доля, 1)} от разобранного` : 'разборов не было',
         сбоев ? { dir: 'down', text: доля > 0.1 ? 'много' : 'бывает' } : null)}
       ${kpi('Среднее время ответа', свод.avg_ms ? fmtDur(свод.avg_ms / 1000) : '—',
@@ -12726,7 +15021,7 @@ RENDERERS.llmqueue = {
     const ширина = Number((д.series || {}).bucket_seconds) ||
       ((д.stats || {}).since ? (Date.now() / 1000 - с_какого) : 3600) / корзин;
     const метки = [];
-    const разобрано = [];
+    const успешные = [];
     const сбои = [];
     const время = [];
     // Корзины приходят разрежённо: пустые сервер не присылает. Развернём в
@@ -12735,8 +15030,11 @@ RENDERERS.llmqueue = {
     for (let i = 0; i < корзин; i += 1) {
       const с = по_корзинам.get(i);
       метки.push(подписьВремени(с_какого + i * ширина, ширина));
-      разобрано.push(с ? Number(с.n || 0) : 0);
       сбои.push(с ? Number(с.failed || 0) : 0);
+      // Успешные — своим счётом сервера; «всё минус сбои» записывало в
+      // успешные и снятые с очереди записи.
+      успешные.push(с ? (с.ok === undefined || с.ok === null
+        ? Number(с.n || 0) - сбои[i] : Number(с.ok)) : 0);
       время.push(с && с.avg_ms ? Number(с.avg_ms) / 1000 : null);
     }
     место.innerHTML = `<div class="grid cols-2">
@@ -12746,9 +15044,18 @@ RENDERERS.llmqueue = {
     </div>`;
     window.Charts.bars(qs('#lq-c1'), {
       labels: метки,
-      series: [{ name: 'успешно', values: разобрано.map((з, i) => з - сбои[i]), color: 'ok' },
+      series: [{ name: 'успешно', values: успешные, color: 'ok' },
                { name: 'сбои', values: сбои, color: 'err' }],
       height: 200, emptyText: 'за окно разборов не было',
+      // Кусок столбца — разборы корзины: её границы считаются от начала и
+      // шага, которые прислал сервер. Нет шага от сервера — нет и
+      // раскрытия: границы от часов браузера со списком не сошлись бы.
+      onPick: Number((д.series || {}).bucket_seconds) > 0
+        ? (номер, кусок) => Drill.open(qs('#lq-c1'), this.раскрыть(
+          кусок.series ? 'failed' : 'ok', с_какого + номер * ширина,
+          с_какого + (номер + 1) * ширина,
+          `${кусок.series ? 'Сбои разбора' : 'Разобрано успешно'}: ${метки[номер]}`))
+        : undefined,
     });
     window.Charts.line(qs('#lq-c2'), {
       labels: метки,
@@ -13526,6 +15833,27 @@ RENDERERS.voice = {
   вкладка: 'summary',
   период: 'week',
 
+  /* Раскрытие числа в список записей.
+   *
+   * Свод считает готовые записи без контрольных прогонов, а распределения
+   * (причины, исходы, трекеры, скоркарта) — только по ответам без сбоя.
+   * Список обязан начинаться с того же, иначе под числом «6» окажется семь
+   * строк: седьмая — запись, на которой модель упала. Окно — из ответа
+   * свода (`window`), режется оно временем записи.
+   */
+  ЗАПИСИ: ['status:completed', 'no_control'],
+
+  раскрыть(отборы, заголовок, сбой) {
+    return Drill.spec((state.voice || {}).window, {
+      base: 'llm', title: заголовок,
+      f: [...this.ЗАПИСИ, ...(сбой ? [] : ['llm_ok']), ...(отборы || [])],
+    });
+  },
+
+  число(разметка, отборы, заголовок, сбой) {
+    return Drill.num(разметка, null, this.раскрыть(отборы, заголовок, сбой));
+  },
+
   async render(root) {
     root.innerHTML = `
       <div class="settings-toolbar">
@@ -13597,14 +15925,22 @@ RENDERERS.voice = {
     const решено = д.resolved_share;           // проценты 0–100 или null
     const действий = Number(д.actions || 0);
     место.innerHTML = `<div class="grid cols-5" style="margin-bottom:16px">
-      ${kpi('Разговоров за период', num(всего), 'с расшифровкой')}
-      ${kpi('Разобрано моделью', num(разобрано),
+      ${kpi('Разговоров за период', всего ? Drill.num(num(всего), д.window, {
+          f: this.ЗАПИСИ, title: 'Разговоры за период' }) : num(всего), 'с расшифровкой')}
+      ${kpi('Разобрано моделью', разобрано
+          ? this.число(num(разобрано), [], 'Разобрано моделью') : num(разобрано),
         всего ? `${pct(покрытие, 0)} покрытия` : '',
         покрытие < 0.5 && всего ? { dir: 'down', text: 'модель отстаёт' } : null)}
-      ${kpi('Решено при обращении', решено == null ? '—' : pct(Number(решено) / 100, 0),
+      ${kpi('Решено при обращении', решено == null ? '—'
+          // Доля раскрывается числителем: записи, где вопрос решён.
+          : (Number(решено) ? this.число(pct(Number(решено) / 100, 0), ['resolved:1'],
+              'Вопрос решён при обращении') : pct(0, 0)),
         'по мнению модели')}
       ${kpi('Обязательств', num(действий),
-        д.records_with_actions ? `в ${num(д.records_with_actions)} разговорах` : 'обещаний, данных клиентам')}
+        // Само число — обещания, а не записи; записями раскрывается то,
+        // что под ним: в скольких разговорах они прозвучали.
+        д.records_with_actions ? `в ${this.число(num(д.records_with_actions), ['with_actions'],
+          'Разговоры с обязательствами')} разговорах` : 'обещаний, данных клиентам')}
       ${kpi('Модель', esc(с.model || д.model || '—'),
         // Состояние связи — поле `available` с причиной в `reason`: поля
         // `reachable` сервер не отдаёт, и при лежащем сервере модели здесь
@@ -13654,10 +15990,14 @@ RENDERERS.voice = {
     window.Charts.hbars(qs('#vo-s1'), {
       items: причины.slice(0, 12).map((п) => ({ label: п.key, value: п.records })),
       labelWidth: 200, emptyText: 'причины не спрашивались',
+      onPick: (номер, причина) => Drill.open(qs('#vo-s1'),
+        this.раскрыть([`reason:${причина.label}`], `Причина: ${причина.label}`)),
     });
     window.Charts.donut(qs('#vo-s2'), {
       parts: исходы.map((п) => ({ label: п.key, value: п.records })),
       size: 170, centerLabel: 'записей', emptyText: 'исходы не спрашивались',
+      onPick: (номер, исход) => Drill.open(qs('#vo-s2'),
+        this.раскрыть([`outcome:${исход.label}`], `Исход: ${исход.label}`)),
     });
     this.связатьТаблицу(место);
   },
@@ -13682,7 +16022,11 @@ RENDERERS.voice = {
             return `<tr><td>${esc(п)}</td>
               ${топ_исходов.map((и) => {
                 const n = пары.get(`${п}|${и}`) || 0;
-                return `<td class="num ${n ? '' : 'faint'}">${n || '—'}</td>`;
+                // Клетка — записи с этой причиной и этим исходом разом.
+                // «Всего» справа не раскрывается: это сумма по показанным
+                // исходам, а не все записи причины.
+                return `<td class="num ${n ? '' : 'faint'}">${n ? this.число(n,
+                  [`reason:${п}`, `outcome:${и}`], `${п} → ${и}`) : '—'}</td>`;
               }).join('')}
               <td class="num mono">${num(всего)}</td></tr>`;
           }).join('')}
@@ -13690,15 +16034,21 @@ RENDERERS.voice = {
           : '<div class="empty">Причины или исходы у модели не спрашивались.</div>')}
       ${card('Цитаты, по которым модель решила', 'проверка на доверие: видно, за что зацепилась модель',
         `<div class="table-wrap"><table>
-          <thead><tr><th style="width:170px">Причина</th><th>Цитата</th>
+          <thead><tr><th style="width:170px">Запись</th>
+            <th style="width:170px">Причина</th><th>Цитата</th>
             <th style="width:170px">Исход</th><th>Цитата</th></tr></thead>
           <tbody>${строки.filter((с) => с.reason_quote || с.outcome_quote).slice(0, 30)
             .map((с) => `<tr>
+              <td class="small truncate" style="max-width:170px">
+                <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
               <td class="small">${esc(с.reason || '—')}</td>
               <td class="small dim">${esc(с.reason_quote || '')}</td>
               <td class="small">${esc(с.outcome || '—')}</td>
               <td class="small dim">${esc(с.outcome_quote || '')}</td></tr>`).join('')}
           </tbody></table></div>`)}`;
+    // Цитата без записи — утверждение без источника: «за что зацепилась
+    // модель» проверяют, открыв сам разговор.
+    this.связатьТаблицу(место);
   },
 
   drawActions(место, д) {
@@ -13753,8 +16103,12 @@ RENDERERS.voice = {
         items: трекеры.map((т) => ({
           label: т.label || т.id, value: Number(т.fired || 0),
           note: `проверено ${num(т.checked)}`,
+          // Трекер, который не сработал ни разу, раскрывать не во что.
+          id: т.id, pick: Number(т.fired || 0) > 0,
         })),
         labelWidth: 220,
+        onPick: (номер, трекер) => Drill.open(qs('#vo-t1'),
+          this.раскрыть([`tracker:${трекер.id}`], `Сработал трекер: ${трекер.label}`)),
       });
     }
     this.связатьТаблицу(место);
@@ -13766,18 +16120,22 @@ RENDERERS.voice = {
     const пары = (д.scorecard || [])
       .map((в) => {
         const да = Number(в['да'] || 0), нет = Number(в['нет'] || 0);
-        return [в.question || в.id, да, нет, Number(в['н/п'] || 0), да + нет ? да / (да + нет) : 0];
+        return [в.question || в.id, да, нет, Number(в['н/п'] || 0), да + нет ? да / (да + нет) : 0,
+                в.id];
       })
       .sort((a, b) => a[4] - b[4]);
     место.innerHTML = card('Скоркарта', 'доля разговоров, где пункт выполнен',
       пари(пары) ? `<div class="table-wrap"><table>
         <thead><tr><th>Пункт</th><th class="num">выполнено</th><th class="num">нет</th>
           <th class="num">н/п</th><th style="width:240px">доля</th></tr></thead>
-        <tbody>${пары.map(([в, да, нет, нп, доля]) => `<tr>
+        <tbody>${пары.map(([в, да, нет, нп, доля, пункт]) => `<tr>
           <td class="small">${esc(в)}</td>
-          <td class="num mono">${num(да)}</td>
-          <td class="num mono">${num(нет)}</td>
-          <td class="num mono faint">${num(нп)}</td>
+          <td class="num mono">${да ? this.число(num(да), [`score_yes:${пункт}`],
+            `Выполнено: ${в}`) : num(да)}</td>
+          <td class="num mono">${нет ? this.число(num(нет), [`score_no:${пункт}`],
+            `Не выполнено: ${в}`) : num(нет)}</td>
+          <td class="num mono faint">${нп ? this.число(num(нп), [`score_na:${пункт}`],
+            `Неприменимо: ${в}`) : num(нп)}</td>
           <td>${да + нет ? полоса_доли(доля, доля > 0.8 ? 'ok' : (доля > 0.5 ? 'warn' : 'err')) : '—'}</td>
         </tr>`).join('')}</tbody></table></div>`
         : `<div class="empty">Скоркарта не настроена.
@@ -13788,9 +16146,21 @@ RENDERERS.voice = {
   drawRecords(место, д) {
     const строки = д.rows || [];
     const всего = Number(д.rows_total || строки.length);
-    место.innerHTML = card('Разобранные записи',
-      `${num(всего)} за период` + (всего > строки.length ? ` · показаны последние ${num(строки.length)}` : ''),
-      this.таблицаЗаписей(строки));
+    const сбоев = Number(д.errors || 0);
+    // Таблица ниже — последние три сотни, а счёт над ней — за весь период:
+    // он и раскрывается полным списком. Сюда входят и ответы со сбоем — в
+    // отличие от плитки «Разобрано моделью»; сбои рядом, своим числом.
+    // Отступ под шапкой отдан таблице: между ними встаёт раскрытый список,
+    // и без этого он лежал бы на таблице вплотную.
+    место.innerHTML = `<section class="card">
+      <div data-drill-host><div class="card-head" style="margin-bottom:0"><h3>Разобранные записи</h3>
+        <span class="hint">${всего ? this.число(num(всего), [], 'Записи с ответом модели', true)
+          : num(всего)} за период${всего > строки.length
+          ? ` · показаны последние ${num(строки.length)}` : ''}</span>
+        ${сбоев ? `<span class="chip err">со сбоем: ${this.число(num(сбоев), ['llm_failed'],
+          'Сбои разбора', true)}</span>` : ''}
+      </div></div>
+      <div style="margin-top:12px">${this.таблицаЗаписей(строки)}</div></section>`;
     this.связатьТаблицу(место);
   },
 

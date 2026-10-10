@@ -1073,6 +1073,29 @@ def _нижний(значение: Any) -> Any:
     return значение.lower() if isinstance(значение, str) else значение
 
 
+def _есть_метка(строка: Any, метка: Any) -> int:
+    """Есть ли метка в строке «через запятую» — для SQL.
+
+    Метки и признаки качества лежат одной строкой, и сравнение образцом
+    LIKE зависит от того, как именно её набрали: «срочно, согласие» и
+    «срочно,согласие» — одна и та же пара меток. Аналитика читает колонку
+    через `split(",")` и `strip()`; раскрытие числа в список записей обязано
+    читать её так же, иначе список не сойдётся с числом, которое раскрывали.
+    """
+    if not isinstance(строка, str) or not строка:
+        return 0
+    искомая = str(метка or "").strip()
+    return int(any(часть.strip() == искомая for часть in строка.split(",")))
+
+
+class QueryTimeout(Exception):
+    """Запрос на чтение не уложился в отведённый срок и был прерван.
+
+    Не ошибка сервера и не `ASRHubError`: это ожидаемый исход запроса с
+    предельным сроком, и решает, что с ним делать, тот, кто срок поставил.
+    """
+
+
 def _порядок_заданий(order: str, соединение: bool) -> str:
     """Порядок выборки заданий в виде SQL.
 
@@ -1177,10 +1200,12 @@ class Database:
             # оставляет как есть, и поиск по справочнику не находил
             # человека, если регистр не совпал буква в букву. Подменяем
             # своей — питоновский str.lower() знает все алфавиты.
-            try:
-                conn.create_function("lower", 1, _нижний, deterministic=True)
-            except (sqlite3.NotSupportedError, TypeError):    # старая сборка
-                conn.create_function("lower", 1, _нижний)
+            for имя, число, функция in (("lower", 1, _нижний),
+                                        ("has_tag", 2, _есть_метка)):
+                try:
+                    conn.create_function(имя, число, функция, deterministic=True)
+                except (sqlite3.NotSupportedError, TypeError):    # старая сборка
+                    conn.create_function(имя, число, функция)
             self._local.conn = conn
         return conn
 
@@ -1306,6 +1331,38 @@ class Database:
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
         rows = self.query(sql, params)
         return rows[0] if rows else None
+
+    def query_bounded(self, sql: str, params: Sequence[Any] = (), *,
+                      seconds: float = 5.0) -> list[sqlite3.Row]:
+        """Чтение с предельным сроком: дольше — прерывается `QueryTimeout`.
+
+        Нужно запросам, чья цена зависит от того, что спросил человек, а не
+        от того, что написал программист: редкий отбор по всему архиву
+        читает архив целиком, и на миллионе записей это уже не «мгновенно».
+        Обычный запрос в таком случае держал бы поток пула, пока не
+        дочитает, — а человек давно закрыл список и открыл соседний.
+
+        Срок проверяет сам SQLite между шагами своей машины: соединение у
+        потока своё, так что обработчик хода никому больше не мешает и
+        снимается сразу после запроса.
+        """
+        conn = self.conn
+        срок = time.monotonic() + max(0.05, float(seconds))
+        conn.set_progress_handler(lambda: 1 if time.monotonic() > срок else 0, 5000)
+        try:
+            return list(conn.execute(sql, params))
+        except sqlite3.OperationalError as exc:
+            if "interrupt" in str(exc).lower():
+                raise QueryTimeout(sql[:120]) from exc
+            _значение_не_того_вида(exc)
+            log.warning("Ошибка чтения из базы: %s; запрос: %s", exc, sql[:200])
+            raise StorageError(f"Ошибка чтения из базы: {exc}") from exc
+        except sqlite3.Error as exc:
+            _значение_не_того_вида(exc)
+            log.warning("Ошибка чтения из базы: %s; запрос: %s", exc, sql[:200])
+            raise StorageError(f"Ошибка чтения из базы: {exc}") from exc
+        finally:
+            conn.set_progress_handler(None, 0)
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         with self.write() as conn:
@@ -4378,6 +4435,23 @@ class Database:
         свод["reasons"] = {str(r["reason"]): int(r["n"]) for r in причины}
         return свод
 
+    #: Основа «решения с первого раза»: отвеченный входящий, у которого
+    #: известен номер звонящего. `{c}` — псевдоним таблицы звонков.
+    ОСНОВА_ПОВТОРОВ = ("{c}.direction='входящий' AND COALESCE({c}.answered,0)=1"
+                       " AND COALESCE({c}.src,'')<>''")
+
+    #: Повторное обращение: тот же номер позвонил входящим ещё раз в пределах
+    #: окна после этого звонка. `{c}` — псевдоним звонка, `{окно}` — место
+    #: длины окна в секундах. Выражение одно на свод (`call_kpi`) и на список
+    #: раскрытия (`drill`): посчитай они «повторный» по-разному, показатель
+    #: раскрывался бы не в те звонки, из которых сложился.
+    ПОВТОРНЫЙ_ЗВОНОК = ("EXISTS ("
+                        "SELECT 1 FROM calls p"
+                        " WHERE p.src = {c}.src AND p.direction='входящий'"
+                        " AND p.started_at > {c}.started_at"
+                        " AND p.started_at <= {c}.started_at + {окно}"
+                        " AND p.uniqueid <> {c}.uniqueid)")
+
     def call_kpi(self, *, owner: str | list[str] | None = None,
                  station: str = "", queue: str = "",
                  since: float = 0.0, until: float = 0.0,
@@ -4456,16 +4530,10 @@ class Database:
         окно = max(0.0, float(repeat_window_days)) * 86400.0
         повтор = self.query_one(
             "SELECT COUNT(*) AS base,"
-            "       SUM(CASE WHEN EXISTS ("
-            "             SELECT 1 FROM calls p"
-            "             WHERE p.src = c.src AND p.direction='входящий'"
-            "               AND p.started_at > c.started_at"
-            "               AND p.started_at <= c.started_at + ?"
-            "               AND p.uniqueid <> c.uniqueid)"
+            f"       SUM(CASE WHEN {self.ПОВТОРНЫЙ_ЗВОНОК.format(c='c', окно='?')}"
             "           THEN 1 ELSE 0 END) AS repeated "
             f"FROM calls c{где}{' AND' if где else ' WHERE'} "
-            "  c.direction='входящий' AND COALESCE(c.answered,0)=1"
-            "  AND COALESCE(c.src,'')<>''", [окно, *args]) if окно > 0 else None
+            f"  {self.ОСНОВА_ПОВТОРОВ.format(c='c')}", [окно, *args]) if окно > 0 else None
 
         основа = float((повтор["base"] if повтор else 0) or 0)
         повторных = float((повтор["repeated"] if повтор else 0) or 0)
@@ -4487,9 +4555,17 @@ class Database:
             "service_level": (round(свод["in_time"] / свод["inbound_answered"], 4)
                               if свод["inbound_answered"] else None),
             "service_level_s": порог,
+            # Числитель уровня обслуживания и число повторных обращений —
+            # сами счётчики, а не только доли: долю интерфейс раскрывает в
+            # список звонков, и сверять список приходится с числом.
+            "in_time": int(свод["in_time"]),
             "fcr": (round(1.0 - повторных / основа, 4) if основа else None),
             "fcr_base": int(основа),
+            "repeated": int(повторных),
             "repeat_window_days": round(float(repeat_window_days), 2),
+            # Окно в секундах без округления: по нему список повторных
+            # обращений отбирается тем же условием, что и счёт.
+            "repeat_window_s": окно,
         }
 
     def list_calls(self, *, owner: str | list[str] | None = None,
@@ -4611,6 +4687,28 @@ class Database:
             args = [*args, float(until)]
         return части, args
 
+    def call_horizon(self, now: float | None = None) -> float:
+        """Верхняя граница окна сводов по звонкам: «сейчас», но не раньше
+        самого позднего звонка архива.
+
+        Своды раздела «АТС» сверху не ограничены: звонок, чьё время начала
+        ушло вперёд (часы станции спешат, пояс не задан), в них входит. Список
+        раскрытия режется по обеим границам — и граница «сейчас» выбросила бы
+        из него ровно эти звонки, то есть число разошлось бы со списком на
+        той самой станции, где и так что-то не в порядке. Поэтому верх окна
+        поднимается до последнего звонка: всё, что свод посчитал, в список
+        попадёт, а звонки, начавшиеся позже ответа, — уже нет.
+
+        Самый поздний звонок берётся по всему архиву, без разреза по
+        владельцу: это граница, а не данные, и чужого она не выдаёт, зато
+        читается одним шагом по указателю `idx_calls_started`.
+        """
+        сейчас = float(now if now is not None else time.time())
+        строка = self.query_one("SELECT MAX(started_at) AS t FROM calls")
+        последний = float(строка["t"] or 0.0) if строка else 0.0
+        # Верхняя граница не входит в окно, отсюда секунда запаса.
+        return max(сейчас, последний + 1.0)
+
     #: Что считаем в каждой корзине времени. Держим одним списком: колонки
     #: нужны и линии нагрузки, и сводке за период, и расходиться они не должны.
     СЧЁТ_ЗВОНКОВ = (
@@ -4655,6 +4753,20 @@ class Database:
         номер = f"CAST(({t} + {сдвиг} - {неделя}) / {шаг} AS INTEGER)"
         return f"{номер} * {шаг} + {неделя} - {сдвиг}", номер
 
+    def _конец_корзины_звонка(self, шаг: int, сдвиг: int) -> str:
+        """SQL конца корзины (секунды эпохи): первая секунда следующей.
+
+        Нужен раскрытию точки линии в список звонков: «с такого-то по
+        такое-то» обязано быть ровно той корзиной, в которую звонок попал
+        при счёте. Час, сутки и неделя — начало плюс шаг; месяц — начало
+        следующего календарного месяца, а не «плюс тридцать суток».
+        """
+        if шаг == self.ШАГ_КОРЗИНЫ["month"]:
+            return ("CAST(strftime('%s', c.started_at, 'unixepoch', 'localtime', "
+                    "'start of month', '+1 month', 'utc') AS INTEGER)")
+        начало, _ = self._корзина_звонка(шаг, сдвиг)
+        return f"{начало} + {шаг}"
+
     @staticmethod
     def _сдвиг_времени() -> int:
         """Смещение местного времени от UTC, секунды.
@@ -4691,12 +4803,17 @@ class Database:
         # и том же ответе.
         сдвиг = self._сдвиг_времени() if шаг >= 86400 else 0
         начало, _ = self._корзина_звонка(шаг, сдвиг)
+        конец = self._конец_корзины_звонка(шаг, сдвиг)
         rows = self.query(
-            f"SELECT {начало} AS bucket, "
+            # Конец у всех звонков корзины один; MAX — чтобы он был
+            # выражением группы, а не «какой-нибудь строки».
+            f"SELECT {начало} AS bucket, MAX({конец}) AS bucket_end, "
             + ", ".join(self.СЧЁТ_ЗВОНКОВ)
             + f" FROM calls c WHERE {' AND '.join(части)} "
             f"GROUP BY bucket ORDER BY bucket LIMIT {int(limit)}", args)
         return [{"t": float(r["bucket"]),
+                 # Точные границы корзины: звонок в ней, если t <= начало < until.
+                 "until": float(r["bucket_end"]),
                  **{к: int(r[к] or 0) for к in
                     ("total", "inbound", "outbound", "internal", "answered",
                      "queued", "skipped", "talk_s", "wait_s")}}
@@ -4853,7 +4970,12 @@ class Database:
         имена.append(f"дольше {границы[-1] // 60}м")
         по_корзинам = {int(r["корзина"]): (int(r["n"] or 0), int(r["talk_s"] or 0))
                        for r in rows}
+        # Границы корзины в секундах: нижняя входит, верхняя нет; у первой
+        # нижней нет, у последней — верхней. По ним столбец раскрывается в
+        # список звонков тем же условием, которым посчитан.
+        края = (None, *границы, None)
         return [{"label": имя,
+                 "from": края[н], "to": края[н + 1],
                  "count": по_корзинам.get(н, (0, 0))[0],
                  "talk_s": по_корзинам.get(н, (0, 0))[1]}
                 for н, имя in enumerate(имена)]
@@ -5453,10 +5575,21 @@ class Database:
         return {"total": int(всего["n"]) if всего else 0,
                 "items": [dict(r) for r in rows]}
 
-    def llmq_stats(self, since: float, *,
+    def llmq_stats(self, since: float, *, until: float | None = None,
                    owner: str | list[str] | None = None) -> dict[str, Any]:
-        """Сводка по завершённым запросам за окно: сколько, как долго, как часто ошибались."""
+        """Сводка по завершённым запросам за окно: сколько, как долго, как часто ошибались.
+
+        `until` — верхняя граница окна (не входит). Без неё окно открыто в
+        будущее: число «сбоев за сутки» раскрывается в список отдельным
+        запросом и позже, и разбор, закончившийся между сводкой и списком,
+        попадал бы в список, не попав в число. Границы возвращаются в
+        ответе — ими список и режется.
+        """
         откуда, своё, своё_args = self._llmq_откуда(owner)
+        окно, окно_args = "q.finished_at>=?", [float(since)]
+        if until is not None:
+            окно += " AND q.finished_at<?"
+            окно_args.append(float(until))
         строка = self.query_one(
             "SELECT COUNT(*) AS n, "
             "       SUM(CASE WHEN q.state=? THEN 1 ELSE 0 END) AS ok, "
@@ -5465,10 +5598,11 @@ class Database:
             "       SUM(q.calls) AS calls, "
             "       AVG(CASE WHEN q.started_at IS NOT NULL AND q.enqueued_at IS NOT NULL "
             "                THEN q.started_at-q.enqueued_at END) AS wait_s "
-            f"{откуда} WHERE q.finished_at>=? AND {своё}",
-            (self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, float(since), *своё_args))
+            f"{откуда} WHERE {окно} AND {своё}",
+            (self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, *окно_args, *своё_args))
         свод = dict(строка) if строка else {}
         свод["since"] = float(since)
+        свод["until"] = float(until) if until is not None else None
         return свод
 
     def llmq_series(self, since: float, until: float, buckets: int, *,
@@ -5480,13 +5614,17 @@ class Database:
         rows = self.query(
             "SELECT CAST((q.finished_at-?)/? AS INTEGER) AS bucket, "
             "       COUNT(*) AS n, "
+            # Успешные — своим счётом, а не «всё минус сбои»: в `n` входят и
+            # снятые с очереди (у отмены тоже есть время конца), и на графике
+            # они рисовались разобранными успешно.
+            "       SUM(CASE WHEN q.state=? THEN 1 ELSE 0 END) AS ok, "
             "       SUM(CASE WHEN q.state=? THEN 1 ELSE 0 END) AS failed, "
             "       AVG(q.latency_ms) AS avg_ms, "
             "       AVG(CASE WHEN q.started_at IS NOT NULL AND q.enqueued_at IS NOT NULL "
             "                THEN q.started_at-q.enqueued_at END) AS wait_s "
             f"{откуда} WHERE q.finished_at>=? AND q.finished_at<? AND {своё} "
             "GROUP BY bucket ORDER BY bucket",
-            (since, шаг, self.LLMQ_ОШИБКА, since, until, *своё_args))
+            (since, шаг, self.LLMQ_ГОТОВО, self.LLMQ_ОШИБКА, since, until, *своё_args))
         return buckets, [dict(r) for r in rows]
 
     # --- контроль качества работы оператора -----------------------------

@@ -826,3 +826,58 @@ button.plain {
 button.plain:hover { background: transparent; text-decoration: underline; }
 button.plain:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 th.sortable button.plain { white-space: nowrap; }
+
+/* ---------- Раскрытие числа в список записей ---------- */
+
+/* Число-кнопка выглядит числом: тот же шрифт и цвет, что вокруг. Что по
+   нему можно щёлкнуть, говорят пунктир под ним и уголок — цвета одного
+   мало, им в интерфейсе уже размечены «хорошо» и «плохо». */
+button.drill {
+  background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit;
+  letter-spacing: inherit; cursor: pointer; text-align: inherit; border-radius: 3px;
+  text-decoration: underline dotted var(--text-faint); text-underline-offset: 3px;
+  white-space: nowrap;
+}
+button.drill:hover, button.drill.drill-on {
+  background: none; color: var(--accent); text-decoration-color: var(--accent);
+}
+button.drill::after {
+  content: '▸'; display: inline-block; font-size: max(9px, .45em); margin-left: 2px;
+  opacity: .55; vertical-align: middle; transition: transform .12s; text-decoration: none;
+}
+button.drill.drill-on::after { transform: rotate(90deg); opacity: 1; }
+[data-drill]:not(button) { cursor: pointer; }
+.chart .pick, .chart-legend .pick, .row.pick { cursor: pointer; }
+.chart .pick:focus-visible, .chart-legend .pick:focus-visible, .row.pick:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+
+.drill-panel {
+  margin: 12px 0 0; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+/* Под рядом плиток или карточек: ряд свой отступ уже отдал. */
+.grid + .drill-panel, .kpi + .drill-panel { margin: -4px 0 16px; }
+.drill-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.drill-title { font-size: 13px; font-weight: 600; }
+.drill-head select.drill-sort { width: auto; padding: 3px 8px; font-size: 12px; }
+/* Высота панели ограничена: тысяча строк не должна уводить остальной
+   раздел на десятки экранов вниз. Листается сам список. */
+.drill-body { max-height: 440px; }
+.drill-table { font-size: 12.5px; }
+.drill-table th { background: var(--bg-elev-2); }
+.drill-table td { padding: 6px 10px; }
+.drill-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 10px; }
+.drill-foot .warn { color: var(--warn); }
+tr.drill-row, tr.drill-row:hover { background: none; }
+tr.drill-row > td { padding: 0 0 10px; white-space: normal; }
+tr.drill-row .drill-panel { margin: 6px 10px 0; }
+/* Список в строке таблицы не должен её раздвигать: его собственная таблица
+   шире узкой карточки, и без этого ячейка растягивалась под неё, а за
+   ячейкой — таблица, карточка и на экранах 900–980 px весь документ. С
+   ограничением панель занимает ширину своей таблицы, а лишнее листается
+   внутри неё, как и задумано. */
+tr.drill-row .drill-panel { contain: inline-size; }

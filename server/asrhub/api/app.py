@@ -41,6 +41,7 @@ from .routes_auth import router as auth_router
 from .routes_backup import router as backup_router
 from .routes_catalog import router as catalog_router
 from .routes_content import router as content_router
+from .routes_drill import router as drill_router
 from .routes_employees import router as employees_router
 from .routes_jobs import router as jobs_router
 from .routes_llm import router as llm_router
@@ -743,6 +744,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # добавит кто-нибудь «/api/llm/{раздел}» — и перехват станет возможен.
     app.include_router(llm_proxy_router)
     app.include_router(trends_router)
+    app.include_router(drill_router)
     app.include_router(telephony_router)
     # Справочник сотрудников: кто стоит за внутренним номером в журнале АТС.
     app.include_router(employees_router)

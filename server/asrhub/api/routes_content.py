@@ -16,6 +16,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 
+from ..drill import раскрытие_показателя
 from ..errors import ASRHubError, ConfigError, JobNotFound
 from ..insights import ОТБОРЫ, РАЗРЕЗЫ, Insights, признаки_для
 from .deps import (
@@ -67,9 +68,61 @@ def _реплики_записи(state: Any, задание: dict[str, Any]) -> 
 
 
 def _insights(request: Request) -> Insights:
-    """Свод. Заводится на запрос: он не хранит состояния, только ссылки."""
+    """Свод. Заводится на запрос: он не хранит состояния, только ссылки.
+
+    Окно периода замораживается на всю жизнь свода, то есть на один ответ:
+    сколько бы разрезов ни считал обработчик, граница у них общая, и её же
+    он отдаёт в ответе (`_с_окном`) — по ней интерфейс раскрывает число в
+    список записей.
+    """
     state = get_state(request)
-    return Insights(state.db, _index(request))
+    свод = Insights(state.db, _index(request))
+    свод._окна = {}
+    return свод
+
+
+def _с_окном(свод: Insights, period: str, ответ: dict[str, Any]) -> dict[str, Any]:
+    """Дописывает в ответ свода границы окна, по которому он посчитан.
+
+    Число раскрывается в список отдельным запросом (`GET /api/drill`), и
+    позже: посчитай список «неделю до сейчас» сам, он показал бы уже другую
+    неделю и разошёлся бы с числом. Верхняя граница — момент ответа:
+    записи, пришедшие после него, в свод не вошли.
+    """
+    if isinstance(ответ, dict):
+        ответ.setdefault("window", {"since": свод.window(period)[0], "until": time.time()})
+    return ответ
+
+
+def _прошлое_окно(свод: Insights, period: str) -> dict[str, Any] | None:
+    """Границы окна «прошлый такой же период» — того, с которым свод сравнивает.
+
+    Числа прошлого периода («было 412», колонка «Прошлый период») тоже
+    раскрываются в записи, а окно у них своё: от начала прошлого периода до
+    начала нынешнего. Граница общая с `window` того же ответа — обе берутся
+    из одного замороженного окна. Пусто у «всего времени»: сравнивать там
+    не с чем, и свод прошлого периода не считает.
+    """
+    начало, прошлое = свод.window(period)
+    if начало is None:
+        return None
+    return {"since": прошлое, "until": начало}
+
+
+def _признаки_с_раскрытием(settings: Any) -> list[dict[str, Any]]:
+    """Описания показателей свода и то, чем каждый раскрывается в записи.
+
+    Что стоит за показателем — среднее по измеренным записям, сумма или
+    доля, — знает сервер: это устройство свода. Интерфейс получает готовый
+    отбор (`drill`: отборы и порядок для `GET /api/drill`) и не держит
+    своей копии соответствий; у показателя без отбора кнопки не будет.
+    """
+    признаки = признаки_для(settings)
+    for признак in признаки:
+        чем = раскрытие_показателя(str(признак["key"]), int(признак.get("good") or 0))
+        if чем is not None:
+            признак["drill"] = чем
+    return признаки
 
 
 @router.get("", summary="Полный отчёт по содержанию записей")
@@ -82,7 +135,8 @@ def report(request: Request, period: str = ПЕРИОД,
     отдельности, а эта нужна выгрузке и сводке по расписанию, где отчёт
     требуется целиком и один раз.
     """
-    return _insights(request).report(period, owner=scope_owner(principal))
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.report(period, owner=scope_owner(principal)))
 
 
 @router.get("/status", summary="Состояние разбора")
@@ -103,22 +157,24 @@ def summary(request: Request, period: str = ПЕРИОД,
             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     свод = _insights(request)
     начало, прошлое = свод.window(period)
-    return {
+    return _с_окном(свод, period, {
         "period": period,
         "current": свод.summary(period, owner=scope_owner(principal)),
         "previous": (свод.summary(period, owner=scope_owner(principal),
                                   since=прошлое, until=начало)
                      if начало is not None else None),
-        "features": признаки_для(get_state(request).settings),
-    }
+        "window_previous": _прошлое_окно(свод, period),
+        "features": _признаки_с_раскрытием(get_state(request).settings),
+    })
 
 
 @router.get("/timeline", summary="Показатели по времени")
 def timeline(request: Request, period: str = ПЕРИОД,
              buckets: int = Query(default=24, ge=4, le=200),
              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    return _insights(request).timeline(period, owner=scope_owner(principal),
-                                       buckets=buckets)
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.timeline(
+        period, owner=scope_owner(principal), buckets=buckets))
 
 
 @router.get("/breakdown/{dimension}", summary="Разрез по признаку")
@@ -129,8 +185,9 @@ def breakdown(request: Request, dimension: str, period: str = ПЕРИОД,
         raise error_response(ConfigError(
             f"Неизвестный разрез «{dimension}».",
             hint="Доступные разрезы: " + ", ".join(sorted(РАЗРЕЗЫ))))
-    return _insights(request).breakdown(dimension, period,
-                                        owner=scope_owner(principal), limit=limit)
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.breakdown(
+        dimension, period, owner=scope_owner(principal), limit=limit))
 
 
 @router.get("/topics", summary="Темы корпуса")
@@ -142,22 +199,44 @@ def topics(request: Request, period: str = Query(default="all",
     свод = _insights(request)
     владелец = scope_owner(principal)
     окно = period if period != "all" else "month"
-    return {**свод.topics(period, владелец, limit=limit),
-            "trend": свод.topic_trend(окно, владелец),
-            "new": свод.new_topics(окно, владелец)}
+    ответ = _с_окном(свод, period, {
+        **свод.topics(period, владелец, limit=limit),
+        "trend": свод.topic_trend(окно, владелец),
+        "new": свод.new_topics(окно, владелец)})
+    # Ход тем и новые слова считаются по своему окну: при «всё время» это
+    # месяц, а не весь архив, и у «было» границы свои. Раскрывать их числа
+    # общим окном ответа значило бы показать не те записи — поэтому границы
+    # отдаются отдельно: «сейчас» — от `since` до `until`, «было» — от
+    # `before_since` до `since`.
+    начало, прошлое = свод.window(окно)
+    ответ["trend_window"] = {"period": окно, "since": начало, "before_since": прошлое,
+                             "until": ответ["window"]["until"]}
+    return ответ
 
 
 @router.get("/correlations", summary="Связи между признаками")
 def correlations(request: Request, period: str = ПЕРИОД,
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    return _insights(request).correlations(period, owner=scope_owner(principal))
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.correlations(period, owner=scope_owner(principal)))
 
 
 @router.get("/findings", summary="Готовые выводы")
 def findings(request: Request, period: str = ПЕРИОД,
              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    return {"items": _insights(request).findings(
-        period, owner=scope_owner(principal))}
+    свод = _insights(request)
+    return _с_окном(свод, period, {"items": свод.findings(
+        period, owner=scope_owner(principal))})
+
+
+#: Как подписать в списке раскрытия величины, которых нет среди признаков
+#: раздела: по ним упорядочены отборы «что послушать».
+_ПОДПИСИ_ВЕЛИЧИН = {
+    "money_max": "Сумма", "frustration": "Признаков раздражения",
+    "repeat_contact": "Признаков повторного обращения",
+    "profanity": "Нецензурных слов", "objections_unhandled": "Возражений без отработки",
+    "violations": "Нарушений",
+}
 
 
 @router.get("/records", summary="Записи, которые стоит послушать")
@@ -169,8 +248,22 @@ def records(request: Request, kind: str = Query(default="negative"),
         raise error_response(ConfigError(
             f"Неизвестный отбор «{kind}».",
             hint="Доступные отборы: " + ", ".join(sorted(ОТБОРЫ))))
-    return _insights(request).records(kind, period, owner=scope_owner(principal),
-                                      limit=limit)
+    from ..drill import ПОРЯДОК_ПОСЛУШАТЬ  # noqa: PLC0415
+    from ..insights import ПРИЗНАКИ_ПО_КЛЮЧУ  # noqa: PLC0415
+
+    свод = _insights(request)
+    ответ = _с_окном(свод, period, свод.records(
+        kind, period, owner=scope_owner(principal), limit=limit))
+    # Чем этот отбор раскрывается в полный список (`GET /api/drill`): тем
+    # же условием и тем же порядком, что сама выдача, — чтобы интерфейс не
+    # держал второй копии двадцати пяти условий.
+    порядок = ПОРЯДОК_ПОСЛУШАТЬ.get(kind, "")
+    величина = порядок.partition(":")[0]
+    ответ["drill"] = {"base": "content", "f": [f"listen_{kind}"], "sort": порядок,
+                      # Подпись столбца величины в списке — названием признака.
+                      "value": (ПРИЗНАКИ_ПО_КЛЮЧУ.get(величина) or {}).get("title")
+                      or _ПОДПИСИ_ВЕЛИЧИН.get(величина, "")}
+    return ответ
 
 
 @router.get("/kinds", summary="Перечень отборов и разрезов")
@@ -225,7 +318,11 @@ def categories_report(request: Request, period: str = ПЕРИОД,
     «возврат И НЕ брак», «дорого РЯДОМ(5) конкурент»; у категории есть
     фильтр «кто сказал» и окно «где в разговоре».
     """
-    return _insights(request).categories(period, owner=scope_owner(principal))
+    свод = _insights(request)
+    ответ = свод.categories(period, owner=scope_owner(principal))
+    # Колонка «Было» считается по прошлому окну — его границы нужны списку.
+    ответ["window_previous"] = _прошлое_окно(свод, period)
+    return _с_окном(свод, period, ответ)
 
 
 @router.get("/drivers", summary="Драйверы негатива")
@@ -238,7 +335,8 @@ def drivers(request: Request, period: str = ПЕРИОД,
     десяти записях и больше. Связь, а не причина: тема может быть и
     следствием плохого разговора.
     """
-    return _insights(request).drivers(period, owner=scope_owner(principal))
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.drivers(period, owner=scope_owner(principal)))
 
 
 #: Разрез оператора: метка говорящего или владелец задания.
@@ -255,8 +353,9 @@ def norms(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ,
     """Обычная величина каждого показателя — медиана и межквартильный размах
     по четырём неделям до периода — и где относительно неё медиана периода.
     С `agent` — норма и период по одному оператору."""
-    return _insights(request).norms(period, owner=scope_owner(principal),
-                                    agent=(by, agent) if agent else None)
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.norms(
+        period, owner=scope_owner(principal), agent=(by, agent) if agent else None))
 
 
 @router.get("/control", summary="Контрольные карты по дням")
@@ -266,8 +365,9 @@ def control(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМ�
     """Доля отрицательных, балл оператора, тональность и скрипт по дням с
     пределами 2σ и 3σ по четырём неделям до периода; отметки за пределами
     и серии по одну сторону от среднего."""
-    return _insights(request).control(period, owner=scope_owner(principal),
-                                      agent=(by, agent) if agent else None)
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.control(
+        period, owner=scope_owner(principal), agent=(by, agent) if agent else None))
 
 
 @router.get("/agents", summary="Операторы: балл, эмпатия, нарушения")
@@ -276,7 +376,9 @@ def agents(request: Request, period: str = ПЕРИОД, by: str = ПО_КОМУ
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Список операторов с показателями — разрез по говорящему или по
     владельцу задания (ключу доступа); строка ведёт в карточку."""
-    return _insights(request).agents(by, period, owner=scope_owner(principal), limit=limit)
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.agents(
+        by, period, owner=scope_owner(principal), limit=limit))
 
 
 @router.get("/agents/{key}", summary="Карточка оператора")
@@ -289,8 +391,9 @@ def agent_card(request: Request, key: str, period: str = ПЕРИОД, by: str =
     первым»); `by=owner` — по владельцу задания, точнее там, где у каждого
     сотрудника свой ключ доступа.
     """
-    return _insights(request).agent_card(key, by=by, period=period,
-                                         owner=scope_owner(principal))
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.agent_card(
+        key, by=by, period=period, owner=scope_owner(principal)))
 
 
 @router.get("/employees", summary="Аналитика по сотрудникам")
@@ -305,8 +408,9 @@ def employees(request: Request, period: str = ПЕРИОД, by: str = ПО_КО�
     сравнивать нужно не людей, а участки.
     """
     try:
-        return _insights(request).employees(by, period, owner=scope_owner(principal),
-                                            limit=limit)
+        свод = _insights(request)
+        return _с_окном(свод, period, свод.employees(
+            by, period, owner=scope_owner(principal), limit=limit))
     except ValueError as exc:
         raise error_response(ConfigError(str(exc))) from exc
 
@@ -321,9 +425,10 @@ def coaching(request: Request, period: str = ПЕРИОД,
     низкий балл, скрипт меньше половины, долгий монолог, невежливость,
     возражение без отработки, раздражённый клиент. Разобранные скрыты,
     пока не попросят `done=true`."""
-    return _insights(request).coaching(
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.coaching(
         period, owner=scope_owner(principal),
-        agent=(by, agent) if agent else None, limit=limit, include_done=done)
+        agent=(by, agent) if agent else None, limit=limit, include_done=done))
 
 
 @router.get("/references", summary="Эталонные разговоры")
@@ -332,7 +437,9 @@ def references(request: Request, period: str = ПЕРИОД,
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Лучшие разговоры периода по баллу и тональности без нарушений — и всё,
     что отмечено эталоном руками, независимо от периода."""
-    return _insights(request).references(period, owner=scope_owner(principal), limit=limit)
+    свод = _insights(request)
+    return _с_окном(свод, period, свод.references(
+        period, owner=scope_owner(principal), limit=limit))
 
 
 @router.put("/marks/{job_id}", summary="Отметить запись: разобрано, эталон")
@@ -649,7 +756,7 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
         назвали = True
 
     всего = len(записи)
-    return {
+    return _с_окном(свод, period, {
         "period": period, "since": начало,
         "records": всего,
         "topics": [т.to_dict(всего) for т in найденные],
@@ -658,4 +765,4 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
         "named_by_model": назвали,
         "threshold": threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
         "min_size": min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ,
-    }
+    })

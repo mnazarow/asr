@@ -202,7 +202,11 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
         "worker": состояние,
         "current": текущее,
         "counts": state.db.llmq_counts(owner=свой),
-        "stats": state.db.llmq_stats(с_какого, owner=свой),
+        # Сводка — по тому же промежутку, что и график: [с_какого, сейчас).
+        # Обе границы уходят в ответ (`stats.since`, `stats.until`): по ним
+        # число «сбоев за окно» раскрывается в список записей, и список
+        # обязан резаться там же, где резалось число.
+        "stats": state.db.llmq_stats(с_какого, until=сейчас, owner=свой),
         # Ширина корзины — от сервера. Интерфейс считал её сам, от часов
         # браузера: при расхождении часов с сервером подписи графика
         # уезжали от корзин, которые им соответствуют.
@@ -399,23 +403,44 @@ def llm_report(request: Request, period: str = ПЕРИОД,
     секунд = PERIODS.get(period, 7 * 86400)
     since = (time.time() - секунд) if секунд else 0.0
     свод = state.db.llm_stats(tasks.VERSION, since, owner=scope_owner(principal))
+    # Окно свода — в ответ: числа раздела раскрываются в список записей
+    # отдельным запросом (`GET /api/drill`) и позже, а «неделя до сейчас»
+    # через минуту — уже другая неделя. Нижняя граница одна на весь ответ
+    # (свод читает базу один раз), верхняя — момент, когда он прочитан.
+    # Режется, как и список, временем записи (`j.created_at`), а не временем
+    # ответа модели.
+    окно = {"since": since or None, "until": time.time()}
     строки = [р for р in свод["rows"] if not р.get("error")]
     распределения = tasks.summarize_for_digest(строки)
+    # Трекеры и скоркарта считаются в записях, а не в элементах списка.
+    # Разница видна, когда в настройке два трекера (или два пункта) с одним
+    # id: у записи тогда два элемента с этим id, и запись считалась дважды
+    # — «сработал в 12 разговорах» при шести разговорах в списке под числом.
     трекеры: dict[str, dict[str, Any]] = {}
     for р in строки:
+        проверено: set[str] = set()
+        сработало: set[str] = set()
         for т in р.get("trackers") or []:
-            запись = трекеры.setdefault(str(т.get("id")), {"id": str(т.get("id")),
-                                                            "label": т.get("label"),
-                                                            "checked": 0, "fired": 0})
-            запись["checked"] += 1
-            запись["fired"] += 1 if т.get("fired") else 0
+            ключ = str(т.get("id"))
+            трекеры.setdefault(ключ, {"id": ключ, "label": т.get("label"),
+                                      "checked": 0, "fired": 0})
+            проверено.add(ключ)
+            if т.get("fired"):
+                сработало.add(ключ)
+        for ключ in проверено:
+            трекеры[ключ]["checked"] += 1
+        for ключ in сработало:
+            трекеры[ключ]["fired"] += 1
     скоркарта: dict[str, dict[str, Any]] = {}
     for р in строки:
+        ответы: set[tuple[str, str]] = set()
         for о in р.get("scorecard") or []:
-            запись = скоркарта.setdefault(str(о.get("id")), {"id": str(о.get("id")),
-                                                             "question": о.get("question"),
-                                                             "да": 0, "нет": 0, "н/п": 0})
-            запись[о.get("answer") if о.get("answer") in ("да", "нет", "н/п") else "н/п"] += 1
+            ключ = str(о.get("id"))
+            скоркарта.setdefault(ключ, {"id": ключ, "question": о.get("question"),
+                                        "да": 0, "нет": 0, "н/п": 0})
+            ответы.add((ключ, о.get("answer") if о.get("answer") in ("да", "нет") else "н/п"))
+        for ключ, ответ in ответы:
+            скоркарта[ключ][ответ] += 1
     свежие = sorted(свод["rows"], key=lambda x: -float(x.get("created_at") or 0))
     действия = []
     for р in свежие:
@@ -467,6 +492,7 @@ def llm_report(request: Request, period: str = ПЕРИОД,
         "rows": построчно,
         "rows_total": len(свод["rows"]),
         "worker": поток.status(),
+        "window": окно,
     }
 
 

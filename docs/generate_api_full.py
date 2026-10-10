@@ -86,6 +86,14 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      "направлению, очереди, оператору и номеру. Настройки станции и ручной "
      "заход — только администратору.",
      ("/api/telephony",)),
+    ("Раскрытие числа в список",
+     "Из каких записей или звонков сложилось число отчёта. Один маршрут на "
+     "все разделы аналитики: отчёт отдаёт число и окно, по которому оно "
+     "посчитано (`window`), а список запрашивается тем же окном и тем же "
+     "отбором — и потому совпадает с числом. Страницы — по указателю, счёт "
+     "— не дальше десяти тысяч, у запроса есть срок. Выборка сужается до "
+     "записей самого ключа, как и у отчётов.",
+     ("/api/drill",)),
     ("Здоровье распознавания",
      "Очередь ручной проверки и контрольные прогоны второй моделью: то, из "
      "чего появляются эталоны и согласие моделей. Список сужается до "
@@ -138,7 +146,7 @@ OPEN_ROUTES = {"/api/health", "/health"}
 SCOPED_ROUTES = {"/api/jobs", "/api/analytics", "/api/analytics/{section}",
                  "/api/events", "/api/content", "/api/review", "/api/control",
                  "/api/trends", "/api/telephony/calls", "/api/telephony/status",
-                 "/api/telephony/dimensions"}
+                 "/api/telephony/dimensions", "/api/drill"}
 #: Маршруты, требующие ключа администратора.
 ADMIN_ROUTES = {
     ("/api/keys", "get"), ("/api/keys", "post"), ("/api/keys/{preview}", "delete"),
@@ -532,6 +540,32 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
         "note": "Разделы `accuracy`, `calibration` и `latency` — здоровье "
                 "распознавания по записям с эталоном и по хвостам задержки; "
                 "`drift` и `control` — дрейф уверенности и контрольные карты.",
+    },
+    ("/api/drill", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' \\\n"
+                f"     '{HOST}/api/drill?base=jobs&since=1791009762&until=1791614562"
+                "&f=model:gigaam-v3-rnnt&f=status:failed&limit=50'",
+        "show": "/api/drill?base=jobs&f=status:completed&limit=2", "limit": 900,
+        "note": "Границы `since` и `until` берутся из поля `window` того "
+                "отчёта, откуда число. Отборов может быть несколько — они "
+                "складываются по «и»; виды записи: признак (`negative`), "
+                "значение (`model:x`), целое (`hour:9`), статус "
+                "(`status:completed,failed`), диапазон по величине "
+                "(`duration:60..300`), `has:<величина>` и `nz:<величина>`. "
+                "Следующая страница — тот же запрос с `cursor`, равным `next` "
+                "из ответа; `total` приходит только на первой странице. "
+                "Неверно составленный запрос — 400 с подсказкой, что именно "
+                "не так. Разбор с примерами — в главе «Программный "
+                "интерфейс», раздел «GET /api/drill».",
+    },
+    ("/api/drill/filters", "get"): {
+        "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/drill/filters",
+        "show": "/api/drill/filters", "limit": 1300,
+        "note": "`filters` — отборы заданий, `call_filters` — звонков; у "
+                "каждого вид (`признак`, `текст`, `целое`, `диапазон`) и "
+                "описание. `values` и `call_values` — величины для `sort`, "
+                "`has:`, `nz:` и диапазонов; `page`, `page_max` и "
+                "`count_cap` — размер страницы и потолок счёта.",
     },
     ("/api/jobs/models", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/jobs/models",
