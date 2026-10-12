@@ -423,7 +423,8 @@ def test_список_записей_сотрудника_идёт_по_инде
             {"base": "content", "filters": ["speaker:SPEAKER_00", "violation"]},
             {"base": "content", "since": 1.0, "until": 2.0, "filters": []}):
         план = _план(архив, monkeypatch, **параметры)
-        assert "idx_jobs_created" in план and "idx_jobs_status" not in план, план
+        assert ("idx_jobs_window" in план or "idx_jobs_created" in план) \
+            and "idx_jobs_status" not in план, план
         # Досортировка одинаковых времён — не сортировка всего набора.
         assert "USE TEMP B-TREE FOR ORDER BY" not in план, план
     # Звонки сотрудника — по указателю «оператор + начало звонка» (или по

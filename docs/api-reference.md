@@ -875,7 +875,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:580",
+  "instance": "vm:1901",
   "instances": [],
   "workers": [],
   "worker_count": 1,
@@ -1464,7 +1464,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1791615265.6372032,
+    "generated_at": 1791828434.4804044,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1631,8 +1631,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.21",
-  "uptime_s": 14.2,
+  "version": "3.1.22",
+  "uptime_s": 2.1,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "checks": {
@@ -1711,18 +1711,18 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.21",
-  "uptime_s": 14.2,
+  "version": "3.1.22",
+  "uptime_s": 2.1,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v114",
     "arch": "x86_64",
-    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.8,
-    "disk_free_gb": 24.9,
+    "ram_available_gb": 7.0,
+    "disk_free_gb": 25.1,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2345,12 +2345,27 @@ llm_timeout_s на каждый.
 исполнению, срабатывания умных трекеров, ответы скоркарты — по
 записям периода с ответом модели.
 
+Свод можно взять в две части — так делает раздел «Голосовая
+аналитика», чтобы на большом архиве не ждать всего сразу:
+
+- `part=fast` — то, что считается без чтения ответов: записей и
+  разобрано, сбои, причины, исходы, «причина × исход», доля решённых,
+  последние разборы построчно. Доли секунды на любом окне;
+- `part=heavy` — то, что лежит в ответах списками: обязательства,
+  трекеры, скоркарта, «ответ мимо списка». Читает каждый ответ окна.
+
+Без `part` — обе части разом, как раньше. `since` — нижняя граница
+окна вместо отсчёта от «сейчас»: вторую часть спрашивают позже первой,
+и считаться она должна по тому же окну (`window.since` первой части).
+
 **Доступ:** любой действующий ключ.
 
 
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `period` | в адресе | string | `week` | — |
+| `part` | в адресе | string | — | — |
+| `since` | в адресе | number | — | — |
 
 **Пример**
 
@@ -2371,18 +2386,12 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "stale": 0,
   "coverage": null,
   "avg_latency_ms": null,
-  "off_list": 0,
   "outcomes": [],
   "reasons": [],
   "resolved_share": null,
-  "actions": 0,
-  "records_with_actions": 0,
-  "trackers": [],
-  "scorecard": [],
-  "action_items": [],
   "pairs": [],
-  "rows": [],
   "rows_total": 0,
+  "rows": [],
   "worker": {
     "running": true,
     "queued": 0,
@@ -2402,9 +2411,15 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
     "auto": false,
     "backfill": false
   },
+  "off_list": 0,
+  "actions": 0,
+  "records_with_actions": 0,
+  "trackers": [],
+  "scorecard": [],
+  "action_items": [],
   "window": {
-    "since": 1791010465.769281,
-    "until": 1791615265.7694018
+    "since": 1791223634.555002,
+    "until": 1791828434.5555449
   }
 }
 ```
@@ -2637,11 +2652,11 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
 {
   "hardware": {
     "kind": "cpu",
-    "device": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 6.8,
+    "free_gb": 7.0,
     "reserve_gb": 4.0,
-    "budget_gb": 2.8,
+    "budget_gb": 2.9,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -4343,14 +4358,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 14.4,
+  "uptime_s": 2.2,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 14 с",
+        "detail": "работает 2 с",
         "hint": ""
       },
       {
@@ -4379,7 +4394,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 24.9 ГБ",
+        "detail": "свободно 25.1 ГБ",
         "hint": ""
       },
       {

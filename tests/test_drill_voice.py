@@ -397,14 +397,150 @@ def test_список_голосовой_аналитики_идёт_по_инд
         sql, аргументы = пойманы[0]
         план = " | ".join(str(р["detail"]) for р in архив.db.query(
             "EXPLAIN QUERY PLAN " + sql, аргументы))
-        assert "idx_jobs_created" in план and "idx_jobs_status" not in план, план
+        # По времени — указателем окна (в нём же статус и источник) или
+        # прежним указателем времени; главное — не перебором готовых.
+        assert ("idx_jobs_window" in план or "idx_jobs_created" in план) \
+            and "idx_jobs_status" not in план, план
         assert "USE TEMP B-TREE FOR ORDER BY" not in план, план
+        # Причине, исходу и признаку сбоя хватает узкого указателя ответов:
+        # сам ответ модели — три-четыре килобайта — не читается. Трекеру его
+        # мало: там JSON из ответа, и просьба идти по указателю не ставится.
+        if отборы == ["tracker:жалоба"]:
+            assert "idx_llm_results_brief" not in план, план
+        else:
+            assert "USING COVERING INDEX idx_llm_results_brief" in план, план
     # Редкому статусу индекс по статусу, наоборот, оставлен.
     пойманы.clear()
     drill.Drill(архив.db).page(since=1.0, until=2.0, filters=["status:failed"])
     план = " | ".join(str(р["detail"]) for р in архив.db.query(
         "EXPLAIN QUERY PLAN " + пойманы[0][0], пойманы[0][1]))
     assert "idx_jobs_status" in план, план
+
+
+# ---------------------------------------------------------------------------
+# Заход 50: свод в две части и узкий указатель ответов
+# ---------------------------------------------------------------------------
+
+БЫСТРЫЕ = ("records", "analyzed", "errors", "stale", "coverage", "avg_latency_ms",
+           "outcomes", "reasons", "resolved_share", "pairs", "rows", "rows_total")
+ПО_СПИСКАМ = ("off_list", "actions", "records_with_actions", "trackers", "scorecard",
+              "action_items")
+
+
+@pytest.mark.parametrize("period", ["day", "week", "all"])
+def test_две_части_свода_складываются_в_целый(c, period):
+    """Раздел берёт свод двумя запросами; вместе они обязаны дать ровно то,
+    что отдаёт запрос без `part`, — иначе у интерфейса и у выгрузки по API
+    были бы разные числа."""
+    целый = _свод(c, period)
+    первая = c.get("/api/content/llm", params={"period": period, "part": "fast"}).json()
+    начало = первая["window"]["since"]
+    вторая = c.get("/api/content/llm", params={
+        "period": period, "part": "heavy", **({"since": начало} if начало else {})}).json()
+    assert первая["part"] == "fast" and вторая["part"] == "heavy" and "part" not in целый
+    for поле in БЫСТРЫЕ:
+        assert первая[поле] == целый[поле], поле
+        assert поле not in вторая, поле
+    for поле in ПО_СПИСКАМ:
+        assert вторая[поле] == целый[поле], поле
+        assert поле not in первая, поле
+    assert первая["analyzed"] > 0 and вторая["actions"] > 0 and вторая["trackers"]
+    # Вторая часть посчитана по окну первой — тем же началом, до секунды.
+    assert вторая["window"]["since"] == начало
+
+
+def test_вторая_часть_считается_по_окну_первой(c, архив):
+    """«Неделя до сейчас» у второго запроса — уже другая неделя: запись у
+    самой границы окна вошла бы в причины и не вошла бы в обязательства."""
+    сутки = c.get("/api/content/llm", params={"period": "day", "part": "heavy"}).json()
+    всё = c.get("/api/content/llm", params={"period": "day", "part": "heavy",
+                                            "since": 1.0}).json()
+    за_всё_время = c.get("/api/content/llm", params={"period": "all", "part": "heavy"}).json()
+    assert 0 < сутки["records_with_actions"] < всё["records_with_actions"]
+    assert всё["records_with_actions"] == за_всё_время["records_with_actions"]
+    assert всё["window"]["since"] == 1.0
+    assert c.get("/api/content/llm", params={"part": "половина"}).status_code == 422
+    assert c.get("/api/content/llm", params={"since": -1}).status_code == 422
+
+
+def test_счётная_часть_сходится_с_прямым_счётом_по_ответам(c, архив):
+    """Счёт идёт группами по указателю; здесь он сверяется с тем, как свод
+    считался раньше, — перебором ответов целиком."""
+    свод = _свод(c, "all")
+    ответы = архив.db.llm_stats(tasks.VERSION, 0.0)["rows"]
+    годные = [р for р in ответы if not р.get("error")]
+    assert свод["records"] == архив.db.llm_stats(tasks.VERSION, 0.0)["total"]
+    assert свод["analyzed"] == len(годные) and свод["rows_total"] == len(ответы)
+    assert свод["errors"] == len(ответы) - len(годные) > 0
+    assert свод["stale"] == sum(1 for р in годные if р["version"] != tasks.VERSION)
+    assert свод["avg_latency_ms"] == round(
+        sum(float(р.get("latency_ms") or 0) for р in годные) / len(годные), 1)
+    прежде = tasks.summarize_for_digest(годные)
+    assert свод["resolved_share"] == прежде["resolved_share"]
+    assert свод["actions"] == прежде["actions"]
+    assert свод["records_with_actions"] == прежде["records_with_actions"]
+    for поле in ("reasons", "outcomes"):
+        assert sorted(свод[поле], key=lambda д: д["key"]) \
+            == sorted(прежде[поле], key=lambda д: д["key"]), поле
+        # При равном числе записей порядок теперь определён: по алфавиту.
+        assert свод[поле] == sorted(свод[поле], key=lambda д: (-д["records"], д["key"]))
+    # Построчный список — самые свежие разборы, от новых к старым.
+    времена = [с["created_at"] for с in свод["rows"]]
+    assert времена == sorted(времена, reverse=True) and len(времена) == min(300, len(ответы))
+    assert времена[0] == max(р["created_at"] for р in ответы)
+
+
+def test_счёт_свода_не_читает_ответы_модели(архив):
+    """Ответ модели — три-четыре килобайта: пересказ, цитаты, JSON трекеров.
+    Причины и исходы считаются по двум узким указателям, и ни задание, ни
+    ответ целиком при этом не поднимаются."""
+    пойманы: list[tuple[str, list]] = []
+    настоящий = архив.db.query
+
+    def подсмотреть(sql, params=()):
+        пойманы.append((sql, list(params)))
+        return настоящий(sql, params)
+
+    архив.db.query = подсмотреть
+    try:
+        архив.db.llm_brief(tasks.VERSION, 0.0, owner=["анна", "борис"])
+    finally:
+        del архив.db.query
+    assert len(пойманы) == 2
+    for sql, аргументы in пойманы:
+        план = " | ".join(str(р["detail"]) for р in настоящий(
+            "EXPLAIN QUERY PLAN " + sql, аргументы))
+        assert "USING COVERING INDEX idx_jobs_window" in план, план
+        if "llm_results" in sql:
+            assert "USING COVERING INDEX idx_llm_results_brief" in план, план
+        assert "PRIMARY KEY" not in план, план
+
+
+def test_указатели_создаются_и_на_базе_прежней_версии(tmp_path):
+    """Обновление с 3.1.21: схема 31, указателей ещё нет — появляются при
+    открытии, без отдельной команды."""
+    from asrhub.db import SCHEMA_VERSION, Database
+
+    путь = tmp_path / "old.db"
+    база = Database(путь)
+    база.execute("DROP INDEX idx_llm_results_brief")
+    база.execute("DROP INDEX idx_jobs_window")
+    база.execute("PRAGMA user_version=31")
+    база.close()
+    новая = Database(путь)
+    assert новая.has_index("idx_llm_results_brief") and новая.has_index("idx_jobs_window")
+    assert новая.query_one("PRAGMA user_version")[0] == SCHEMA_VERSION >= 32
+    assert not новая.has_index("idx_нет_такого")
+    новая.close()
+
+
+def test_состояние_модели_считает_покрытие_по_указателю(c, архив):
+    покрытие = c.get("/api/llm/status").json()["coverage"]
+    ответы = архив.db.llm_stats(tasks.VERSION, архив.данные["now"] - 86400)
+    assert покрытие["total"] == ответы["total"] > 0
+    assert покрытие["analyzed"] == sum(
+        1 for р in ответы["rows"] if not р.get("error") and р["version"] == tasks.VERSION)
+    assert покрытие["errors"] == sum(1 for р in ответы["rows"] if р.get("error"))
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +555,12 @@ def test_интерфейс_раскрывает_теми_же_отборами(
     голос = код.split("RENDERERS.voice = {", 1)[1].split("\n};\n", 1)[0]
     assert "ЗАПИСИ: ['status:completed', 'no_control']," in голос
     assert "f: [...this.ЗАПИСИ, ...(сбой ? [] : ['llm_ok']), ...(отборы || [])]," in голос
-    for отбор in ("['resolved:1']", "['with_actions']", "[`reason:${причина.label}`]",
-                  "[`outcome:${исход.label}`]", "[`reason:${п}`, `outcome:${и}`]",
+    # Причины и исходы на сводке — перечнями: отбор собирается из имени
+    # разреза (`reason`, `outcome`) и ключа строки.
+    assert "[`${что.отбор}:${с.key}`]" in голос
+    assert "отбор: 'reason', подпись: 'Причина'" in голос
+    assert "отбор: 'outcome', подпись: 'Исход'" in голос
+    for отбор in ("['resolved:1']", "['with_actions']", "[`reason:${п}`, `outcome:${и}`]",
                   "[`tracker:${трекер.id}`]", "[`score_yes:${пункт}`]",
                   "[`score_no:${пункт}`]", "[`score_na:${пункт}`]", "['llm_failed']"):
         assert отбор in голос, отбор

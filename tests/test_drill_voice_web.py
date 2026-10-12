@@ -43,8 +43,10 @@ def _число(текст: str) -> int:
 def _голос(вкладка, раздел: str = ""):
     с = вкладка.открыть("voice")
     с.select_option("#vo-period", "all")
-    с.wait_for_selector("#vo-s1 svg")
-    с.wait_for_timeout(400)
+    с.wait_for_selector("#vo-s1 tr.drill-item")
+    # Свод приходит двумя частями; проверкам нужны обе.
+    с.wait_for_function("() => (window.__asrhub.state.voice || {}).lists === 'ready'")
+    с.wait_for_timeout(300)
     if раздел:
         с.click(f'#vo-tabs button[data-tab="{раздел}"]')
         с.wait_for_selector("#vo-body .card")
@@ -113,36 +115,134 @@ def test_плитки_шапки(вкладка):
     вкладка.чисто()
 
 
-def test_причина_и_исход_раскрываются_с_графиков(вкладка):
+def _заголовки(с, где: str) -> list[str]:
+    return [т.strip().lower() for т in с.locator(f"{где} .drill-panel thead th").all_inner_texts()]
+
+
+def test_причина_раскрывается_строкой_в_своём_блоке(вкладка):
+    """Блок «Причины обращений» — перечень: строка с уголком и подчёркнутым
+    числом, под ней по щелчку — её разговоры. Раньше здесь был график, по
+    столбцу которого можно было щёлкнуть, но ничто на экране этого не
+    говорило."""
     с, свод = _голос(вкладка)
-    причина = свод["reasons"][0]
-    с.locator("#vo-s1 svg rect.pick").first.click()
-    с.wait_for_selector(".drill-panel tbody tr")
-    assert с.locator(".drill-title").inner_text() == f"Причина: {причина['key']}"
-    assert _строк(с) == min(50, причина["records"])
-    assert _колонка(с, 7) == {причина["key"]}
-    # Панель — под рядом карточек, во всю ширину; повторный щелчок сворачивает.
-    assert с.evaluate("""() => { const п = document.querySelector('.drill-panel');
-        return п.previousElementSibling.classList.contains('grid')
-          && п.getBoundingClientRect().width > 900; }""")
-    с.locator("#vo-s1 svg rect.pick").first.click()
-    assert с.locator(".drill-panel").count() == 0
-    # Сектор кольца — по строке легенды.
+    строки = с.locator("#vo-s1 tr.drill-item")
+    assert строки.count() == len(свод["reasons"]) >= 2
+    assert вкладка.раскрытий() == 0                      # до щелчка — ни запроса
+    assert "раскрывает" in с.locator('section.card:has(#vo-s1) .hint').inner_text()
+    первая, вторая = свод["reasons"][0], свод["reasons"][1]
+    assert строки.first.get_attribute("aria-expanded") == "false"
+    assert _число(строки.first.locator(".drill-num").inner_text()) == первая["records"]
+    строки.first.click()
+    с.wait_for_selector("#vo-s1 .drill-panel tbody tr")
+    assert строки.first.get_attribute("aria-expanded") == "true"
+    assert с.locator("#vo-s1 .drill-title").inner_text() == f"Причина: {первая['key']}"
+    assert _строк(с, "#vo-s1") == min(50, первая["records"])
+    # Список — под своей строкой, внутри блока, со столбцами под его ширину:
+    # причина у всех строк одна, вместо неё — исход.
+    assert с.evaluate("""() => { const р = document.querySelector('#vo-s1 tr.drill-row');
+        return р.previousElementSibling.classList.contains('drill-on')
+          && р.getBoundingClientRect().width
+             <= document.querySelector('#vo-s1').getBoundingClientRect().width + 1; }""")
+    assert _заголовки(с, "#vo-s1") == ["когда", "запись", "длительность", "исход"]
+    исходы = {и["key"] for и in свод["outcomes"]} | {"—"}
+    assert _колонка(с, 4) <= исходы and _колонка(с, 4) - {"—"}
+    assert вкладка.раскрытий() == 1
+    # Вторая строка: раскрыта в блоке одна — первая сворачивается сама.
+    строки.nth(1).click()
+    с.wait_for_function("""(название) => { const т = document.querySelectorAll('#vo-s1 .drill-title');
+        return т.length === 1 && т[0].innerText === название; }""",
+                        arg=f"Причина: {вторая['key']}")
+    с.wait_for_selector("#vo-s1 .drill-panel tbody tr")
+    assert _строк(с, "#vo-s1") == min(50, вторая["records"])
+    assert строки.first.get_attribute("aria-expanded") == "false"
+    # Повторный щелчок сворачивает; с клавиатуры строка раскрывается так же.
+    строки.nth(1).click()
+    assert с.locator("#vo-s1 .drill-panel").count() == 0
+    строки.first.focus()
+    с.keyboard.press("Enter")
+    с.wait_for_selector("#vo-s1 .drill-panel tbody tr")
+    с.keyboard.press("Enter")
+    assert с.locator("#vo-s1 .drill-panel").count() == 0
+    вкладка.чисто()
+
+
+def test_исход_раскрывается_строкой_и_сектором_кольца(вкладка):
+    с, свод = _голос(вкладка)
+    строки = с.locator("#vo-s2-list tr.drill-item")
+    assert строки.count() == len(свод["outcomes"]) >= 2
     исход = свод["outcomes"][0]
-    с.locator("#vo-s2 .row.pick").first.click()
-    с.wait_for_selector(".drill-panel tbody tr")
-    assert с.locator(".drill-title").inner_text() == f"Исход: {исход['key']}"
-    assert _строк(с) == min(50, исход["records"])
-    assert _колонка(с, 8) == {исход["key"]}
+    строки.first.click()
+    с.wait_for_selector("#vo-s2-list .drill-panel tbody tr")
+    assert с.locator("#vo-s2-list .drill-title").inner_text() == f"Исход: {исход['key']}"
+    assert _строк(с, "#vo-s2-list") == min(50, исход["records"])
+    assert _заголовки(с, "#vo-s2-list") == ["когда", "запись", "длительность", "причина"]
+    причины = {п["key"] for п in свод["reasons"]} | {"—"}
+    assert _колонка(с, 4) <= причины
+    assert f"из {исход['records']}" in с.locator("#vo-s2-list .drill-count").inner_text() \
+        or _строк(с, "#vo-s2-list") == исход["records"]
     # Ссылка открывает запись на вкладке разбора; список остаётся.
-    ссылка = с.locator(".drill-panel a.drill-open").first
+    ссылка = с.locator("#vo-s2-list .drill-panel a.drill-open").first
     номер = ссылка.get_attribute("data-open")
+    assert ссылка.get_attribute("href") == f"#/jobs/{номер}"
     ссылка.click()
     с.wait_for_selector(".modal-backdrop")
     assert с.evaluate("document.querySelector('.modal-backdrop').dataset.jobId") == номер
     assert с.evaluate("location.hash") == "#voice"
-    assert _строк(с) == min(50, исход["records"])
+    assert _строк(с, "#vo-s2-list") == min(50, исход["records"])
+    с.keyboard.press("Escape")
+    с.wait_for_selector(".modal-backdrop", state="detached")
+    # Сектор кольца раскрывает ту же строку: второй сектор — вторую.
+    второй = свод["outcomes"][1]
+    с.locator("#vo-s2 svg path.pick").nth(1).dispatch_event("click")
+    с.wait_for_function("""(название) => { const т = document.querySelectorAll('#vo-s2-list .drill-title');
+        return т.length === 1 && т[0].innerText === название; }""",
+                        arg=f"Исход: {второй['key']}")
+    assert строки.nth(1).get_attribute("aria-expanded") == "true"
+    # Причины при этом не трогаются: у каждого блока свой раскрытый список.
+    с.locator("#vo-s1 tr.drill-item").first.click()
+    с.wait_for_selector("#vo-s1 .drill-panel tbody tr")
+    assert с.locator(".drill-panel").count() == 2
     вкладка.чисто()
+
+
+def test_раздел_рисуется_не_дожидаясь_второй_части_свода(сервер):
+    """Обязательства, трекеры и скоркарту сервер считает, читая каждый
+    ответ модели, — на большом архиве это десятки секунд. Причины и исходы
+    их не ждут: раздел рисуется по первой части, вторая дорисовывает своё."""
+    окно = Вкладка(сервер)
+    try:
+        окно.страница.add_init_script("""
+            const настоящий = window.fetch;
+            window.fetch = (адрес, ...прочее) => (String(адрес).includes('part=heavy')
+              ? new Promise((готово) => setTimeout(готово, 2500)).then(() => настоящий(адрес, ...прочее))
+              : настоящий(адрес, ...прочее));""")
+        с = окно.открыть("voice")
+        с.wait_for_selector("#vo-s1 tr.drill-item")
+        assert с.evaluate("window.__asrhub.state.voice.lists") is None
+        шапка = с.inner_text("#vo-head").lower()
+        assert "обязательств\n…\n" in шапка and "разобрано моделью" in шапка, шапка
+        # Строка раскрывается, пока вторая часть ещё считается.
+        с.locator("#vo-s1 tr.drill-item").first.click()
+        с.wait_for_selector("#vo-s1 .drill-panel tbody tr")
+        с.locator("#vo-head button.drill").first.click()
+        с.wait_for_selector("#vo-head .drill-panel tbody tr")
+        # Вкладка, которой нужна вторая часть, честно говорит, что считает.
+        с.click('#vo-tabs button[data-tab="trackers"]')
+        assert "считаем по всем разборам" in с.inner_text("#vo-body").lower()
+        с.click('#vo-tabs button[data-tab="summary"]')
+        с.wait_for_function("() => window.__asrhub.state.voice.lists === 'ready'")
+        с.wait_for_function(
+            "() => !document.querySelector('#vo-head').innerText.includes('…')")
+        # Список, раскрытый под плитками, перерисовку шапки пережил.
+        assert с.locator("#vo-head .drill-panel tbody tr").count() > 0
+        с.click('#vo-tabs button[data-tab="trackers"]')
+        с.wait_for_selector("#vo-t1 svg")
+        адреса = [а for а in окно.запросы if "/api/content/llm" in а]
+        assert len(адреса) == 2 and "part=fast" in адреса[0] and "part=heavy" in адреса[1]
+        assert "since=" in адреса[1]
+        окно.чисто()
+    finally:
+        окно.закрыть()
 
 
 def test_клетка_причина_исход(вкладка):
@@ -213,10 +313,14 @@ def test_на_узком_экране_список_не_раздвигает_с�
     try:
         с = окно.открыть("voice")
         с.select_option("#vo-period", "all")
-        с.wait_for_selector("#vo-s1 svg")
+        с.wait_for_selector("#vo-s1 tr.drill-item")
         до = с.evaluate("document.documentElement.scrollWidth")
         с.locator("#vo-head button.drill").nth(1).click()
         с.wait_for_selector(".drill-panel tbody tr")
+        assert с.evaluate("document.documentElement.scrollWidth") <= max(до, 391)
+        # И список под строкой перечня — тоже: он листается внутри себя.
+        с.locator("#vo-s1 tr.drill-item").first.click()
+        с.wait_for_selector("#vo-s1 .drill-panel tbody tr")
         assert с.evaluate("document.documentElement.scrollWidth") <= max(до, 391)
         окно.чисто()
     finally:

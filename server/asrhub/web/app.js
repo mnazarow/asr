@@ -1461,6 +1461,11 @@ const Drill = {
     if (кнопка._панель && кнопка._панель.isConnected) { this._close(кнопка._панель); return; }
     let описание;
     try { описание = JSON.parse(кнопка.dataset.drill); } catch (e) { return; }
+    // `data-drill-single` на блоке — «раскрыта одна строка»: в перечне, где
+    // раскрывается каждая строка, десять списков разом — это десять тысяч
+    // строк в разметке ради девяти, на которые уже не смотрят.
+    const один = кнопка.closest('[data-drill-single]');
+    if (один) qsa('.drill-panel', один).forEach((прежняя) => this._close(прежняя));
     const панель = this._panel(описание, кнопка);
     const строка = кнопка.closest('tr');
     const наружу = this._наружу(кнопка);
@@ -1729,12 +1734,51 @@ const Drill = {
         <th>Итог</th><th>Запись</th></tr>`;
     }
     const величина = this._величина(ход);
-    return `<tr><th>Когда</th><th>Запись</th><th class="num">Длительность</th><th>Модель</th>
-      <th>Владелец</th><th>Статус</th>
-      ${this._нужен(ход, 'sentiment') ? '<th>Тональность</th>' : ''}
-      ${this._нужен(ход, 'agent_score') ? '<th class="num">Балл</th>' : ''}
-      ${описание.base === 'llm' ? '<th>Причина</th><th>Исход</th>' : ''}
-      ${величина ? `<th class="num">${esc(описание.value || 'Величина')}</th>` : ''}</tr>`;
+    return `<tr>${this._столбцы(ход).map((имя) => {
+      const [заголовок, класс] = this.СТОЛБЦЫ[имя];
+      return `<th${класс === 'num' ? ' class="num"' : ''}>${заголовок}</th>`;
+    }).join('')}${величина ? `<th class="num">${esc(описание.value || 'Величина')}</th>` : ''}</tr>`;
+  },
+
+  /**
+   * Столбцы списка записей: заголовок, класс ячейки и её разметка.
+   *
+   * Набор по умолчанию — полный: список во всю ширину раздела место под
+   * него имеет. Но список бывает и внутри карточки в полэкрана (строка
+   * блока «Причины обращений» раскрывается прямо в нём), и восемь столбцов
+   * там — это горизонтальная прокрутка ради модели и владельца, которые в
+   * этом месте никто не ищет. Тогда раздел называет столбцы сам:
+   * `cols: ['when', 'record', 'duration', 'outcome']`.
+   */
+  СТОЛБЦЫ: {
+    when: ['Когда', 'nowrap', (с) => Drill._когда(с.created_at)],
+    record: ['Запись', '', (с, описание) => {
+      const вкладка = описание.tab || (описание.base === 'jobs' ? '' : 'analysis');
+      return `<a class="drill-open" href="#/jobs/${encodeURIComponent(с.id)}" data-open="${esc(с.id)}"
+        ${вкладка ? `data-tab="${esc(вкладка)}"` : ''}>${esc(с.filename || с.id)}</a>
+        ${с.error_code ? `<span class="chip err">${esc(с.error_code)}</span>` : ''}`;
+    }],
+    duration: ['Длительность', 'num', (с) => (с.media_duration_s ? fmtDur(с.media_duration_s) : '—')],
+    model: ['Модель', '', (с) => esc(с.model || '—')],
+    owner: ['Владелец', '', (с) => esc(с.owner || '—')],
+    status: ['Статус', '', (с) => statusChip(с.status)],
+    tone: ['Тональность', '', (с) => toneChip(с.sentiment, '')],
+    score: ['Балл', 'num', (с) => (с.agent_score === null || с.agent_score === undefined
+      ? '—' : num(Math.round(с.agent_score)))],
+    reason: ['Причина', '', (с) => esc(с.reason || '—')],
+    outcome: ['Исход', '', (с) => esc(с.outcome || '—')],
+    resolved: ['Решено', '', (с) => (с.resolved === null || с.resolved === undefined ? '—'
+      : `<span class="chip ${с.resolved ? 'ok' : 'warn'}">${с.resolved ? 'да' : 'нет'}</span>`)],
+  },
+
+  /** Какие столбцы у этого списка записей: названные разделом либо полный набор. */
+  _столбцы(ход) {
+    const { описание } = ход;
+    if (Array.isArray(описание.cols)) return описание.cols.filter((имя) => this.СТОЛБЦЫ[имя]);
+    return ['when', 'record', 'duration', 'model', 'owner', 'status',
+      ...(this._нужен(ход, 'sentiment') ? ['tone'] : []),
+      ...(this._нужен(ход, 'agent_score') ? ['score'] : []),
+      ...(описание.base === 'llm' ? ['reason', 'outcome'] : [])];
   },
 
   /** Время записи; год — только когда он не нынешний, иначе он шум. */
@@ -1805,20 +1849,10 @@ const Drill = {
         <td>${запись}</td></tr>`;
     }
     const величина = this._величина(ход);
-    const вкладка = описание.tab || (описание.base === 'jobs' ? '' : 'analysis');
-    return `<tr><td class="nowrap">${this._когда(с.created_at)}</td>
-      <td><a class="drill-open" href="#/jobs/${encodeURIComponent(с.id)}" data-open="${esc(с.id)}"
-        ${вкладка ? `data-tab="${esc(вкладка)}"` : ''}>${esc(с.filename || с.id)}</a>
-        ${с.error_code ? `<span class="chip err">${esc(с.error_code)}</span>` : ''}</td>
-      <td class="num">${с.media_duration_s ? fmtDur(с.media_duration_s) : '—'}</td>
-      <td>${esc(с.model || '—')}</td><td>${esc(с.owner || '—')}</td>
-      <td>${statusChip(с.status)}</td>
-      ${this._нужен(ход, 'sentiment') ? `<td>${toneChip(с.sentiment, '')}</td>` : ''}
-      ${this._нужен(ход, 'agent_score') ? `<td class="num">${
-        с.agent_score === null || с.agent_score === undefined
-          ? '—' : num(Math.round(с.agent_score))}</td>` : ''}
-      ${описание.base === 'llm' ? `<td>${esc(с.reason || '—')}</td><td>${esc(с.outcome || '—')}</td>` : ''}
-      ${величина ? `<td class="num">${this._значение(описание, с.value)}</td>` : ''}</tr>`;
+    return `<tr>${this._столбцы(ход).map((имя) => {
+      const [, класс, ячейка] = this.СТОЛБЦЫ[имя];
+      return `<td${класс ? ` class="${класс}"` : ''}>${ячейка(с, описание)}</td>`;
+    }).join('')}${величина ? `<td class="num">${this._значение(описание, с.value)}</td>` : ''}</tr>`;
   },
 };
 
@@ -1864,6 +1898,16 @@ document.addEventListener('click', (событие) => {
   событие.stopPropagation();
   Drill.toggle(кнопка);
 }, true);
+// Раскрывает не только кнопка: в перечнях раскрывается вся строка. У кнопки
+// Enter и пробел работают сами, строке их даёт этот обработчик — иначе
+// раскрытие строк существовало бы только для мыши.
+document.addEventListener('keydown', (событие) => {
+  if (событие.key !== 'Enter' && событие.key !== ' ') return;
+  const цель = событие.target;
+  if (!цель || !цель.matches || !цель.matches('[data-drill]:not(button)')) return;
+  событие.preventDefault();
+  Drill.toggle(цель);
+});
 window.__asrhub.Drill = Drill;
 
 function modelById(id) { return state.models.find((m) => m.id === id); }
@@ -15843,11 +15887,11 @@ RENDERERS.voice = {
    */
   ЗАПИСИ: ['status:completed', 'no_control'],
 
-  раскрыть(отборы, заголовок, сбой) {
-    return Drill.spec((state.voice || {}).window, {
+  раскрыть(отборы, заголовок, сбой, ещё) {
+    return Drill.spec((state.voice || {}).window, Object.assign({
       base: 'llm', title: заголовок,
       f: [...this.ЗАПИСИ, ...(сбой ? [] : ['llm_ok']), ...(отборы || [])],
-    });
+    }, ещё || {}));
   },
 
   число(разметка, отборы, заголовок, сбой) {
@@ -15891,12 +15935,25 @@ RENDERERS.voice = {
     await this.load();
   },
 
+  /* Свод приходит двумя частями.
+   *
+   * Первая — счётная: записей и разобрано, причины, исходы, «причина ×
+   * исход», последние разборы. Сервер считает её по указателям, не читая
+   * самих ответов модели, и на любом окне это доли секунды. Вторая — то,
+   * что лежит в ответах списками: обязательства, трекеры, скоркарта; ради
+   * неё читается каждый ответ окна, и на сотнях тысяч разборов это уже
+   * десятки секунд. Раньше раздел ждал обе разом и на большом архиве
+   * открывался полминуты; теперь он рисуется по первой, а вторая
+   * дорисовывает своё, когда посчитается.
+   */
   async load() {
+    let свод;
     try {
-      const [свод, состояние] = await Promise.all([
-        API.latest('voice', `/api/content/llm?period=${this.период}`),
+      const [первая, состояние] = await Promise.all([
+        API.latest('voice', `/api/content/llm?period=${this.период}&part=fast`),
         API.latest('voice-status', '/api/llm/status').catch(() => null),
       ]);
+      свод = первая;
       state.voice = свод;
       state.voiceStatus = состояние;
     } catch (err) {
@@ -15908,6 +15965,52 @@ RENDERERS.voice = {
     }
     this.drawHead();
     this.draw();
+    this.догрузить(свод);
+  },
+
+  /** Вкладки, которым нужна вторая часть свода. */
+  ПО_СПИСКАМ: ['actions', 'trackers', 'scorecard'],
+
+  async догрузить(свод) {
+    // Окно — то же, что у первой части: вторую считают позже, и «неделя до
+    // сейчас» у неё была бы уже другой неделей.
+    const начало = (свод.window || {}).since;
+    let вторая;
+    try {
+      вторая = await API.latest('voice-lists',
+        `/api/content/llm?period=${this.период}&part=heavy${начало ? `&since=${начало}` : ''}`);
+    } catch (err) {
+      if ((err && err.code === 'aborted') || state.voice !== свод) return;
+      свод.lists = 'failed';
+      this.дорисовать();
+      return;
+    }
+    if (state.voice !== свод) return;              // период уже сменили
+    ['off_list', 'actions', 'records_with_actions', 'trackers', 'scorecard', 'action_items']
+      .forEach((поле) => { свод[поле] = вторая[поле]; });
+    свод.lists = 'ready';
+    this.дорисовать();
+  },
+
+  /** Вторая часть пришла (или не пришла): шапка и вкладка, которая её ждала. */
+  дорисовать() {
+    if (state.view !== 'voice' || !qs('#vo-head')) return;
+    // Список, раскрытый под плитками, переезжает через перерисовку шапки.
+    const вернуть = Drill.keep(qs('#vo-head'));
+    this.drawHead();
+    вернуть();
+    if (this.ПО_СПИСКАМ.includes(this.вкладка)) this.draw();
+  },
+
+  /** Заглушка вкладки, пока вторая часть свода считается. */
+  ждёмСписки(место, заголовок) {
+    const д = state.voice || {};
+    место.innerHTML = card(заголовок, '', д.lists === 'failed'
+      ? `<div class="empty">Эту часть посчитать не удалось.
+           <div class="small dim" style="margin-top:6px">Нажмите «Обновить» или выберите период короче.</div></div>`
+      : `<div class="empty">Считаем по всем разборам периода…
+           <div class="small dim" style="margin-top:6px">Обязательства, трекеры и скоркарта лежат
+           в ответах модели списками — ради них читается каждый ответ.</div></div>`);
   },
 
   drawHead() {
@@ -15936,11 +16039,15 @@ RENDERERS.voice = {
           : (Number(решено) ? this.число(pct(Number(решено) / 100, 0), ['resolved:1'],
               'Вопрос решён при обращении') : pct(0, 0)),
         'по мнению модели')}
-      ${kpi('Обязательств', num(действий),
+      ${д.lists === 'ready' ? kpi('Обязательств', num(действий),
         // Само число — обещания, а не записи; записями раскрывается то,
         // что под ним: в скольких разговорах они прозвучали.
         д.records_with_actions ? `в ${this.число(num(д.records_with_actions), ['with_actions'],
-          'Разговоры с обязательствами')} разговорах` : 'обещаний, данных клиентам')}
+          'Разговоры с обязательствами')} разговорах` : 'обещаний, данных клиентам')
+        // Обещания считаются чтением каждого ответа модели — это вторая
+        // часть свода, и плитка ждёт её, не задерживая остальные.
+        : kpi('Обязательств', д.lists === 'failed' ? '—' : '…',
+            д.lists === 'failed' ? 'не посчитано' : 'считаем по всем разборам')}
       ${kpi('Модель', esc(с.model || д.model || '—'),
         // Состояние связи — поле `available` с причиной в `reason`: поля
         // `reachable` сервер не отдаёт, и при лежащем сервере модели здесь
@@ -15957,6 +16064,11 @@ RENDERERS.voice = {
     if (!место) return;
     if (!Number(д.analyzed || 0) && this.вкладка !== 'summary') {
       место.innerHTML = '<div class="empty">За период модель ничего не разобрала.</div>';
+      return;
+    }
+    if (this.ПО_СПИСКАМ.includes(this.вкладка) && д.lists !== 'ready') {
+      this.ждёмСписки(место, { actions: 'Обязательства перед клиентами',
+        trackers: 'Умные трекеры', scorecard: 'Скоркарта' }[this.вкладка]);
       return;
     }
     if (this.вкладка === 'summary') this.drawSummary(место, д);
@@ -15978,28 +16090,85 @@ RENDERERS.voice = {
     }
     const причины = д.reasons || [];
     const исходы = д.outcomes || [];
+    const как = 'строка раскрывает разговоры';
     место.innerHTML = `
       <div class="grid cols-2">
-        ${card('Причины обращений', 'о чём звонили', '<div id="vo-s1" class="chart"></div>')}
-        ${card('Чем закончилось', 'исход из закрытого списка', '<div id="vo-s2" class="chart"></div>')}
+        ${card('Причины обращений', `о чём звонили · ${как}`, '<div id="vo-s1"></div>')}
+        ${card('Чем закончилось', `исход из списка · ${как}`,
+          '<div id="vo-s2" class="chart vo-donut"></div><div id="vo-s2-list"></div>')}
       </div>
       ${card('Последние разборы', 'резюме, причина и исход по каждой записи',
         this.таблицаЗаписей((д.rows || []).slice(0, 25)))}`;
-    // У графиков свой формат: hbars ждёт items, donut — parts. С labels и
-    // values оба рисовали пустоту даже при данных.
-    window.Charts.hbars(qs('#vo-s1'), {
-      items: причины.slice(0, 12).map((п) => ({ label: п.key, value: п.records })),
-      labelWidth: 200, emptyText: 'причины не спрашивались',
-      onPick: (номер, причина) => Drill.open(qs('#vo-s1'),
-        this.раскрыть([`reason:${причина.label}`], `Причина: ${причина.label}`)),
-    });
-    window.Charts.donut(qs('#vo-s2'), {
-      parts: исходы.map((п) => ({ label: п.key, value: п.records })),
-      size: 170, centerLabel: 'записей', emptyText: 'исходы не спрашивались',
-      onPick: (номер, исход) => Drill.open(qs('#vo-s2'),
-        this.раскрыть([`outcome:${исход.label}`], `Исход: ${исход.label}`)),
-    });
+    // Причины и исходы — перечнями, а не только графиком: у каждой строки
+    // свой список разговоров, и он раскрывается прямо под ней. Столбцы
+    // списка — под ширину карточки: причина у всех его строк одна, поэтому
+    // вместо неё стоит исход (и наоборот).
+    this.перечень(qs('#vo-s1'), причины, {
+      отбор: 'reason', подпись: 'Причина', пусто: 'причины не спрашивались',
+      столбцы: ['when', 'record', 'duration', 'outcome'] });
+    const цвета = window.Charts.palette();
+    // Без исходов кольцу рисовать нечего — об этом скажет перечень под ним.
+    if (исходы.length) {
+      window.Charts.donut(qs('#vo-s2'), {
+        parts: исходы.map((п) => ({ label: п.key, value: п.records })),
+        size: 150, centerLabel: 'записей', legend: false,
+        pickHint: 'щелчок — список разговоров',
+        // Сектор раскрывает ту же строку перечня, что стоит под кольцом.
+        onPick: (номер) => {
+          const строка = qsa('#vo-s2-list tr.drill-item')[номер];
+          if (строка) Drill.toggle(строка);
+        },
+      });
+    }
+    this.перечень(qs('#vo-s2-list'), исходы, {
+      отбор: 'outcome', подпись: 'Исход', пусто: 'исходы не спрашивались', цвета,
+      столбцы: ['when', 'record', 'duration', 'reason'] });
     this.связатьТаблицу(место);
+  },
+
+  /** Сколько строк перечня показывать: закрытый список причин длиннее не бывает. */
+  СТРОК_ПЕРЕЧНЯ: 30,
+
+  /**
+   * Перечень с раскрытием: причина или исход, сколько разговоров, какая это
+   * доля — и по щелчку на строке список этих разговоров прямо под ней.
+   *
+   * Раньше здесь стоял один график: по столбцу можно было щёлкнуть, но
+   * ничто на экране этого не говорило. Строка с уголком и подчёркнутым
+   * числом говорит. Раскрывается вся строка — попасть проще, чем в число, —
+   * и с клавиатуры тоже (Tab, затем Enter).
+   *
+   * На большом архиве не тормозит по тем же причинам, что и остальные
+   * списки: пока строку не раскрыли, запросов нет; приходит страница в
+   * полсотни строк, дальше — по прокрутке; раскрыта в блоке одна строка
+   * (`data-drill-single`), так что разметка не копится.
+   */
+  перечень(место, строки, что) {
+    if (!место) return;
+    if (!строки.length) {
+      место.innerHTML = `<div class="empty small">${esc(что.пусто)}</div>`;
+      return;
+    }
+    const видны = строки.slice(0, this.СТРОК_ПЕРЕЧНЯ);
+    const наибольшее = Math.max(1, ...видны.map((с) => Number(с.records || 0)));
+    место.innerHTML = `<div class="table-wrap full"><table class="drill-list" data-drill-single>
+      <tbody>${видны.map((с, номер) => {
+        const n = Number(с.records || 0);
+        const цвет = что.цвета ? что.цвета[номер % что.цвета.length] : '';
+        return `<tr class="drill-item" tabindex="0" role="button" aria-expanded="false"
+            title="Показать разговоры"${Drill.attr(null, this.раскрыть(
+              [`${что.отбор}:${с.key}`], `${что.подпись}: ${с.key}`, false, { cols: что.столбцы }))}>
+          <td class="drill-name"><span class="drill-caret"></span>${
+            цвет ? `<i class="drill-swatch" style="background:${цвет}"></i>` : ''}${esc(с.key)}</td>
+          <td class="drill-bar-cell"><div class="drill-bar"><span style="width:${
+            (100 * n / наибольшее).toFixed(1)}%${цвет ? `;background:${цвет}` : ''}"></span></div></td>
+          <td class="num"><span class="drill-num">${num(n)}</span></td>
+          <td class="num faint nowrap">${с.share === null || с.share === undefined
+            ? '' : `${num(Number(с.share), 0)} %`}</td>
+        </tr>`;
+      }).join('')}</tbody></table></div>
+      ${строки.length > видны.length ? `<div class="small faint" style="margin-top:6px">Показаны
+        первые ${видны.length} из ${num(строки.length)} — самые частые.</div>` : ''}`;
   },
 
   drawReasons(место, д) {

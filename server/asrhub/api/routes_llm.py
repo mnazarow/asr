@@ -59,15 +59,19 @@ def llm_status(request: Request, principal: Principal = Depends(authenticate)) -
     разбора и покрытие: сколько записей за сутки уже разобрано."""
     state, клиент, поток = _slot(request)
     since = time.time() - 86400
-    свод = state.db.llm_stats(tasks.VERSION, since, owner=scope_owner(principal))
-    разобрано = [р for р in свод["rows"] if not р.get("error") and р.get("version") == tasks.VERSION]
+    # Покрытие за сутки — счётом по указателям (`llm_brief`), а не чтением
+    # всех ответов суток: раздел спрашивает состояние при каждом открытии.
+    свод = state.db.llm_brief(tasks.VERSION, since, owner=scope_owner(principal))
+    годные = [г for г in свод["groups"] if г["ok"]]
+    разобрано = sum(int(г["n"]) - int(г["stale"] or 0) for г in годные)
+    ошибок = sum(int(г["n"]) for г in свод["groups"] if not г["ok"])
     return {
         **клиент.status(),
         "worker": поток.status(),
         "version": tasks.VERSION,
-        "coverage": {"total": свод["total"], "analyzed": len(разобрано),
-                     "errors": sum(1 for р in свод["rows"] if р.get("error")),
-                     "share": round(len(разобрано) / свод["total"], 4) if свод["total"] else None},
+        "coverage": {"total": свод["total"], "analyzed": разобрано,
+                     "errors": ошибок,
+                     "share": round(разобрано / свод["total"], 4) if свод["total"] else None},
     }
 
 
@@ -393,30 +397,89 @@ def llm_queue_clear(request: Request, state_filter: str = Body(default="", embed
 ДЕЙСТВИЙ_В_СВОДЕ = 200
 
 
-@router.get("/content/llm", summary="Свод ответов модели за период")
-def llm_report(request: Request, period: str = ПЕРИОД,
-               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-    """Причины и исходы по закрытым спискам, доля решённых, действия к
-    исполнению, срабатывания умных трекеров, ответы скоркарты — по
-    записям периода с ответом модели."""
-    state, клиент, поток = _slot(request)
-    секунд = PERIODS.get(period, 7 * 86400)
-    since = (time.time() - секунд) if секунд else 0.0
-    свод = state.db.llm_stats(tasks.VERSION, since, owner=scope_owner(principal))
-    # Окно свода — в ответ: числа раздела раскрываются в список записей
-    # отдельным запросом (`GET /api/drill`) и позже, а «неделя до сейчас»
-    # через минуту — уже другая неделя. Нижняя граница одна на весь ответ
-    # (свод читает базу один раз), верхняя — момент, когда он прочитан.
-    # Режется, как и список, временем записи (`j.created_at`), а не временем
-    # ответа модели.
-    окно = {"since": since or None, "until": time.time()}
-    строки = [р for р in свод["rows"] if not р.get("error")]
-    распределения = tasks.summarize_for_digest(строки)
+def _счётная_часть(state: Any, since: float,
+                   owner: str | list[str] | None) -> dict[str, Any]:
+    """Числа свода, которые считаются без чтения ответов модели.
+
+    Сколько записей и сколько разобрано, сбои, причины, исходы, клетки
+    «причина × исход», доля решённых — группы по коротким колонкам ответа
+    (`Database.llm_brief`). Доли и порядок — как раньше: причины и исходы
+    считаются по ответам без сбоя, пустые в распределение не идут, при
+    равном числе записей первой стоит та, что раньше по алфавиту (прежде
+    порядок равных зависел от того, какой строкой их отдала база).
+    """
+    сводка = state.db.llm_brief(tasks.VERSION, since, owner=owner)
+    группы = сводка["groups"]
+    годные = [г for г in группы if г["ok"]]
+    разобрано = sum(int(г["n"]) for г in годные)
+    всего_ответов = sum(int(г["n"]) for г in группы)
+
+    def доли(поле: str) -> list[dict[str, Any]]:
+        счёт: dict[str, int] = {}
+        for г in годные:
+            if г[поле]:
+                счёт[str(г[поле])] = счёт.get(str(г[поле]), 0) + int(г["n"])
+        всего = sum(счёт.values())
+        return [{"key": ключ, "records": n, "share": round(100.0 * n / всего, 1)}
+                for ключ, n in sorted(счёт.items(), key=lambda пара: (-пара[1], пара[0]))]
+
+    # «Причина × исход» — по всем записям периода, а не по построчному
+    # списку: тот обрезан, и клетки считались бы по его части.
+    пары: dict[tuple[str, str], int] = {}
+    for г in годные:
+        ключ = (str(г["reason"] or "—"), str(г["outcome"] or "—"))
+        пары[ключ] = пары.get(ключ, 0) + int(г["n"])
+    известно = sum(int(г["resolved_known"] or 0) for г in годные)
+    решено = sum(int(г["resolved_yes"] or 0) for г in годные)
+    задержка = sum(float(г["latency_ms"] or 0) for г in годные)
+    return {
+        "records": сводка["total"], "analyzed": разобрано,
+        "errors": всего_ответов - разобрано,
+        "stale": sum(int(г["stale"] or 0) for г in годные),
+        "coverage": round(разобрано / сводка["total"], 4) if сводка["total"] else None,
+        "avg_latency_ms": round(задержка / разобрано, 1) if разобрано else None,
+        "outcomes": доли("outcome"), "reasons": доли("reason"),
+        "resolved_share": round(100.0 * решено / известно, 1) if известно else None,
+        "pairs": [{"reason": причина, "outcome": исход, "records": n}
+                  for (причина, исход), n in sorted(пары.items(),
+                                                   key=lambda пара: (-пара[1], пара[0]))],
+        "rows_total": всего_ответов,
+    }
+
+
+def _построчно(state: Any, since: float,
+               owner: str | list[str] | None) -> list[dict[str, Any]]:
+    """Последние разборы окна — строки для таблиц раздела."""
+    return [{
+        "job_id": р["job_id"], "filename": р.get("filename"),
+        "created_at": р.get("created_at"), "summary": р.get("summary") or "",
+        "reason": р.get("reason"), "reason_quote": р.get("reason_quote") or "",
+        "outcome": р.get("outcome"), "outcome_quote": р.get("outcome_quote") or "",
+        "resolved": р.get("resolved"), "actions": р.get("actions") or [],
+        "trackers": р.get("trackers") or [], "scorecard": р.get("scorecard") or [],
+        "error": р.get("error") or "",
+    } for р in state.db.llm_recent(since, owner=owner, limit=СТРОК_В_СВОДЕ)]
+
+
+def _часть_по_спискам(state: Any, since: float,
+                      owner: str | list[str] | None) -> dict[str, Any]:
+    """Числа свода, ради которых приходится читать каждый ответ.
+
+    Обязательства, трекеры, скоркарта и «ответ мимо списка» лежат в ответе
+    модели строками JSON. Это дорогая часть: на сотнях тысяч разборов —
+    секунды, а не доли секунды. Поэтому она отделена от счётной: раздел
+    сначала показывает причины и исходы, а эти числа дорисовывает, когда
+    они посчитаются.
+    """
+    строки = state.db.llm_details(since, owner=owner)
     # Трекеры и скоркарта считаются в записях, а не в элементах списка.
     # Разница видна, когда в настройке два трекера (или два пункта) с одним
     # id: у записи тогда два элемента с этим id, и запись считалась дважды
     # — «сработал в 12 разговорах» при шести разговорах в списке под числом.
     трекеры: dict[str, dict[str, Any]] = {}
+    скоркарта: dict[str, dict[str, Any]] = {}
+    действий = с_действиями = мимо_списка = 0
+    свежие: list[dict[str, Any]] = []
     for р in строки:
         проверено: set[str] = set()
         сработало: set[str] = set()
@@ -431,8 +494,6 @@ def llm_report(request: Request, period: str = ПЕРИОД,
             трекеры[ключ]["checked"] += 1
         for ключ in сработало:
             трекеры[ключ]["fired"] += 1
-    скоркарта: dict[str, dict[str, Any]] = {}
-    for р in строки:
         ответы: set[tuple[str, str]] = set()
         for о in р.get("scorecard") or []:
             ключ = str(о.get("id"))
@@ -441,59 +502,78 @@ def llm_report(request: Request, period: str = ПЕРИОД,
             ответы.add((ключ, о.get("answer") if о.get("answer") in ("да", "нет") else "н/п"))
         for ключ, ответ in ответы:
             скоркарта[ключ][ответ] += 1
-    свежие = sorted(свод["rows"], key=lambda x: -float(x.get("created_at") or 0))
-    действия = []
+        действий += len(tasks._список(р.get("actions")))
+        if р.get("actions"):
+            с_действиями += 1
+            # Строки идут от новых к старым: первые и есть самые свежие.
+            if len(свежие) < ДЕЙСТВИЙ_В_СВОДЕ:
+                свежие.append(р)
+        if any("вне списка" in str(з) for з in (р.get("warnings") or [])):
+            мимо_списка += 1
+    имена = state.db.filenames([р["job_id"] for р in свежие])
+    действия: list[dict[str, Any]] = []
     for р in свежие:
-        if р.get("error"):
-            continue
         for д in р.get("actions") or []:
             if not isinstance(д, dict):
                 д = {"what": str(д)}
-            действия.append({**д, "job_id": р["job_id"], "filename": р.get("filename"),
+            действия.append({**д, "job_id": р["job_id"], "filename": имена.get(р["job_id"]),
                              "created_at": р.get("created_at")})
             if len(действия) >= ДЕЙСТВИЙ_В_СВОДЕ:
                 break
         if len(действия) >= ДЕЙСТВИЙ_В_СВОДЕ:
             break
-    # «Причина × исход» — по всем записям периода, а не по построчному
-    # списку ниже: тот обрезан, и клетки считались бы по его части.
-    пары: dict[tuple[str, str], int] = {}
-    for р in строки:
-        ключ = (str(р.get("reason") or "—"), str(р.get("outcome") or "—"))
-        пары[ключ] = пары.get(ключ, 0) + 1
-    # Построчный список для раздела «Голосовая аналитика»: он рисовал
-    # таблицы и цитаты по полю `rows`, которого в ответе не было вовсе, и
-    # показывал «модель ничего не разобрала» при разобранном архиве.
-    построчно = [{
-        "job_id": р["job_id"], "filename": р.get("filename"),
-        "created_at": р.get("created_at"), "summary": р.get("summary") or "",
-        "reason": р.get("reason"), "reason_quote": р.get("reason_quote") or "",
-        "outcome": р.get("outcome"), "outcome_quote": р.get("outcome_quote") or "",
-        "resolved": р.get("resolved"), "actions": р.get("actions") or [],
-        "trackers": р.get("trackers") or [], "scorecard": р.get("scorecard") or [],
-        "error": р.get("error") or "",
-    } for р in свежие[:СТРОК_В_СВОДЕ]]
     return {
-        "period": period, "enabled": клиент.enabled, "model": клиент.model,
-        "records": свод["total"], "analyzed": len(строки),
-        "errors": sum(1 for р in свод["rows"] if р.get("error")),
-        "stale": sum(1 for р in строки if р.get("version") != tasks.VERSION),
-        "coverage": round(len(строки) / свод["total"], 4) if свод["total"] else None,
-        "avg_latency_ms": round(sum(float(р.get("latency_ms") or 0) for р in строки)
-                                / len(строки), 1) if строки else None,
-        "off_list": sum(1 for р in строки
-                        if any("вне списка" in str(з) for з in (р.get("warnings") or []))),
-        **распределения,
+        "off_list": мимо_списка,
+        "actions": действий, "records_with_actions": с_действиями,
         "trackers": sorted(трекеры.values(), key=lambda т: -т["fired"]),
         "scorecard": list(скоркарта.values()),
         "action_items": действия,
-        "pairs": [{"reason": п, "outcome": и, "records": n}
-                  for (п, и), n in sorted(пары.items(), key=lambda kv: -kv[1])],
-        "rows": построчно,
-        "rows_total": len(свод["rows"]),
-        "worker": поток.status(),
-        "window": окно,
     }
+
+
+@router.get("/content/llm", summary="Свод ответов модели за период")
+def llm_report(request: Request, period: str = ПЕРИОД,
+               part: str = Query(default="", pattern="^(|fast|heavy)$"),
+               since: float | None = Query(default=None, ge=0),
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Причины и исходы по закрытым спискам, доля решённых, действия к
+    исполнению, срабатывания умных трекеров, ответы скоркарты — по
+    записям периода с ответом модели.
+
+    Свод можно взять в две части — так делает раздел «Голосовая
+    аналитика», чтобы на большом архиве не ждать всего сразу:
+
+    - `part=fast` — то, что считается без чтения ответов: записей и
+      разобрано, сбои, причины, исходы, «причина × исход», доля решённых,
+      последние разборы построчно. Доли секунды на любом окне;
+    - `part=heavy` — то, что лежит в ответах списками: обязательства,
+      трекеры, скоркарта, «ответ мимо списка». Читает каждый ответ окна.
+
+    Без `part` — обе части разом, как раньше. `since` — нижняя граница
+    окна вместо отсчёта от «сейчас»: вторую часть спрашивают позже первой,
+    и считаться она должна по тому же окну (`window.since` первой части).
+    """
+    state, клиент, поток = _slot(request)
+    секунд = PERIODS.get(period, 7 * 86400)
+    начало = float(since) if since is not None else (
+        (time.time() - секунд) if секунд else 0.0)
+    владелец = scope_owner(principal)
+    ответ: dict[str, Any] = {"period": period, "enabled": клиент.enabled, "model": клиент.model}
+    if part != "heavy":
+        ответ.update(_счётная_часть(state, начало, владелец))
+        ответ["rows"] = _построчно(state, начало, владелец)
+        ответ["worker"] = поток.status()
+    if part != "fast":
+        ответ.update(_часть_по_спискам(state, начало, владелец))
+    if part:
+        ответ["part"] = part
+    # Окно свода — в ответ: числа раздела раскрываются в список записей
+    # отдельным запросом (`GET /api/drill`) и позже, а «неделя до сейчас»
+    # через минуту — уже другая неделя. Нижняя граница одна на весь ответ,
+    # верхняя — момент, когда он посчитан. Режется, как и список, временем
+    # записи (`j.created_at`), а не временем ответа модели.
+    ответ["window"] = {"since": начало or None, "until": time.time()}
+    return ответ
 
 
 # --- установка модели ---------------------------------------------------

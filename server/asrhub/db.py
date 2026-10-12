@@ -30,7 +30,30 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
+
+#: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
+#: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
+#: время ответа), — рядом с номером записи и без самого ответа.
+#:
+#: Строка ответа широкая: пересказ, цитаты, JSON трекеров и скоркарты — три-
+#: четыре килобайта. Чтобы узнать причину обращения, базе приходилось
+#: поднимать её всю, и на четырёхстах тысячах разборов «сколько звонков про
+#: возврат за год» означало прочитать два гигабайта: свод раздела собирался
+#: полминуты, а список под числом не укладывался в срок. По этому указателю
+#: тот же вопрос — проход по тридцати мегабайтам.
+#:
+#: Колонки перечислены здесь же: список раскрытия (`drill`) просит базу идти
+#: по указателю только тогда, когда запросу хватает именно их.
+УКАЗАТЕЛЬ_ОТВЕТОВ = "idx_llm_results_brief"
+КОЛОНКИ_УКАЗАТЕЛЯ_ОТВЕТОВ = ("job_id", "error", "reason", "outcome", "resolved",
+                             "version", "latency_ms")
+
+#: Окно заданий по времени — вместе с тем, чем окно обычно сужают: статус,
+#: источник, владелец. Строка задания тоже широкая (в ней расшифровка), и
+#: без этих колонок в указателе «готовые за год, без контрольных прогонов»
+#: читали каждое задание года с диска ради трёх коротких полей.
+УКАЗАТЕЛЬ_ОКНА = "idx_jobs_window"
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
 CLEANUP_BATCH = 5000
@@ -461,6 +484,9 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_llm_cache_created ON llm_cache(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_llm_cache_job ON llm_cache(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_results_outcome ON llm_results(outcome)",
+    # --- версия 32: счёт и отбор ответов модели без чтения самих ответов ---
+    f"CREATE INDEX IF NOT EXISTS {УКАЗАТЕЛЬ_ОТВЕТОВ} "
+    f"ON llm_results({', '.join(КОЛОНКИ_УКАЗАТЕЛЯ_ОТВЕТОВ)})",
     "CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, picked_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_model_checks_created ON model_checks(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_model_checks_job ON model_checks(job_id)",
@@ -563,6 +589,12 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_crm ON jobs(crm_status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC)",
+    # Версия 32. Порядок — как у списков: сначала новые, при равном времени
+    # по номеру; статус, источник и владелец — довеском, чтобы условие по
+    # ним проверялось по указателю, а строка задания читалась только у тех,
+    # кто его прошёл.
+    f"CREATE INDEX IF NOT EXISTS {УКАЗАТЕЛЬ_ОКНА} "
+    "ON jobs(created_at DESC, id DESC, status, source, owner)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_model ON jobs(model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_hash ON jobs(file_hash)",
@@ -1149,6 +1181,8 @@ class Database:
         #: Поколение реплик: растёт при каждой их записи и удалении. Память
         #: поиска (`jobs_matching`) действительна только в своём поколении.
         self._поколение_реплик = 0
+        #: Указатели, про которые уже известно, что они в базе есть.
+        self._известные_указатели: set[str] = set()
         #: Что сервер рассказывает о себе в отметке жизни (версия, файловая
         #: система) — заполняет `create_app`.
         self.сведения_отметки: dict[str, Any] = {}
@@ -1331,6 +1365,24 @@ class Database:
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
         rows = self.query(sql, params)
         return rows[0] if rows else None
+
+    def has_index(self, name: str) -> bool:
+        """Есть ли в базе указатель с таким именем.
+
+        Запрос с `INDEXED BY` по указателю, которого нет, — ошибка, а не
+        медленный запрос. Указатели создаются при открытии базы, но создание
+        может не пройти (см. `_catch_up_indexes`: это повод работать
+        медленнее, а не падать), поэтому тот, кто просит базу идти по
+        указателю, сначала спрашивает здесь. Утвердительный ответ
+        запоминается: указатели на ходу не удаляют.
+        """
+        if name in self._известные_указатели:
+            return True
+        строка = self.query_one(
+            "SELECT 1 AS x FROM sqlite_master WHERE type='index' AND name=?", (name,))
+        if строка:
+            self._известные_указатели.add(name)
+        return bool(строка)
 
     def query_bounded(self, sql: str, params: Sequence[Any] = (), *,
                       seconds: float = 5.0) -> list[sqlite3.Row]:
@@ -2969,10 +3021,15 @@ class Database:
             [*args, limit])
         return [dict(r) for r in rows]
 
-    def llm_stats(self, version: int, since: float, *,
-                  owner: str | list[str] | None = None) -> dict[str, Any]:
-        """Свод ответов модели за окно: покрытие, исходы, причины, действия,
-        трекеры, задержка, ошибки."""
+    @staticmethod
+    def _окно_ответов(since: float,
+                      owner: str | list[str] | None) -> tuple[str, list[Any]]:
+        """Какие задания входят в свод ответов модели — одним местом.
+
+        Готовые, не старше начала окна, без контрольных прогонов; с владельцем
+        — только его. Все четыре условия стоят по колонкам указателя окна
+        (`УКАЗАТЕЛЬ_ОКНА`), так что проверяются без чтения самих заданий.
+        """
         where = ["j.status='completed'", "j.created_at >= ?",
                  "COALESCE(j.source,'') <> 'control'"]
         args: list[Any] = [since]
@@ -2982,7 +3039,23 @@ class Database:
         elif owner:
             where.append("j.owner=?")
             args.append(owner)
-        условие = " AND ".join(where)
+        return " AND ".join(where), args
+
+    def _задания_окна(self) -> str:
+        """`jobs j` — с просьбой идти по указателю окна, если он есть."""
+        return ("jobs j INDEXED BY " + УКАЗАТЕЛЬ_ОКНА
+                if self.has_index(УКАЗАТЕЛЬ_ОКНА) else "jobs j")
+
+    def llm_stats(self, version: int, since: float, *,
+                  owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Свод ответов модели за окно: покрытие, исходы, причины, действия,
+        трекеры, задержка, ошибки.
+
+        Отдаёт ответы целиком — с пересказом и JSON. Годится там, где окно
+        короткое или нужен сам текст (сводка по расписанию); счёт за длинное
+        окно — `llm_brief`, он ответов не читает.
+        """
+        условие, args = self._окно_ответов(since, owner)
         всего = int(self.query_one(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args)["n"])
         rows = self.query(
             "SELECT l.job_id, l.version, l.summary, l.reason, l.reason_quote, l.outcome, "
@@ -2991,6 +3064,123 @@ class Database:
             "       j.created_at, j.owner "
             f"FROM llm_results l JOIN jobs j ON j.id = l.job_id WHERE {условие}", args)
         return {"total": всего, "rows": [_row_to_llm(r) for r in rows]}
+
+    def llm_brief(self, version: int, since: float, *,
+                  owner: str | list[str] | None = None) -> dict[str, Any]:
+        """Счётная часть свода ответов модели — без чтения самих ответов.
+
+        Сколько записей в окне, сколько из них с ответом, сколько сбоев, как
+        ответы разложились по причинам и исходам, где модель сказала «решён»
+        — всё это группы по трём коротким колонкам. Раньше ради них в память
+        поднимались ответы целиком: пересказ, цитаты, JSON трекеров и
+        скоркарты каждой записи окна, и на четырёхстах тысячах разборов
+        раздел «Голосовая аналитика» открывался полминуты. Здесь база идёт
+        по двум узким указателям — окно заданий и ответы — и ни одной
+        широкой строки не поднимает: то же окно считается за доли секунды.
+
+        Ответ — сырые группы; доли, сортировку и подписи собирает вызывающий.
+        """
+        условие, args = self._окно_ответов(since, owner)
+        задания = self._задания_окна()
+        ответы = ("llm_results l INDEXED BY " + УКАЗАТЕЛЬ_ОТВЕТОВ
+                  if self.has_index(УКАЗАТЕЛЬ_ОТВЕТОВ) else "llm_results l")
+        всего = int(self.query_one(
+            f"SELECT COUNT(*) n FROM {задания} WHERE {условие}", args)["n"])
+        группы = self.query(
+            "SELECT COALESCE(l.error,'') = '' AS ok, COALESCE(l.reason,'') AS reason, "
+            "       COALESCE(l.outcome,'') AS outcome, COUNT(*) AS n, "
+            "       SUM(CASE WHEN l.version <> ? THEN 1 ELSE 0 END) AS stale, "
+            "       SUM(COALESCE(l.latency_ms,0)) AS latency_ms, "
+            "       SUM(CASE WHEN l.resolved IS NOT NULL THEN 1 ELSE 0 END) AS resolved_known, "
+            "       SUM(CASE WHEN l.resolved THEN 1 ELSE 0 END) AS resolved_yes "
+            f"FROM {задания} JOIN {ответы} ON l.job_id = j.id "
+            f"WHERE {условие} GROUP BY 1, 2, 3", [int(version), *args])
+        return {"total": всего, "groups": [dict(r) for r in группы]}
+
+    def llm_recent(self, since: float, *, owner: str | list[str] | None = None,
+                   limit: int = 300) -> list[dict[str, Any]]:
+        """Последние ответы модели окна целиком — столько, сколько показывают.
+
+        Построчный список раздела — это три сотни свежих разборов. Брать их
+        сортировкой всех ответов окна значило читать всё окно; здесь база
+        идёт по времени от новых и останавливается на нужной строке.
+        """
+        условие, args = self._окно_ответов(since, owner)
+        rows = self.query(
+            "SELECT l.job_id, l.version, l.summary, l.reason, l.reason_quote, l.outcome, "
+            "       l.outcome_quote, l.resolved, l.actions, l.trackers, l.scorecard, "
+            "       l.latency_ms, l.error, l.calls, l.chunks, l.warnings, j.filename, "
+            "       j.created_at, j.owner "
+            f"FROM {self._задания_окна()} JOIN llm_results l ON l.job_id = j.id "
+            f"WHERE {условие} ORDER BY j.created_at DESC, j.id DESC LIMIT ?",
+            [*args, max(1, int(limit))])
+        return [_row_to_llm(r) for r in rows]
+
+    def llm_details(self, since: float, *,
+                    owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+        """Разборы окна без сбоя — только то, что лежит в них списками.
+
+        Обязательства, трекеры, скоркарта и замечания хранятся в ответе
+        строками JSON, и посчитать их можно, только прочитав каждый ответ:
+        это и есть дорогая часть свода. Остального из ответа здесь не
+        берётся — ни пересказа, ни цитат, — а задание читается по указателю
+        окна. Строки идут от новых к старым.
+        """
+        условие, args = self._окно_ответов(since, owner)
+        rows = self.query(
+            "SELECT l.job_id, l.actions, l.trackers, l.scorecard, l.warnings, j.created_at "
+            f"FROM {self._задания_окна()} JOIN llm_results l ON l.job_id = j.id "
+            f"WHERE {условие} AND COALESCE(l.error,'') = '' "
+            "ORDER BY j.created_at DESC, j.id DESC", args)
+        # Разбор JSON — главная цена этого прохода, а строки повторяются:
+        # пустой список обязательств и замечаний — почти у всех, трекеры, из
+        # которых не сработал ни один, — одной и той же строкой у большинства
+        # записей. Пустое не разбирается вовсе, повторы — один раз. Память
+        # под повторы ограничена: скоркарта с цитатами у каждой записи своя.
+        # Разобранное общее на все строки — вызывающий его только читает.
+        память: dict[str, Any] = {}
+
+        def разобрать(сырое: Any) -> Any:
+            if not isinstance(сырое, str):
+                return сырое
+            if сырое == "[]":
+                return []
+            готовое = память.get(сырое, память)
+            if готовое is память:
+                try:
+                    готовое = json.loads(сырое)
+                except (TypeError, ValueError):
+                    готовое = None
+                if len(память) < 4096:
+                    память[сырое] = готовое
+            return готовое
+
+        return [{"job_id": r["job_id"], "created_at": r["created_at"],
+                 "actions": разобрать(r["actions"]), "trackers": разобрать(r["trackers"]),
+                 "scorecard": разобрать(r["scorecard"]), "warnings": разобрать(r["warnings"])}
+                for r in rows]
+
+    def llm_latencies(self, since: float) -> list[float]:
+        """Время ответа модели по разборам окна без сбоя, мс — по указателю."""
+        условие, args = self._окно_ответов(since, None)
+        ответы = ("llm_results l INDEXED BY " + УКАЗАТЕЛЬ_ОТВЕТОВ
+                  if self.has_index(УКАЗАТЕЛЬ_ОТВЕТОВ) else "llm_results l")
+        rows = self.query(
+            f"SELECT l.latency_ms FROM {self._задания_окна()} JOIN {ответы} ON l.job_id = j.id "
+            f"WHERE {условие} AND COALESCE(l.error,'') = '' AND l.latency_ms IS NOT NULL", args)
+        return [float(r["latency_ms"]) for r in rows]
+
+    def filenames(self, job_ids: Sequence[str]) -> dict[str, str]:
+        """Имена файлов по номерам заданий — порциями, одним запросом на порцию."""
+        имена: dict[str, str] = {}
+        номера = list(dict.fromkeys(job_ids))
+        for начало in range(0, len(номера), 500):
+            порция = номера[начало:начало + 500]
+            for r in self.query(
+                    "SELECT id, filename FROM jobs WHERE id IN "
+                    f"({','.join('?' for _ in порция)})", порция):
+                имена[str(r["id"])] = str(r["filename"] or "")
+        return имена
 
     def llm_cache_get(self, key: str) -> str | None:
         row = self.query_one("SELECT response FROM llm_cache WHERE key=?", (key,))

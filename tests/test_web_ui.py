@@ -984,7 +984,7 @@ def test_голосовая_аналитика_показывает_разобр
     """
     _открыть(страница, "voice")
     страница.select_option("#vo-period", "all")
-    страница.wait_for_selector("#vo-s1 svg", timeout=20000)
+    страница.wait_for_selector("#vo-s1 tr.drill-item", timeout=20000)
     страница.wait_for_selector("#vo-s2 svg", timeout=20000)
     # Подписи KPI набраны прописными через CSS — сравниваем без регистра.
     шапка = страница.inner_text("#vo-head").lower()

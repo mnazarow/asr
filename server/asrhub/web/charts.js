@@ -556,11 +556,16 @@ function fmtNum(value, digits) {
       const влево = значение < 0 && двусторонний;
       const запас = подпись.length * 6.5 + 10;
       const тесно = влево && (x - ctx.pad.left) < запас;
+      // Число, которое раскрывается, помечено так же, как числа-кнопки
+      // вне графиков, — пунктиром: без этого столбец, по которому можно
+      // щёлкнуть, ничем не отличался от столбца, по которому нельзя.
+      const раскрывается = typeof config.onPick === 'function' && item.pick !== false;
       el('text', {
         x: тесно ? x + 6 : влево ? x - 8 : x + длина + 8,
         y: y + rowHeight / 2 + 4,
         'text-anchor': влево && !тесно ? 'end' : 'start',
         fill: ink(), 'font-size': 11.5,
+        class: раскрывается ? 'pick-value' : null,
       }, ctx.svg).textContent = подпись;
       if (typeof config.onPick === 'function' && item.pick !== false) {
         // Цель щелчка — вся строка с именем, а не столбец: у малого значения
@@ -656,6 +661,9 @@ function fmtNum(value, digits) {
     el('text', { x: cx, y: cy + 16, 'text-anchor': 'middle', fill: faint(),
                  'font-size': 11 }, svg).textContent = config.centerLabel || 'всего';
 
+    // `legend: false` — когда доли подписаны рядом самим разделом (списком,
+    // строки которого раскрываются): вторая легенда повторяла бы первую.
+    if (config.legend === false) return svg;
     const list = document.createElement('div');
     list.className = 'stack';
     list.style.fontSize = '12.5px';
@@ -669,6 +677,7 @@ function fmtNum(value, digits) {
         `<b class="mono">${fmtNum(part.value)}</b>` +
         `<span class="faint mono">${((part.value / total) * 100).toFixed(0)} %</span>`;
       if (part.pick !== false) pickable(row, config, исходный(part), part);
+      if (part.pick !== false && typeof config.onPick === 'function') row.classList.add('pick-row');
       list.appendChild(row);
     });
     wrap.appendChild(list);

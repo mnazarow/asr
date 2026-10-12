@@ -562,17 +562,19 @@ class Collector:
                                   {"status": "cache"}))
                 from ..llm import tasks as llm_tasks  # noqa: PLC0415
 
-                свод = self.state.db.llm_stats(llm_tasks.VERSION, since)
-                ответы = [р for р in свод["rows"] if not р.get("error")]
-                задержки = sorted(float(р["latency_ms"]) / 1000 for р in ответы
-                                  if р.get("latency_ms") is not None)
+                # Счёт и время ответа — по узкому указателю ответов, без
+                # чтения самих ответов: сбор идёт по расписанию, и поднимать
+                # ради двух чисел пересказы всех разборов окна незачем.
+                свод = self.state.db.llm_brief(llm_tasks.VERSION, since)
+                ответов = sum(int(г["n"]) for г in свод["groups"] if г["ok"])
+                задержки = sorted(мс / 1000 for мс in self.state.db.llm_latencies(since))
                 for stat, значение in self._quantiles(задержки).items():
                     if stat in ("p50", "p95"):
                         out.append(Sample("asrhub_llm_latency_seconds", round(значение, 3),
                                           {"stat": stat}))
                 if свод["total"]:
                     out.append(Sample("asrhub_llm_coverage",
-                                      round(len(ответы) / свод["total"], 4)))
+                                      round(ответов / свод["total"], 4)))
             except Exception as exc:                         # noqa: BLE001
                 log.debug("Метрики языковой модели не посчитаны: %s", exc)
         # Калибровка — за неделю: за сутки эталонных записей обычно единицы,
