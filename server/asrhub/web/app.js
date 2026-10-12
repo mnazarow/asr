@@ -3971,13 +3971,15 @@ function showJobModal(job, opts) {
         ${job.silence_share !== null && job.silence_share !== undefined ? ` · тишины ${pct(job.silence_share, 0)}` : ''}</div>` : ''}
 
       ${job.call ? `<div class="card tight" style="margin-bottom:12px">
-        <b class="small">Звонок с АТС</b>
+        <b class="small">${job.source === 'asterisk' ? 'Звонок с АТС' : 'Звонок'}</b>
         <div class="small dim" style="margin-top:4px">
           ${esc(job.call.direction || 'направление неизвестно')} ·
           ${esc(job.call.src || '—')} → ${esc(job.call.dst || '—')}
-          ${job.call.clid ? ` · ${esc(job.call.clid)}` : ''}
+          ${job.call.clid && job.call.clid !== job.call.src ? ` · ${esc(job.call.clid)}` : ''}
           ${job.call.queue ? ` · очередь ${esc(job.call.queue)}` : ''}
-          ${job.call.agent ? ` · оператор ${esc(job.call.agent)}` : ''}
+          ${job.call.agent ? ` · добавочный <b class="mono">${esc(job.call.agent)}</b>${
+            job.call.agent_name ? ` — ${esc(job.call.agent_name)}${
+              job.call.agent_department ? `, ${esc(job.call.agent_department)}` : ''}` : ''}` : ''}
         </div>
         <div class="small dim" style="margin-top:2px">
           начало ${esc(fmtTime(job.call.started_at))} · разговор ${fmtDur(job.call.billsec || 0)}

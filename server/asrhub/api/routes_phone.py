@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .. import phone_compat
+from .. import employees, phone_compat
 from ..errors import ASRHubError, ConfigError, ForbiddenError
 from ..logging_setup import get_logger
 from .deps import (
@@ -37,8 +37,24 @@ log = get_logger("api.phone")
 router = APIRouter(tags=["Совместимость с phone_asr"])
 
 
+#: Сколько знаков номера хранить. Номер — подпись, а не данные: длиннее
+#: этого приезжает только мусор, и ради него отказывать в разговоре нельзя.
+ДЛИНА_НОМЕРА = 64
+
+
 class ProcessCallBody(BaseModel):
-    """Тело запроса. Поля и умолчания повторяют схему phone_asr."""
+    """Тело запроса. Поля и умолчания повторяют схему phone_asr.
+
+    Сверх неё — номера разговора: кто звонил (`phone`) и кто говорил
+    (`internalPhone`, добавочный сотрудника). Их шлёт интеграция поверх
+    phone_asr, а phone_asr их не читал — номера терялись, и разговор,
+    приехавший этим путём, не попадал ни в журнал звонков, ни в разрез по
+    сотрудникам. Поля необязательные: без них всё как раньше.
+    """
+
+    #: Имя поля в схеме — `internalPhone`, как его пишет интеграция; в
+    #: Python оно `internal_phone`, и по этому имени тоже принимается.
+    model_config = ConfigDict(populate_by_name=True)
 
     call_id: str
     files: list[str]
@@ -49,11 +65,39 @@ class ProcessCallBody(BaseModel):
     #: Ключ доступа прямо в теле — так его шлёт phone_asr. Заголовок и
     #: параметр адреса тоже принимаются; в задание и в журнал он не попадает.
     api_key: str = ""
+    #: Кто звонил — номер абонента.
+    phone: str = Field(default="", description="Кто звонил: номер абонента")
+    #: Кто говорил — добавочный (внутренний) номер сотрудника.
+    internal_phone: str = Field(default="", alias="internalPhone",
+                                description="Кто говорил: добавочный номер сотрудника")
+    #: Направление звонка, если интеграция его знает: входящий, исходящий,
+    #: внутренний (или in, out, internal).
+    direction: str = Field(default="", description="входящий, исходящий или внутренний")
 
     @field_validator("base_url", mode="before")
     @classmethod
     def _scheme(cls, value: str) -> str:
         return phone_compat.normalise_base_url(str(value or ""))
+
+    @field_validator("phone", "internal_phone", "direction", mode="before")
+    @classmethod
+    def _подпись(cls, value: Any) -> str:
+        """Номер строкой — даже если его прислали числом.
+
+        PHP кладёт номер в JSON тем типом, каким он был в переменной, и
+        `'internalPhone' => $to` приезжает то строкой «101», то числом 101.
+        Строгая проверка типа отвечала бы на число отказом 422 — и разговор
+        не принимался бы вовсе из-за необязательной подписи. Задание важнее
+        метки: число становится строкой, пустое — пустой строкой, лишняя
+        длина отрезается.
+        """
+        if value is None or isinstance(value, bool):
+            return ""
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if not isinstance(value, (str, int, float)):
+            return ""
+        return str(value).strip()[:ДЛИНА_НОМЕРА]
 
 
 @router.post("/process-call", status_code=status.HTTP_202_ACCEPTED,
@@ -97,8 +141,10 @@ def process_call(request: Request, body: ProcessCallBody,
 
     # Скачивание идёт в отдельном потоке: файл лежит на чужом сервере, и ждать
     # его, держа обработчик запроса, значит отвечать 202 через полминуты.
+    номера = {"phone": body.phone, "internal_phone": body.internal_phone,
+              "direction": body.direction}
     threading.Thread(target=_accept, name=f"phone-{call.uuid}",
-                     args=(state, call, target, principal), daemon=True).start()
+                     args=(state, call, target, principal, номера), daemon=True).start()
 
     return {
         "status": "accepted",
@@ -146,7 +192,7 @@ def _phone_status(status_name: str) -> str:
 
 
 def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
-            principal: Principal) -> None:
+            principal: Principal, номера: dict[str, str] | None = None) -> None:
     """Скачивает запись и ставит её в обычную очередь."""
     # path_key, а не uuid: call_id приходит от клиента, и в исходном виде он
     # уводил и запись файла, и рекурсивную уборку за пределы своих каталогов.
@@ -190,6 +236,7 @@ def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
             raise
         log.info("Разговор %s принят как задание %s", call.uuid, job["id"],
                  extra={"job_id": job["id"]})
+        _записать_звонок(state, job, call, principal, номера or {})
     except ASRHubError as exc:
         log.warning("Разговор %s не принят: %s", call.uuid, exc.message)
         _send_failure(state, call, target, exc.message)
@@ -198,6 +245,55 @@ def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
         _send_failure(state, call, target, str(exc))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _записать_звонок(state: Any, job: dict[str, Any], call: phone_compat.PhoneRequest,
+                     principal: Principal, номера: dict[str, str]) -> None:
+    """Номера разговора — строкой в журнале звонков, связанной с заданием.
+
+    Тот же путь, что у полей звонка в `POST /api/jobs` (`_данные_звонка`,
+    `_сохранить_звонок`): строка в `calls` с `job_id`, и разговор виден в
+    разделе «Телефония», в разрезе «Аналитики по сотрудникам» по оператору,
+    в карточке записи — с именем сотрудника, если его добавочный есть в
+    справочнике.
+
+    Кто звонил (`phone`) — это `src`, номер звонящего. Кто говорил
+    (`internalPhone`) — добавочный сотрудника: он и `agent` (по нему идут
+    разрез по оператору и сверка со справочником), и `dst` (журнал
+    показывает «кто → кому»). В `agent` добавочный хранится одними цифрами,
+    как его пишет АТС и как его хранит справочник: «доб. 101» и «101» —
+    один и тот же стол, и сравниваются они строкой.
+
+    Номеров не прислали — строки нет, всё как раньше. Не записалось —
+    задание всё равно распознаётся: это подпись, а не условие; причина
+    уходит в журнал и в события задания.
+    """
+    from .routes_jobs import СТАНЦИЯ_API, _данные_звонка, _сохранить_звонок  # noqa: PLC0415
+
+    звонящий = str(номера.get("phone") or "").strip()
+    добавочный = str(номера.get("internal_phone") or "").strip()
+    направление = str(номера.get("direction") or "").strip()
+    if not (звонящий or добавочный or направление):
+        return
+    данные, беды = _данные_звонка({
+        "caller": звонящий, "callee": добавочный,
+        "agent": employees.внутренний(добавочный) or добавочный,
+        "direction": направление, "call_id": call.call_id, "station": СТАНЦИЯ_API})
+    # Разговор частями — несколько заданий одного звонка: ключ строки свой у
+    # каждой части, а идентификатор звонка общий (как в пакетной загрузке).
+    итог = _сохранить_звонок(state, job, principal, данные, беды,
+                             ключ_по_заданию=call.total_parts > 1)
+    сказано = ", ".join(ч for ч in (
+        f"звонил {звонящий}" if звонящий else "",
+        f"добавочный {данные.get('agent')}" if данные.get("agent") else "") if ч)
+    if итог.get("saved"):
+        state.db.add_event(job["id"], "call", f"Звонок записан в журнал: {сказано}",
+                           {"uniqueid": итог.get("uniqueid"), "warnings": итог.get("warnings")})
+    else:
+        log.warning("Номера разговора %s не записаны: %s", call.uuid,
+                    "; ".join(итог.get("warnings") or []))
+        state.db.add_event(job["id"], "call_failed", "Номера разговора не записаны: "
+                           + "; ".join(итог.get("warnings") or []))
 
 
 def _settings_for(state: Any, call: phone_compat.PhoneRequest,
