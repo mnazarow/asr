@@ -15956,6 +15956,7 @@ function высотыКолонок(колонки, порядок) {
  */
 const ГОЛОС_ВКЛАДКИ = [
   ['summary', 'Сводка'],
+  ['problems', 'Проблемы'],
   ['reasons', 'Причины и исходы'],
   ['actions', 'Обязательства'],
   ['trackers', 'Трекеры и риски'],
@@ -16066,9 +16067,82 @@ RENDERERS.voice = {
       return;
     }
     this.выборДобавочного(свод);
+    state.voiceProblems = null;
     this.drawHead();
     this.draw();
     this.догрузить(свод);
+    this.загрузитьПроблемы(свод);
+  },
+
+  /* Проблемы и сложности за то же окно — отдельным запросом: им не нужна
+   * языковая модель (большая часть признаков — из разбора содержания и
+   * журнала звонков), и раздел не ждёт их, чтобы нарисоваться. */
+  async загрузитьПроблемы(свод) {
+    const окно = свод.window || {};
+    const параметры = { period: this.период, since: окно.since, until: окно.until,
+      agent: this.добавочный };
+    try {
+      const ответ = await ПРОБЛЕМЫ_ГОЛОСА.загрузить('voice-problems', параметры);
+      if (state.voice !== свод) return;
+      state.voiceProblems = ответ;
+      this.проблемыПараметры = параметры;
+    } catch (err) {
+      if ((err && err.code === 'aborted') || state.voice !== свод) return;
+      state.voiceProblems = { failed: err.message || 'ошибка' };
+    }
+    if (state.view !== 'voice') return;
+    if (this.вкладка === 'problems') this.draw();
+    else if (this.вкладка === 'summary') this.drawProblemsShort();
+  },
+
+  /** Трекеры и скоркарта из второй части свода — для перечня проблем. */
+  спискиДляПроблем() {
+    const д = state.voice || {};
+    if (д.lists === 'ready') return { trackers: д.trackers || [], scorecard: д.scorecard || [] };
+    return д.lists === 'failed' ? {} : null;
+  },
+
+  drawProblems(место) {
+    const п = state.voiceProblems;
+    if (п && п.failed) {
+      место.innerHTML = card(ПРОБЛЕМЫ_ГОЛОСА.ЗАГОЛОВОК, '',
+        `<div class="empty small">Сводку проблем посчитать не удалось: ${esc(п.failed)}</div>`);
+      return;
+    }
+    const вернуть = Drill.keep(место);
+    место.innerHTML = card(ПРОБЛЕМЫ_ГОЛОСА.ЗАГОЛОВОК, п && п.base
+      ? `сводка по всем разговорам · сравнение: ${п.base.label} · число — разговоры`
+      : 'сводка по всем разговорам · число — разговоры',
+      `<div id="vo-problems">${ПРОБЛЕМЫ_ГОЛОСА.полностью(п, this.спискиДляПроблем())}</div>`);
+    вернуть();
+    if (п) {
+      ПРОБЛЕМЫ_ГОЛОСА.оживить(место, this.проблемыПараметры, (сводка) => {
+        if (state.voiceProblems !== п) return;
+        п.digest = сводка;
+        if (this.вкладка === 'problems') this.draw();
+      });
+    }
+  },
+
+  /** Сводка проблем на «Сводке» — коротко, со ссылкой на вкладку. */
+  drawProblemsShort() {
+    const место = qs('#vo-problems-short');
+    if (!место) return;
+    const п = state.voiceProblems;
+    if (п && п.failed) {
+      место.innerHTML = `<div class="empty small">Сводку проблем посчитать не удалось: ${esc(п.failed)}</div>`;
+      return;
+    }
+    место.innerHTML = ПРОБЛЕМЫ_ГОЛОСА.кратко(п, п ? `<button class="ghost sm" id="vo-problems-all"
+      style="margin-top:8px">Все проблемы, причины и сотрудники →</button>` : '');
+    const кнопка = qs('#vo-problems-all', место);
+    if (кнопка) {
+      кнопка.addEventListener('click', () => {
+        this.вкладка = 'problems';
+        qsa('#vo-tabs button').forEach((б) => б.classList.toggle('active', б.dataset.tab === 'problems'));
+        this.draw();
+      });
+    }
   },
 
   /** Сузить раздел до одного добавочного (пусто — снять отбор). */
@@ -16125,7 +16199,7 @@ RENDERERS.voice = {
     const вернуть = Drill.keep(qs('#vo-head'));
     this.drawHead();
     вернуть();
-    if (this.ПО_СПИСКАМ.includes(this.вкладка)) this.draw();
+    if (this.ПО_СПИСКАМ.includes(this.вкладка) || this.вкладка === 'problems') this.draw();
   },
 
   /** Заглушка вкладки, пока вторая часть свода считается. */
@@ -16189,6 +16263,12 @@ RENDERERS.voice = {
     const место = qs('#vo-body');
     const д = state.voice || {};
     if (!место) return;
+    // Проблемам модель не обязательна: большая часть признаков — из
+    // разбора содержания и журнала звонков.
+    if (this.вкладка === 'problems') {
+      this.drawProblems(место);
+      return;
+    }
     if (!Number(д.analyzed || 0) && this.вкладка !== 'summary') {
       место.innerHTML = '<div class="empty">За период модель ничего не разобрала.</div>';
       return;
@@ -16207,18 +16287,22 @@ RENDERERS.voice = {
   },
 
   drawSummary(место, д) {
+    const проблемы = card(ПРОБЛЕМЫ_ГОЛОСА.ЗАГОЛОВОК,
+      'сводка по всем разговорам · подробно — вкладка «Проблемы»', '<div id="vo-problems-short"></div>');
     if (!Number(д.analyzed || 0)) {
-      место.innerHTML = `<div class="empty">
+      место.innerHTML = `${проблемы}<div class="empty">
         За период модель ничего не разобрала.
         <div class="small dim" style="margin-top:8px">
           Смысловой слой включается в настройках («Языковая модель»), а ход
           разбора виден в разделе «Очередь LLM».</div></div>`;
+      this.drawProblemsShort();
       return;
     }
     const причины = д.reasons || [];
     const исходы = д.outcomes || [];
     const как = 'строка раскрывает разговоры';
     место.innerHTML = `
+      ${проблемы}
       <div class="grid cols-2">
         ${card('Причины обращений', `о чём звонили · ${как}`, '<div id="vo-s1"></div>')}
         ${card('Чем закончилось', `исход из списка · ${как}`,
@@ -16228,6 +16312,7 @@ RENDERERS.voice = {
         '<div id="vo-agents"></div>')}
       ${card('Последние разборы', 'резюме, причина и исход по каждой записи',
         this.таблицаЗаписей((д.rows || []).slice(0, 25)))}`;
+    this.drawProblemsShort();
     // Причины и исходы — перечнями, а не только графиком: у каждой строки
     // свой список разговоров, и он раскрывается прямо под ней. Столбцы
     // списка — под ширину карточки: причина у всех его строк одна, поэтому
@@ -16635,6 +16720,272 @@ function значимаДоля(а, n1, б, n2) {
   return разброс > 0 && Math.abs((p1 - p2) / разброс) >= 1.96;
 }
 
+/**
+ * Проблемы и сложности за период — сводка по всем разговорам.
+ *
+ * Общий блок «Голосовой аналитики» (вкладка «Проблемы» и сводка на
+ * «Сводке») и разделов «за день» … «за год». Сервер (`GET
+ * /api/voice/problems`) считает по каждому разговору периода закрытый
+ * перечень проблем — от «вопрос не решён» до «плохой звук» — с долями,
+ * изменением к базе, частыми причинами обращения и сотрудниками; здесь
+ * это рисуется и раскрывается в списки разговоров. Трекеры риска и пункты
+ * скоркарты лежат в ответах модели списками и считаются второй частью
+ * своего раздела — блок дорисовывает их, когда она пришла (`списки`).
+ *
+ * Связную сводку с выводами по тем же числам и пересказам самых
+ * проблемных разговоров составляет языковая модель — по кнопке, потому
+ * что это минута работы модели, а не доли секунды.
+ */
+const ПРОБЛЕМЫ_ГОЛОСА = {
+  ЗАГОЛОВОК: 'Проблемы и сложности за период',
+
+  /** Адрес сводки по параметрам окна раздела. */
+  адрес(параметры, путь = '/api/voice/problems') {
+    const п = new URLSearchParams();
+    Object.entries(параметры || {}).forEach(([к, з]) => {
+      if (з !== undefined && з !== null && з !== '') п.set(к, з);
+    });
+    return `${путь}?${п}`;
+  },
+
+  /** Загрузить сводку; ответ — данные или null, если запрос сняли. */
+  async загрузить(ключ, параметры) {
+    return API.latest(ключ, this.адрес(параметры));
+  },
+
+  /** Описание раскрытия строки: окно сводки, отбор раздела и свои условия. */
+  раскрыть(д, что, заголовок) {
+    const звонки = что.base === 'calls';
+    const раздел = (д.drill || ['no_control']).filter((о) => !(звонки && о === 'no_control'));
+    const готовые = (что.base === 'calls' || что.status) ? [] : ['status:completed'];
+    return Drill.spec(д.window, {
+      base: что.base || 'content',
+      f: [...готовые, ...раздел, ...(что.f || [])],
+      title: `${заголовок}${д.label ? ` · ${д.label}` : ''}`,
+    });
+  },
+
+  число(д, разметка, что, заголовок) {
+    return Drill.num(разметка, null, this.раскрыть(д, что, заголовок));
+  },
+
+  /** Трекеры и пункты скоркарты из второй части раздела — строками перечня. */
+  изСписков(списки) {
+    if (!списки) return [];
+    const строки = [];
+    (списки.trackers || []).filter((т) => т.checked).forEach((т) => {
+      строки.push({
+        id: `tracker:${т.id}`, group: 'risk', label: т.label || т.id,
+        hint: 'умный трекер: модель проверила разговор по описанию риска',
+        records: т.fired || 0, base: т.checked || 0,
+        share: т.checked ? (т.fired || 0) / т.checked : null,
+        prev_share: т.prev_share ?? null, delta_pp: т.delta_pp ?? null,
+        significant: Boolean(т.significant), prev_base: т.prev_checked || 0,
+        drill: { base: 'llm', f: ['llm_ok', `tracker:${т.id}`] }, reasons: [], agents: [],
+      });
+    });
+    (списки.scorecard || []).forEach((п) => {
+      const да = Number(п.yes ?? п['да'] ?? 0);
+      const нет = Number(п.no ?? п['нет'] ?? 0);
+      if (!(да + нет)) return;
+      const было = п.prev_pass_share;
+      строки.push({
+        id: `score:${п.id}`, group: 'score', label: п.question || п.id,
+        hint: 'пункт скоркарты, который модель отметила невыполненным',
+        records: нет, base: да + нет, share: нет / (да + нет),
+        prev_share: было === null || было === undefined ? null : 1 - было,
+        delta_pp: п.delta_pp === null || п.delta_pp === undefined ? null : -п.delta_pp,
+        significant: Boolean(п.significant),
+        drill: { base: 'llm', f: ['llm_ok', `score_no:${п.id}`] }, reasons: [], agents: [],
+      });
+    });
+    return строки;
+  },
+
+  /** Короткая сводка — для «Сводки» основного раздела. */
+  кратко(д, кнопка) {
+    if (!д) return '<div class="empty small">Считаем проблемы по всем разговорам периода…</div>';
+    const т = д.records || {};
+    return `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('Разговоров с речью', num(д.conversations || 0), д.base ? `было ${num(д.prev_conversations || 0)}` : '')}
+        ${kpi('С проблемами', `${num(д.with_problems || 0)} <span class="small dim">${pct(д.share || 0, 0)}</span>`,
+          д.base ? `было ${pct(д.prev_share || 0, 0)}` : 'хотя бы одна проблема',
+          д.change ? сдвигКБазе(д.share || 0, д.prev_share || 0, { доля: true, лучше: 'down',
+            значимо: д.change.significant }) : '')}
+        ${kpi('Проблем на разговор', num(д.per_conversation || 0, 2), 'в среднем')}
+        ${kpi('Без речи, короткие, ошибки', num((т.no_speech || 0) + (т.short || 0) + (т.failed || 0)),
+          `без речи ${num(т.no_speech || 0)} · коротких ${num(т.short || 0)} · ошибок ${num(т.failed || 0)}`)}
+      </div>
+      <ul class="vp-summary">${(д.summary || []).map((ф) => `<li>${esc(ф)}</li>`).join('')}</ul>
+      ${кнопка || ''}`;
+  },
+
+  /** Полный блок: плитки, коротко, перечень по группам, разрезы, сводка моделью. */
+  полностью(д, списки) {
+    if (!д) return '<div class="empty small">Считаем проблемы по всем разговорам периода…</div>';
+    if (!д.conversations && !(д.records || {}).jobs) {
+      return '<div class="empty small">За период записей нет — проблемам не в чем найтись.</div>';
+    }
+    const строки = [...(д.items || []), ...this.изСписков(списки)];
+    const группы = [...(д.groups || []),
+      { id: 'risk', label: 'Риски (трекеры модели)' },
+      { id: 'score', label: 'Скоркарта: пункт не выполнен' }];
+    const база = `<span title="${esc(д.base ? `База сравнения: ${д.base.label || ''}${д.base.to_date
+      ? ' — тот же отрезок от начала' : ''}` : 'Сравнивать не с чем')}">было</span>`;
+    const таблица = группы.map((г) => {
+      const свои = строки.filter((с) => с.group === г.id);
+      if (!свои.length) {
+        if (г.id === 'risk' || г.id === 'score') {
+          return списки === undefined || списки === null
+            ? `<tr class="vprob-group"><td colspan="7">${esc(г.label)}
+                <span class="faint small">— считаем по ответам модели…</span></td></tr>` : '';
+        }
+        return '';
+      }
+      const есть = свои.filter((с) => с.records).sort((а, б) => (б.share || 0) - (а.share || 0)
+        || б.records - а.records);
+      const нет = свои.filter((с) => !с.records && с.base);
+      const неМерили = свои.filter((с) => !с.records && !с.base);
+      return `<tr class="vprob-group"><td colspan="7">${esc(г.label)}</td></tr>
+        ${есть.map((с) => this.строка(д, с)).join('')}
+        ${нет.length || неМерили.length ? `<tr class="vprob-zero"><td colspan="7">${нет.length
+          ? `Не встретилось: ${нет.map((с) => esc(с.label.toLowerCase())).join(', ')}.` : ''}${неМерили.length
+          ? ` <span class="faint">Не измерялось (нет разбора или проверки): ${
+            неМерили.map((с) => esc(с.label.toLowerCase())).join(', ')}.</span>` : ''}</td></tr>` : ''}`;
+    }).join('');
+    return `${this.кратко(д)}
+      <div class="table-wrap full" style="margin-top:12px"><table class="small vprob-table">
+        <thead><tr><th>Проблема</th><th class="num">Разговоров</th><th style="width:170px">Доля</th>
+          <th class="num">${база}</th><th class="num">Изменение</th><th>Чаще с причиной</th>
+          <th>У кого чаще</th></tr></thead>
+        <tbody>${таблица}</tbody></table></div>
+      <div class="small faint" style="margin-top:6px">Доля — от разговоров, у которых признак мог быть:
+        «вопрос не решён» — от разобранных моделью, «скрипт не соблюдён» — от проверенных по скрипту.
+        «≈» — сдвиг в пределах случайного. Число раскрывает разговоры.</div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <div><div class="small dim" style="margin-bottom:4px">У кого больше всего проблемных разговоров</div>
+          ${this.люди(д)}</div>
+        <div><div class="small dim" style="margin-bottom:4px">С какой причиной обращения сложнее всего</div>
+          ${this.причины(д)}</div>
+      </div>
+      <div class="vprob-digest" style="margin-top:14px">${this.сводкаМоделью(д)}</div>`;
+  },
+
+  строка(д, с) {
+    const цвет = (с.share || 0) > 0.2 ? 'err' : (с.share || 0) > 0.05 ? 'warn' : 'ok';
+    const раскрытие = { ...с.drill };
+    const причины = (с.reasons || []).slice(0, 2).map((р) => `<span class="chip">${this.число(д, esc(р.reason),
+      { ...раскрытие, f: [...(раскрытие.f || []), `reason:${р.reason}`] },
+      `${с.label}: ${р.reason}`)} <span class="faint">${num(р.records)}</span></span>`).join(' ');
+    const люди = (с.agents || []).map((ч) => `<span class="chip">${this.число(д, esc(ч.agent),
+      { ...раскрытие, f: [...(раскрытие.f || []), `agent:${ч.agent}`] },
+      `${с.label}: добавочный ${ч.agent}`)} <span class="faint">${num(ч.records)}</span></span>`).join(' ');
+    return `<tr>
+      <td title="${esc(с.hint || '')}">${esc(с.label)}</td>
+      <td class="num nowrap">${this.число(д, num(с.records), раскрытие, с.label)}
+        <span class="faint">из ${num(с.base || 0)}</span></td>
+      <td>${полоса_доли(с.share || 0, цвет)}</td>
+      <td class="num nowrap faint">${с.prev_share === null || с.prev_share === undefined ? '—' : pct(с.prev_share, 0)}</td>
+      <td class="num nowrap">${с.prev_share === null || с.prev_share === undefined ? ''
+        : сдвигКБазе(с.share || 0, с.prev_share, { доля: true, лучше: 'down', значимо: с.significant })}${с.significant
+        ? ' <span class="chip warn" title="Изменение больше случайного (критерий для двух долей, 5 %)">значимо</span>' : ''}</td>
+      <td class="small">${причины || '<span class="faint">—</span>'}</td>
+      <td class="small">${люди || '<span class="faint">—</span>'}</td></tr>`;
+  },
+
+  люди(д) {
+    const люди = д.by_agent || [];
+    if (!люди.length) {
+      return '<div class="empty small">Добавочных с пятью и больше разговорами за период нет.</div>';
+    }
+    return `<div class="table-wrap"><table class="small"><thead><tr><th>Добавочный</th>
+      <th class="num">Разговоров</th><th style="width:150px">С проблемами</th><th class="num">Не решён</th>
+      <th>Чаще всего</th></tr></thead><tbody>${люди.map((ч) => `<tr>
+        <td class="nowrap">${добавочный(ч)}</td>
+        <td class="num">${this.число(д, num(ч.conversations), { base: 'jobs', f: [`agent:${ч.agent}`] },
+          `Разговоры: добавочный ${ч.agent}`)}</td>
+        <td>${полоса_доли(ч.share || 0, (ч.share || 0) > 0.5 ? 'err' : 'warn')}</td>
+        <td class="num">${ч.unresolved ? this.число(д, pct(ч.unresolved_share || 0, 0),
+          { base: 'llm', f: ['llm_ok', 'resolved:0', `agent:${ч.agent}`] },
+          `Вопрос не решён: добавочный ${ч.agent}`) : '<span class="faint">—</span>'}</td>
+        <td class="small">${ч.top ? `${esc(ч.top.label)} <span class="faint">${num(ч.top.records)}</span>` : '—'}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  },
+
+  причины(д) {
+    const причины = д.by_reason || [];
+    if (!причины.length) {
+      return '<div class="empty small">Причины обращений не разобраны: их называет языковая модель.</div>';
+    }
+    return `<div class="table-wrap"><table class="small"><thead><tr><th>Причина</th>
+      <th class="num">Разговоров</th><th style="width:150px">С проблемами</th><th class="num">Не решён</th>
+      <th class="num">Негатив</th><th>Чаще всего</th></tr></thead><tbody>${причины.map((п) => `<tr>
+        <td>${esc(п.reason)}</td>
+        <td class="num">${this.число(д, num(п.conversations), { base: 'llm', f: ['llm_ok', `reason:${п.reason}`] },
+          `Причина: ${п.reason}`)}</td>
+        <td>${полоса_доли(п.share || 0, (п.share || 0) > 0.5 ? 'err' : 'warn')}</td>
+        <td class="num">${п.unresolved ? this.число(д, pct(п.unresolved_share || 0, 0),
+          { base: 'llm', f: ['llm_ok', 'resolved:0', `reason:${п.reason}`] },
+          `Не решён: ${п.reason}`) : '<span class="faint">—</span>'}</td>
+        <td class="num">${п.negative_share === null || п.negative_share === undefined ? '—' : pct(п.negative_share, 0)}</td>
+        <td class="small">${п.top ? `${esc(п.top.label)} <span class="faint">${num(п.top.records)}</span>` : '—'}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  },
+
+  /** Сводка языковой моделью: сохранённая, с кнопкой составить или обновить. */
+  сводкаМоделью(д) {
+    const с = д.digest;
+    const можно = Boolean(д.llm_enabled);
+    const кнопка = можно ? `<button class="${с ? 'ghost' : 'primary'} sm" data-vprob-digest>${
+      с ? 'Составить заново' : 'Составить сводку моделью'}</button>` : '';
+    const шапка = `<div class="row" style="gap:10px;align-items:center;margin-bottom:6px">
+        <b>Сводка по всем разговорам — выводы модели</b><span class="spacer"></span>${кнопка}</div>`;
+    if (!с) {
+      return `${шапка}<div class="small dim">${можно
+        ? 'Модель прочтёт перечень проблем с долями и пересказы до сорока самых проблемных разговоров '
+          + 'периода и напишет связно: что главное, какие проблемы и сложности, где их корни и что '
+          + 'сделать. Это минута работы модели; сводка сохранится.'
+        : 'Связную сводку с выводами пишет языковая модель — она выключена. Включите её в настройках '
+          + '(«Языковая модель»); перечень выше считается и без неё.'}</div>`;
+    }
+    const р = с.result || {};
+    const когда = с.generated_at ? fmtTime(с.generated_at) : '';
+    return `${шапка}<div class="small faint" style="margin-bottom:8px">Составлено ${esc(когда)} моделью
+        ${esc(с.model || '')} по ${num(с.conversations || 0)} разговорам, из них с проблемами ${
+        num(с.with_problems || 0)}; пересказов в подсказке — ${num((с.sample || []).length)}.${с.stale
+        ? ' <span class="chip warn">с тех пор разговоров стало больше — составьте заново</span>' : ''}</div>
+      ${р.overview ? `<p style="margin:0 0 10px">${esc(р.overview)}</p>` : ''}
+      ${(р.problems || []).length ? `<ol class="vprob-list">${р.problems.map((п) => `<li>
+          <b>${esc(п.title)}</b>${п.details ? ` — ${esc(п.details)}` : ''}
+          ${(п.examples || []).length ? `<div class="small dim" style="margin-top:2px">${п.examples
+            .map((е) => `«${esc(е)}»`).join('<br>')}</div>` : ''}</li>`).join('')}</ol>` : ''}
+      ${(р.causes || []).length ? `<div class="small dim" style="margin-top:8px">Вероятные причины</div>
+        <ul class="vp-summary">${р.causes.map((т) => `<li>${esc(т)}</li>`).join('')}</ul>` : ''}
+      ${(р.recommendations || []).length ? `<div class="small dim" style="margin-top:8px">Что сделать</div>
+        <ul class="vp-summary">${р.recommendations.map((т) => `<li>${esc(т)}</li>`).join('')}</ul>` : ''}`;
+  },
+
+  /** Повесить кнопку «составить сводку» в отрисованном блоке. */
+  оживить(место, параметры, готово) {
+    const кнопка = qs('[data-vprob-digest]', место);
+    if (!кнопка) return;
+    кнопка.addEventListener('click', async () => {
+      кнопка.disabled = true;
+      const подпись = кнопка.textContent;
+      кнопка.textContent = 'Составляем… модель читает разговоры';
+      try {
+        const сводка = await API.call(this.адрес(параметры, '/api/voice/problems/digest'),
+          { method: 'POST' });
+        готово(сводка);
+      } catch (err) {
+        кнопка.disabled = false;
+        кнопка.textContent = подпись;
+        fail(err);
+      }
+    });
+  },
+};
+
 function периодГолоса(масштаб) {
   const про = ГОЛОС_ПЕРИОД[масштаб];
   return {
@@ -16741,10 +17092,14 @@ function периодГолоса(масштаб) {
       }
       this.данные = д;
       this.списки = null;
+      this.проблемы = null;
       if (this.база >= (д.baselines || []).length) this.база = 0;
       this.шапка();
       this.draw();
-      if (!д.future && д.totals) this.догрузить(д);
+      if (!д.future && д.totals) {
+        this.догрузить(д);
+        this.загрузитьПроблемы(д);
+      }
     },
 
     /** Трекеры, скоркарта и обязательства — второй частью, когда посчитаются. */
@@ -16829,6 +17184,9 @@ function периодГолоса(масштаб) {
         ${this.баннер(д)}
         ${card('Коротко о периоде', 'главное из чисел ниже — без языковой модели',
           `<ul class="vp-summary">${(д.summary || []).map((ф) => `<li>${esc(ф)}</li>`).join('')}</ul>`)}
+        ${card(ПРОБЛЕМЫ_ГОЛОСА.ЗАГОЛОВОК, (д.baselines || [])[0]
+          ? `сводка по всем разговорам · сравнение с «${(д.baselines || [])[0].label}» · число — разговоры`
+          : 'сводка по всем разговорам · число — разговоры', '<div id="vp-problems"></div>')}
         <div class="grid cols-4 vp-kpis">${this.плитки(т, б, база)}</div>
         <div class="grid cols-3 vp-row">
           <div class="vp-wide">${card('Нагрузка ' + про.шаг, база
@@ -16883,6 +17241,47 @@ function периодГолоса(масштаб) {
         <div id="vp-lists"></div>`;
       this.графики(д, т, б, база);
       this.drawLists();
+      this.рисоватьПроблемы();
+    },
+
+    /** Проблемы и сложности периода — отдельным запросом, после отчёта. */
+    async загрузитьПроблемы(д) {
+      const параметры = { scale: масштаб, date: this.дата, agent: this.добавочный,
+        department: this.отдел };
+      try {
+        const ответ = await ПРОБЛЕМЫ_ГОЛОСА.загрузить(`vp-${масштаб}-problems`, параметры);
+        if (this.данные !== д) return;
+        this.проблемы = ответ;
+        this.проблемыПараметры = параметры;
+      } catch (err) {
+        if ((err && err.code === 'aborted') || this.данные !== д) return;
+        this.проблемы = { failed: err.message || 'ошибка' };
+      }
+      this.рисоватьПроблемы();
+    },
+
+    рисоватьПроблемы() {
+      const место = qs('#vp-problems');
+      if (!место) return;
+      const п = this.проблемы;
+      if (п && п.failed) {
+        место.innerHTML = `<div class="empty small">Сводку проблем посчитать не удалось: ${esc(п.failed)}</div>`;
+        return;
+      }
+      const вернуть = Drill.keep(место);
+      // Трекеры и скоркарта — из второй части отчёта: пока она не пришла,
+      // `null` (группы помечены «считаем»), не посчиталась — без них.
+      const списки = this.списки && !this.списки.failed ? this.списки
+        : (this.списки && this.списки.failed ? {} : null);
+      место.innerHTML = ПРОБЛЕМЫ_ГОЛОСА.полностью(п, списки);
+      вернуть();
+      if (п) {
+        ПРОБЛЕМЫ_ГОЛОСА.оживить(место, this.проблемыПараметры, (сводка) => {
+          if (this.проблемы !== п) return;
+          п.digest = сводка;
+          this.рисоватьПроблемы();
+        });
+      }
     },
 
     баннер(д) {
@@ -17352,6 +17751,7 @@ function периодГолоса(масштаб) {
     drawLists() {
       const место = qs('#vp-lists');
       if (!место || !this.данные || this.данные.future) return;
+      if (this.проблемы) this.рисоватьПроблемы();
       const с = this.списки;
       if (!с) {
         место.innerHTML = card('Риски, скоркарта, обязательства', '',
@@ -17425,6 +17825,19 @@ function периодГолоса(масштаб) {
       строки.push([], ['Добавочный', 'Сотрудник', 'Отдел', 'Разговоров', 'Было', 'Решено', 'Негатив', 'Балл']);
       (д.agents || []).forEach((ч) => строки.push([ч.agent, ч.agent_name || '', ч.agent_department || '',
         ч.completed, ч.prev_completed, ч.resolved_share, ч.negative_share, ч.agent_score]));
+      // Проблемы и сложности — если сводка уже пришла: та же таблица, что на экране.
+      const п = this.проблемы;
+      if (п && !п.failed) {
+        строки.push([], ['Проблемы и сложности', 'С проблемами', п.with_problems, 'из', п.conversations,
+          'доля', п.share]);
+        строки.push(['Проблема', 'Группа', 'Разговоров', 'Из', 'Доля', 'Доля была', 'Изменение, п. п.',
+          'Значимо', 'Чаще с причиной', 'У кого чаще']);
+        const группы = Object.fromEntries((п.groups || []).map((г) => [г.id, г.label]));
+        (п.items || []).filter((с) => с.records).forEach((с) => строки.push([с.label,
+          группы[с.group] || с.group, с.records, с.base, с.share, с.prev_share, с.delta_pp,
+          с.significant ? 'да' : '', (с.reasons || []).map((р) => `${р.reason} (${р.records})`).join(', '),
+          (с.agents || []).map((ч) => `${ч.agent} (${ч.records})`).join(', ')]));
+      }
       const текст = строки.map((с) => с.map((к) => {
         const з = String(к === null || к === undefined ? '' : к);
         return /[;"\n]/.test(з) ? `"${з.replace(/"/g, '""')}"` : з;

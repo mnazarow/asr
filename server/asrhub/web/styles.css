@@ -966,3 +966,14 @@ table.vp-agents a[data-agent], #vp-depts a[data-dept] { color: inherit; text-dec
   .main, .content { margin: 0 !important; padding: 0 !important; }
   .card { break-inside: avoid; }
 }
+
+/* Проблемы и сложности за период (голосовая аналитика). */
+.vprob-table tr.vprob-group td { background: var(--bg-elev-2); font-weight: 600;
+  font-size: 12px; letter-spacing: .02em; text-transform: none; padding-top: 8px; padding-bottom: 6px; }
+.vprob-table tr.vprob-zero td { color: var(--text-dim); font-size: 12px; }
+.vprob-table td .chip { margin: 1px 2px 1px 0; }
+.vprob-digest { border-top: 1px solid var(--border); padding-top: 12px; }
+.vprob-list { margin: 0; padding-left: 20px; line-height: 1.55; }
+.vprob-list li { margin-bottom: 6px; }
+@media print { .vprob-digest button { display: none; } }
+.vprob-table td .chip { white-space: nowrap; }

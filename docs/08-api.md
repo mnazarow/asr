@@ -362,6 +362,8 @@ GET  /api/content/llm?period=year&part=fast    только счётная ча�
 GET  /api/content/llm?period=year&part=heavy&since=…   часть по спискам — по окну первой части
 GET  /api/content/llm?period=month&agent=101           свод по разговорам одного добавочного
 GET  /api/voice/period?scale=month&date=2026-10-01     голосовая аналитика за календарный период
+GET  /api/voice/problems?period=week                  проблемы и сложности по всем разговорам окна
+POST /api/voice/problems/digest?scale=month           сводка проблем языковой моделью
 GET  /api/llm/models[?refresh=true]        каталог моделей и подбор под оборудование (администратор)
 POST /api/llm/setup       {"models": […]}  поставить, скачать, прогреть и включить (администратор)
 GET  /api/llm/setup/status                 ход установки: шаги, проценты, журнал (администратор)
@@ -1047,7 +1049,7 @@ curl -H "X-API-Key: ah_xxx" -G "https://asr.example.com/api/drill" \
 | Разбор содержания | отборы списка заданий по содержанию и по работе оператора (`negative`, `alerts`, `violation`, `low_score` и остальные — см. «Аналитика записей» выше), а также `neutral`, `scored`, `category:<id>`, `violation_category:<id>`, `categorized` и `uncategorized`, `stem:<основа>` — тема, `speaker`, `label`, `nps_group`, `mood_up`, `mood_down`, `mood_flat`, `stress_high`, `effort_high`, `clarity_low`, `coaching`, `coaching_open`, `listen_<вид>` — отборы вкладки «Что послушать» |
 | Ответ языковой модели | `reason`, `outcome`, `resolved:1` или `resolved:0`, `resolved_known`, `llm_ok`, `llm_failed`, `with_actions`, `off_list`, `tracker:<id>`, `tracker_checked:<id>`, `score_yes:<id>`, `score_no:<id>`, `score_na:<id>` |
 | Очередь модели | `llmq_done`, `llmq_ok`, `llmq_failed` — со значением «от..до», секунды эпохи: промежуток по времени конца разбора, а не по времени записи |
-| Звонки (`base=calls`) | `station`, `queue`, `agent`, `department`, `direction`, `no_direction`, `src`, `dst`, `context`, `disposition`, `reason` — причина пропуска, `answered` и `unanswered`, `recognized`, `skipped`, `deferred`, `pending`, `abandoned`, `timed`, `hour`, `weekday`, `wait_within:<секунд>`, `billsec:от..до`, `fcr_base`, `repeated:<секунд>`, `not_repeated:<секунд>` |
+| Звонки (`base=calls`) | `station`, `queue`, `agent`, `department`, `direction`, `no_direction`, `src`, `dst`, `context`, `disposition`, `reason` — причина пропуска, `answered` и `unanswered`, `recognized`, `skipped`, `deferred`, `pending`, `abandoned`, `timed`, `hour`, `weekday`, `wait_within:<секунд>`, `wait_over:<секунд>`, `billsec:от..до`, `fcr_base`, `repeated:<секунд>`, `not_repeated:<секунд>` |
 
 Величины — для `sort`, `has:`, `nz:` и диапазонов: `duration`, `rtf`, `processing`, `wait`, `confidence`, `wer`, `snr`, `loudness`, `memory`, `words`, времена стадий (`inference`, `model_load` и другие), числовые признаки разбора (`sentiment`, `agent_score`, `compliance`, `stress`, `clarity`, `nps`, `wpm`, `monologue_s` и остальные), `llm_latency`; у звонков — `billsec` и `wait`. Отбор, который требует разбора или ответа модели, сам ограничивает список записями, где они есть. Полный перечень с описаниями отдаёт `GET /api/drill/filters` — в нём около ста шестидесяти отборов и больше восьмидесяти величин, и переписывать его сюда значило бы завести вторую копию, которая отстанет.
 
@@ -1158,6 +1160,50 @@ GET /api/voice/period?scale=month&date=2026-10-15&agent=&department=&part=
 curl -s -H "X-API-Key: ah_xxx" \
   "https://asr.example.com/api/voice/period?scale=month&date=2026-10-01&department=Отдел%20продаж&part=fast" \
   | jq '{label, summary, movers: [.reasons[] | select(.significant)]}'
+```
+
+## GET /api/voice/problems
+
+Проблемы и сложности по всем разговорам периода — блок «Проблемы и сложности за период» «Голосовой аналитики» и разделов «за день» … «за год» (глава [26. Голосовая аналитика и очередь к модели](26-voice-analytics.md)).
+
+```
+GET /api/voice/problems?scale=month&date=2026-10-01&agent=&department=
+GET /api/voice/problems?period=week&since=&until=&agent=
+```
+
+| Параметр | Что задаёт |
+|---|---|
+| `scale`, `date` | календарный период — как у `GET /api/voice/period`, с той же главной базой (идущий период — «на ту же дату») |
+| `period` | без `scale` — скользящее окно до «сейчас»: `hour`, `day`, `week`, `month`, `quarter`, `year`, `all`; база — такое же окно перед ним, у `all` базы нет |
+| `since`, `until` | границы скользящего окна, секунды эпохи — чтобы сводка совпала с окном раздела |
+| `agent`, `department` | только добавочный; только отдел (по справочнику через добавочный) |
+
+| Поле | Что в нём |
+|---|---|
+| `window`, `base`, `label`, `period_id` | окно сводки; база (`since`, `until`, `label`, `to_date`) или `null`; подпись окна; имя периода (`month:2026-10-01`, `period:week`) |
+| `conversations`, `with_problems`, `share`, `problems_total`, `per_conversation` | разговоров с речью; с хотя бы одной проблемой групп «клиент», «оператор», «ход разговора»; их доля; проблем всего и на разговор |
+| `prev_conversations`, `prev_with_problems`, `prev_share`, `change` | то же в базе и изменение доли: `{delta_pp, z, significant}` |
+| `items` | проблемы: `{id, group, label, hint, records, base, share, prev_records, prev_base, prev_share, delta_pp, z, significant, drill, reasons, agents}`; `base` — из скольких разговоров признак мог быть; `drill` — `{base, f}` для `GET /api/drill` (к нему — `status:completed`, кроме строк состояния и звонков, и отборы `drill` сводки); `reasons` и `agents` — до трёх `{reason|agent, records, share}` |
+| `groups` | группы: `client`, `agent`, `process`, `record` с подписями |
+| `by_agent` | добавочные с пятью и больше разговорами по доле разговоров с проблемами: `{agent, agent_name, agent_department, conversations, with_problems, share, unresolved_share, top}` |
+| `by_reason` | причины из ответа модели: `{reason, conversations, with_problems, share, unresolved_share, negative_share, top}` |
+| `records`, `telephony` | записи окна по состояниям (`jobs`, `completed`, `no_speech`, `short`, `failed`); журнал звонков (`calls`, `inbound`, `abandoned`, `answered`, `long_wait`) или `null` |
+| `summary` | главное фразами |
+| `drill`, `filter` | отборы раздела для списков (`no_control`, `agent:…`, `department:…`); отбор запроса |
+| `llm_enabled`, `digest` | включена ли модель; последняя сводка моделью этого периода и отбора (как ответ `POST …/digest`) с `stale: true`, если разговоров с тех пор стало больше, или `null` |
+
+Неверный `scale` или `period` — `422`, неразборчивая дата — `400`.
+
+`POST /api/voice/problems/digest` с теми же параметрами просит языковую модель написать сводку по перечню проблем, разрезам и пересказам до сорока самых проблемных разговоров (расшифровки не передаются). Ответ: `period_id`, `label`, `window`, `filter`, `generated_at`, `model`, `backend`, `conversations`, `with_problems`, `sample` (номера разговоров, чьи пересказы ушли в подсказку) и `result` — `{overview, problems: [{title, details, examples}], causes, recommendations}`. Сводка сохраняется и приходит полем `digest` в `GET /api/voice/problems`. Нужен ключ с правом записи; модель выключена — `400 config_error`, модель не ответила — `500` с причиной. За период без проблемных разговоров модель не вызывается.
+
+```bash
+# месяц: главное и проблемы, которые заметно выросли
+curl -s -H "X-API-Key: ah_xxx" "https://asr.example.com/api/voice/problems?scale=month" \
+  | jq '{summary, grew: [.items[] | select(.significant and .delta_pp > 0) | {label, share, delta_pp}]}'
+
+# сводка моделью за прошлый квартал
+curl -s -X POST -H "X-API-Key: ah_xxx" \
+  "https://asr.example.com/api/voice/problems/digest?scale=quarter&date=2026-07-01" | jq .result
 ```
 
 ## GET /api/monitoring/resources
