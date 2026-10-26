@@ -268,8 +268,37 @@ class AudioTooLong(ASRHubError):
         )
 
 
+class AudioTooShort(ASRHubError):
+    """Запись короче порога «короткой записи».
+
+    Не отказ, а итог: задание с ним завершается состоянием `short`, а не
+    `failed` (см. `job_queue.ИТОГ_БЕЗ_РАСШИФРОВКИ`). На телефонии таких
+    записей много — сброс на первой секунде, гудок, пустой файл
+    неотвеченного звонка, — и считать их ошибками значит прятать настоящие.
+    """
+
+    code = "audio_too_short"
+    http_status = 422
+
+    def __init__(self, duration_s: float, limit_s: float):
+        if duration_s <= 0.05:
+            сообщение = "В записи нет звука: файл пустой или длится доли секунды."
+        else:
+            сообщение = (f"Запись длится {duration_s:.1f} с — короче порога "
+                         f"{limit_s:g} с, распознавать в ней нечего.")
+        super().__init__(
+            сообщение,
+            hint=("Порог — параметр audio_min_duration_s («Короткая запись — короче»); "
+                  "ноль оставляет короткими только пустые файлы."),
+            details={"duration_s": round(float(duration_s), 3), "limit_s": limit_s})
+
+
 class NoSpeechDetected(ASRHubError):
-    """В записи не обнаружено речи."""
+    """В записи не обнаружено речи.
+
+    Как и `AudioTooShort`, это итог, а не отказ: задание завершается
+    состоянием `no_speech`.
+    """
 
     code = "no_speech"
     http_status = 422

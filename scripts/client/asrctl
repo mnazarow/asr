@@ -15,7 +15,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="3.1.23"
+VERSION="3.1.24"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
 CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"
@@ -512,6 +512,15 @@ cmd_wait() {
       cancelled)
         printf '\r%s!%s отменено                                      \n' "${C_YELLOW}" "${C_RESET}"
         return 1 ;;
+      no_speech|short)
+        # Итог, а не ошибка: запись обработана, но слов в ней нет. Код
+        # возврата 0 — иначе пакетная отправка звонков считала бы каждую
+        # молчащую запись сбоем.
+        local label="без речи"
+        [[ "${status}" == "short" ]] && label="короткая запись"
+        printf '\r%s–%s %s — расшифровки нет                      \n' "${C_DIM}" "${C_RESET}" "${label}"
+        printf '  %s\n' "$(json_get "${response}" error_message)"
+        return 0 ;;
       paused)
         # Отдельная ветка: иначе пользователь смотрит на крутящийся значок и
         # не понимает, что очередь на паузе и ждать можно бесконечно.

@@ -1205,7 +1205,13 @@ def test_импорт_справочника_называет_пропущенн
                     "Зайцев;Пётр;Продажи;106;77\n;;Склад;107;78\n", encoding="utf-8")
     вкладка = _вкладка(браузер, стенд["адрес"])
     _открыть(вкладка, "staff", 2000)
+    # С захода 52 импорт файлом — окно с предпросмотром: причина пропуска
+    # видна ещё до записи, а после «Импортировать» — в итоге, как раньше.
+    вкладка.click("#st-file-import")
     вкладка.set_input_files("#st-file", str(файл))
+    вкладка.wait_for_selector("#st-apply:not([disabled])", timeout=10000)
+    assert "нет фамилии и имени" in вкладка.inner_text("#st-preview")
+    вкладка.click("#st-apply")
     вкладка.wait_for_timeout(2500)
     assert "пропущено 1" in вкладка.inner_text("#toasts")
     assert "нет фамилии и имени" in вкладка.inner_text(".modal-backdrop .modal-body")

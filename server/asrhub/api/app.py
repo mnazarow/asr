@@ -53,6 +53,7 @@ from .routes_system import health_router
 from .routes_system import router as system_router
 from .routes_telephony import router as telephony_router
 from .routes_trends import router as trends_router
+from .routes_voice import router as voice_router
 
 log = get_logger("app")
 
@@ -745,6 +746,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(llm_proxy_router)
     app.include_router(trends_router)
     app.include_router(drill_router)
+    app.include_router(voice_router)
     app.include_router(telephony_router)
     # Справочник сотрудников: кто стоит за внутренним номером в журнале АТС.
     app.include_router(employees_router)

@@ -308,8 +308,16 @@ def удалить(request: Request, employee_id: str,
 @router.post("/import", summary="Импорт выгрузки справочника")
 async def импорт(request: Request,
                  file: UploadFile | None = File(default=None),
+                 dry_run: str | None = Query(
+                     default=None,
+                     description="true — предпросмотр без записи; то же полем формы или тела"),
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Забирает выгрузку по адресу или принимает присланный файл.
+
+    Форматы — по содержимому: Excel XML 2003 (в том числе с расширением
+    `.xls`), книга Excel `.xlsx`, CSV, JSON. `dry_run=true` — предпросмотр:
+    как легли колонки, первые карточки, кого добавить, у кого что поменять
+    и кого отметить уволенным, — без записи в базу.
 
     Двумя способами, и оба нужны. По адресу — то, что делает расписание, и
     то, чем пользуются, когда справочник выложен на портале. Файлом — когда
@@ -359,12 +367,17 @@ async def импорт(request: Request,
         # соседнего раздела в тело запроса.
         адрес = str(state.settings.get("employees_url") or "").strip()
 
+    # Предпросмотр: разобрать и сравнить со справочником, ничего не записав.
+    # Флаг — полем формы или тела, а также параметром адреса (?dry_run=true).
+    пробно = _флаг(тело.get("dry_run", dry_run), False)
     try:
         итог = справочник.импорт(state.db, url=адрес, данные=данные,
                                  source=источник, deactivate_missing=убирать,
-                                 тип=str(тело.get("format") or ""))
+                                 тип=str(тело.get("format") or ""), dry_run=пробно)
     except ASRHubError as exc:
         raise error_response(exc) from exc
+    if пробно:
+        return итог
     state.db.add_event(
         None, "employees_imported",
         f"Справочник «{источник}»: +{итог.get('added')} новых, "

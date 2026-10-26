@@ -54,7 +54,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '3.1.23'
+$Version = '3.1.24'
 # APPDATA есть только в Windows; в WSL и PowerShell для Linux берём ~/.config
 $ConfigBase = if ($env:APPDATA) { $env:APPDATA }
               elseif ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME }
@@ -428,6 +428,13 @@ function Wait-Job {
                 return 1
             }
             'cancelled' { Write-Host "`r! отменено                                    " -ForegroundColor Yellow; return 1 }
+            { $_ -in @('no_speech', 'short') } {
+                # Итог, а не ошибка: запись обработана, но слов в ней нет.
+                $label = if ("$($job.status)" -eq 'short') { 'короткая запись' } else { 'без речи' }
+                Write-Host "`r– $label — расшифровки нет                      " -ForegroundColor DarkGray
+                if ($job.error_message) { Write-Host "  $($job.error_message)" }
+                return 0
+            }
             'paused' {
                 Write-Host ("`r{0} задание приостановлено — .\asrctl.ps1 resume {1}      " -f $spinner[$i % 4], $JobId) -NoNewline
                 $i++

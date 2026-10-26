@@ -279,7 +279,8 @@ _m(MetricSpec(
     labels=("status",),
     description=(
         "Число заданий в каждом состоянии: queued, running, paused, retry, "
-        "completed, failed, cancelled."
+        "completed, failed, cancelled, no_speech (запись без речи), short "
+        "(короткая запись). Последние два — итоги, а не ошибки."
     ),
     recommendation=(
         "Растущее число в состоянии retry говорит, что задания падают на "
@@ -396,8 +397,9 @@ _m(MetricSpec(
     labels=("status",), since_restart=True,
     description=(
         "Накопительный счётчик заданий по итоговому состоянию с момента запуска "
-        "сервиса. В отличие от asrhub_jobs_by_status, значение только растёт — "
-        "по нему считают частоту через rate()."
+        "сервиса: completed, failed, cancelled, no_speech, short. В отличие от "
+        "asrhub_jobs_by_status, значение только растёт — по нему считают частоту "
+        "через rate()."
     ),
     recommendation=(
         "Доля отказов: rate(asrhub_jobs_total{status=\"failed\"}[30m]) / "
@@ -968,7 +970,9 @@ _m(MetricSpec(
 _m(MetricSpec(
     name="asrhub_no_speech_total", type="counter", group="quality",
     label="Записей без речи", since_restart=True,
-    description="Сколько заданий завершилось с признаком «речь не найдена».",
+    description=(
+        "Сколько заданий завершилось итогом «без речи» (состояние no_speech). Это "
+        "не отказы: в asrhub_jobs_total{status=\"failed\"} они не попадают."),
     recommendation=(
         "Единичные срабатывания нормальны. Всплеск означает, что источник начал "
         "присылать тишину: сломался микрофон, отвалилась дорожка при перекодировании "

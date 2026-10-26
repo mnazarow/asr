@@ -61,8 +61,11 @@ from .pipeline.calibration import КОРЗИН as КОРЗИН_КАЛИБРОВ�
 #: Срок одного запроса к базе, секунды. Страница и счёт — каждый со своим.
 СРОК_С = 4.0
 
-#: Статусы заданий; `active` — «ещё в работе», как в списке заданий.
-СТАТУСЫ = ("queued", "running", "completed", "failed", "cancelled", "paused", "retry")
+#: Статусы заданий; `active` — «ещё в работе», как в списке заданий,
+#: `empty` — «без речи» и «короткие» вместе.
+СТАТУСЫ = ("queued", "running", "completed", "failed", "cancelled", "paused", "retry",
+           "no_speech", "short")
+БЕЗ_РАСШИФРОВКИ = ("no_speech", "short")
 В_РАБОТЕ = ("queued", "running", "retry")
 
 
@@ -248,6 +251,12 @@ def _отборы() -> dict[str, Отбор]:
                           описание="приоритет ниже обычного"),
         # --- журнал звонков -------------------------------------------------
         "agent": О(f"{_звонок('agent')} = ?", текст, описание="сотрудник из журнала АТС"),
+        # Отдел — по справочнику сотрудников через добавочный из журнала:
+        # тот же отбор у раздела «Голосовая аналитика за период».
+        "department": О("EXISTS (SELECT 1 FROM calls cl JOIN employees e "
+                        "ON e.phone_ext = cl.agent WHERE cl.job_id = j.id "
+                        "AND COALESCE(cl.agent,'') <> '' AND e.department = ?)", текст,
+                        описание="отдел сотрудника (по справочнику, через добавочный)"),
         "queue": О(f"{_звонок('queue')} = ?", текст, описание="очередь"),
         "station": О(f"{_звонок('station')} = ?", текст, описание="станция"),
         "direction": О(f"{_звонок('direction')} = ?", текст, описание="направление"),
@@ -355,6 +364,9 @@ _ПРОПУЩЕН = "COALESCE(cl.skipped,'') <> '' AND cl.skipped NOT LIKE 'от
     "station": Отбор("cl.station = ?", "текст", описание="станция; пусто — без станции"),
     "queue": Отбор("cl.queue = ?", "текст", описание="очередь"),
     "agent": Отбор("cl.agent = ?", "текст", описание="оператор"),
+    "department": Отбор("EXISTS (SELECT 1 FROM employees e WHERE e.phone_ext = cl.agent "
+                        "AND e.department = ?)", "текст",
+                        описание="отдел оператора по справочнику сотрудников"),
     "direction": Отбор("COALESCE(cl.direction,'') = ?", "текст",
                        описание="направление; пусто — не определено"),
     "no_direction": Отбор("COALESCE(cl.direction,'') NOT IN "
@@ -676,11 +688,13 @@ def разобрать(отборы: list[str], перечень: dict[str, От
                 часть = часть.strip()
                 if часть == "active":
                     статусы.extend(В_РАБОТЕ)
+                elif часть == "empty":
+                    статусы.extend(БЕЗ_РАСШИФРОВКИ)
                 elif часть in СТАТУСЫ:
                     статусы.append(часть)
                 elif часть:
                     raise Отказ(f"Неизвестный статус «{часть}».",
-                                hint="Статусы: " + ", ".join((*СТАТУСЫ, "active")))
+                                hint="Статусы: " + ", ".join((*СТАТУСЫ, "active", "empty")))
             if not статусы or перечень is not ОТБОРЫ:
                 raise Отказ("Отбор по статусу задан неверно.")
             # «Готово» — статус почти всего
@@ -917,6 +931,6 @@ def describe() -> dict[str, Any]:
         "call_filters": строки(ОТБОРЫ_ЗВОНКОВ),
         "values": sorted(ЧИСЛА),
         "call_values": sorted(ПОРЯДОК_ЗВОНКОВ),
-        "statuses": [*СТАТУСЫ, "active"],
+        "statuses": [*СТАТУСЫ, "active", "empty"],
         "page": СТРАНИЦА, "page_max": ПРЕДЕЛ_СТРАНИЦЫ, "count_cap": ПРЕДЕЛ_СЧЁТА,
     }

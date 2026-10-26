@@ -186,6 +186,9 @@ def _phone_status(status_name: str) -> str:
         "paused": "pending",
         "running": "in_progress",
         "completed": "success",
+        # Без речи и короткая — итоги, а не отказы (см. `callback_body`).
+        "no_speech": "success",
+        "short": "success",
         "failed": "failed",
         "cancelled": "failed",
     }.get(status_name, "pending")

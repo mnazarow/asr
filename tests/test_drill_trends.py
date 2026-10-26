@@ -90,6 +90,15 @@ def _досеять(хранилище: Архив, сейчас: float) -> dict
             db.update_job(номер, status="failed", finished_at=когда + 3,
                           error_code="audio_decode_failed", error_message="сбой", retries=1 + n % 2)
             return
+        # Без речи и короткие — по всему году, как и ошибки (заход 52).
+        if n % 9 == 7:
+            db.update_job(номер, status="no_speech", finished_at=когда + 2, progress=1.0,
+                          error_code="no_speech", error_message="речи нет")
+            return
+        if n % 9 == 1:
+            db.update_job(номер, status="short", finished_at=когда + 1, progress=1.0,
+                          error_code="audio_too_short", error_message="короткая")
+            return
         текст = тексты[n % len(тексты)]
         db.update_job(
             номер, status="completed", text=текст, finished_at=когда + 20,
@@ -285,7 +294,7 @@ def test_раскрывается_всё_что_про_записи_и_ниче�
     без_списка = {п.id: п.source for п in ПОКАЗАТЕЛИ if п.id not in РАСКРЫТИЯ}
     assert set(без_списка.values()) == {"checks", "system", "gpu"}
     assert {п.source for п in ПОКАЗАТЕЛИ if п.id in РАСКРЫТИЯ} == {"jobs", "content", "llm"}
-    assert len(РАСКРЫТИЯ) == 53 and not set(РАСКРЫТИЯ) - set(ПО_ID)
+    assert len(РАСКРЫТИЯ) == 55 and not set(РАСКРЫТИЯ) - set(ПО_ID)
     # Источники раскрываемых показателей режут окно по времени записи — по
     # тому же, по которому его режет список. У прогонов время своё.
     for показатель in РАСКРЫТИЯ:

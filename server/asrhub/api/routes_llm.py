@@ -395,10 +395,14 @@ def llm_queue_clear(request: Request, state_filter: str = Body(default="", embed
 #: таблица считаются по всем записям периода.
 СТРОК_В_СВОДЕ = 300
 ДЕЙСТВИЙ_В_СВОДЕ = 200
+#: Сколько добавочных показывает разрез «По добавочным»: колл-центр на
+#: тысячу столов — редкость, а таблица длиннее не читается.
+ДОБАВОЧНЫХ_В_СВОДЕ = 500
 
 
 def _счётная_часть(state: Any, since: float,
-                   owner: str | list[str] | None) -> dict[str, Any]:
+                   owner: str | list[str] | None, *, until: float | None = None,
+                   agent: str = "") -> dict[str, Any]:
     """Числа свода, которые считаются без чтения ответов модели.
 
     Сколько записей и сколько разобрано, сбои, причины, исходы, клетки
@@ -408,7 +412,7 @@ def _счётная_часть(state: Any, since: float,
     равном числе записей первой стоит та, что раньше по алфавиту (прежде
     порядок равных зависел от того, какой строкой их отдала база).
     """
-    сводка = state.db.llm_brief(tasks.VERSION, since, owner=owner)
+    сводка = state.db.llm_brief(tasks.VERSION, since, owner=owner, until=until, agent=agent)
     группы = сводка["groups"]
     годные = [г for г in группы if г["ok"]]
     разобрано = sum(int(г["n"]) for г in годные)
@@ -447,9 +451,76 @@ def _счётная_часть(state: Any, since: float,
     }
 
 
+def _имена_включены(state: Any) -> bool:
+    """Подставлять ли имя сотрудника по добавочному (`employees_match_ext`)."""
+    return bool(state.settings.get("employees_match_ext", True))
+
+
+def _по_добавочным(state: Any, since: float, owner: str | list[str] | None, *,
+                   until: float | None = None) -> dict[str, Any]:
+    """Свод «Голосовой аналитики» по добавочным: кто сколько говорил и с чем.
+
+    Разговоров — все готовые записи окна с этим добавочным в журнале
+    звонков; разобрано, доля решённых, частые причины и исходы — по
+    ответам модели без сбоя. Считается группами по указателям, как и
+    счётная часть, — без чтения ответов. Отбор раздела по добавочному сюда
+    не применяется: разрез показывает всех, а выбранный в нём отмечен.
+    """
+    from .. import employees as справочник  # noqa: PLC0415
+
+    люди: dict[str, dict[str, Any]] = {}
+    for г in state.db.llm_by_agent(since, owner=owner, until=until):
+        ключ = str(г["agent"] or "")
+        з = люди.setdefault(ключ, {"agent": ключ, "records": 0, "analyzed": 0, "errors": 0,
+                                   "known": 0, "yes": 0, "reasons": {}, "outcomes": {}})
+        n = int(г["n"] or 0)
+        з["records"] += n
+        if not г["has"]:
+            continue
+        if not г["ok"]:
+            з["errors"] += n
+            continue
+        з["analyzed"] += n
+        з["known"] += int(г["resolved_known"] or 0)
+        з["yes"] += int(г["resolved_yes"] or 0)
+        for поле, куда in (("reason", "reasons"), ("outcome", "outcomes")):
+            if г[поле]:
+                з[куда][г[поле]] = з[куда].get(г[поле], 0) + n
+
+    def частые(счёт: dict[str, int]) -> list[dict[str, Any]]:
+        return [{"key": к, "records": n} for к, n in
+                sorted(счёт.items(), key=lambda пара: (-пара[1], пара[0]))[:3]]
+
+    строки = [{
+        "agent": з["agent"], "records": з["records"], "analyzed": з["analyzed"],
+        "errors": з["errors"],
+        "resolved_share": round(100.0 * з["yes"] / з["known"], 1) if з["known"] else None,
+        "reasons": частые(з["reasons"]), "outcomes": частые(з["outcomes"]),
+    } for з in люди.values() if з["agent"]]
+    строки.sort(key=lambda с: (-с["records"], с["agent"]))
+    видны = строки[:ДОБАВОЧНЫХ_В_СВОДЕ]
+    справочник.подписать_добавочные(state.db, видны, имена=_имена_включены(state))
+    return {"agents": видны, "agents_total": len(строки),
+            "without_agent": int((люди.get("") or {}).get("records") or 0)}
+
+
 def _построчно(state: Any, since: float,
-               owner: str | list[str] | None) -> list[dict[str, Any]]:
-    """Последние разборы окна — строки для таблиц раздела."""
+               owner: str | list[str] | None, *, until: float | None = None,
+               agent: str = "") -> list[dict[str, Any]]:
+    """Последние разборы окна — строки для таблиц раздела.
+
+    С добавочным оператора и его именем из справочника: «чей это
+    разговор» — первое, что спрашивают у строки.
+    """
+    from .. import employees as справочник  # noqa: PLC0415
+
+    строки = _строки_разборов(state, since, owner, until=until, agent=agent)
+    справочник.подписать_добавочные(state.db, строки, имена=_имена_включены(state))
+    return строки
+
+
+def _строки_разборов(state: Any, since: float, owner: str | list[str] | None, *,
+                     until: float | None = None, agent: str = "") -> list[dict[str, Any]]:
     return [{
         "job_id": р["job_id"], "filename": р.get("filename"),
         "created_at": р.get("created_at"), "summary": р.get("summary") or "",
@@ -458,11 +529,13 @@ def _построчно(state: Any, since: float,
         "resolved": р.get("resolved"), "actions": р.get("actions") or [],
         "trackers": р.get("trackers") or [], "scorecard": р.get("scorecard") or [],
         "error": р.get("error") or "",
-    } for р in state.db.llm_recent(since, owner=owner, limit=СТРОК_В_СВОДЕ)]
+    } for р in state.db.llm_recent(since, owner=owner, limit=СТРОК_В_СВОДЕ,
+                                   until=until, agent=agent)]
 
 
 def _часть_по_спискам(state: Any, since: float,
-                      owner: str | list[str] | None) -> dict[str, Any]:
+                      owner: str | list[str] | None, *, until: float | None = None,
+                      agent: str = "") -> dict[str, Any]:
     """Числа свода, ради которых приходится читать каждый ответ.
 
     Обязательства, трекеры, скоркарта и «ответ мимо списка» лежат в ответе
@@ -471,7 +544,7 @@ def _часть_по_спискам(state: Any, since: float,
     сначала показывает причины и исходы, а эти числа дорисовывает, когда
     они посчитаются.
     """
-    строки = state.db.llm_details(since, owner=owner)
+    строки = state.db.llm_details(since, owner=owner, until=until, agent=agent)
     # Трекеры и скоркарта считаются в записях, а не в элементах списка.
     # Разница видна, когда в настройке два трекера (или два пункта) с одним
     # id: у записи тогда два элемента с этим id, и запись считалась дважды
@@ -522,6 +595,9 @@ def _часть_по_спискам(state: Any, since: float,
                 break
         if len(действия) >= ДЕЙСТВИЙ_В_СВОДЕ:
             break
+    from .. import employees as справочник  # noqa: PLC0415
+
+    справочник.подписать_добавочные(state.db, действия, имена=_имена_включены(state))
     return {
         "off_list": мимо_списка,
         "actions": действий, "records_with_actions": с_действиями,
@@ -535,6 +611,8 @@ def _часть_по_спискам(state: Any, since: float,
 def llm_report(request: Request, period: str = ПЕРИОД,
                part: str = Query(default="", pattern="^(|fast|heavy)$"),
                since: float | None = Query(default=None, ge=0),
+               agent: str = Query(default="", max_length=64,
+                                  description="Только разговоры этого добавочного"),
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Причины и исходы по закрытым спискам, доля решённых, действия к
     исполнению, срабатывания умных трекеров, ответы скоркарты — по
@@ -552,6 +630,13 @@ def llm_report(request: Request, period: str = ПЕРИОД,
     Без `part` — обе части разом, как раньше. `since` — нижняя граница
     окна вместо отсчёта от «сейчас»: вторую часть спрашивают позже первой,
     и считаться она должна по тому же окну (`window.since` первой части).
+
+    `agent` — только разговоры этого добавочного (из журнала звонков).
+    Разрез по добавочным (`agents`, в счётной части) от него не зависит:
+    он показывает всех, чтобы было из кого выбирать. Построчные записи и
+    обязательства приходят с добавочным (`agent`) и, если номер есть в
+    справочнике сотрудников, с именем и отделом (`agent_name`,
+    `agent_department`).
     """
     state, клиент, поток = _slot(request)
     секунд = PERIODS.get(period, 7 * 86400)
@@ -559,12 +644,16 @@ def llm_report(request: Request, period: str = ПЕРИОД,
         (time.time() - секунд) if секунд else 0.0)
     владелец = scope_owner(principal)
     ответ: dict[str, Any] = {"period": period, "enabled": клиент.enabled, "model": клиент.model}
+    добавочный = agent.strip()
     if part != "heavy":
-        ответ.update(_счётная_часть(state, начало, владелец))
-        ответ["rows"] = _построчно(state, начало, владелец)
+        ответ.update(_счётная_часть(state, начало, владелец, agent=добавочный))
+        ответ["rows"] = _построчно(state, начало, владелец, agent=добавочный)
+        ответ.update(_по_добавочным(state, начало, владелец))
         ответ["worker"] = поток.status()
     if part != "fast":
-        ответ.update(_часть_по_спискам(state, начало, владелец))
+        ответ.update(_часть_по_спискам(state, начало, владелец, agent=добавочный))
+    if добавочный:
+        ответ["agent"] = добавочный
     if part:
         ответ["part"] = part
     # Окно свода — в ответ: числа раздела раскрываются в список записей

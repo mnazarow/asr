@@ -37,7 +37,7 @@ from ..errors import (
     StorageError,
     UnsupportedFormat,
 )
-from ..job_queue import ACTIVE_STATUSES
+from ..job_queue import ACTIVE_STATUSES, EMPTY_STATUSES
 from ..logging_setup import get_logger
 from ..pipeline import export as export_mod
 from ..pipeline import waveform as waveform_mod
@@ -780,7 +780,11 @@ def _без_раскладки(job: dict[str, Any], principal: Principal) -> dic
 @router.get("", summary="Список заданий")
 def list_jobs(
     request: Request,
-    status: str | None = Query(default=None, description="queued, running, completed, failed…"),
+    status: str | None = Query(
+        default=None,
+        description="queued, running, completed, failed, cancelled, no_speech (без "
+                    "речи), short (короткая запись); несколько — через запятую; "
+                    "active — в работе, empty — без речи и короткие"),
     owner: str | None = None,
     model: str | None = None,
     group_id: str | None = None,
@@ -808,6 +812,8 @@ def list_jobs(
     statuses: list[str] | str | None = status
     if status == "active":
         statuses = list(ACTIVE_STATUSES)
+    elif status == "empty":
+        statuses = list(EMPTY_STATUSES)
     elif status and "," in status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
     since = time.time() - since_hours * 3600 if since_hours else None
@@ -1182,6 +1188,13 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
     state = get_state(request)
     _owned_job(request, job_id, principal)
     job = state.queue.get(job_id)
+    if job["status"] in EMPTY_STATUSES:
+        # Не «пока нет», а «не будет»: расшифровки у такой записи нет и
+        # ждать её незачем.
+        raise error_response(ConfigError(
+            f"Расшифровки нет: {job.get('error_message') or 'в записи нет речи'}",
+            hint="Запись без речи и короткая запись завершаются без текста — это "
+                 "итог, а не ошибка. Распознать заново: POST /api/jobs/{id}/retry."))
     if job["status"] != "completed":
         raise error_response(ConfigError(
             f"Задание в состоянии «{job['status']}» — результата пока нет.",

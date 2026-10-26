@@ -321,7 +321,8 @@ def test_разрезы_раскрываются_из_таблицы_и_из_г�
     строк, _, заголовок = _раскрыто(с, "#content-body tr.drill-row")
     assert строк == записей and f"Владелец «{владельцы[0]['label']}»" in заголовок
     хозяева = set(с.evaluate("""() => Array.from(document.querySelectorAll(
-        '#content-body tr.drill-row tbody tr td:nth-child(5)')).map((я) => я.innerText.trim())"""))
+        '#content-body tr.drill-row tbody tr td:nth-child(6)')).map((я) => я.innerText.trim())"""))
+    # Шестой: у списков разговоров третьим стоит «Добавочный» (заход 52).
     assert хозяева == {владельцы[0]["key"]}, хозяева
     _свернуть_всё(с)
     # Столбец графика «Тональность по владельцам» — та же группа, по тональности.

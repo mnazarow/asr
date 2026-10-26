@@ -413,7 +413,9 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
         f"ASR Hub, сводка за период «{сводка.get('period') or '—'}»",
         f"Заданий: {задания.get('total') or 0}, "
         f"готово {задания.get('completed') or 0}, "
-        f"ошибок {задания.get('failed') or 0}",
+        f"ошибок {задания.get('failed') or 0}"
+        + (f", без речи {задания.get('no_speech')}" if задания.get("no_speech") else "")
+        + (f", коротких {задания.get('short')}" if задания.get("short") else ""),
         f"Звука обработано: {число(объём.get('audio_hours'))} ч, "
         f"слов {объём.get('words') or 0}",
         f"Скорость: RTF {число((скорость.get('rtf') or {}).get('avg'), 3)} "

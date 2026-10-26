@@ -244,6 +244,16 @@ span.warn { color: var(--warn); }
 
 .chip.err { background: var(--err-soft); color: var(--err); border-color: transparent; }
 .chip.info { background: var(--info-soft); color: var(--info); border-color: transparent; }
+/* Итоги без расшифровки: не ошибка и не успех — пунктирная рамка. */
+.chip.nospeech { color: #39c5cf; border: 1px dashed currentColor; background: transparent; }
+.chip.short { color: #db61a2; border: 1px dashed currentColor; background: transparent; }
+body.light .chip.nospeech { color: #1b7c83; }
+body.light .chip.short { color: #bf3989; }
+.empty-outcome { border-style: dashed; }
+.empty-outcome.no_speech > b { color: #39c5cf; }
+.empty-outcome.short > b { color: #db61a2; }
+body.light .empty-outcome.no_speech > b { color: #1b7c83; }
+body.light .empty-outcome.short > b { color: #bf3989; }
 .chip.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 
 .kpi { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
@@ -752,6 +762,7 @@ td.pick input, th.pick input { width: auto; margin: 0; cursor: pointer; }
 .finding.warning { border-left-color: var(--warn); }
 .finding.good    { border-left-color: var(--ok); }
 .finding.info    { border-left-color: var(--accent); }
+.finding.critical { border-left-color: var(--err); }
 
 /* Изменение показателя к прошлому периоду: знак и цвет направления.
    Отдельные классы, а не inline-стиль, — чтобы они переключались вместе
@@ -915,3 +926,43 @@ tr.drill-item.drill-on .drill-num { color: var(--accent); text-decoration-color:
 /* Число на графике, которое раскрывается, — с тем же пунктиром. */
 .chart text.pick-value { text-decoration: underline dotted; text-underline-offset: 2px; }
 .row.pick-row b { text-decoration: underline dotted var(--text-faint); text-underline-offset: 3px; }
+
+/* Добавочный с именем в таблицах отчётов */
+.agent-ext { white-space: nowrap; }
+.agent-ext .mono { font-weight: 600; }
+table.vo-agents tr.selected td { background: var(--accent-soft); }
+table.vo-agents a[data-agent] { color: inherit; text-decoration: none; border-bottom: 1px dashed var(--border); }
+
+/* Импорт сотрудников из файла */
+.st-drop { display: block; border: 1px dashed var(--border); border-radius: var(--radius);
+  padding: 16px; cursor: pointer; text-align: center; background: var(--bg-elev-2); }
+.st-drop:hover, .st-drop.over { border-color: var(--accent); background: var(--accent-soft); }
+details.st-changes { margin-bottom: 8px; }
+details.st-changes summary { cursor: pointer; }
+
+/* Голосовая аналитика за период */
+.nav-item.nav-sub { padding-left: 26px; font-size: 13px; }
+.vp-toolbar { flex-wrap: wrap; gap: 8px; }
+.vp-label { min-width: 190px; text-align: center; font-size: 15px; }
+.vp-banner { margin-bottom: 12px; }
+.vp-summary { margin: 0; padding-left: 18px; line-height: 1.7; }
+.vp-kpis { margin-bottom: 16px; }
+.vp-kpi .kpi-sub { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.vp-spark { margin-top: 6px; height: 26px; }
+.vp-delta { font-size: 12px; font-weight: 600; color: var(--text-dim); white-space: nowrap; }
+.vp-delta.good { color: var(--ok); }
+.vp-delta.bad { color: var(--err); }
+.vp-row { margin-bottom: 0; }
+.grid.cols-3 > .vp-wide { grid-column: span 2; }
+@media (max-width: 980px) { .grid.cols-3 > .vp-wide { grid-column: auto; } }
+.vp-multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+.vp-multiple { padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+table.vp-tel td { padding: 5px 8px; }
+table.vp-agents tr.selected td { background: var(--accent-soft); }
+table.vp-agents a[data-agent], #vp-depts a[data-dept] { color: inherit; text-decoration: none;
+  border-bottom: 1px dashed var(--border); }
+@media print {
+  .sidebar, .topbar, .vp-toolbar, .drill-panel { display: none !important; }
+  .main, .content { margin: 0 !important; padding: 0 !important; }
+  .card { break-inside: avoid; }
+}

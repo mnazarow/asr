@@ -106,8 +106,26 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 STATUS_PAUSED = "paused"
 STATUS_RETRY = "retry"
+#: Запись обработана, а слов в ней нет: молчит, или модель не нашла ни
+#: одного. Итог, а не отказ — в ошибки и в долю отказов не идёт.
+STATUS_NO_SPEECH = "no_speech"
+#: Запись короче порога `audio_min_duration_s` (или пустая) — не
+#: распознаётся вовсе. Тоже итог, а не отказ.
+STATUS_SHORT = "short"
 
 ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY, STATUS_PAUSED)
+#: Итоги без расшифровки — отдельные категории, не ошибки.
+EMPTY_STATUSES = (STATUS_NO_SPEECH, STATUS_SHORT)
+#: Все конечные состояния: дальше задание само никуда не двинется.
+FINISHED_STATUSES = (STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, *EMPTY_STATUSES)
+
+#: Код «отказа» процессора → итог без расшифровки. Процессор сообщает о
+#: молчащей и о короткой записи исключением — это единственный способ
+#: прервать обработку на полпути, — а очередь превращает его в итог.
+ИТОГ_БЕЗ_РАСШИФРОВКИ: dict[str, str] = {
+    "no_speech": STATUS_NO_SPEECH,
+    "audio_too_short": STATUS_SHORT,
+}
 
 
 def check_outbound_url(url: str, allow_internal: bool = False) -> str:
@@ -784,7 +802,7 @@ class JobQueue:
         бы готовый результат отменённым.
         """
         job = self.get(job_id)
-        if job["status"] in (STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED):
+        if job["status"] in FINISHED_STATUSES:
             return job
         with self._lock:
             self._cancelled.add(job_id)
@@ -1794,6 +1812,18 @@ class JobQueue:
             self._discard_results(outdir)
             return
 
+        # Молчащая или короткая запись — итог, а не отказ: ни повторов, ни
+        # резервной модели (речь ищет детектор, а не модель, и длительность
+        # от модели не зависит), ни строки в ошибках.
+        итог = ИТОГ_БЕЗ_РАСШИФРОВКИ.get(error.code)
+        if итог:
+            # Повтор готового задания с другими настройками не стирает
+            # прежнюю расшифровку — как и при настоящем отказе.
+            if self._вернуть_прежний(job_id, f"Повторное распознавание: {error.message}"):
+                return
+            self._без_расшифровки(job, error, итог, outdir)
+            return
+
         retries = int(job.get("retries") or 0)
         # Уже в пределах серверного: `Settings.merged` не даёт заданию больше.
         max_retries = max(0, S.integer(merged, "max_retries", 0))
@@ -1870,6 +1900,42 @@ class JobQueue:
                     log.error("Задание %s: %s", job_id, строка.strip(),
                               extra={"job_id": job_id, "error_code": error.code})
         self._emit("job.failed", {"id": job_id, "error": error.to_dict()})
+        self._discard_results(outdir)
+        self._send_webhook(job_id)
+
+    def _без_расшифровки(self, job: dict[str, Any], error: ASRHubError, статус: str,
+                         outdir: Path | None) -> None:
+        """Завершает задание итогом «без речи» или «короткая запись».
+
+        Причина остаётся в полях `error_*`: других полей «почему так» у
+        задания нет, а карточка и API показывают её не как ошибку, а как
+        пояснение к итогу — состояние задания говорит, что это не отказ.
+        """
+        job_id = job["id"]
+        поля: dict[str, Any] = {
+            "status": статус, "finished_at": now(), "progress": 1.0,
+            "stage": "без речи" if статус == STATUS_NO_SPEECH else "короткая запись",
+            "error_code": error.code, "error_message": error.message,
+            "error_hint": error.hint, "instance_id": None, "heartbeat_at": None}
+        длительность = (error.details or {}).get("duration_s")
+        if длительность is not None and not float(job.get("media_duration_s") or 0):
+            поля["media_duration_s"] = float(длительность)
+        if not self._write_own(job_id, **поля):
+            self._discard_unless_taken(outdir, job_id)
+            return
+        RUNTIME.inc("asrhub_jobs_total", {"status": статус})
+        if статус == STATUS_NO_SPEECH:
+            RUNTIME.inc("asrhub_no_speech_total")
+        self.db.add_event(job_id, статус, error.message, error.to_dict())
+        log.info("Задание %s: %s", job_id, error.message,
+                 extra={"job_id": job_id, "error_code": error.code})
+        данные = {"id": job_id, "status": статус, "message": error.message}
+        # Имя события — строкой, а не сборкой: по строкам сверяется таблица
+        # событий в документации (tests/test_api.py).
+        if статус == STATUS_NO_SPEECH:
+            self._emit("job.no_speech", данные)
+        else:
+            self._emit("job.short", данные)
         self._discard_results(outdir)
         self._send_webhook(job_id)
 
@@ -1975,13 +2041,19 @@ class JobQueue:
             self._deliver_webhook(job, payload)
             return
 
+        пустой = job["status"] in EMPTY_STATUSES
         body: dict[str, Any] = {
             "id": job["id"], "status": job["status"], "filename": job.get("filename"),
             "model": job.get("model"), "rtf": job.get("rtf"),
             "duration_s": job.get("media_duration_s"),
             "words": job.get("words_count"),
-            "error": job.get("error_message"),
+            # У записи без речи и короткой причина — пояснение к итогу, а не
+            # ошибка: приёмник, который считает отказы по полю `error`, не
+            # должен записывать их в отказы.
+            "error": None if пустой else job.get("error_message"),
         }
+        if пустой:
+            body["reason"] = job.get("error_message")
         # Огибающая в уведомлении — совместимость с приёмниками phone_asr,
         # которые ждут её полем `waveforms`. По умолчанию выключено: тело
         # уведомления задумано коротким, а повторов доставки до пяти.
@@ -2441,7 +2513,7 @@ class JobQueue:
         counts = {status: self.db.count_jobs(status=status)
                   for status in (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY,
                                  STATUS_PAUSED, STATUS_COMPLETED, STATUS_FAILED,
-                                 STATUS_CANCELLED)}
+                                 STATUS_CANCELLED, *EMPTY_STATUSES)}
         queued = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY], limit=500,
                                    light=True)
         pending_audio = sum(float(j.get("media_duration_s") or 0) for j in queued)

@@ -143,9 +143,10 @@ def test_причина_раскрывается_строкой_в_своём_б
         return р.previousElementSibling.classList.contains('drill-on')
           && р.getBoundingClientRect().width
              <= document.querySelector('#vo-s1').getBoundingClientRect().width + 1; }""")
-    assert _заголовки(с, "#vo-s1") == ["когда", "запись", "длительность", "исход"]
+    # Заход 52: «Добавочный» — чей это разговор — третьим столбцом.
+    assert _заголовки(с, "#vo-s1") == ["когда", "запись", "добавочный", "длительность", "исход"]
     исходы = {и["key"] for и in свод["outcomes"]} | {"—"}
-    assert _колонка(с, 4) <= исходы and _колонка(с, 4) - {"—"}
+    assert _колонка(с, 5) <= исходы and _колонка(с, 5) - {"—"}
     assert вкладка.раскрытий() == 1
     # Вторая строка: раскрыта в блоке одна — первая сворачивается сама.
     строки.nth(1).click()
@@ -175,9 +176,10 @@ def test_исход_раскрывается_строкой_и_сектором_
     с.wait_for_selector("#vo-s2-list .drill-panel tbody tr")
     assert с.locator("#vo-s2-list .drill-title").inner_text() == f"Исход: {исход['key']}"
     assert _строк(с, "#vo-s2-list") == min(50, исход["records"])
-    assert _заголовки(с, "#vo-s2-list") == ["когда", "запись", "длительность", "причина"]
+    assert _заголовки(с, "#vo-s2-list") == ["когда", "запись", "добавочный", "длительность",
+                                            "причина"]
     причины = {п["key"] for п in свод["reasons"]} | {"—"}
-    assert _колонка(с, 4) <= причины
+    assert _колонка(с, 5) <= причины
     assert f"из {исход['records']}" in с.locator("#vo-s2-list .drill-count").inner_text() \
         or _строк(с, "#vo-s2-list") == исход["records"]
     # Ссылка открывает запись на вкладке разбора; список остаётся.
@@ -253,7 +255,7 @@ def test_клетка_причина_исход(вкладка):
     с.wait_for_selector("#vo-body tr.drill-row .drill-panel tbody tr")
     assert _строк(с) == сколько
     причина, исход = с.locator(".drill-title").inner_text().split(" → ")
-    assert _колонка(с, 7) == {причина} and _колонка(с, 8) == {исход}
+    assert _колонка(с, 8) == {причина} and _колонка(с, 9) == {исход}
     assert сколько == next(п["records"] for п in свод["pairs"]
                            if п["reason"] == причина and п["outcome"] == исход)
     # Столбец «всего» — сумма по показанным исходам: не раскрывается.

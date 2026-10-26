@@ -738,7 +738,8 @@ _STATS = [("avg",), ("p50",), ("p90",), ("p95",), ("p99",)]
 
 _KNOWN_LABEL_VALUES: dict[str, list[tuple[str, ...]]] = {
     "asrhub_jobs_by_status": [("queued",), ("running",), ("completed",),
-                              ("failed",), ("cancelled",), ("retry",), ("paused",)],
+                              ("failed",), ("cancelled",), ("retry",), ("paused",),
+                              ("no_speech",), ("short",)],
     "asrhub_rtf": _STATS,
     "asrhub_queue_wait_seconds": _STATS,
     "asrhub_confidence": _STATS,
@@ -750,7 +751,8 @@ _KNOWN_LABEL_VALUES: dict[str, list[tuple[str, ...]]] = {
     "asrhub_audio_snr_db": [("p10",), ("p50",), ("p90",)],
     "asrhub_llm_latency_seconds": [("p50",), ("p95",)],
     "asrhub_llm_calls_total": [("ok",), ("error",), ("cache",)],
-    "asrhub_jobs_total": [("completed",), ("failed",), ("cancelled",)],
+    "asrhub_jobs_total": [("completed",), ("failed",), ("cancelled",), ("no_speech",),
+                          ("short",)],
     "asrhub_webhooks_total": [("ok",), ("failed",)],
     "asrhub_database_rows": [("jobs",), ("segments",), ("events",), ("metrics",)],
     "asrhub_storage_bytes": [("uploads",), ("results",), ("models",), ("logs",)],

@@ -364,6 +364,9 @@ def test_параметры_запросов_в_документах_сущес�
         имена = {п["name"] for м in методы.values() if isinstance(м, dict)
                  for п in м.get("parameters", []) if п.get("in") == "query"}
         маршруты.append((re.compile("^" + re.sub(r"\{[^}]+\}", "[^/]+", путь) + "$"), имена))
+    # Точный путь прежде шаблона: `/api/employees/import` иначе узнавался
+    # как `/api/employees/{employee_id}` — с чужими параметрами.
+    маршруты.sort(key=lambda м: "[^/]+" in м[0].pattern)
     ложные, проверено = [], 0
     for путь in [*ДОКУМЕНТЫ.glob("*.md"), КОРЕНЬ / "README.md"]:
         if путь.name in ("18-review.md", "api-reference.md", "proposal-2026.md",

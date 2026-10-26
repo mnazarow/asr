@@ -15,8 +15,12 @@
     light: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#4a3aa7', '#008300', '#e34948'],
   };
   const STATUS = {
-    dark:  { ok: '#3fb950', warn: '#d29922', err: '#f85149', idle: '#6b7889', info: '#a371f7' },
-    light: { ok: '#1a7f37', warn: '#9a6700', err: '#cf222e', idle: '#808da0', info: '#8250df' },
+    // nospeech и short — итоги без расшифровки («без речи», «короткая»): свои
+    // цвета, не цвет ошибки и не цвет отменённого.
+    dark:  { ok: '#3fb950', warn: '#d29922', err: '#f85149', idle: '#6b7889', info: '#a371f7',
+             nospeech: '#39c5cf', short: '#db61a2' },
+    light: { ok: '#1a7f37', warn: '#9a6700', err: '#cf222e', idle: '#808da0', info: '#8250df',
+             nospeech: '#1b7c83', short: '#bf3989' },
   };
 
   const NS = 'http://www.w3.org/2000/svg';
@@ -998,6 +1002,298 @@ function fmtNum(value, digits) {
     return null;
   }
 
+  // ---- столбцы с линиями поверх -------------------------------------------------
+
+  /* Объём столбцами, база сравнения линиями поверх — на одной оси.
+   *
+   * Так периодный отчёт отвечает на вопрос «больше или меньше обычного»
+   * в каждой корзине, а не только в итоге: октябрь столбцами, сентябрь и
+   * октябрь прошлого года — пунктиром по тем же числам месяца. Столбцы
+   * бывают составными (`bars` — несколько рядов друг на друге).
+   *
+   * config: { labels, bars: [{name, values, color}], lines: [{name, values,
+   *           color, dash}], height, unit, onPick(номер), pickHint }
+   */
+  function combo(host, config) {
+    const столбцы = (config.bars || []).filter((ряд) => ряд && ряд.values);
+    const линии = (config.lines || []).filter((ряд) => ряд && ряд.values);
+    const подписи = config.labels || [];
+    const n = подписи.length || (столбцы[0] || линии[0] || { values: [] }).values.length;
+    if (!n) return empty(host, config.emptyText);
+    const суммы = Array.from({ length: n }, (_, i) => столбцы.reduce(
+      (сумма, ряд) => сумма + (Number(ряд.values[i]) || 0), 0));
+    let max = Math.max(0, ...суммы);
+    линии.forEach((ряд) => ряд.values.forEach((v) => { if (v !== null && v !== undefined) max = Math.max(max, v); }));
+    if (!max) return empty(host, config.emptyText || 'За период ничего нет');
+    const ctx = frame(host, config);
+    const ticks = niceTicks(0, max, 4);
+    ctx.yMin = 0;
+    ctx.yMax = ticks[ticks.length - 1];
+    axes(ctx, ticks, null, config);
+    const slot = ctx.iw / n;
+    const gap = Math.min(8, slot * 0.25);
+    const ширина = Math.max(2, slot - gap);
+    const yAt = (v) => ctx.pad.top + ctx.ih - (v / ctx.yMax) * ctx.ih;
+    const цвета = palette();
+    for (let i = 0; i < n; i += 1) {
+      let низ = ctx.pad.top + ctx.ih;
+      const x = ctx.pad.left + i * slot + gap / 2;
+      const непустые = столбцы.map((ряд, k) => ({ ряд, k, v: Number(ряд.values[i]) || 0 }))
+        .filter((кусок) => кусок.v > 0);
+      непустые.forEach((кусок, номер) => {
+        const h = (кусок.v / ctx.yMax) * ctx.ih;
+        const верхний = номер === непустые.length - 1;
+        el('path', {
+          d: верхний ? roundedTop(x, низ - h, ширина, Math.max(1, h), Math.min(3, ширина / 2))
+            : `M${x},${низ - h}h${ширина}v${Math.max(1, h)}h${-ширина}Z`,
+          fill: seriesColor(кусок.ряд.color, кусок.k),
+        }, ctx.svg);
+        низ -= h;
+      });
+    }
+    линии.forEach((ряд, k) => {
+      const цвет = ряд.color || (k ? faint() : ink());
+      const точки = [];
+      ряд.values.forEach((v, i) => {
+        if (v !== null && v !== undefined) точки.push([ctx.pad.left + i * slot + slot / 2, yAt(v), i]);
+      });
+      splitRuns(точки).forEach((кусок) => {
+        const путь = кусок.map((т) => `${т[0].toFixed(1)},${т[1].toFixed(1)}`);
+        if (путь.length === 1) путь.push(путь[0]);
+        el('path', { d: 'M' + путь.join('L'), fill: 'none', stroke: цвет, 'stroke-width': 2,
+                     'stroke-dasharray': ряд.dash === false ? null : (ряд.dash || '5 4'),
+                     'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, ctx.svg);
+      });
+    });
+    // Подписи под осью — по ширине, как у столбцов.
+    const ширина_подписи = Math.max(...подписи.map((л) => String(л).length), 1) * 6 + 10;
+    const шаг = Math.max(1, Math.ceil(ширина_подписи / slot));
+    подписи.forEach((подпись, i) => {
+      if (i % шаг) return;
+      el('text', { x: ctx.pad.left + i * slot + slot / 2, y: ctx.pad.top + ctx.ih + 15,
+                   'text-anchor': 'middle', fill: faint(), 'font-size': 10 }, ctx.svg)
+        .textContent = подпись;
+    });
+    // Колонка целиком — подсказка и цель щелчка.
+    for (let i = 0; i < n; i += 1) {
+      const колонка = el('rect', { x: ctx.pad.left + i * slot, y: ctx.pad.top, width: slot,
+                                   height: ctx.ih, fill: 'transparent' }, ctx.svg);
+      const строки = [String(подписи[i] === undefined ? i : подписи[i])];
+      столбцы.forEach((ряд) => строки.push(`  ${ряд.name}: ${fmtNum(Number(ряд.values[i]) || 0)}${config.unit || ''}`));
+      линии.forEach((ряд) => {
+        const v = ряд.values[i];
+        строки.push(`  ${ряд.name}: ${v === null || v === undefined ? '—' : fmtNum(v) + (config.unit || '')}`);
+      });
+      const можно = суммы[i] > 0 && typeof config.onPick === 'function';
+      attachTip(колонка, строки.join('\n') + (можно ? pickNote(config) : ''));
+      if (можно) pickable(колонка, config, i, null);
+    }
+    legend(host, [
+      ...столбцы.map((ряд, k) => ({ name: ряд.name, color: seriesColor(ряд.color, k) })),
+      ...линии.map((ряд, k) => ({ name: ряд.name, color: ряд.color || (k ? faint() : ink()) })),
+    ]);
+    return ctx.svg;
+  }
+
+  // ---- Парето ---------------------------------------------------------------------
+
+  /* Столбцы по убыванию и линия накопленной доли с отметкой 80 %.
+   *
+   * Отвечает на вопрос «на чём сосредоточиться»: какие несколько причин
+   * дают большую часть обращений. Ось доли — справа, от 0 до 100 %.
+   *
+   * config: { labels, values, height, onPick(номер), pickHint }
+   */
+  function pareto(host, config) {
+    const values = (config.values || []).map((v) => Number(v) || 0);
+    if (!values.length || !values.some(Boolean)) return empty(host, config.emptyText);
+    const подписи = config.labels || [];
+    const ctx = frame(host, Object.assign({}, config, {
+      height: config.height || 240,
+      pad: { top: 14, right: 40, bottom: 58, left: 46 } }));
+    const всего = values.reduce((а, б) => а + б, 0);
+    const ticks = niceTicks(0, Math.max(...values), 4);
+    ctx.yMin = 0;
+    ctx.yMax = ticks[ticks.length - 1];
+    axes(ctx, ticks, null, config);
+    const slot = ctx.iw / values.length;
+    const gap = Math.min(10, slot * 0.25);
+    const ширина = Math.max(3, slot - gap);
+    const цвет = palette()[0];
+    let накоплено = 0;
+    const точки = [];
+    values.forEach((v, i) => {
+      const h = (v / ctx.yMax) * ctx.ih;
+      const x = ctx.pad.left + i * slot + gap / 2;
+      el('path', { d: roundedTop(x, ctx.pad.top + ctx.ih - h, ширина, Math.max(h, v ? 2 : 0), 3),
+                   fill: цвет }, ctx.svg);
+      накоплено += v;
+      точки.push([x + ширина / 2, ctx.pad.top + ctx.ih - (накоплено / всего) * ctx.ih, накоплено / всего]);
+      const подпись = String(подписи[i] === undefined ? i : подписи[i]);
+      const короче = подпись.length > 16 ? подпись.slice(0, 15) + '…' : подпись;
+      const t = el('text', { x: x + ширина / 2, y: ctx.pad.top + ctx.ih + 10,
+                             'text-anchor': 'end', fill: faint(), 'font-size': 10,
+                             transform: `rotate(-35 ${x + ширина / 2} ${ctx.pad.top + ctx.ih + 10})` },
+                   ctx.svg);
+      t.textContent = короче;
+      const колонка = el('rect', { x: ctx.pad.left + i * slot, y: ctx.pad.top, width: slot,
+                                   height: ctx.ih, fill: 'transparent' }, ctx.svg);
+      attachTip(колонка, `${подпись}: ${fmtNum(v)} (${fmtNum((v / всего) * 100, 1)} %)\n` +
+        `накоплено: ${fmtNum((накоплено / всего) * 100, 1)} %${v ? pickNote(config) : ''}`);
+      if (v) pickable(колонка, config, i, null);
+    });
+    // Ось доли справа и отметка 80 %.
+    [0, 0.5, 0.8, 1].forEach((доля) => {
+      const y = ctx.pad.top + ctx.ih - доля * ctx.ih;
+      el('text', { x: ctx.pad.left + ctx.iw + 6, y: y + 3.5, fill: faint(), 'font-size': 10 },
+         ctx.svg).textContent = `${Math.round(доля * 100)} %`;
+    });
+    const y80 = ctx.pad.top + ctx.ih * 0.2;
+    el('line', { x1: ctx.pad.left, x2: ctx.pad.left + ctx.iw, y1: y80, y2: y80, stroke: status().warn,
+                 'stroke-width': 1, 'stroke-dasharray': '4 4', opacity: 0.8 }, ctx.svg);
+    el('path', { d: 'M' + точки.map((т) => `${т[0].toFixed(1)},${т[1].toFixed(1)}`).join('L'),
+                 fill: 'none', stroke: status().warn, 'stroke-width': 2 }, ctx.svg);
+    точки.forEach((т) => el('circle', { cx: т[0], cy: т[1], r: 2.5, fill: status().warn }, ctx.svg));
+    return ctx.svg;
+  }
+
+  // ---- календарь ---------------------------------------------------------------------
+
+  /* Дни периода клетками: недели — столбцами, дни недели — строками.
+   *
+   * Год одним взглядом: праздники, выходные, сбои сбора (пустые дни среди
+   * полных) и сезонность. Неделя начинается с понедельника, месяц подписан
+   * над своей первой неделей.
+   *
+   * config: { from: 'ГГГГ-ММ-ДД', to: 'ГГГГ-ММ-ДД' (не включая), values:
+   *           {'ГГГГ-ММ-ДД': число}, unit, onPick(дата) }
+   */
+  function calendar(host, config) {
+    const начало = new Date(`${config.from}T00:00:00`);
+    const конец = new Date(`${config.to}T00:00:00`);
+    if (!(конец > начало)) return empty(host, config.emptyText);
+    const значения = config.values || {};
+    const cell = config.cell || 13;
+    const left = 22;
+    const top = 16;
+    const первыйПн = new Date(начало);
+    первыйПн.setDate(первыйПн.getDate() - ((первыйПн.getDay() + 6) % 7));
+    const недель = Math.ceil(((конец - первыйПн) / 86400000) / 7);
+    const width = left + недель * cell + 4;
+    const height = top + 7 * cell + 4;
+    host.innerHTML = '';
+    // Не растягивать больше чем в полтора раза: квартал — четырнадцать
+    // недель, и во всю ширину карточки клетка становилась с ладонь.
+    const svg = el('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width: '100%',
+                            style: `width:100%;max-width:${Math.round(width * 1.5)}px;height:auto`,
+                            preserveAspectRatio: 'xMidYMid meet' }, host);
+    const все = Object.values(значения).filter((v) => Number.isFinite(v));
+    const max = Math.max(1, ...все);
+    const rampLight = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95'];
+    const ramp = mode() === 'light' ? rampLight : rampLight.slice().reverse();
+    ['Пн', '', 'Ср', '', 'Пт', '', 'Вс'].forEach((подпись, r) => {
+      if (подпись) el('text', { x: left - 4, y: top + r * cell + cell - 3, 'text-anchor': 'end',
+                                fill: faint(), 'font-size': 8.5 }, svg).textContent = подпись;
+    });
+    const месяцы = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+    let прошлыйМесяц = -1;
+    const день = new Date(начало);
+    while (день < конец) {
+      const номерДня = Math.round((день - первыйПн) / 86400000);
+      const неделя = Math.floor(номерДня / 7);
+      const ряд = (день.getDay() + 6) % 7;
+      const ключ = `${день.getFullYear()}-${String(день.getMonth() + 1).padStart(2, '0')}-${String(день.getDate()).padStart(2, '0')}`;
+      const v = значения[ключ];
+      const есть = Number.isFinite(v) && v > 0;
+      const level = есть ? Math.min(ramp.length - 1, Math.floor(Math.sqrt(v / max) * ramp.length)) : 0;
+      const rect = el('rect', { x: left + неделя * cell, y: top + ряд * cell, width: cell - 2,
+                                height: cell - 2, rx: 2, fill: есть ? ramp[level] : gridColor() }, svg);
+      attachTip(rect, `${день.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', weekday: 'short' })}: ${
+        есть ? fmtNum(v) : 0}${config.unit || ''}${есть ? pickNote(config) : ''}`);
+      if (есть) pickable(rect, config, ключ, null);
+      if (день.getMonth() !== прошлыйМесяц) {
+        прошлыйМесяц = день.getMonth();
+        el('text', { x: left + неделя * cell, y: 10, fill: faint(), 'font-size': 9 }, svg)
+          .textContent = месяцы[прошлыйМесяц];
+      }
+      день.setDate(день.getDate() + 1);
+    }
+    return svg;
+  }
+
+  // ---- точечная диаграмма -------------------------------------------------------------
+
+  /* Точки с размером: сотрудники в осях «доля решённых × доля негатива».
+   *
+   * Квадранты по медианам подписаны: правый нижний — «решают и без
+   * негатива», левый верхний — «кому нужна помощь». Размер точки — объём.
+   *
+   * config: { points: [{x, y, size, label, color}], xLabel, yLabel,
+   *           xFormat, yFormat, quadrants: {x, y, labels: [ЛВ, ПВ, ЛН, ПН]},
+   *           height, onPick(номер) }
+   */
+  function scatter(host, config) {
+    const точки = (config.points || []).filter((т) => Number.isFinite(т.x) && Number.isFinite(т.y));
+    if (!точки.length) return empty(host, config.emptyText);
+    const ctx = frame(host, Object.assign({}, config, {
+      height: config.height || 280, pad: { top: 14, right: 18, bottom: 40, left: 52 } }));
+    const xs = точки.map((т) => т.x);
+    const ys = точки.map((т) => т.y);
+    const xMin = config.xMin !== undefined ? config.xMin : Math.min(...xs);
+    const xMax = config.xMax !== undefined ? config.xMax : Math.max(...xs);
+    const yTicks = niceTicks(config.yMin !== undefined ? config.yMin : Math.min(0, ...ys),
+      config.yMax !== undefined ? config.yMax : Math.max(...ys), 4);
+    ctx.yMin = yTicks[0];
+    ctx.yMax = yTicks[yTicks.length - 1];
+    axes(ctx, yTicks, null, { yFormat: config.yFormat });
+    const xTicks = niceTicks(xMin, xMax === xMin ? xMin + 1 : xMax, 5);
+    const x0 = xTicks[0], x1 = xTicks[xTicks.length - 1];
+    const xAt = (v) => ctx.pad.left + ((v - x0) / (x1 - x0 || 1)) * ctx.iw;
+    const yAt = (v) => ctx.pad.top + ctx.ih - ((v - ctx.yMin) / (ctx.yMax - ctx.yMin || 1)) * ctx.ih;
+    xTicks.forEach((v) => {
+      el('text', { x: xAt(v), y: ctx.pad.top + ctx.ih + 15, 'text-anchor': 'middle',
+                   fill: faint(), 'font-size': 10 }, ctx.svg)
+        .textContent = config.xFormat ? config.xFormat(v) : fmtNum(v);
+    });
+    if (config.xLabel) {
+      el('text', { x: ctx.pad.left + ctx.iw / 2, y: ctx.height - 4, 'text-anchor': 'middle',
+                   fill: faint(), 'font-size': 10.5 }, ctx.svg).textContent = config.xLabel;
+    }
+    if (config.yLabel) {
+      el('text', { x: 12, y: ctx.pad.top + ctx.ih / 2, 'text-anchor': 'middle', fill: faint(),
+                   'font-size': 10.5, transform: `rotate(-90 12 ${ctx.pad.top + ctx.ih / 2})` }, ctx.svg)
+        .textContent = config.yLabel;
+    }
+    const q = config.quadrants;
+    if (q && Number.isFinite(q.x) && Number.isFinite(q.y)) {
+      el('line', { x1: xAt(q.x), x2: xAt(q.x), y1: ctx.pad.top, y2: ctx.pad.top + ctx.ih,
+                   stroke: faint(), 'stroke-dasharray': '3 4', opacity: 0.6 }, ctx.svg);
+      el('line', { x1: ctx.pad.left, x2: ctx.pad.left + ctx.iw, y1: yAt(q.y), y2: yAt(q.y),
+                   stroke: faint(), 'stroke-dasharray': '3 4', opacity: 0.6 }, ctx.svg);
+      const [лв, пв, лн, пн] = q.labels || [];
+      const подпись = (x, y, текст, якорь) => текст && el('text', { x, y, 'text-anchor': якорь,
+        fill: faint(), 'font-size': 9.5, opacity: 0.9 }, ctx.svg).appendChild(document.createTextNode(текст));
+      подпись(ctx.pad.left + 4, ctx.pad.top + 10, лв, 'start');
+      подпись(ctx.pad.left + ctx.iw - 4, ctx.pad.top + 10, пв, 'end');
+      подпись(ctx.pad.left + 4, ctx.pad.top + ctx.ih - 4, лн, 'start');
+      подпись(ctx.pad.left + ctx.iw - 4, ctx.pad.top + ctx.ih - 4, пн, 'end');
+    }
+    const наибольший = Math.max(1, ...точки.map((т) => т.size || 1));
+    const цвета = palette();
+    точки.forEach((т, i) => {
+      const r = 4 + Math.sqrt((т.size || 1) / наибольший) * 12;
+      const круг = el('circle', { cx: xAt(т.x), cy: yAt(т.y), r, fill: т.color || цвета[0],
+                                  'fill-opacity': 0.55, stroke: т.color || цвета[0], 'stroke-width': 1.5 },
+                      ctx.svg);
+      attachTip(круг, `${т.label}\n${config.xName || 'x'}: ${config.xFormat ? config.xFormat(т.x) : fmtNum(т.x)}\n${
+        config.yName || 'y'}: ${config.yFormat ? config.yFormat(т.y) : fmtNum(т.y)}${
+        т.size ? `\n${config.sizeName || 'объём'}: ${fmtNum(т.size)}` : ''}${pickNote(config)}`);
+      pickable(круг, config, (config.points || []).indexOf(т), т);
+    });
+    return ctx.svg;
+  }
+
   global.Charts = { line, bars, hbars, stacked, donut, spark, heat, grid, waveform,
+                    combo, pareto, calendar, scatter,
                     palette, status, fmtNum, legend, empty, splitRuns, dotsFit };
 })(window);

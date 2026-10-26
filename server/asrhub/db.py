@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -992,6 +992,9 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_station ON calls(station, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
+    # Версия 33: добавочный по заданию без чтения строки звонка — им
+    # подписываются таблицы «Голосовой аналитики» и разрез по добавочным.
+    "CREATE INDEX IF NOT EXISTS idx_calls_job_agent ON calls(job_id, agent)",
     "CREATE INDEX IF NOT EXISTS idx_calls_agent ON calls(agent, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_queue ON calls(queue, started_at DESC)",
     # Повторные обращения ищутся по номеру звонящего в окне в неделю: без
@@ -1467,11 +1470,45 @@ class Database:
                     self._снять_качество_с_переписки(conn)
                 if current < 31:
                     self._движок_вместо_auto(conn)
+                if current < 33:
+                    self._итоги_без_расшифровки(conn)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:
                 conn.execute("ROLLBACK")
                 raise StorageError(f"Не удалось применить миграции: {exc}") from exc
+
+    #: Порог короткой записи для архива до версии 33 — значение
+    #: `audio_min_duration_s` по умолчанию. Настроек у миграции нет: она
+    #: идёт при открытии базы, до того как их прочли.
+    ПОРОГ_КОРОТКОЙ_АРХИВ_С = 2.0
+
+    def _итоги_без_расшифровки(self, conn: sqlite3.Connection) -> None:
+        """Прежние «ошибки» молчащих и коротких записей — в их итоги.
+
+        До версии 33 запись без речи и пустой файл кончались состоянием
+        `failed` и попадали в ошибки, в долю отказов и в «требуют внимания».
+        Новые задания получают `no_speech` и `short` сами (см.
+        `job_queue.ИТОГ_БЕЗ_РАСШИФРОВКИ`); здесь то же делается с архивом,
+        иначе отчёт за прошлый месяц показывал бы те же ошибки, что и
+        раньше. Узнаются они по коду отказа и по тексту, который писал
+        этот же сервер: «близка к нулю», «нет ни одного отсчёта звука»,
+        «Файл пуст».
+        """
+        порог = self.ПОРОГ_КОРОТКОЙ_АРХИВ_С
+        conn.execute(
+            "UPDATE jobs SET status='short', stage='короткая запись', progress=1.0, "
+            "error_code='audio_too_short' "
+            "WHERE status='failed' AND ("
+            "  (error_code='no_speech' AND COALESCE(media_duration_s, 0) > 0 "
+            "   AND media_duration_s < ?)"
+            "  OR (error_code='audio_error' AND ("
+            "      error_message LIKE '%близка к нулю%' "
+            "      OR error_message LIKE '%нет ни одного отсчёта звука%' "
+            "      OR error_message LIKE 'Файл пуст:%')))", (порог,))
+        conn.execute(
+            "UPDATE jobs SET status='no_speech', stage='без речи', progress=1.0 "
+            "WHERE status='failed' AND error_code='no_speech'")
 
     def _движок_вместо_auto(self, conn: sqlite3.Connection) -> None:
         """«auto» в колонке движка заменяется движком модели.
@@ -3022,23 +3059,33 @@ class Database:
         return [dict(r) for r in rows]
 
     @staticmethod
-    def _окно_ответов(since: float,
-                      owner: str | list[str] | None) -> tuple[str, list[Any]]:
+    def _окно_ответов(since: float, owner: str | list[str] | None, *,
+                      until: float | None = None,
+                      agent: str = "") -> tuple[str, list[Any]]:
         """Какие задания входят в свод ответов модели — одним местом.
 
         Готовые, не старше начала окна, без контрольных прогонов; с владельцем
         — только его. Все четыре условия стоят по колонкам указателя окна
         (`УКАЗАТЕЛЬ_ОКНА`), так что проверяются без чтения самих заданий.
+        `until` — верхняя граница (свод за прошлый месяц, а не «до сейчас»),
+        `agent` — только разговоры этого добавочного из журнала звонков.
         """
         where = ["j.status='completed'", "j.created_at >= ?",
                  "COALESCE(j.source,'') <> 'control'"]
         args: list[Any] = [since]
+        if until is not None:
+            where.append("j.created_at < ?")
+            args.append(float(until))
         if isinstance(owner, (list, tuple)):
             where.append(f"j.owner IN ({','.join('?' for _ in owner)})")
             args.extend(owner)
         elif owner:
             where.append("j.owner=?")
             args.append(owner)
+        if agent:
+            where.append("EXISTS (SELECT 1 FROM calls cl WHERE cl.job_id = j.id "
+                         "AND cl.agent = ?)")
+            args.append(str(agent))
         return " AND ".join(where), args
 
     def _задания_окна(self) -> str:
@@ -3047,7 +3094,8 @@ class Database:
                 if self.has_index(УКАЗАТЕЛЬ_ОКНА) else "jobs j")
 
     def llm_stats(self, version: int, since: float, *,
-                  owner: str | list[str] | None = None) -> dict[str, Any]:
+                  owner: str | list[str] | None = None, until: float | None = None,
+                  agent: str = "") -> dict[str, Any]:
         """Свод ответов модели за окно: покрытие, исходы, причины, действия,
         трекеры, задержка, ошибки.
 
@@ -3055,7 +3103,7 @@ class Database:
         короткое или нужен сам текст (сводка по расписанию); счёт за длинное
         окно — `llm_brief`, он ответов не читает.
         """
-        условие, args = self._окно_ответов(since, owner)
+        условие, args = self._окно_ответов(since, owner, until=until, agent=agent)
         всего = int(self.query_one(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args)["n"])
         rows = self.query(
             "SELECT l.job_id, l.version, l.summary, l.reason, l.reason_quote, l.outcome, "
@@ -3066,7 +3114,8 @@ class Database:
         return {"total": всего, "rows": [_row_to_llm(r) for r in rows]}
 
     def llm_brief(self, version: int, since: float, *,
-                  owner: str | list[str] | None = None) -> dict[str, Any]:
+                  owner: str | list[str] | None = None, until: float | None = None,
+                  agent: str = "") -> dict[str, Any]:
         """Счётная часть свода ответов модели — без чтения самих ответов.
 
         Сколько записей в окне, сколько из них с ответом, сколько сбоев, как
@@ -3080,7 +3129,7 @@ class Database:
 
         Ответ — сырые группы; доли, сортировку и подписи собирает вызывающий.
         """
-        условие, args = self._окно_ответов(since, owner)
+        условие, args = self._окно_ответов(since, owner, until=until, agent=agent)
         задания = self._задания_окна()
         ответы = ("llm_results l INDEXED BY " + УКАЗАТЕЛЬ_ОТВЕТОВ
                   if self.has_index(УКАЗАТЕЛЬ_ОТВЕТОВ) else "llm_results l")
@@ -3097,15 +3146,42 @@ class Database:
             f"WHERE {условие} GROUP BY 1, 2, 3", [int(version), *args])
         return {"total": всего, "groups": [dict(r) for r in группы]}
 
+    def llm_by_agent(self, since: float, *,
+                     owner: str | list[str] | None = None,
+                     until: float | None = None) -> list[dict[str, Any]]:
+        """Свод ответов модели по добавочным — группами, без чтения ответов.
+
+        Добавочный — из журнала звонков, подзапросом по указателю
+        `idx_calls_job_agent`: соединение размножило бы задание, у которого
+        две строки звонка. Записи без ответа модели тоже здесь (`has` = 0):
+        «разговоров у добавочного» — все его готовые записи окна, а не только
+        разобранные. Без добавочного — группа с пустым `agent`.
+        """
+        условие, args = self._окно_ответов(since, owner, until=until)
+        ответы = ("llm_results l INDEXED BY " + УКАЗАТЕЛЬ_ОТВЕТОВ
+                  if self.has_index(УКАЗАТЕЛЬ_ОТВЕТОВ) else "llm_results l")
+        группы = self.query(
+            "SELECT COALESCE((SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id "
+            "                 AND COALESCE(cl.agent,'') <> '' LIMIT 1), '') AS agent, "
+            "       l.job_id IS NOT NULL AS has, COALESCE(l.error,'') = '' AS ok, "
+            "       COALESCE(l.reason,'') AS reason, COALESCE(l.outcome,'') AS outcome, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN l.resolved IS NOT NULL THEN 1 ELSE 0 END) AS resolved_known, "
+            "       SUM(CASE WHEN l.resolved THEN 1 ELSE 0 END) AS resolved_yes "
+            f"FROM {self._задания_окна()} LEFT JOIN {ответы} ON l.job_id = j.id "
+            f"WHERE {условие} GROUP BY 1, 2, 3, 4, 5", [*args])
+        return [dict(r) for r in группы]
+
     def llm_recent(self, since: float, *, owner: str | list[str] | None = None,
-                   limit: int = 300) -> list[dict[str, Any]]:
+                   limit: int = 300, until: float | None = None,
+                   agent: str = "") -> list[dict[str, Any]]:
         """Последние ответы модели окна целиком — столько, сколько показывают.
 
         Построчный список раздела — это три сотни свежих разборов. Брать их
         сортировкой всех ответов окна значило читать всё окно; здесь база
         идёт по времени от новых и останавливается на нужной строке.
         """
-        условие, args = self._окно_ответов(since, owner)
+        условие, args = self._окно_ответов(since, owner, until=until, agent=agent)
         rows = self.query(
             "SELECT l.job_id, l.version, l.summary, l.reason, l.reason_quote, l.outcome, "
             "       l.outcome_quote, l.resolved, l.actions, l.trackers, l.scorecard, "
@@ -3117,7 +3193,8 @@ class Database:
         return [_row_to_llm(r) for r in rows]
 
     def llm_details(self, since: float, *,
-                    owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+                    owner: str | list[str] | None = None, until: float | None = None,
+                    agent: str = "") -> list[dict[str, Any]]:
         """Разборы окна без сбоя — только то, что лежит в них списками.
 
         Обязательства, трекеры, скоркарта и замечания хранятся в ответе
@@ -3126,7 +3203,7 @@ class Database:
         берётся — ни пересказа, ни цитат, — а задание читается по указателю
         окна. Строки идут от новых к старым.
         """
-        условие, args = self._окно_ответов(since, owner)
+        условие, args = self._окно_ответов(since, owner, until=until, agent=agent)
         rows = self.query(
             "SELECT l.job_id, l.actions, l.trackers, l.scorecard, l.warnings, j.created_at "
             f"FROM {self._задания_окна()} JOIN llm_results l ON l.job_id = j.id "
@@ -5251,6 +5328,50 @@ class Database:
             (номер,))
         return dict(row) if row else None
 
+    def employees_by_ext(self, номера: Any) -> dict[str, dict[str, Any]]:
+        """Сотрудники по внутренним номерам — разом, для таблиц отчётов.
+
+        Отчёт показывает сотни строк, и спрашивать справочник по строке —
+        сотни запросов. Здесь один запрос на пятьсот номеров. На номер,
+        который делят двое, — тот же выбор, что у `employee_by_ext`:
+        работающий раньше уволенного, свежая карточка раньше старой.
+        """
+        список = sorted({str(н).strip() for н in (номера or []) if str(н or "").strip()})
+        итог: dict[str, dict[str, Any]] = {}
+        for начало in range(0, len(список), 500):
+            кусок = список[начало:начало + 500]
+            строки = self.query(
+                "SELECT phone_ext, last_name, first_name, middle_name, department, "
+                "       position, active FROM employees "
+                f"WHERE phone_ext IN ({','.join('?' for _ in кусок)}) "
+                # Последней пишется лучшая — она и остаётся в словаре.
+                "ORDER BY active ASC, updated_at ASC", кусок)
+            for r in строки:
+                имя = " ".join(str(r[поле] or "").strip() for поле in
+                               ("last_name", "first_name", "middle_name")).strip()
+                итог[str(r["phone_ext"])] = {
+                    "name": " ".join(имя.split()), "department": str(r["department"] or ""),
+                    "position": str(r["position"] or ""), "active": bool(r["active"])}
+        return итог
+
+    def agents_for_jobs(self, ids: Any) -> dict[str, str]:
+        """Добавочный оператора по заданию — из журнала звонков, разом.
+
+        Строка звонка у задания одна (у разговора частями — у каждой части
+        своя); если их всё же две, берётся первая с непустым оператором.
+        Ищется по указателю `idx_calls_job_agent` без чтения строк звонков.
+        """
+        список = sorted({str(i) for i in (ids or []) if i})
+        итог: dict[str, str] = {}
+        for начало in range(0, len(список), 500):
+            кусок = список[начало:начало + 500]
+            for r in self.query(
+                    "SELECT job_id, agent FROM calls "
+                    f"WHERE job_id IN ({','.join('?' for _ in кусок)}) "
+                    "AND COALESCE(agent,'') <> ''", кусок):
+                итог.setdefault(str(r["job_id"]), str(r["agent"]))
+        return итог
+
     def employee_list(self, *, query: str = "", department: str = "",
                       active: bool | None = None, source: str = "",
                       limit: int = 500, offset: int = 0) -> dict[str, Any]:
@@ -5292,19 +5413,37 @@ class Database:
             "FROM employees GROUP BY department ORDER BY n DESC")
         return [dict(r) for r in rows]
 
+    #: Сколько имён в каждом перечне «что изменилось» отдаёт импорт.
+    ИМЁН_В_ИТОГЕ_ИМПОРТА = 50
+
     def employees_import(self, записи: list[dict[str, Any]], *, source: str,
-                         deactivate_missing: bool = True) -> dict[str, Any]:
+                         deactivate_missing: bool = True,
+                         dry_run: bool = False) -> dict[str, Any]:
         """Разом заводит выгрузку справочника. Возвращает, что изменилось.
 
         Пропавших из выгрузки не удаляем, а помечаем неработающими: по ним
         есть звонки, и удаление превратило бы половину архива в разговоры
         неизвестно с кем. Это же и честнее: человек уволился, а разговоры
         остались.
+
+        `dry_run` — посчитать то же самое, ничего не записав: так работает
+        предпросмотр импорта. Перечни `changes` — кого добавить, у кого
+        какие поля поменять, кого отметить уволенным (по полсотни имён).
         """
         было = {str(r["external_id"]): dict(r) for r in self.query(
             "SELECT * FROM employees WHERE source=?", (source,)) if r["external_id"]}
         добавлено = обновлено = без_изменений = 0
         пришли: set[str] = set()
+        предел = self.ИМЁН_В_ИТОГЕ_ИМПОРТА
+        перечни: dict[str, list[dict[str, Any]]] = {
+            "added": [], "updated": [], "deactivated": []}
+
+        def кто(карточка: dict[str, Any]) -> dict[str, Any]:
+            return {"name": " ".join(str(карточка.get(п) or "").strip() for п in
+                                     ("last_name", "first_name", "middle_name")).strip(),
+                    "phone_ext": str(карточка.get("phone_ext") or ""),
+                    "department": str(карточка.get("department") or "")}
+
         for запись in записи:
             данные = {к: з for к, з in запись.items() if к in self.ПОЛЯ_СОТРУДНИКА}
             данные["source"] = source
@@ -5314,25 +5453,34 @@ class Database:
             пришли.add(ключ)
             прежний = было.get(ключ)
             if прежний is None:
-                self.employee_save(данные)
+                if not dry_run:
+                    self.employee_save(данные)
                 добавлено += 1
+                if len(перечни["added"]) < предел:
+                    перечни["added"].append(кто(данные))
                 continue
             различия = {к: з for к, з in данные.items()
                         if str(прежний.get(к) or "") != str(з or "")}
             if not различия:
                 без_изменений += 1
                 continue
-            self.employee_save(данные, id=str(прежний["id"]))
+            if not dry_run:
+                self.employee_save(данные, id=str(прежний["id"]))
             обновлено += 1
+            if len(перечни["updated"]) < предел:
+                перечни["updated"].append({**кто(данные), "fields": sorted(различия)})
         уволено = 0
         if deactivate_missing:
             for ключ, прежний in было.items():
                 if ключ not in пришли and int(прежний.get("active") or 0):
-                    self.execute("UPDATE employees SET active=0, updated_at=? WHERE id=?",
-                                 (now(), прежний["id"]))
+                    if not dry_run:
+                        self.execute("UPDATE employees SET active=0, updated_at=? WHERE id=?",
+                                     (now(), прежний["id"]))
                     уволено += 1
+                    if len(перечни["deactivated"]) < предел:
+                        перечни["deactivated"].append(кто(прежний))
         return {"added": добавлено, "updated": обновлено, "unchanged": без_изменений,
-                "deactivated": уволено, "received": len(пришли)}
+                "deactivated": уволено, "received": len(пришли), "changes": перечни}
 
     # --- агенты на станциях ------------------------------------------------
 

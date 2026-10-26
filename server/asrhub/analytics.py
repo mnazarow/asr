@@ -170,6 +170,10 @@ class Analytics:
         done = [j for j in jobs if j["status"] == "completed"]
         failed = [j for j in jobs if j["status"] == "failed"]
         cancelled = [j for j in jobs if j["status"] == "cancelled"]
+        # Без речи и короткие — итоги, а не ошибки: в «успешные» они идут
+        # (задание дошло до конца без сбоя), в объём и скорость — нет.
+        без_речи = sum(1 for j in jobs if j["status"] == "no_speech")
+        коротких = sum(1 for j in jobs if j["status"] == "short")
 
         audio_s = sum(float(j.get("media_duration_s") or 0) for j in done)
         proc_s = sum(float(j.get("processing_time_s") or 0) for j in done)
@@ -197,9 +201,12 @@ class Analytics:
                 "completed": len(done),
                 "failed": len(failed),
                 "cancelled": len(cancelled),
+                "no_speech": без_речи,
+                "short": коротких,
                 "in_progress": sum(1 for j in jobs if j["status"] in ("queued", "running", "retry")),
                 "cached": sum(1 for j in jobs if j.get("cached_from")),
-                "success_rate": round(len(done) / len(jobs), 4) if jobs else None,
+                "success_rate": (round((len(done) + без_речи + коротких) / len(jobs), 4)
+                                 if jobs else None),
             },
             "volume": {
                 "audio_seconds": round(audio_s, 1),
@@ -288,13 +295,13 @@ class Analytics:
         конец = max(time.time(), нижние[-1])
 
         series = {
-            "labels": [], "completed": [], "failed": [], "audio_minutes": [],
+            "labels": [], "completed": [], "failed": [], "empty": [], "audio_minutes": [],
             "rtf": [], "queue_time": [], "words": [],
         }
         grid: dict[int, dict[str, list[float] | int]] = {}
         for job in jobs:
             slot = _корзина(нижние, float(job["created_at"]))
-            cell = grid.setdefault(slot, {"completed": 0, "failed": 0, "audio": 0.0,
+            cell = grid.setdefault(slot, {"completed": 0, "failed": 0, "empty": 0, "audio": 0.0,
                                           "rtf": [], "queue": [], "words": 0})
             if job["status"] == "completed":
                 cell["completed"] = int(cell["completed"]) + 1        # type: ignore[assignment]
@@ -309,13 +316,17 @@ class Analytics:
                     cell["queue"].append(float(job["queue_time_s"]))  # type: ignore[union-attr]
             elif job["status"] == "failed":
                 cell["failed"] = int(cell["failed"]) + 1              # type: ignore[assignment]
+            elif job["status"] in ("no_speech", "short"):
+                # Без речи и короткие — свой ряд: не ошибки и не расшифровки.
+                cell["empty"] = int(cell["empty"]) + 1                # type: ignore[assignment]
 
         for slot in range(buckets):
-            cell = grid.get(slot, {"completed": 0, "failed": 0, "audio": 0.0,
+            cell = grid.get(slot, {"completed": 0, "failed": 0, "empty": 0, "audio": 0.0,
                                    "rtf": [], "queue": [], "words": 0})
             series["labels"].append(нижние[slot])
             series["completed"].append(cell["completed"])
             series["failed"].append(cell["failed"])
+            series["empty"].append(cell["empty"])
             series["audio_minutes"].append(round(float(cell["audio"]) / 60, 2))
             rtf_list = cell["rtf"]                                     # type: ignore[assignment]
             queue_list = cell["queue"]                                 # type: ignore[assignment]
@@ -462,6 +473,10 @@ class Analytics:
             "total_jobs": total_jobs,
             "failure_rate": round(total_failed / total_jobs, 4) if total_jobs else 0.0,
             "by_code": rows,
+            # Не ошибки, но рядом с ними их ищут: «а куда делись молчащие?»
+            "no_speech": self.db.count_jobs(status="no_speech", since=since or None,
+                                            owner=owner),
+            "short": self.db.count_jobs(status="short", since=since or None, owner=owner),
         }
 
     def duration_histogram(self, period: str = "month", bins: int = 10,
@@ -1492,7 +1507,7 @@ class Analytics:
                 t.strip() for t in str(job.get("tags") or "").split(",") if t.strip()))
             for метка in метки or ["без метки"]:
                 запись = собрано.setdefault(метка, {
-                    "tag": метка, "jobs": 0, "completed": 0, "failed": 0,
+                    "tag": метка, "jobs": 0, "completed": 0, "failed": 0, "empty": 0,
                     "audio_hours": 0.0, "processing_s": 0.0, "words": 0})
                 запись["jobs"] += 1
                 if job["status"] == "completed":
@@ -1502,6 +1517,8 @@ class Analytics:
                     запись["words"] += int(job.get("words_count") or 0)
                 elif job["status"] == "failed":
                     запись["failed"] += 1
+                elif job["status"] in ("no_speech", "short"):
+                    запись["empty"] += 1
 
         строки = []
         for запись in собрано.values():
@@ -1649,7 +1666,7 @@ class Analytics:
         # отдаёт свои показания под своими именами.
         counts = {status: self.db.count_jobs(status=status)
                   for status in ("queued", "running", "completed", "failed",
-                                 "cancelled", "retry")}
+                                 "cancelled", "retry", "no_speech", "short")}
         for status, value in counts.items():
             add("jobs_current", value, f'status="{status}"',
                 "Число заданий по статусам сейчас" if status == "queued" else "", "gauge")

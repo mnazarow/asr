@@ -388,7 +388,10 @@ def callback_body(request: PhoneRequest, job: dict[str, Any],
     """
     from .pipeline.waveform import to_phone_asr
 
-    status = "success" if job.get("status") == "completed" else "failed"
+    # Запись без речи и короткая запись — не отказ: в словаре phone_asr
+    # это успех с пустым диалогом, как и отвечал бы сам phone_asr на тишину.
+    пустой = job.get("status") in ("no_speech", "short")
+    status = "success" if job.get("status") == "completed" or пустой else "failed"
     dialogue = [
         {
             "speaker": str(segment.get("speaker") or SPEAKER_LEFT),
@@ -416,5 +419,5 @@ def callback_body(request: PhoneRequest, job: dict[str, Any],
         "formatted_dialogue": dialogue,
         "transcription": " ".join(item["dialogue"] for item in dialogue),
         "status": status,
-        "error_message": _failure_text(job),
+        "error_message": None if пустой else _failure_text(job),
     }

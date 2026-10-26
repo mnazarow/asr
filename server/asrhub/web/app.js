@@ -400,11 +400,16 @@ function подписьВремени(секунды, ширинаКорзины
 const STATUS_LABELS = {
   queued: 'в очереди', running: 'обработка', completed: 'готово',
   failed: 'ошибка', cancelled: 'отменено', paused: 'пауза', retry: 'повтор',
+  no_speech: 'без речи', short: 'короткая',
 };
 const STATUS_CLASS = {
   completed: 'ok', failed: 'err', cancelled: '', running: 'accent',
-  queued: '', retry: 'warn', paused: 'warn',
+  queued: '', retry: 'warn', paused: 'warn', no_speech: 'nospeech', short: 'short',
 };
+/** Итоги без расшифровки: запись обработана, слов в ней нет. Не ошибки. */
+const EMPTY_STATUSES = ['no_speech', 'short'];
+/** Все конечные состояния — для «готовых и упавших» и для повтора. */
+const FINISHED_STATUSES = ['completed', 'failed', 'cancelled', ...EMPTY_STATUSES];
 const QUALITY_LABELS = {
   excellent: 'отличное', good: 'хорошее', fair: 'среднее',
   poor: 'слабое', none: 'нет русского',
@@ -770,6 +775,13 @@ function handleEvent(message) {
             (message.error && message.error.message) || '');
       refreshQueue(); refreshLiveViews();
       break;
+    case 'job.no_speech':
+    case 'job.short':
+      // Не ошибка и не повод для красного: итог записи, в которой нет слов.
+      toast(message.type === 'job.short' ? 'Короткая запись — не распознаётся'
+        : 'В записи нет речи', '', message.message || '');
+      refreshQueue(); refreshLiveViews();
+      break;
     case 'job.retry':
       toast(`Повтор ${message.attempt} через ${message.delay_s} с`, 'warn', message.error);
       break;
@@ -821,6 +833,10 @@ const VIEWS = {
   transcribe: { title: 'Транскрибация', subtitle: 'Загрузка файлов и распознавание речи' },
   rescan:     { title: 'Распознавание записей', subtitle: 'Повторное распознавание: одной записи, отобранных или всего архива — другой моделью или после правки настроек' },
   voice:      { title: 'Голосовая аналитика', subtitle: 'Что языковая модель поняла из разговоров: темы и причины, исходы, обязательства, риски, соблюдение скрипта' },
+  voice_day:  { title: 'Голосовая аналитика за день', subtitle: 'Сводка дня по часам: нагрузка, причины, исходы, качество, сотрудники — против вчера и того же дня неделей раньше' },
+  voice_month: { title: 'Голосовая аналитика за месяц', subtitle: 'Сводка месяца по дням: тренды, Парето причин, что изменилось, сотрудники и отделы — против прошлого месяца и года назад' },
+  voice_quarter: { title: 'Голосовая аналитика за квартал', subtitle: 'Сводка квартала по неделям: календарь, сдвиг причин, рейтинг и карта сотрудников — против прошлого квартала и года назад' },
+  voice_year: { title: 'Голосовая аналитика за год', subtitle: 'Сводка года по месяцам: сезонность, календарь, ряды причин, сотрудники и отделы — против прошлого года' },
   llmqueue:   { title: 'Очередь LLM', subtitle: 'Ход смыслового разбора в реальном времени: что идёт сейчас, что ждёт, сколько заняло и чем кончилось' },
   staff:      { title: 'Сотрудники', subtitle: 'Справочник: карточки, отделы, внутренние номера, импорт из выгрузки по адресу' },
   dictation:  { title: 'Диктовка', subtitle: 'Распознавание с микрофона на лету, без ожидания конца записи' },
@@ -1084,6 +1100,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // номера получают первые десять, а список показывается в подсказке.
 const HOTKEY_VIEWS = ['dashboard', 'transcribe', 'dictation', 'queue', 'results',
                       'rescan', 'analytics', 'trends', 'content', 'voice',
+                      'voice_day', 'voice_month', 'voice_quarter', 'voice_year',
                       'llmqueue', 'employees', 'pbx', 'telephony', 'models',
                       'compare', 'staff', 'settings', 'system', 'monitoring'];
 
@@ -1307,6 +1324,26 @@ function card(title, hint, body, actions) {
       ${hint ? `<span class="hint">${esc(hint)}</span>` : ''}
       <span class="spacer"></span>${actions || ''}</div>
     ${body}</section>`;
+}
+
+/**
+ * Добавочный оператора с именем из справочника: «101 Петрова М. И.».
+ *
+ * Строку отчёта читают глазами, и номер без человека заставляет идти в
+ * справочник; полное имя и отдел — в подсказке, чтобы столбец не
+ * раздувался. Номера нет — прочерк.
+ */
+function добавочный(с, пусто = '—') {
+  const номер = String((с && с.agent) || '');
+  if (!номер) return `<span class="faint">${esc(пусто)}</span>`;
+  const имя = String((с && с.agent_name) || '');
+  const части = имя.split(/\s+/).filter(Boolean);
+  const коротко = части.length > 1
+    ? `${части[0]} ${части.slice(1).map((ч) => `${ч[0]}.`).join(' ')}` : имя;
+  const подсказка = [имя, с.agent_department].filter(Boolean).join(', ');
+  return `<span class="agent-ext"${подсказка ? ` title="${esc(подсказка)}"` : ''}>`
+    + `<span class="mono">${esc(номер)}</span>${коротко
+      ? ` <span class="small dim">${esc(коротко)}</span>` : ''}</span>`;
 }
 
 function statusChip(status) {
@@ -1765,6 +1802,7 @@ const Drill = {
     tone: ['Тональность', '', (с) => toneChip(с.sentiment, '')],
     score: ['Балл', 'num', (с) => (с.agent_score === null || с.agent_score === undefined
       ? '—' : num(Math.round(с.agent_score)))],
+    agent: ['Добавочный', 'nowrap', (с) => добавочный(с)],
     reason: ['Причина', '', (с) => esc(с.reason || '—')],
     outcome: ['Исход', '', (с) => esc(с.outcome || '—')],
     resolved: ['Решено', '', (с) => (с.resolved === null || с.resolved === undefined ? '—'
@@ -1775,7 +1813,11 @@ const Drill = {
   _столбцы(ход) {
     const { описание } = ход;
     if (Array.isArray(описание.cols)) return описание.cols.filter((имя) => this.СТОЛБЦЫ[имя]);
-    return ['when', 'record', 'duration', 'model', 'owner', 'status',
+    // Добавочный — у списков разговоров (разбор, ответы модели): у них
+    // первый вопрос к строке — «чей это разговор».
+    return ['when', 'record',
+      ...(описание.base === 'llm' || описание.base === 'content' ? ['agent'] : []),
+      'duration', 'model', 'owner', 'status',
       ...(this._нужен(ход, 'sentiment') ? ['tone'] : []),
       ...(this._нужен(ход, 'agent_score') ? ['score'] : []),
       ...(описание.base === 'llm' ? ['reason', 'outcome'] : [])];
@@ -1841,7 +1883,7 @@ const Drill = {
       return `<tr><td class="nowrap">${this._когда(с.started_at)}</td>
         <td>${esc(с.direction || '—')}</td>
         <td class="mono small">${esc(с.src || '—')} → ${esc(с.dst || '—')}</td>
-        <td>${esc(с.queue || '—')}</td><td>${esc(с.agent || '—')}</td>
+        <td>${esc(с.queue || '—')}</td><td class="nowrap">${добавочный(с)}</td>
         <td class="num">${fmtDur(с.billsec)}</td>
         ${своя ? `<td class="num">${this._значение(описание, с.value)}</td>` : ''}
         <td>${с.answered ? '<span class="chip ok">отвечен</span>'
@@ -2328,7 +2370,7 @@ RENDERERS.transcribe = {
 
     // Облегчённый список: без него каждые четыре секунды приезжали полные
     // расшифровки шести записей ради имени файла и длительности.
-    API.get('/api/jobs?status=completed,failed&limit=6&light=true').then((data) => {
+    API.get('/api/jobs?status=completed,failed,no_speech,short&limit=6&light=true').then((data) => {
       const host = qs('#recent-jobs');
       if (!host) return;
       host.innerHTML = data.items.length ? `<div class="table-wrap"><table>
@@ -2947,7 +2989,10 @@ RENDERERS.queue = {
       <div class="grid cols-6" style="margin-bottom:16px">
         ${kpi('В очереди', q.queue_depth ?? 0, 'ожидают запуска')}
         ${kpi('Выполняется', q.active ?? 0, `воркеров: ${q.worker_count ?? 0}`)}
-        ${kpi('Готово', (q.counts && q.counts.completed) ?? 0, 'за всё время')}
+        ${kpi('Готово', (q.counts && q.counts.completed) ?? 0,
+              (q.counts && (q.counts.no_speech || q.counts.short))
+                ? `без речи ${num(q.counts.no_speech || 0)} · коротких ${num(q.counts.short || 0)}`
+                : 'за всё время')}
         ${kpi('Ошибок', (q.counts && q.counts.failed) ?? 0, 'требуют внимания')}
         ${kpi('Аудио в ожидании', fmtDur(q.pending_audio_s), 'суммарная длительность')}
         ${kpi('Оценка времени', fmtDur(q.eta_s), 'до опустошения очереди')}
@@ -2995,6 +3040,8 @@ RENDERERS.queue = {
             <option value="retry">Ожидают повтора</option>
             <option value="failed">С ошибкой</option>
             <option value="completed">Завершённые</option>
+            <option value="no_speech">Без речи</option>
+            <option value="short">Короткие</option>
           </select>
           <input type="search" id="q-search" placeholder="поиск по имени файла"
             style="width:220px">
@@ -3137,7 +3184,7 @@ RENDERERS.queue = {
     // после автообновления таблицы.
     return `<tr class="queue-row ${job.status}" data-job-id="${esc(job.id)}">
       <td>${job.status === 'running' ? '▶' : job.status === 'failed' ? '✕'
-            : job.status === 'completed' ? '✓' : '·'}</td>
+            : job.status === 'completed' ? '✓' : EMPTY_STATUSES.includes(job.status) ? '∅' : '·'}</td>
       <td><div class="truncate" style="max-width:230px" title="${esc(job.filename)}">
         ${esc(job.filename)}</div>
         <div class="small faint mono">${esc(job.id.slice(0, 16))}</div></td>
@@ -3164,7 +3211,8 @@ RENDERERS.queue = {
             data-action="resume" onclick="__asrhub.jobAction(${jsArg(job.id)},'resume')">▶</button>` : ''}
         ${active ? `<button class="ghost sm danger" title="Отменить"
             data-action="cancel" onclick="__asrhub.jobAction(${jsArg(job.id)},'cancel')">✕</button>` : ''}
-        ${job.status === 'failed' ? `<button class="ghost sm" title="Повторить"
+        ${job.status === 'failed' || EMPTY_STATUSES.includes(job.status)
+          ? `<button class="ghost sm" title="Повторить"
             data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')">↻</button>` : ''}
         <button class="ghost sm" data-action="open"
           onclick="__asrhub.openJob(${jsArg(job.id)})">Открыть</button>
@@ -3989,7 +4037,15 @@ function showJobModal(job, opts) {
         </div>
       </div>` : ''}
 
-      ${job.error_message ? `<div class="card tight" style="border-color:var(--err)">
+      ${job.error_message && EMPTY_STATUSES.includes(job.status)
+        // Итог без расшифровки — пояснение, а не ошибка: без красного.
+        ? `<div class="card tight empty-outcome ${job.status}">
+        <b>${job.status === 'short' ? 'Короткая запись' : 'Без речи'}</b>
+        <span class="small faint"> · не ошибка: запись обработана, слов в ней нет</span>
+        <div style="margin-top:4px">${esc(job.error_message)}</div>
+        ${job.error_hint ? `<div class="small dim" style="margin-top:6px;white-space:pre-wrap">${
+          esc(job.error_hint)}</div>` : ''}</div>`
+        : job.error_message ? `<div class="card tight" style="border-color:var(--err)">
         <b style="color:var(--err)">${esc(job.error_code || 'ошибка')}</b>
         <div style="margin-top:4px">${esc(job.error_message)}</div>
         ${job.error_hint ? `<div class="small dim" style="margin-top:6px;white-space:pre-wrap">${
@@ -4010,7 +4066,7 @@ function showJobModal(job, opts) {
         <div class="small faint" style="margin-top:6px">Признаки считаются по сегментам без эталона и ничего не доказывают — это повод послушать.</div>
       </div>` : ''}
 
-      ${job.status === 'completed' || job.status === 'failed'
+      ${job.status === 'completed' || job.status === 'failed' || EMPTY_STATUSES.includes(job.status)
         ? '<div class="player" id="job-player"></div>' : ''}
 
       ${(job.waveform || []).length ? `<div class="wave-block" id="job-waveform-block">
@@ -4048,7 +4104,10 @@ function showJobModal(job, opts) {
            title="Скачать в формате ${f}">${f}</button>`).join('') : ''}
       ${job.status === 'failed'
         ? `<button class="primary" data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')">
-             Повторить</button>` : ''}
+             Повторить</button>` : EMPTY_STATUSES.includes(job.status)
+          ? `<button class="btn sm" data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')"
+               title="Распознать заново — например, после того как понизили порог детектора речи">
+             Распознать заново</button>` : ''}
     </div></div></div>`);
 
   backdrop.dataset.jobId = String(job.id);
@@ -4058,8 +4117,11 @@ function showJobModal(job, opts) {
 
   const body = qs('#job-tab-body', backdrop);
   const tabs = {
-    text: () => `<div class="transcript" style="white-space:pre-wrap;line-height:1.7">${
-      esc(job.text || '—')}</div>`,
+    text: () => (EMPTY_STATUSES.includes(job.status) && !job.text
+      ? `<div class="empty">${job.status === 'short' ? 'Короткая запись не распознаётся'
+        : 'В записи нет речи'} — расшифровки нет.</div>`
+      : `<div class="transcript" style="white-space:pre-wrap;line-height:1.7">${
+        esc(job.text || '—')}</div>`),
     segments: () => segments.length ? `
       <div class="job-find">
         <input type="search" id="job-find-input" placeholder="Найти в разговоре"
@@ -5193,12 +5255,19 @@ RENDERERS.analytics = {
       <div class="grid cols-6" style="margin-bottom:16px">
         ${kpi('Заданий', Р(num(o.jobs.total), { title: 'Задания за период' }),
               `готово ${Р(o.jobs.completed, { f: ['status:completed'], title: 'Готовые задания' })
-              } · ошибок ${Р(o.jobs.failed, { f: ['status:failed'], title: 'Задания с ошибкой' })}`)}
+              } · ошибок ${Р(o.jobs.failed, { f: ['status:failed'], title: 'Задания с ошибкой' })}${
+              o.jobs.no_speech ? ` · без речи ${Р(o.jobs.no_speech, { f: ['status:no_speech'],
+                title: 'Записи без речи' })}` : ''}${
+              o.jobs.short ? ` · коротких ${Р(o.jobs.short, { f: ['status:short'],
+                title: 'Короткие записи' })}` : ''}`)}
         ${kpi('Успешность', o.jobs.success_rate !== null
-                ? Ч(o.jobs.completed, pct(o.jobs.success_rate, 1),
-                    { f: [ГОТОВЫЕ], title: 'Успешно завершённые задания' }) : '—',
+                ? Ч(o.jobs.completed + (o.jobs.no_speech || 0) + (o.jobs.short || 0),
+                    pct(o.jobs.success_rate, 1),
+                    { f: ['status:completed,no_speech,short'],
+                      title: 'Задания, завершённые без ошибки' }) : '—',
               o.jobs.cached ? `из кеша: ${Р(o.jobs.cached, { f: ['cached'],
-                title: 'Задания, результат которых взят из кеша' })}` : 'доля завершённых')}
+                title: 'Задания, результат которых взят из кеша' })}`
+                : 'доля завершённых без ошибки')}
         ${kpi('Аудио', Ч(o.volume.audio_seconds, `${num(o.volume.audio_hours)} ч`,
                 РАСКРЫТИЕ.звук([], 'Готовые задания: сверху самые длинные записи')),
               `${Ч(o.volume.words, num(o.volume.words), { f: [ГОТОВЫЕ, 'nz:words'],
@@ -5351,13 +5420,17 @@ RENDERERS.analytics = {
       series: [
         { name: 'Готово', values: ts.completed },
         { name: 'Ошибки', values: ts.failed },
+        // Свой ряд, а не часть ошибок: молчащие и короткие записи — итог.
+        ...((ts.empty || []).some(Boolean)
+          ? [{ name: 'Без речи и короткие', values: ts.empty }] : []),
       ],
       onPick: (номер) => {
-        // Оба ряда — в одном списке: статус в нём стоит столбцом.
-        if (!((ts.completed[номер] || 0) + (ts.failed[номер] || 0))) return;
+        // Все ряды — в одном списке: статус в нём стоит столбцом.
+        if (!((ts.completed[номер] || 0) + (ts.failed[номер] || 0)
+              + ((ts.empty || [])[номер] || 0))) return;
         РАСКРЫТИЕ.открыть(qs('#chart-flow'), Drill.spec(РАСКРЫТИЕ.корзина(края, номер), {
-          f: ['status:completed,failed'],
-          title: `Готовые и упавшие задания, созданные ${РАСКРЫТИЕ.когда(края, номер)}` }));
+          f: ['status:completed,failed,no_speech,short'],
+          title: `Завершённые задания, созданные ${РАСКРЫТИЕ.когда(края, номер)}` }));
       },
     });
 
@@ -5385,11 +5458,14 @@ RENDERERS.analytics = {
       parts: [
         { label: 'Готово', value: o.jobs.completed, color: statusColors.ok },
         { label: 'Ошибка', value: o.jobs.failed, color: statusColors.err },
+        { label: 'Без речи', value: o.jobs.no_speech || 0, color: statusColors.nospeech },
+        { label: 'Короткие', value: o.jobs.short || 0, color: statusColors.short },
         { label: 'В работе', value: o.jobs.in_progress, color: statusColors.info },
         { label: 'Отменено', value: o.jobs.cancelled, color: statusColors.idle },
       ],
       onPick: (номер, доля) => РАСКРЫТИЕ.открыть(qs('#chart-status'), Drill.spec(окно, {
-        f: [`status:${['completed', 'failed', 'active', 'cancelled'][номер]}`],
+        f: [`status:${['completed', 'failed', 'no_speech', 'short', 'active',
+          'cancelled'][номер]}`],
         title: `Задания: ${доля.label.toLowerCase()}` })),
     });
 
@@ -5491,11 +5567,19 @@ RENDERERS.analytics = {
       </tr>`; }).join('')}</tbody></table>` : '<div class="empty">Нет данных за период</div>';
 
     const errors = data.errors;
+    // Молчащие и короткие записи — не ошибки, но искать их будут здесь.
+    const неОшибки = errors.no_speech || errors.short ? `<span class="small faint"
+      style="margin-left:8px" title="Итоги без расшифровки — отдельные категории, в ошибки не входят">не ошибки: ${
+      errors.no_speech ? `без речи ${Р(errors.no_speech, { f: ['status:no_speech'],
+        title: 'Записи без речи' })}` : ''}${errors.no_speech && errors.short ? ' · ' : ''}${
+      errors.short ? `коротких ${Р(errors.short, { f: ['status:short'],
+        title: 'Короткие записи' })}` : ''}</span>` : '';
     qs('#errors-body').innerHTML = errors.by_code.length ? `
       <div class="row" style="margin-bottom:10px">
         <span class="chip err">неудач: ${Ч(errors.total_failed, errors.total_failed,
           { f: ['status:failed'], title: 'Задания с ошибкой' })}</span>
-        <span class="chip">доля: ${pct(errors.failure_rate, 2)}</span></div>
+        <span class="chip">доля: ${pct(errors.failure_rate, 2)}</span>
+        ${неОшибки}</div>
       ${errors.by_code.map((e) => {
         // Код «unknown» — отказы без кода: в базе у них пусто.
         const код = ['status:failed', `error:${Drill.val(e.code, 'unknown')}`];
@@ -5510,7 +5594,8 @@ RENDERERS.analytics = {
           Object.entries(e.models).map(([m, c]) => `${esc(m)} (${Р(c,
             { f: [...код, `model:${Drill.val(m, '—')}`],
               title: `Ошибка ${e.code} на модели ${m}` })})`).join(', ')}</div>
-      </div>`; }).join('')}` : '<div class="empty small">Ошибок за период не было</div>';
+      </div>`; }).join('')}` : `<div class="empty small">Ошибок за период не было${
+        неОшибки ? `<div style="margin-top:6px">${неОшибки}</div>` : ''}</div>`;
 
     const eff = data.efficiency;
     qs('#efficiency-body').innerHTML = `<table>
@@ -15270,6 +15355,8 @@ RENDERERS.rescan = {
           <option value="completed">готовые</option>
           <option value="failed">с ошибкой</option>
           <option value="completed,failed">готовые и с ошибкой</option>
+          <option value="no_speech">без речи</option>
+          <option value="short">короткие</option>
         </select>
         <select id="rs-period" style="width:150px" title="За какой срок">
           <option value="">за всё время</option>
@@ -15462,7 +15549,8 @@ RENDERERS.rescan = {
             ${this.выбранные.has(з.id) ? 'checked' : ''}></td>
           <td class="truncate" style="max-width:320px">
             <a href="#" data-open="${esc(з.id)}">${esc(з.filename || з.id)}</a>
-            ${з.error_message ? `<div class="small err">${esc(з.error_message)}</div>` : ''}</td>
+            ${з.error_message ? `<div class="small ${EMPTY_STATUSES.includes(з.status) ? 'faint' : 'err'}">${
+              esc(з.error_message)}</div>` : ''}</td>
           <td>${statusChip(з.status)}</td>
           <td class="small dim truncate" style="max-width:150px">${esc(з.model || '—')}</td>
           <td class="small">${з.media_duration_s ? fmtDur(з.media_duration_s) : '—'}</td>
@@ -15878,6 +15966,8 @@ const ГОЛОС_ВКЛАДКИ = [
 RENDERERS.voice = {
   вкладка: 'summary',
   период: 'week',
+  /** Отбор раздела по добавочному: пусто — все разговоры. */
+  добавочный: '',
 
   /* Раскрытие числа в список записей.
    *
@@ -15889,10 +15979,15 @@ RENDERERS.voice = {
    */
   ЗАПИСИ: ['status:completed', 'no_control'],
 
+  /** Отборы «записей раздела» — с добавочным, если раздел им сужен. */
+  записи() {
+    return [...this.ЗАПИСИ, ...(this.добавочный ? [`agent:${this.добавочный}`] : [])];
+  },
+
   раскрыть(отборы, заголовок, сбой, ещё) {
     return Drill.spec((state.voice || {}).window, Object.assign({
-      base: 'llm', title: заголовок,
-      f: [...this.ЗАПИСИ, ...(сбой ? [] : ['llm_ok']), ...(отборы || [])],
+      base: 'llm', title: this.добавочный ? `${заголовок} · добавочный ${this.добавочный}` : заголовок,
+      f: [...this.записи(), ...(сбой ? [] : ['llm_ok']), ...(отборы || [])],
     }, ещё || {}));
   },
 
@@ -15910,6 +16005,9 @@ RENDERERS.voice = {
           <option value="quarter">за квартал</option>
           <option value="year">за год</option>
           <option value="all">за всё время</option>
+        </select>
+        <select id="vo-agent" style="width:230px" title="Разговоры одного добавочного">
+          <option value="">все добавочные</option>
         </select>
         <button class="btn sm" id="vo-analyze"
           title="Поставить в очередь разбора всё, что модель ещё не смотрела">
@@ -15930,6 +16028,7 @@ RENDERERS.voice = {
       this.draw();
     }));
     qs('#vo-period').addEventListener('change', () => { this.период = qs('#vo-period').value; this.load(); });
+    qs('#vo-agent').addEventListener('change', () => this.отобрать(qs('#vo-agent').value));
     qs('#vo-refresh').addEventListener('click', () => this.load());
     qs('#vo-queue').addEventListener('click', () => go('llmqueue'));
     qs('#vo-analyze').addEventListener('click', (е) => this.analyze(е.currentTarget));
@@ -15952,7 +16051,8 @@ RENDERERS.voice = {
     let свод;
     try {
       const [первая, состояние] = await Promise.all([
-        API.latest('voice', `/api/content/llm?period=${this.период}&part=fast`),
+        API.latest('voice', `/api/content/llm?period=${this.период}&part=fast${
+          this.добавочный ? `&agent=${encodeURIComponent(this.добавочный)}` : ''}`),
         API.latest('voice-status', '/api/llm/status').catch(() => null),
       ]);
       свод = первая;
@@ -15965,9 +16065,32 @@ RENDERERS.voice = {
         esc(err.message || '')}</div>`;
       return;
     }
+    this.выборДобавочного(свод);
     this.drawHead();
     this.draw();
     this.догрузить(свод);
+  },
+
+  /** Сузить раздел до одного добавочного (пусто — снять отбор). */
+  отобрать(номер) {
+    this.добавочный = String(номер || '');
+    const поле = qs('#vo-agent');
+    if (поле) поле.value = this.добавочный;
+    this.load();
+  },
+
+  /** Список добавочных в отборе — из разреза свода (он всегда по всем). */
+  выборДобавочного(свод) {
+    const поле = qs('#vo-agent');
+    if (!поле) return;
+    const люди = свод.agents || [];
+    const есть = люди.some((ч) => ч.agent === this.добавочный);
+    поле.innerHTML = `<option value="">все добавочные</option>${люди.map((ч) =>
+      `<option value="${esc(ч.agent)}">${esc(ч.agent)}${ч.agent_name ? ` — ${esc(ч.agent_name)}` : ''}
+        (${num(ч.records)})</option>`).join('')}${this.добавочный && !есть
+      ? `<option value="${esc(this.добавочный)}">${esc(this.добавочный)}</option>` : ''}`;
+    поле.value = this.добавочный;
+    поле.disabled = !люди.length && !this.добавочный;
   },
 
   /** Вкладки, которым нужна вторая часть свода. */
@@ -15980,7 +16103,8 @@ RENDERERS.voice = {
     let вторая;
     try {
       вторая = await API.latest('voice-lists',
-        `/api/content/llm?period=${this.период}&part=heavy${начало ? `&since=${начало}` : ''}`);
+        `/api/content/llm?period=${this.период}&part=heavy${начало ? `&since=${начало}` : ''}${
+          this.добавочный ? `&agent=${encodeURIComponent(this.добавочный)}` : ''}`);
     } catch (err) {
       if ((err && err.code === 'aborted') || state.voice !== свод) return;
       свод.lists = 'failed';
@@ -16031,7 +16155,8 @@ RENDERERS.voice = {
     const действий = Number(д.actions || 0);
     место.innerHTML = `<div class="grid cols-5" style="margin-bottom:16px">
       ${kpi('Разговоров за период', всего ? Drill.num(num(всего), д.window, {
-          f: this.ЗАПИСИ, title: 'Разговоры за период' }) : num(всего), 'с расшифровкой')}
+          f: this.записи(), title: 'Разговоры за период' }) : num(всего),
+        this.добавочный ? `добавочный ${esc(this.добавочный)}` : 'с расшифровкой')}
       ${kpi('Разобрано моделью', разобрано
           ? this.число(num(разобрано), [], 'Разобрано моделью') : num(разобрано),
         всего ? `${pct(покрытие, 0)} покрытия` : '',
@@ -16099,6 +16224,8 @@ RENDERERS.voice = {
         ${card('Чем закончилось', `исход из списка · ${как}`,
           '<div id="vo-s2" class="chart vo-donut"></div><div id="vo-s2-list"></div>')}
       </div>
+      ${card('По добавочным', `кто говорил и с чем · номер — отобрать раздел, число — разговоры`,
+        '<div id="vo-agents"></div>')}
       ${card('Последние разборы', 'резюме, причина и исход по каждой записи',
         this.таблицаЗаписей((д.rows || []).slice(0, 25)))}`;
     // Причины и исходы — перечнями, а не только графиком: у каждой строки
@@ -16107,7 +16234,8 @@ RENDERERS.voice = {
     // вместо неё стоит исход (и наоборот).
     this.перечень(qs('#vo-s1'), причины, {
       отбор: 'reason', подпись: 'Причина', пусто: 'причины не спрашивались',
-      столбцы: ['when', 'record', 'duration', 'outcome'] });
+      столбцы: ['when', 'record', 'agent', 'duration', 'outcome'] });
+    this.поДобавочным(qs('#vo-agents'), д);
     const цвета = window.Charts.palette();
     // Без исходов кольцу рисовать нечего — об этом скажет перечень под ним.
     if (исходы.length) {
@@ -16124,8 +16252,64 @@ RENDERERS.voice = {
     }
     this.перечень(qs('#vo-s2-list'), исходы, {
       отбор: 'outcome', подпись: 'Исход', пусто: 'исходы не спрашивались', цвета,
-      столбцы: ['when', 'record', 'duration', 'reason'] });
+      столбцы: ['when', 'record', 'agent', 'duration', 'reason'] });
     this.связатьТаблицу(место);
+  },
+
+  /**
+   * Разрез по добавочным: разговоры, разобрано, доля решённых, частые
+   * причина и исход. Номер сужает весь раздел до этого добавочного, число
+   * разговоров раскрывается в их список. Полоса — доля от самого занятого.
+   */
+  поДобавочным(место, д) {
+    if (!место) return;
+    const люди = д.agents || [];
+    if (!люди.length) {
+      место.innerHTML = `<div class="empty small">Добавочных за период нет.
+        <div class="small dim" style="margin-top:6px">Добавочный приходит из журнала звонков: с АТС,
+        полем <span class="mono">internalPhone</span> в <span class="mono">/process-call</span> или
+        полями звонка при загрузке.</div></div>`;
+      return;
+    }
+    const наибольшее = Math.max(1, ...люди.map((ч) => Number(ч.records || 0)));
+    const окно = д.window;
+    const частое = (список) => (список && список.length
+      ? `${esc(список[0].key)} <span class="faint">${num(список[0].records)}</span>` : '<span class="faint">—</span>');
+    место.innerHTML = `<div class="table-wrap"><table class="vo-agents" data-drill-host>
+      <thead><tr><th>Добавочный</th><th>Отдел</th><th class="num">Разговоров</th><th></th>
+        <th class="num">Разобрано</th><th class="num">Решено</th>
+        <th>Частая причина</th><th>Частый исход</th></tr></thead>
+      <tbody>${люди.map((ч) => {
+        const n = Number(ч.records || 0);
+        const свой = [...this.ЗАПИСИ, `agent:${ч.agent}`];
+        const подпись = `${ч.agent}${ч.agent_name ? ` — ${ч.agent_name}` : ''}`;
+        return `<tr class="${ч.agent === this.добавочный ? 'selected' : ''}">
+          <td class="nowrap"><a href="#" data-agent="${esc(ч.agent)}"
+            title="Показать раздел только по этому добавочному">${добавочный(ч)}</a></td>
+          <td class="small dim">${esc(ч.agent_department || '')}</td>
+          <td class="num">${n ? Drill.num(num(n), окно, { base: 'llm', f: свой,
+            title: `Разговоры: добавочный ${подпись}`,
+            cols: ['when', 'record', 'duration', 'reason', 'outcome', 'resolved'] }) : num(n)}</td>
+          <td style="width:120px"><div class="drill-bar"><span style="width:${
+            (100 * n / наибольшее).toFixed(1)}%"></span></div></td>
+          <td class="num">${num(ч.analyzed || 0)}${ч.errors
+            ? ` <span class="chip err" title="Разбор сорвался">${num(ч.errors)}</span>` : ''}</td>
+          <td class="num">${ч.resolved_share === null || ч.resolved_share === undefined ? '—'
+            : pct(Number(ч.resolved_share) / 100, 0)}</td>
+          <td class="small">${частое(ч.reasons)}</td>
+          <td class="small">${частое(ч.outcomes)}</td></tr>`;
+      }).join('')}</tbody></table></div>
+      <div class="small faint" style="margin-top:6px">${Number(д.agents_total || 0) > люди.length
+        ? `Показаны ${num(люди.length)} из ${num(д.agents_total)} самых занятых. ` : ''}${
+        д.without_agent ? `Разговоров без добавочного: ${num(д.without_agent)} — у них нет строки
+          в журнале звонков.` : ''}${this.добавочный
+        ? ` <a href="#" data-agent="">Снять отбор по добавочному</a>` : ''}</div>`;
+    qsa('[data-agent]', место).forEach((к) => {
+      к.onclick = (е) => {
+        е.preventDefault();
+        this.отобрать(к.dataset.agent === this.добавочный ? '' : к.dataset.agent);
+      };
+    });
   },
 
   /** Сколько строк перечня показывать: закрытый список причин длиннее не бывает. */
@@ -16205,13 +16389,14 @@ RENDERERS.voice = {
           : '<div class="empty">Причины или исходы у модели не спрашивались.</div>')}
       ${card('Цитаты, по которым модель решила', 'проверка на доверие: видно, за что зацепилась модель',
         `<div class="table-wrap"><table>
-          <thead><tr><th style="width:170px">Запись</th>
+          <thead><tr><th style="width:170px">Запись</th><th style="width:150px">Добавочный</th>
             <th style="width:170px">Причина</th><th>Цитата</th>
             <th style="width:170px">Исход</th><th>Цитата</th></tr></thead>
           <tbody>${строки.filter((с) => с.reason_quote || с.outcome_quote).slice(0, 30)
             .map((с) => `<tr>
               <td class="small truncate" style="max-width:170px">
                 <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
+              <td class="small nowrap">${добавочный(с)}</td>
               <td class="small">${esc(с.reason || '—')}</td>
               <td class="small dim">${esc(с.reason_quote || '')}</td>
               <td class="small">${esc(с.outcome || '—')}</td>
@@ -16229,11 +16414,13 @@ RENDERERS.voice = {
       `${num(всего)} за период — то, что обещали сделать` +
         (всего > действия.length ? ` · показаны последние ${num(действия.length)}` : ''),
       действия.length ? `<div class="table-wrap"><table>
-        <thead><tr><th style="width:150px">Когда</th><th style="width:140px">Кто</th>
+        <thead><tr><th style="width:150px">Когда</th><th style="width:170px">Добавочный</th>
+          <th style="width:140px">Кто</th>
           <th>Что обещано</th><th style="width:140px">Срок</th>
           <th style="width:200px">Запись</th></tr></thead>
         <tbody>${действия.map((а) => `<tr>
           <td class="small faint nowrap">${fmtTime(а.created_at)}</td>
+          <td class="small nowrap">${добавочный(а)}</td>
           <td class="small">${esc(а.who || '—')}</td>
           <td class="small">${esc(а.what || а.text || '')}</td>
           <td class="small dim">${esc(а.when || а.due || '—')}</td>
@@ -16261,11 +16448,12 @@ RENDERERS.voice = {
       ${строки.length ? card('Разговоры со срабатываниями', '',
         `<div class="table-wrap"><table>
           <thead><tr><th style="width:150px">Когда</th><th style="width:220px">Запись</th>
-            <th>Сработало</th></tr></thead>
+            <th style="width:170px">Добавочный</th><th>Сработало</th></tr></thead>
           <tbody>${строки.slice(0, 100).map((с) => `<tr>
               <td class="small faint nowrap">${fmtTime(с.created_at)}</td>
               <td class="small truncate" style="max-width:220px">
                 <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
+              <td class="small nowrap">${добавочный(с)}</td>
               <td><div class="chips">${сработавшие(с)
                 .map((т) => `<span class="chip warn">${esc(т.label || т.id)}</span>`).join('')}</div></td>
             </tr>`).join('')}</tbody></table></div>`) : ''}`;
@@ -16339,12 +16527,14 @@ RENDERERS.voice = {
     if (!строки.length) return '<div class="empty">Ничего не разобрано.</div>';
     return `<div class="table-wrap"><table>
       <thead><tr><th style="width:140px">Когда</th><th style="width:200px">Запись</th>
+        <th style="width:170px">Добавочный</th>
         <th>Резюме</th><th style="width:150px">Причина</th>
         <th style="width:150px">Исход</th><th style="width:90px">Решено</th></tr></thead>
       <tbody>${строки.map((с) => `<tr>
         <td class="small faint nowrap">${fmtTime(с.created_at)}</td>
         <td class="small truncate" style="max-width:200px">
           <a href="#" data-open="${esc(с.job_id)}">${esc(с.filename || с.job_id)}</a></td>
+        <td class="small nowrap">${добавочный(с)}</td>
         <td class="small">${esc(с.summary || '')}
           ${с.error ? `<div class="err small">${esc(с.error)}</div>` : ''}</td>
         <td class="small">${esc(с.reason || '—')}</td>
@@ -16393,6 +16583,869 @@ function полоса_доли(доля, вид) {
 
 
 // ==========================================================================
+// Голосовая аналитика за период: день, месяц, квартал, год
+// ==========================================================================
+
+/**
+ * Четыре раздела — один отчёт с разным масштабом: как у периодных отчётов
+ * систем речевой аналитики (Contact Lens, NICE, Genesys, Calabrio), где
+ * меняются период, шаг по времени и база сравнения, а набор блоков общий.
+ * Сервер считает всё группами (`GET /api/voice/period`); здесь — подача.
+ *
+ * Отличия масштабов: у дня шаг — час, базы — вчера и тот же день неделей
+ * раньше, карты недели нет; у месяца шаг — день; у квартала — неделя, есть
+ * календарь дней; у года — месяц, календарь и ряды причин по месяцам.
+ */
+const ГОЛОС_ПЕРИОД = {
+  day: { шаг: 'по часам', кто: 'дня', поле: 'date', ряды: 'часам' },
+  month: { шаг: 'по дням', кто: 'месяца', поле: 'month', ряды: 'дням' },
+  quarter: { шаг: 'по неделям', кто: 'квартала', поле: 'quarter', ряды: 'неделям' },
+  year: { шаг: 'по месяцам', кто: 'года', поле: 'year', ряды: 'месяцам' },
+};
+
+/**
+ * Изменение к базе одной строкой: «▲ 8 %» или «▼ 3,1 п. п.».
+ *
+ * Цвет — по смыслу показателя, а не по знаку: рост пропущенных — плохо,
+ * рост решённых — хорошо, а у объёма хорошего и плохого нет — он без
+ * цвета (так же делает Contact Lens). Изменение доли, которое могло
+ * получиться случайно (`значимо === false`), не красится и помечено «≈».
+ */
+function сдвигКБазе(сейчас, было, вид = {}) {
+  if (сейчас === null || сейчас === undefined || было === null || было === undefined) return '';
+  const доля = Boolean(вид.доля);
+  const разница = доля ? (сейчас - было) * 100 : (было ? (сейчас - было) / Math.abs(было) : null);
+  if (разница === null || !Number.isFinite(разница)) return '';
+  const стрелка = разница > 0 ? '▲' : разница < 0 ? '▼' : '•';
+  const величина = доля ? `${num(Math.abs(разница), 1)} п. п.` : `${num(Math.abs(разница) * 100, 0)} %`;
+  let класс = '';
+  if (вид.лучше && разница !== 0 && вид.значимо !== false) {
+    класс = (разница > 0) === (вид.лучше === 'up') ? 'good' : 'bad';
+  }
+  const случайно = вид.значимо === false && доля && разница !== 0;
+  return `<span class="vp-delta ${класс}" title="${esc(вид.подсказка || '')}${случайно
+    ? ' — изменение в пределах случайного' : ''}">${случайно ? '≈ ' : ''}${стрелка} ${величина}</span>`;
+}
+
+/** Значимо ли изменение доли (тот же критерий, что на сервере). */
+function значимаДоля(а, n1, б, n2) {
+  if (!n1 || !n2 || n1 < 20 || n2 < 20) return false;
+  const p1 = а / n1, p2 = б / n2, p = (а + б) / (n1 + n2);
+  const разброс = Math.sqrt(p * (1 - p) * (1 / n1 + 1 / n2));
+  return разброс > 0 && Math.abs((p1 - p2) / разброс) >= 1.96;
+}
+
+function периодГолоса(масштаб) {
+  const про = ГОЛОС_ПЕРИОД[масштаб];
+  return {
+    масштаб,
+    /** Любой день периода (ГГГГ-ММ-ДД); пусто — текущий период. */
+    дата: '',
+    добавочный: '',
+    отдел: '',
+    /** Номер базы сравнения в `baselines`. */
+    база: 0,
+
+    async render(root) {
+      root.innerHTML = `
+        <div class="settings-toolbar vp-toolbar">
+          <button class="ghost sm" id="vp-prev" title="Предыдущий период" aria-label="Предыдущий период">◀</button>
+          <b id="vp-label" class="vp-label">…</b>
+          <button class="ghost sm" id="vp-next" title="Следующий период" aria-label="Следующий период">▶</button>
+          <span id="vp-picker"></span>
+          <button class="ghost sm" id="vp-today" title="К текущему периоду">Текущий</button>
+          <select id="vp-base" style="width:240px" title="С чем сравнивать"></select>
+          <select id="vp-dept" style="width:200px" title="Только отдел (по справочнику сотрудников)">
+            <option value="">все отделы</option></select>
+          <select id="vp-agent" style="width:220px" title="Только добавочный">
+            <option value="">все добавочные</option></select>
+          <span class="spacer"></span>
+          <button class="ghost sm" id="vp-csv" title="Сводка периода в CSV">CSV</button>
+          <button class="ghost sm" id="vp-print" title="Распечатать или сохранить в PDF">Печать</button>
+          <button class="ghost sm" id="vp-refresh">Обновить</button>
+        </div>
+        <div id="vp-body"><div class="empty">Загрузка…</div></div>`;
+      qs('#vp-prev').addEventListener('click', () => this.перейти((this.данные || {}).nav, 'prev'));
+      qs('#vp-next').addEventListener('click', () => this.перейти((this.данные || {}).nav, 'next'));
+      qs('#vp-today').addEventListener('click', () => { this.дата = ''; this.load(); });
+      qs('#vp-refresh').addEventListener('click', () => this.load());
+      qs('#vp-print').addEventListener('click', () => window.print());
+      qs('#vp-csv').addEventListener('click', () => this.csv());
+      qs('#vp-base').addEventListener('change', () => {
+        this.база = Number(qs('#vp-base').value) || 0;
+        // База меняет только подачу: счёт на сервере уже есть для обеих.
+        this.draw();
+      });
+      qs('#vp-dept').addEventListener('change', () => { this.отдел = qs('#vp-dept').value; this.load(); });
+      qs('#vp-agent').addEventListener('change', () => { this.добавочный = qs('#vp-agent').value; this.load(); });
+      this.выборПериода();
+      await this.load();
+    },
+
+    перейти(навигация, куда) {
+      if (!навигация || !навигация[куда]) return;
+      this.дата = навигация[куда];
+      this.load();
+    },
+
+    /** Выбор периода: день — календарём, месяц — месяцем, квартал и год — списком. */
+    выборПериода() {
+      const место = qs('#vp-picker');
+      if (!место) return;
+      const сегодня = new Date();
+      const год = сегодня.getFullYear();
+      if (масштаб === 'day') {
+        место.innerHTML = '<input type="date" id="vp-date" style="width:150px" title="День">';
+      } else if (масштаб === 'month') {
+        место.innerHTML = '<input type="month" id="vp-date" style="width:150px" title="Месяц">';
+      } else if (масштаб === 'quarter') {
+        const варианты = [];
+        for (let г = год; г >= год - 5; г -= 1) {
+          for (let к = 4; к >= 1; к -= 1) {
+            варианты.push(`<option value="${г}-${String((к - 1) * 3 + 1).padStart(2, '0')}-01">${
+              ['I', 'II', 'III', 'IV'][к - 1]} квартал ${г}</option>`);
+          }
+        }
+        место.innerHTML = `<select id="vp-date" style="width:170px" title="Квартал">${варианты.join('')}</select>`;
+      } else {
+        const варианты = [];
+        for (let г = год; г >= год - 10; г -= 1) варианты.push(`<option value="${г}-01-01">${г} год</option>`);
+        место.innerHTML = `<select id="vp-date" style="width:130px" title="Год">${варианты.join('')}</select>`;
+      }
+      qs('#vp-date').addEventListener('change', (е) => {
+        const значение = е.target.value;
+        if (!значение) return;
+        this.дата = масштаб === 'month' ? `${значение}-01` : значение;
+        this.load();
+      });
+    },
+
+    адрес(часть) {
+      const п = new URLSearchParams({ scale: масштаб });
+      if (this.дата) п.set('date', this.дата);
+      if (this.добавочный) п.set('agent', this.добавочный);
+      if (this.отдел) п.set('department', this.отдел);
+      if (часть) п.set('part', часть);
+      return `/api/voice/period?${п}`;
+    },
+
+    async load() {
+      const место = qs('#vp-body');
+      let д;
+      try {
+        д = await API.latest(`vp-${масштаб}`, this.адрес('fast'));
+      } catch (err) {
+        if (err.code === 'aborted') return;
+        if (место) место.innerHTML = `<div class="empty">Отчёт недоступен: ${esc(err.message || '')}</div>`;
+        return;
+      }
+      this.данные = д;
+      this.списки = null;
+      if (this.база >= (д.baselines || []).length) this.база = 0;
+      this.шапка();
+      this.draw();
+      if (!д.future && д.totals) this.догрузить(д);
+    },
+
+    /** Трекеры, скоркарта и обязательства — второй частью, когда посчитаются. */
+    async догрузить(д) {
+      let ответ;
+      try {
+        ответ = await API.latest(`vp-${масштаб}-lists`, this.адрес('heavy'));
+      } catch (err) {
+        if ((err && err.code === 'aborted') || this.данные !== д) return;
+        this.списки = { failed: true };
+        this.drawLists();
+        return;
+      }
+      if (this.данные !== д) return;
+      this.списки = ответ.lists || {};
+      this.drawLists();
+    },
+
+    шапка() {
+      const д = this.данные || {};
+      if (!qs('#vp-label')) return;
+      qs('#vp-label').textContent = д.label || '—';
+      qs('#vp-prev').disabled = !(д.nav && д.nav.prev);
+      qs('#vp-next').disabled = !(д.nav && д.nav.next);
+      qs('#vp-today').disabled = Boolean(д.nav && д.period && д.nav.today === д.period.date);
+      const поле = qs('#vp-date');
+      if (поле && д.period) {
+        поле.value = масштаб === 'month' ? д.period.date.slice(0, 7) : д.period.date;
+      }
+      qs('#vp-base').innerHTML = (д.baselines || []).map((б, номер) =>
+        `<option value="${номер}"${номер === this.база ? ' selected' : ''}>сравнивать: ${esc(б.label)}</option>`).join('')
+        || '<option value="0">сравнивать не с чем</option>';
+      const варианты = д.options || {};
+      const отделы = варианты.departments || [];
+      qs('#vp-dept').innerHTML = `<option value="">все отделы</option>${отделы.map((о) =>
+        `<option value="${esc(о)}">${esc(о)}</option>`).join('')}${this.отдел && !отделы.includes(this.отдел)
+        ? `<option value="${esc(this.отдел)}">${esc(this.отдел)}</option>` : ''}`;
+      qs('#vp-dept').value = this.отдел;
+      qs('#vp-dept').disabled = !отделы.length && !this.отдел;
+      const люди = варианты.agents || [];
+      qs('#vp-agent').innerHTML = `<option value="">все добавочные</option>${люди.map((ч) =>
+        `<option value="${esc(ч.agent)}">${esc(ч.agent)}${ч.agent_name ? ` — ${esc(ч.agent_name)}` : ''}</option>`).join('')}${
+        this.добавочный && !люди.some((ч) => ч.agent === this.добавочный)
+          ? `<option value="${esc(this.добавочный)}">${esc(this.добавочный)}</option>` : ''}`;
+      qs('#vp-agent').value = this.добавочный;
+      qs('#vp-agent').disabled = !люди.length && !this.добавочный;
+    },
+
+    /** Описание раскрытия: окно периода и отбор раздела плюс свои условия. */
+    раскрыть(что, окно) {
+      const д = this.данные || {};
+      // У журнала звонков нет «контрольных прогонов» — там этот отбор лишний.
+      const свои = (д.drill || ['no_control'])
+        .filter((отбор) => !((что || {}).base === 'calls' && отбор === 'no_control'));
+      return Drill.spec(окно || д.window, Object.assign({}, что, {
+        f: [...свои, ...((что || {}).f || [])],
+        title: `${(что || {}).title || 'Записи'} · ${д.label || ''}`,
+      }));
+    },
+
+    число(разметка, что, окно) {
+      return Drill.num(разметка, null, this.раскрыть(что, окно));
+    },
+
+    draw() {
+      const место = qs('#vp-body');
+      const д = this.данные;
+      if (!место || !д) return;
+      if (д.future) {
+        место.innerHTML = `<div class="empty">Период «${esc(д.label)}» ещё не начался.</div>`;
+        return;
+      }
+      const т = д.totals.current;
+      const база = (д.baselines || [])[this.база] || null;
+      const б = база ? д.totals[база.id] : null;
+      if (!т.jobs) {
+        место.innerHTML = `${this.баннер(д)}<div class="empty">За ${esc(д.label)} записей нет.
+          <div class="small dim" style="margin-top:6px">Выберите другой период стрелками или снимите отбор.</div></div>`;
+        return;
+      }
+      место.innerHTML = `
+        ${this.баннер(д)}
+        ${card('Коротко о периоде', 'главное из чисел ниже — без языковой модели',
+          `<ul class="vp-summary">${(д.summary || []).map((ф) => `<li>${esc(ф)}</li>`).join('')}</ul>`)}
+        <div class="grid cols-4 vp-kpis">${this.плитки(т, б, база)}</div>
+        <div class="grid cols-3 vp-row">
+          <div class="vp-wide">${card('Нагрузка ' + про.шаг, база
+            ? `разговоры с речью; пунктир — ${база.label}` : 'разговоры с речью',
+            '<div id="vp-load" class="chart"></div>')}</div>
+          ${card('Из чего сложился период', 'все записи: с речью, без речи, короткие, ошибки',
+            '<div id="vp-mix"></div>')}
+        </div>
+        <div class="grid cols-2 vp-row">
+          ${card('Качество ' + про.шаг, 'решено при обращении, негатив, балл оператора — в процентах и баллах',
+            '<div id="vp-quality" class="chart"></div>')}
+          ${card('Состав записей ' + про.шаг, 'без речи и короткие — не ошибки, но их видно',
+            '<div id="vp-stack" class="chart"></div>')}
+        </div>
+        <div class="grid cols-2 vp-row">
+          ${масштаб === 'day' ? card('Направления', 'входящие, исходящие, внутренние', '<div id="vp-dir"></div>')
+            : card('Когда звонят', 'разговоры по дням недели и часам · клетка — список',
+              '<div id="vp-week" class="chart"></div>')}
+          ${card(масштаб === 'day' ? 'Тональность' : 'Тональность и направления',
+            'доля разговоров по оценке тональности · сектор — список',
+            `<div id="vp-tone"></div>${масштаб === 'day' ? '' : '<div id="vp-dir" style="margin-top:16px"></div>'}`)}
+        </div>
+        ${масштаб === 'quarter' || масштаб === 'year' ? card('Календарь',
+          'разговоры по дням периода: выходные, праздники, сбои сбора · день — список',
+          '<div id="vp-cal" class="chart"></div>') : ''}
+        <div class="grid cols-2 vp-row">
+          ${card('Причины обращений', 'Парето: столбцы — разговоры, линия — накопленная доля, пунктир — 80 %',
+            '<div id="vp-pareto" class="chart"></div>')}
+          ${card('Что изменилось', база ? `доли причин против «${база.label}»` : 'сравнивать не с чем',
+            '<div id="vp-movers"></div>')}
+        </div>
+        <div class="grid cols-3 vp-row">
+          ${card('Чем закончилось', база ? `исходы: сейчас и ${база.label}` : 'исходы',
+            '<div id="vp-outcomes"></div>')}
+          <div class="vp-wide">${card('Причина × исход', 'клетка — разговоры с этой причиной и этим исходом и их доля в причине',
+            '<div id="vp-pairs"></div>')}</div>
+        </div>
+        ${масштаб === 'day' ? '' : card(`Причины по ${про.ряды}`, 'как менялась каждая из главных причин внутри периода',
+          '<div id="vp-reason-series" class="vp-multiples"></div>')}
+        ${card('Сотрудники', `рейтинг ${про.кто} по добавочным · число — разговоры · номер — отобрать`,
+          '<div id="vp-agents"></div>')}
+        <div class="grid cols-2 vp-row">
+          ${card('Решено и негатив по сотрудникам', 'точка — добавочный, размер — разговоры; линии — медианы',
+            '<div id="vp-scatter" class="chart"></div>')}
+          ${card('Отделы', 'по справочнику сотрудников', '<div id="vp-depts"></div>')}
+        </div>
+        ${т.telephony && т.telephony.calls ? `<div class="grid cols-2 vp-row">
+          ${card('Звонки по журналу', 'отвеченные и пропущенные входящие ' + про.шаг,
+            '<div id="vp-calls" class="chart"></div>')}
+          ${card('Телефония', 'из журнала звонков', `<div id="vp-tel">${this.телефония(т.telephony, б && б.telephony)}</div>`)}
+        </div>` : ''}
+        <div id="vp-lists"></div>`;
+      this.графики(д, т, б, база);
+      this.drawLists();
+    },
+
+    баннер(д) {
+      if (д.complete) return '';
+      const база = (д.baselines || [])[this.база];
+      return `<div class="finding info vp-banner">Период ещё идёт: прошло ${pct(д.elapsed || 0, 0)}.
+        ${база ? `Сравнение — с тем же отрезком от начала периода «${esc(база.label)}», а не с ним целиком.` : ''}</div>`;
+    },
+
+    /** Плитки: значение, изменение к базе, искровая линия по корзинам. */
+    плитки(т, б, база) {
+      const с = т.content || {}, сб = (б || {}).content || {};
+      const л = т.llm || {}, лб = (б || {}).llm || {};
+      const ряд = this.данные.series || {};
+      const плитка = (имя, значение, сдвиг, низ, искра) => `<div class="kpi vp-kpi">
+        <div class="kpi-label">${esc(имя)}</div>
+        <div class="kpi-value">${значение}</div>
+        <div class="kpi-sub">${сдвиг || ''}${низ ? ` <span class="faint">${низ}</span>` : ''}</div>
+        ${искра ? `<div class="vp-spark" data-spark="${esc(JSON.stringify(искра))}"></div>` : ''}</div>`;
+      const n = (v) => (v === null || v === undefined ? 0 : v);
+      const к_базе = база ? `к «${база.label}»` : '';
+      const список = [
+        плитка('Разговоров с речью', т.completed ? this.число(num(т.completed), {
+          f: ['status:completed'], title: 'Разговоры с речью' }) : '0',
+        б ? сдвигКБазе(т.completed, б.completed, { подсказка: к_базе }) : '',
+        б ? `было ${num(б.completed)}` : '', ряд.completed),
+        плитка('Без речи и короткие', т.empty ? this.число(num(т.empty), {
+          f: ['status:no_speech,short'], title: 'Записи без речи и короткие' }) : '0',
+        б ? сдвигКБазе(т.empty_share, б.empty_share, { доля: true, лучше: 'down',
+          значимо: значимаДоля(т.empty, т.jobs, б.empty, б.jobs), подсказка: к_базе }) : '',
+        `${pct(т.empty_share, 0)} всех · без речи ${num(т.no_speech)}, коротких ${num(т.short)}`, ряд.empty),
+        плитка('Ошибок распознавания', т.failed ? this.число(num(т.failed), {
+          f: ['status:failed'], title: 'Записи с ошибкой' }) : '0',
+        б ? сдвигКБазе(т.failed_share, б.failed_share, { доля: true, лучше: 'down',
+          значимо: значимаДоля(т.failed, т.jobs, б.failed, б.jobs), подсказка: к_базе }) : '',
+        pct(т.failed_share, 1), ряд.failed),
+        плитка('Часов разговоров', `${num(т.talk_hours, 1)} ч`,
+          б ? сдвигКБазе(т.talk_hours, б.talk_hours, { подсказка: к_базе }) : '',
+          т.median_duration_s ? `медиана ${fmtDur(т.median_duration_s)}, 90 % — до ${fmtDur(т.p90_duration_s)}` : '',
+          ряд.talk_hours),
+        плитка('Решено при обращении', л.resolved_share === null || л.resolved_share === undefined ? '—'
+          : this.число(pct(л.resolved_share, 0), { base: 'llm', f: ['status:completed', 'resolved:1'],
+            title: 'Вопрос решён при обращении' }),
+        б ? сдвигКБазе(л.resolved_share, лб.resolved_share, { доля: true, лучше: 'up',
+          значимо: значимаДоля(n(л.resolved_yes), n(л.resolved_known), n(лб.resolved_yes), n(лб.resolved_known)),
+          подсказка: к_базе }) : '',
+        `по мнению модели · из ${num(л.resolved_known || 0)}`, ряд.resolved_share),
+        плитка('Разобрано моделью', л.analyzed ? this.число(num(л.analyzed), { base: 'llm',
+          f: ['status:completed', 'llm_ok'], title: 'Разобрано моделью' }) : '0',
+        б ? сдвигКБазе(л.coverage, лб.coverage, { доля: true, лучше: 'up', подсказка: к_базе }) : '',
+        `${pct(л.coverage, 0)} покрытия`, ряд.analyzed),
+        плитка('Негативных разговоров', с.negative_share === null || с.negative_share === undefined ? '—'
+          : this.число(pct(с.negative_share, 0), { base: 'content', f: ['status:completed', 'negative'],
+            title: 'Разговоры с отрицательной тональностью' }),
+        б ? сдвигКБазе(с.negative_share, сб.negative_share, { доля: true, лучше: 'down',
+          значимо: значимаДоля(n(с.negative), n(с.scored), n(сб.negative), n(сб.scored)), подсказка: к_базе }) : '',
+        `позитивных ${pct(с.positive_share, 0)}`, ряд.negative_share),
+        плитка('Балл оператора', с.agent_score === null || с.agent_score === undefined ? '—' : num(с.agent_score, 0),
+          б && сб.agent_score !== null && сб.agent_score !== undefined
+            ? сдвигКБазе(с.agent_score / 100, сб.agent_score / 100, { доля: true, лучше: 'up', подсказка: к_базе })
+              .replace(' п. п.', ' б.') : '',
+          'из 100, по разбору разговора', ряд.agent_score),
+        плитка('Соблюдение скрипта', с.compliance === null || с.compliance === undefined ? '—' : pct(с.compliance, 0),
+          б ? сдвигКБазе(с.compliance, сб.compliance, { доля: true, лучше: 'up', подсказка: к_базе }) : '',
+          'среднее по разговорам', ряд.compliance),
+        плитка('Повторные обращения', с.repeat_share === null || с.repeat_share === undefined ? '—'
+          : this.число(pct(с.repeat_share, 0), { base: 'content', f: ['status:completed', 'repeat'],
+            title: 'Повторные обращения' }),
+        б ? сдвигКБазе(с.repeat_share, сб.repeat_share, { доля: true, лучше: 'down',
+          значимо: значимаДоля(n(с.repeat), n(с.records), n(сб.repeat), n(сб.records)), подсказка: к_базе }) : '',
+        'клиент звонит не в первый раз', ряд.repeat_share),
+        плитка('Раздражение клиента', с.frustrated_share === null || с.frustrated_share === undefined ? '—'
+          : this.число(pct(с.frustrated_share, 0), { base: 'content', f: ['status:completed', 'frustrated'],
+            title: 'Разговоры с раздражением клиента' }),
+        б ? сдвигКБазе(с.frustrated_share, сб.frustrated_share, { доля: true, лучше: 'down',
+          значимо: значимаДоля(n(с.frustrated), n(с.records), n(сб.frustrated), n(сб.records)), подсказка: к_базе }) : '',
+        с.profanity_share !== null && с.profanity_share !== undefined ? `мат — ${pct(с.profanity_share, 1)}` : '',
+        null),
+        плитка('Нарушения оператора', с.violation_share === null || с.violation_share === undefined ? '—'
+          : this.число(pct(с.violation_share, 0), { base: 'content', f: ['status:completed', 'violation'],
+            title: 'Разговоры с нарушениями оператора' }),
+        б ? сдвигКБазе(с.violation_share, сб.violation_share, { доля: true, лучше: 'down',
+          значимо: значимаДоля(n(с.violation_records), n(с.records), n(сб.violation_records), n(сб.records)),
+          подсказка: к_базе }) : '',
+        с.nps_index !== null && с.nps_index !== undefined ? `индекс NPS (оценка) ${num(с.nps_index, 0)}` : '',
+        null),
+      ];
+      return список.join('');
+    },
+
+    телефония(т, б) {
+      const строка = (имя, значение, сдвиг) => `<tr><td class="dim">${имя}</td>
+        <td class="num">${значение}</td><td class="num">${сдвиг || ''}</td></tr>`;
+      return `<table class="vp-tel">${[
+        строка('Звонков', this.число(num(т.calls), { base: 'calls', f: [], title: 'Звонки' }),
+          б ? сдвигКБазе(т.calls, б.calls) : ''),
+        строка('Отвечено', `${num(т.answered)} · ${pct(т.answer_share, 0)}`,
+          б ? сдвигКБазе(т.answer_share, б.answer_share, { доля: true, лучше: 'up' }) : ''),
+        строка('Пропущено входящих', т.missed ? this.число(`${num(т.missed)} · ${pct(т.missed_share, 0)}`,
+          { base: 'calls', f: ['direction:входящий', 'unanswered'], title: 'Пропущенные входящие' }) : '0',
+          б ? сдвигКБазе(т.missed_share, б.missed_share, { доля: true, лучше: 'down',
+            значимо: значимаДоля(т.missed, т.inbound, б.missed, б.inbound) }) : ''),
+        строка('Среднее ожидание ответа', т.avg_wait_s === null ? '—' : `${num(т.avg_wait_s, 0)} с`,
+          б && б.avg_wait_s !== null ? сдвигКБазе(т.avg_wait_s, б.avg_wait_s, { лучше: 'down' }) : ''),
+        строка('Входящих / исходящих / внутренних', `${num(т.inbound)} / ${num(т.outbound)} / ${num(т.internal)}`, ''),
+      ].join('')}</table>`;
+    },
+
+    графики(д, т, б, база) {
+      const C = window.Charts;
+      const ряд = д.series || {};
+      const края = ряд.edges || [];
+      const цвета = C.status();
+      const корзина = (номер) => ({ since: края[номер], until: края[номер + 1] });
+      const когда = (номер) => `${ряд.labels[номер]}`;
+      // Искровые линии на плитках.
+      qsa('.vp-spark').forEach((узел) => {
+        try { C.spark(узел, JSON.parse(узел.dataset.spark), { width: 150, height: 26 }); } catch (e) { /* пусто */ }
+      });
+      const линии = [];
+      (д.baselines || []).forEach((б_, номер) => {
+        const значения = (ряд.baselines || {})[б_.id];
+        if (значения) {
+          линии.push({ name: б_.label, values: значения.map((v, i) => (i < ряд.labels.length ? v : null))
+            .slice(0, ряд.labels.length), dash: номер ? '2 4' : '6 4' });
+        }
+      });
+      if (qs('#vp-load')) {
+        C.combo(qs('#vp-load'), {
+          labels: ряд.labels, height: 240,
+          bars: [{ name: 'Разговоры с речью', values: ряд.completed, color: 'ok' }],
+          lines: линии,
+          pickHint: 'щелчок — разговоры за этот промежуток',
+          onPick: (номер) => РАСКРЫТИЕ.открыть(qs('#vp-load'), this.раскрыть({
+            f: ['status:completed'], title: `Разговоры: ${когда(номер)}` }, корзина(номер))),
+        });
+      }
+      if (qs('#vp-mix')) {
+        const доли = [
+          { label: 'С речью', value: т.completed, color: цвета.ok, s: 'completed' },
+          { label: 'Без речи', value: т.no_speech, color: цвета.nospeech, s: 'no_speech' },
+          { label: 'Короткие', value: т.short, color: цвета.short, s: 'short' },
+          { label: 'Ошибки', value: т.failed, color: цвета.err, s: 'failed' },
+          { label: 'Отменено', value: т.cancelled, color: цвета.idle, s: 'cancelled' },
+          { label: 'В работе', value: т.active, color: цвета.info, s: 'active' },
+        ];
+        C.donut(qs('#vp-mix'), { parts: доли, size: 150, centerLabel: 'записей',
+          onPick: (номер, доля) => РАСКРЫТИЕ.открыть(qs('#vp-mix'), this.раскрыть({
+            f: [`status:${доля.s}`], title: `Записи: ${доля.label.toLowerCase()}` })) });
+      }
+      if (qs('#vp-quality')) {
+        const проценты = (значения) => (значения || []).map((v) => (v === null || v === undefined ? null : v * 100));
+        C.line(qs('#vp-quality'), {
+          labels: ряд.labels, height: 220, yMin: 0,
+          series: [
+            { name: 'Решено, %', values: проценты(ряд.resolved_share), color: цвета.ok },
+            { name: 'Негатив, %', values: проценты(ряд.negative_share), color: цвета.err },
+            { name: 'Балл оператора', values: ряд.agent_score, color: цвета.info },
+          ],
+        });
+      }
+      if (qs('#vp-stack')) {
+        C.bars(qs('#vp-stack'), {
+          labels: ряд.labels, height: 220, showValues: false,
+          series: [
+            { name: 'С речью', values: ряд.completed, color: 'ok' },
+            { name: 'Без речи', values: ряд.no_speech, color: 'nospeech' },
+            { name: 'Короткие', values: ряд.short, color: 'short' },
+            { name: 'Ошибки', values: ряд.failed, color: 'err' },
+          ],
+          pickHint: 'щелчок — записи этого промежутка',
+          onPick: (номер, кусок) => {
+            const статус = ['completed', 'no_speech', 'short', 'failed'][(кусок || {}).series || 0];
+            РАСКРЫТИЕ.открыть(qs('#vp-stack'), this.раскрыть({ f: [`status:${статус}`],
+              title: `${(кусок || {}).name || 'Записи'}: ${когда(номер)}` }, корзина(номер)));
+          },
+        });
+      }
+      if (qs('#vp-week') && д.week_map) {
+        const дни = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+        C.grid(qs('#vp-week'), {
+          rows: дни, cols: Array.from({ length: 24 }, (_, ч) => String(ч).padStart(2, '0')),
+          // Ноль — «никто не звонил», а не самый светлый оттенок шкалы.
+          values: д.week_map.map((ряд) => ряд.map((v) => (v ? v : null))), canPick: (r, c, v) => v > 0,
+          pickHint: 'щелчок — разговоры этого часа недели',
+          onPick: (r, клетка) => РАСКРЫТИЕ.открыть(qs('#vp-week'), this.раскрыть({
+            f: ['status:completed', `weekday:${клетка.row}`, `hour:${клетка.col}`],
+            title: `Разговоры: ${дни[клетка.row]}, ${String(клетка.col).padStart(2, '0')}:00` })),
+        });
+      }
+      if (qs('#vp-cal') && д.calendar) {
+        const значения = {};
+        д.calendar.forEach((день) => { значения[день.date] = день.completed; });
+        const конец = new Date((д.period.end - 1) * 1000);
+        const до = new Date(конец.getFullYear(), конец.getMonth(), конец.getDate() + 1);
+        const ключ = (дата) => `${дата.getFullYear()}-${String(дата.getMonth() + 1).padStart(2, '0')}-${String(дата.getDate()).padStart(2, '0')}`;
+        C.calendar(qs('#vp-cal'), {
+          from: д.period.date, to: ключ(до), values: значения, cell: масштаб === 'year' ? 16 : 26,
+          pickHint: 'щелчок — разговоры этого дня',
+          onPick: (дата) => {
+            const начало = new Date(`${дата}T00:00:00`);
+            const следующий = new Date(начало.getFullYear(), начало.getMonth(), начало.getDate() + 1);
+            РАСКРЫТИЕ.открыть(qs('#vp-cal'), this.раскрыть({ f: ['status:completed'],
+              title: `Разговоры ${начало.toLocaleDateString('ru-RU')}` },
+            { since: начало.getTime() / 1000, until: следующий.getTime() / 1000 }));
+          },
+        });
+      }
+      if (qs('#vp-dir')) {
+        const направления = (д.directions || {}).current || {};
+        const ключи = Object.keys(направления).sort((а, бб) => направления[бб] - направления[а]);
+        C.donut(qs('#vp-dir'), {
+          parts: ключи.map((к) => ({ label: к === '—' ? 'не определено' : к, value: направления[к], key: к })),
+          size: 140, centerLabel: 'разговоров',
+          onPick: (номер, доля) => РАСКРЫТИЕ.открыть(qs('#vp-dir'), this.раскрыть({
+            f: ['status:completed', `direction:${доля.key === '—' ? '' : доля.key}`],
+            title: `Разговоры: ${доля.label}` })),
+        });
+      }
+      if (qs('#vp-tone')) {
+        const с = т.content || {};
+        C.stacked(qs('#vp-tone'), { parts: [
+          { label: 'Позитив', value: с.positive || 0, color: цвета.ok, f: 'positive' },
+          { label: 'Нейтрально', value: Math.max(0, (с.scored || 0) - (с.positive || 0) - (с.negative || 0)),
+            color: цвета.idle, pick: false },
+          { label: 'Негатив', value: с.negative || 0, color: цвета.err, f: 'negative' },
+        ], onPick: (номер, доля) => РАСКРЫТИЕ.открыть(qs('#vp-tone'), this.раскрыть({
+          base: 'content', f: ['status:completed', доля.f], title: `Тональность: ${доля.label}` })) });
+      }
+      const причины = (д.reasons || []).filter((п) => п.records);
+      if (qs('#vp-pareto')) {
+        const видны = причины.slice(0, 15);
+        C.pareto(qs('#vp-pareto'), {
+          labels: видны.map((п) => п.key), values: видны.map((п) => п.records),
+          emptyText: 'Причины не спрашивались у модели или ещё не разобраны',
+          pickHint: 'щелчок — разговоры с этой причиной',
+          onPick: (номер) => РАСКРЫТИЕ.открыть(qs('#vp-pareto'), this.раскрыть({ base: 'llm',
+            f: ['status:completed', 'llm_ok', `reason:${видны[номер].key}`],
+            cols: ['when', 'record', 'agent', 'duration', 'outcome', 'resolved'],
+            title: `Причина: ${видны[номер].key}` })),
+        });
+      }
+      if (qs('#vp-movers')) qs('#vp-movers').innerHTML = this.движение(д.reasons || [], база);
+      if (qs('#vp-outcomes')) this.исходы(qs('#vp-outcomes'), д.outcomes || [], база);
+      if (qs('#vp-pairs')) qs('#vp-pairs').innerHTML = this.матрица(д, причины);
+      if (qs('#vp-reason-series')) this.рядыПричин(qs('#vp-reason-series'), д, причины);
+      if (qs('#vp-agents')) qs('#vp-agents').innerHTML = this.сотрудники(д.agents || [], д);
+      qsa('#vp-agents [data-agent]').forEach((к) => {
+        к.onclick = (е) => {
+          е.preventDefault();
+          this.добавочный = к.dataset.agent === this.добавочный ? '' : к.dataset.agent;
+          this.load();
+        };
+      });
+      if (qs('#vp-scatter')) this.точки(qs('#vp-scatter'), д.agents || []);
+      if (qs('#vp-depts')) this.отделы(qs('#vp-depts'), д.departments || []);
+      if (qs('#vp-calls') && ряд.telephony) {
+        C.bars(qs('#vp-calls'), {
+          labels: ряд.labels, height: 220, showValues: false,
+          series: [
+            { name: 'Отвечено', values: ряд.telephony.answered, color: 'ok' },
+            { name: 'Пропущено входящих', values: ряд.telephony.missed, color: 'err' },
+            { name: 'Прочие без ответа', values: ряд.telephony.other, color: 'idle' },
+          ],
+          onPick: (номер, кусок) => РАСКРЫТИЕ.открыть(qs('#vp-calls'), this.раскрыть({ base: 'calls',
+            f: [['answered', 'unanswered', 'unanswered'][(кусок || {}).series || 0],
+              ...((кусок || {}).series === 1 ? ['direction:входящий'] : [])],
+            title: `Звонки: ${когда(номер)}` }, корзина(номер))),
+        });
+      }
+    },
+
+    /**
+     * «Причина × исход» таблицей с подкраской: названия причин длинные, и
+     * в клетчатой карте они обрезались до «статус за…». Доля в клетке — от
+     * разговоров этой причины: «доставка → не решено, 40 %» и есть ответ.
+     */
+    матрица(д, причины) {
+      const строки = причины.slice(0, 10);
+      const столбцы = (д.outcomes || []).filter((и) => и.records).slice(0, 6);
+      if (!строки.length || !столбцы.length) {
+        return '<div class="empty small">Причины и исходы не разобраны.</div>';
+      }
+      const клетки = new Map((д.pairs || []).map((п) => [`${п.reason}|${п.outcome}`, п.records]));
+      return `<div class="table-wrap"><table class="small vp-matrix"><thead><tr><th>Причина</th>${
+        столбцы.map((и) => `<th class="num">${esc(и.key)}</th>`).join('')}</tr></thead><tbody>${
+        строки.map((п) => `<tr><td>${esc(п.key)} <span class="faint">${num(п.records)}</span></td>${
+          столбцы.map((и) => {
+            const n = клетки.get(`${п.key}|${и.key}`) || 0;
+            const доля = п.records ? n / п.records : 0;
+            return `<td class="num" style="background:rgba(76,141,255,${(0.08 + доля * 0.62).toFixed(2)})"
+              title="${esc(п.key)} → ${esc(и.key)}: ${n} из ${п.records}">${n ? this.число(
+                `${num(n)} <span class="faint">${pct(доля, 0)}</span>`, { base: 'llm',
+                  f: ['status:completed', 'llm_ok', `reason:${п.key}`, `outcome:${и.key}`],
+                  title: `${п.key} → ${и.key}` }) : '<span class="faint">—</span>'}</td>`;
+          }).join('')}</tr>`).join('')}</tbody></table></div>`;
+    },
+
+    /** «Что изменилось»: причины, чья доля сдвинулась сильнее всего. */
+    движение(причины, база) {
+      if (!база) return '<div class="empty small">Базы сравнения нет.</div>';
+      const сдвиги = причины.filter((п) => п.delta_pp !== null && п.delta_pp !== undefined
+        && п.prev_share !== null && п.prev_share !== undefined && (п.records || п.prev_records))
+        .sort((а, б) => Math.abs(б.delta_pp) - Math.abs(а.delta_pp)).slice(0, 12);
+      if (!сдвиги.length) {
+        return '<div class="empty small">Причины не сравнить: в одном из периодов их нет.</div>';
+      }
+      return `<div class="table-wrap"><table class="small">
+        <thead><tr><th>Причина</th><th class="num">Сейчас</th><th class="num">Было</th>
+          <th class="num">Изменение</th></tr></thead><tbody>${сдвиги.map((п) => `<tr>
+          <td>${esc(п.key)}</td>
+          <td class="num">${п.records ? this.число(num(п.records), { base: 'llm',
+            f: ['status:completed', 'llm_ok', `reason:${п.key}`], title: `Причина: ${п.key}` }) : '0'}
+            <span class="faint">${pct(п.share, 0)}</span></td>
+          <td class="num">${num(п.prev_records)} <span class="faint">${pct(п.prev_share, 0)}</span></td>
+          <td class="num">${сдвигКБазе(п.share || 0, п.prev_share || 0, { доля: true,
+            значимо: п.significant, подсказка: `z = ${num(п.z, 2)}` })}${п.significant
+            ? ' <span class="chip warn" title="Изменение больше случайного (критерий для двух долей, 5 %)">значимо</span>' : ''}</td>
+        </tr>`).join('')}</tbody></table></div>
+        <div class="small faint" style="margin-top:6px">«≈» — сдвиг в пределах случайного: при таком числе
+          разговоров он мог получиться сам собой. «Значимо» — нет.</div>`;
+    },
+
+    исходы(место, исходы, база) {
+      const C = window.Charts;
+      const цвета = C.palette();
+      const есть = исходы.filter((и) => и.records || и.prev_records);
+      if (!есть.length) {
+        место.innerHTML = '<div class="empty small">Исходы не разобраны.</div>';
+        return;
+      }
+      const было = есть.some((и) => и.prev_records);
+      место.innerHTML = `<div class="small dim">Сейчас</div><div id="vp-out-now"></div>
+        ${база && было ? `<div class="small dim" style="margin-top:10px">${esc(база.label)}</div><div id="vp-out-was"></div>` : ''}
+        <div class="table-wrap" style="margin-top:10px"><table class="small"><thead><tr><th>Исход</th>
+          <th class="num">Сейчас</th><th class="num">Было</th><th class="num">Изменение</th></tr></thead>
+          <tbody>${есть.slice(0, 10).map((и) => `<tr><td>${esc(и.key)}</td>
+            <td class="num nowrap">${и.records ? this.число(num(и.records), { base: 'llm',
+              f: ['status:completed', 'llm_ok', `outcome:${и.key}`], title: `Исход: ${и.key}` }) : '0'}
+              <span class="faint">${pct(и.share, 0)}</span></td>
+            <td class="num nowrap">${num(и.prev_records)} <span class="faint">${pct(и.prev_share, 0)}</span></td>
+            <td class="num nowrap">${база && и.prev_share !== null && и.prev_share !== undefined
+              ? сдвигКБазе(и.share || 0, и.prev_share, { доля: true, значимо: и.significant }) : ''}</td>
+            </tr>`).join('')}</tbody></table></div>`;
+      const доли = (поле) => есть.map((и, номер) => ({ label: и.key, value: и[поле] || 0,
+        color: цвета[номер % цвета.length], key: и.key }));
+      C.stacked(qs('#vp-out-now', место), { parts: доли('records'), height: 26,
+        onPick: (номер, доля) => РАСКРЫТИЕ.открыть(место, this.раскрыть({ base: 'llm',
+          f: ['status:completed', 'llm_ok', `outcome:${доля.key}`], title: `Исход: ${доля.key}` })) });
+      if (база && qs('#vp-out-was', место)) {
+        C.stacked(qs('#vp-out-was', место), { parts: доли('prev_records').map((д) => Object.assign(д, { pick: false })),
+          height: 26 });
+      }
+    },
+
+    /** Малые графики: по одной искровой линии на каждую из главных причин. */
+    рядыПричин(место, д, причины) {
+      const ряды = д.reason_series || {};
+      const ключи = причины.map((п) => п.key).filter((к) => ряды[к]);
+      if (!ключи.length) {
+        место.innerHTML = '<div class="empty small">Причины не разобраны.</div>';
+        return;
+      }
+      место.innerHTML = ключи.map((к, номер) => `<div class="vp-multiple">
+        <div class="small truncate" title="${esc(к)}">${esc(к)}</div>
+        <div class="vp-multiple-spark" data-i="${номер}"></div>
+        <div class="small faint">${num(ряды[к].reduce((а, б) => а + б, 0))} за период ·
+          больше всего: ${esc((д.series.labels || [])[ряды[к].indexOf(Math.max(...ряды[к]))] || '')}
+          (${num(Math.max(...ряды[к]))})</div></div>`).join('');
+      qsa('.vp-multiple-spark', место).forEach((узел) => {
+        window.Charts.spark(узел, ряды[ключи[Number(узел.dataset.i)]], { width: 200, height: 34 });
+      });
+    },
+
+    сотрудники(люди, д) {
+      if (!люди.length) {
+        return `<div class="empty small">Добавочных за период нет.
+          <div class="small dim" style="margin-top:6px">Добавочный приходит из журнала звонков: с АТС,
+          полем <span class="mono">internalPhone</span> в <span class="mono">/process-call</span> или полями звонка
+          при загрузке.</div></div>`;
+      }
+      const наибольшее = Math.max(1, ...люди.map((ч) => ч.completed || 0));
+      const база = (д.baselines || [])[0];
+      return `<div class="table-wrap"><table class="vp-agents">
+        <thead><tr><th>#</th><th>Добавочный</th><th>Отдел</th><th class="num">Разговоров</th><th></th>
+          <th class="num">${база ? 'К базе' : ''}</th><th class="num">Часов</th><th class="num">Средний</th>
+          <th class="num">Решено</th><th class="num">Негатив</th><th class="num">Балл</th>
+          <th class="num">Скрипт</th><th>Частая причина</th><th class="num">Без речи и кор.</th></tr></thead>
+        <tbody>${люди.map((ч, номер) => `<tr class="${ч.agent === this.добавочный ? 'selected' : ''}">
+          <td class="faint">${номер + 1}</td>
+          <td class="nowrap"><a href="#" data-agent="${esc(ч.agent)}" title="Отчёт только по этому добавочному">${добавочный(ч)}</a></td>
+          <td class="small dim">${esc(ч.agent_department || '')}</td>
+          <td class="num">${ч.completed ? this.число(num(ч.completed), { f: ['status:completed', `agent:${ч.agent}`],
+            title: `Разговоры: добавочный ${ч.agent}` }) : '0'}</td>
+          <td style="width:90px"><div class="drill-bar"><span style="width:${(100 * (ч.completed || 0) / наибольшее).toFixed(1)}%"></span></div></td>
+          <td class="num">${база && ч.prev_completed ? сдвигКБазе(ч.completed, ч.prev_completed) : (база && ч.completed ? '<span class="chip">новый</span>' : '')}</td>
+          <td class="num">${num(ч.talk_hours, 1)}</td>
+          <td class="num">${ч.avg_duration_s ? fmtDur(ч.avg_duration_s) : '—'}</td>
+          <td class="num">${ч.resolved_share === null ? '—' : pct(ч.resolved_share, 0)}</td>
+          <td class="num">${ч.negative_share === null ? '—' : pct(ч.negative_share, 0)}</td>
+          <td class="num">${ч.agent_score === null ? '—' : num(ч.agent_score, 0)}</td>
+          <td class="num">${ч.compliance === null ? '—' : pct(ч.compliance, 0)}</td>
+          <td class="small">${ч.top_reason ? `${esc(ч.top_reason)} <span class="faint">${num(ч.top_reason_n)}</span>` : '<span class="faint">—</span>'}</td>
+          <td class="num">${ч.empty ? this.число(num(ч.empty), { f: ['status:no_speech,short', `agent:${ч.agent}`],
+            title: `Без речи и короткие: добавочный ${ч.agent}` }) : '<span class="faint">0</span>'}</td>
+        </tr>`).join('')}</tbody></table></div>
+        <div class="small faint" style="margin-top:6px">${Number(д.agents_total || 0) > люди.length
+          ? `Показаны ${num(люди.length)} из ${num(д.agents_total)}. ` : ''}${(д.without_agent || {}).completed
+          ? `Разговоров без добавочного: ${num(д.without_agent.completed)}. ` : ''}Доли у сотрудника с парой
+          разговоров — не вывод: смотрите на число рядом.</div>`;
+    },
+
+    точки(место, люди) {
+      const годные = люди.filter((ч) => ч.resolved_share !== null && ч.negative_share !== null && ч.completed >= 3);
+      if (годные.length < 2) {
+        место.innerHTML = '<div class="empty small">Мало сотрудников с разобранными разговорами (нужно хотя бы три разговора у каждого).</div>';
+        return;
+      }
+      const медиана = (значения) => {
+        const по = [...значения].sort((а, б) => а - б);
+        return по.length % 2 ? по[(по.length - 1) / 2] : (по[по.length / 2 - 1] + по[по.length / 2]) / 2;
+      };
+      window.Charts.scatter(место, {
+        points: годные.map((ч) => ({ x: ч.resolved_share * 100, y: ч.negative_share * 100, size: ч.completed,
+          label: `${ч.agent}${ч.agent_name ? ' — ' + ч.agent_name : ''}`, agent: ч.agent })),
+        xName: 'решено', yName: 'негатив', sizeName: 'разговоров',
+        xLabel: 'решено при обращении, %', yLabel: 'негатив, %',
+        xFormat: (v) => `${num(v, 0)} %`, yFormat: (v) => `${num(v, 0)} %`, yMin: 0,
+        quadrants: { x: медиана(годные.map((ч) => ч.resolved_share * 100)),
+          y: медиана(годные.map((ч) => ч.negative_share * 100)),
+          labels: ['мало решают, много негатива', 'решают, но с негативом',
+            'мало решают, спокойно', 'решают и спокойно'] },
+        pickHint: 'щелчок — его разговоры',
+        onPick: (номер, точка) => РАСКРЫТИЕ.открыть(место, this.раскрыть({ base: 'llm',
+          f: ['status:completed', 'llm_ok', `agent:${точка.agent}`],
+          cols: ['when', 'record', 'duration', 'reason', 'outcome', 'resolved'],
+          title: `Разговоры: ${точка.label}` })),
+      });
+    },
+
+    отделы(место, отделы) {
+      if (!отделы.length) {
+        место.innerHTML = `<div class="empty small">Отделов нет: у добавочных периода нет карточек в справочнике
+          сотрудников (раздел «Сотрудники») или связь номера с человеком выключена.</div>`;
+        return;
+      }
+      const наибольшее = Math.max(1, ...отделы.map((о) => о.completed || 0));
+      место.innerHTML = `<div class="table-wrap"><table class="small">
+        <thead><tr><th>Отдел</th><th class="num">Сотр.</th><th class="num">Разговоров</th><th></th>
+          <th class="num">К базе</th><th class="num">Решено</th><th class="num">Негатив</th><th class="num">Балл</th></tr></thead>
+        <tbody>${отделы.map((о) => `<tr>
+          <td><a href="#" data-dept="${esc(о.department)}" title="Отчёт только по отделу">${esc(о.department)}</a></td>
+          <td class="num">${num(о.agents)}</td>
+          <td class="num">${о.completed ? this.число(num(о.completed), { f: ['status:completed', `department:${о.department}`],
+            title: `Разговоры отдела ${о.department}` }) : '0'}</td>
+          <td style="width:80px"><div class="drill-bar"><span style="width:${(100 * (о.completed || 0) / наибольшее).toFixed(1)}%"></span></div></td>
+          <td class="num">${о.prev_completed ? сдвигКБазе(о.completed, о.prev_completed) : ''}</td>
+          <td class="num">${о.resolved_share === null ? '—' : pct(о.resolved_share, 0)}</td>
+          <td class="num">${о.negative_share === null ? '—' : pct(о.negative_share, 0)}</td>
+          <td class="num">${о.agent_score === null ? '—' : num(о.agent_score, 0)}</td></tr>`).join('')}</tbody></table></div>`;
+      qsa('[data-dept]', место).forEach((к) => {
+        к.onclick = (е) => { е.preventDefault(); this.отдел = к.dataset.dept; this.load(); };
+      });
+    },
+
+    /** Вторая часть: трекеры риска, скоркарта, обязательства — со сдвигом к базе. */
+    drawLists() {
+      const место = qs('#vp-lists');
+      if (!место || !this.данные || this.данные.future) return;
+      const с = this.списки;
+      if (!с) {
+        место.innerHTML = card('Риски, скоркарта, обязательства', '',
+          '<div class="empty small">Считаем по ответам модели за период…</div>');
+        return;
+      }
+      if (с.failed) {
+        место.innerHTML = card('Риски, скоркарта, обязательства', '',
+          '<div class="empty small">Эту часть посчитать не удалось. Нажмите «Обновить».</div>');
+        return;
+      }
+      const база = (this.данные.baselines || [])[0];
+      const трекеры = (с.trackers || []).filter((т) => т.checked);
+      const пункты = (с.scorecard || []).filter((п) => п.yes + п.no);
+      место.innerHTML = `<div class="grid cols-2 vp-row">
+        ${card('Трекеры риска', база ? `сработали в доле разговоров · сдвиг к «${база.label}»` : 'сработали в доле разговоров',
+          трекеры.length ? `<div class="table-wrap"><table class="small"><thead><tr><th>Трекер</th>
+            <th class="num">Сработал</th><th style="width:150px">Доля</th><th class="num">Изменение</th></tr></thead>
+            <tbody>${трекеры.map((т) => `<tr><td>${esc(т.label)}</td>
+              <td class="num">${т.fired ? this.число(num(т.fired), { base: 'llm',
+                f: ['status:completed', 'llm_ok', `tracker:${т.id}`], title: `Трекер: ${т.label}` }) : '0'}
+                <span class="faint">из ${num(т.checked)}</span></td>
+              <td>${полоса_доли(т.share || 0, (т.share || 0) > 0.2 ? 'err' : (т.share || 0) > 0.05 ? 'warn' : 'ok')}</td>
+              <td class="num">${т.prev_checked ? сдвигКБазе(т.share || 0, т.prev_share || 0, { доля: true,
+                лучше: 'down', значимо: т.significant }) : ''}</td></tr>`).join('')}</tbody></table></div>`
+            : '<div class="empty small">Трекеры не настроены или не проверялись.</div>')}
+        ${card('Скоркарта', 'доля разговоров, где пункт выполнен · сначала худшие',
+          пункты.length ? `<div class="table-wrap"><table class="small"><thead><tr><th>Пункт</th>
+            <th class="num">Не выполнен</th><th style="width:150px">Выполнено</th><th class="num">Изменение</th></tr></thead>
+            <tbody>${пункты.map((п) => `<tr><td>${esc(п.question)}</td>
+              <td class="num">${п.no ? this.число(num(п.no), { base: 'llm',
+                f: ['status:completed', 'llm_ok', `score_no:${п.id}`], title: `Не выполнено: ${п.question}` }) : '0'}</td>
+              <td>${полоса_доли(п.pass_share || 0, (п.pass_share || 0) > 0.8 ? 'ok' : (п.pass_share || 0) > 0.5 ? 'warn' : 'err')}</td>
+              <td class="num">${п.prev_pass_share !== null && п.prev_pass_share !== undefined
+                ? сдвигКБазе(п.pass_share || 0, п.prev_pass_share, { доля: true, лучше: 'up', значимо: п.significant }) : ''}</td>
+              </tr>`).join('')}</tbody></table></div>`
+            : '<div class="empty small">Скоркарта не настроена.</div>')}
+      </div>
+      ${card('Обязательства перед клиентами', '',
+        `<div class="grid cols-3">${kpi('Обещаний', num(с.actions || 0),
+          база ? сдвигКБазе(с.actions || 0, с.prev_actions || 0) : '')}
+          ${kpi('Разговоров с обещаниями', с.records_with_actions ? this.число(num(с.records_with_actions),
+            { base: 'llm', f: ['status:completed', 'with_actions'], title: 'Разговоры с обязательствами' }) : '0',
+            с.records ? pct(с.records_with_actions / с.records, 0) + ' разобранных' : '')}
+          ${kpi('Разобрано моделью', num(с.records || 0), база ? `было ${num(с.prev_records || 0)}` : '')}</div>`)}`;
+    },
+
+    /** Сводка периода в CSV: показатели, причины, сотрудники — для таблиц и почты. */
+    csv() {
+      const д = this.данные;
+      if (!д || !д.totals) return;
+      const т = д.totals.current;
+      const база = (д.baselines || [])[this.база];
+      const б = база ? д.totals[база.id] : {};
+      const строки = [['Голосовая аналитика', д.label], [], ['Показатель', 'Значение', база ? база.label : '']];
+      const добавить = (имя, а, бб) => строки.push([имя, а === null || а === undefined ? '' : а,
+        бб === null || бб === undefined ? '' : бб]);
+      добавить('Записей', т.jobs, б.jobs);
+      добавить('Разговоров с речью', т.completed, б.completed);
+      добавить('Без речи', т.no_speech, б.no_speech);
+      добавить('Коротких', т.short, б.short);
+      добавить('Ошибок', т.failed, б.failed);
+      добавить('Часов разговоров', т.talk_hours, б.talk_hours);
+      добавить('Медиана длительности, с', т.median_duration_s, б.median_duration_s);
+      добавить('Решено при обращении, доля', (т.llm || {}).resolved_share, (б.llm || {}).resolved_share);
+      добавить('Негатив, доля', (т.content || {}).negative_share, (б.content || {}).negative_share);
+      добавить('Балл оператора', (т.content || {}).agent_score, (б.content || {}).agent_score);
+      строки.push([], ['Причина', 'Разговоров', 'Доля', 'Было', 'Доля была', 'Изменение, п. п.', 'Значимо']);
+      (д.reasons || []).forEach((п) => строки.push([п.key, п.records, п.share, п.prev_records, п.prev_share,
+        п.delta_pp, п.significant ? 'да' : '']));
+      строки.push([], ['Добавочный', 'Сотрудник', 'Отдел', 'Разговоров', 'Было', 'Решено', 'Негатив', 'Балл']);
+      (д.agents || []).forEach((ч) => строки.push([ч.agent, ч.agent_name || '', ч.agent_department || '',
+        ч.completed, ч.prev_completed, ч.resolved_share, ч.negative_share, ч.agent_score]));
+      const текст = строки.map((с) => с.map((к) => {
+        const з = String(к === null || к === undefined ? '' : к);
+        return /[;"\n]/.test(з) ? `"${з.replace(/"/g, '""')}"` : з;
+      }).join(';')).join('\r\n');
+      const ссылка = document.createElement('a');
+      ссылка.href = URL.createObjectURL(new Blob(['﻿' + текст], { type: 'text/csv;charset=utf-8' }));
+      ссылка.download = `голосовая-аналитика-${масштаб}-${(д.period || {}).date || 'период'}.csv`;
+      document.body.appendChild(ссылка);
+      ссылка.click();
+      setTimeout(() => { URL.revokeObjectURL(ссылка.href); ссылка.remove(); }, 1000);
+    },
+  };
+}
+
+RENDERERS.voice_day = периодГолоса('day');
+RENDERERS.voice_month = периодГолоса('month');
+RENDERERS.voice_quarter = периодГолоса('quarter');
+RENDERERS.voice_year = периодГолоса('year');
+
+
+// ==========================================================================
 // Сотрудники: справочник
 // ==========================================================================
 
@@ -16431,9 +17484,9 @@ RENDERERS.staff = {
         <button class="primary sm" id="st-add">Добавить</button>
         <button class="btn sm" id="st-import" title="Забрать выгрузку по адресу из настроек">
           Импорт по адресу</button>
-        <label class="ghost sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px"
-          title="Загрузить файл выгрузки: Excel XML, CSV или JSON">
-          Загрузить файл<input type="file" id="st-file" accept=".xml,.csv,.json,.txt" hidden></label>
+        <button class="btn sm" id="st-file-import"
+          title="Импорт сотрудников из файла: Excel XML, XLSX, CSV или JSON — с предпросмотром">
+          Импорт из файла</button>
         <button class="ghost sm" id="st-refresh">Обновить</button>
       </div>
       <div id="st-top"></div>
@@ -16456,7 +17509,7 @@ RENDERERS.staff = {
     qs('#st-refresh').addEventListener('click', () => this.load());
     qs('#st-add').addEventListener('click', () => this.edit(null));
     qs('#st-import').addEventListener('click', (е) => this.importUrl(е.currentTarget));
-    qs('#st-file').addEventListener('change', (е) => this.importFile(е.currentTarget));
+    qs('#st-file-import').addEventListener('click', () => this.importDialog());
 
     await this.load();
   },
@@ -16653,20 +17706,151 @@ RENDERERS.staff = {
     }
   },
 
-  async importFile(поле) {
-    const файл = поле.files && поле.files[0];
-    if (!файл) return;
-    const форма = new FormData();
-    форма.append('file', файл);
-    try {
-      const итог = await API.call('/api/employees/import', { method: 'POST', body: форма });
-      this.показатьИтог(итог);
-      this.load();
-    } catch (err) {
-      fail(err);
-    } finally {
-      поле.value = '';
-    }
+  /** Подписи полей карточки — для «что куда ляжет» в предпросмотре. */
+  ПОДПИСИ_ПОЛЕЙ() {
+    return Object.assign(Object.fromEntries(СОТР_ПОЛЯ.map(([к, п]) => [к, п])),
+      { active: 'Работает' });
+  },
+
+  /**
+   * Импорт из файла в два шага: сначала предпросмотр, потом запись.
+   *
+   * Файл уходит на сервер с `dry_run=true`: сервер разбирает его тем же
+   * кодом, что и при настоящем импорте, сравнивает со справочником и
+   * отвечает, как легли колонки, кто добавится, у кого что поменяется и
+   * кого отметят уволенным, — ничего не записав. Импортирует человек уже
+   * то, что видел. Раньше файл импортировался сразу по выбору, и узнать,
+   * что колонка «тел. внутренний» не узналась, можно было только по
+   * пустым номерам у шестисот карточек.
+   */
+  importDialog() {
+    const уволить = state.settings.employees_deactivate_missing !== false;
+    const фон = h(`<div class="modal-backdrop"><div class="modal" style="max-width:860px">
+      <div class="modal-head"><b>Импорт сотрудников из файла</b><span class="spacer"></span>
+        <button class="ghost icon" data-close aria-label="Закрыть" title="Закрыть">✕</button></div>
+      <div class="modal-body">
+        <label class="st-drop" id="st-drop">
+          <input type="file" id="st-file" accept=".xml,.xls,.xlsx,.csv,.json,.txt" hidden>
+          <div><b>Выберите файл</b> или перетащите его сюда</div>
+          <div class="small dim" style="margin-top:6px">Excel XML 2003 (в том числе выгрузка
+            портала с расширением .xls), книга Excel .xlsx, CSV или JSON. Колонки узнаются по
+            заголовкам: «фамилия», «имя», «отчество», «должность», «отдел», «тел. внутренний»,
+            «тел. мобильный», «электропочта», «работает» и им подобные; неизвестные уходят в
+            примечание.</div>
+          <div class="small" id="st-file-name" style="margin-top:8px"></div>
+        </label>
+        <label class="row small" style="gap:8px;margin-top:10px;align-items:center">
+          <input type="checkbox" id="st-deactivate" ${уволить ? 'checked' : ''}>
+          Отметить уволенными тех, кого нет в файле
+          <span class="faint">(карточки не удаляются: по ним остаются звонки)</span></label>
+        <div id="st-preview" style="margin-top:12px"></div>
+      </div>
+      <div class="modal-foot"><span class="small faint" id="st-preview-state"></span>
+        <span class="spacer"></span>
+        <button class="ghost" data-close>Отмена</button>
+        <button class="primary" id="st-apply" disabled>Импортировать</button></div>
+    </div></div>`);
+    mountModal(фон, { label: 'Импорт сотрудников из файла' });
+    qsa('[data-close]', фон).forEach((к) => { к.onclick = () => closeModal(фон); });
+    let файл = null;
+    const поле = qs('#st-file', фон);
+    const форма = (пробно) => {
+      const данные = new FormData();
+      данные.append('file', файл);
+      данные.append('deactivate_missing', qs('#st-deactivate', фон).checked ? 'true' : 'false');
+      if (пробно) данные.append('dry_run', 'true');
+      return данные;
+    };
+    const просмотреть = async () => {
+      if (!файл) return;
+      qs('#st-file-name', фон).innerHTML = `Файл: <b>${esc(файл.name)}</b> · ${fmtBytes(файл.size)}`;
+      qs('#st-apply', фон).disabled = true;
+      qs('#st-preview-state', фон).textContent = 'Разбираем файл…';
+      qs('#st-preview', фон).innerHTML = '';
+      try {
+        const итог = await API.call('/api/employees/import', { method: 'POST', body: форма(true) });
+        qs('#st-preview', фон).innerHTML = this.предпросмотр(итог);
+        qs('#st-preview-state', фон).textContent = 'Предпросмотр: в справочник ещё ничего не записано';
+        qs('#st-apply', фон).disabled = false;
+      } catch (err) {
+        qs('#st-preview-state', фон).textContent = '';
+        qs('#st-preview', фон).innerHTML = `<div class="finding critical"><b>Файл не разобран.</b>
+          <div class="small" style="margin-top:4px">${esc(err.message || '')}</div>${err.hint
+            ? `<div class="small dim" style="margin-top:4px">${esc(err.hint)}</div>` : ''}</div>`;
+      }
+    };
+    поле.addEventListener('change', () => { файл = поле.files && поле.files[0]; просмотреть(); });
+    qs('#st-deactivate', фон).addEventListener('change', просмотреть);
+    const зона = qs('#st-drop', фон);
+    зона.addEventListener('dragover', (е) => { е.preventDefault(); зона.classList.add('over'); });
+    зона.addEventListener('dragleave', () => зона.classList.remove('over'));
+    зона.addEventListener('drop', (е) => {
+      е.preventDefault();
+      зона.classList.remove('over');
+      const брошенный = е.dataTransfer && е.dataTransfer.files && е.dataTransfer.files[0];
+      if (брошенный) { файл = брошенный; просмотреть(); }
+    });
+    qs('#st-apply', фон).addEventListener('click', async (е) => {
+      if (!файл) return;
+      е.currentTarget.disabled = true;
+      qs('#st-preview-state', фон).textContent = 'Импортируем…';
+      try {
+        const итог = await API.call('/api/employees/import', { method: 'POST', body: форма(false) });
+        closeModal(фон);
+        this.показатьИтог(итог);
+        this.load();
+      } catch (err) {
+        е.currentTarget.disabled = false;
+        qs('#st-preview-state', фон).textContent = '';
+        fail(err);
+      }
+    });
+  },
+
+  /** Разметка предпросмотра импорта по ответу сервера с `dry_run`. */
+  предпросмотр(итог) {
+    const и = итог || {};
+    const подписи = this.ПОДПИСИ_ПОЛЕЙ();
+    const перечни = и.changes || {};
+    const имя = (ч) => `${esc(ч.name || '—')}${ч.phone_ext ? ` <span class="mono faint">${esc(ч.phone_ext)}</span>` : ''}`;
+    const перечень = (заголовок, список, всего, строка) => (всего ? `<details class="st-changes">
+        <summary><b>${заголовок}: ${num(всего)}</b></summary>
+        <div class="small" style="margin-top:6px;columns:2;column-gap:24px">${список.map((ч) =>
+          `<div>${строка(ч)}</div>`).join('')}${всего > список.length
+          ? `<div class="faint">…и ещё ${num(всего - список.length)}</div>` : ''}</div></details>` : '');
+    const образцы = и.sample || [];
+    const формат = { xml: 'Excel XML 2003', xlsx: 'книга Excel .xlsx', csv: 'CSV', json: 'JSON' };
+    return `<div class="grid cols-5" style="margin-bottom:12px">
+        ${kpi('Строк в файле', num(и.rows || 0), формат[и.format] || и.format || '')}
+        ${kpi('Добавится', num(и.added || 0), 'новых карточек')}
+        ${kpi('Обновится', num(и.updated || 0), `без изменений ${num(и.unchanged || 0)}`)}
+        ${kpi('Уволенными', num(и.deactivated || 0), 'нет в файле')}
+        ${kpi('Пропущено', num(и.skipped || 0), Object.entries(и.skip_reasons || {})
+          .map(([п, n]) => `${п}: ${num(n)}`).join(', ') || 'строк без людей')}
+      </div>
+      <div class="grid cols-2">
+        <div><div class="small dim" style="margin-bottom:4px">Как легли колонки</div>
+          <div class="table-wrap"><table class="small"><thead><tr><th>Колонка файла</th>
+            <th>Поле карточки</th></tr></thead><tbody>${(и.columns || []).map((к) => `<tr>
+              <td>${esc(к.header)}</td><td>${к.field ? esc(подписи[к.field] || к.field)
+                : '<span class="warn">в примечание</span>'}</td></tr>`).join('')}</tbody></table></div></div>
+        <div>${перечень('Добавятся', перечни.added || [], и.added || 0, имя)}
+          ${перечень('Изменятся', перечни.updated || [], и.updated || 0, (ч) => `${имя(ч)}
+            <span class="faint">— ${(ч.fields || []).map((п) => esc(подписи[п] || п)).join(', ')}</span>`)}
+          ${перечень('Будут отмечены уволенными', перечни.deactivated || [], и.deactivated || 0, имя)}
+          ${(и.notes || []).length ? `<details class="st-changes"><summary><b>Замечания: ${
+            num(и.notes.length)}</b></summary><ul class="small">${и.notes.slice(0, 50)
+            .map((з) => `<li>${esc(з)}</li>`).join('')}</ul></details>` : ''}</div>
+      </div>
+      ${образцы.length ? `<div class="small dim" style="margin:12px 0 4px">Первые карточки из файла</div>
+        <div class="table-wrap"><table class="small"><thead><tr><th>ФИО</th><th>Должность</th>
+          <th>Отдел</th><th>Внутренний</th><th>Мобильный</th><th>Почта</th><th>Работает</th></tr></thead>
+          <tbody>${образцы.map((к) => `<tr>
+            <td>${esc([к.last_name, к.first_name, к.middle_name].filter(Boolean).join(' '))}</td>
+            <td>${esc(к.position || '')}</td><td>${esc(к.department || '')}</td>
+            <td class="mono">${esc(к.phone_ext || '')}</td><td class="mono">${esc(к.phone_mobile || '')}</td>
+            <td>${esc(к.email || '')}</td><td>${к.active ? 'да' : '<span class="warn">нет</span>'}</td>
+          </tr>`).join('')}</tbody></table></div>` : ''}`;
   },
 
   показатьИтог(итог) {

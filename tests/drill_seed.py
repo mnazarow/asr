@@ -51,7 +51,17 @@ def наполнить(приложение: Any, *, заданий: int = 96, �
             "language": ЯЗЫКИ[n % len(ЯЗЫКИ)], "source": ИСТОЧНИКИ[n % len(ИСТОЧНИКИ)],
             "tags": метки if n % 5 else "", "media_duration_s": 20.0 + (n * 37) % 900})
         db.execute("UPDATE jobs SET created_at=? WHERE id=?", (когда, job_id))
-        if n % 11 == 3:
+        if n % 11 == 3 and (n // 11) % 3 == 1:
+            # Итоги без расшифровки (заход 52): не ошибки, свои состояния.
+            # Берутся из бывших «ошибок», чтобы готовых записей было столько
+            # же, сколько раньше: на них держатся сверки разбора.
+            db.update_job(job_id, status="no_speech", finished_at=когда + 4, progress=1.0,
+                          error_code="no_speech", error_message="В записи не обнаружено речи")
+        elif n % 11 == 3 and (n // 11) % 3 == 2:
+            db.update_job(job_id, status="short", finished_at=когда + 1, progress=1.0,
+                          error_code="audio_too_short", error_message="Запись короче порога",
+                          media_duration_s=1.2)
+        elif n % 11 == 3:
             db.update_job(job_id, status="failed", finished_at=когда + 5,
                           error_code=("audio_decode_failed", "model_load_failed")[n % 2],
                           error_message="сбой", retries=n % 3)

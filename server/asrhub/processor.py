@@ -26,9 +26,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import settings_access as S
 from .catalog import get_model
 from .engines import EngineRegistry, Segment
-from .errors import ASRHubError, JobCancelled, JobTimeout, NoSpeechDetected
+from .errors import ASRHubError, AudioTooShort, JobCancelled, JobTimeout, NoSpeechDetected
 from .logging_setup import get_logger
 from .pipeline import audio as audio_mod
 from .pipeline import audio_profile, export, metrics, postprocess, vad
@@ -249,9 +250,18 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     # ---- 1. Подготовка аудио -------------------------------------------
     report(0.01, "анализ файла")
     timer.start("audio_prep")
+    # Короткая запись — итог, а не отказ (см. `AudioTooShort`): решается
+    # до всякой обработки, по длительности исходника. Файл без единого
+    # байта — тоже короткая запись: это пустая запись неотвеченного
+    # звонка, а не сбой.
+    порог = max(0.0, S.num(settings, "audio_min_duration_s", 2.0))
+    if source.is_file() and source.stat().st_size == 0:
+        raise AudioTooShort(0.0, порог)
     info = audio_mod.probe(source)
     outcome.duration_s = info.duration_s
     outcome.stats["source"] = info.to_dict()
+    if info.duration_s <= 0.05 or info.duration_s < порог:
+        raise AudioTooShort(info.duration_s, порог)
 
     if not audio_mod.has_ffmpeg() and source.suffix.lower() != ".wav":
         outcome.warnings.append(
@@ -386,7 +396,16 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     if silent_channels and not all_segments:
         raise NoSpeechDetected(
             f"В файле «{имя}» не обнаружено речи "
-            f"(длительность {info.duration_s:.1f} с).")
+            f"(длительность {info.duration_s:.1f} с).",
+            details={"duration_s": round(float(info.duration_s), 3)})
+    # Детектор речи что-то услышал (или выключен), а модель не вернула ни
+    # слова — шум, музыка ожидания, гудки. Раньше такое задание кончалось
+    # «готово» с пустой расшифровкой и шло в отчёты разговором без слов.
+    if not any(str(s.text or "").strip() for s in all_segments):
+        raise NoSpeechDetected(
+            f"В файле «{имя}» модель не распознала ни одного слова "
+            f"(длительность {info.duration_s:.1f} с).",
+            details={"duration_s": round(float(info.duration_s), 3), "empty_text": True})
     if silent_channels:
         outcome.warnings.append(
             "Речь не обнаружена в каналах: " + ", ".join(silent_channels))

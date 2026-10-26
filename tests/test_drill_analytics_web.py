@@ -232,18 +232,22 @@ def _щёлкнуть_точку(с: Any, график: str, номер: int, в
 def test_точка_ряда_раскрывается_в_задания_своей_корзины(вкладка):
     с = _открыть(вкладка)
     ряд = _свод(с, "timeseries")
-    поток = [а + б for а, б in zip(ряд["completed"], ряд["failed"], strict=True)]
+    # Без речи и короткие — свой ряд того же графика (заход 52), и точка
+    # раскрывает все завершённые записи корзины.
+    пустые = ряд.get("empty") or [0] * len(ряд["completed"])
+    поток = [а + б + в for а, б, в in zip(ряд["completed"], ряд["failed"], пустые,
+                                          strict=True)]
     номер = max(range(len(поток)), key=lambda i: поток[i])
     _щёлкнуть_точку(с, "#chart-flow", номер, len(поток))
     панель = _панель(с)
     assert панель["total"] == поток[номер] and панель["rows"] == min(50, поток[номер])
-    assert панель["title"].startswith("Готовые и упавшие задания")
+    assert панель["title"].startswith("Завершённые задания")
     assert not панель["inRow"] and панель["width"] > 900
     запрос = _отборы(вкладка)
     # Границы корзины — те, что отдал свод, до последнего знака.
     assert float(запрос["since"][0]) == ряд["edges"][номер]
     assert float(запрос["until"][0]) == ряд["edges"][номер + 1]
-    assert запрос["f"] == ["status:completed,failed"]
+    assert запрос["f"] == ["status:completed,failed,no_speech,short"]
     # Та же точка ещё раз — свернуть.
     _щёлкнуть_точку(с, "#chart-flow", номер, len(поток))
     assert с.locator(".drill-panel").count() == 0

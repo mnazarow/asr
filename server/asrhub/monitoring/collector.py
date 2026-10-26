@@ -164,6 +164,8 @@ class Runtime:
     ("asrhub_jobs_total", {"status": "completed"}),
     ("asrhub_jobs_total", {"status": "failed"}),
     ("asrhub_jobs_total", {"status": "cancelled"}),
+    ("asrhub_jobs_total", {"status": "no_speech"}),
+    ("asrhub_jobs_total", {"status": "short"}),
     ("asrhub_webhooks_total", {"result": "ok"}),
     ("asrhub_webhooks_total", {"result": "failed"}),
     ("asrhub_retries_total", None),

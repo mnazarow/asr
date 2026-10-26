@@ -72,6 +72,14 @@ def page(request: Request,
             owner=scope_owner(principal), sort=sort, limit=limit, cursor=cursor)
     except ASRHubError as exc:
         raise error_response(exc) from exc
+    # Чей разговор: добавочный из журнала звонков и имя по справочнику — в
+    # каждую строку страницы, двумя запросами на страницу.
+    from .. import employees as справочник  # noqa: PLC0415
+
+    state = get_state(request)
+    справочник.подписать_добавочные(
+        state.db, ответ["items"], ключ="job_id" if base == "calls" else "id",
+        имена=bool(state.settings.get("employees_match_ext", True)))
     if principal.mask_pii:
         # Посредник обезличивания видит только ключ из заголовка; вошедшему
         # по билету или куке с тем же флагом он бы отдал номера как есть.

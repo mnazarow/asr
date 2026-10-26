@@ -99,10 +99,13 @@ def main() -> int:
             print("Не удалось получить состояние очереди.", file=sys.stderr)
             return 1
         for job in response.json()["items"]:
-            if job["id"] in jobs and job["status"] in ("completed", "failed", "cancelled"):
+            # no_speech и short — итоги без расшифровки, а не ошибки.
+            if job["id"] in jobs and job["status"] in ("completed", "failed", "cancelled",
+                                                       "no_speech", "short"):
                 if job["id"] not in done:
                     done[job["id"]] = job["status"]
-                    mark = "✓" if job["status"] == "completed" else "✕"
+                    mark = {"completed": "✓", "no_speech": "–", "short": "–"}.get(
+                        job["status"], "✕")
                     print(f"  {mark} {jobs[job['id']].name}"
                           f"{'' if job['status'] == 'completed' else ': ' + str(job.get('error_message'))}")
         print(f"\r  готово {len(done)} из {len(jobs)}", end="", flush=True)
@@ -117,7 +120,10 @@ def main() -> int:
                 target = jobs[job_id].with_suffix(f".{fmt}")
                 target.write_bytes(response.content)
     print(f"Выгружено: {len(ok_ids)} записей в форматах {args.formats}")
-    return 0 if len(ok_ids) == len(jobs) else 1
+    без_речи = sum(1 for status in done.values() if status in ("no_speech", "short"))
+    if без_речи:
+        print(f"Без речи и коротких (расшифровки нет): {без_речи}")
+    return 0 if len(ok_ids) + без_речи == len(jobs) else 1
 
 
 if __name__ == "__main__":

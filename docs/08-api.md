@@ -241,7 +241,7 @@ GET /api/jobs?status=completed&model=gigaam-v3-rnnt&limit=50&offset=0
 
 | Параметр | Описание |
 |---|---|
-| `status` | `queued`, `running`, `completed`, `failed`, `cancelled`, `retry`, `paused`; `active` — все незавершённые; можно перечислить через запятую |
+| `status` | `queued`, `running`, `completed`, `failed`, `cancelled`, `retry`, `paused`, `no_speech` (без речи), `short` (короткая запись); `active` — все незавершённые, `empty` — без речи и короткие; можно перечислить через запятую |
 | `owner`, `model`, `group_id` | фильтры по значению |
 | `search` | поиск по имени файла и тексту расшифровки |
 | `since_hours` | только за последние N часов |
@@ -360,6 +360,8 @@ POST /api/llm/backfill    {"limit": 100}   поставить архив в оч
 GET  /api/content/llm?period=week          свод: исходы, причины, действия, трекеры, скоркарта
 GET  /api/content/llm?period=year&part=fast    только счётная часть свода — без чтения ответов модели
 GET  /api/content/llm?period=year&part=heavy&since=…   часть по спискам — по окну первой части
+GET  /api/content/llm?period=month&agent=101           свод по разговорам одного добавочного
+GET  /api/voice/period?scale=month&date=2026-10-01     голосовая аналитика за календарный период
 GET  /api/llm/models[?refresh=true]        каталог моделей и подбор под оборудование (администратор)
 POST /api/llm/setup       {"models": […]}  поставить, скачать, прогреть и включить (администратор)
 GET  /api/llm/setup/status                 ход установки: шаги, проценты, журнал (администратор)
@@ -392,6 +394,8 @@ curl -s -H "X-API-Key: ah_xxx" "https://asr.example.com/api/content/llm?period=y
 curl -s -H "X-API-Key: ah_xxx" \
   "https://asr.example.com/api/content/llm?period=year&part=heavy&since=1760078562"
 ```
+
+**Добавочные (3.1.24).** Счётная часть несёт разрез по добавочным `agents` — строки `{agent, agent_name, agent_department, records, analyzed, errors, resolved_share, reasons, outcomes}` (`reasons` и `outcomes` — три самых частых `{key, records}`), самые занятые сверху, до пятисот, — а также `agents_total` и `without_agent` (разговоров без строки в журнале звонков). Строки `rows` и `action_items` приходят с добавочным `agent` и, если номер есть в справочнике сотрудников и связь не выключена настройкой `employees_match_ext`, с `agent_name` и `agent_department`. Параметр `agent` сужает обе части свода до разговоров этого добавочного; разрез `agents` от него не зависит, а в ответе появляется поле `agent`.
 
 Значение `part` не из двух и отрицательный `since` отвергает проверка полей — `422`. При равном числе записей причины и исходы в `reasons` и `outcomes` идут по алфавиту; до 3.1.22 порядок равных был таким, каким их отдала база. Покрытие в `GET /api/llm/status` считается по тем же указателям и ответов модели тоже не читает. Замеры на большом архиве — в главе [26. Голосовая аналитика и очередь к модели](26-voice-analytics.md), «Раздел открывается в две части».
 
@@ -653,7 +657,13 @@ POST   /api/employees/import                       импорт по адрес�
 POST   /api/employees/link                         сверить номера со звонками
 ```
 
-Импорт принимает `{"url": "…"}` либо многочастный запрос с полем `file`. Форматы: Excel XML 2003 (SpreadsheetML), CSV (разделитель и кодировка определяются сами), JSON. Без `url` берётся адрес из настройки `employees_url`. В ответе — `added`, `updated`, `unchanged`, `deactivated`, `received` и список замечаний по строкам.
+Импорт принимает `{"url": "…"}` либо многочастный запрос с полем `file`. Форматы — по содержимому: Excel XML 2003 (SpreadsheetML, в том числе с расширением `.xls`), книга Excel `.xlsx`, CSV (разделитель и кодировка определяются сами), JSON; старый двоичный `.xls` отвергается с подсказкой, как его пересохранить. Без `url` берётся адрес из настройки `employees_url`. В ответе — `added`, `updated`, `unchanged`, `deactivated`, `received`, `changes` (перечни `added`, `updated` с изменёнными полями `fields` и `deactivated` — по полсотни имён), `columns` (колонка файла → поле карточки), `sample` (первые восемь карточек) и список замечаний по строкам. `dry_run=true` (поле формы или тела, параметр адреса) — предпросмотр: тот же ответ и `"dry_run": true`, но в базу ничего не пишется.
+
+```bash
+# что будет, если импортировать файл, — ничего не записывая
+curl -s -H "X-API-Key: ah_xxx" -F file=@employees.xml \
+  "https://asr.example.com/api/employees/import?dry_run=true" | jq '{added, updated, deactivated, columns}'
+```
 
 `POST /api/employees` без `external_id` правит существующую карточку, только если совпали и внутренний номер, и ФИО. Полный тёзка без номера или другой человек на том же номере получает новую карточку, а ответ несёт `warning` с объяснением.
 
@@ -769,6 +779,8 @@ setInterval(() => ws.send('ping'), 30000);   // держим соединени�
 | `job.retry` | будет повтор после сбоя | `id`, `attempt`, `delay_s`, `error` |
 | `job.fallback` | основная модель не справилась, задание поставлено в очередь с резервной (`model_fallback`) | `id`, `from`, `to` — модели, `error` — объект с причиной |
 | `job.cancelled` | задание отменено | `id` |
+| `job.no_speech` | запись обработана, речи в ней нет — итог, а не отказ | `id`, `status`, `message` — пояснение |
+| `job.short` | запись короче порога `audio_min_duration_s` или пустая — не распознавалась | `id`, `status`, `message` |
 | `job.cached` | результат взят из кеша | `id`, `source` — задание, из которого взят результат |
 | `queue.paused` | очередь приостановлена | — |
 | `queue.resumed` | очередь возобновлена | — |
@@ -1017,7 +1029,7 @@ curl -H "X-API-Key: ah_xxx" -G "https://asr.example.com/api/drill" \
 | признак | имя без значения | `f=negative`, `f=cached` |
 | значение | `имя:значение`; пустое значение — «не задано» | `f=model:whisper-large`, `f=owner:` |
 | целое | `имя:число` в своих границах | `f=hour:9`, `f=weekday:0` (понедельник) |
-| статус | `status:` и статусы через запятую; `active` — все незавершённые | `f=status:completed,failed` |
+| статус | `status:` и статусы через запятую; `active` — все незавершённые, `empty` — без речи и короткие | `f=status:completed,failed` |
 | диапазон по величине | `величина:от..до` — нижняя граница входит, верхняя нет, любая из двух может быть пустой | `f=duration:60..300`, `f=confidence:..0.75` |
 | величина измерена | `has:величина` | `f=has:wer` |
 | величина не ноль | `nz:величина` — измерена и не равна нулю | `f=nz:rtf` |
@@ -1031,11 +1043,11 @@ curl -H "X-API-Key: ah_xxx" -G "https://asr.example.com/api/drill" \
 | Задание | `model`, `engine`, `language`, `owner`, `source`, `device`, `error` — код ошибки, `tag` и `untagged`, `format` и `no_format`, `date` (ГГГГ-ММ-ДД), `hour`, `weekday`, `speakers` |
 | Ход обработки | `cached` и `computed`, `retried` и `first_try`, `waited_minute`, `waited_long`, `low_confidence`, `cancelled_by`, `webhook`, `same_file` — повторы одного файла |
 | Здоровье распознавания, звук | `flagged`, `assessed` и `unassessed`, `flag:<признак>`, `suspect_segments`, `has_reference`, `calibrated`, `bad_audio`, `noisy`, `clipped` |
-| Звонок записи | `agent`, `queue`, `station`, `direction` — поля звонка, с которого пришла запись |
+| Звонок записи | `agent`, `queue`, `station`, `direction` — поля звонка, с которого пришла запись; `department` — отдел оператора по справочнику сотрудников (через добавочный) |
 | Разбор содержания | отборы списка заданий по содержанию и по работе оператора (`negative`, `alerts`, `violation`, `low_score` и остальные — см. «Аналитика записей» выше), а также `neutral`, `scored`, `category:<id>`, `violation_category:<id>`, `categorized` и `uncategorized`, `stem:<основа>` — тема, `speaker`, `label`, `nps_group`, `mood_up`, `mood_down`, `mood_flat`, `stress_high`, `effort_high`, `clarity_low`, `coaching`, `coaching_open`, `listen_<вид>` — отборы вкладки «Что послушать» |
 | Ответ языковой модели | `reason`, `outcome`, `resolved:1` или `resolved:0`, `resolved_known`, `llm_ok`, `llm_failed`, `with_actions`, `off_list`, `tracker:<id>`, `tracker_checked:<id>`, `score_yes:<id>`, `score_no:<id>`, `score_na:<id>` |
 | Очередь модели | `llmq_done`, `llmq_ok`, `llmq_failed` — со значением «от..до», секунды эпохи: промежуток по времени конца разбора, а не по времени записи |
-| Звонки (`base=calls`) | `station`, `queue`, `agent`, `direction`, `no_direction`, `src`, `dst`, `context`, `disposition`, `reason` — причина пропуска, `answered` и `unanswered`, `recognized`, `skipped`, `deferred`, `pending`, `abandoned`, `timed`, `hour`, `weekday`, `wait_within:<секунд>`, `billsec:от..до`, `fcr_base`, `repeated:<секунд>`, `not_repeated:<секунд>` |
+| Звонки (`base=calls`) | `station`, `queue`, `agent`, `department`, `direction`, `no_direction`, `src`, `dst`, `context`, `disposition`, `reason` — причина пропуска, `answered` и `unanswered`, `recognized`, `skipped`, `deferred`, `pending`, `abandoned`, `timed`, `hour`, `weekday`, `wait_within:<секунд>`, `billsec:от..до`, `fcr_base`, `repeated:<секунд>`, `not_repeated:<секунд>` |
 
 Величины — для `sort`, `has:`, `nz:` и диапазонов: `duration`, `rtf`, `processing`, `wait`, `confidence`, `wer`, `snr`, `loudness`, `memory`, `words`, времена стадий (`inference`, `model_load` и другие), числовые признаки разбора (`sentiment`, `agent_score`, `compliance`, `stress`, `clarity`, `nps`, `wpm`, `monologue_s` и остальные), `llm_latency`; у звонков — `billsec` и `wait`. Отбор, который требует разбора или ответа модели, сам ограничивает список записями, где они есть. Полный перечень с описаниями отдаёт `GET /api/drill/filters` — в нём около ста шестидесяти отборов и больше восьмидесяти величин, и переписывать его сюда значило бы завести вторую копию, которая отстанет.
 
@@ -1103,6 +1115,50 @@ curl -H "X-API-Key: ah_xxx" "https://asr.example.com/api/drill/filters"
 | `call_values` | величины звонков — для `sort` |
 | `statuses` | значения отбора `status` |
 | `page`, `page_max`, `count_cap` | размер страницы по умолчанию и предельный, потолок счёта |
+
+## GET /api/voice/period
+
+Голосовая аналитика за календарный период — то, что показывают разделы «Голосовая аналитика за день», «за месяц», «за квартал» и «за год» (глава [26. Голосовая аналитика и очередь к модели](26-voice-analytics.md)).
+
+```
+GET /api/voice/period?scale=month&date=2026-10-15&agent=&department=&part=
+```
+
+| Параметр | Что задаёт |
+|---|---|
+| `scale` | `day`, `month`, `quarter` или `year`; другое — `422` |
+| `date` | любой день периода, ГГГГ-ММ-ДД; без него — текущий период. Неразборчивая дата — `400` |
+| `agent` | только разговоры этого добавочного (из журнала звонков) |
+| `department` | только отдел — по справочнику сотрудников через добавочный |
+| `part` | `fast` — счётная часть, `heavy` — трекеры, скоркарта и обязательства; без него — обе |
+
+Границы — календарные, по местному времени сервера. Базы сравнения (`baselines`): у дня — тот же день неделей раньше (`week`) и вчера (`prev`), у месяца и квартала — прошлый период (`prev`) и тот же период год назад (`yoy`), у года — прошлый год (`prev`). Пока период идёт (`complete: false`, доля прошедшего — `elapsed`), базы обрезаются тем же отрезком от своего начала (`to_date: true`, `until` < `end`).
+
+Счётная часть отвечает:
+
+| Поле | Что в нём |
+|---|---|
+| `label`, `period`, `window`, `nav` | подпись периода («октябрь 2026»), его границы, окно для списков раскрытия и соседние периоды (`prev`, `next`, `today` — даты первых дней) |
+| `totals.<база>` | по периоду (`current`) и каждой базе: `jobs`, `completed`, `no_speech`, `short`, `failed`, `cancelled`, `active`, `empty`, `empty_share`, `failed_share`, `talk_hours`, `avg_duration_s`; у текущего и главной базы — `median_duration_s`, `p90_duration_s`. Внутри — `content` (свод разбора: тональность и доли, балл оператора, скрипт, повторные, раздражение, мат, нарушения, NPS), `llm` (`analyzed`, `llm_errors`, `resolved_share`, `resolved_known`, `resolved_yes`, `coverage`) и `telephony` (журнал звонков: `calls`, `answered`, `missed`, `inbound`, `outbound`, `internal`, доли и `avg_wait_s`) |
+| `series` | по корзинам периода (час, день, неделя, месяц): `labels`, `edges` (границы корзин), `completed`, `empty`, `no_speech`, `short`, `failed`, `talk_hours`, `negative_share`, `positive_share`, `agent_score`, `compliance`, `repeat_share`, `analyzed`, `resolved_share`, `telephony`; `baselines.<база>` — разговоры баз по тем же номерам корзин |
+| `reasons`, `outcomes` | `{key, records, share, prev_records, prev_share, delta_pp, z, significant, cumulative_share}` — против главной базы; `significant` — изменение доли больше случайного (критерий для двух долей, 5 %, и не меньше двадцати разговоров в каждой выборке) |
+| `pairs`, `reason_series` | «причина × исход» и ряды двенадцати главных причин по корзинам |
+| `agents`, `agents_total`, `without_agent` | рейтинг добавочных: разговоры, без речи и короткие, ошибки, часы, средняя длительность, доля решённых и негатива, балл, скрипт, частая причина, `prev_completed` и `change` к главной базе, имя и отдел |
+| `departments` | то же по отделам справочника |
+| `directions` | разговоры по направлениям — текущий период и главная база |
+| `week_map`, `calendar` | разговоры по дням недели и часам (кроме дня); по дням периода (квартал, год) |
+| `summary` | «коротко о периоде» — фразы из этих же чисел |
+| `drill` | отборы для `GET /api/drill`, повторяющие отбор отчёта (`no_control`, `agent:…`, `department:…`) |
+| `options` | из чего выбирать: добавочные периода с именами и отделы справочника |
+
+Часть `heavy` — `lists`: `trackers` (`{id, label, checked, fired, share, prev_share, delta_pp, significant}`), `scorecard` (`{id, question, yes, no, na, pass_share, prev_pass_share, …}`, сначала худшие), `actions`, `records_with_actions` и то же по базе. Будущий период — `future: true` без чисел. Без речи и короткие входят в объём, но не в доли.
+
+```bash
+# октябрь 2026 по отделу продаж: главное и что изменилось
+curl -s -H "X-API-Key: ah_xxx" \
+  "https://asr.example.com/api/voice/period?scale=month&date=2026-10-01&department=Отдел%20продаж&part=fast" \
+  | jq '{label, summary, movers: [.reasons[] | select(.significant)]}'
+```
 
 ## GET /api/monitoring/resources
 
@@ -1248,6 +1304,8 @@ $response = curl_exec($ch);
 
 Отказ приходит тем же обратным вызовом со `status: "failed"` и причиной в `error_message`. Молчание было бы худшим исходом: вы ответили `202` и ждёте результат, которого не будет.
 
+Запись без речи и короткая запись (состояния `no_speech` и `short`, с 3.1.24) — не отказ: обратный вызов приходит со `status: "success"`, пустыми `formatted_dialogue` и `transcription` и `error_message: null` — так ответил бы на тишину и сам phone_asr. До 3.1.24 такие разговоры приходили с `failed`.
+
 ⚠️ Если ваш приёмник стоит в локальной сети (обычное дело), включите `webhook_allow_internal` — иначе сервер откажется отправлять результат на внутренний адрес. Отказ придёт сразу, при приёме разговора, а не через минуту.
 
 ### Состояние разговоров
@@ -1260,7 +1318,7 @@ curl -H "X-API-Key: $КЛЮЧ" http://сервер:8080/statuses
 [{"call_id": "4821", "part": 1, "status": "success"}]
 ```
 
-Состояния в словаре `phone_asr`: `pending`, `in_progress`, `success`, `failed`.
+Состояния в словаре `phone_asr`: `pending`, `in_progress`, `success`, `failed`. Без речи и короткая запись — `success`.
 
 ### Что при этом остаётся своим
 
@@ -1308,7 +1366,8 @@ curl -H "X-API-Key: $КЛЮЧ" http://сервер:8080/statuses
 | `file_too_large` | 413 | нет | превышен `max_upload_mb` |
 | `audio_too_long` | 413 | нет | превышен `audio_max_duration_s` |
 | `unsupported_format` | 415 | нет | расширение не поддерживается |
-| `no_speech` | 422 | нет | речь не найдена |
+| `no_speech` | 422 | нет | речь не найдена; у задания это не отказ, а итог — состояние `no_speech` («без речи») |
+| `audio_too_short` | 422 | нет | запись короче `audio_min_duration_s` или пустая; у задания это итог — состояние `short` («короткая запись») |
 | `queue_full` | 429 | да | очередь переполнена |
 | `rate_limited` | 429 | да | превышен лимит частоты |
 | `quota_exceeded` | 429 | да | исчерпана суточная квота ключа (см. «Квоты») |

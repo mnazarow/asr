@@ -100,6 +100,11 @@ def main() -> int:
         status = job["status"]
         if status == "completed":
             break
+        # Без речи и короткая запись — итоги, а не ошибки: слов в записи нет,
+        # и скачивать нечего.
+        if status in ("no_speech", "short"):
+            print(f"\n  расшифровки нет: {job.get('error_message') or status}")
+            return 0
         if status in ("failed", "cancelled"):
             print(f"\n{job.get('error_message') or status}", file=sys.stderr)
             if job.get("error_hint"):
