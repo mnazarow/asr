@@ -25,13 +25,27 @@
 """
 from __future__ import annotations
 
+import asyncio
+import functools
+import hashlib
 import json
+import math
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 
 from ..db import new_id
 from ..errors import (
@@ -63,8 +77,43 @@ router = APIRouter(prefix="/api/telephony/agent", tags=["Телефония"])
 
 #: Идентификатор агента приходит от него самого — значит, это ввод.
 #: Пропускаем только то, из чего нельзя собрать путь: он же служит частью
-#: имени станции в архиве.
-ПОХОЖ_НА_ID = re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
+#: имени станции в архиве. Из одних точек — нельзя: «.» и «..» в адресе
+#: управления агентом браузер нормализует, и ручка уходила не туда.
+ПОХОЖ_НА_ID = re.compile(r"^(?!\.+$)[A-Za-z0-9._\-]{1,64}$")
+
+#: Предел длины идентификатора звонка: у Asterisk это «эпоха.счётчик» с
+#: приставкой системы, и длиннее этого приезжает только мусор, ложащийся
+#: в первичный ключ архива.
+ДЛИНА_UNIQUEID = 128
+
+#: Сколько агентов может завести один ключ, не администратор. Каждый —
+#: станция в архиве и строка в разделе «АТС»; ключ роли user заводил их без
+#: счёта, по одному на каждое приветствие без идентификатора.
+АГЕНТОВ_НА_КЛЮЧ = 100
+
+#: Ключи звонков, запись которых принимается прямо сейчас. Проверка «есть ли
+#: звонок» и запись строки разделены приёмом файла: повтор агента после 504
+#: от прокси, пока первый запрос ещё идёт, или задвоение запроса сетью
+#: создавали два задания на один звонок и два файла в uploads.
+_ПРИНИМАЮТСЯ: set[str] = set()
+_ЗАМОК_ПРИЁМА = threading.Lock()
+
+
+class АгентНеизвестен(ConfigError):
+    """Агента нет на сервере (убрали в разделе «АТС» или не здоровался).
+
+    Код ответа прежний, 400, — так его понимают уже поставленные агенты, — а
+    свой код ошибки нужен агенту: по нему он прерывает заход и откладывает
+    звонки, а не теряет их как «ошибку одного звонка».
+    """
+
+    code = "agent_unknown"
+
+
+class АгентВыключен(ConfigError):
+    """Агент выключен в разделе «АТС» — звонков от него сервер не принимает."""
+
+    code = "agent_disabled"
 
 #: Расширения записей, которые примем от агента.
 ЗВУК = {".wav", ".mp3", ".ogg", ".gsm", ".alaw", ".ulaw", ".sln", ".g722", ".opus"}
@@ -115,7 +164,7 @@ def _свой_агент(state: Any, agent_id: str, principal: Principal) -> dic
     """
     запись = state.db.agent_get(agent_id)
     if запись is None:
-        raise error_response(ConfigError(
+        raise error_response(АгентНеизвестен(
             f"Агент «{agent_id}» серверу неизвестен.",
             hint="Вызовите POST /api/telephony/agent/hello."))
     владелец = str(запись.get("owner") or "")
@@ -123,11 +172,42 @@ def _свой_агент(state: Any, agent_id: str, principal: Principal) -> dic
         state.db.agent_save(agent_id, {"owner": principal.name}, seen=False)
         запись["owner"] = principal.name
     elif владелец != principal.name and not principal.is_admin:
+        if not _владелец_жив(state, владелец):
+            # Ключа, под которым агент работал, больше нет (его отозвали),
+            # а пришедший — с правом записи: это и есть «завели новый ключ и
+            # перезапустили install.sh». Раньше агент запирался навсегда:
+            # «работает под другим ключом — переустановите с нужным», хотя
+            # именно это и было сделано. Перехват живого чужого агента
+            # по-прежнему невозможен: его ключ на месте.
+            log.warning("Агент «%s» переходит от ключа «%s» (его больше нет) к «%s»",
+                        agent_id, владелец, principal.name)
+            state.db.agent_save(agent_id, {"owner": principal.name}, seen=False)
+            state.db.add_event(None, "agent_owner",
+                               f"Агент {agent_id}: ключ «{владелец}» отозван, "
+                               f"теперь «{principal.name}»")
+            запись["owner"] = principal.name
+            return запись
         raise error_response(ForbiddenError(
             f"Агент «{agent_id}» работает под другим ключом доступа.",
             hint="Каждый агент ходит своим ключом — тем, с которым он был "
-                 "установлен. Переустановите агента с нужным ключом."))
+                 "установлен. Передать агента другому ключу может "
+                 "администратор: POST /api/telephony/agents/<id>/owner."))
     return запись
+
+
+def _владелец_жив(state: Any, имя: str) -> bool:
+    """Есть ли ещё ключ (или учётная запись) с этим именем."""
+    for сведения in (getattr(state.settings, "api_keys", None) or {}).values():
+        if str((сведения or {}).get("name") or "ключ") == имя \
+                and (сведения or {}).get("enabled") is not False:
+            return True
+    учётки = getattr(state, "accounts", None)
+    if учётки is not None:
+        try:
+            return any(str(у.username) == имя for у in учётки.list())
+        except Exception:                                    # noqa: BLE001
+            return True
+    return False
 
 
 def _число(значение: Any, по_умолчанию: float = 0.0) -> float:
@@ -139,9 +219,12 @@ def _число(значение: Any, по_умолчанию: float = 0.0) -> 
     if значение is None or значение == "":
         return по_умолчанию
     try:
-        return float(значение)
+        число = float(значение)
     except (TypeError, ValueError):
         return по_умолчанию
+    # «Infinity» и «NaN» — тоже числа для float, но не для длительности:
+    # int(inf) бросал OverflowError, и звонок получал ответ 500.
+    return число if math.isfinite(число) else по_умолчанию
 
 
 @router.post("/hello", summary="Агент сообщает о себе и получает задание")
@@ -162,14 +245,24 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         # Узнаём только своих: агента того же ключа (или ещё ничейного).
         # Иначе посторонний ключ, назвав хост и имя станции, получал в ответ
         # чужой идентификатор — а с ним и чужое задание.
+        #
+        # И только ту же машину, если агент её называет (`machine` — отпечаток
+        # /etc/machine-id): две станции с именем хоста по умолчанию
+        # («freepbx.sangoma.local»), поставленные одним ключом без --name,
+        # сливались в одного агента, и звонки второй с совпавшим uniqueid
+        # отбрасывались как «уже импортирован».
         хост = str(данные.get("host") or "").strip()
         имя = str(данные.get("name") or "").strip()
+        машина = str(данные.get("machine") or "").strip()[:64]
         for прежний in state.db.agent_list():
             чей = str(прежний.get("owner") or "")
             if чей and чей != principal.name:
                 continue
             if хост and str(прежний.get("host") or "") == хост \
                     and (not имя or str(прежний.get("name") or "") == имя):
+                была = _машина_агента(прежний)
+                if машина and была and была != машина:
+                    continue
                 agent_id = str(прежний["id"])
                 log.info("Агент с хоста «%s» узнан по прежней записи: %s", хост, agent_id)
                 break
@@ -181,6 +274,13 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
     новый = state.db.agent_get(agent_id) is None
     if not новый:
         _свой_агент(state, agent_id, principal)
+    elif not principal.is_admin and sum(
+            1 for а in state.db.agent_list()
+            if str(а.get("owner") or "") == principal.name) >= АГЕНТОВ_НА_КЛЮЧ:
+        raise error_response(ConfigError(
+            f"У ключа «{principal.name}» уже {АГЕНТОВ_НА_КЛЮЧ} агентов.",
+            hint="Уберите лишних в разделе «АТС» или поставьте агента с "
+                 "сохранённым идентификатором (state.json)."))
     # «Только посмотреть»: самопроверка агента (`--selftest`) здоровается,
     # чтобы проверить связь и часы, — и раньше забирала при этом задание
     # сервера («собрать всё»), которого сама не выполняет: нажатое в
@@ -191,6 +291,12 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
     состояние_агента = данные.get("state") if isinstance(данные.get("state"), dict) else {}
     посмотреть = bool(данные.get("peek")) or bool((состояние_агента or {}).get("selftest"))
 
+    состояние_сохранить = dict(данные.get("state") or {}) \
+        if isinstance(данные.get("state"), dict) else {}
+    if данные.get("machine"):
+        # Отпечаток машины — в состоянии агента: отдельной колонки под него
+        # нет, а читать его нужно только при узнавании (см. выше).
+        состояние_сохранить["machine"] = str(данные.get("machine"))[:64]
     запись = state.db.agent_save(agent_id, {
         # Владелец ставится один раз — при первом приветствии. Иначе
         # администратор, поздоровавшийся за агента (проверка руками),
@@ -204,7 +310,7 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         "source": str(данные.get("source") or "")[:40],
         "station": _агентская_станция(agent_id),
         **({} if посмотреть else
-           {"state": json.dumps(данные.get("state") or {}, ensure_ascii=False)[:4000]}),
+           {"state": json.dumps(состояние_сохранить, ensure_ascii=False)[:4000]}),
     })
     # При «только посмотреть» задание остаётся на сервере: его покажут,
     # но не снимут — выполнит его настоящий заход агента.
@@ -225,6 +331,41 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         "min_duration_s": int(state.settings.get("telephony_min_duration_s") or 0),
         "skip_unanswered": bool(state.settings.get("telephony_skip_unanswered", True)),
     }
+
+
+def _машина_агента(запись: dict[str, Any]) -> str:
+    """Отпечаток машины из сохранённого состояния агента; пусто — не знаем."""
+    try:
+        состояние = json.loads(str(запись.get("state") or "{}"))
+    except ValueError:
+        return ""
+    return str(состояние.get("machine") or "") if isinstance(состояние, dict) else ""
+
+
+def _включён(state: Any, agent_id: str, запись: dict[str, Any]) -> None:
+    """Отказ «агент выключен» — тем же видом на /ask и на /call.
+
+    Вопрос о звонках у выключенного агента раньше отвечал как обычно, и
+    агент шёл слать то, что сервер всё равно не примет.
+    """
+    if not int(запись.get("enabled") if запись.get("enabled") is not None else 1):
+        raise error_response(АгентВыключен(
+            f"Агент «{agent_id}» выключен на сервере.",
+            hint="Включите его в разделе «АТС»."))
+
+
+#: Пометки звонка без задания, к которому агент вправе дослать запись:
+#: сервер не принял её раньше (413 от прокси, перебой) — а запись на
+#: станции есть. Без этого звонок с такой пометкой оставался без записи
+#: навсегда: /ask отвечал «уже в архиве», /call — «уже импортирован».
+ДОСЛАТЬ_МОЖНО = ("сервер не принял запись", "запись не читается", "не дождались записи")
+
+
+def _дослать_можно(строка: dict[str, Any]) -> bool:
+    if строка.get("job_id"):
+        return False
+    пометка = str(строка.get("skipped") or "")
+    return any(пометка.startswith(п) for п in ДОСЛАТЬ_МОЖНО)
 
 
 @router.get("/command", summary="Задание для агента, если оно есть")
@@ -249,24 +390,77 @@ def ask(request: Request, данные: dict[str, Any],
     state = get_state(request)
     require_write(principal)
     agent_id = _проверить_id(str(данные.get("agent_id") or ""))
-    _свой_агент(state, agent_id, principal)
+    _включён(state, agent_id, _свой_агент(state, agent_id, principal))
     станция = _агентская_станция(agent_id)
     ids = [str(и) for и in (данные.get("ids") or []) if str(и).strip()]
     if len(ids) > 5000:
         raise error_response(ConfigError(
             "За один раз можно спросить не более 5000 звонков.",
             hint="Разбейте список на части."))
-    нужны = [и for и in ids if not state.db.call_exists(f"{станция}:{и}")]
+    нужны = []
+    for и in ids:
+        строка = state.db.call_get(f"{станция}:{и}")
+        if строка is None or _дослать_можно(строка):
+            нужны.append(и)
     return {"wanted": нужны, "known": len(ids) - len(нужны)}
+
+
+class ЗвонокПринимается(ASRHubError):
+    """Тот же звонок уже принимается другим запросом — повторить позже."""
+
+    code = "call_in_progress"
+    http_status = 409
 
 
 @router.post("/call", summary="Звонок с записью от агента")
 async def call(request: Request,
                meta: str = Form(..., description="JSON с полями звонка"),
                file: UploadFile | None = File(default=None),
+               sha256: str = Form(default="", description="SHA-256 записи — поле "
+                                  "после файла: агент считает её по ходу отправки"),
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Принимает звонок (и запись) от агента на станции.
+
+    Обработчик асинхронный — ради потокового приёма файла, — а всё, что
+    ходит в базу и запускает ffprobe, уходит в поток. Раньше agent_get,
+    call_exists, save_call и queue.submit (хеш файла, ffprobe до минуты,
+    запись в базу) шли прямо в цикле событий, и на каждую запись от агента
+    сервер переставал отвечать всем — /health ждал полторы-три секунды.
+
+    Суточная квота ключа действует и здесь: прежде через агента ключ с
+    квотой «два задания в сутки» ставил их сколько угодно.
+    """
     state = get_state(request)
     require_write(principal)
+    try:
+        # Разбор полей и проверка агента ходят в базу — в потоке.
+        итог = await asyncio.to_thread(_звонок_до_записи, state, principal, meta)
+    except BaseException:
+        if file is not None:
+            await file.close()
+        raise
+    поля, agent_id, запись_агента = итог["поля"], итог["agent_id"], итог["агент"]
+    uniqueid, станция, ключ = итог["uniqueid"], итог["станция"], итог["ключ"]
+    if sha256:
+        поля["sha256"] = sha256
+    with _ЗАМОК_ПРИЁМА:
+        if ключ in _ПРИНИМАЮТСЯ:
+            if file is not None:
+                await file.close()
+            raise error_response(ЗвонокПринимается(
+                f"Звонок {uniqueid} уже принимается другим запросом.",
+                hint="Агент повторит его позже сам."))
+        _ПРИНИМАЮТСЯ.add(ключ)
+    try:
+        return await _принять(request, state, principal, поля, file, agent_id,
+                              запись_агента, uniqueid, станция, ключ)
+    finally:
+        with _ЗАМОК_ПРИЁМА:
+            _ПРИНИМАЮТСЯ.discard(ключ)
+
+
+def _звонок_до_записи(state: Any, principal: Principal, meta: str) -> dict[str, Any]:
+    """Всё, что о звонке решается до приёма записи, — в потоке (база)."""
     try:
         поля = json.loads(meta)
     except ValueError as exc:
@@ -277,19 +471,31 @@ async def call(request: Request,
 
     agent_id = _проверить_id(str(поля.get("agent_id") or ""))
     запись_агента = _свой_агент(state, agent_id, principal)
-    if not int(запись_агента.get("enabled") or 0):
-        raise error_response(ConfigError(
-            f"Агент «{agent_id}» выключен на сервере.",
-            hint="Включите его в разделе «АТС»."))
+    _включён(state, agent_id, запись_агента)
 
     uniqueid = str(поля.get("uniqueid") or "").strip()
     if not uniqueid:
         raise error_response(ConfigError(
             "У звонка нет идентификатора (uniqueid)."))
+    if len(uniqueid) > ДЛИНА_UNIQUEID:
+        raise error_response(ConfigError(
+            f"Идентификатор звонка длиннее {ДЛИНА_UNIQUEID} знаков.",
+            hint="У Asterisk это «эпоха.счётчик»; проверьте разбор журнала на станции."))
     станция = _агентская_станция(agent_id)
-    ключ = f"{станция}:{uniqueid}"
-    if state.db.call_exists(ключ):
-        return {"ok": True, "skipped": "уже импортирован", "uniqueid": uniqueid}
+    return {"поля": поля, "agent_id": agent_id, "агент": запись_агента,
+            "uniqueid": uniqueid, "станция": станция, "ключ": f"{станция}:{uniqueid}"}
+
+
+async def _принять(request: Request, state: Any, principal: Principal,
+                   поля: dict[str, Any], file: UploadFile | None, agent_id: str,
+                   запись_агента: dict[str, Any], uniqueid: str, станция: str,
+                   ключ: str) -> dict[str, Any]:
+    """Сам приём звонка — под занятым ключом (см. `_ПРИНИМАЮТСЯ`).
+
+    Всё, что ходит в базу и запускает ffprobe, — в потоке (см. `call`).
+    """
+    from ..telephony.asterisk import нога_лучше  # noqa: PLC0415
+    from .routes_jobs import _probe_duration, check_quota, под_квотой  # noqa: PLC0415
 
     звонок = {к: поля.get(к) for к in ПОЛЯ_ЗВОНКА if к in поля}
     звонок["duration"] = int(_число(звонок.get("duration")))
@@ -297,27 +503,65 @@ async def call(request: Request,
     звонок["started_at"] = _число(звонок.get("started_at"))
     звонок["answered"] = 1 if звонок.get("answered") else 0
     звонок["pbx_uid"] = uniqueid
+    есть_файл = file is not None and bool((file.filename or "").strip())
 
-    if file is None or not (file.filename or "").strip():
+    прежний = await asyncio.to_thread(state.db.call_get, ключ)
+    if прежний is not None:
+        # Звонок уже в архиве. Asterisk 12+ пишет на один звонок несколько
+        # строк CDR, и пришедшая позже бывает той самой — отвеченной. Раньше
+        # она отбрасывалась как «уже импортирован», приняв тело целиком.
+        лучше = нога_лучше(звонок, прежний)
+        if прежний.get("job_id") or not (есть_файл and (лучше or _дослать_можно(прежний))):
+            if лучше:
+                пометка = str(прежний.get("skipped") or "") if прежний.get("job_id") \
+                    else str(поля.get("skipped") or прежний.get("skipped") or "")
+                await asyncio.to_thread(functools.partial(
+                    state.db.save_call, ключ, job_id=None, skipped=пометка, owner=None,
+                    station=станция, **звонок))
+            if file is not None:
+                await file.close()
+            return {"ok": True, "skipped": "уже импортирован", "uniqueid": uniqueid,
+                    **({"updated": True} if лучше else {})}
+
+    if not есть_файл:
         # Звонок без записи — тоже звонок: он нужен в журнале, в счётчиках
         # и в разрезах. Просто распознавать нечего.
-        state.db.save_call(ключ, job_id=None, skipped=str(поля.get("skipped") or "нет записи"),
-                           owner=principal.name, station=станция, **звонок)
-        state.db.agent_count(agent_id, calls=1)
+        def без_записи() -> None:
+            state.db.save_call(ключ, job_id=None,
+                               skipped=str(поля.get("skipped") or "нет записи"),
+                               owner=principal.name, station=станция, **звонок)
+            state.db.agent_count(agent_id, calls=1)
+
+        await asyncio.to_thread(без_записи)
+        if file is not None:
+            await file.close()
         return {"ok": True, "skipped": "нет записи", "uniqueid": uniqueid}
+    assert file is not None
 
     имя = Path(str(file.filename)).name
     расширение = Path(имя).suffix.lower()
     if расширение not in ЗВУК:
         # 415, а не 400: агент по этому коду понимает, что дело в ЗАПИСИ, и
         # шлёт звонок ещё раз без неё — звонок остаётся в журнале.
+        await file.close()
         ошибка = UnsupportedFormat(имя)
         ошибка.message = f"«{имя}»: такие записи сервер не принимает."
         ошибка.hint = "Ожидаются " + ", ".join(sorted(ЗВУК)) + "."
         raise error_response(ошибка)
+    # Суточная квота по числу заданий — до приёма файла, как у обычной
+    # загрузки и у /process-call: незачем принимать сотню мегабайт, чтобы
+    # затем отказать. Отказ — 429 с Retry-After: агент повторит позже.
+    # Раньше этот путь квоту не проверял вовсе: ключ с quota_jobs_per_day=2
+    # сам заводил агента через /hello и ставил задания без счёта.
+    try:
+        await asyncio.to_thread(check_quota, request, principal)
+    except BaseException:
+        await file.close()
+        raise
     предел = int(state.settings.get("max_upload_mb") or 2048)
     цель = state.settings.paths.uploads / f"{new_id('pbx')}{расширение}"
     размер = 0
+    сумма = hashlib.sha256()
     try:
         with цель.open("wb") as выход:
             while True:
@@ -334,31 +578,60 @@ async def call(request: Request,
                     ошибка.hint = ("Поднимите «Предел размера загрузки» или сжимайте "
                                    "записи на станции.")
                     raise error_response(ошибка)
+                сумма.update(кусок)
                 выход.write(кусок)
     except OSError as exc:
         цель.unlink(missing_ok=True)
-        state.db.agent_count(agent_id, errors=1, error=str(exc))
+        await asyncio.to_thread(state.db.agent_count, agent_id, errors=1, error=str(exc))
         raise error_response(StorageError(f"Не удалось сохранить запись: {exc}")) from exc
     finally:
         await file.close()
 
-    try:
-        метки = ",".join(м for м in ("АТС", "агент", str(запись_агента.get("name") or ""),
-                                     str(звонок.get("direction") or "")) if м)
-        задание = state.queue.submit(
-            file_path=цель, filename=имя,
-            settings=state.settings.merged({}),
-            owner=principal.name, api_key_name=principal.name,
-            priority=int(state.settings.get("telephony_priority") or 40),
-            source="asterisk", tags=метки)
-    except Exception as exc:                                 # noqa: BLE001
+    ожидалось = str(поля.get("sha256") or "").strip().lower()
+    if ожидалось and ожидалось != сумма.hexdigest():
+        # Запись доехала не той, что ушла: обрыв, который прокси выдал за
+        # конец тела, или порча по дороге. Повтор агента пришлёт её заново.
         цель.unlink(missing_ok=True)
-        state.db.agent_count(agent_id, errors=1, error=str(exc))
-        raise
-    звонок["recording"] = str(цель)
-    state.db.save_call(ключ, job_id=задание.get("id"), skipped="",
-                       owner=principal.name, station=станция, **звонок)
-    state.db.agent_count(agent_id, calls=1, files=1, size=размер)
+        await asyncio.to_thread(functools.partial(
+            state.db.agent_count, agent_id, errors=1,
+            error="контрольная сумма записи не сошлась"))
+        raise error_response(ConfigError(
+            f"Запись звонка {uniqueid} повреждена в пути: контрольная сумма не сошлась.",
+            hint="Агент отправит её ещё раз; если повторяется — проверьте прокси "
+                 "между станцией и сервером."))
+
+    def поставить() -> dict[str, Any]:
+        # Хеш файла, ffprobe и запись в базу — в потоке, а не в цикле событий:
+        # на записи в сотни мегабайт они занимали его секундами, и сервер не
+        # отвечал даже на /api/health. Последняя проверка квоты и постановка
+        # — под одним замком владельца (см. `под_квотой`): иначе
+        # одновременные звонки обходили квоту.
+        try:
+            метки = ",".join(м for м in ("АТС", "агент", str(запись_агента.get("name") or ""),
+                                         str(звонок.get("direction") or "")) if м)
+            задание = под_квотой(
+                state, principal, functools.partial(
+                    state.queue.submit,
+                    file_path=цель, filename=имя,
+                    settings=state.settings.merged({}),
+                    owner=principal.name, api_key_name=principal.name,
+                    priority=int(state.settings.get("telephony_priority") or 40),
+                    source="asterisk", tags=метки),
+                incoming_bytes=размер, incoming_audio_s=_probe_duration(цель))
+        except BaseException as exc:
+            цель.unlink(missing_ok=True)
+            state.db.agent_count(agent_id, errors=1, error=str(getattr(exc, "message", exc)))
+            raise
+        звонок["recording"] = str(цель)
+        state.db.save_call(ключ, job_id=задание.get("id"), skipped="",
+                           owner=principal.name, station=станция, **звонок)
+        state.db.agent_count(agent_id, calls=1, files=1, size=размер)
+        return задание
+
+    try:
+        задание = await asyncio.to_thread(поставить)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
     return {"ok": True, "uniqueid": uniqueid, "job_id": задание.get("id"),
             "bytes": размер}
 
@@ -475,6 +748,36 @@ def включить(request: Request, agent_id: str, данные: dict[str, An
                         seen=False)
     return {"ok": True, "agent_id": agent_id,
             "enabled": bool(данные.get("enabled", True))}
+
+
+@управление.post("/agents/{agent_id}/owner", summary="Передать агента другому ключу")
+def передать(request: Request, agent_id: str, данные: dict[str, Any],
+             principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Агент принадлежит ключу, которым поздоровался впервые.
+
+    Сменить ключ на станции значило переустановить агента — и получить 403
+    «работает под другим ключом», хотя именно это и сделано; удаление
+    состояния давало новый идентификатор и вторую станцию в архиве с теми же
+    звонками. Здесь администратор передаёт агента ключу по его имени.
+    """
+    state = get_state(request)
+    require_admin(principal)
+    agent_id = _проверить_id(agent_id)
+    кому = str(данные.get("owner") or "").strip()
+    if not кому:
+        raise error_response(ConfigError("Не указано, какому ключу передать агента.",
+                                         hint="Тело: {\"owner\": \"<имя ключа>\"}."))
+    if not _владелец_жив(state, кому):
+        raise error_response(ConfigError(
+            f"Ключа или учётной записи «{кому}» нет.",
+            hint="Имя ключа — в разделе «Доступ»."))
+    прежний = state.db.agent_get(agent_id)
+    if прежний is None:
+        raise error_response(АгентНеизвестен(f"Агент «{agent_id}» серверу неизвестен."))
+    state.db.agent_save(agent_id, {"owner": кому}, seen=False)
+    state.db.add_event(None, "agent_owner",
+                       f"Агент {agent_id}: «{прежний.get('owner') or '—'}» → «{кому}»")
+    return {"ok": True, "agent_id": agent_id, "owner": кому}
 
 
 @управление.delete("/agents/{agent_id}", summary="Убрать агента")

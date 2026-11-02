@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 import shutil
-import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,13 @@ router = APIRouter(tags=["Совместимость с phone_asr"])
 #: Сколько знаков номера хранить. Номер — подпись, а не данные: длиннее
 #: этого приезжает только мусор, и ради него отказывать в разговоре нельзя.
 ДЛИНА_НОМЕРА = 64
+
+#: Сколько разговоров скачивается одновременно. Раньше на каждый запрос
+#: заводился свой поток без счёта: тысяча запросов с медленными ссылками —
+#: тысяча потоков, каждый держит соединение и место на диске. Остальные
+#: ждут своей очереди здесь же, в памяти, — ответ 202 им уже дан.
+ПРИЁМ_ПОТОКОВ = 16
+_приём = ThreadPoolExecutor(max_workers=ПРИЁМ_ПОТОКОВ, thread_name_prefix="phone")
 
 
 class ProcessCallBody(BaseModel):
@@ -143,8 +151,7 @@ def process_call(request: Request, body: ProcessCallBody,
     # его, держа обработчик запроса, значит отвечать 202 через полминуты.
     номера = {"phone": body.phone, "internal_phone": body.internal_phone,
               "direction": body.direction}
-    threading.Thread(target=_accept, name=f"phone-{call.uuid}",
-                     args=(state, call, target, principal, номера), daemon=True).start()
+    _приём.submit(_accept, state, call, target, principal, номера)
 
     return {
         "status": "accepted",
@@ -164,18 +171,33 @@ def statuses(request: Request,
     from .deps import scope_owner
 
     owner = scope_owner(principal)
-    jobs = state.db.list_jobs(owner=owner, limit=500, light=False)
     result: list[dict[str, Any]] = []
-    for job in jobs:
-        call = (job.get("params") or {}).get("_phone")
-        if not call:
-            continue
-        result.append({
-            "call_id": call.get("call_id"),
-            "part": call.get("part", 1),
-            "status": _phone_status(str(job.get("status") or "")),
-        })
+    # Страницами, а не последние пятьсот заданий владельца: у ключа, через
+    # который идут и обычные загрузки, разговоры phone_asr тонули в них, и
+    # /statuses переставал видеть звонки, принятые час назад. Глубина — за
+    # месяц и не больше десяти страниц: это справка о свежих звонках, а не
+    # выгрузка архива.
+    since = time.time() - СТАТУСЫ_ЗА_С
+    for страница in range(СТАТУСЫ_СТРАНИЦ):
+        jobs = state.db.list_jobs(owner=owner, limit=500, offset=страница * 500,
+                                  since=since, light=False)
+        for job in jobs:
+            call = (job.get("params") or {}).get("_phone")
+            if not call:
+                continue
+            result.append({
+                "call_id": call.get("call_id"),
+                "part": call.get("part", 1),
+                "status": _phone_status(str(job.get("status") or "")),
+            })
+        if len(jobs) < 500:
+            break
     return result
+
+
+#: Глубина и предел /statuses: тридцать дней и десять страниц по пятьсот.
+СТАТУСЫ_ЗА_С = 30 * 86400
+СТАТУСЫ_СТРАНИЦ = 10
 
 
 def _phone_status(status_name: str) -> str:
@@ -199,7 +221,14 @@ def _accept(state: Any, call: phone_compat.PhoneRequest, target: str,
     """Скачивает запись и ставит её в обычную очередь."""
     # path_key, а не uuid: call_id приходит от клиента, и в исходном виде он
     # уводил и запись файла, и рекурсивную уборку за пределы своих каталогов.
-    ключ = call.path_key
+    # И с приставкой new_id: call_id не уникален — две CRM с разными ключами
+    # нумеруют звонки с 1001, да и повтор запроса никто не запрещает, — а
+    # под общим именем второй запрос перезаписывал файл, на который уже
+    # ссылалось ждущее задание первого: одна CRM получала в обратном вызове
+    # расшифровку чужого разговора. call_id остаётся в параметрах задания.
+    from ..db import new_id  # noqa: PLC0415
+
+    ключ = f"{new_id('ph')}-{call.path_key}"
     workdir = Path(state.settings.get("temp_dir") or state.settings.paths.tmp) / \
         f"phone-{ключ}"
     try:
@@ -354,17 +383,16 @@ def _send_failure(state: Any, call: phone_compat.PhoneRequest, target: str,
         "formatted_dialogue": [], "transcription": "",
         "status": "failed", "error_message": message,
     }
-    import urllib.error
-    import urllib.request
-
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        target, data=payload, method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8",
-                 "User-Agent": "ASRHub/3.0"})
+    # Той же доставкой, что и результат: с подписью X-ASRHub-Signature,
+    # повторами, проверкой каждого перенаправления и кодированием адреса.
+    # Прямой urlopen шёл по «302 → внутренний адрес» сам, на кириллице в
+    # адресе падал UnicodeEncodeError (клиент не получал ничего), а при
+    # недоступном приёмнике не повторял. Задания у отказа нет — запись
+    # о доставке обновлять не в чем, и это не ошибка.
     try:
-        with urllib.request.urlopen(request, timeout=15):
-            pass
-    except (urllib.error.URLError, OSError) as exc:
+        state.queue._deliver_webhook(                          # noqa: SLF001
+            {"id": f"phone-{call.path_key}", "webhook_url": target}, payload)
+    except Exception as exc:                                  # noqa: BLE001
         log.warning("Отказ по разговору %s не доставлен на %s: %s",
                     call.uuid, target, exc)

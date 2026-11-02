@@ -101,6 +101,10 @@ if [[ -z "${SERVICE_NAME}" ]]; then
   SERVICE_NAME="$(service_name_for "${PREFIX}" || true)"
 fi
 
+# Каталог данных принадлежит пользователю службы — копии базы и
+# конфигурации пишутся от его имени (data_owner_init в common.sh).
+data_owner_init "${DATA_DIR}"
+
 VENV="${PREFIX}/venv"
 # Разбору внутри библиотеки нужны и pip, и каталог требований: по спутникам
 # --no-deps он отличает наши намеренные отступления от настоящих находок.
@@ -119,6 +123,13 @@ SNAPSHOT_DIR="${PREFIX%/}.snapshot"
 SNAPSHOT_LEGACY="${PREFIX}/../asrhub-snapshot"
 CURRENT_VERSION="$(cat "${PREFIX}/VERSION" 2>/dev/null || echo 'неизвестна')"
 NEW_VERSION="$(cat "${SOURCE_DIR}/VERSION" 2>/dev/null || echo 'неизвестна')"
+# Признак незаконченного обновления: ставится сразу после снимка, снимается
+# в конце (удачном или с откатом). Обновление, оборванное посреди (kill,
+# пропало питание), оставляло смесь версий, и повторный запуск видел
+# «версия другая» и переснимал снимок с этой смеси — прежний код терялся.
+UPDATE_MARK="${PREFIX}/.asrhub-update-in-progress"
+#: Отложенные при подмене прежние каталоги — удаляются после успеха.
+OLD_ITEMS=()
 
 # --- Откат ------------------------------------------------------------------
 
@@ -140,16 +151,23 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
   info "Снимок от $(date -r "${SNAPSHOT_DIR}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?'), версия $(cat "${SNAPSHOT_DIR}/VERSION" 2>/dev/null || echo '?')"
   confirm "Восстановить предыдущую версию?" || exit 0
   acquire_install_lock "${PREFIX}" || exit 1
-  [[ -n "${SERVICE_NAME}" ]] && { bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" \
+  RB_DOCKER=0
+  [[ "$(install_marker_value "${PREFIX}" mode || true)" == "docker" ]] && RB_DOCKER=1
+  [[ "${RB_DOCKER}" -eq 0 && -n "${SERVICE_NAME}" ]] && { bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" \
     --data "${DATA_DIR}" --name "${SERVICE_NAME}" 2>/dev/null || true; }
   # Каталог за каталогом, как при обновлении: копия поверх (`cp -a снимок/.`)
   # оставляла файлы новой версии, которых в прежней не было, — модули,
   # которые прежний код не ждёт. venv и данные в снимок не входят и не
-  # трогаются.
-  for item in server scripts config requirements docker examples VERSION README.md; do
+  # трогаются. Каталог docker — поверх: в нём .env, certs и, возможно, data.
+  for item in ${ASRHUB_INSTALL_ITEMS}; do
     [[ -e "${SNAPSHOT_DIR}/${item}" ]] || continue
     if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
       printf '  [пробный запуск] %s ← снимок\n' "${PREFIX}/${item}"
+      continue
+    fi
+    if [[ "${item}" == "docker" ]]; then
+      overlay_docker_dir "${SNAPSHOT_DIR}/docker" "${PREFIX}/docker" \
+        || { error "Не удалось вернуть docker."; exit 1; }
       continue
     fi
     staged="${PREFIX:?}/.${item}.rollback"
@@ -160,30 +178,95 @@ if [[ "${DO_ROLLBACK}" -eq 1 ]]; then
   done
   # Файл конфигурации лежит не в prefix, поэтому переносится отдельно — и
   # только если он в снимке есть. Нынешний не выбрасываем: человек мог
-  # успеть поправить в нём что-то нужное.
+  # успеть поправить в нём что-то нужное. Пишется от имени владельца
+  # каталога данных и через временное имя: `cp` поверх подложенной на место
+  # config.yaml ссылки писал бы от root в чужой файл.
   if [[ -f "${SNAPSHOT_DIR}/config.yaml.snapshot" ]]; then
     if [[ -f "${DATA_DIR}/config.yaml" ]] \
        && ! cmp -s "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"; then
       KEEP="${DATA_DIR}/config.yaml.new.$(date +%Y%m%d-%H%M%S)"
-      run cp -a "${DATA_DIR}/config.yaml" "${KEEP}"
+      read_owned "${DATA_DIR}/config.yaml" | write_file "${KEEP}" 0640 nobackup
       info "Конфигурация новой версии сохранена рядом: $(basename "${KEEP}")"
     fi
-    run cp -a "${SNAPSHOT_DIR}/config.yaml.snapshot" "${DATA_DIR}/config.yaml"
+    write_file "${DATA_DIR}/config.yaml" 0640 nobackup < "${SNAPSHOT_DIR}/config.yaml.snapshot"
     ok "Конфигурация возвращена к виду до обновления"
   fi
-  [[ -n "${SERVICE_NAME}" ]] && { bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" \
-    --data "${DATA_DIR}" --name "${SERVICE_NAME}" 2>/dev/null || true; }
-  ok "Откат выполнен: версия $(cat "${PREFIX}/VERSION" 2>/dev/null || echo '?')"
-  # Зависимости и база в снимок не входят: пакеты новой версии остаются в
-  # окружении, база — в том виде, в каком её оставила новая версия.
-  hint "Пакеты окружения остались от новой версии. Вернуть прежние:"
-  hint "  '${VPIP}' install -r '${PREFIX}/requirements/base.txt'"
-  LAST_DB_COPY="$(ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | head -1 || true)"
+  # Пакеты окружения — к тому виду, что был до обновления: обновление ставит
+  # всё с --upgrade по диапазонам, и прежний код без этого шага оставался на
+  # новых пакетах — ровно тех, из-за которых чаще всего и откатываются.
+  if [[ "${RB_DOCKER}" -eq 0 && -f "${SNAPSHOT_DIR}/pip-freeze.txt" && -x "${VPIP}" ]]; then
+    info "Возврат пакетов окружения к снимку…"
+    if pip_install "${VPIP}" 2 --disable-pip-version-check --no-input --no-deps \
+         -r "${SNAPSHOT_DIR}/pip-freeze.txt"; then
+      ok "Пакеты окружения возвращены"
+      EXTRA="$("${VPIP}" freeze --all 2>/dev/null | sed 's/[=@ ].*//' | LC_ALL=C sort -u \
+               | LC_ALL=C comm -23 - <(sed 's/[=@ ].*//' "${SNAPSHOT_DIR}/pip-freeze.txt" | LC_ALL=C sort -u) \
+               | tr '\n' ' ' || true)"
+      if [[ -n "${EXTRA// /}" ]]; then
+        hint "Пакеты, которых до обновления не было (оставлены): ${EXTRA}"
+        hint "  убрать: '${VPIP}' uninstall -y ${EXTRA}"
+      fi
+    else
+      warn "Пакеты вернуть не удалось — прежний код работает на пакетах новой версии."
+      hint "Повторить: '${VPIP}' install --no-deps -r '${SNAPSHOT_DIR}/pip-freeze.txt'"
+    fi
+  elif [[ "${RB_DOCKER}" -eq 0 ]]; then
+    hint "В снимке нет списка пакетов (снимок старой версии) — пакеты остались от новой:"
+    hint "  '${VPIP}' install -r '${PREFIX}/requirements/base.txt'"
+  fi
+  rm -f "${UPDATE_MARK}" 2>/dev/null || true
+
+  RB_RC=0
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    :
+  elif [[ "${RB_DOCKER}" -eq 1 ]]; then
+    # Контейнер — тоже прежней версии: файлы возвращены, но работающий образ
+    # собран из новых, и без пересборки «Откат выполнен» означал, что
+    # дальше работает та же новая версия.
+    if have docker; then
+      RB_COMPOSE="docker compose"
+      docker compose version >/dev/null 2>&1 || RB_COMPOSE="docker-compose"
+      RB_FILES=(-f docker-compose.yml)
+      grep -qE '^ASRHUB_ACCEL=cuda' "${PREFIX}/docker/.env" 2>/dev/null \
+        && [[ -f "${PREFIX}/docker/docker-compose.gpu.yml" ]] && RB_FILES+=(-f docker-compose.gpu.yml)
+      info "Пересборка образа прежней версии…"
+      ( cd "${PREFIX}/docker" && run ${RB_COMPOSE} --env-file .env "${RB_FILES[@]}" build \
+          && run ${RB_COMPOSE} --env-file .env "${RB_FILES[@]}" up -d ) || RB_RC=1
+    else
+      error "Установка в контейнере, а docker не найден — контейнер прежней версии не поднят."
+      RB_RC=1
+    fi
+  elif [[ -n "${SERVICE_NAME}" ]]; then
+    bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" \
+      --data "${DATA_DIR}" --name "${SERVICE_NAME}" 2>/dev/null || RB_RC=1
+  fi
+  # После отката сервер проверяется так же, как после обновления: «Откат
+  # выполнен» про сервер, который так и не поднялся, — та же неправда.
+  if [[ "${ASRHUB_DRY_RUN}" != "1" && ( "${RB_DOCKER}" -eq 1 || -n "${SERVICE_NAME}" ) ]]; then
+    RB_PORT="$(server_port_hint "${DATA_DIR}" "${PREFIX}" \
+               "$( [[ "${RB_DOCKER}" -eq 1 ]] && echo docker || echo native )" "${SERVICE_NAME:-asrhub}")"
+    if [[ "${RB_RC}" -eq 0 ]] && wait_for_health "${RB_PORT}" "${HEALTH_WAIT_S:-60}" \
+         "${SERVICE_NAME:-asrhub}" "${PROBE_HOST_HINT:-127.0.0.1}"; then
+      ok "Сервер отвечает на прежней версии"
+    else
+      RB_RC=1
+      error "Сервер не отвечает и после отката."
+      hint "Журнал службы: bash '${PREFIX}/scripts/service.sh' logs -n 100"
+    fi
+  fi
+  ok "Файлы возвращены: версия $(cat "${PREFIX}/VERSION" 2>/dev/null || echo '?')"
+  # База в снимок не входит: она в том виде, в каком её оставила новая
+  # версия. Копия до обновления — та, что записана в снимке, а не самая
+  # свежая: после повторного запуска самая свежая — это уже копия после
+  # миграции.
+  LAST_DB_COPY="$(cat "${SNAPSHOT_DIR}/db-backup.path" 2>/dev/null || true)"
+  [[ -n "${LAST_DB_COPY}" && -f "${LAST_DB_COPY}" ]] \
+    || LAST_DB_COPY="$(ls -1t "${DATA_DIR}"/asrhub.db.bak.* 2>/dev/null | tail -1 || true)"
   if [[ -n "${LAST_DB_COPY}" ]]; then
     hint "База — в том виде, в каком её оставила новая версия. Копия до обновления:"
     hint "  bash '${PREFIX}/scripts/service.sh' restore --from '${LAST_DB_COPY}'"
   fi
-  exit 0
+  exit "${RB_RC}"
 fi
 
 # --- Проверка ---------------------------------------------------------------
@@ -197,6 +280,13 @@ printf '\n'
 if [[ "${ENGINES_ONLY}" -eq 0 && ! -d "${SOURCE_DIR}/server" ]]; then
   error "В каталоге источника нет каталога server: ${SOURCE_DIR}"
   hint "Укажите путь к распакованному дистрибутиву: --source /путь/к/asr-hub"
+  exit 2
+fi
+# Без VERSION и scripts это не дистрибутив: «версия неизвестна» ставилась
+# поверх рабочей установки, а снимок и откат потом не знали, что вернули.
+if [[ "${ENGINES_ONLY}" -eq 0 ]] && { [[ ! -f "${SOURCE_DIR}/VERSION" ]] || [[ ! -d "${SOURCE_DIR}/scripts" ]]; }; then
+  error "Каталог ${SOURCE_DIR} не похож на дистрибутив ASR Hub: нет VERSION или scripts."
+  hint "Укажите путь к распакованному дистрибутиву целиком: --source /путь/к/asr-hub"
   exit 2
 fi
 
@@ -280,14 +370,36 @@ if [[ "${CURRENT_VERSION}" == "${NEW_VERSION}" && -f "${SNAPSHOT_DIR}/VERSION" ]
   KEEP_SNAPSHOT=1
   info "Версия не меняется — снимок версии $(cat "${SNAPSHOT_DIR}/VERSION") оставлен для отката."
 fi
+# Прошлое обновление не дошло до конца: в каталоге может лежать смесь двух
+# версий, и снимок с неё — не прежняя версия. Оставляем тот, что был.
+if [[ -f "${UPDATE_MARK}" && -d "${SNAPSHOT_DIR}" ]]; then
+  KEEP_SNAPSHOT=1
+  warn "Прошлое обновление не завершилось — снимок версии $(cat "${SNAPSHOT_DIR}/VERSION" 2>/dev/null || echo '?') оставлен как есть."
+fi
 if [[ "${ASRHUB_DRY_RUN}" != "1" && "${KEEP_SNAPSHOT}" -eq 0 ]]; then
+  # Место под снимок и подменяемые копии — заранее: кончившееся посреди
+  # копирования место оставляло обновление на полпути.
+  check_disk_space "${PREFIX%/*}" 1 || exit 1
   rm -rf "${SNAPSHOT_DIR}"
   mkdir -p "${SNAPSHOT_DIR}"
   # README.md попадает в снимок: обновление его заменяет, а откат без него
-  # оставлял бы файл от новой версии.
-  for item in server scripts config requirements docker examples VERSION README.md; do
-    [[ -e "${PREFIX}/${item}" ]] && cp -a "${PREFIX}/${item}" "${SNAPSHOT_DIR}/"
+  # оставлял бы файл от новой версии. Каталог docker — без data/: база и
+  # модели в снимок не входят.
+  for item in ${ASRHUB_INSTALL_ITEMS}; do
+    [[ -e "${PREFIX}/${item}" ]] || continue
+    if [[ "${item}" == "docker" ]]; then
+      copy_docker_dir_without_data "${PREFIX}/docker" "${SNAPSHOT_DIR}/docker"
+    else
+      cp -a "${PREFIX}/${item}" "${SNAPSHOT_DIR}/"
+    fi
   done
+  # Пакеты окружения — тоже в снимок: откат ставит их обратно. Обновление
+  # ставит всё с --upgrade по диапазонам, и без этого списка прежний код
+  # после отката работал на новых пакетах.
+  if [[ -x "${VPIP}" ]]; then
+    "${VPIP}" freeze --all --exclude-editable 2>/dev/null \
+      | grep -vE '^(-e |pip==|setuptools==|wheel==)' > "${SNAPSHOT_DIR}/pip-freeze.txt" || true
+  fi
   # Конфигурация лежит в каталоге данных и обновлением не трогается — но
   # откат без неё всё равно неполон: за время работы новой версии интерфейс
   # мог записать в файл параметры, которых в прежней версии нет, и прежняя
@@ -295,11 +407,15 @@ if [[ "${ASRHUB_DRY_RUN}" != "1" && "${KEEP_SNAPSHOT}" -eq 0 ]]; then
   # конца.
   # Имя с суффиксом — нарочно: откат копирует снимок поверх prefix целиком,
   # и файл с именем config.yaml осел бы там лишним.
-  [[ -f "${DATA_DIR}/config.yaml" ]] \
-    && cp -a "${DATA_DIR}/config.yaml" "${SNAPSHOT_DIR}/config.yaml.snapshot"
+  # Читается от имени владельца каталога данных: ссылка на месте config.yaml
+  # не должна переносить в снимок чужой файл.
+  if [[ -f "${DATA_DIR}/config.yaml" && ! -L "${DATA_DIR}/config.yaml" ]]; then
+    ( umask 077; read_owned "${DATA_DIR}/config.yaml" > "${SNAPSHOT_DIR}/config.yaml.snapshot" ) || true
+  fi
   ok "Снимок: ${SNAPSHOT_DIR}"
   hint "Откат при проблемах: bash '${PREFIX}/scripts/update.sh' --rollback"
 fi
+[[ "${ASRHUB_DRY_RUN}" == "1" ]] || printf '%s\n' "${CURRENT_VERSION}" > "${UPDATE_MARK}" 2>/dev/null || true
 
 # --- База данных ------------------------------------------------------------
 
@@ -363,7 +479,14 @@ compose_cmd() {
 
 step "Остановка службы"
 WAS_RUNNING=0
-if [[ "${DOCKER_MODE}" -eq 1 ]]; then
+if [[ "${NO_RESTART}" -eq 1 && "${DOCKER_MODE}" -eq 0 ]]; then
+  # --no-restart — «перезапущу сам»: службу не останавливаем вовсе. Раньше
+  # её гасили, а перезапуск пропускали, и сценарий выходил с нулём при
+  # остановленном сервере. Каталоги подменяются целиком, а работающий
+  # процесс держит загруженный код до перезапуска.
+  info "Ключ --no-restart: служба не останавливается и работает на прежнем коде до перезапуска."
+  ok "Готово"
+elif [[ "${DOCKER_MODE}" -eq 1 ]]; then
   if docker ps --filter "name=^asrhub$" --format '{{.Names}}' 2>/dev/null | grep -q asrhub; then
     WAS_RUNNING=1
   fi
@@ -376,11 +499,17 @@ else
   if bash "${SCRIPT_DIR}/service.sh" status --prefix "${PREFIX}" --data "${DATA_DIR}" \
        --name "${SERVICE_NAME}" >/dev/null 2>&1; then
     WAS_RUNNING=1
+    # Любой сбой дальше — откат подменённых каталогов и запуск службы:
+    # раньше обновление, упавшее посреди, оставляло её остановленной.
+    add_rollback "bash $(_q "${SCRIPT_DIR}/service.sh") start --prefix $(_q "${PREFIX}") --data $(_q "${DATA_DIR}") --name $(_q "${SERVICE_NAME}")"
     bash "${SCRIPT_DIR}/service.sh" stop --prefix "${PREFIX}" --data "${DATA_DIR}" \
       --name "${SERVICE_NAME}" || warn "Не удалось остановить службу."
   fi
   ok "Служба остановлена"
 fi
+# Признак незаконченного обновления снимается и при откате: файлы
+# возвращены, установка — снова прежняя.
+add_rollback "rm -f $(_q "${UPDATE_MARK}")"
 
 # Копия базы — после остановки и командой копирования SQLite: копия
 # работающей базы в режиме WAL теряет то, что лежит только в журнале, а
@@ -390,14 +519,18 @@ if [[ -f "${DATA_DIR}/asrhub.db" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
   DB_BACKUP="${DATA_DIR}/asrhub.db.bak.$(date +%Y%m%d-%H%M%S)"
   if sqlite_backup "${DATA_DIR}/asrhub.db" "${DB_BACKUP}" "${VPY}"; then
     # Владелец копии — тот же, что у базы: служба её читает при restore.
-    chown "$(stat -c '%u:%g' "${DATA_DIR}/asrhub.db" 2>/dev/null \
+    chown -h "$(stat -c '%u:%g' "${DATA_DIR}/asrhub.db" 2>/dev/null \
              || stat -f '%u:%g' "${DATA_DIR}/asrhub.db" 2>/dev/null || echo "$(id -u):$(id -g)")" \
       "${DB_BACKUP}" 2>/dev/null || true
+    # Копия до ЭТОГО обновления — в снимок: подсказка отката раньше брала
+    # самую свежую копию, а после повторного запуска это уже копия базы
+    # после миграции новой версией.
+    [[ "${KEEP_SNAPSHOT}" -eq 0 && -d "${SNAPSHOT_DIR}" ]] && \
+      printf '%s\n' "${DB_BACKUP}" > "${SNAPSHOT_DIR}/db-backup.path" 2>/dev/null || true
     ok "Копия базы: $(basename "${DB_BACKUP}") ($(human_size "$(stat -c%s "${DB_BACKUP}" 2>/dev/null || stat -f%z "${DB_BACKUP}" 2>/dev/null || echo 0)"))"
   else
+    # Службу поднимет откат (он зарегистрирован при остановке).
     error "Копию базы сделать не удалось — обновление остановлено, файлы не тронуты."
-    [[ "${WAS_RUNNING}" -eq 1 ]] && bash "${SCRIPT_DIR}/service.sh" start --prefix "${PREFIX}" \
-      --data "${DATA_DIR}" --name "${SERVICE_NAME}" >/dev/null 2>&1 || true
     exit 1
   fi
   # Держим не больше пяти копий
@@ -423,24 +556,56 @@ if [[ "${ENGINES_ONLY}" -eq 0 ]]; then
     info "Источник совпадает с установкой — файлы уже на месте, копирование пропущено."
     info "Чтобы обновиться из другого места: bash update.sh --source /путь/к/новой/версии"
   elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
-    for item in server scripts config requirements docker examples VERSION README.md; do
+    # Сначала ВСЁ копируется рядом во временные имена, и только потом
+    # каталоги подменяются — подряд, переименованием. Раньше подмена шла по
+    # одному: сбой на копировании scripts оставлял новый server при старых
+    # scripts и VERSION, а остановленную службу никто не поднимал. Прежние
+    # каталоги откладываются до конца: любой сбой дальше возвращает их
+    # откатом, вместе с запуском службы.
+    for item in ${ASRHUB_INSTALL_ITEMS}; do
       [[ -e "${SOURCE_DIR}/${item}" ]] || continue
-      # Копируем во временное имя рядом и подменяем: если копирование
-      # сорвётся на середине, прежний каталог останется целым.
       staged="${PREFIX:?}/.${item}.new"
       rm -rf "${staged}"
-      if ! cp -a "${SOURCE_DIR}/${item}" "${staged}"; then
-        rm -rf "${staged}"
+      register_temp "${staged}"
+      if [[ "${item}" == "docker" ]]; then
+        copy_docker_dir_without_data "${SOURCE_DIR}/docker" "${staged}" || {
+          error "Не удалось скопировать docker; прежняя версия не тронута."; exit 1; }
+      elif ! cp -a "${SOURCE_DIR}/${item}" "${staged}"; then
         error "Не удалось скопировать ${item}; прежняя версия не тронута."
         exit 1
       fi
-      rm -rf "${PREFIX:?}/${item}"
+      own_like "${PREFIX}" "${staged}"
+    done
+    for item in ${ASRHUB_INSTALL_ITEMS}; do
+      staged="${PREFIX:?}/.${item}.new"
+      [[ -e "${staged}" ]] || continue
+      if [[ "${item}" == "docker" ]]; then
+        # Каталог docker — поверх: .env, certs и data/ в нём местные.
+        if [[ -d "${PREFIX}/docker" ]]; then
+          rm -rf "${PREFIX:?}/.docker.old"
+          register_temp "${PREFIX}/.docker.old"
+          copy_docker_dir_without_data "${PREFIX}/docker" "${PREFIX}/.docker.old"
+          add_rollback "overlay_docker_dir $(_q "${PREFIX}/.docker.old") $(_q "${PREFIX}/docker")"
+        fi
+        overlay_docker_dir "${staged}" "${PREFIX}/docker"
+        rm -rf "${staged}"
+        continue
+      fi
+      if [[ -e "${PREFIX}/${item}" || -L "${PREFIX}/${item}" ]]; then
+        rm -rf "${PREFIX:?}/.${item}.old"
+        mv "${PREFIX}/${item}" "${PREFIX}/.${item}.old"
+        OLD_ITEMS+=("${PREFIX}/.${item}.old")
+        add_rollback "rm -rf $(_q "${PREFIX}/${item}") && mv $(_q "${PREFIX}/.${item}.old") $(_q "${PREFIX}/${item}")"
+      else
+        add_rollback "rm -rf $(_q "${PREFIX}/${item}")"
+      fi
       mv "${staged}" "${PREFIX:?}/${item}"
     done
     chmod +x "${PREFIX}"/scripts/*.sh 2>/dev/null || true
     # Клиент командной строки — исполняемый файл без расширения, и прошлая
     # строка его не задевала: после обновления asrctl терял право на запуск.
     chmod +x "${PREFIX}"/scripts/client/asrctl 2>/dev/null || true
+    chmod +x "${PREFIX}"/agent/install.sh 2>/dev/null || true
   fi
   ok "Файлы обновлены до версии ${NEW_VERSION}"
 fi
@@ -545,12 +710,29 @@ fi
 
 # --- Запуск и проверка ------------------------------------------------------
 
+# Обновление дошло до конца (каким бы ни был ответ сервера): откат по списку
+# больше не нужен — дальше откатывает только --rollback из снимка, — прежние
+# каталоги можно удалить, признак незаконченного обновления снять.
+finish_update() {
+  clear_rollback
+  local old
+  for old in ${OLD_ITEMS[@]+"${OLD_ITEMS[@]}"}; do
+    rm -rf "${old:?}" 2>/dev/null || warn "Не удалось удалить ${old} — удалите вручную."
+  done
+  OLD_ITEMS=()
+  rm -f "${UPDATE_MARK}" 2>/dev/null || true
+  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
+    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
+}
+
 step "Запуск и проверка"
 if [[ "${NO_RESTART}" -eq 1 ]]; then
   info "Перезапуск пропущен (--no-restart)."
   checklist_skip "выбран ключ --no-restart"
-  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
-    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
+  finish_update
+  if [[ "${DOCKER_MODE}" -eq 0 && -n "${SERVICE_NAME}" ]]; then
+    hint "Новый код вступит в силу после перезапуска: bash '${PREFIX}/scripts/service.sh' restart"
+  fi
   exit 0
 fi
 
@@ -582,8 +764,7 @@ else
   # шла и в этом случае, и обновление, прошедшее без единой ошибки,
   # заканчивалось строкой «сервер не отвечает».
   [[ -n "${SERVICE_NAME}" ]] && hint "Запустить: bash '${PREFIX}/scripts/service.sh' start"
-  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
-    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
+  finish_update
   exit 0
 fi
 
@@ -626,8 +807,7 @@ if [[ "${HEALTH_RC}" -eq 0 ]]; then
   fi
   # Метка установки — после удачного обновления: установка, поставленная до
   # 3.1.19, получает её здесь, и дальше сценарии обслуживания узнают её сами.
-  write_install_marker "${PREFIX}" "${DATA_DIR}" "${SERVICE_NAME}" \
-    "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" || true
+  finish_update
   printf '\n%s%sОбновление завершено: %s → %s%s\n\n' "${C_BOLD}" "${C_GREEN}" \
     "${CURRENT_VERSION}" "${NEW_VERSION}" "${C_RESET}"
   hint "Сплошная проверка всех частей: раздел «Дашборд» → «Глубокая проверка»"
@@ -641,19 +821,36 @@ elif [[ "${HEALTH_RC}" -eq 2 ]]; then
   printf '%s\n' "${HTTP_BODY}" | head -20 | sed 's/^/  /' >&2
   hint "Подробности: bash ${PREFIX}/scripts/doctor.sh"
   hint "Журнал службы: bash ${PREFIX}/scripts/service.sh logs -n 100"
+  finish_update
   exit 1
 else
   error "Сервер не отвечает после обновления."
   diagnose_server_down "${PORT}" "${PREFIX}" "${DATA_DIR}" \
     "$( [[ "${DOCKER_MODE}" -eq 1 ]] && echo docker || echo native )" \
     "${SERVICE_NAME:-asrhub}" "${PROBE_HOST}"
+  # Каталоги новой версии остаются на месте: откатывает --rollback из
+  # снимка (он возвращает и пакеты), а не список действий этого запуска.
+  finish_update
   if confirm "Откатиться к предыдущей версии?"; then
     # Каталог данных и имя службы передаются дальше: без них откат искал
     # config.yaml в каталоге по умолчанию и возвращал конфигурацию ЧУЖОЙ
     # установки, а службу дёргал вообще не ту. Оба значения здесь уже
     # определены — своими ключами или разбором.
-    exec bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" \
-      --data "${DATA_DIR}" ${SERVICE_NAME:+--name "${SERVICE_NAME}"} --yes
+    #
+    # Дочерним процессом, а не exec: откат заканчивался `exit 0`, и
+    # неудачное обновление с откатом отчитывалось успехом — задача Ansible
+    # или cron не узнавала, что обновление не удалось. Замок родителя
+    # откату разрешён (ASRHUB_LOCK_PARENT).
+    RB_RC=0
+    ASRHUB_LOCK_PARENT="$$" PROBE_HOST_HINT="${PROBE_HOST}" \
+      bash "${SCRIPT_DIR}/update.sh" --rollback --prefix "${PREFIX}" \
+      --data "${DATA_DIR}" ${SERVICE_NAME:+--name "${SERVICE_NAME}"} --yes || RB_RC=$?
+    if [[ "${RB_RC}" -eq 0 ]]; then
+      error "Обновление не удалось; установка возвращена к версии ${CURRENT_VERSION}."
+    else
+      error "Обновление не удалось, и откат тоже не поднял сервер — нужна ручная проверка."
+    fi
+    exit 1
   fi
   hint "Откатиться позже: bash '${PREFIX}/scripts/update.sh' --rollback --prefix '${PREFIX}' --data '${DATA_DIR}'"
   exit 1

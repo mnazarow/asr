@@ -15,25 +15,35 @@ build/
 benchmarks/
 examples/
 
+# Шаблон без «**/» действует только в корне контекста: __pycache__ из
+# server/asrhub и .pytest_cache из tests уезжали в образ, а docker/data
+# (база и модели при запуске по README) и docker/.env с токеном — в контекст
+# сборки. Поэтому вложенные пути — явно.
+
+# Тесты в образе не нужны
+tests/
+
 # Окружения и кеши
 .venv/
 venv/
 env/
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
 node_modules/
 
 # Данные и результаты работы
 data/
-*.db
-*.db-shm
-*.db-wal
-*.log
+docker/data/
+docker/certs/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.log
 *.wav
 *.mp3
 *.m4a
@@ -43,7 +53,7 @@ data/
 *.tar.gz
 *.zip
 
-# Локальные настройки
-.env
+# Локальные настройки и секреты
+**/.env
 config/local*.yaml
 .DS_Store

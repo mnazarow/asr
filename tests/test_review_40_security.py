@@ -550,6 +550,8 @@ def test_сбой_протокола_приёмника_не_валит_пото
 def test_тело_без_длины_режется_по_пределу(ключи):
     """Предел загрузки проверялся по Content-Length, а потоковое тело его не несёт."""
     ключи.set("max_upload_mb", 1, source="test")
+    # С захода 54 у тела без файла свой предел — max_request_mb.
+    ключи.set("max_request_mb", 1, source="test")
     app = create_app(ключи, start_queue=False)
 
     def куски():

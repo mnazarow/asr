@@ -396,7 +396,17 @@ def test_из_списка_и_из_таблицы_медленных_откры�
 
     # А десятку продолжает список под таблицей — и из него открывается карточка.
     с.locator("#table-slow button.drill").click()
-    assert _панель(с)["total"] == _свод(с, "overview.performance.rtf.count")
+    # Заход 54: «самые медленные» — без клонов из кеша (у них чужой RTF и
+    # нулевая обработка), и список под таблицей — тоже: готовые с RTF минус
+    # взятые из кеша.
+    из_кеша = с.evaluate("""async () => {
+        const о = window.__asrhub.state.analytics.window;
+        const r = await window.__asrhub.API.call('/api/drill?base=jobs&f=status:completed'
+          + '&f=nz:rtf&f=cached&limit=1&since=' + о.since + '&until=' + о.until,
+          { background: true });
+        return r.total; }""")
+    assert _панель(с)["total"] == _свод(с, "overview.performance.rtf.count") - из_кеша
+    assert из_кеша > 0, "в архиве нет клонов из кеша — проверять нечего"
     # Верх списка — тот же RTF, что у первой строки таблицы (при равных RTF
     # порядок между ними у таблицы и у списка свой).
     первая = с.locator(f"{СТРОКИ} td:last-child").first.inner_text()

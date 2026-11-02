@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,55 @@ def _envelope(samples: Any, sample_rate: int, interval_s: float) -> list[dict[st
             "amplitude": round(sum(abs(v) for v in segment) / len(segment), 6),
         })
     return points
+
+
+def _огибающая_файла(path: Path, interval_s: float,
+                     segments: list[Any] | None = None,
+                     speakers: list[str] | None = None
+                     ) -> tuple[int, dict[str | None, list[dict[str, float]]]]:
+    """Огибающая прямо из файла, блоками по интервалу — без записи в памяти.
+
+    Тот же расчёт, что `_envelope` и `_by_speakers`: средний модуль отсчёта
+    по интервалу, а у говорящего — с нулями вне его реплик. Только считается
+    по ходу чтения: в памяти один интервал, а не вся запись и не её копия на
+    каждого говорящего (см. `audio.wav_блоками`). Возвращает частоту и кривые:
+    ключ None — общая, иначе имя говорящего.
+    """
+    from .audio import wav_блоками
+
+    with wave.open(str(path), "rb") as wf:
+        rate = wf.getframerate()
+    step = max(1, int(round(rate * interval_s)))
+    отрезки: dict[str, list[tuple[int, int]]] = {}
+    for говорящий in speakers or []:
+        отрезки[говорящий] = sorted(
+            (max(0, int(float(_field(с, "start", 0.0)) * rate)),
+             int(float(_field(с, "end", 0.0)) * rate))
+            for с in segments or [] if _field(с, "speaker") == говорящий)
+    кривые: dict[str | None, list[dict[str, float]]] = {
+        **({None: []} if not speakers else {}), **{г: [] for г in speakers or []}}
+    for index, (начало, блок) in enumerate(wav_блоками(path, step)):
+        размер = len(блок)
+        if not размер:
+            continue
+        время = round(float(index * interval_s), 3)
+        модули = [abs(v) for v in блок] if isinstance(блок, list) else None
+        if not speakers:
+            сумма = sum(модули) if модули is not None else float(abs(блок).sum())
+            кривые[None].append({"time": время, "amplitude": round(сумма / размер, 6)})
+            continue
+        abs_блок = модули if модули is not None else abs(блок)
+        конец = начало + размер
+        for говорящий, свои in отрезки.items():
+            сумма = 0.0
+            for с, по in свои:
+                if по <= начало or с >= конец:
+                    continue
+                а, б = max(с, начало) - начало, min(по, конец) - начало
+                кусок = abs_блок[а:б]
+                сумма += float(sum(кусок)) if модули is not None else float(кусок.sum())
+            кривые[говорящий].append({"time": время, "amplitude": round(сумма / размер, 6)})
+    return rate, кривые
 
 
 def _field(segment: Any, name: str, default: Any = None) -> Any:
@@ -134,8 +184,6 @@ def build(channels: list[tuple[str, Path]], segments: list[Any],
     `speaker`: тот же набор, что отдаёт phone_asr, чтобы принимающая сторона
     работала без правок.
     """
-    from . import audio as audio_mod
-
     interval = float(settings.get("waveform_interval_s") or 1.0)
     interval = min(60.0, max(0.05, interval))
     curves: list[dict[str, Any]] = []
@@ -144,9 +192,9 @@ def build(channels: list[tuple[str, Path]], segments: list[Any],
     # где в левом канале оператор, а в правом абонент.
     if len(channels) > 1:
         for index, (label, path) in enumerate(channels):
-            samples, rate = audio_mod.load_samples(path)
+            rate, по_файлу = _огибающая_файла(path, interval)
             curves.append({
-                "audio_waveform": _envelope(samples, rate, interval),
+                "audio_waveform": по_файлу[None],
                 "sample_rate": rate,
                 "speaker": index,
                 "label": label or f"Канал {index + 1}",
@@ -157,24 +205,29 @@ def build(channels: list[tuple[str, Path]], segments: list[Any],
         return curves
 
     label, path = channels[0]
-    samples, rate = audio_mod.load_samples(path)
 
     # Монозапись: если диаризация нашла нескольких говорящих, кривая на
     # каждого. Это то же намерение, что у phone_asr, где монозапись перед
     # расчётом принудительно разделяли диаризацией на два канала.
-    per_speaker = _by_speakers(samples, rate, interval, segments)
-    if per_speaker:
-        for index, (speaker, points) in enumerate(per_speaker.items()):
+    speakers: list[str] = []
+    for segment in segments:
+        name = _field(segment, "speaker")
+        if name and name not in speakers:
+            speakers.append(name)
+    if len(speakers) >= 2:
+        rate, по_говорящим = _огибающая_файла(path, interval, segments, speakers)
+        for index, speaker in enumerate(speakers):
             curves.append({
-                "audio_waveform": points,
+                "audio_waveform": по_говорящим[speaker],
                 "sample_rate": rate,
                 "speaker": index,
                 "label": speaker,
             })
         return curves
 
+    rate, общая = _огибающая_файла(path, interval)
     curves.append({
-        "audio_waveform": _envelope(samples, rate, interval),
+        "audio_waveform": общая[None],
         "sample_rate": rate,
         "speaker": ALL,
         "label": label or "Вся запись",

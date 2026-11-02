@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import zipfile
 from collections.abc import Callable
 from datetime import datetime
@@ -390,18 +391,31 @@ def _собрать_xlsx(таблицы: list[Таблица], title: str) -> by
         отказ.http_status = 503
         raise отказ from exc
 
+    # Управляющие знаки (NUL, вертикальная табуляция…) в XML книги недопустимы:
+    # openpyxl бросал IllegalCharacterError, и один такой знак в метке, имени
+    # файла или в самом периоде запроса («?period=%00») превращал выгрузку
+    # во «внутреннюю ошибку сервера». Знак убирается — значение остаётся.
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE  # noqa: PLC0415
+
+    def чистое(значение: Any) -> Any:
+        if isinstance(значение, str):
+            return ILLEGAL_CHARACTERS_RE.sub("", значение)
+        return значение
+
     книга = Workbook()
     книга.remove(книга.active)
     шапка = Font(bold=True)
     for имя, заголовки, строки in таблицы:
-        лист = книга.create_sheet(имя[:31])
-        лист.append(list(заголовки))
+        # Имя листа: ещё и без знаков, которых Excel не допускает в нём.
+        лист = книга.create_sheet(
+            re.sub(r"[\\/*?:\[\]]", " ", str(чистое(имя)))[:31].strip() or "Лист")
+        лист.append([чистое(з) for з in заголовки])
         for клетка in лист[1]:
             клетка.font = шапка
             клетка.alignment = Alignment(vertical="center")
             _как_текст(клетка)
         for строка in строки:
-            лист.append(["" if v is None else v for v in строка])
+            лист.append(["" if v is None else чистое(v) for v in строка])
             for клетка in лист[лист.max_row]:
                 _как_текст(клетка)
         # Ширина по содержимому: лист со столбцами по умолчанию показывает
@@ -417,7 +431,7 @@ def _собрать_xlsx(таблицы: list[Таблица], title: str) -> by
     if not книга.sheetnames:
         книга.create_sheet("Пусто").append(["За период данных нет"])
     свойства = книга.properties
-    свойства.title = title
+    свойства.title = чистое(title)
     свойства.creator = "ASR Hub"
     буфер = io.BytesIO()
     книга.save(буфер)

@@ -11,10 +11,12 @@
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import tempfile
 import threading
+import time
 import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -46,10 +48,13 @@ HALLUCINATION_PHRASES_EN = [
 ]
 HALLUCINATION_PHRASES = HALLUCINATION_PHRASES_RU + HALLUCINATION_PHRASES_EN
 
+#: Встроенный список — только междометия. Прежде в нём стояли и слова с
+#: собственным значением: «Что это значит?» становилось «Что это?», «Ты
+#: знаешь ответ» — «Ты ответ», «В общем зале тихо» — «Зале тихо». Фильтр не
+#: отличает паразита от того же слова в деле, а испорченный смысл хуже
+#: лишнего «типа». Свой список (`filler_words`) по-прежнему может быть любым.
 FILLER_WORDS_RU = [
-    "э", "э-э", "эм", "ээ", "ммм", "мм", "ну", "вот", "как бы", "типа",
-    "короче", "в общем", "это самое", "так сказать", "значит", "собственно",
-    "как говорится", "понимаешь", "знаешь",
+    "э", "э-э", "э-э-э", "эм", "ээ", "эээ", "ммм", "мм", "м-м", "хм", "ну",
 ]
 
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -147,6 +152,36 @@ def remove_fillers(text: str, fillers: Iterable[str] = ()) -> str:
 
 _PUNCT_CACHE: dict[str, Any] = {}
 
+#: Когда модель постобработки в последний раз не загрузилась — по ключу кеша.
+#: Отказ раньше запоминался до перезапуска: нет сети в момент первого
+#: задания, и все дальнейшие получали «заглавная плюс точка» до следующего
+#: перезапуска сервера, хотя сеть вернулась через минуту. Теперь отказ
+#: помнится `ПАМЯТЬ_ОТКАЗА_С`, потом загрузка пробуется снова.
+_ОТКАЗЫ: dict[str, float] = {}
+ПАМЯТЬ_ОТКАЗА_С = 600.0
+
+
+def _готово_в_кеше(кеш: dict[str, Any], ключ: str, вид: str) -> bool:
+    """Есть ли в кеше ответ, которому можно верить: модель — всегда, отказ — пока свеж."""
+    if ключ not in кеш:
+        return False
+    if кеш[ключ] is not None:
+        return True
+    когда = _ОТКАЗЫ.get(f"{вид}:{ключ}", 0.0)
+    if time.monotonic() - когда < ПАМЯТЬ_ОТКАЗА_С:
+        return True
+    кеш.pop(ключ, None)
+    return False
+
+
+def _запомнить_отказ(вид: str, ключ: str) -> None:
+    _ОТКАЗЫ[f"{вид}:{ключ}"] = time.monotonic()
+
+
+#: Почему последняя загрузка модели пунктуации не удалась — для
+#: предупреждения в задании (см. `process`).
+_ПРИЧИНЫ_ОТКАЗА: dict[str, str] = {}
+
 
 def _report_missing(what: str, choice: str, explicit: bool, exc: Exception) -> None:
     """Сообщает о недоступной надстройке ровно настолько громко, насколько надо.
@@ -195,7 +230,7 @@ _ЗАГРУЗКА_МОДЕЛЕЙ = threading.RLock()
 
 
 def _load_punctuator(model: str, language: str) -> Callable[[str], str] | None:
-    if model in _PUNCT_CACHE:
+    if _готово_в_кеше(_PUNCT_CACHE, model, "punct"):
         return _PUNCT_CACHE[model]
     with _ЗАГРУЗКА_МОДЕЛЕЙ:
         return _load_punctuator_unlocked(model, language)
@@ -208,11 +243,17 @@ def _load_punctuator_unlocked(model: str, language: str) -> Callable[[str], str]
     # трансформера — до полутора гигабайт за язык, до девяноста девяти копий.
     # Ни collect_idle, ни счётчик загруженных моделей про этот кеш не знали.
     key = model
-    if key in _PUNCT_CACHE:
+    if _готово_в_кеше(_PUNCT_CACHE, key, "punct"):
         return _PUNCT_CACHE[key]
+    причины: list[str] = []
 
     def _register(fn: Callable[[str], str] | None):
         _PUNCT_CACHE[key] = fn
+        if fn is None:
+            _запомнить_отказ("punct", key)
+            _ПРИЧИНЫ_ОТКАЗА[key] = "; ".join(причины) or "модель не выбрана"
+        else:
+            _ПРИЧИНЫ_ОТКАЗА.pop(key, None)
         return fn
 
     choice = model
@@ -236,6 +277,7 @@ def _load_punctuator_unlocked(model: str, language: str) -> Callable[[str], str]
             if фн is not None:
                 return _register(фн)
         except Exception as exc:                            # noqa: BLE001
+            причины.append(f"rupunct_onnx: {exc}")
             _report_missing("Модуль расстановки знаков препинания",
                             "rupunct_onnx", explicit, exc)
 
@@ -245,12 +287,14 @@ def _load_punctuator_unlocked(model: str, language: str) -> Callable[[str], str]
 
             pipe = pipeline("ner", model="RUPunct/RUPunct_big",
                             aggregation_strategy="first")
+            труба = _ТрубаОкнами(pipe)
 
             def apply(text: str) -> str:
-                return _apply_rupunct(pipe, text)
+                return _apply_rupunct(труба, text)
 
             return _register(apply)
         except Exception as exc:
+            причины.append(f"rupunct: {exc}")
             _report_missing("Модуль расстановки знаков препинания", "rupunct",
                             explicit, exc)
 
@@ -261,6 +305,7 @@ def _load_punctuator_unlocked(model: str, language: str) -> Callable[[str], str]
             model_obj = SbertPuncCase()
             return _register(lambda text: model_obj.punctuate(text))
         except Exception as exc:
+            причины.append(f"sbert_punc_case_ru: {exc}")
             _report_missing("Модуль расстановки знаков препинания",
                             "sbert_punc_case_ru", explicit, exc)
 
@@ -271,6 +316,7 @@ def _load_punctuator_unlocked(model: str, language: str) -> Callable[[str], str]
             model_obj = PunctuationModel()
             return _register(lambda text: model_obj.restore_punctuation(text))
         except Exception as exc:
+            причины.append(f"multilingual: {exc}")
             _report_missing("Модуль расстановки знаков препинания",
                             "multilingual", explicit, exc)
 
@@ -324,6 +370,34 @@ def _файл_onnx(источник: str) -> str:
     raise FileNotFoundError(
         f"В «{источник}» не нашлось ни одного из файлов "
         f"{', '.join(ФАЙЛЫ_ONNX)}.") from последняя
+
+
+class _ТрубаОкнами:
+    """Труба `ner` из transformers — окнами по `ОКНО_СЛОВ` слов и под замком.
+
+    Окно — потому что труба режет вход по 512 токенам и возвращает слова
+    только из поместившегося, а текст реплики собирается из её ответа: хвост
+    длинной реплики (NeMo без пунктуации отдаёт запись одной репликой,
+    склейка по паузам собирает несколько) пропадал из расшифровки. У
+    варианта ONNX окно было с самого начала, здесь — не было.
+
+    Замок — потому что одна труба на процесс, а заданий одновременно
+    несколько: быстрый токенизатор при одновременном вызове из двух потоков
+    падает с «Already borrowed», и реплика молча уходила в запасное правило.
+    """
+
+    def __init__(self, труба: Any) -> None:
+        self.труба = труба
+        self.замок = threading.Lock()
+
+    def __call__(self, text: str) -> list[dict[str, Any]]:
+        слова = str(text or "").split()
+        размеченные: list[dict[str, Any]] = []
+        for начало in range(0, len(слова), ОКНО_СЛОВ):
+            with self.замок:
+                ответ = self.труба(" ".join(слова[начало:начало + ОКНО_СЛОВ]))
+            размеченные.extend(ответ or [])
+        return размеченные
 
 
 class _ТрубаONNX:
@@ -443,9 +517,13 @@ def _рупункт_onnx() -> Callable[[str], str] | None:
     сессия = onnxruntime.InferenceSession(_файл_onnx(источник),
                                           providers=["CPUExecutionProvider"])
     труба = _ТрубаONNX(токенизатор, сессия, метки)
+    # Токенизатор тот же быстрый, что и у transformers, и так же не терпит
+    # одновременного вызова из двух заданий (см. `_ТрубаОкнами`).
+    замок = threading.Lock()
 
     def применить(text: str) -> str:
-        return _apply_rupunct(труба, text)
+        with замок:
+            return _apply_rupunct(труба, text)
 
     return применить
 
@@ -474,16 +552,29 @@ def _apply_rupunct(pipe: Any, text: str) -> str:
 
 
 def restore_punctuation(text: str, model: str = "auto", language: str = "ru") -> str:
+    return _расставить(text, model, language)[0]
+
+
+def _расставить(text: str, model: str = "auto",
+                language: str = "ru") -> tuple[str, str]:
+    """Знаки препинания и, если модель не справилась, — почему (иначе пусто).
+
+    Причина нужна заданию: запасное правило — заглавная буква и точка в
+    конце реплики — это не пунктуация, а без причины в предупреждениях
+    задание показывало «пунктуация применена», и разницу видел только тот,
+    кто читал журнал сервера.
+    """
     if not text.strip():
-        return text
+        return text, ""
     fn = _load_punctuator(model, language)
     if fn is None:
-        return _naive_punctuation(text)
+        причина = _ПРИЧИНЫ_ОТКАЗА.get(model) or "модель недоступна"
+        return _naive_punctuation(text), причина
     try:
-        return normalize_spaces(fn(text))
+        return normalize_spaces(fn(text)), ""
     except Exception as exc:
         log.warning("Модель пунктуации дала сбой (%s), применено простое правило", exc)
-        return _naive_punctuation(text)
+        return _naive_punctuation(text), f"сбой модели: {exc}"
 
 
 def _naive_punctuation(text: str) -> str:
@@ -509,7 +600,8 @@ def _naive_punctuation(text: str) -> str:
 _ITN_CACHE: dict[str, Any] = {}
 
 _UNITS_RU = {
-    "ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+    "ноль": 0, "один": 1, "одна": 1, "одно": 1, "одну": 1, "два": 2, "две": 2,
+    "три": 3, "четыре": 4,
     "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
     "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
     "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17, "восемнадцать": 18,
@@ -526,7 +618,7 @@ _SCALES_RU = {"тысяча": 1000, "тысячи": 1000, "тысяч": 1000, "�
 
 def _load_itn(backend: str, language: str):
     key = f"{backend}:{language}"
-    if key in _ITN_CACHE:
+    if _готово_в_кеше(_ITN_CACHE, key, "itn"):
         return _ITN_CACHE[key]
     with _ЗАГРУЗКА_МОДЕЛЕЙ:
         return _load_itn_unlocked(backend, language)
@@ -536,7 +628,7 @@ def _load_itn_unlocked(backend: str, language: str):
     # Язык здесь значим: InverseNormalizer(lang=...) создаётся под конкретный
     # язык. Но число языков ограничиваем — иначе кеш растёт без предела.
     key = f"{backend}:{language}"
-    if key in _ITN_CACHE:
+    if _готово_в_кеше(_ITN_CACHE, key, "itn"):
         return _ITN_CACHE[key]
     if len(_ITN_CACHE) >= _ITN_CACHE_LIMIT:
         _ITN_CACHE.clear()
@@ -582,6 +674,7 @@ def _load_itn_unlocked(backend: str, language: str):
         except Exception as exc:
             _report_missing("Нормализатор чисел", "rus2num", explicit, exc)
     _ITN_CACHE[key] = None
+    _запомнить_отказ("itn", key)
     return None
 
 
@@ -619,13 +712,28 @@ def _порядковое(слово: str) -> tuple[int, str] | None:
 
     «четвертом» → (4, «м»), «двадцать третий» разбирается по слову.
     """
+    разбор = _порядковое_с_окончанием(слово)
+    return (разбор[0], разбор[1]) if разбор is not None else None
+
+
+def _порядковое_с_окончанием(слово: str) -> tuple[int, str, str] | None:
+    """То же, что `_порядковое`, и ещё окончание слова: «пятых» → (5, «х», «ых»)."""
     низ = без_ё(слово.lower().strip(".,!?;:…()«»\"'"))
     for длина in range(len(низ) - 1, 2, -1):
         основа, окончание = низ[:длина], низ[длина:]
         значение = _ПОРЯДКОВЫЕ_ОСНОВЫ.get(основа)
         if значение is not None and окончание in _НАРАЩЕНИЯ:
-            return значение, _НАРАЩЕНИЯ[окончание]
+            return значение, _НАРАЩЕНИЯ[окончание], окончание
     return None
+
+
+#: Окончания множественного числа порядкового: «пятых», «первых», «третьими».
+#: После числа это почти всегда дробь («три пятых») или счёт мест («пять
+#: первых»), а не хвост того же числа.
+_МНОЖЕСТВЕННЫЕ = frozenset({"ых", "их", "ьих", "ыми", "ими", "ьими"})
+
+#: Одиночное «один» — слово, а не число: «я один дома», «ни один из них».
+_ОДИН = frozenset({"один", "одна", "одно", "одну"})
 
 
 def _builtin_itn_ru(text: str) -> str:
@@ -637,12 +745,17 @@ def _builtin_itn_ru(text: str) -> str:
     tokens = text.split()
     out: list[str] = []
     buffer: list[str] = []
+    #: Где в `out` оставлено словом одиночное «один» — см. перечисления ниже.
+    одиночные: list[int] = []
 
     def flush() -> None:
         if not buffer:
             return
         value = _parse_number_ru(buffer)
-        if value is None:
+        if value is not None and len(buffer) == 1 and buffer[0].lower() in _ОДИН:
+            одиночные.append(len(out))
+            out.extend(buffer)
+        elif value is None:
             out.extend(buffer)
         else:
             out.append(str(value))
@@ -660,14 +773,31 @@ def _builtin_itn_ru(text: str) -> str:
         #
         # Одиноко стоящее порядковое («первый раз», «третья попытка») не
         # трогаем: это слово, а не число, и цифра вместо него читается хуже.
-        хвост = _порядковое(bare) if buffer else None
+        #
+        # Хвост — только то, что меньше младшего разряда группы: «двадцать»
+        # + «пятый», «две тысячи двадцать» + «четвёртом». Прежде годилось
+        # всё, что меньше разряда, умноженного на десять, и «пять первых
+        # мест» становилось «6-х мест», «одна вторая» — «3-я». И не во
+        # множественном числе: «три пятых акций» — дробь, а не «8-х акций».
+        # Исключение — десятилетия после года: «тысяча девятьсот девяностых»
+        # — это «1990-х».
+        хвост = _порядковое_с_окончанием(bare) if buffer else None
         if хвост is not None:
-            значение, наращение = хвост
+            значение, наращение, окончание = хвост
             начало = _parse_number_ru(buffer)
-            if начало is not None and значение < max(1, _magnitude(начало) * 10):
-                знаки = token[len(token.rstrip(trailing)):]
-                out.append(f"{начало + значение}-{наращение}{знаки}")
+            if начало is not None:
+                множественное = окончание in _МНОЖЕСТВЕННЫЕ
+                десятилетие = 10 <= значение < 100 and значение % 10 == 0 and начало >= 1000
+                if значение < _magnitude(начало) and (not множественное or десятилетие):
+                    знаки = token[len(token.rstrip(trailing)):]
+                    out.append(f"{начало + значение}-{наращение}{знаки}")
+                    buffer.clear()
+                    continue
+                # Число, за которым порядковое, но не его хвост, — дробь или
+                # счёт («три пятых», «пять первых»): оставляем словами всё.
+                out.extend(buffer)
                 buffer.clear()
+                out.append(token)
                 continue
         if bare in _UNITS_RU or bare in _SCALES_RU:
             # Знак препинания разрывает число. Раньше он снимался при
@@ -685,6 +815,15 @@ def _builtin_itn_ru(text: str) -> str:
         flush()
         out.append(token)
     flush()
+    # Одиночное «один» — слово («я один дома»), но в перечислении через
+    # запятую рядом с числами это число: «Один, два, три, поехали!» → «1, 2, 3».
+    for место in одиночные:
+        слово = out[место]
+        после = out[место + 1] if место + 1 < len(out) else ""
+        до = out[место - 1] if место > 0 else ""
+        if (слово.endswith(",") and после[:1].isdigit()) or \
+                (до.endswith(",") and до[:1].isdigit()):
+            out[место] = "1" + слово[len(слово.rstrip(trailing)):]
     result = " ".join(out)
     result = re.sub(r"(\d+)\s+процент(?:ов|а|)\b", r"\1 %", result)
     result = re.sub(r"(\d+)\s+рубл(?:ей|я|ь)\b", r"\1 ₽", result)
@@ -705,8 +844,14 @@ def _parse_number_ru(words: list[str]) -> int | None:
     total = 0
     current = 0
     seen = False
-    for raw in words:
-        word = raw.lower().strip(".,!?;:…()«»\"'")
+    last_scale = 0
+    cleaned = [raw.lower().strip(".,!?;:…()«»\"'") for raw in words]
+    # «Ноль» рядом с другими числительными — это цифры, продиктованные по
+    # одной: «восемь ноль ноль», «код ноль пять», «добавочный ноль ноль
+    # семь». Сложение давало «8», «5» и «7» — время, код и номер пропадали.
+    if len(cleaned) > 1 and "ноль" in cleaned:
+        return None
+    for word in cleaned:
         if word in _UNITS_RU:
             value = _UNITS_RU[word]
             # Разряды числительного идут по убыванию: «сто двадцать три».
@@ -719,9 +864,15 @@ def _parse_number_ru(words: list[str]) -> int | None:
             seen = True
         elif word in _SCALES_RU:
             scale = _SCALES_RU[word]
+            # Множитель без своего числа после уже сложенной группы («тысяча
+            # тысяч», «сто тысяч миллионов») и растущий множитель — не одно
+            # число: прежде выходило «2000» и «1100000».
+            if (current == 0 and total > 0) or (last_scale and scale >= last_scale):
+                return None
             current = (current or 1) * scale
             total += current
             current = 0
+            last_scale = scale
             seen = True
         else:
             return None
@@ -830,6 +981,227 @@ def apply_itn(text: str, backend: str = "auto", language: str = "ru") -> str:
 # 5. Словарь замен
 # --------------------------------------------------------------------------
 
+#: Сколько секунд даётся словарю замен с выражениями на всю запись разом.
+#: Выражения выполняются в отдельном процессе (см. `применить_словарь`), и
+#: предел ограничивает именно его: простая замена слов в него не входит.
+ПРЕДЕЛ_ВЫРАЖЕНИЙ_С = 20.0
+
+#: Предел длины одного выражения: больше — это уже не правило замены, а
+#: программа, и проверить её на безопасность нечем.
+ДЛИНА_ВЫРАЖЕНИЯ = 500
+
+
+def _опасный_повтор(шаблон: str) -> str:
+    """Почему выражение может работать экспоненциально долго; пусто — не видно.
+
+    Python re при катастрофическом откате не отпускает GIL: стоят и
+    HTTP, и отметка жизни, и все воркеры. Здесь — проверка при приёме
+    словаря, чтобы ошибка администратора всплыла сразу, а не первой длинной
+    репликой. Ловит классику: повтор внутри повтора («(\\w+\\s?)+»), и
+    повтор над вариантами, которые могут начаться одинаково («(a|ab)+»).
+    Полной защитой она не является — поэтому сами выражения ещё и
+    выполняются в отдельном процессе с пределом времени.
+    """
+    try:
+        from re import _constants as C  # type: ignore[attr-defined]  # noqa: PLC0415
+        from re import _parser  # type: ignore[attr-defined]  # noqa: PLC0415
+    except ImportError:                                     # pragma: no cover
+        return ""
+    try:
+        дерево = _parser.parse(шаблон)
+    except Exception:                                       # noqa: BLE001
+        return ""                       # синтаксис проверит re.compile
+
+    повторы = {C.MAX_REPEAT, C.MIN_REPEAT}
+
+    def начала(ветка: Any) -> set[Any] | None:
+        """С чего может начаться ветка: множество литер или None — «с чего угодно»."""
+        for op, av in ветка:
+            if op == C.LITERAL:
+                return {av}
+            if op == C.SUBPATTERN:
+                return начала(av[-1])
+            return None
+        return set()
+
+    def якорь(ветка: Any) -> bool:
+        """Есть ли в теле повтора обязательная литера вне вложенных повторов.
+
+        Она делит круги повтора однозначно: «(?:\\s*,\\s*)+» без запятой
+        круга не сделает, и разбить строку на круги можно одним способом.
+        """
+        for op, av in ветка:
+            if op == C.LITERAL:
+                return True
+            if op == C.SUBPATTERN and якорь(av[-1]):
+                return True
+        return False
+
+    def обход(ветка: Any, в_повторе: bool, под_повтором: bool) -> str:
+        """`в_повторе` — внутри повтора без якоря; `под_повтором` — внутри любого."""
+        for op, av in ветка:
+            if op in повторы:
+                _, верх, внутри = av
+                # Повтор с малым пределом («{2}») не взрывается: кругов мало.
+                многократный = верх > 10
+                if верх > 1 and в_повторе:
+                    return "повтор внутри повтора"
+                причина = обход(внутри, в_повторе or (многократный and not якорь(внутри)),
+                                под_повтором or многократный)
+                if причина:
+                    return причина
+            elif op == C.SUBPATTERN:
+                причина = обход(av[-1], в_повторе, под_повтором)
+                if причина:
+                    return причина
+            elif op == C.BRANCH:
+                ветви = av[1]
+                if под_повтором and len(ветви) > 1:
+                    виденные: set[Any] = set()
+                    for в in ветви:
+                        н = начала(в)
+                        # Пустой вариант («a|aa» парсер сворачивает в
+                        # «a(|a)») продолжается следующим кругом повтора —
+                        # то есть начинается так же, как соседний.
+                        if н is None or not н or н & виденные:
+                            return "повтор над вариантами, которые начинаются одинаково"
+                        виденные |= н
+                for в in ветви:
+                    причина = обход(в, в_повторе, под_повтором)
+                    if причина:
+                        return причина
+            elif op in (C.ASSERT, C.ASSERT_NOT):
+                причина = обход(av[1], в_повторе, под_повтором)
+                if причина:
+                    return причина
+        return ""
+
+    return обход(дерево, False, False)
+
+
+def проверить_словарь(glossary: Any) -> list[str]:
+    """Ошибки словаря замен: вид записей, синтаксис и опасность выражений.
+
+    Прежде словарь принимался любым: `{"а": 5}` ронял всю постобработку
+    задания (TypeError посреди замен — без пунктуации, чисел и имён
+    говорящих), а выражение с катастрофическим откатом замораживало сервер.
+    """
+    if not isinstance(glossary, dict):
+        return ['ожидается объект «что заменить: на что», например {"сбер": "Сбер"}']
+    ошибки: list[str] = []
+    for ключ, значение in glossary.items():
+        if not isinstance(ключ, str) or not isinstance(значение, str):
+            ошибки.append(f"«{ключ}»: замена должна быть строкой")
+            continue
+        if not ключ.startswith("re:"):
+            continue
+        шаблон = ключ[3:]
+        if len(шаблон) > ДЛИНА_ВЫРАЖЕНИЯ:
+            ошибки.append(f"«{ключ[:40]}…»: выражение длиннее {ДЛИНА_ВЫРАЖЕНИЯ} знаков")
+            continue
+        try:
+            выражение = re.compile(шаблон, re.IGNORECASE | re.UNICODE)
+            выражение.subn(значение, "")      # разбирает и строку замены
+        except re.error as exc:
+            ошибки.append(f"«{ключ}»: {exc}")
+            continue
+        # Две проверки: своя (повтор внутри повтора, варианты с общим
+        # началом) и `safe_regex` (неоднозначная граница между кругами
+        # повтора — «(?:\s*,\s*)+» на «, , , ,» откатывается 2ⁿ раз).
+        опасность = _опасный_повтор(шаблон) or _опасное_выражение(шаблон)
+        if опасность:
+            ошибки.append(f"«{ключ}»: {опасность} — такое выражение на длинной "
+                          "реплике работает часами")
+    return ошибки
+
+
+def _есть_выражения(glossary: dict[str, Any]) -> bool:
+    return any(isinstance(ключ, str) and ключ.startswith("re:") for ключ in glossary)
+
+
+def _без_выражений(glossary: dict[str, Any]) -> dict[str, Any]:
+    return {к: з for к, з in glossary.items() if not (isinstance(к, str) and к.startswith("re:"))}
+
+
+#: Что выполняется в отдельном процессе: тот же `apply_glossary`, что и здесь.
+_ПРОЦЕСС_СЛОВАРЯ = (
+    "import json, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from asrhub.pipeline.postprocess import apply_glossary\n"
+    "данные = json.load(sys.stdin)\n"
+    "итог = [apply_glossary(t, данные['g']) for t in данные['t']]\n"
+    "json.dump(итог, sys.stdout, ensure_ascii=False)\n"
+)
+
+
+def применить_словарь(тексты: list[str], glossary: dict[str, Any], *,
+                      предел_с: float | None = None) -> tuple[list[str], int, str]:
+    """Словарь замен ко всем репликам. Возвращает (тексты, замен, предупреждение).
+
+    Без выражений — здесь же. С выражениями — в отдельном процессе с
+    пределом времени: модуля regex с тайм-аутом в зависимостях нет, а
+    стандартный re при катастрофическом откате держит GIL, и остановить его
+    из соседнего потока нельзя. Процесс убивается по пределу, выражения
+    этой записи пропускаются, простые замены применяются — и задание
+    говорит об этом предупреждением, а сервер продолжает отвечать.
+    """
+    if not glossary:
+        return list(тексты), 0, ""
+    # Выражения, которые проверка признаёт опасными, не исполняются вовсе —
+    # ни здесь, ни в отдельном процессе (там `apply_glossary` пропустил бы
+    # их молча). Словарь мог попасть в задание до проверки: из старой
+    # конфигурации или снимком настроек давнего задания.
+    опасные = {к: (_опасный_повтор(к[3:]) or _опасное_выражение(к[3:]))
+               for к in glossary if isinstance(к, str) and к.startswith("re:")}
+    опасные = {к: причина for к, причина in опасные.items() if причина}
+    заметка = ""
+    if опасные:
+        glossary = {к: з for к, з in glossary.items() if к not in опасные}
+        первое = next(iter(опасные))
+        заметка = (f"Выражения словаря замен («re:…») пропущены: «{первое[:60]}» — "
+                   f"{опасные[первое]}"
+                   + (f" (и ещё {len(опасные) - 1})" if len(опасные) > 1 else "")
+                   + ". Простые замены применены.")
+        log.warning("Словарь замен: опасные выражения пропущены: %s", ", ".join(опасные))
+    if not _есть_выражения(glossary):
+        итог = [apply_glossary(т, glossary) for т in тексты]
+        return [т for т, _ in итог], sum(н for _, н in итог), заметка
+    import json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    предел = float(ПРЕДЕЛ_ВЫРАЖЕНИЙ_С if предел_с is None else предел_с)
+    корень = str(Path(__file__).resolve().parents[2])
+    причина = ""
+    try:
+        готово = subprocess.run(
+            [sys.executable, "-I", "-c", _ПРОЦЕСС_СЛОВАРЯ, корень],
+            input=json.dumps({"g": glossary, "t": list(тексты)}, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8",
+            timeout=max(1.0, предел), check=False)
+        if готово.returncode == 0:
+            итог = json.loads(готово.stdout or "[]")
+            if isinstance(итог, list) and len(итог) == len(тексты):
+                return ([str(т) for т, _ in итог], sum(int(н) for _, н in итог), заметка)
+        причина = (готово.stderr or "").strip().splitlines()[-1:] or ["отказ процесса"]
+        причина = причина[0][:200]
+    except subprocess.TimeoutExpired:
+        причина = f"не уложились в {предел:g} с"
+    except (OSError, ValueError, TypeError) as exc:
+        причина = str(exc)[:200]
+    log.warning("Выражения словаря замен пропущены: %s", причина)
+    простые = _без_выражений(glossary)
+    итог = [apply_glossary(т, простые) for т in тексты]
+    return ([т for т, _ in итог], sum(н for _, н in итог),
+            f"Выражения словаря замен («re:…») пропущены: {причина}. "
+            "Простые замены применены.")
+@functools.lru_cache(maxsize=256)
+def _опасное_выражение(образец: str) -> str:
+    from ..safe_regex import проблема  # noqa: PLC0415
+
+    return проблема(образец)
+
+
 def apply_glossary(text: str, glossary: dict[str, str]) -> tuple[str, int]:
     if not glossary:
         return text, 0
@@ -838,6 +1210,14 @@ def apply_glossary(text: str, glossary: dict[str, str]) -> tuple[str, int]:
         if not source:
             continue
         if source.startswith("re:"):
+            # Выражение с вложенным повтором останавливает весь процесс: `re`
+            # откатывается без предела и не отпускает GIL. Приём параметров
+            # такие отвергает, а здесь — последний рубеж для словаря, попавшего
+            # в задание другой дорогой (см. `safe_regex`).
+            беда = _опасное_выражение(source[3:])
+            if беда:
+                log.warning("Выражение словаря замен пропущено: %s", беда)
+                continue
             try:
                 pattern = re.compile(source[3:], re.IGNORECASE | re.UNICODE)
             except re.error as exc:
@@ -1048,6 +1428,9 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
         "profanity_hits": 0,
         "segments_before": len(segments),
     }
+    #: Что сказать человеку о постобработке. Уходит в `stats["warnings"]`, а
+    #: оттуда конвейер переносит в предупреждения задания.
+    предупреждения: list[str] = []
     language = str(settings.get("language") or "ru")
     if language == "auto":
         language = str(segments[0].get("language") or "ru") if segments else "ru"
@@ -1070,9 +1453,21 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
 
     if settings.get("punctuation_enabled", True) and not model_has_punctuation:
         model_name = str(settings.get("punctuation_model") or "auto")
+        отказы: list[str] = []
         for seg in segments:
-            seg["text"] = restore_punctuation(seg["text"], model_name, language)
-        stats["punctuation_applied"] = True
+            seg["text"], причина = _расставить(seg["text"], model_name, language)
+            if причина:
+                отказы.append(причина)
+        # «Применено» — только если знаки расставила модель. Запасное
+        # правило (заглавная и точка) пунктуацией не является, и задание
+        # обязано об этом сказать, как говорит о подмене диаризации.
+        stats["punctuation_applied"] = not отказы
+        if отказы:
+            stats["punctuation_fallback"] = len(отказы)
+            предупреждения.append(
+                f"Пунктуация не расставлена: модель «{model_name}» недоступна "
+                f"({отказы[0]}). Применено простое правило — заглавная буква и "
+                "точка в конце реплики.")
 
     if settings.get("itn_enabled", True):
         backend = str(settings.get("itn_backend") or "auto")
@@ -1082,11 +1477,12 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
 
     glossary = settings.get("glossary") or {}
     if isinstance(glossary, dict) and glossary:
-        total = 0
-        for seg in segments:
-            seg["text"], n = apply_glossary(seg["text"], glossary)
-            total += n
+        тексты, total, беда = применить_словарь([seg["text"] for seg in segments], glossary)
+        for seg, текст in zip(segments, тексты, strict=True):
+            seg["text"] = текст
         stats["glossary_replacements"] = total
+        if беда:
+            предупреждения.append(беда)
 
     mode = str(settings.get("profanity_filter") or "off")
     if mode != "off":
@@ -1115,6 +1511,8 @@ def process(segments: list[dict[str, Any]], settings: dict[str, Any],
                 seg["speaker"] = mapping[seg["speaker"]]
 
     stats["segments_after"] = len(segments)
+    if предупреждения:
+        stats["warnings"] = предупреждения
     return segments, stats
 
 

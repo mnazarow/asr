@@ -51,10 +51,37 @@ def liveness(state: Any) -> dict[str, Any]:
         checks.append(_check("queue_thread", CHECK_OK, БЕЗ_ОЧЕРЕДИ))
     else:
         alive = bool(getattr(queue, "_started", False)) if queue is not None else False
+        # Флаг «запущена» не говорит, живы ли потоки: упавший поток флаг не
+        # снимает. Смотрим сами потоки — служебные и хотя бы один рабочий.
+        потоки = [п for п in (getattr(queue, "_workers", None) or [])
+                  if hasattr(п, "is_alive")]
+        мёртвые = [п.name for п in потоки
+                   if п.name in ("asrhub-janitor", "asrhub-heartbeat") and not п.is_alive()]
+        рабочие = [п for п in потоки if п.name.startswith("asrhub-worker")]
+        if alive and рабочие and not any(п.is_alive() for п in рабочие):
+            мёртвые.append("asrhub-worker")
+        if alive and мёртвые:
+            checks.append(_check(
+                "queue_thread", CHECK_FAIL, "остановились потоки очереди: " + ", ".join(мёртвые),
+                "Перезапустите службу: scripts/service.sh restart"))
+        else:
+            checks.append(_check(
+                "queue_thread", CHECK_OK if alive else CHECK_FAIL,
+                "рабочие потоки запущены" if alive else "рабочие потоки не запущены",
+                "" if alive else "Перезапустите службу: scripts/service.sh restart"))
+
+    # Поток смыслового разбора: умерший поток никто не поднимает, и очередь
+    # разбора стоит до перезапуска. Раз начатый и не остановленный поток
+    # обязан быть жив — иначе перезапуск и есть лечение.
+    поток = getattr(getattr(state, "llm_worker", None), "_thread", None)
+    стоп = getattr(getattr(state, "llm_worker", None), "_stop", None)
+    if поток is not None and hasattr(поток, "is_alive") \
+            and not (стоп is not None and стоп.is_set()):
+        жив = поток.is_alive()
         checks.append(_check(
-            "queue_thread", CHECK_OK if alive else CHECK_FAIL,
-            "рабочие потоки запущены" if alive else "рабочие потоки не запущены",
-            "" if alive else "Перезапустите службу: scripts/service.sh restart"))
+            "llm_thread", CHECK_OK if жив else CHECK_FAIL,
+            "поток разбора работает" if жив else "поток смыслового разбора остановился",
+            "" if жив else "Перезапустите службу: scripts/service.sh restart"))
 
     failed = any(c["status"] == CHECK_FAIL for c in checks)
     return {"status": "fail" if failed else "ok", "checks": checks}

@@ -18,6 +18,37 @@ from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 _SPEAKER_RE = re.compile(r"\[(S\d+|SPK\d+|SPEAKER_\d+)\]\s*")
 
 
+def _говорящий(метка: str) -> str:
+    """«S1», «SPK1», «SPEAKER_00» — «Говорящий N».
+
+    Прежде номер брался двумя последними знаками: «[SPK1]» давал «Говорящий
+    K1», а «[SPEAKER_00]» и «[SPEAKER_01]» оба — «Говорящий 1». Метки
+    pyannote нумеруются с нуля, MOSS — с единицы.
+    """
+    цифры = "".join(с for с in метка if с.isdigit())
+    if not цифры:
+        return f"Говорящий {метка}"
+    номер = int(цифры)
+    return f"Говорящий {номер + 1 if метка.upper().startswith('SPEAKER_') else max(1, номер)}"
+
+
+def _вид_таймкодов(модель: Any) -> Any:
+    """Что просить у конвейера: «word» у CTC, True у Whisper, ничего у прочих.
+
+    Прежде всегда уходило `return_timestamps=True`. CTC (wav2vec2) так не
+    умеет — нужен «word» или «char», и конвейер бросал ValueError; прочие
+    seq2seq отвечали «We cannot return_timestamps yet on non-CTC models apart
+    from Whisper». Ни одна модель этого движка не распознавала.
+    """
+    тип = str(getattr(модель, "type", "") or "")
+    if тип.startswith("ctc"):
+        return "word"
+    конфиг = getattr(getattr(модель, "model", None), "config", None)
+    if str(getattr(конфиг, "model_type", "") or "") == "whisper":
+        return True
+    return None
+
+
 class TransformersEngine(Engine):
     id = "transformers"
     supports_word_timestamps = False
@@ -50,9 +81,13 @@ class TransformersEngine(Engine):
         if device == "cpu":
             dtype = torch.float32
 
+        # Устройство — аргументом конвейера, с номером карты. Прежде при
+        # «cuda:1» стоял device_map="auto" (модель раскладывалась по всем
+        # картам), а при «cpu» не передавалось ничего — и свежий transformers
+        # сам брал первую карту.
         kwargs: dict[str, Any] = {
             "model": self.spec.source,
-            "device_map": "auto" if device.startswith("cuda") else None,
+            "device": device,
             "torch_dtype": dtype,
         }
         if settings.get("models_dir"):
@@ -61,10 +96,13 @@ class TransformersEngine(Engine):
             return pipeline("automatic-speech-recognition",
                             **{k: v for k, v in kwargs.items() if v is not None})
         except Exception as exc:
-            # Часть моделей требует доверенного кода из репозитория
+            # Часть моделей требует доверенного кода из репозитория. Флаг —
+            # аргументом самого конвейера: в model_kwargs он уходил второй
+            # раз рядом с тем, что конвейер передаёт сам из hub_kwargs, и
+            # падал TypeError о двойном аргументе — запасная ветка не
+            # срабатывала никогда.
             try:
-                kwargs.setdefault("model_kwargs", {})["trust_remote_code"] = True
-                return pipeline("automatic-speech-recognition",
+                return pipeline("automatic-speech-recognition", trust_remote_code=True,
                                 **{k: v for k, v in kwargs.items() if v is not None})
             except Exception:
                 raise classify_exception(exc, engine=self.id, model=self.spec.id) from exc
@@ -79,8 +117,10 @@ class TransformersEngine(Engine):
             "chunk_length_s": chunk,
             "stride_length_s": max(0.0, min(overlap, chunk / 6)),
             "batch_size": int(settings.get("batch_size") or 8),
-            "return_timestamps": True,
         }
+        вид = _вид_таймкодов(self._model)
+        if вид is not None:
+            kwargs["return_timestamps"] = вид
         language = self.language_for(settings)
         generate: dict[str, Any] = {}
         if language:
@@ -101,7 +141,25 @@ class TransformersEngine(Engine):
 
         segments: list[Segment] = []
         chunks = raw.get("chunks") if isinstance(raw, dict) else None
-        if chunks:
+        if chunks and вид == "word":
+            # У CTC куски — слова: реплика одна на запись, слова — внутри.
+            слова = []
+            for item in chunks:
+                stamp = item.get("timestamp") or (None, None)
+                текст = str(item.get("text", "")).strip()
+                if not текст or stamp[0] is None:
+                    continue
+                слова.append({"word": текст, "start": round(float(stamp[0]), 3),
+                              "end": round(float(stamp[1] if stamp[1] is not None
+                                                 else stamp[0]), 3)})
+            text = str(raw.get("text", "")).strip()
+            if text:
+                segments.append(Segment(
+                    start=слова[0]["start"] if слова else 0.0,
+                    end=слова[-1]["end"] if слова else info.duration_s,
+                    text=text, language=language,
+                    words=слова if settings.get("word_timestamps", True) else []))
+        elif chunks:
             for item in chunks:
                 stamp = item.get("timestamp") or (None, None)
                 start = float(stamp[0]) if stamp[0] is not None else 0.0
@@ -112,7 +170,7 @@ class TransformersEngine(Engine):
                 speaker = None
                 match = _SPEAKER_RE.match(text)
                 if match:
-                    speaker = f"Говорящий {match.group(1)[-2:].lstrip('0') or '1'}"
+                    speaker = _говорящий(match.group(1))
                     text = _SPEAKER_RE.sub("", text, count=1).strip()
                 segments.append(Segment(start=start, end=end, text=text,
                                         speaker=speaker, language=language))

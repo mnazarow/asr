@@ -81,25 +81,50 @@ _apt_python_dev_package() {
   printf 'python3-dev'
 }
 
-install_system_packages() {
-  # install_system_packages ffmpeg git build-essential
-  local manager; manager="$(detect_package_manager)"
-  [[ $# -eq 0 ]] && return 0
-  info "Установка системных пакетов: $*"
+# Одна команда установки для текущего менеджера пакетов.
+_install_packages_with() {
+  local manager="$1"; shift
   case "${manager}" in
-    apt-get)
-      as_root apt-get update -qq
-      DEBIAN_FRONTEND=noninteractive as_root apt-get install -y -qq "$@" ;;
+    # DEBIAN_FRONTEND — через env внутри as_root: перед sudo переменная
+    # терялась (sudo сбрасывает окружение), и apt-get под sudo останавливался
+    # на вопросе debconf посреди установки без терминала.
+    apt-get) as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
     dnf)    as_root dnf install -y -q "$@" ;;
     yum)    as_root yum install -y -q "$@" ;;
     zypper) as_root zypper --non-interactive install "$@" ;;
     pacman) as_root pacman -S --noconfirm --needed "$@" ;;
     apk)    as_root apk add --no-cache "$@" ;;
     brew)   run brew install "$@" ;;
+    *)      return 1 ;;
+  esac
+}
+
+install_system_packages() {
+  # install_system_packages ffmpeg git build-essential
+  local manager; manager="$(detect_package_manager)"
+  [[ $# -eq 0 ]] && return 0
+  info "Установка системных пакетов: $*"
+  case "${manager}" in
+    apt-get|dnf|yum|zypper|pacman|apk|brew) : ;;
     *)
       warn "Менеджер пакетов не определён. Установите вручную: $*"
       return 1 ;;
   esac
+  [[ "${manager}" == "apt-get" ]] && { as_root apt-get update -qq || true; }
+  _install_packages_with "${manager}" "$@" && return 0
+  # Одно неизвестное имя срывает всю команду: ffmpeg на RHEL без RPM Fusion,
+  # имена Debian на ALT с apt-rpm — и вместе с ним не ставились git и cmake,
+  # которые в репозитории есть. Повторяем по одному и называем, что не встало.
+  [[ $# -gt 1 ]] || return 1
+  local package failed=""
+  for package in "$@"; do
+    _install_packages_with "${manager}" "${package}" >/dev/null 2>&1 || failed="${failed} ${package}"
+  done
+  if [[ -n "${failed}" ]]; then
+    warn "Не установились:${failed}"
+    return 1
+  fi
+  return 0
 }
 
 install_supported_python() {
@@ -195,7 +220,10 @@ system_package_names() {
     build:dnf|build:yum) printf 'gcc gcc-c++ make' ;;
     build:pacman)        printf 'base-devel' ;;
     build:apk)           printf 'build-base' ;;
+    # Без этой строки zypper получал пакет с буквальным именем «build».
+    build:zypper)        printf 'gcc gcc-c++ make' ;;
     build:brew)          printf '' ;;
+    build:*)             printf '' ;;
     # Имя версионное: на Ubuntu пакет называется python3.12-venv,
     # python3.14-venv и так далее, а метапакет python3-venv тянет venv для
     # ИНОГО интерпретатора — того, что считается системным. Если сервер
@@ -285,17 +313,33 @@ torch_index_url() {
   esac
 }
 
-# Версия ctranslate2, совместимая с установленным cuDNN.
-# Самая частая ошибка установки faster-whisper — рассогласование версий.
+# Ограничения версий для faster-whisper под установленные CUDA и cuDNN —
+# строками файла ограничений pip (`-c`). Самая частая ошибка установки
+# faster-whisper — рассогласование версий:
+#   CUDA 12 + cuDNN 9  ->  ctranslate2>=4.5
+#   CUDA 12 + cuDNN 8  ->  ctranslate2==4.4.0
+#   CUDA 11 + cuDNN 8  ->  ctranslate2==3.24.0, а с ним faster-whisper<1.0
+#                          (1.x требует ctranslate2 4.x)
+#
+# Раньше версия ставилась отдельной командой, а следующая команда ставила
+# файл требований со строкой «ctranslate2>=4.5» — и тут же её отменяла.
+# Ограничение, переданное в ту же команду, pip обязан соблюсти.
+#
+#   ctranslate2_pin УСКОРИТЕЛЬ [PYTHON_ОКРУЖЕНИЯ]
 ctranslate2_pin() {
-  local accel="${1:-$(detect_gpu)}"
+  local accel="${1:-$(detect_gpu)}" py="${2:-}" cudnn=""
   local cuda; cuda="$(detect_cuda_version)"
-  if [[ "${accel}" != "cuda" ]]; then printf 'ctranslate2>=4.5'; return 0; fi
+  if [[ "${accel}" != "cuda" ]]; then printf 'ctranslate2>=4.5\n'; return 0; fi
+  # cuDNN — у torch из этого окружения: он ставится раньше движков и
+  # приносит свою библиотеку. Без окружения версию не узнать — считаем 9.
+  if [[ -n "${py}" && -x "${py}" ]]; then
+    cudnn="$("${py}" -c 'import torch; print(torch.backends.cudnn.version() or "")' 2>/dev/null || true)"
+  fi
   case "${cuda}" in
-    11.*) printf 'ctranslate2==3.24.0' ;;
-    12.*) printf 'ctranslate2>=4.5' ;;
-    13.*) printf 'ctranslate2>=4.5' ;;
-    *)    printf 'ctranslate2>=4.5' ;;
+    11.*) printf 'ctranslate2==3.24.0\nfaster-whisper<1.0\n' ;;
+    12.*) if [[ "${cudnn}" == 8* ]]; then printf 'ctranslate2==4.4.0\n'
+          else printf 'ctranslate2>=4.5\n'; fi ;;
+    *)    printf 'ctranslate2>=4.5\n' ;;
   esac
 }
 

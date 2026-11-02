@@ -494,16 +494,22 @@ def recommended_settings(info: HardwareInfo | None = None) -> dict[str, Any]:
         except ValueError:
             cc_val = 0.0
         compute_type = "float16" if cc_val >= 7.0 else "float32"
-        if vram_gb >= 24:
+        # Пороги «по паспорту» с допуском: карта на 8 ГБ отдаёт 8188 МиБ
+        # (7,996 ГБ), на 24 — 24564 МиБ, и ни одна не доходила до своего
+        # уровня — RTX 4060 получала CTC и пакет 4, RTX 4090 — уровень 12 ГБ.
+        if vram_gb >= 23:
             batch, model, cache = 24, "gigaam-v3-rnnt", 3
-        elif vram_gb >= 12:
+        elif vram_gb >= 11:
             batch, model, cache = 16, "gigaam-v3-rnnt", 2
-        elif vram_gb >= 8:
+        elif vram_gb >= 7.5:
             batch, model, cache = 8, "gigaam-v3-rnnt", 1
         else:
             batch, model, cache = 4, "gigaam-v3-ctc", 1
         device = "cuda"
-        concurrent = max(1, len(info.gpus))
+        # По числу карт заданий не прибавляем: раздачи заданий по картам нет
+        # — экземпляр модели один и держится под замком всё распознавание, и
+        # «четыре задания на четыре карты» шли по очереди на карту 0.
+        concurrent = 1
     elif info.accelerator == "rocm":
         device, compute_type, batch, cache = "rocm", "float16", 8, 1
         model = "gigaam-v3-ctc"
@@ -721,12 +727,16 @@ def dkms_состояние(корень: str = "") -> str:
 def _версии_сходятся(a: str, b: str) -> bool:
     """«595.91.07» и «595.91» — одна версия, записанная по-разному.
 
-    Пустое значение сравнивать не с чем, и выдумывать расхождение на пустом
-    месте хуже, чем промолчать.
+    Сравниваются все числа, что есть у обеих: прежде только два первых, и
+    «535.183.01» против «535.183.06» (автообновление без перезагрузки)
+    признавалось «сходится». Пустое значение сравнивать не с чем, и
+    выдумывать расхождение на пустом месте хуже, чем промолчать.
     """
     if not a or not b:
         return True
-    return a.split(".")[:2] == b.split(".")[:2]
+    па, пб = a.split("."), b.split(".")
+    общих = min(len(па), len(пб))
+    return па[:общих] == пб[:общих]
 
 
 def _версия_библиотек() -> str:
@@ -736,6 +746,17 @@ def _версия_библиотек() -> str:
     отказывается: «Failed to initialize NVML: Driver/library version
     mismatch / NVML library version: 595.99».
     """
+    return _библиотеки()[0]
+
+
+def _библиотеки() -> tuple[str, bool]:
+    """Версия библиотек NVIDIA и «nvidia-smi сам сообщил о расхождении».
+
+    Строку «NVML library version: 535.183» nvidia-smi печатает только при
+    отказе «Driver/library version mismatch» — сам её факт уже означает
+    расхождение, а третьего числа версии в ней нет. Полная версия берётся
+    тогда из имени файла libnvidia-ml.so.X.Y.Z.
+    """
     import glob  # noqa: PLC0415
     import re  # noqa: PLC0415
 
@@ -743,17 +764,23 @@ def _версия_библиотек() -> str:
         вывод = _run(["nvidia-smi"], со_стдерр=True)
         совпало = re.search(r"NVML library version:\s*([0-9][0-9.]*)", вывод)
         if совпало:
-            return совпало.group(1)
+            версия = совпало.group(1).rstrip(".")
+            for образец in NVML_GLOBS:
+                for путь in sorted(glob.glob(образец)):
+                    хвост = путь.rsplit("libnvidia-ml.so.", 1)[-1]
+                    if хвост.startswith(версия + ".") and хвост.count(".") > версия.count("."):
+                        версия = хвост
+            return версия, True
         строка = _run(["nvidia-smi", "--query-gpu=driver_version",
                        "--format=csv,noheader"]).strip().splitlines()
         if строка and строка[0].strip():
-            return строка[0].strip()
+            return строка[0].strip(), False
     for образец in NVML_GLOBS:
         for путь in sorted(glob.glob(образец)):
             хвост = путь.rsplit("libnvidia-ml.so.", 1)[-1]
             if хвост[:1].isdigit():
-                return хвост
-    return ""
+                return хвост, False
+    return "", False
 
 
 def проверить_драйвер(*, proc: str = "", корень: str = "") -> dict[str, Any]:
@@ -787,7 +814,7 @@ def проверить_драйвер(*, proc: str = "", корень: str = "")
             загружен = совпало.group(1) if совпало else ""
     except OSError:
         загружен = ""
-    библиотеки = _версия_библиотек()
+    библиотеки, сообщено = _библиотеки()
     работает = platform.release()
     итог: dict[str, Any] = {
         "state": "unknown", "loaded": загружен, "userspace": библиотеки,
@@ -810,8 +837,14 @@ def проверить_драйвер(*, proc: str = "", корень: str = "")
         на_диске = по_ядрам.get(работает, "")
     итог["ondisk"] = на_диске
 
-    if _версии_сходятся(загружен, библиотеки):
+    # «Сходится» — только если и nvidia-smi не жаловался: его жалоба на
+    # расхождение — уже факт, даже когда видимые числа совпали.
+    if _версии_сходятся(загружен, библиотеки) and not сообщено:
         итог["state"] = "ok"
+        return итог
+    if сообщено and на_диске and _версии_сходятся(на_диске, библиотеки) \
+            and not _версии_сходятся(загружен, на_диске):
+        итог["state"] = "reboot"
         return итог
     if на_диске and not _версии_сходятся(загружен, на_диске):
         итог["state"] = "reboot"

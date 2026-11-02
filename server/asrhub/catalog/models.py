@@ -419,7 +419,7 @@ _add(ModelSpec(
         "KenLM не собирается нативно под Windows — нужен WSL или Docker",
     ],
     notes="Требует Python 3.9+, Poetry 2.1+, минимум 4 ядра CPU и 8 ГБ RAM.",
-    default_params={"chunk_ms": 300, "use_lm": True},
+    default_params={},
 ))
 
 # ---------------------------------------------------------------------------
@@ -691,6 +691,12 @@ for _sid, _name, _par, _disk, _vram, _spd, _en_only in _WHISPER_SIZES:
         family="Whisper",
         engine="whisper",
         source=_sid,
+        # Ревизия — файл весов, который кладёт openai-whisper (`<имя>.pt`).
+        # Короткое имя у openai-whisper и faster-whisper одно и то же, и без
+        # ревизии веса искались и качались как веса faster-whisper:
+        # «Скачать whisper-large-v3» клало 3 ГБ CTranslate2, «Удалить» стирало
+        # каталог faster-whisper-large-v3, а настоящий large-v3.pt не виделся.
+        revision=f"{_sid}.pt",
         license="MIT",
         commercial_use=True,
         languages=["en"] if _en_only else _WHISPER_LANGS,
@@ -856,7 +862,7 @@ for _sid, _name, _disk in _WCPP:
         notes=("Веса — файл ggml из репозитория ggerganov/whisper.cpp на Hugging Face: "
                "раздел «Модели» или bash scripts/models.sh download <модель>. Вместе с ними "
                "скачивается модель поиска речи ggml-silero."),
-        default_params={"beam_size": 5, "threads": 0, "flash_attn": True},
+        default_params={"beam_size": 5},
     ))
 
 _add(ModelSpec(
@@ -892,7 +898,7 @@ _add(ModelSpec(
     ],
     notes=("Модели pyannote распространяются по лицензии CC-BY-4.0, отличной от BSD-2 самого WhisperX. "
            "Русская модель выравнивания по умолчанию — jonatasgrosman/wav2vec2-large-xlsr-53-russian."),
-    default_params={"batch_size": 16, "compute_type": "float16", "diarize": True,
+    default_params={"batch_size": 16, "compute_type": "float16",
                     "align_model": "jonatasgrosman/wav2vec2-large-xlsr-53-russian"},
 ))
 
@@ -944,7 +950,7 @@ _add(ModelSpec(
         "Требуется атрибуция по условиям CC-BY-4.0",
     ],
     notes="Для продакшена без NeMo используйте ONNX-экспорт или sherpa-onnx.",
-    default_params={"batch_size": 16, "timestamps": True},
+    default_params={"batch_size": 16},
 ))
 
 _add(ModelSpec(
@@ -971,7 +977,7 @@ _add(ModelSpec(
     recommended_for=["Английские конвейеры с высокой нагрузкой"],
     strengths=["Рекордная пропускная способность"],
     weaknesses=["Только английский — для остальных языков берите v3"],
-    default_params={"batch_size": 32, "timestamps": True},
+    default_params={"batch_size": 32},
 ))
 
 _add(ModelSpec(
@@ -1001,7 +1007,7 @@ _add(ModelSpec(
     strengths=["Перевод в обе стороны между английским и 24 языками",
                "Автоматическая нарезка длинного аудио с параллельной обработкой"],
     weaknesses=["Один проход ограничен 40 секундами", "Требует минимум 6 ГБ видеопамяти"],
-    default_params={"batch_size": 8, "task": "transcribe", "timestamps": True},
+    default_params={"batch_size": 8, "task": "transcribe"},
 ))
 
 _add(ModelSpec(
@@ -1092,7 +1098,7 @@ _add(ModelSpec(
     recommended_for=["Транскрипт и краткое содержание одной моделью"],
     strengths=["Два режима: чистое ASR и работа как LLM над транскриптом"],
     weaknesses=["Только английский, окно 40 секунд, 12 ГБ видеопамяти"],
-    default_params={"batch_size": 4, "mode": "asr"},
+    default_params={"batch_size": 4},
 ))
 
 _add(ModelSpec(
@@ -1132,7 +1138,7 @@ _add(ModelSpec(
         "Инференс на CPU не заявлен",
     ],
     notes="Пермиссивная лицензия Linux Foundation: коммерческое использование разрешено.",
-    default_params={"latency_ms": 560, "batch_size": 8},
+    default_params={"batch_size": 8},
 ))
 
 _add(ModelSpec(
@@ -1274,7 +1280,7 @@ _add(ModelSpec(
     ],
     weaknesses=["Выпущена в июле 2026, мало полевого опыта",
                 "Отдельных метрик по русскому нет"],
-    default_params={"batch_size": 4, "diarize": True},
+    default_params={"batch_size": 4},
 ))
 
 _add(ModelSpec(
@@ -1365,7 +1371,7 @@ _add(ModelSpec(
     strengths=["Задержка настраивается от 80 мс до 2.4 с шагом 80 мс",
                "Нативно потоковая архитектура с каузальным аудиоэнкодером"],
     weaknesses=["Требует минимум 16 ГБ видеопамяти"],
-    default_params={"latency_ms": 480},
+    default_params={},
 ))
 
 _add(ModelSpec(
@@ -1434,6 +1440,8 @@ _add(ModelSpec(
     disk_mb=4000,
     vram_gb=4.0,
     timestamps=T.SEGMENT,
+    # Один проход модели — до 40 секунд: длиннее конвейер подаёт кусками.
+    max_audio_s=40,
     released="2025-11",
     maturity=M.NEW,
     benchmarks=[B("Мультиязычный трек (7B v2)", "WER", 5.84, SOURCES["openasr-arxiv"],
@@ -1445,7 +1453,7 @@ _add(ModelSpec(
                "Apache-2.0 и на код, и на веса — свободная замена Meta MMS"],
     weaknesses=["Отдельных метрик по русскому нет"],
     notes="Код русского языка в этой модели — rus_Cyrl.",
-    default_params={"lang_code": "rus_Cyrl"},
+    default_params={},
 ))
 
 _add(ModelSpec(
@@ -1637,6 +1645,68 @@ EXCLUDED_MODELS: list[dict[str, str]] = [
     {"name": "AssemblyAI, Deepgram, ElevenLabs Scribe, Zoom Scribe", "license": "проприетарные API",
      "reason": "Закрытые облачные сервисы. Приведены в документации только как ориентир качества."},
 ]
+
+
+# ---------------------------------------------------------------------------
+# Что исполняется, а что нет
+# ---------------------------------------------------------------------------
+
+#: Модели, которые в задание не берутся, — с причиной. Прежде любая модель
+#: каталога принималась как основная: движок ставился, веса качались, и
+#: первое же задание падало. Вспомогательные — их выход не расшифровка;
+#: остальные адаптер не исполняет (свой код вывода, свой класс модели).
+#: В каталоге они остаются справочно — с этой пометкой.
+_НЕ_В_ЗАДАНИЕ: dict[str, tuple[str, str]] = {
+    "gigaam-emo": ("auxiliary", "модель распознаёт эмоции, а не речь; этапа "
+                                "эмоций в конвейере нет"),
+    "sortformer-diar-4spk-v2": ("auxiliary", "модель разделения по говорящим: "
+                                             "включается diarization_backend: sortformer"),
+    "kyutai-stt-1b-en-fr": ("unsupported", "адаптер Kyutai не реализован: нет ни "
+                                           "распознавания файла, ни потока"),
+    "canary-qwen-2.5b": ("unsupported", "модель SALM (nemo.collections.speechlm2), "
+                                        "а не ASRModel: transcribe у неё нет"),
+    "voxtral-mini-4b-realtime": ("unsupported", "у Realtime свой класс модели и "
+                                                "процессор; адаптер Voxtral их не знает"),
+    "phi4-multimodal": ("unsupported", "нужен свой код вывода (подсказка с аудио), "
+                                       "а не конвейер распознавания transformers"),
+    "granite-speech-4.1-2b": ("unsupported", "нужен свой код вывода (чат-шаблон), "
+                                             "а не конвейер распознавания transformers"),
+    "owsm-ctc-v4-1b": ("unsupported", "модель ESPnet, а не чекпоинт transformers"),
+    "borealis-ru": ("unsupported", "аудио-LLM со своим кодом вывода, а не чекпоинт "
+                                   "конвейера распознавания transformers"),
+}
+
+for _m in MODELS:
+    if _m.id in _НЕ_В_ЗАДАНИЕ:
+        _m.role, _m.role_note = _НЕ_В_ЗАДАНИЕ[_m.id]
+
+#: Короткие имена openai-whisper. Под ними одни и те же веса умеют все три
+#: движка семейства: openai-whisper грузит их как есть, faster-whisper и
+#: WhisperX — их перевод в CTranslate2 под тем же именем.
+_ИМЕНА_WHISPER = frozenset({
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en",
+    "large-v1", "large-v2", "large-v3", "large", "large-v3-turbo", "turbo"})
+
+
+def engines_for_model(spec: ModelSpec) -> list[str]:
+    """Движки, которые умеют исполнить эту модель. Первый — её собственный.
+
+    Закреплённый движок раньше не сверялся с моделью вовсе: пресет ставил
+    `engine: demo`, быстрый выбор модели в форме менял только модель, и
+    задание с `gigaam-v3-e2e-rnnt` приходило «готово» с текстом демонстрации.
+    GigaAM при чужом движке грузил другой вариант, T-one и демо модель не
+    читали совсем. Общий источник весов есть только у семейства Whisper:
+    короткие имена openai-whisper понимают и faster-whisper, и WhisperX, а
+    свои переводы CTranslate2 — оба последних. whisper.cpp держит веса в
+    другом формате (ggml) и с ними не пересекается.
+    """
+    движки = [spec.engine]
+    if spec.engine in ("whisper", "faster_whisper", "whisperx"):
+        if spec.source in _ИМЕНА_WHISPER:
+            движки += ["whisper", "faster_whisper", "whisperx"]
+        elif spec.engine in ("faster_whisper", "whisperx"):
+            движки += ["faster_whisper", "whisperx"]
+    return list(dict.fromkeys(движки))
 
 
 # ---------------------------------------------------------------------------

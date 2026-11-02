@@ -41,15 +41,16 @@ class FunASREngine(Engine):
         except ModuleNotFoundError as exc:
             raise DependencyMissing("funasr", "funasr", cause=exc) from exc
         device = self.resolve_device(settings)
-        return AutoModel(model=self.spec.source,
-                         device="cuda:0" if device.startswith("cuda") else "cpu",
-                         disable_update=True,
+        # Номер карты — как задан: прежде стояло жёсткое «cuda:0».
+        карта = (device if ":" in device else "cuda:0") if device.startswith("cuda") else "cpu"
+        return AutoModel(model=self.spec.source, device=карта, disable_update=True,
                          cache_dir=str(settings.get("models_dir") or "") or None)
 
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:
         info = probe(audio_path)
         language = self.language_for(settings) or "auto"
+        найденный = ""
         self.report(progress, 0.15, "распознавание")
         try:
             out = self._model.generate(
@@ -66,7 +67,10 @@ class FunASREngine(Engine):
             tags = [t for t in text.split("<|") if "|>" in t]
             for tag in tags:
                 name = tag.split("|>")[0]
-                if name.isupper() and name not in ("ZH", "EN", "JA", "KO", "YUE", "NOSPEECH"):
+                if name.lower() in ("zh", "en", "ja", "ko", "yue", "ru"):
+                    # Метка языка: при «auto» в результат шло слово «auto».
+                    найденный = найденный or name.lower()
+                elif name.isupper() and name not in ("NOSPEECH",):
                     emotions.append(name)
             clean = text
             for tag in tags:
@@ -74,8 +78,11 @@ class FunASREngine(Engine):
             segments.extend(_single(clean, info.duration_s, language))
 
         self.report(progress, 0.98, "сборка результата")
+        итог = language if language != "auto" else (найденный or "")
+        for segment in segments:
+            segment.language = итог or None
         return TranscriptionResult(
-            segments=segments, language=language, duration=info.duration_s,
+            segments=segments, language=итог, duration=info.duration_s,
             meta={"emotions": sorted(set(emotions))} if emotions else {})
 
 
@@ -104,9 +111,12 @@ class MoonshineEngine(Engine):
                     progress: ProgressCallback | None) -> TranscriptionResult:
         info = probe(audio_path)
         if info.duration_s > 64:
+            # Сюда длинная запись доходит только при выключенном поиске речи:
+            # с ним конвейер подаёт её кусками (см. `processor._по_речи`).
             raise EngineError(
                 "Moonshine рассчитана на короткие фрагменты (до минуты).",
-                hint="Включите VAD или выберите другую модель для длинных записей.")
+                hint="Включите «Поиск речи» (vad_enabled) — запись пойдёт в модель "
+                     "кусками по речи, — или выберите другую модель.")
         self.report(progress, 0.2, "распознавание")
         name = self.spec.source.rsplit("/", 1)[-1]
         out = self._model.transcribe(str(audio_path), f"moonshine/{name.replace('moonshine-', '')}")
@@ -136,7 +146,7 @@ class OmnilingualEngine(Engine):
             )
         except ModuleNotFoundError as exc:
             raise DependencyMissing("omnilingual", "omnilingual-asr", cause=exc) from exc
-        return ASRInferencePipeline(model_card=self.spec.source.rsplit("/", 1)[-1])
+        return ASRInferencePipeline(model_card=_карточка_omnilingual(self.spec.source))
 
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:
@@ -146,7 +156,15 @@ class OmnilingualEngine(Engine):
         # было негде, а языки вне четырёх известных — немецкий, французский,
         # испанский, итальянский, китайский, японский, которые `language`
         # разрешает, — молча распознавались как русский.
-        lang = _ЯЗЫКИ_OMNILINGUAL.get(self.language_for(settings) or "ru", "rus_Cyrl")
+        код = self.language_for(settings) or "ru"
+        lang = _ЯЗЫКИ_OMNILINGUAL.get(код)
+        if lang is None:
+            # Прежде незнакомый код молча становился русским: польская запись
+            # распознавалась как русская без единого предупреждения.
+            raise EngineError(
+                f"Язык «{код}» для Omnilingual в ASR Hub не сопоставлен с её кодом.",
+                hint="Поддержаны: " + ", ".join(sorted(_ЯЗЫКИ_OMNILINGUAL))
+                     + ". Для других языков возьмите Whisper или Parakeet.")
         self.report(progress, 0.2, "распознавание")
         try:
             out = self._model.transcribe([str(audio_path)], lang=[lang],
@@ -154,18 +172,65 @@ class OmnilingualEngine(Engine):
         except Exception as exc:
             raise classify_exception(exc, engine=self.id, model=self.spec.id) from exc
         text = out[0] if isinstance(out, (list, tuple)) and out else str(out)
-        return TranscriptionResult(segments=_single(text, info.duration_s, lang[:3]),
-                                   language=lang, duration=info.duration_s,
+        # Язык — кодом из настроек, как у прочих движков: прежде сегменты
+        # были «rus», а задание — «rus_Cyrl».
+        код = self.language_for(settings) or "ru"
+        return TranscriptionResult(segments=_single(text, info.duration_s, код),
+                                   language=код, duration=info.duration_s,
                                    meta={"lang_code": lang})
+
+
+def _карточка_omnilingual(источник: str) -> str:
+    """Имя карточки модели в omnilingual-asr по репозиторию каталога.
+
+    Библиотека называет карточки «omniASR_CTC_1B», «omniASR_LLM_7B» и т. п.,
+    а адаптер передавал хвост репозитория «omnilingual-asr-ctc-1b» — такой
+    карточки нет. Проверено по документации библиотеки, не запуском.
+    """
+    хвост = источник.rsplit("/", 1)[-1]
+    части = хвост.replace("omnilingual-asr-", "").replace("omniASR-", "").split("-")
+    if len(части) >= 2:
+        return "omniASR_" + "_".join(ч.upper() for ч in части)
+    return хвост
 
 
 #: Коды языков Omnilingual — код ISO 639-3 и письменность — для значений
 #: параметра `language`. Определять язык сам движок не умеет, поэтому при
-#: «auto» запись считается русской, как и прежде.
+#: «auto» запись считается русской, как и прежде. Перечень параметра
+#: расширен до языков моделей каталога, и каждый его язык должен получить
+#: здесь свой код: иначе язык задания молча подменялся бы русским. Для
+#: макроязыков взят основной вариант в записи FLORES-200, по которой
+#: названы коды Omnilingual (арабский — arb, персидский — pes, малайский —
+#: zsm, узбекский — uzn, суахили — swh). Сверено с документацией, не
+#: запуском: язык, которого у модели нет, библиотека отвергнет своей ошибкой.
 _ЯЗЫКИ_OMNILINGUAL = {
     "ru": "rus_Cyrl", "en": "eng_Latn", "uk": "ukr_Cyrl", "kk": "kaz_Cyrl",
     "de": "deu_Latn", "fr": "fra_Latn", "es": "spa_Latn", "it": "ita_Latn",
-    "zh": "cmn_Hans", "ja": "jpn_Jpan",
+    "zh": "cmn_Hans", "ja": "jpn_Jpan", "be": "bel_Cyrl", "pl": "pol_Latn",
+    "pt": "por_Latn", "tr": "tur_Latn", "nl": "nld_Latn", "sv": "swe_Latn",
+    "cs": "ces_Latn", "bg": "bul_Cyrl", "ky": "kir_Cyrl", "tt": "tat_Cyrl",
+    "ba": "bak_Cyrl", "hy": "hye_Armn", "ka": "kat_Geor", "ko": "kor_Hang",
+    "hi": "hin_Deva",
+    "af": "afr_Latn", "am": "amh_Ethi", "ar": "arb_Arab", "as": "asm_Beng",
+    "az": "azj_Latn", "bn": "ben_Beng", "bo": "bod_Tibt", "br": "bre_Latn",
+    "bs": "bos_Latn", "ca": "cat_Latn", "cy": "cym_Latn", "da": "dan_Latn",
+    "el": "ell_Grek", "et": "est_Latn", "eu": "eus_Latn", "fa": "pes_Arab",
+    "fi": "fin_Latn", "fil": "tgl_Latn", "fo": "fao_Latn", "gl": "glg_Latn",
+    "gu": "guj_Gujr", "ha": "hau_Latn", "haw": "haw_Latn", "he": "heb_Hebr",
+    "hr": "hrv_Latn", "ht": "hat_Latn", "hu": "hun_Latn", "id": "ind_Latn",
+    "is": "isl_Latn", "jw": "jav_Latn", "km": "khm_Khmr", "kn": "kan_Knda",
+    "la": "lat_Latn", "lb": "ltz_Latn", "ln": "lin_Latn", "lo": "lao_Laoo",
+    "lt": "lit_Latn", "lv": "lvs_Latn", "mg": "plt_Latn", "mi": "mri_Latn",
+    "mk": "mkd_Cyrl", "ml": "mal_Mlym", "mn": "khk_Cyrl", "mr": "mar_Deva",
+    "ms": "zsm_Latn", "mt": "mlt_Latn", "my": "mya_Mymr", "nb": "nob_Latn",
+    "ne": "npi_Deva", "nn": "nno_Latn", "no": "nob_Latn", "oc": "oci_Latn",
+    "pa": "pan_Guru", "ps": "pbt_Arab", "ro": "ron_Latn", "sa": "san_Deva",
+    "sd": "snd_Arab", "si": "sin_Sinh", "sk": "slk_Latn", "sl": "slv_Latn",
+    "sn": "sna_Latn", "so": "som_Latn", "sq": "als_Latn", "sr": "srp_Cyrl",
+    "su": "sun_Latn", "sw": "swh_Latn", "ta": "tam_Taml", "te": "tel_Telu",
+    "tg": "tgk_Cyrl", "th": "tha_Thai", "tk": "tuk_Latn", "tl": "tgl_Latn",
+    "ur": "urd_Arab", "uz": "uzn_Latn", "vi": "vie_Latn", "yi": "ydd_Hebr",
+    "yo": "yor_Latn", "yue": "yue_Hant",
 }
 
 
@@ -175,10 +240,15 @@ class VoxtralEngine(Engine):
     id = "voxtral"
     supports_streaming = True
     outputs_punctuation = True
+    режет_сам = True               # сам режет по речи (`_куски_по_речи`)
 
     @classmethod
     def check_available(cls) -> tuple[bool, str]:
+        # Обе библиотеки: процессор Voxtral разбирает звук через
+        # mistral-common, и «установлен» по одному transformers было
+        # неправдой — движок падал на первом задании.
         try:
+            import mistral_common  # type: ignore  # noqa: F401
             import transformers  # type: ignore  # noqa: F401
             return True, ""
         except ModuleNotFoundError:
@@ -192,11 +262,17 @@ class VoxtralEngine(Engine):
         except ImportError as exc:
             raise DependencyMissing("voxtral", "transformers", cause=exc) from exc
         device = self.resolve_device(settings)
-        processor = AutoProcessor.from_pretrained(self.spec.source)
+        # Кеш весов — каталог моделей, куда их кладёт и раздел «Модели»:
+        # прежде движок читал кеш Hugging Face по умолчанию, не находил
+        # заранее скачанные веса и качал их второй раз.
+        кеш = str(settings.get("models_dir") or "") or None
+        processor = AutoProcessor.from_pretrained(self.spec.source, cache_dir=кеш)
+        # Карта — та, что задана: «auto» раскладывал модель по всем картам,
+        # и «cuda:1» не действовал.
         model = VoxtralForConditionalGeneration.from_pretrained(
-            self.spec.source,
+            self.spec.source, cache_dir=кеш,
             torch_dtype=torch.bfloat16 if device.startswith("cuda") else torch.float32,
-            device_map="auto" if device.startswith("cuda") else None)
+            device_map=device if device.startswith("cuda") else None)
         return {"processor": processor, "model": model, "device": device}
 
     #: Сколько звука отдаётся модели за раз. Окно Voxtral — 32 тысячи
@@ -251,8 +327,12 @@ class VoxtralEngine(Engine):
     def _кусок(self, processor: Any, model: Any, path: Path, language: str | None,
                seconds: float) -> str:
         try:
-            inputs = processor.apply_transcription_request(
-                language=language, audio=str(path), model_id=self.spec.source)
+            # transformers 4.54–4.55 называли метод с опечаткой
+            # («apply_transcrition_request»), новые — без неё; требования
+            # движка допускают обе версии.
+            запрос = (getattr(processor, "apply_transcription_request", None)
+                      or processor.apply_transcrition_request)
+            inputs = запрос(language=language, audio=str(path), model_id=self.spec.source)
             inputs = inputs.to(model.device, dtype=model.dtype)
             предел = int(min(8192, max(256, seconds * self.ТОКЕНОВ_НА_СЕКУНДУ)))
             outputs = model.generate(**inputs, max_new_tokens=предел)

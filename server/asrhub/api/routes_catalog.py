@@ -164,6 +164,14 @@ def download_model(request: Request, model_id: str,
 
                 entry["message"] = "загрузка весов GigaAM"
                 download_weights(spec.source, spec.revision or "", models_dir)
+            elif spec.engine == "whisper":
+                # Веса openai-whisper — файл <имя>.pt его же загрузчиком.
+                # Общая дорога ниже клала веса faster-whisper под тем же
+                # коротким именем.
+                from ..engines.whisper_engine import download_weights as whisper_weights
+
+                entry["message"] = "загрузка весов openai-whisper"
+                whisper_weights(spec.source, models_dir)
             elif spec.engine == "whisper_cpp":
                 # Файл ggml из репозитория whisper.cpp. Общая дорога ниже
                 # принимала «large-v3-turbo» за модель faster-whisper и
@@ -272,12 +280,14 @@ def apply_preset(request: Request, preset_id: str,
     preset = catalog.get_preset(preset_id)
     if preset is None:
         raise error_response(PresetNotFound(preset_id, [p.id for p in catalog.PRESETS]))
-    applied: dict[str, Any] = {}
-    for key, value in preset.values.items():
-        try:
-            state.settings.set(key, value, source=f"preset:{preset_id}")
-            applied[key] = value
-        except ASRHubError as exc:
-            log.warning("Пресет %s: параметр %s не применён (%s)", preset_id, key, exc.message)
+    # Значения прошлого пресета, которых нет в этом, снимаются — пресеты
+    # больше не накладываются друг на друга (см. Settings.применить_пресет).
+    applied = state.settings.применить_пресет(preset_id, preset.values)
+    # Применённое — сразу и в работу: тот же шаг, что после PUT /api/settings
+    # (число воркеров, кеш моделей, мониторинг). Снятые значения прошлого
+    # пресета тоже могли быть среди них — поэтому «поменяться могло всё».
+    from .routes_system import применить_на_ходу  # noqa: PLC0415
+
+    применить_на_ходу(state, None)
     state.db.add_event(None, "preset_applied", f"Применён пресет «{preset.name}»")
     return {"preset": preset_id, "applied": applied}

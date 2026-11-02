@@ -98,6 +98,12 @@ _LOAD_REASONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
 )
 
 
+#: Отказы, при которых запасная загрузка через transformers не поможет.
+_БЕЗ_ЗАПАСНОГО = (r"out of memory", r"cuda error", r"cudnn", r"cublas",
+                  r"no space left", r"errno 28", r"read-only file system", r"errno 30",
+                  r"permission denied", r"errno 13", r"invalid device ordinal",
+                  r"no cuda gpus are available", r"driver/library version mismatch")
+
 #: Короткие имена, которые библиотека сама разворачивает в v3_*.
 _SHORT_NAMES = frozenset({"ctc", "rnnt", "e2e_ctc", "e2e_rnnt", "ssl"})
 
@@ -243,6 +249,7 @@ class GigaAMEngine(Engine):
     id = "gigaam"
     supports_word_timestamps = True
     supports_batching = True
+    режет_сам = True
 
     @classmethod
     def check_available(cls) -> tuple[bool, str]:
@@ -312,7 +319,13 @@ class GigaAMEngine(Engine):
             except Exception as exc:      # пробуем следующий способ
                 errors.append(f"{attempt}: {type(exc).__name__}: {exc}")
 
-        # Запасной путь — через transformers с trust_remote_code
+        # Запасной путь — через transformers с trust_remote_code. Не при
+        # нехватке памяти, отказе карты, места или прав: запасная загрузка
+        # тянет код из сети, на закрытом сервере ждёт сетевого тайм-аута и
+        # прячет настоящую причину за своей.
+        первая = (errors[0] if errors else "").lower()
+        if any(re.search(примета, первая) for примета in _БЕЗ_ЗАПАСНОГО):
+            raise _load_failure(self.spec.id, errors, device, str(models_dir))
         try:
             from transformers import AutoModel  # type: ignore
 
@@ -342,11 +355,15 @@ class GigaAMEngine(Engine):
             spans = vad.detect(audio_path, opts)
         else:
             spans = []
-        plan = vad.chunk_plan(duration, opts, spans)
+        # Предел модели — и для механической нарезки: без поиска речи длина
+        # куска бралась из chunk_length_s (до 600 по каталогу), и при 30 с
+        # библиотека отвечала «Too long wav file».
+        plan = vad.chunk_plan(duration, opts, spans, предел_модели=_MAX_CHUNK_S)
         if not plan:
             plan = [vad.SpeechSegment(0.0, min(duration, _MAX_CHUNK_S))]
 
         segments: list[Segment] = []
+        слов_нет = 0
         with tempfile.TemporaryDirectory(prefix="gigaam-",
                                          dir=settings.get("temp_dir") or None) as tmp:
             tmpdir = Path(tmp)
@@ -364,6 +381,8 @@ class GigaAMEngine(Engine):
                 text, words = self._run_chunk(piece, want_words)
                 if not text.strip():
                     continue
+                if want_words and not words:
+                    слов_нет += 1
                 shifted = [
                     {"word": w.get("word", w.get("text", "")),
                      "start": round(float(w.get("start", 0.0)) + span.start, 3),
@@ -386,13 +405,24 @@ class GigaAMEngine(Engine):
             segments, float(settings.get("chunk_overlap_s") or 0.0))
 
         self.report(progress, 0.98, "сборка результата")
+        meta: dict[str, Any] = {"chunks": len(plan), "revision": self.spec.revision,
+                                "punctuation_from_model": self.outputs_punctuation}
+        if слов_нет and segments:
+            # Пословные таймкоды просили, а библиотека их не отдала (по
+            # опубликованному API transcribe возвращает только текст).
+            # Прежде об этом молчали, и привязка говорящих по словам и
+            # субтитры «по словам» шли по фрагментам до 22 с. Не проверено на
+            # живой библиотеке: если её версия слова отдаёт, замечания нет.
+            meta["warnings"] = [
+                "GigaAM не отдала пословные таймкоды — границы известны только у "
+                "фрагментов. Для точных границ слов включите выравнивание "
+                "(alignment_backend)."]
         return TranscriptionResult(
             segments=segments,
             language="ru",
             language_probability=1.0,
             duration=duration,
-            meta={"chunks": len(plan), "revision": self.spec.revision,
-                  "punctuation_from_model": self.outputs_punctuation},
+            meta=meta,
         )
 
     def _run_chunk(self, path: Path, want_words: bool) -> tuple[str, list[dict[str, Any]]]:
@@ -407,7 +437,11 @@ class GigaAMEngine(Engine):
                 out = model.transcribe(str(path))
         except Exception as exc:
             message = str(exc).lower()
-            if "25" in message and ("second" in message or "длин" in message):
+            # «Too long wav file, use 'transcribe_longform' method.» — так
+            # отказывает библиотека; прежний разбор искал «25» и «second» и
+            # этот текст не узнавал.
+            if ("too long" in message or "longform" in message
+                    or ("25" in message and ("second" in message or "длин" in message))):
                 raise EngineError(
                     "GigaAM отказалась обрабатывать фрагмент длиннее 25 секунд.",
                     hint="Уменьшите vad_max_speech_s до 22 секунд или включите VAD.",
@@ -424,6 +458,22 @@ class GigaAMEngine(Engine):
                 words = first.get("words") or []
             else:
                 text, words = str(first), []
+        elif isinstance(out, str):
+            text, words = out, []
+        elif hasattr(out, "text") or hasattr(out, "transcription"):
+            # Ответ объектом: прежде шёл `str(out)`, и в расшифровку попадал
+            # его repr вида «TranscriptionResult(text=…)».
+            text = str(getattr(out, "transcription", None) or getattr(out, "text", "") or "")
+            words = getattr(out, "words", None) or []
         else:
             text, words = str(out), []
-        return text, list(words) if isinstance(words, (list, tuple)) else []
+        слова: list[dict[str, Any]] = []
+        for слово in words if isinstance(words, (list, tuple)) else []:
+            if isinstance(слово, dict):
+                слова.append(слово)
+            elif hasattr(слово, "start"):
+                слова.append({"word": str(getattr(слово, "word", None)
+                                          or getattr(слово, "text", "") or ""),
+                              "start": getattr(слово, "start", 0.0),
+                              "end": getattr(слово, "end", 0.0)})
+        return text, слова

@@ -550,6 +550,11 @@ _SCHEMA = [
         cached_from       TEXT,
         webhook_url       TEXT,
         webhook_status    TEXT,
+        -- Заход 54: уведомление — состояние, а не разовая попытка.
+        -- «pending» ждёт доставки (досылает служебный цикл, в том числе
+        -- после перезапуска), «sending» — доставка идёт до webhook_next_at.
+        webhook_attempts  INTEGER DEFAULT 0,
+        webhook_next_at   REAL,
         waveform          TEXT,
         instance_id       TEXT,
         heartbeat_at      REAL,
@@ -1004,11 +1009,17 @@ _SCHEMA = [
     # Уборка журнала звонков по сроку и множество известных звонков для
     # обхода каталога записей — по времени импорта.
     "CREATE INDEX IF NOT EXISTS idx_calls_imported ON calls(imported_at)",
+    # Отдан ли файл записи другому звонку станции — подбор записи по
+    # номерам спрашивает это на каждом звонке (см. `call_has_recording`).
+    "CREATE INDEX IF NOT EXISTS idx_calls_recording ON calls(recording)",
     "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit(actor, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_qa_status ON qa_reviews(status, assigned_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_qa_job ON qa_reviews(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_qa_agent ON qa_reviews(agent, reviewed_at DESC)",
+    # Заход 54: уведомления, ждущие доставки, — без чтения всех заданий.
+    "CREATE INDEX IF NOT EXISTS idx_jobs_webhook ON jobs(webhook_status, webhook_next_at) "
+    "WHERE webhook_status IN ('pending', 'sending')",
 ]
 
 
@@ -1223,6 +1234,13 @@ class Database:
                 conn.execute("PRAGMA synchronous="
                              + ("NORMAL" if self.journal_mode == "wal" else "FULL"))
                 conn.execute("PRAGMA foreign_keys=ON")
+                # Освобождённые страницы — затирать. Удаление по требованию
+                # вычищало строки и указатель, а фамилия и номер оставались в
+                # свободных страницах файла и уезжали в следующую резервную
+                # копию — до VACUUM. В сборках Debian и Ubuntu это включено
+                # при компиляции, в других (python.org для Windows и macOS)
+                # — нет, и стирание зависело от того, чей Python стоит.
+                conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA temp_store=MEMORY")
                 conn.execute(f"PRAGMA cache_size=-{КЕШ_СОЕДИНЕНИЯ_КБ}")
                 conn.execute(f"PRAGMA journal_size_limit={ПРЕДЕЛ_ЖУРНАЛА}")
@@ -1451,13 +1469,27 @@ class Database:
             return
         log.info("Обновление схемы базы: версия %s → %s", current, SCHEMA_VERSION)
         with self._write_lock:
-            conn.execute("BEGIN IMMEDIATE")
             try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise StorageError(f"Не удалось начать обновление схемы базы: {exc}") from exc
+            try:
+                # Версию перечитываем уже под блокировкой записи: два сервера,
+                # запущенные разом на старой схеме, оба видели прежний номер
+                # до BEGIN, и второй, дождавшись первого, повторял починки
+                # данных поверх уже обновлённой базы.
+                current = conn.execute("PRAGMA user_version").fetchone()[0]
+                if current >= SCHEMA_VERSION:
+                    conn.execute("COMMIT")
+                    return
                 # Колонки добавляются ПЕРЕД схемой: индексы из _SCHEMA могут
                 # ссылаться на поля, которых в старой таблице ещё нет.
                 self._add_missing_columns(conn)
                 for statement in _SCHEMA:
-                    conn.execute(statement)
+                    if statement.strip().upper().startswith("CREATE UNIQUE INDEX"):
+                        self._уникальный_указатель(conn, statement)
+                    else:
+                        conn.execute(statement)
                 # Починки данных — после колонок и схемы: им нужны и новые
                 # поля, и новые указатели. Каждая идёт один раз, при
                 # переходе через свою версию.
@@ -1477,6 +1509,47 @@ class Database:
             except sqlite3.Error as exc:
                 conn.execute("ROLLBACK")
                 raise StorageError(f"Не удалось применить миграции: {exc}") from exc
+
+    @staticmethod
+    def _уникальный_указатель(conn: sqlite3.Connection, statement: str) -> None:
+        """Уникальный указатель — в своей точке сохранения, а не всей миграцией.
+
+        На базе, где до появления указателя завелись дубли («Admin» и
+        «admin»), `CREATE UNIQUE INDEX` падает. `_catch_up_indexes` в таком
+        случае предупреждал и шёл дальше, а миграция на тот же указатель
+        откатывала ВСЁ: база, сегодня работающая с предупреждением,
+        следующим выпуском с новым номером схемы не поднималась вовсе — с
+        сообщением, не называющим ни таблицы, ни способа лечения. Теперь
+        указатель пропускается с предупреждением и перечнем дублей, а
+        остальная миграция идёт; `_catch_up_indexes` попробует снова при
+        следующем запуске, когда дубли уберут.
+        """
+        conn.execute("SAVEPOINT уникальный")
+        try:
+            conn.execute(statement)
+        except sqlite3.IntegrityError as exc:
+            conn.execute("ROLLBACK TO уникальный")
+            conn.execute("RELEASE уникальный")
+            log.warning("Уникальный указатель не создан (%s): %s. Дубли: %s. Уберите "
+                        "или переименуйте их — указатель создастся при следующем запуске.",
+                        statement.split(" ON ")[0].split()[-1], exc,
+                        Database._дубли(conn, statement) or "не найдены")
+            return
+        conn.execute("RELEASE уникальный")
+
+    @staticmethod
+    def _дубли(conn: sqlite3.Connection, statement: str) -> str:
+        """Значения, которые мешают уникальному указателю, — до десяти."""
+        try:
+            таблица, поля = statement.split(" ON ", 1)[1].split("(", 1)
+            поля = поля.rsplit(")", 1)[0]
+            строки = conn.execute(
+                f"SELECT {поля}, COUNT(*) FROM {таблица.strip()} "     # noqa: S608
+                f"GROUP BY {поля} HAVING COUNT(*) > 1 LIMIT 10").fetchall()
+        except (sqlite3.Error, ValueError, IndexError):
+            return ""
+        return "; ".join(" / ".join(str(з) for з in строка[:-1]) + f" ×{строка[-1]}"
+                         for строка in строки)
 
     #: Порог короткой записи для архива до версии 33 — значение
     #: `audio_min_duration_s` по умолчанию. Настроек у миграции нет: она
@@ -1701,12 +1774,16 @@ class Database:
                 conn.execute("BEGIN IMMEDIATE")
                 for statement in _FTS_SCHEMA:
                     conn.execute(statement)
+                # «Есть ли хоть одна», а не «сколько»: COUNT(*) по репликам и
+                # по `_docsize` шёл при каждом открытии базы под BEGIN
+                # IMMEDIATE — на архиве в миллионы реплик это секунды
+                # блокировки записи на каждом запуске и у каждого сценария.
                 реплик = conn.execute(
-                    "SELECT COUNT(*) FROM segments").fetchone()[0]
+                    "SELECT EXISTS(SELECT 1 FROM segments)").fetchone()[0]
                 в_указателе = conn.execute(
-                    "SELECT COUNT(*) FROM segments_fts_docsize").fetchone()[0]
+                    "SELECT EXISTS(SELECT 1 FROM segments_fts_docsize)").fetchone()[0]
                 if реплик and not в_указателе:
-                    log.info("Сборка поискового указателя по %d репликам…", реплик)
+                    log.info("Сборка поискового указателя по репликам архива…")
                     начало = time.time()
                     conn.execute(
                         "INSERT INTO segments_fts(segments_fts) VALUES('rebuild')")
@@ -1786,7 +1863,12 @@ class Database:
                 except sqlite3.Error as exc:
                     # Указатель по колонке, которой в этой базе ещё нет, —
                     # не повод не подниматься: без него медленнее, и только.
-                    log.warning("Не удалось создать указатель: %s", exc)
+                    # У уникального — ещё и перечень дублей: без него
+                    # непонятно, что именно убрать.
+                    дубли = (self._дубли(conn, statement)
+                             if isinstance(exc, sqlite3.IntegrityError) else "")
+                    log.warning("Не удалось создать указатель: %s%s", exc,
+                                f". Дубли: {дубли}" if дубли else "")
                 else:
                     log.info("Миграция: создан указатель «%s»",
                              statement.split(" ON ")[0].split()[-1])
@@ -1989,7 +2071,7 @@ class Database:
                     owner: str | list[str] | None = None,
                     model: str | None = None, search: str | None = None,
                     group_id: str | None = None, since: float | None = None,
-                    content: str | None = None,
+                    content: str | None = None, until: float | None = None,
                     ) -> tuple[str, list[str], list[Any]] | None:
         """Условия отбора заданий — общие для списка и для счётчика.
 
@@ -2046,6 +2128,12 @@ class Database:
         if since:
             where.append("created_at>=?")
             args.append(since)
+        # Верхняя граница — та же, что у списков раскрытия (`drill`):
+        # полуоткрытое окно [since, until). Иначе «Записи» из отчёта за
+        # период показывали бы и то, что пришло после отчёта.
+        if until is not None:
+            where.append("created_at<?")
+            args.append(float(until))
         if search:
             # Расшифровку ищет указатель, имя файла и номер — перебором.
             # Перебор здесь дёшев: обе колонки короткие и лежат в начале
@@ -2092,10 +2180,11 @@ class Database:
                   order: str = "created_at DESC",
                   light: bool = False,
                   content: str | None = None,
-                  ready_before: float | None = None) -> list[dict[str, Any]]:
+                  ready_before: float | None = None,
+                  until: float | None = None) -> list[dict[str, Any]]:
         собрано = self._jobs_where(status=status, owner=owner, model=model,
                                    search=search, group_id=group_id, since=since,
-                                   content=content)
+                                   content=content, until=until)
         if собрано is None:
             return []
         соединение, where, args = собрано
@@ -2464,13 +2553,24 @@ class Database:
             "SELECT COUNT(*) n FROM jobs j WHERE j.status='completed' "
             "AND j.text IS NOT NULL AND j.text != '' "
             f"AND COALESCE(j.source,'') <> 'control'{где}", свои)["n"])
-        разобрано = int(self.query_one(
-            "SELECT COUNT(*) n FROM content c JOIN jobs j ON j.id = c.job_id "
+        # Тем же проходом — сколько из «разобранных» на деле заглушки: разбор
+        # записи не удался несколько раз подряд, и в строке лежит только
+        # ошибка (тональности у неё нет, а у настоящего разбора она есть
+        # всегда). Без этого числа такие записи были неотличимы от
+        # разобранных. Признак — сама ошибка в подробностях, а не пустая
+        # тональность: свод без неё бывает и у настоящего разбора.
+        строка = self.query_one(
+            "SELECT COUNT(*) n, SUM(CASE WHEN c.sentiment_label IS NULL "
+            "AND json_valid(c.detail) AND json_extract(c.detail, '$.error') IS NOT NULL "
+            "THEN 1 ELSE 0 END) f "
+            "FROM content c JOIN jobs j ON j.id = c.job_id "
             "WHERE c.version >= ? AND j.status='completed' "
             "AND j.text IS NOT NULL AND j.text != '' "
-            f"AND COALESCE(j.source,'') <> 'control'{где}", (version, *свои))["n"])
+            f"AND COALESCE(j.source,'') <> 'control'{где}", (version, *свои))
+        разобрано = int(строка["n"])
         return {"total": всего, "analyzed": разобрано,
-                "pending": max(0, всего - разобрано)}
+                "pending": max(0, всего - разобрано),
+                "failed": int(строка["f"] or 0)}
 
     def document_frequency(self, limit: int = 40000,
                            min_df: int = 2) -> tuple[dict[str, int], int]:
@@ -3358,11 +3458,17 @@ class Database:
     def erase_calls(self, запрос: str) -> int:
         """Обезличивает строки журнала звонков, где встречается номер или имя.
 
-        И звонки без задания: пропущенные (короткий, без записи, не
-        отвеченный) тоже хранят номер — удалять по требованию нужно и их.
+        Звонки без задания: пропущенные (короткий, без записи, не отвеченный)
+        тоже хранят номер — удалять по требованию нужно и их. Звонки, чьё
+        задание ещё есть, не трогаются: их обезличивает удаление самого
+        задания (`delete_job`). Прежде обезличивалось всё совпавшее, и
+        задания сверх предела одного запроса оставались с расшифровкой, но
+        без номера — найти их по номеру повторным запросом было уже нельзя.
         """
         условие, args = self._условие_звонка(запрос)
-        return self.execute(f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE {условие}", args)
+        return self.execute(
+            f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE {условие} "
+            "AND (job_id IS NULL OR job_id NOT IN (SELECT id FROM jobs))", args)
 
     def llm_outcome_filter(self, kind: str, value: str) -> tuple[str, list[Any]]:
         """Условие отбора заданий по исходу или причине из ответа модели."""
@@ -3914,12 +4020,14 @@ class Database:
             "storage_gb": round(float(row["bytes"] or 0) / 1024 ** 3, 4),
         }
 
+
     def count_jobs(self, *, status: str | list[str] | None = None,
                    owner: str | list[str] | None = None,
                    model: str | None = None, search: str | None = None,
                    group_id: str | None = None,
                    content: str | None = None,
-                   since: float | None = None) -> int:
+                   since: float | None = None,
+                   until: float | None = None) -> int:
         """Сколько заданий подходит под отбор.
 
         Тот же набор условий, что у `list_jobs`, и собирает их та же
@@ -3929,7 +4037,7 @@ class Database:
         """
         собрано = self._jobs_where(status=status, owner=owner, model=model,
                                    search=search, group_id=group_id, since=since,
-                                   content=content)
+                                   content=content, until=until)
         if собрано is None:
             return 0
         соединение, where, args = собрано
@@ -4078,6 +4186,55 @@ class Database:
         changed = self.execute(f"UPDATE jobs SET {columns} WHERE {where}", args)
         return bool(changed)
 
+    # --- уведомления ----------------------------------------------------
+
+    def webhook_due(self, *, limit: int = 20) -> list[str]:
+        """Задания, чьё уведомление пора (до)слать: ждущие и брошенные посреди доставки."""
+        строки = self.query(
+            "SELECT id FROM jobs WHERE webhook_status IN ('pending', 'sending') "
+            "AND COALESCE(webhook_next_at, 0) <= ? LIMIT ?", (now(), max(1, int(limit))))
+        return [str(с["id"]) for с in строки]
+
+    def webhook_claim(self, job_id: str, *, hold_s: float) -> bool:
+        """Берёт доставку уведомления на себя — неделимо, как захват задания.
+
+        Серверов над базой бывает несколько, и без условной записи оба
+        досылали бы одно уведомление. «sending» со сроком: доставка,
+        брошенная падением процесса, по истечении срока снова считается
+        ждущей.
+        """
+        момент = now()
+        return bool(self.execute(
+            "UPDATE jobs SET webhook_status='sending', webhook_next_at=? "
+            "WHERE id=? AND webhook_status IN ('pending', 'sending') "
+            "AND COALESCE(webhook_next_at, 0) <= ?",
+            (момент + max(1.0, float(hold_s)), job_id, момент)))
+
+    # --- планирование ---------------------------------------------------
+
+    def fair_share_candidates(self, *, per_owner: int, ready_before: float,
+                              owners: int = 500) -> list[dict[str, Any]]:
+        """По нескольку старших ждущих заданий на каждого владельца.
+
+        Справедливому разделению нужен не «верх очереди», а «верх каждого
+        владельца»: окно в пятьсот заданий по времени постановки у отдела,
+        поставившего шестьсот записей, целиком состояло из его заданий, и
+        одинокая запись соседа выбиралась сто первой. Порядок внутри
+        владельца — как у «по приоритету»: важность, потом время постановки.
+        """
+        колонки = self.LIGHT_COLUMNS
+        строки = self.query(
+            f"SELECT {колонки} FROM ("
+            f"  SELECT {колонки}, ROW_NUMBER() OVER ("
+            "      PARTITION BY COALESCE(owner, 'anonymous') "
+            "      ORDER BY priority DESC, created_at ASC, id ASC) AS место "
+            "  FROM jobs WHERE status IN ('queued', 'retry') "
+            "    AND (queued_at IS NULL OR queued_at <= ?)"
+            ") WHERE место <= ? ORDER BY created_at ASC LIMIT ?",
+            (float(ready_before), max(1, int(per_owner)),
+             max(1, int(per_owner)) * max(1, int(owners))))
+        return [dict(r) for r in строки]
+
     def find_cached(self, file_hash: str, params_hash: str, *,
                     owner: str | None = None) -> dict[str, Any] | None:
         """Готовое задание с той же записью и теми же настройками.
@@ -4110,6 +4267,20 @@ class Database:
         разбор пометил «сжимаемый текст, тишина», у клона выглядела чистой,
         и в сводке качества таких записей становилось меньше, чем есть.
         """
+        rows = self._строки_реплик(job_id, segments)
+        self._поколение_реплик += 1
+        with self.write() as conn:
+            conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
+            conn.executemany(self._ВСТАВКА_РЕПЛИКИ, rows)
+
+    _ВСТАВКА_РЕПЛИКИ = (
+        "INSERT INTO segments (job_id, idx, start_s, end_s, text, speaker, "
+        "confidence, no_speech, compression, temperature, language, words) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+
+    @staticmethod
+    def _строки_реплик(job_id: str, segments: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+        """Реплики — строками для вставки (см. `save_segments`)."""
         def взять(seg: dict[str, Any], *имена: str) -> Any:
             for имя in имена:
                 if seg.get(имя) is not None:
@@ -4126,13 +4297,41 @@ class Database:
                 seg.get("temperature"), seg.get("language"),
                 json.dumps(seg.get("words"), ensure_ascii=False) if seg.get("words") else None,
             ))
-        self._поколение_реплик += 1
+        return rows
+
+    def finish_job(self, job_id: str, segments: list[dict[str, Any]], *,
+                   expected: list[str], expected_instance: str | None,
+                   **fields: Any) -> bool:
+        """Отметка «готово» и реплики — одной транзакцией и одним условием.
+
+        Реплики писались отдельно и ДО отметки «готово», а при её провале
+        (задание отменили или отобрали) стирались `clear_segments` без
+        всякой проверки, чьё задание. «Оживший» экземпляр — замерший дольше
+        отметки жизни (заморозка ВМ, подвисшее хранилище) или с часами,
+        ушедшими вперёд, — стирал так реплики задания, которое за это время
+        честно досчитал сосед: в базе оставалось «готово, сегментов 40» и
+        пустая таблица реплик. Теперь реплики пишутся, только если прошла
+        отметка, и тем же условием: не прошла — не тронуто ничего, ни
+        реплик соседа, ни прежних реплик задания (повтор готового задания,
+        отменённый в последний миг, остаётся с прежним текстом).
+        """
+        rows = self._строки_реплик(job_id, segments)
+        fields["updated_at"] = now()
+        _serialize_json_fields(fields)
+        columns = ", ".join(f"{name}=?" for name in fields)
+        placeholders = ",".join("?" for _ in expected)
+        where = f"id=? AND status IN ({placeholders})"
+        args: list[Any] = [*fields.values(), job_id, *expected]
+        if expected_instance is not None:
+            where += " AND instance_id=?"
+            args.append(expected_instance)
         with self.write() as conn:
+            if conn.execute(f"UPDATE jobs SET {columns} WHERE {where}", args).rowcount != 1:
+                return False
             conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
-            conn.executemany(
-                "INSERT INTO segments (job_id, idx, start_s, end_s, text, speaker, "
-                "confidence, no_speech, compression, temperature, language, words) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            conn.executemany(self._ВСТАВКА_РЕПЛИКИ, rows)
+        self._поколение_реплик += 1
+        return True
 
     def clear_segments(self, job_id: str) -> None:
         """Убирает реплики задания.
@@ -4589,8 +4788,11 @@ class Database:
             условия.append("COALESCE(station,'')=?")
             args.append(str(station))
         if older_than is not None:
-            условия.append("COALESCE(deferred_at, imported_at, started_at, 0) >= ?")
+            бессрочные = ",".join("?" for _ in self.ОТЛОЖЕН_БЕССРОЧНО)
+            условия.append("(COALESCE(deferred_at, imported_at, started_at, 0) >= ? "
+                           f"OR skipped IN ({бессрочные}))")
             args.append(float(older_than))
+            args.extend(f"{self.ОТЛОЖЕН}{п}" for п in self.ОТЛОЖЕН_БЕССРОЧНО)
         args.append(max(1, int(limit)))
         rows = self.query(
             f"SELECT * FROM calls WHERE {' AND '.join(условия)} "
@@ -4606,6 +4808,13 @@ class Database:
     #: так и не появилась за срок хранения отложенных.
     НЕ_ДОЖДАЛИСЬ = "не дождались записи: "
 
+    #: Причины откладывания, у которых нет срока. Звонок, отложенный из-за
+    #: полной очереди, — не безнадёжный: запись у него на месте, ждёт он
+    #: места в очереди. Раньше через сутки он списывался «не дождались
+    #: записи: очередь отказала», и первое подключение к большому архиву
+    #: теряло всё, что очередь не успела разобрать за день.
+    ОТЛОЖЕН_БЕССРОЧНО = ("очередь отказала",)
+
     def calls_expire_deferred(self, *, station: str = "",
                               older_than: float) -> int:
         """Отложенные дольше срока — в окончательный пропуск с причиной.
@@ -4616,9 +4825,12 @@ class Database:
         пишется» (или какая была причина откладывания), и она видна в
         разрезе пропусков.
         """
+        бессрочные = ",".join("?" for _ in self.ОТЛОЖЕН_БЕССРОЧНО)
         условия = ["skipped LIKE ? ESCAPE '\\'",
-                   "COALESCE(deferred_at, imported_at, started_at, 0) < ?"]
-        args: list[Any] = [f"{_экранировать_like(self.ОТЛОЖЕН)}%", float(older_than)]
+                   "COALESCE(deferred_at, imported_at, started_at, 0) < ?",
+                   f"skipped NOT IN ({бессрочные})"]
+        args: list[Any] = [f"{_экранировать_like(self.ОТЛОЖЕН)}%", float(older_than),
+                           *(f"{self.ОТЛОЖЕН}{п}" for п in self.ОТЛОЖЕН_БЕССРОЧНО)]
         if station:
             условия.append("COALESCE(station,'')=?")
             args.append(str(station))
@@ -4647,6 +4859,38 @@ class Database:
             return False
         return self.query_one("SELECT 1 FROM calls WHERE uniqueid=?",
                               (str(uniqueid),)) is not None
+
+    def call_get(self, uniqueid: str) -> dict[str, Any] | None:
+        """Строка архива по ключу звонка; None — такого звонка нет.
+
+        Импортёру мало «есть ли»: у Asterisk на один звонок бывает несколько
+        строк CDR, и пришедшая позже может оказаться той самой, ради которой
+        звонок и записывали (см. `telephony.asterisk.нога_лучше`).
+        """
+        if not uniqueid:
+            return None
+        строка = self.query_one("SELECT * FROM calls WHERE uniqueid=?", (str(uniqueid),))
+        if строка is None:
+            return None
+        звонок = dict(строка)
+        звонок["answered"] = bool(звонок.get("answered"))
+        return звонок
+
+    def call_has_recording(self, recording: str, *, station: str = "",
+                           кроме: str = "") -> bool:
+        """Отдан ли файл записи звонку станции, кроме названного.
+
+        Подбор записи по номерам и по маске — догадка, и один файл доставался
+        двум звонкам: второй уезжал в распознавание с чужим разговором.
+        Отложенные не в счёт: файл им ещё не отдан окончательно.
+        """
+        if not recording:
+            return False
+        return self.query_one(
+            "SELECT 1 FROM calls WHERE recording=? AND COALESCE(station,'')=? "
+            "AND uniqueid<>? AND COALESCE(skipped,'') NOT LIKE ? ESCAPE '\\' LIMIT 1",
+            (str(recording), str(station or ""), str(кроме or ""),
+             f"{_экранировать_like(self.ОТЛОЖЕН)}%")) is not None
 
     #: Сколько известных звонков держать в памяти при обходе каталога.
     ПРЕДЕЛ_ИЗВЕСТНЫХ_ЗВОНКОВ = 100000
@@ -4887,7 +5131,10 @@ class Database:
         всего = self.query_one(f"SELECT COUNT(*) AS n FROM calls c{где}", args)
         предел = max(1, min(int(limit), 500))
         rows = self.query(
-            "SELECT c.*, j.status AS job_status, j.text AS job_text,"
+            # Начало расшифровки — строкой в двести знаков, как в списке
+            # заданий: полный текст каждой записи страницы ради превью —
+            # мегабайты на каждое открытие журнала звонков.
+            "SELECT c.*, j.status AS job_status, substr(j.text, 1, 200) AS job_text,"
             "       j.media_duration_s AS job_duration "
             f"FROM calls c LEFT JOIN jobs j ON j.id=c.job_id{где} "
             "ORDER BY c.started_at DESC, c.imported_at DESC LIMIT ? OFFSET ?",
@@ -5247,15 +5494,31 @@ class Database:
                  "talk_s": по_корзинам.get(н, (0, 0))[1]}
                 for н, имя in enumerate(имена)]
 
-    def forget_calls(self, *, before: float) -> int:
-        """Убирает старые записи журнала звонков вместе с их заданиями.
+    def forget_calls(self, *, before: float, file_keys_before: float | None = None) -> int:
+        """Убирает старые строки журнала звонков — те, чьих заданий уже нет.
 
-        Сама запись занимает сотни байт, но за год их набегает миллион, и
+        Сама строка занимает сотни байт, но за год их набегает миллион, и
         обход папки записей начинает читать это множество целиком. Срок
-        хранения тот же, что у заданий: звонок без задания бесполезен.
+        хранения тот же, что у заданий.
+
+        Звонок с живым заданием не трогается. Срок звонка считается от
+        импорта, а срок задания — от окончания, и задание, простоявшее в
+        очереди, теряло свой звонок раньше себя: разрезы по оператору,
+        очереди и станции давали «—», а импорт из каталога записей больше не
+        узнавал файл и заводил его заново.
+
+        `file_keys_before` — свой, более ранний срок для строк, заведённых
+        обходом каталога (ключ `file:…`): только по ним импорт узнаёт уже
+        распознанный файл, и строка, забытая раньше, чем файл выходит из
+        глубины просмотра станции, означает повторное распознавание записи.
         """
-        return self.execute("DELETE FROM calls WHERE imported_at < ?",
-                            (float(before),))
+        граница_файлов = float(before) if file_keys_before is None \
+            else min(float(before), float(file_keys_before))
+        return self.execute(
+            "DELETE FROM calls WHERE imported_at < ? "
+            "  AND (job_id IS NULL OR job_id NOT IN (SELECT id FROM jobs)) "
+            "  AND (instr(uniqueid, 'file:') = 0 OR imported_at < ?)",
+            (float(before), граница_файлов))
 
     # --- сотрудники -------------------------------------------------------
 
@@ -5324,9 +5587,34 @@ class Database:
         if not номер:
             return None
         row = self.query_one(
-            "SELECT * FROM employees WHERE phone_ext=? ORDER BY active DESC, updated_at DESC",
-            (номер,))
+            "SELECT * FROM employees WHERE phone_ext=? "
+            "ORDER BY active DESC, updated_at DESC, id DESC", (номер,))
         return dict(row) if row else None
+
+    #: Внутренние номера, чья главная карточка — в этом отделе (один `?`).
+    #:
+    #: Номер бывает у двоих: общий номер отдела, номер, переданный новому
+    #: человеку при старой карточке уволенного. Отчёты подписывают номер
+    #: одним человеком — работающим раньше уволенного, свежей карточкой
+    #: раньше старой, при равенстве — последней заведённой
+    #: (`employees_by_ext`), — и отдел номера — отдел этого человека.
+    #: Отбор по отделу обязан смотреть туда же. Прежнее «есть карточка с
+    #: этим номером в отделе» относило номер сразу к двум отделам: таблица
+    #: «По отделам» показывала его разговоры у одного, а отбор и список под
+    #: числом — у обоих, подписанные чужим отделом. Подзапрос не зависит от
+    #: строки звонка: база считает его один раз на запрос.
+    ДОБАВОЧНЫЕ_ОТДЕЛА = (
+        "SELECT e.phone_ext FROM employees e WHERE e.department = ? "
+        "AND COALESCE(e.phone_ext,'') <> '' AND NOT EXISTS ("
+        "SELECT 1 FROM employees b WHERE b.phone_ext = e.phone_ext AND b.id <> e.id AND ("
+        "COALESCE(b.active,0) > COALESCE(e.active,0) OR (COALESCE(b.active,0) = COALESCE(e.active,0) "
+        "AND (COALESCE(b.updated_at,0) > COALESCE(e.updated_at,0) "
+        "OR (COALESCE(b.updated_at,0) = COALESCE(e.updated_at,0) AND b.id > e.id)))))")
+    #: Разговор отдела: у задания строка звонка с добавочным отдела.
+    ОТДЕЛ_ЗАДАНИЯ = ("EXISTS (SELECT 1 FROM calls cl WHERE cl.job_id = j.id "
+                     f"AND cl.agent IN ({ДОБАВОЧНЫЕ_ОТДЕЛА}))")
+    #: Звонок отдела: оператор звонка — добавочный отдела.
+    ОТДЕЛ_ЗВОНКА = f"cl.agent IN ({ДОБАВОЧНЫЕ_ОТДЕЛА})"
 
     def employees_by_ext(self, номера: Any) -> dict[str, dict[str, Any]]:
         """Сотрудники по внутренним номерам — разом, для таблиц отчётов.
@@ -5344,8 +5632,12 @@ class Database:
                 "SELECT phone_ext, last_name, first_name, middle_name, department, "
                 "       position, active FROM employees "
                 f"WHERE phone_ext IN ({','.join('?' for _ in кусок)}) "
-                # Последней пишется лучшая — она и остаётся в словаре.
-                "ORDER BY active ASC, updated_at ASC", кусок)
+                # Последней пишется лучшая — она и остаётся в словаре. Порядок
+                # полный, до ключа карточки: при равном времени правки выбор
+                # не должен зависеть от того, как база отдала строки, — по
+                # нему же отбор «отдел» относит номер к отделу
+                # (`ДОБАВОЧНЫЕ_ОТДЕЛА`).
+                "ORDER BY active ASC, updated_at ASC, id ASC", кусок)
             for r in строки:
                 имя = " ".join(str(r[поле] or "").strip() for поле in
                                ("last_name", "first_name", "middle_name")).strip()
@@ -5418,7 +5710,9 @@ class Database:
 
     def employees_import(self, записи: list[dict[str, Any]], *, source: str,
                          deactivate_missing: bool = True,
-                         dry_run: bool = False) -> dict[str, Any]:
+                         dry_run: bool = False,
+                         предел_увольнений: tuple[float, int] | None = None
+                         ) -> dict[str, Any]:
         """Разом заводит выгрузку справочника. Возвращает, что изменилось.
 
         Пропавших из выгрузки не удаляем, а помечаем неработающими: по ним
@@ -5432,11 +5726,39 @@ class Database:
         """
         было = {str(r["external_id"]): dict(r) for r in self.query(
             "SELECT * FROM employees WHERE source=?", (source,)) if r["external_id"]}
-        добавлено = обновлено = без_изменений = 0
+        добавлено = обновлено = без_изменений = сменились = 0
         пришли: set[str] = set()
         предел = self.ИМЁН_В_ИТОГЕ_ИМПОРТА
         перечни: dict[str, list[dict[str, Any]]] = {
-            "added": [], "updated": [], "deactivated": []}
+            "added": [], "updated": [], "deactivated": [], "replaced": []}
+        # Предохранитель (`предел_увольнений` — доля и порог «без вопросов»):
+        # оборванная или кривая выгрузка «увольняла» остаток штата молча.
+        заблокировано = 0
+        if deactivate_missing and предел_увольнений is not None:
+            ключи = {str(з.get("external_id") or "").strip() for з in записи} - {""}
+            работают = [к for к, п in было.items() if int(п.get("active") or 0)]
+            пропадут = sum(1 for к in работают if к not in ключи)
+            доля, без_вопросов = предел_увольнений
+            if пропадут > max(int(без_вопросов), доля * len(работают)):
+                deactivate_missing = False
+                заблокировано = пропадут
+
+        def имя_части(карточка: dict[str, Any], поле: str) -> str:
+            return str(карточка.get(поле) or "").strip().lower().replace("ё", "е")
+
+        def другой_человек(прежний: dict[str, Any], данные: dict[str, Any]) -> bool:
+            """Тот же ключ-номер, но фамилия И имя другие — на месте новый человек.
+
+            Ключ карточки — внутренний номер, а номер уволенного отдают
+            тому, кто сел на его место. Импорт находил карточку по номеру и
+            переписывал её: прежний человек исчезал из справочника, его
+            примечание переезжало к новому, а сверка приписывала новому
+            звонки прежнего. Смена одной фамилии (замужество) или
+            исправленное имя — тот же человек; обе сразу — другой.
+            """
+            return all(имя_части(прежний, п) and имя_части(данные, п)
+                       and имя_части(прежний, п) != имя_части(данные, п)
+                       for п in ("last_name", "first_name"))
 
         def кто(карточка: dict[str, Any]) -> dict[str, Any]:
             return {"name": " ".join(str(карточка.get(п) or "").strip() for п in
@@ -5459,6 +5781,23 @@ class Database:
                 if len(перечни["added"]) < предел:
                     перечни["added"].append(кто(данные))
                 continue
+            if другой_человек(прежний, данные):
+                # Прежнюю карточку не трогаем по содержанию: она уходит в
+                # неработающие с датой и с ключом, которого импорт больше не
+                # встретит, а новый человек получает свою карточку.
+                if not dry_run:
+                    self.execute(
+                        "UPDATE employees SET active=0, external_id=?, active_until=CASE "
+                        "WHEN COALESCE(active_until,'')='' THEN ? ELSE active_until END, "
+                        "updated_at=? WHERE id=?",
+                        (f"{ключ}~{прежний['id']}",
+                         time.strftime("%Y-%m-%d"), now(), прежний["id"]))
+                    self.employee_save(данные)
+                сменились += 1
+                добавлено += 1
+                if len(перечни["replaced"]) < предел:
+                    перечни["replaced"].append({**кто(данные), "previous": кто(прежний)["name"]})
+                continue
             различия = {к: з for к, з in данные.items()
                         if str(прежний.get(к) or "") != str(з or "")}
             if not различия:
@@ -5480,7 +5819,8 @@ class Database:
                     if len(перечни["deactivated"]) < предел:
                         перечни["deactivated"].append(кто(прежний))
         return {"added": добавлено, "updated": обновлено, "unchanged": без_изменений,
-                "deactivated": уволено, "received": len(пришли), "changes": перечни}
+                "deactivated": уволено, "replaced": сменились, "received": len(пришли),
+                "deactivation_blocked": заблокировано, "changes": перечни}
 
     # --- агенты на станциях ------------------------------------------------
 
@@ -6252,7 +6592,9 @@ class Database:
     # --- обслуживание ---------------------------------------------------
 
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
-                events_days: int = 90, audit_days: int = 365) -> dict[str, int]:
+                events_days: int = 90, audit_days: int = 365,
+                calls_file_days: int = 0) -> dict[str, int]:
+        """Уборка по срокам хранения (`calls_file_days` — см. `forget_calls`)."""
         removed = {"jobs": 0, "metrics": 0, "events": 0, "samples": 0,
                    "gpu_samples": 0, "llm_cache": 0, "calls": 0,
                    "audit": 0, "orphans": 0, "bytes": 0}
@@ -6270,12 +6612,26 @@ class Database:
             # повтора не устаревали никогда, и их загруженные файлы лежали в
             # uploads вечно. Им даём срок втрое больше: они могут ждать
             # долго, но не бесконечно.
+            # Исключения (эталон, открытая проверка качества) — ниже.
             stale = self.query(
                 "SELECT id, result_path, file_path FROM jobs "
-                "WHERE (finished_at IS NOT NULL AND finished_at<?) "
-                "   OR (finished_at IS NULL AND created_at<?) "
+                "WHERE ((finished_at IS NOT NULL AND finished_at<?) "
+                "   OR (finished_at IS NULL AND created_at<?)) "
+                "  AND id NOT IN (SELECT job_id FROM content_marks "
+                "                 WHERE kind='reference' AND status='yes') "
+                "  AND id NOT IN (SELECT job_id FROM qa_reviews WHERE status='pending' "
+                "                 AND assigned_at>=?) "
                 "ORDER BY COALESCE(finished_at, created_at) LIMIT ?",
-                (cutoff, ts - results_days * 3 * 86400, CLEANUP_BATCH))
+                (cutoff, ts - results_days * 3 * 86400, ts - results_days * 3 * 86400,
+                 CLEANUP_BATCH))
+            # Исключения — то, что человек оставил намеренно: запись,
+            # отмеченная эталоном, и запись с неоконченной проверкой качества
+            # работы оператора. По общему сроку они удалялись наравне со
+            # всеми: эталоны раздела «Лучшие разговоры» пропадали через
+            # месяц, а проверяющий открывал назначенную ему проверку и видел
+            # пустоту. Брошенная проверка держит запись не дольше втрое
+            # большего срока — как и задание, застрявшее в очереди. Удаление
+            # по требованию удаляет и их.
             for row in stale:
                 # Сначала файлы, потом запись: если удаление файлов упадёт,
                 # задание останется в базе и попадёт в следующую уборку.
@@ -6332,7 +6688,8 @@ class Database:
         # начинает читать это множество целиком.
         if results_days > 0:
             removed["calls"] = self.forget_calls(
-                before=ts - results_days * 86400)
+                before=ts - results_days * 86400,
+                file_keys_before=ts - max(results_days, calls_file_days) * 86400)
         return removed
 
     def sweep_orphans(self) -> dict[str, Any]:
@@ -6421,6 +6778,66 @@ class Database:
             return False
         log.info("Поисковый указатель дочищается дольше %.0f с — продолжим завтра", предел_с)
         return False
+
+    #: Шаг снимка в режиме журнала отката, страниц (по 4 КБ — 8 МБ за шаг).
+    ШАГ_СНИМКА_СТРАНИЦ = 2048
+    #: Пауза между шагами снимка, секунд: окно для писателей других серверов.
+    ПАУЗА_СНИМКА_С = 0.05
+    #: Сколько раз снимок по шагам может начаться заново из-за чужой записи,
+    #: прежде чем доделать его одним шагом.
+    ПЕРЕЗАПУСКОВ_СНИМКА = 3
+
+    def snapshot(self, приёмник: sqlite3.Connection) -> None:
+        """Согласованный снимок базы в `приёмник` («.backup» SQLite).
+
+        В WAL снимок идёт одним шагом: читатель писателям не мешает. В
+        режиме журнала отката (`db_journal_mode: delete`, раскладка для
+        нескольких машин над общим каталогом) снимок держит разделяемую
+        блокировку, и писатели — воркер, дописывающий расшифровку, отметки
+        жизни — через 30 с получали «database is locked»: копия базы в
+        гигабайты идёт минуты, и ночная копия стоила результатов заданий.
+
+        Поэтому в режиме отката снимок идёт под замком записи этого
+        процесса: свои писатели ждут на замке, а не падают по тайм-ауту
+        SQLite. Запись другим соединением начинает снимок заново, так что
+        отпускать своих писателей между шагами бессмысленно — снимок под
+        непрерывными отметками прогресса не кончился бы никогда. Писателям
+        других серверов оставлено окно между шагами; если из-за их записи
+        снимок начинался заново больше `ПЕРЕЗАПУСКОВ_СНИМКА` раз, он
+        доделывается одним шагом.
+        """
+        источник = self.conn
+        if self.journal_mode == "wal":
+            источник.backup(приёмник)
+            return
+
+        class _Перезапуски(Exception):
+            pass
+
+        перезапусков = 0
+        было: int | None = None
+
+        def ход(статус: int, осталось: int, _всего: int) -> None:
+            nonlocal перезапусков, было
+            if было is not None and осталось > было:
+                перезапусков += 1
+                if перезапусков > self.ПЕРЕЗАПУСКОВ_СНИМКА:
+                    raise _Перезапуски
+            было = осталось
+            # Пауза — только после сделанного шага: на занятой базе SQLite
+            # и так ждёт сам (параметр `sleep`).
+            if осталось and статус == 0:              # SQLITE_OK
+                time.sleep(self.ПАУЗА_СНИМКА_С)
+
+        with self._write_lock:
+            try:
+                источник.backup(приёмник, pages=self.ШАГ_СНИМКА_СТРАНИЦ, progress=ход,
+                                sleep=self.ПАУЗА_СНИМКА_С)
+                return
+            except _Перезапуски:
+                log.info("Снимок базы начинался заново %d раз из-за записи других "
+                         "серверов — доделываю одним шагом", перезапусков)
+            источник.backup(приёмник, sleep=self.ПАУЗА_СНИМКА_С)
 
     def checkpoint(self) -> dict[str, int] | None:
         """Вливает журнал WAL в базу и усекает его файл до нуля.

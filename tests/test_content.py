@@ -1645,14 +1645,19 @@ def test_a_script_item_can_demand_its_marker_within_seconds():
     """
     from asrhub.content import compliance
 
+    # Начало без окна — первые три реплики оператора и первые полминуты
+    # (заход 54): реплика на сороковой секунде здесь — четвёртая у оператора.
     сег = [{"start": 0, "end": 3, "speaker": "A", "text": "Алло, слушаю вас."},
            {"start": 3.5, "end": 8, "speaker": "B", "text": "Здравствуйте, по договору."},
+           {"start": 9, "end": 12, "speaker": "A", "text": "Номер договора подскажите."},
+           {"start": 13, "end": 18, "speaker": "B", "text": "Сто двадцать пять."},
+           {"start": 19, "end": 25, "speaker": "A", "text": "Минуту, смотрю."},
            {"start": 40, "end": 45, "speaker": "A", "text": "Разговор записывается."},
            {"start": 46, "end": 50, "speaker": "A", "text": "Всего доброго."}]
     пункт = {"id": "rec", "label": "Предупредил о записи",
              "any": ["разговор записывается"], "where": "start"}
 
-    # По долям реплик начало — первая реплика оператора: не прошло.
+    # По краю в репликах начало — первые три реплики оператора: не прошло.
     assert not compliance.check(сег, script=[пункт], speaker="A")["items"][0]["passed"]
     # Окно в 45 секунд накрывает реплику на сороковой; окно в 30 — нет.
     assert compliance.check(сег, script=[{**пункт, "within_s": 45}],
@@ -3086,8 +3091,10 @@ def test_norms_come_from_the_archive_and_flag_the_period_outside_them(tmp_path):
     assert нормы["current_records"] == 35
     темп = по["wpm"]
     assert темп["enough"] and темп["n"] == 140
-    # На базе темп ровный: коридор узкий, а неделя — сильно быстрее.
-    assert темп["q1"] == темп["q3"] == темп["median"]
+    # На базе темп ровный: коридор узкий (не уже двух единиц показа — заход
+    # 54: при нулевом размахе выбросом было любое отличие), а неделя — сильно
+    # быстрее.
+    assert темп["q1"] <= темп["median"] <= темп["q3"] and темп["q3"] - темп["q1"] <= 2
     assert темп["current"] > темп["high"] and темп["status"] == "outlier_high"
     assert по["sentiment"]["status"] == "inside"
     # Темп — показатель без направления: выброс даёт вывод «к сведению»

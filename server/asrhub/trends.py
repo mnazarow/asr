@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .logging_setup import get_logger
+from .pipeline import audio_profile as AP
 
 log = get_logger("trends")
 
@@ -178,6 +179,8 @@ class Источник:
             # больше в корзине незавершённых и упавших.
             "audio_done_s": "SUM(CASE WHEN j.status='completed' "
                             "THEN COALESCE(j.media_duration_s,0) ELSE 0 END)",
+            "audio_done_n": "SUM(CASE WHEN j.status='completed' "
+                            "AND COALESCE(j.media_duration_s,0) <> 0 THEN 1 ELSE 0 END)",
             "proc_done_s": "SUM(CASE WHEN j.status='completed' "
                            "THEN COALESCE(j.processing_time_s,0) ELSE 0 END)",
             "words": f"SUM({_СЛОВА})",
@@ -200,13 +203,27 @@ class Источник:
             "checked": "SUM(CASE WHEN j.quality_flags IS NOT NULL THEN 1 ELSE 0 END)",
             "snr_sum": "SUM(COALESCE(j.snr_db,0))",
             "snr_n": "SUM(CASE WHEN j.snr_db IS NOT NULL THEN 1 ELSE 0 END)",
-            "bad_audio": "SUM(CASE WHEN j.snr_db IS NOT NULL AND j.snr_db < 10 THEN 1 ELSE 0 END)",
+            # Плохой звук — тот же, что в «Аналитике» (`audio_profile.is_bad`):
+            # шум ИЛИ клиппинг. Здесь был один шум, и под одной подписью
+            # «Доля плохого звука» два раздела давали 20 % и 0,4 %.
+            "bad_audio": ("SUM(CASE WHEN j.snr_db IS NOT NULL AND "
+                          f"(j.snr_db < {AP.SNR_ПЛОХОЙ!r} "
+                          f"OR COALESCE(j.clipping_share,0) >= {AP.КЛИППИНГ_ПЛОХОЙ!r}) "
+                          "THEN 1 ELSE 0 END)"),
             "clip_sum": "SUM(COALESCE(j.clipping_share,0))",
             "clip_n": "SUM(CASE WHEN j.clipping_share IS NOT NULL THEN 1 ELSE 0 END)",
             "lufs_sum": "SUM(COALESCE(j.loudness_lufs,0))",
             "lufs_n": "SUM(CASE WHEN j.loudness_lufs IS NOT NULL THEN 1 ELSE 0 END)",
-            "speakers_sum": "SUM(COALESCE(j.speakers_count,0))",
-            "speakers_n": "SUM(CASE WHEN j.speakers_count IS NOT NULL THEN 1 ELSE 0 END)",
+            # Говорящих — по завершённым, где разделение что-то насчитало:
+            # колонка объявлена DEFAULT 0, и у задания без диаризации (и у
+            # упавшего, и у стоящего в очереди) она равна нулю, а не NULL.
+            # «IS NOT NULL» брал в знаменатель все задания, и тренд
+            # показывал «1 говорящий» там, где у половины записей разделение
+            # просто выключено.
+            "speakers_sum": "SUM(CASE WHEN j.status='completed' AND j.speakers_count > 0 "
+                            "THEN j.speakers_count ELSE 0 END)",
+            "speakers_n": "SUM(CASE WHEN j.status='completed' AND j.speakers_count > 0 "
+                          "THEN 1 ELSE 0 END)",
         }),
     Источник(
         id="content", frm="FROM content c JOIN jobs j ON j.id = c.job_id",
@@ -281,12 +298,20 @@ class Источник:
     Источник(
         id="system", frm="FROM system_samples s", ts="s.ts", owner_alias="",
         admin_only=True,
+        # Средние железа — по непустым замерам каждой колонки: что не
+        # измеряли, то не ноль. `SUM(COALESCE(x,0))/COUNT(*)` показывал карту
+        # без датчика мощности как «0 Вт», «0 °C», а сервер без замера диска
+        # — как «свободно 0 ГБ».
         cols={
             "n": "COUNT(*)",
             "cpu_sum": "SUM(COALESCE(s.cpu_percent,0))",
-            "ram_sum": "SUM(COALESCE(s.ram_used_mb,0))",
-            "ram_total": "SUM(COALESCE(s.ram_total_mb,0))",
+            "cpu_n": "COUNT(s.cpu_percent)",
+            "ram_sum": "SUM(CASE WHEN s.ram_total_mb > 0 THEN COALESCE(s.ram_used_mb,0) "
+                       "ELSE 0 END)",
+            "ram_total": "SUM(CASE WHEN s.ram_used_mb IS NOT NULL THEN "
+                         "COALESCE(s.ram_total_mb,0) ELSE 0 END)",
             "disk_sum": "SUM(COALESCE(s.disk_free_gb,0))",
+            "disk_n": "COUNT(s.disk_free_gb)",
         }),
     Источник(
         id="gpu", frm="FROM gpu_samples g", ts="g.ts", owner_alias="",
@@ -294,9 +319,13 @@ class Источник:
         cols={
             "n": "COUNT(*)",
             "util_sum": "SUM(COALESCE(g.util_percent,0))",
+            "util_n": "COUNT(g.util_percent)",
             "mem_sum": "SUM(COALESCE(g.mem_used_mb,0))",
+            "mem_n": "COUNT(g.mem_used_mb)",
             "temp_sum": "SUM(COALESCE(g.temperature_c,0))",
+            "temp_n": "COUNT(g.temperature_c)",
             "power_sum": "SUM(COALESCE(g.power_w,0))",
+            "power_n": "COUNT(g.power_w)",
         }),
 )
 
@@ -326,9 +355,14 @@ def _показатели() -> tuple[Показатель, ...]:
           hint="Записи короче порога «Короткая запись» (audio_min_duration_s) и "
                "пустые файлы: сброс на первой секунде, неотвеченный звонок. Не "
                "распознаются и в ошибки не идут."),
-        П("audio_hours", "Часов аудио", "объём", "jobs", _число("audio_s", 1 / 3600), "ч", 2,
-          hint="Суммарная длительность звука, а не время работы сервера: два часа "
-               "записи могут обработаться за десять минут."),
+        # По завершённым, как «Часов аудио» в сводке: длительность известна
+        # с постановки, и сумма по всем статусам считала и упавшие, и
+        # стоящие в очереди — на одном окне 0,58 ч здесь против 0,08 ч там.
+        П("audio_hours", "Часов аудио", "объём", "jobs", _число("audio_done_s", 1 / 3600),
+          "ч", 2,
+          hint="Суммарная длительность расшифрованного звука (завершённые задания), "
+               "а не время работы сервера: два часа записи могут обработаться за "
+               "десять минут."),
         П("words", "Слов распознано", "объём", "jobs", _число("words"), "шт", 0,
           hint="Слов в расшифровках. Растёт и от объёма, и от разговорчивости — "
                "сам по себе ни о чём не говорит, но резкий провал означает, что "
@@ -550,31 +584,31 @@ def _показатели() -> tuple[Показатель, ...]:
 
         # --- железо ----------------------------------------------------------
         П("cpu", "Загрузка процессора", "железо", "system",
-          _средневзвешенно("cpu_sum", "n"), "%", 1, admin_only=True,
+          _средневзвешенно("cpu_sum", "cpu_n"), "%", 1, admin_only=True,
           hint="Средняя загрузка процессора по замерам корзины."),
         П("ram", "Занято памяти", "железо", "system",
           lambda с: (float(с.get("ram_sum") or 0) / float(с["ram_total"]) * 100)
           if float(с.get("ram_total") or 0) else None, "%", 1, admin_only=True,
           hint="Доля занятой оперативной памяти."),
         П("disk_free", "Свободно на диске", "железо", "system",
-          _средневзвешенно("disk_sum", "n"), "ГБ", 1, "up", admin_only=True,
+          _средневзвешенно("disk_sum", "disk_n"), "ГБ", 1, "up", admin_only=True,
           hint="Свободное место на диске данных. Падение до нуля останавливает "
                "приём записей."),
         П("gpu_util", "Загрузка видеокарты", "железо", "gpu",
-          _средневзвешенно("util_sum", "n"), "%", 1, admin_only=True,
+          _средневзвешенно("util_sum", "util_n"), "%", 1, admin_only=True,
           hint="Средняя загрузка видеокарты. Устойчивые 100 % — карта и есть узкое "
                "место."),
         П("gpu_mem", "Видеопамять занята", "железо", "gpu",
-          lambda с: (float(с.get("mem_sum") or 0) / float(с["n"]) / 1024)
-          if float(с.get("n") or 0) else None, "ГБ", 1, admin_only=True,
+          lambda с: (float(с.get("mem_sum") or 0) / float(с["mem_n"]) / 1024)
+          if float(с.get("mem_n") or 0) else None, "ГБ", 1, admin_only=True,
           hint="Занятая видеопамять. Вместе со смысловым слоем именно она "
                "кончается первой."),
         П("gpu_temp", "Температура видеокарты", "железо", "gpu",
-          _средневзвешенно("temp_sum", "n"), "°C", 1, "down", admin_only=True,
+          _средневзвешенно("temp_sum", "temp_n"), "°C", 1, "down", admin_only=True,
           hint="Температура видеокарты. Около предела карта сбрасывает частоты, и "
                "RTF растёт сам собой."),
         П("gpu_power", "Потребление видеокарты", "железо", "gpu",
-          _средневзвешенно("power_sum", "n"), "Вт", 0, admin_only=True,
+          _средневзвешенно("power_sum", "power_n"), "Вт", 0, admin_only=True,
           hint="Потребление видеокарты. Упор в предел мощности выглядит как "
                "необъяснимое замедление."),
     )
@@ -672,7 +706,8 @@ def _раскрытия() -> dict[str, Раскрытие]:
         "failed": Р("failed", ("status:failed",), "Задания с ошибкой"),
         "no_speech": Р("no_speech", ("status:no_speech",), "Записи без речи"),
         "short": Р("short", ("status:short",), "Короткие записи"),
-        "audio_hours": Р("audio_n", ("nz:duration",), "Записи, из которых сложились часы аудио",
+        "audio_hours": Р("audio_done_n", ("status:completed", "nz:duration"),
+                         "Завершённые записи, из которых сложились часы аудио",
                          "сумма", sort="duration:desc", value="Длительность", fmt="dur"),
         "words": Р("words_n", ("nz:words",), "Записи, из которых сложились слова",
                    "сумма", sort="words:desc", value="Слов", fmt="int"),
@@ -711,12 +746,14 @@ def _раскрытия() -> dict[str, Раскрытие]:
                  sort="mer:desc", value="MER"),
         "scored_records": Р("scored", ("has_reference",), "Записи с эталоном"),
         "suspect_share": Р("suspect", ("flagged",), "Подозрительные расшифровки", "доля"),
-        "speakers": Р("speakers_n", ("has:speakers_count",), "Записи по числу говорящих",
+        "speakers": Р("speakers_n", ("status:completed", "nz:speakers_count"),
+                      "Завершённые записи с разделением говорящих",
                       "среднее", sort="speakers_count:desc", value="Говорящих", fmt="int"),
         # --- звук на входе --------------------------------------------------
         "snr": Р("snr_n", ("has:snr",), "Записи с измеренным шумом", "среднее",
                  sort="snr:asc", value="SNR, дБ"),
-        "bad_audio": Р("bad_audio", ("noisy",), "Записи с плохим звуком", "доля",
+        "bad_audio": Р("bad_audio", ("has:snr", "bad_audio"),
+                       "Записи с плохим звуком: шум или клиппинг", "доля",
                        sort="snr:asc", value="SNR, дБ"),
         "clipping": Р("clip_n", ("has:clipping",), "Записи с измеренным клиппингом",
                       "среднее", sort="clipping:desc", value="Клиппинг", fmt="pct"),
@@ -852,6 +889,99 @@ def _окно(секунд: float) -> tuple[float, float]:
     return float(math.ceil(конец - секунд)), конец
 
 
+def _к_началу(момент: float, имя_шага: str) -> float:
+    """Начало календарной корзины, в которую попадает момент, — по местным часам.
+
+    Час — с нуля минут, сутки — с полуночи, неделя — с понедельника, месяц
+    — с первого числа. Местные — те же, по которым режут сутки и часы
+    отборы списка (`date`, `hour`) и разложение по часам недели.
+    """
+    м = time.localtime(момент)
+    if имя_шага == "hour":
+        поля = (м.tm_year, м.tm_mon, м.tm_mday, м.tm_hour)
+    elif имя_шага == "week":
+        поля = (м.tm_year, м.tm_mon, м.tm_mday - м.tm_wday, 0)
+    elif имя_шага == "month":
+        поля = (м.tm_year, м.tm_mon, 1, 0)
+    else:
+        поля = (м.tm_year, м.tm_mon, м.tm_mday, 0)
+    return float(time.mktime((*поля, 0, 0, 0, 0, -1)))
+
+
+def _сдвиг(начало: float, имя_шага: str, сколько: int = 1) -> float:
+    """Начало корзины через `сколько` шагов календаря (можно назад).
+
+    Через `mktime`, а не прибавлением секунд: месяц бывает от 28 до 31
+    дня, а сутки при переходе на летнее время — 23 или 25 часов.
+    """
+    м = time.localtime(начало)
+    if имя_шага == "hour":
+        поля = (м.tm_year, м.tm_mon, м.tm_mday, м.tm_hour + сколько)
+    elif имя_шага == "week":
+        поля = (м.tm_year, м.tm_mon, м.tm_mday + 7 * сколько, 0)
+    elif имя_шага == "month":
+        год, месяц = divmod(м.tm_year * 12 + м.tm_mon - 1 + сколько, 12)
+        поля = (год, месяц + 1, 1, 0)
+    else:
+        поля = (м.tm_year, м.tm_mon, м.tm_mday + сколько, 0)
+    return float(time.mktime((*поля, 0, 0, 0, 0, -1)))
+
+
+def _границы(с: float, по: float, имя_шага: str) -> list[float]:
+    """Нижние границы календарных корзин от корзины момента `с` до `по`.
+
+    Корзины трендов шли от «сейчас»: суточная — «с 15:42 до 15:42», а
+    подпись под ней — календарная дата, и звонки понедельника стояли под
+    пятницей. И окно было «период до сейчас» без оглядки на шаг: год по
+    неделям — 52 недели и обрубок в сутки, и последняя точка показывала
+    10 при настоящих 70. Теперь корзины — по местному календарю, первая
+    начинается на границе календаря (окно чуть длиннее периода, зато
+    первая корзина целая), а последняя — текущая, неполная: она
+    помечается (`partial_last`) и в «последнее», минимум, наклон и среднее
+    счётных не идёт.
+    """
+    граница = _к_началу(с, имя_шага)
+    out = [граница]
+    while True:
+        следующая = _сдвиг(граница, имя_шага)
+        # Страховка от часов, которые при переводе стрелок повторяются:
+        # граница обязана расти, иначе цикл не кончится.
+        граница = следующая if следующая > граница else граница + BUCKETS.get(имя_шага, 3600.0)
+        if граница >= по:
+            break
+        out.append(граница)
+    # Предел числа точек — с последней стороны: свежие корзины важнее.
+    return out[-(МАКС_ТОЧЕК + 1):]
+
+
+def _номер(столбец: str, границы: list[float]) -> tuple[str, list[float]]:
+    """Номер корзины в SQL — по тем же границам, что уходят в ответ.
+
+    Равный шаг (часы, сутки и недели без перевода часов) — делением, как
+    раньше. Неравный (месяцы, сутки с переходом на летнее время) —
+    двоичным поиском по границам: «меньше границы k — левее k», — по
+    тем же числам, по которым список под точкой режет `GET /api/drill`.
+    Граница входит в свою корзину и там, и там.
+    """
+    if len(границы) <= 1:
+        return "0", []
+    шаги = {границы[i + 1] - границы[i] for i in range(len(границы) - 1)}
+    if len(шаги) == 1:
+        return f"CAST(({столбец}-?)/? AS INTEGER)", [границы[0], next(iter(шаги))]
+    параметры: list[float] = []
+
+    def поиск(низ: int, верх: int) -> str:
+        if низ == верх:
+            return str(низ)
+        середина = (низ + верх + 1) // 2
+        параметры.append(границы[середина])
+        левее = поиск(низ, середина - 1)
+        правее = поиск(середина, верх)
+        return f"CASE WHEN {столбец} < ? THEN {левее} ELSE {правее} END"
+
+    return поиск(0, len(границы) - 1), параметры
+
+
 def _записей(раскрытие: Раскрытие | None, строка: dict[str, Any] | None) -> int:
     """Сколько записей стоит за значением: сырьевая колонка раскрытия."""
     if раскрытие is None or строка is None:
@@ -867,22 +997,23 @@ class Trends:
 
     # --- сырьё ------------------------------------------------------------
 
-    def _сырьё(self, источник: Источник, since: float, until: float, шаг: float,
+    def _сырьё(self, источник: Источник, границы: list[float], until: float,
                owner: str | list[str] | None) -> dict[int, dict[str, Any]]:
         """Суммы источника по корзинам: {номер корзины: {колонка: сумма}}."""
         колонки = ", ".join(f"{выр} AS {имя}" for имя, выр in источник.cols.items())
         where = [f"{источник.ts}>=?", f"{источник.ts}<?"]
-        args: list[Any] = [since, until]
+        args: list[Any] = [границы[0], until]
         if owner and источник.owner_alias:
             отбор, свои = self.db._owner_clause(owner, источник.owner_alias)
             if отбор:
                 where.append(отбор)
                 args.extend(свои)
-        запрос = (f"SELECT CAST(({источник.ts}-?)/? AS INTEGER) AS bucket, {колонки} "
+        номер, его = _номер(источник.ts, границы)
+        запрос = (f"SELECT {номер} AS bucket, {колонки} "
                   f"{источник.frm} WHERE {' AND '.join(where)} "
                   "GROUP BY bucket ORDER BY bucket")
         try:
-            rows = self.db.query(запрос, [since, шаг, *args])
+            rows = self.db.query(запрос, [*его, *args])
         except Exception as exc:                             # noqa: BLE001
             # Источника может не быть на старой базе (таблица появилась
             # позже) — ряд просто пустой, а не отчёт целиком с ошибкой.
@@ -890,20 +1021,28 @@ class Trends:
             return {}
         return {int(r["bucket"]): dict(r) for r in rows}
 
-    def _ряды(self, показатели: list[Показатель], since: float, until: float,
-              шаг: float, корзин: int, owner: str | list[str] | None,
+    def _ряды(self, показатели: list[Показатель], границы: list[float], until: float,
+              owner: str | list[str] | None,
               сырьё: dict[str, dict[int, dict[str, Any]]] | None = None,
               ) -> dict[str, list[float | None]]:
         if сырьё is None:
-            сырьё = self._всё_сырьё(показатели, since, until, шаг, owner)
+            сырьё = self._всё_сырьё(показатели, границы, until, owner)
+        корзин = len(границы)
         out: dict[str, list[float | None]] = {}
         for п in показатели:
             строки = сырьё.get(п.source, {})
+            # Счётный показатель в пустой корзине — ноль, а не «нет данных»:
+            # в ней правда ничего не пришло. Прежде ряд, минимум, «последнее»
+            # и наклон пустые корзины пропускали, а `_итог` считал нулями —
+            # свод противоречил сам себе, и поток, упавший до нуля, выглядел
+            # ровным. Ноль — от первой корзины с данными: раньше сервера
+            # (или ключа) ещё не было.
+            первая = min(строки) if строки and _суммируемый(п) else None
             ряд: list[float | None] = []
             for i in range(корзин):
                 строка = строки.get(i)
                 if строка is None:
-                    ряд.append(None)
+                    ряд.append(0.0 if первая is not None and i > первая else None)
                     continue
                 try:
                     значение = п.calc(строка)
@@ -913,11 +1052,11 @@ class Trends:
             out[п.id] = ряд
         return out
 
-    def _всё_сырьё(self, показатели: list[Показатель], since: float, until: float,
-                   шаг: float, owner: str | list[str] | None,
+    def _всё_сырьё(self, показатели: list[Показатель], границы: list[float], until: float,
+                   owner: str | list[str] | None,
                    ) -> dict[str, dict[int, dict[str, Any]]]:
         нужные = {п.source for п in показатели}
-        return {и: self._сырьё(ИСТОЧНИКИ_ПО_ID[и], since, until, шаг, owner)
+        return {и: self._сырьё(ИСТОЧНИКИ_ПО_ID[и], границы, until, owner)
                 for и in нужные if и in ИСТОЧНИКИ_ПО_ID}
 
     # --- наружу -----------------------------------------------------------
@@ -956,8 +1095,16 @@ class Trends:
         """
         секунд = PERIODS.get(period, PERIODS["month"])
         имя_шага, шаг = выбрать_шаг(секунд, bucket)
-        начало, конец = _окно(секунд)
-        корзин = max(1, min(МАКС_ТОЧЕК, int(math.ceil(секунд / шаг))))
+        конец = time.time()
+        # Корзины — по местному календарю (см. `_границы`); последняя —
+        # текущая, неполная.
+        границы = _границы(конец - секунд, конец, имя_шага)
+        начало = границы[0]
+        корзин = len(границы)
+        неполная = _сдвиг(границы[-1], имя_шага) > конец
+        # Сколько корзин целых: по ним — «последнее», минимум, наклон и
+        # среднее счётных на корзину.
+        целых = корзин - 1 if неполная and корзин > 1 else корзин
 
         выбранные = [ПО_ID[м] for м in (metrics or []) if м in ПО_ID]
         if not выбранные:
@@ -965,18 +1112,22 @@ class Trends:
         if not is_admin:
             выбранные = [п for п in выбранные if not п.admin_only]
 
-        сырьё = self._всё_сырьё(выбранные, начало, конец, шаг, owner)
-        ряды = self._ряды(выбранные, начало, конец, шаг, корзин, owner, сырьё)
+        сырьё = self._всё_сырьё(выбранные, границы, конец, owner)
+        ряды = self._ряды(выбранные, границы, конец, owner, сырьё)
         прошлые: dict[str, list[float | None]] = {}
         сырьё_прошлое: dict[str, dict[int, dict[str, Any]]] = {}
         if compare:
-            сырьё_прошлое = self._всё_сырьё(выбранные, начало - секунд, начало, шаг, owner)
-            прошлые = self._ряды(выбранные, начало - секунд, начало, шаг, корзин,
-                                 owner, сырьё_прошлое)
+            # Прошлый период — столько же целых корзин календаря перед окном:
+            # сравнение по окну той же длины и с теми же границами суток,
+            # недель и месяцев.
+            прошлые_границы = [_сдвиг(начало, имя_шага, -целых + i) for i in range(целых)]
+            сырьё_прошлое = self._всё_сырьё(выбранные, прошлые_границы, начало, owner)
+            прошлые = {к: [*р, *([None] * (корзин - len(р)))] for к, р in self._ряды(
+                выбранные, прошлые_границы, начало, owner, сырьё_прошлое).items()}
 
         # Границы корзин — без округления: по ним интерфейс спросит список
         # записей корзины, и округлённая граница резала бы не там, где ряд.
-        точки_времени = [начало + i * шаг for i in range(корзин)]
+        точки_времени = list(границы)
         # Сколько записей стоит за каждой точкой — из того же сырья, что и
         # сама точка: отдельного запроса ради раскрытия нет.
         записей: dict[str, list[int]] = {}
@@ -990,14 +1141,19 @@ class Trends:
         свод = []
         for п in выбранные:
             ряд = ряды.get(п.id, [])
-            значения = [v for v in ряд if v is not None]
-            непустые = [i for i, v in enumerate(ряд) if v is not None]
+            # Неполная текущая корзина — в ряду (её видно на графике), но не
+            # в «последнем», минимуме, максимуме и наклоне: обрубок суток в
+            # конце года давал «последнее 10» при обычных 70 и тянул наклон
+            # вниз на ровном потоке.
+            целый_ряд = ряд[:целых]
+            значения = [v for v in целый_ряд if v is not None]
+            непустые = [i for i, v in enumerate(целый_ряд) if v is not None]
             # Свод за период — по суммам сырья за всё окно, а не средним
             # значений корзин: при шаге в сутки день с одним упавшим
             # заданием и день с девяноста девятью успешными давали «доля
             # успешных 50 %» при настоящих 99 %.
-            сейчас = _итог(п, сырьё.get(п.source, {}), корзин)
-            было = (_итог(п, сырьё_прошлое.get(п.source, {}), корзин)
+            сейчас = _итог(п, сырьё.get(п.source, {}), корзин, целых)
+            было = (_итог(п, сырьё_прошлое.get(п.source, {}), целых, целых)
                     if compare else None)
             изменение = None
             if сейчас is not None and было not in (None, 0):
@@ -1006,7 +1162,9 @@ class Trends:
                 "id": п.id, "label": п.label, "group": п.group, "unit": п.unit,
                 "digits": п.digits, "better": п.better, "hint": п.hint,
                 "points": len(значения),
-                "avg": _округлить(сейчас, п.digits),
+                # Среднее счётного на корзину — дробное: «заданий в среднем
+                # 2,4 в сутки» при digits=0 округлялось до 2.
+                "avg": _округлить(сейчас, п.digits + 1 if _суммируемый(п) else п.digits),
                 "min": _округлить(min(значения), п.digits) if значения else None,
                 "max": _округлить(max(значения), п.digits) if значения else None,
                 "last": _округлить(значения[-1], п.digits) if значения else None,
@@ -1022,21 +1180,28 @@ class Trends:
                 "drill": для_списка[п.id],
                 # Сумма имеет смысл только у счётных показателей: сумма
                 # процентов по корзинам — не число, а бессмыслица.
-                "total": (_округлить(sum(значения), п.digits)
-                          if значения and _суммируемый(п) else None),
+                # Итог — за всё окно, вместе с текущей неполной корзиной.
+                "total": (_округлить(sum(v for v in ряд if v is not None), п.digits)
+                          if _суммируемый(п) and any(v is not None for v in ряд) else None),
                 "previous": _округлить(было, п.digits),
                 "change_percent": изменение,
-                "slope": _наклон(ряды.get(п.id, [])),
+                "slope": _наклон(целый_ряд),
                 "verdict": _вердикт(изменение, п.better),
             })
         return {
             "period": period, "bucket": имя_шага, "step_s": шаг,
             "from": начало, "to": конец,
             # То же окно в общем для сводов виде. Корзина i — это
-            # [buckets[i], buckets[i] + step_s), последняя обрезана концом
-            # окна: при шаге, не делящем период нацело, она неполная.
+            # [buckets[i], buckets[i+1]), последняя — до конца окна. Границы
+            # календарные (местная полночь, понедельник, первое число), и
+            # шаг между ними бывает неравным (месяц, переход на летнее
+            # время): `step_s` — шаг по названию, а граница корзины — по
+            # `buckets`.
             "window": {"since": начало, "until": конец},
             "buckets": точки_времени,
+            # Последняя корзина — текущая, неполная: в «последнее», минимум,
+            # максимум, наклон и среднее счётных на корзину она не входит.
+            "partial_last": bool(неполная),
             "series": [{"id": п.id, "label": п.label, "unit": п.unit,
                         "digits": п.digits, "better": п.better, "group": п.group,
                         "values": ряды.get(п.id, []),
@@ -1184,7 +1349,7 @@ def _суммируемый(п: Показатель) -> bool:
 
 
 def _итог(п: Показатель, строки: dict[int, dict[str, Any]],
-          корзин: int) -> float | None:
+          корзин: int, целых: int | None = None) -> float | None:
     """Значение показателя за всё окно.
 
     Доли и средневзвешенные — по суммам сырья за всё окно: числитель и
@@ -1201,15 +1366,21 @@ def _итог(п: Показатель, строки: dict[int, dict[str, Any]],
     if not строки:
         return None
     if _суммируемый(п):
+        # Неполная текущая корзина (номера от `целых`) в среднее на корзину
+        # не идёт: она занижала его на ровном потоке. Если данные есть только
+        # в ней — считаем по ней, иначе сказать нечего.
+        целых = корзин if целых is None else целых
+        полные = {к: с for к, с in строки.items() if к < целых} or строки
+        предел = целых if полные is not строки else корзин
         всего = 0.0
-        for строка in строки.values():
+        for строка in полные.values():
             try:
                 значение = п.calc(строка)
             except (TypeError, ValueError, ZeroDivisionError):
                 значение = None
             if значение is not None:
                 всего += float(значение)
-        в_деле = max(1, корзин - max(0, min(строки)))
+        в_деле = max(1, предел - max(0, min(полные)))
         return всего / в_деле
     итого: dict[str, float] = {}
     for строка in строки.values():

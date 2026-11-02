@@ -738,7 +738,10 @@ def test_вторая_станция_не_отменяет_первую(tmp_path
             "recordings_dir": str(tmp_path / "pbx")}
     with _сервер(tmp_path, monkeypatch) as client:
         client.post("/api/telephony/stations", json={**поля, "name": "Первая"})
-        client.post("/api/telephony/stations", json={**поля, "name": "Вторая"})
+        # Свой журнал: две включённые станции на одном журнале теперь не
+        # сохраняются — каждый звонок лёг бы в архив дважды.
+        client.post("/api/telephony/stations", json={
+            **поля, "name": "Вторая", "cdr_file": str(tmp_path / "pbx" / "Master2.csv")})
         имена = [с["name"] for с in client.get("/api/telephony/stations").json()["items"]]
         assert имена == ["Первая", "Вторая"], имена
 

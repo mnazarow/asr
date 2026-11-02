@@ -55,10 +55,14 @@ SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
      (f"{PREFIX}/info",)),
 ]
 
+#: Пробы открыты всегда, независимо от monitoring_public: оркестратору ключ
+#: не положен (api/routes_monitoring.py: live, ready, startup без _guard).
+ALWAYS_OPEN = {f"{PREFIX}/live", f"{PREFIX}/ready", f"{PREFIX}/startup"}
+
 #: Маршруты, доступные без ключа при monitoring_public: true.
 OPEN_ROUTES = {
     f"{PREFIX}/metrics", f"{PREFIX}/metrics.json", f"{PREFIX}/health",
-    f"{PREFIX}/live", f"{PREFIX}/ready", f"{PREFIX}/startup",
+    f"{PREFIX}/resources",
     f"{PREFIX}/config/prometheus", f"{PREFIX}/config/prometheus-scrape",
     f"{PREFIX}/config/grafana", f"{PREFIX}/config/zabbix",
 }
@@ -72,6 +76,8 @@ ADMIN_ROUTES = {
 def access_note(path: str, method: str) -> str:
     if (path, method) in ADMIN_ROUTES:
         return "ключ с ролью **admin**"
+    if path in ALWAYS_OPEN:
+        return "без ключа всегда — пробы нужны оркестратору, а тексты исключений в них без путей"
     if path in OPEN_ROUTES:
         return "без ключа при `monitoring_public: true`, иначе любой действующий ключ"
     return "любой действующий ключ"

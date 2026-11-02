@@ -18,7 +18,7 @@ build_whisper_cpp() {
     # зовут из условия, а там errexit не действует, и дальше cmake дважды
     # падал на несуществующем каталоге с невнятным «сборка не удалась».
     retry 3 run git clone --depth 1 https://github.com/ggml-org/whisper.cpp "${target}" || return 1
-    add_rollback "rm -rf '${target}'"
+    add_rollback "rm -rf $(_q "${target}")"
   fi
 
   local flags=()
@@ -59,11 +59,30 @@ build_whisper_cpp() {
   # и строку с «export » отбраковывает — переменная не доходила до службы,
   # и собранный whisper.cpp сервер попросту не находил. Прежнюю строку
   # убираем, иначе она копится при каждой переустановке.
-  local env_file="${DATA_DIR:-/tmp}/env.sh"
-  if [[ -f "${env_file}" ]]; then
-    grep -v '^\(export \)\?ASRHUB_WHISPER_CPP=' "${env_file}" > "${env_file}.new" 2>/dev/null || true
-    mv -f "${env_file}.new" "${env_file}"
+  #
+  # Пробный запуск файл не трогает: раньше он переписывал env.sh (было
+  # 600 и чужой владелец — становилось 644 root). Запись — через write_file
+  # от имени владельца каталога данных: прежнее «env.sh.new» по постоянному
+  # имени root открывал по подложенной ссылке (так создавался чужой
+  # authorized_keys). Права прежнего файла сохраняются, новый — 0640.
+  local env_file="${DATA_DIR:-/tmp}/env.sh" mode="0640"
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '%s[пробный запуск]%s ASRHUB_WHISPER_CPP=%s в %s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${binary}" "${env_file}"
+    return 0
   fi
-  printf 'ASRHUB_WHISPER_CPP=%s\n' "${binary}" >> "${env_file}"
+  if [[ -L "${env_file}" ]]; then
+    warn "${env_file} — символическая ссылка; путь к whisper-cli не записан."
+    hint "Допишите вручную: ASRHUB_WHISPER_CPP=${binary}"
+    return 0
+  fi
+  if [[ -f "${env_file}" ]]; then
+    mode="$(stat -c '%a' "${env_file}" 2>/dev/null || stat -f '%Lp' "${env_file}" 2>/dev/null || echo 640)"
+  fi
+  { if [[ -f "${env_file}" ]]; then
+      read_owned "${env_file}" | grep -vE '^(export )?ASRHUB_WHISPER_CPP=' || true
+    fi
+    printf 'ASRHUB_WHISPER_CPP=%s\n' "${binary}"
+  } | write_file "${env_file}" "${mode}" nobackup
   return 0
 }

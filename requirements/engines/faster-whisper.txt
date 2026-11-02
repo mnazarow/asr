@@ -3,10 +3,12 @@
 # Совместимость CTranslate2 (типовой источник ошибки libcudnn):
 #   CUDA 12 + cuDNN 9  ->  ctranslate2>=4.5
 #   CUDA 12 + cuDNN 8  ->  ctranslate2==4.4.0
-#   CUDA 11 + cuDNN 8  ->  ctranslate2==3.24.0
-# Установщик подставляет нужную версию сам (см. ctranslate2_pin в detect.sh).
+#   CUDA 11 + cuDNN 8  ->  ctranslate2==3.24.0 (и faster-whisper 0.10.x)
+# Версию ctranslate2 здесь не пишем: установщик передаёт её файлом
+# ограничений в ту же команду pip (ctranslate2_pin в detect.sh). Строка
+# «ctranslate2>=4.5» в этом файле отменяла закрепление под CUDA 11 — pip
+# ставил его и следующей же командой заменял версией под CUDA 12.
 
-faster-whisper>=1.1
-ctranslate2>=4.5
+faster-whisper>=0.10
 onnxruntime>=1.17
 av>=11

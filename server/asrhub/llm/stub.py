@@ -34,6 +34,12 @@ def _задача(system: str) -> str:
 
 
 def _разговор(user: str) -> str:
+    # Расшифровка — между метками с номером (см. `tasks.блок`); тройные
+    # кавычки — прежняя запись, ею пользуются и подсказки вне разбора.
+    m = (re.search(r"<<<РАСШИФРОВКА (\w+)>>>\n(.*?)\n<<<КОНЕЦ РАСШИФРОВКИ \1>>>",
+                   user or "", re.DOTALL))
+    if m:
+        return m.group(2)
     m = re.search(r'"""\n(.*?)\n"""', user or "", re.DOTALL)
     return m.group(1) if m else (user or "")
 

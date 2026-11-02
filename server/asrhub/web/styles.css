@@ -22,6 +22,7 @@
   --err-soft:      rgba(248, 81, 73, 0.14);
   --info:          #a371f7;
   --info-soft:     rgba(163, 113, 247, 0.14);
+  --bg-soft:       rgba(255, 255, 255, 0.03);
   --radius:        10px;
   --radius-sm:     6px;
   --shadow:        0 8px 28px rgba(0, 0, 0, 0.4);
@@ -41,6 +42,19 @@ body.light {
   --text-faint:    #808da0;
   --accent:        #1f6feb;
   --accent-soft:   rgba(31, 111, 235, 0.10);
+  /* Цвета состояний — свои, тёмные: оставшиеся от тёмной темы зелёный,
+     жёлтый и красный на белом давали контраст 2,2–2,9:1, и фишки,
+     плашки и цветные числа читались с трудом. Значения — те же, что у
+     графиков в светлой теме (charts.js, STATUS.light). */
+  --ok:            #1a7f37;
+  --ok-soft:       rgba(26, 127, 55, 0.10);
+  --warn:          #9a6700;
+  --warn-soft:     rgba(154, 103, 0, 0.10);
+  --err:           #cf222e;
+  --err-soft:      rgba(207, 34, 46, 0.08);
+  --info:          #8250df;
+  --info-soft:     rgba(130, 80, 223, 0.10);
+  --bg-soft:       rgba(20, 30, 50, 0.04);
   --shadow:        0 6px 20px rgba(20, 30, 50, 0.10);
 }
 
@@ -129,6 +143,18 @@ a:hover { text-decoration: underline; }
    где им нечего делать. */
 [hidden] { display: none !important; }
 
+/* Права в интерфейсе. Роль вошедшего — атрибутом на body (app.js,
+   applyWhoAmI): кнопки, на которые сервер ответит 403, прячутся, а на их
+   месте видно короткое «это делает администратор». Раньше они рисовались
+   всем, и об отказе человек узнавал после нажатия. */
+.non-admin-only, .readonly-only { display: none !important; }
+body[data-role="user"] .admin-only,
+body[data-role="readonly"] .admin-only,
+body[data-role="readonly"] .write-only { display: none !important; }
+body[data-role="user"] .non-admin-only,
+body[data-role="readonly"] .non-admin-only,
+body[data-role="readonly"] .readonly-only { display: revert !important; }
+
 .content { padding: 22px 24px 60px; max-width: 1560px; width: 100%; }
 
 /* ---------- Общие элементы ---------- */
@@ -215,6 +241,16 @@ span.warn { color: var(--warn); }
           border: 1px solid transparent; }
 .banner.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
 .banner.err  { background: var(--err-soft);  color: var(--err);  border-color: var(--err); }
+/* Классы, которые app.js ставит, а правил у них не было: строка копии с
+   ошибкой не выделялась, «выключенный» приёмник выглядел обычной фишкой,
+   «Связь есть» в проверке станции — обычным текстом. */
+.banner.ok   { background: var(--ok-soft);   color: var(--ok);   border-color: var(--ok); }
+.banner.info { background: var(--info-soft); color: var(--info); border-color: var(--info); }
+.chip.idle { color: var(--text-faint); border-style: dashed; }
+tr.row-err td { color: var(--err); }
+/* Раздел «Asterisk: диалплан»: выбранный путь и драйвер в таблицах сравнения. */
+.dp-ours td, th.dp-ours { background: var(--accent-soft); }
+.dp-code { font-size: 12px; line-height: 1.5; tab-size: 4; }
 /* Схема системы на дашборде: узлы по группам и связи между ними. Рисуется
    своими руками, поэтому и стили свои — цвет узла показывает его состояние. */
 .map-wrap { overflow-x: auto; padding: 4px 2px 10px; }
@@ -310,6 +346,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 }
 .param:last-child { border-bottom: 0; }
 .param-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* Длинная фишка «только: whisper, faster_whisper, …» переносится, а не
+   вылезает за край на узком экране. */
+.param-head .chip { white-space: normal; max-width: 100%; }
 .param-label { font-weight: 550; font-size: 13.5px; }
 .param-key { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
 .param-desc { font-size: 12.5px; color: var(--text-dim); margin-top: 5px; line-height: 1.5; }
@@ -331,11 +370,22 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .param-control { display: flex; flex-direction: column; gap: 6px; }
 .param-impact { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .param-meta { font-size: 11.5px; color: var(--text-faint); }
+/* Условие отображения не выполнено (`requires` каталога): параметр виден,
+   но приглушён и подписан, от чего зависит. */
+.param.param-off > :first-child .param-label,
+.param.param-off .param-control { opacity: .55; }
+.param-requires { color: var(--warn); margin-top: 6px; }
 
+/* Липкая панель — под шапкой настоящей высоты. Шапка бывает от 58 до
+   113 px (подзаголовок переносится), а панель липла на 58 px и первой
+   строкой уезжала под неё; высоту шапки кладёт в --topbar-h app.js. */
 .settings-toolbar {
   display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-  padding: 12px 0; position: sticky; top: 58px; background: var(--bg); z-index: 10;
+  padding: 12px 0; position: sticky; top: var(--topbar-h, 58px); background: var(--bg); z-index: 10;
 }
+/* Навигация групп «Настроек» — три-пять строк — не липнет: вторая
+   панель (поиск и кнопки) ложилась поверх неё. */
+.settings-toolbar.settings-groups { position: static; }
 .group-nav { display: flex; gap: 4px; flex-wrap: wrap; }
 .group-nav button {
   font-size: 12.5px; padding: 5px 11px; border-radius: 20px;
@@ -589,7 +639,7 @@ body.modal-open { overflow: hidden; }
      очередь» уезжала за правый край и была недоступна. */
   .card-head { flex-wrap: wrap; row-gap: 8px; }
   .card-head .spacer { margin-left: 0; flex-basis: 100%; height: 0; }
-  .settings-toolbar { top: 48px; }
+  .settings-toolbar { top: var(--topbar-h, 48px); }
   .topbar-actions { flex-wrap: nowrap; }
 
   /* Параметр перестаёт быть двухколоночным: колонка управления была

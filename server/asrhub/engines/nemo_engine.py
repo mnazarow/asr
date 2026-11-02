@@ -11,10 +11,17 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..errors import DependencyMissing, classify_exception
+from ..errors import DependencyMissing, EngineError, classify_exception
 from ..pipeline import stitch, vad
 from ..pipeline.audio import probe, slice_wav
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
+
+#: Длиннее этого запись в модель одним проходом не идёт. Предел из карточки
+#: Parakeet (1440 с) относится к A100 на 80 ГБ: внимание растёт квадратично, и
+#: совещание на 15–24 минуты на карте в 8–24 ГБ кончалось нехваткой памяти, а
+#: деление пакета при повторе не помогало — файл один. Пять минут проходят
+#: и на карте в 8 ГБ.
+БЕЗОПАСНЫЙ_ПРОХОД_С = 300.0
 
 
 class NeMoEngine(Engine):
@@ -22,6 +29,7 @@ class NeMoEngine(Engine):
     supports_word_timestamps = True
     supports_batching = True
     outputs_punctuation = True
+    режет_сам = True
 
     @classmethod
     def check_available(cls) -> tuple[bool, str]:
@@ -44,22 +52,34 @@ class NeMoEngine(Engine):
         except ModuleNotFoundError as exc:
             raise DependencyMissing("nemo", "nemo-toolkit-asr", cause=exc) from exc
 
-        # Совместимость со старыми чекпоинтами при PyTorch 2.6+
-        os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
         models_dir = settings.get("models_dir")
         if models_dir:
             os.environ.setdefault("HF_HOME", str(models_dir))
             os.environ.setdefault("NEMO_CACHE_DIR", str(models_dir))
 
+        # Совместимость со старыми чекпоинтами при PyTorch 2.6+ — только на
+        # время загрузки. Прежде переменная ставилась на весь процесс и
+        # оставалась: после первой модели NeMo каждый torch.load сервера
+        # (pyannote, Sortformer, чужие веса) снова исполнял pickle без
+        # ограничений. Заданную администратором явно не трогаем.
+        свой_флаг = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD" not in os.environ
+        if свой_флаг:
+            os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
         try:
             model = nemo_asr.models.ASRModel.from_pretrained(model_name=self.spec.source)
         except Exception as exc:
             raise classify_exception(exc, engine=self.id, model=self.spec.id) from exc
+        finally:
+            if свой_флаг:
+                os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
 
         device = self.resolve_device(settings)
         try:
             if device.startswith("cuda"):
-                model = model.cuda()
+                # С номером карты: `model.cuda()` всегда шёл на карту 0, и
+                # «device: cuda:1» (карта 0 занята языковой моделью) кончался
+                # нехваткой памяти на чужой карте при отчёте «cuda:1».
+                model = model.to(device if ":" in device else "cuda")
             elif device == "cpu":
                 model = model.cpu()
             model.eval()
@@ -71,37 +91,46 @@ class NeMoEngine(Engine):
                     progress: ProgressCallback | None) -> TranscriptionResult:
         info = probe(audio_path)
         duration = info.duration_s
-        max_chunk = float(settings.get("vad_max_speech_s") or 0) or float(
-            self.spec.max_audio_s or 300)
+        language = self.language_for(settings)
+        if "canary" in self.spec.id and not language:
+            # Canary язык сама не определяет: без source_lang она считает
+            # запись английской — и русская запись выходила английским текстом.
+            raise EngineError(
+                f"Модель «{self.spec.id}» не определяет язык сама.",
+                hint="Укажите язык записи (параметр «Язык»), например ru.")
+        # Предел одного прохода: окно модели (Canary — 40 с), но не больше
+        # безопасного (см. `БЕЗОПАСНЫЙ_ПРОХОД_С`).
+        предел = min(float(self.spec.max_audio_s or БЕЗОПАСНЫЙ_ПРОХОД_С), БЕЗОПАСНЫЙ_ПРОХОД_С)
+        max_chunk = min(float(settings.get("vad_max_speech_s") or 0) or предел, предел)
 
-        # Модели с коротким окном (Canary — 40 с) режем по речи.
-        need_chunking = bool(self.spec.max_audio_s) and duration > (self.spec.max_audio_s or 1e9)
-        pieces: list[tuple[float, Path]] = []
+        need_chunking = duration > предел
+        pieces: list[tuple[float, Path, float]] = []
         tmpdir: tempfile.TemporaryDirectory[str] | None = None
 
         if need_chunking:
             opts = dict(settings)
-            opts["vad_max_speech_s"] = min(max_chunk, float(self.spec.max_audio_s or max_chunk))
+            opts["vad_max_speech_s"] = max_chunk
             spans = vad.detect(audio_path, opts) if settings.get("vad_enabled", True) else []
-            plan = vad.chunk_plan(duration, opts, spans)
+            plan = vad.chunk_plan(duration, opts, spans, предел_модели=предел)
             tmpdir = tempfile.TemporaryDirectory(prefix="nemo-",
                                                  dir=settings.get("temp_dir") or None)
             for idx, span in enumerate(plan):
                 piece = Path(tmpdir.name) / f"chunk{idx:05d}.wav"
                 slice_wav(audio_path, piece, span.start, span.end)
-                pieces.append((span.start, piece))
+                pieces.append((span.start, piece, span.end))
         else:
-            pieces.append((0.0, audio_path))
+            pieces.append((0.0, audio_path, duration))
 
         batch = int(settings.get("batch_size") or 8)
         segments: list[Segment] = []
         try:
             self.report(progress, 0.1, "распознавание")
-            paths = [str(p) for _, p in pieces]
-            kwargs: dict[str, Any] = {"batch_size": max(1, batch)}
-            if settings.get("word_timestamps", True):
-                kwargs["timestamps"] = True
-            language = self.language_for(settings)
+            paths = [str(p) for _, p, _ in pieces]
+            # Таймкоды просятся всегда, а слова отбрасываются на выходе, если
+            # их не просили. Без таймкодов NeMo не даёт и границ реплик, и
+            # запись выходила одной репликой 0.0–0.0: субтитры с нулевыми
+            # интервалами, диаризации не с чем пересекаться.
+            kwargs: dict[str, Any] = {"batch_size": max(1, batch), "timestamps": True}
             if language and "canary" in self.spec.id:
                 kwargs["source_lang"] = language
                 kwargs["target_lang"] = language if str(
@@ -118,8 +147,11 @@ class NeMoEngine(Engine):
                 self.log.warning(
                     "NeMo вернула %d результатов на %d фрагментов — часть будет потеряна",
                     len(flat), len(pieces))
-            for (offset, _), out in zip(pieces, flat, strict=False):
-                segments.extend(_convert(out, offset, language or ""))
+            for (offset, _, конец), out in zip(pieces, flat, strict=False):
+                segments.extend(_convert(out, offset, language or "", конец=конец))
+            if not settings.get("word_timestamps", True):
+                for segment in segments:
+                    segment.words = []
         finally:
             if tmpdir is not None:
                 tmpdir.cleanup()
@@ -153,8 +185,13 @@ def _flatten(outputs: Any) -> list[Any]:
     return [outputs]
 
 
-def _convert(out: Any, offset: float, language: str) -> list[Segment]:
-    """Приводит вывод NeMo к общей структуре сегментов."""
+def _convert(out: Any, offset: float, language: str, *,
+             конец: float | None = None) -> list[Segment]:
+    """Приводит вывод NeMo к общей структуре сегментов.
+
+    `конец` — где кончается фрагмент в координатах записи: граница реплики,
+    когда таймкодов у модели нет.
+    """
     text = getattr(out, "text", None)
     if text is None:
         text = str(out)
@@ -174,8 +211,12 @@ def _convert(out: Any, offset: float, language: str) -> list[Segment]:
         for item in seg_items:
             if not isinstance(item, dict):
                 continue
-            start = float(item.get("start", 0.0)) + offset
-            end = float(item.get("end", start)) + offset
+            # Конец без своего значения — начало реплики. Прежде запасным
+            # значением шло уже сдвинутое начало, и сдвиг прибавлялся второй
+            # раз: (41.0, 81.0) при фрагменте с 40 секунд.
+            сырое_начало = float(item.get("start", 0.0))
+            start = сырое_начало + offset
+            end = float(item.get("end", сырое_начало)) + offset
             piece = str(item.get("segment", item.get("text", ""))).strip()
             if not piece:
                 continue
@@ -188,6 +229,7 @@ def _convert(out: Any, offset: float, language: str) -> list[Segment]:
 
     if not str(text).strip():
         return []
-    end = words[-1]["end"] if words else offset
-    return [Segment(start=offset, end=end, text=str(text).strip(),
+    end = words[-1]["end"] if words else (конец if конец is not None else offset)
+    start = words[0]["start"] if words else offset
+    return [Segment(start=start, end=end, text=str(text).strip(),
                     language=language or None, words=words)]

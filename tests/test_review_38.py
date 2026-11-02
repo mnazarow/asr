@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from asrhub.llm import client as клиент_модуль
 from asrhub.llm.client import LLMClient, LLMError
+from fastapi import HTTPException
 
 ОТВЕТ = '{"summary": "клиент спросил про оплату", "resolved": true}'
 
@@ -463,12 +464,24 @@ def test_шлюз_держит_то_же_окно_что_и_разбор():
 
 
 def test_шлюз_расширяет_окно_под_длинный_запрос():
-    """Перезагрузка раз в долгий запрос дешевле молча обрезанной подсказки."""
+    """Перезагрузка раз в долгий запрос дешевле молча обрезанной подсказки.
+
+    Заход 54: окно растёт не больше чем вдвое против окна разбора (окно —
+    видеопамять общей карты, и любой ключ раздувал его до 131072), а запрос,
+    которому и этого мало, — отказ с объяснением, а не обрезка.
+    """
     клиент = _КлиентШлюза(рассуждающая)
+    окно = клиент_модуль.окно_контекста(клиент.settings, "qwen3.8:27b")
     запрос = _запрос_шлюза()
-    запрос["messages"] = [{"role": "user", "content": "слово " * 20000}]
+    запрос["messages"] = [{"role": "user", "content": "с" * int(окно * 1.5 * 2.5)}]
     тело = шлюз._тело_ollama(запрос, поток=False, клиент=клиент)
-    assert тело["options"]["num_ctx"] >= 120000 / 2.5
+    assert тело["options"]["num_ctx"] == 2 * окно
+    с_ollama = type("К", (), {"backend": "ollama", "model": "qwen3.8:27b",
+                              "max_tokens": 1024, "settings": клиент.settings})()
+    with pytest.raises(HTTPException) as отказ:
+        шлюз._разобрать_чат({"messages": [{"role": "user", "content": "слово " * 20000}]},
+                            с_ollama)
+    assert отказ.value.status_code == 400
 
 
 def test_поток_шлюза_несёт_рассуждение_отдельными_кусками():

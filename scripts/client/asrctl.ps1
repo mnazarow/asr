@@ -33,6 +33,9 @@ param(
     [string]$Model = '',
     [string]$Language = '',
     [string]$Formats = 'txt',
+    # Поля задания объектом JSON, как --settings у asrctl для Linux;
+    # -Model, -Language и -Formats ложатся поверх.
+    [string]$Settings = '',
     [string]$Output = '.',
     [string]$Format = 'txt',
     [string]$Status = '',
@@ -54,7 +57,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '3.1.25'
+$Version = '3.1.26'
+# -Formats по умолчанию «txt»: перекрывать им output_formats из -Settings
+# можно, только если формат задан явно.
+$FormatsGiven = $PSBoundParameters.ContainsKey('Formats')
 # APPDATA есть только в Windows; в WSL и PowerShell для Linux берём ~/.config
 $ConfigBase = if ($env:APPDATA) { $env:APPDATA }
               elseif ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME }
@@ -232,12 +238,22 @@ function Get-ApiResult {
     if ($response.Status -eq 401) {
         $message = 'Неверный или отсутствующий ключ доступа.'
         $hint = "Задайте: .\asrctl.ps1 config add $Profile $Server -"
-    } elseif ($data -and $data.PSObject -and ($data.PSObject.Properties.Name -contains 'detail')) {
-        $detail = $data.detail
-        if ($detail -is [string]) { $message = $detail }
-        elseif ($detail -and ($detail.PSObject.Properties.Name -contains 'message')) {
-            $message = "$($detail.message)"
-            if ($detail.PSObject.Properties.Name -contains 'hint' -and $detail.hint) { $hint = "$($detail.hint)" }
+    } elseif ($data -and $data.PSObject -and $data -isnot [string]) {
+        # Ошибки сервера — поля message и hint на верхнем уровне ответа
+        # (отказ по размеру, 500 и прочие); detail — у ответов FastAPI. Читался
+        # только detail, и отказ 413 печатался как «Ошибка 413» без причины
+        # и совета, хотя asrctl для Linux показывает и то, и другое.
+        $names = @($data.PSObject.Properties.Name)
+        if ($names -contains 'message' -and $data.message) {
+            $message = "$($data.message)"
+            if ($names -contains 'hint' -and $data.hint) { $hint = "$($data.hint)" }
+        } elseif ($names -contains 'detail') {
+            $detail = $data.detail
+            if ($detail -is [string]) { $message = $detail }
+            elseif ($detail -and ($detail.PSObject.Properties.Name -contains 'message')) {
+                $message = "$($detail.message)"
+                if ($detail.PSObject.Properties.Name -contains 'hint' -and $detail.hint) { $hint = "$($detail.hint)" }
+            }
         }
     }
     # 502–504 — прокси или сервер в перезапуске: временное, и ожидание
@@ -297,6 +313,34 @@ function New-UploadContent {
     return ,$content
 }
 
+function ConvertTo-SettingsJson {
+    <#
+      Поля задания одной строкой JSON: -Settings, поверх — -Model,
+      -Language и -Formats. Пусто — -Settings не разобран (причина уже
+      напечатана). Глубина задана явно: ConvertTo-Json в 5.1 по умолчанию
+      обрезает вложенное глубже двух уровней до строки «System.Collections…».
+    #>
+    $fields = [ordered]@{}
+    if ($Settings) {
+        $parsed = $null
+        try { $parsed = $Settings | ConvertFrom-Json -ErrorAction Stop }
+        catch { Write-Err2 "Не разобрать -Settings: $($_.Exception.Message)"; return '' }
+        if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+            Write-Err2 '-Settings должен быть объектом JSON: -Settings ''{"beam_size": 5}'''
+            return ''
+        }
+        foreach ($property in $parsed.PSObject.Properties) { $fields[$property.Name] = $property.Value }
+    }
+    if ($Model) { $fields['model'] = $Model }
+    if ($Language) { $fields['language'] = $Language }
+    if ($Formats -and ($FormatsGiven -or -not $fields.Contains('output_formats'))) {
+        $fields['output_formats'] = @($Formats -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $json = $fields | ConvertTo-Json -Compress -Depth 20
+    if (-not $json -or $json -eq 'null') { $json = '{}' }
+    return $json
+}
+
 function Send-File {
     <# Отправка файла. Объект: Id (пусто при неудаче) и Code — код клиента. #>
     param([string]$Path)
@@ -304,12 +348,8 @@ function Send-File {
         Write-Err2 "Файл не найден: $Path"
         return [pscustomobject]@{ Id = ''; Code = 1 }
     }
-    $settings = [ordered]@{}
-    if ($Model) { $settings['model'] = $Model }
-    if ($Language) { $settings['language'] = $Language }
-    if ($Formats) { $settings['output_formats'] = @($Formats -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    $settingsJson = $settings | ConvertTo-Json -Compress
-    if (-not $settingsJson -or $settingsJson -eq 'null') { $settingsJson = '{}' }
+    $settingsJson = ConvertTo-SettingsJson
+    if (-not $settingsJson) { return [pscustomobject]@{ Id = ''; Code = 2 } }
 
     $item = Get-Item -LiteralPath $Path
     Write-Host "Отправка: $($item.Name) ($([math]::Round($item.Length / 1MB, 1)) МБ)"
@@ -461,6 +501,9 @@ switch ($Command) {
 'send' {
     $file = $Rest | Select-Object -First 1
     if (-not $file) { Stop-Client 'Укажите файл: .\asrctl.ps1 send запись.mp3' 2 }
+    # Второй файл молча пропускался: «send a.mp3 b.mp3» отправлял один.
+    if (@($Rest).Count -gt 1) { Stop-Client "send отправляет один файл; для нескольких — send-dir. Лишнее: $($Rest[1])" 2 }
+    if (-not (ConvertTo-SettingsJson)) { Stop-Client 'Задание не отправлено: -Settings не разобран.' 2 }
     if ($PSBoundParameters.ContainsKey('Priority') -and ($Priority -lt 0 -or $Priority -gt 100)) {
         Stop-Client "Приоритет — число от 0 до 100: $Priority" 2
     }
@@ -476,6 +519,9 @@ switch ($Command) {
     if ($PSBoundParameters.ContainsKey('Priority') -and ($Priority -lt 0 -or $Priority -gt 100)) {
         Stop-Client "Приоритет — число от 0 до 100: $Priority" 2
     }
+    # -Settings — один раз до отправки: иначе опечатка в нём давала тысячу
+    # одинаковых отказов вместо одного.
+    if (-not (ConvertTo-SettingsJson)) { Stop-Client 'Ни один файл не отправлен: -Settings не разобран.' 2 }
     # Каталог отправленных — чтобы повторный запуск (из планировщика) не слал
     # те же файлы снова: сервер их не пересчитывает, но каждый повтор
     # заводил задание-копию и тратил квоту.
@@ -708,7 +754,7 @@ switch ($Command) {
 
 Команды
   send ФАЙЛ [-Model M] [-Language ru] [-Formats srt,txt] [-Priority 0..100]
-            [-Reference ЭТАЛОН] [-Wait] [-Output КАТАЛОГ]
+            [-Reference ЭТАЛОН] [-Settings '{"beam_size": 5}'] [-Wait] [-Output КАТАЛОГ]
   send-dir КАТАЛОГ [-Recurse] [-Pattern '*.mp3'] [-MoveTo КАТАЛОГ]
             [те же параметры]  -MoveTo — куда переносить отправленное,
                                чтобы запуск из планировщика не слал его снова

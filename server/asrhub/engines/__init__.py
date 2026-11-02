@@ -144,14 +144,26 @@ class EngineRegistry:
         if not available:
             raise DependencyMissing(engine_id).with_hint(reason)
 
-        key = f"{engine_id}::{spec.id}::{settings.get('device', 'auto')}::" \
-              f"{settings.get('compute_type', 'auto')}"
+        # Ключ — по тому, ЧТО получится, а не по тому, как попросили: «auto»
+        # и «cuda», «cuda» и «cuda:0», «rocm» и «cuda», «compute_type: auto»
+        # и «float16» на карте — одно и то же, а ключи у них были разные, и
+        # одна модель грузилась в память дважды (пресет «Whisper: устойчивый
+        # режим» с float16 рядом с обычным заданием — две копии по 3–5 ГБ).
+        образец = cls(spec, settings)
+        устройство = образец.resolve_device(settings)
+        if ":" not in устройство and устройство.startswith("cuda"):
+            устройство += ":0"
+        try:
+            точность = образец.resolve_compute_type(settings, устройство)
+        except Exception:                                   # noqa: BLE001
+            точность = str(settings.get("compute_type") or "auto")
+        key = f"{engine_id}::{spec.id}::{устройство}::{точность}"
         if отдельный:
             key += "::поток"
         with self._lock:
             engine = self._cache.get(key)
             if engine is None:
-                engine = cls(spec, settings)
+                engine = образец
                 self._cache[key] = engine
                 self._evict_if_needed(protect=key)
                 # Число загрузок, близкое к числу заданий, — прямое
@@ -183,6 +195,14 @@ class EngineRegistry:
             else:
                 self._busy[id(engine)] = remaining
             engine.last_used = time.time()
+            # Вытеснение — и после освобождения. Оно шло только при заведении
+            # новой записи и пропускало занятые; освободившиеся потом никто
+            # не вытеснял: при двух воркерах на двух моделях обе оставались
+            # в памяти при `model_cache_size: 1` сколько угодно (дальше —
+            # одни попадания в кеш), хотя предел для того и ставят, «чтобы
+            # две большие модели не встретились».
+            if remaining <= 0:
+                self._evict_if_needed()
 
     @contextmanager
     def lease(self, settings: dict[str, Any], *, wait_s: float | None = None,
@@ -212,7 +232,13 @@ class EngineRegistry:
             elif отдельный_если_занят:
                 второй = self._занять(settings, отдельный=True)
                 try:
-                    второй.lock.acquire()
+                    # Тот же предел ожидания, что у первого: второй экземпляр
+                    # тоже бывает занят (вторая сессия диктовки), и поток
+                    # сервера висел на его замке без срока.
+                    if not второй.lock.acquire(
+                            timeout=-1 if wait_s is None else max(0.0, wait_s)):
+                        raise EngineBusy(str(settings.get("model") or второй.spec.id),
+                                         float(wait_s or 0.0))
                 except BaseException:
                     self._освободить(второй)
                     raise
@@ -277,14 +303,29 @@ class EngineRegistry:
                     removed += 1
         return removed
 
-    def unload_all(self) -> None:
+    def unload_all(self, *, кроме_занятых: bool = True) -> dict[str, int]:
+        """Выгружает модели. Ответ — сколько выгружено и сколько занятых оставлено.
+
+        Занятые не трогаются, как и у сборщика простоя: прежде «Выгрузить
+        модели» обнулял модель посреди распознавания, и следующий фрагмент
+        идущего задания падал на «'NoneType' object has no attribute
+        'transcribe'» — или грузил веса заново мимо кеша, а следующее задание
+        заводило второй экземпляр: две копии весов вместо освобождения памяти.
+        Занятая модель выгрузится сама — по простою. При остановке сервера
+        (`кроме_занятых=False`) выгружается всё.
+        """
+        выгружено = занято = 0
         with self._lock:
-            for engine in self._cache.values():
+            for key, engine in list(self._cache.items()):
+                if кроме_занятых and self._is_busy(engine):
+                    занято += 1
+                    continue
                 try:
                     engine.unload()
                 except Exception:
                     pass
-            self._cache.clear()
+                self._cache.pop(key, None)
+                выгружено += 1
         # Модели постобработки живут в своём кеше и раньше про «выгрузить
         # всё» не знали: после освобождения памяти в ней оставались
         # трансформеры расстановки знаков препинания.
@@ -302,6 +343,7 @@ class EngineRegistry:
             model_cache.выгрузить(None)
         except Exception as exc:                            # noqa: BLE001
             log.debug("Не удалось выгрузить вспомогательные модели: %s", exc)
+        return {"freed": выгружено, "busy": занято}
 
     def loaded(self) -> list[dict[str, Any]]:
         with self._lock:

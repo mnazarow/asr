@@ -1,7 +1,9 @@
 # ASR Hub — развёртывание через Docker Compose.
 #
 #   docker compose up -d                                    сервер на процессоре
-#   docker compose --profile proxy up -d                    сервер и прокси nginx
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+#                                       сервер за nginx, прямой порт закрыт
+#   docker compose --profile proxy up -d                    nginx и прямой порт
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #                                                           сервер с видеокартой
 #
@@ -30,6 +32,10 @@ services:
     image: asrhub:${ASRHUB_TAG:-latest}
     container_name: asrhub
     restart: unless-stopped
+    # Срок остановки: по умолчанию у Docker десять секунд, а серверу нужно
+    # дождаться открытых запросов (до 5 с) и вернуть идущие задания в
+    # очередь — иначе SIGKILL приходит раньше, и каждое теряет попытку.
+    stop_grace_period: 40s
     # Профиля у сервера нет намеренно: сервис с профилем не поднимается без
     # явного --profile, и «docker compose up -d» не запускал бы ничего.
     ports:
@@ -43,13 +49,27 @@ services:
     environment:
       ASRHUB_DATA_DIR: /data
       ASRHUB_SERVER_PORT: 8080
-      ASRHUB_LOG_LEVEL: ${ASRHUB_LOG_LEVEL:-INFO}
-      ASRHUB_MAX_CONCURRENT_JOBS: ${ASRHUB_WORKERS:-2}
+      # Без значения — передаются, только если заданы в .env. Переменная
+      # окружения важнее config.yaml, и с умолчаниями прямо здесь число
+      # заданий и уровень журнала, сохранённые в интерфейсе, после каждого
+      # перезапуска возвращались к 2 и INFO.
+      ASRHUB_LOG_LEVEL:
+      ASRHUB_MAX_CONCURRENT_JOBS:
+      # Прежнее имя того же числа; точка входа переводит его сама.
+      ASRHUB_WORKERS:
+      # Адрес сервера языковой модели. 127.0.0.1 внутри контейнера — это сам
+      # контейнер; модель на хосте — http://host.docker.internal:11434.
+      ASRHUB_LLM_URL:
       # Владелец смонтированного тома. Если каталог на хосте принадлежит не
       # 1000:1000, укажите его uid:gid здесь — контейнер подстроится.
       ASRHUB_UID: ${ASRHUB_UID:-1000}
       ASRHUB_GID: ${ASRHUB_GID:-1000}
       HF_TOKEN: ${HF_TOKEN:-}
+    # Хост — под именем host.docker.internal и на Linux (на Docker Desktop
+    # оно есть и так): через него контейнер достаёт до сервера языковой
+    # модели (Ollama), запущенного на той же машине.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       # /health отвечает 503 при недоступной базе — curl -fsS это заметит.
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]

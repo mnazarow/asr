@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -117,16 +119,35 @@ class Target:
         if kind not in KINDS:
             raise ValueError(f"Неизвестный приёмник «{kind}». Доступны: {', '.join(KINDS)}")
         заголовки: dict[str, str] = {}
-        прежние = dict(основа.get("headers") or {})
+        # Сохранённые заголовки переходят к приёмнику, только если он шлёт
+        # туда же: та же схема, узел и порт, тот же вид. Иначе «проверить
+        # приёмник influx на http://свой-узел/» отдавало токен InfluxDB
+        # чужому адресу одним запросом — при обещании «значения заголовков
+        # не отдаются никому».
+        прежние = (dict(основа.get("headers") or {})
+                   if прежний is not None and прежний.kind == kind
+                   and _то_же_место(прежний.url, str(поля.get("url") or "")) else {})
         for ключ, значение in (поля.get("headers") or {}).items():
             if str(значение) == ЗАГЛУШКА:
                 if ключ in прежние:
                     заголовки[str(ключ)] = str(прежние[ключ])
                 continue
-            заголовки[str(ключ)] = str(значение)
+            # Перевод строки и прочие управляющие знаки в значении заголовка
+            # http.client отвергает с ValueError, вписывая значение целиком:
+            # токен с хвостовым \n из config.yaml уходил в last_error и в
+            # журнал, а last_error видят /targets и /info. Края чистим, а
+            # знаки внутри — отказ при сохранении.
+            текст = str(значение).strip()
+            if any(ord(з) < 32 or ord(з) == 127 for з in текст):
+                raise ValueError(f"значение заголовка «{ключ}» содержит управляющие знаки")
+            заголовки[str(ключ).strip()] = текст
+        интервал = float(поля.get("interval_s", 60))
+        срок = float(поля.get("timeout_s", 10.0))
+        if not (math.isfinite(интервал) and math.isfinite(срок)):
+            raise ValueError("interval_s и timeout_s должны быть конечными числами")
         return cls(
             kind=kind, url=str(поля.get("url") or ""),
-            interval_s=max(10, int(float(поля.get("interval_s", 60)))),
+            interval_s=max(10, int(интервал)),
             enabled=_да(поля.get("enabled", True)),
             name=str(поля.get("name") or kind),
             headers=заголовки,
@@ -134,9 +155,20 @@ class Target:
             instance=str(поля.get("instance") or ""),
             database=str(поля.get("database") or "asrhub"),
             prefix=str(поля.get("prefix") or "asrhub"),
-            timeout_s=min(60.0, max(1.0, float(поля.get("timeout_s", 10.0)))),
+            timeout_s=min(60.0, max(1.0, срок)),
             host=str(поля.get("host") or ""),
         )
+
+
+def _то_же_место(один: str, другой: str) -> bool:
+    """Одна ли это точка доставки: схема, узел и порт."""
+    def место(адрес: str) -> tuple[str, str, int | None]:
+        try:
+            части = urllib.parse.urlsplit(str(адрес or "").strip())
+            return части.scheme.lower(), (части.hostname or "").lower(), части.port
+        except ValueError:
+            return "", str(адрес or ""), None
+    return место(один) == место(другой)
 
 
 def _да(значение: Any) -> bool:
@@ -173,6 +205,8 @@ class TargetState:
 
     @property
     def healthy(self) -> bool:
+        # `last_attempt` — конец последней ЗАВЕРШЁННОЙ попытки (см. push_once),
+        # поэтому здоровье — по её исходу, а не по тому, что отправка идёт.
         return self.last_success >= self.last_attempt and self.last_attempt > 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -235,6 +269,28 @@ def скрыть_адрес(адрес: str) -> str:
     return re.sub(r"(//)[^/@\s]+@", r"\1***@", текст)
 
 
+def адрес_для_всех(адрес: str) -> str:
+    """От адреса — схема, узел и порт: куда идёт отправка, без токенов.
+
+    Одна функция для /targets, /info и GET /api/settings. Токен входящего
+    адреса чата лежит в ПУТИ («/services/T0001/B0002/…», «/bot123:AAE…/»),
+    а `скрыть_адрес` прячет только параметры запроса и «user:pass@»: в
+    /targets ключ «только чтение» видел «https://hooks.slack.test/…», а в
+    настройках — тот же адрес целиком.
+    """
+    if not адрес:
+        return ""
+    try:
+        разбор = urllib.parse.urlsplit(str(адрес))
+        порт = f":{разбор.port}" if разбор.port else ""
+    except ValueError:
+        return "***"
+    if not разбор.scheme or not разбор.hostname:
+        return "***"
+    хвост = "/…" if разбор.path not in ("", "/") or разбор.query else ""
+    return f"{разбор.scheme}://{разбор.hostname}{порт}{хвост}"
+
+
 def _без_секретов(текст: str, target: Target) -> str:
     """Текст ошибки без учётных данных приёмника.
 
@@ -245,7 +301,15 @@ def _без_секретов(текст: str, target: Target) -> str:
     """
     итог = str(текст or "")
     if target.url:
-        итог = итог.replace(target.url, скрыть_адрес(target.url))
+        # Текст ошибки видят все, кто видит /targets, поэтому от адреса в нём
+        # — только схема и узел (см. `адрес_для_всех`).
+        итог = итог.replace(target.url, адрес_для_всех(target.url))
+    # И значения заголовков приёмника: ошибка разбора заголовка у http.client
+    # содержит значение целиком («Invalid header value b'Bearer …'»).
+    for значение in target.headers.values():
+        for вид in (str(значение), repr(str(значение).encode("utf-8"))[2:-1]):
+            if len(вид) >= 4:
+                итог = итог.replace(вид, ЗАГЛУШКА)
     return скрыть_адрес(итог)
 
 
@@ -267,9 +331,18 @@ def _statsd_name(sample: Sample, prefix: str) -> str:
     """
     parts = [prefix, sample.name.replace("asrhub_", "")]
     for key, value in sorted(sample.labels.items()):
-        clean = str(value).replace(".", "_").replace(" ", "_").replace("/", "_")
-        parts.append(f"{key}.{clean}")
+        parts.append(f"{_часть_statsd(key)}.{_часть_statsd(value)}")
     return ".".join(parts)
+
+
+def _часть_statsd(значение: Any) -> str:
+    """Часть имени StatsD — без знаков протокола.
+
+    «:» отделяет значение, «|» — тип, перевод строки — следующую строку:
+    метка с любым из них ломала строку целиком или подставляла чужую.
+    Буквы (в том числе кириллица), цифры, «-» и «_» остаются как есть.
+    """
+    return re.sub(r"[^\w-]+", "_", str(значение), flags=re.UNICODE).strip("_") or "_"
 
 
 def _format_value(value: float) -> str:
@@ -307,6 +380,12 @@ def _statsd_lines(target: Target, samples: list[Sample],
         накопительный = spec is not None and (
             spec.type == "counter" or (spec.type == "histogram" and item.name != base))
         if not накопительный:
+            if float(item.value) < 0:
+                # Значение со знаком StatsD читает как «изменить на», а не
+                # «установить»: тональность −0,31 уменьшала gauge на 0,31
+                # каждую минуту. Отрицательное — парой: сначала ноль, потом
+                # приращение до значения.
+                строки.append(f"{имя}:0|g")
             строки.append(f"{имя}:{_format_value(item.value)}|g")
             continue
         значение = float(item.value)
@@ -318,6 +397,19 @@ def _statsd_lines(target: Target, samples: list[Sample],
             прирост = значение - было if значение >= было else значение
         строки.append(f"{имя}:{_format_value(прирост)}|c")
     return строки, новые
+
+
+def _statsd_address(url: str) -> tuple[str, int]:
+    """Узел и порт StatsD: udp://узел:порт, statsd://…, [::1]:8125, узел.
+
+    Адрес резался по первому двоеточию: «udp://[::1]:8125» и
+    «statsd://узел:8125» давали ValueError на каждой отправке.
+    """
+    текст = str(url or "").strip()
+    if "://" not in текст:
+        текст = f"udp://{текст}"
+    части = urllib.parse.urlsplit(текст)
+    return (части.hostname or "127.0.0.1"), int(части.port or 8125)
 
 
 #: Заголовок пакета протокола Zabbix: «ZBXD» и флаги (1 — обычный пакет).
@@ -436,9 +528,7 @@ def send(target: Target, samples: list[Sample],
               {"Content-Type": "application/json", **target.headers}, target.timeout_s)
 
     elif target.kind == "statsd":
-        host, _, port = target.url.replace("udp://", "").partition(":")
-        host = host or "127.0.0.1"
-        port_number = int(port or 8125)
+        host, port_number = _statsd_address(target.url)
         # Семейство определяем по факту: приёмник может слушать IPv6.
         family = socket.AF_INET
         try:
@@ -448,6 +538,12 @@ def send(target: Target, samples: list[Sample],
 
         строки, новые = _statsd_lines(target, samples,
                                       state.statsd_last if state is not None else None)
+        # Прежние значения сливаются, а не заменяются: счётчик, пропавший из
+        # одного снимка (источник отказал на один сбор), возвращался с «было
+        # = 0», и весь итог с запуска уходил приростом — asrhub_llm_calls_total
+        # удваивался.
+        if state is not None:
+            новые = {**state.statsd_last, **новые}
         with socket.socket(family, socket.SOCK_DGRAM) as sock:
             sock.settimeout(target.timeout_s)
             for line in строки:
@@ -496,6 +592,7 @@ class PushManager:
         self._next_at: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._поток_замок = threading.Lock()
         self.set_targets(targets or [])
 
     # -- настройка -----------------------------------------------------------
@@ -558,19 +655,35 @@ class PushManager:
     # -- работа --------------------------------------------------------------
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        # Флаг остановки надо снять: иначе после stop() новый поток выходил
-        # на первом же ожидании, и отправка молча прекращалась навсегда.
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="asrhub-push", daemon=True)
-        self._thread.start()
+        # Запуск и остановка — под своим замком: два одновременных сохранения
+        # настроек мониторинга (включили отправку и тут же поменяли список)
+        # проходили проверку `_thread is None` оба и заводили два цикла,
+        # которые слали каждую метрику дважды.
+        with self._поток_замок:
+            # Флаг остановки надо снять: иначе после stop() новый поток выходил
+            # на первом же ожидании, и отправка молча прекращалась навсегда.
+            # Прошлый поток ещё жив (остановка застала его внутри сбора) — он
+            # и продолжит работу: второй такой же слал бы метрики дважды.
+            self._stop.clear()
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._loop, name="asrhub-push", daemon=True)
+            self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        with self._поток_замок:
+            self._stop.set()
+            поток = self._thread
+        if поток is None:
+            return
+        # Ждём без замка: иначе start() из соседнего сохранения настроек
+        # стоял бы всё ожидание сбора.
+        поток.join(timeout=timeout)
+        with self._поток_замок:
+            # Ссылку забываем, только если поток и правда закончился: иначе
+            # следующий start() поднимал второй цикл рядом с недождавшимся.
+            if self._thread is поток and not поток.is_alive():
+                self._thread = None
 
     def _loop(self) -> None:
         failures = 0
@@ -607,7 +720,16 @@ class PushManager:
         # десятисекундным тайм-аутом задерживал бы отправку во все остальные.
         for target in due:
             with self._lock:
-                self._next_at[target.name] = time.time() + target.interval_s
+                if target.name not in self._states:
+                    continue                # убрали, пока собирался снимок
+                # Следующий срок — от прежнего срока, а не от момента такта:
+                # такт идёт раз в пять секунд, и период выходил interval_s + 5
+                # (отправки на 0, 15 и 30 с при интервале 10).
+                прежний = self._next_at.get(target.name, 0.0)
+                следующий = (прежний or now) + target.interval_s
+                if следующий <= now:
+                    следующий = now + target.interval_s
+                self._next_at[target.name] = следующий
             threading.Thread(target=self.push_once, args=(target, samples),
                              name=f"asrhub-push-{target.name}", daemon=True).start()
 
@@ -626,9 +748,19 @@ class PushManager:
             if проба:
                 state = TargetState(target=target)
             else:
-                state = self._states.get(target.name) or TargetState(target=target)
-                self._states[target.name] = state
-            state.last_attempt = time.time()
+                # Состояния, которого нет, рабочая отправка не заводит: приёмник
+                # удалили, пока собирался снимок, — и прежде он возвращался в
+                # работу, а следующее сохранение списка писало его обратно в
+                # config.yaml.
+                найдено = self._states.get(target.name)
+                if найдено is None or (найдено.target.kind, найдено.target.url) != (
+                        target.kind, target.url):
+                    return {"ok": False, "error": "приёмник убран или изменён"}
+                state = найдено
+        # Время попытки ставится, когда она ЗАКОНЧИЛАСЬ, а не когда началась:
+        # прежде, пока шла отправка, `last_attempt` уже был новее
+        # `last_success`, и медленный приёмник на время каждой отправки
+        # становился «нездоровым» — asrhub_push_targets_healthy мигал нулём.
         try:
             сведения = send(target, payload, None if проба else state)
         except Exception as exc:                             # noqa: BLE001
@@ -639,6 +771,7 @@ class PushManager:
             now = time.time()
             with self._lock:
                 state.failed += 1
+                state.last_attempt = now
                 state.last_error = _без_секретов(f"{type(exc).__name__}: {exc}", target)
                 # Первая неудача — вслух, дальше не чаще раза в час. Само
                 # состояние никуда не девается: оно целиком видно в
@@ -660,7 +793,7 @@ class PushManager:
                 log.info("Отправка метрик в «%s» восстановилась после %s неудач",
                          target.name, state.failed)
             state.sent += 1
-            state.last_success = time.time()
+            state.last_success = state.last_attempt = time.time()
             state.last_error = ""
             state.last_complaint = 0.0
             state.last_info = _без_секретов(сведения or "", target)

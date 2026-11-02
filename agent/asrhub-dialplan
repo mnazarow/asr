@@ -1,0 +1,414 @@
+#!/bin/sh
+#
+# asrhub-dialplan — передача звонка из диалплана Asterisk в ASR Hub.
+#
+# Зовётся из обработчика отбоя (раздел «Asterisk: диалплан» ASR Hub собирает
+# готовый extensions_asrhub.conf):
+#
+#   System(/usr/local/bin/asrhub-dialplan uniqueid=… src=… dst=… file=…)
+#
+# Сразу уходит в фон и возвращает управление Asterisk: канал не ждёт ни
+# сети, ни сервера. В фоне дожидается, пока MixMonitor закроет файл записи,
+# и отправляет звонок вместе с записью. Сервер недоступен — повторяет с
+# растущей паузой; так и не удалось — оставляет звонок в очереди повтора,
+# которую досылает «asrhub-dialplan --resend» (раз в пять минут из cron).
+#
+# Режимы:
+#   asrhub-dialplan поле=значение …   отправить звонок (так зовёт диалплан)
+#   asrhub-dialplan --test            проверить адрес, ключ и станцию; в архив
+#                                     ничего не попадает
+#   asrhub-dialplan --resend          дослать очередь повтора
+#   asrhub-dialplan --resend-failed   дослать и то, что сервер отверг (после
+#                                     исправления настройки)
+#   asrhub-dialplan --install         поставить себя в /usr/local/bin, завести
+#                                     /etc/asrhub/dialplan.conf и каталоги
+#   asrhub-dialplan --version
+#
+# Безопасность. Значения приходят из командной строки, которую собрал
+# диалплан, и среди них есть то, что задаёт звонящий (номер, имя). Диалплан
+# пропускает их через FILTER(), а сценарий проверяет ещё раз: значение с
+# пробелом, кавычкой, «;», «&», «$», «`» или начинающееся с «@» и «<»
+# отбрасывается. Текстовые поля уходят в curl через --form-string — curl
+# не читает файл, даже если значение похоже на «@/etc/passwd».
+#
+# Ключ доступа — в /etc/asrhub/dialplan.conf (root:asterisk, 0640), не в
+# диалплане и не в командной строке curl: он передаётся curl через stdin
+# (--config -) и в списке процессов не виден.
+
+VERSION="@@VERSION@@"
+CONF="${ASRHUB_CONF:-/etc/asrhub/dialplan.conf}"
+
+# Умолчания. Адрес и станцию подставляет сервер, когда отдаёт сценарий;
+# всё можно переопределить в файле настроек.
+ASRHUB_URL="@@SERVER_URL@@"
+ASRHUB_KEY=""
+ASRHUB_STATION="@@STATION@@"
+ASRHUB_SEND_MODE="upload"
+ASRHUB_RECORDINGS="/var/spool/asterisk/monitor"
+ASRHUB_WAIT_S=120
+ASRHUB_RETRIES=5
+ASRHUB_SEND_TIMEOUT_S=600
+ASRHUB_SPOOL="/var/spool/asrhub-dialplan"
+ASRHUB_LOG="/var/log/asterisk/asrhub-dialplan.log"
+ASRHUB_CACERT=""
+ASRHUB_INSECURE="no"
+
+if [ -r "$CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+fi
+
+# Паузы между попытками, с. Пятая и дальше — по последней.
+PAUSES="5 15 30 60 120"
+
+log() {
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$*" \
+        >>"$ASRHUB_LOG" 2>/dev/null || true
+}
+
+say() {
+    printf '%s\n' "$*"
+    log "$*"
+}
+
+die() {
+    printf 'asrhub-dialplan: %s\n' "$*" >&2
+    log "ошибка: $*"
+    exit 1
+}
+
+configured() {
+    case "$ASRHUB_URL" in
+        ""|@@*) die "не задан адрес сервера: ASRHUB_URL в $CONF" ;;
+    esac
+    case "$ASRHUB_KEY" in
+        ""|*ВАШ_КЛЮЧ*) die "не задан ключ доступа: ASRHUB_KEY в $CONF" ;;
+    esac
+    case "$ASRHUB_STATION" in
+        @@*) ASRHUB_STATION="" ;;
+    esac
+    command -v curl >/dev/null 2>&1 || die "нет curl: поставьте пакет curl"
+}
+
+# Безопасно ли значение: только латиница, цифры и «+._/@:-», и не с «@» или «<».
+safe_value() {
+    case "$1" in
+        *[!A-Za-z0-9+._/@:-]*) return 1 ;;
+        @*|"<"*) return 1 ;;
+    esac
+    return 0
+}
+
+KNOWN_FIELDS=" uniqueid linkedid src dst clid agent direction queue context channel dstchannel disposition dialstatus answered duration billsec started_at userfield accountcode station ready "
+
+# --- очередь повтора ---------------------------------------------------------
+#
+# Звонок сначала записывается в файл (синхронно, до ухода в фон): так он не
+# пропадёт, даже если сервер лежит, а процесс убьют. Файлы живут в трёх
+# каталогах: sending/ — отправляется прямо сейчас, pending/ — ждёт повтора,
+# failed/ — сервер отверг (неверный ключ, станция), рядом лежит его ответ.
+
+spool_dirs() {
+    for d in sending pending failed; do
+        mkdir -p "$ASRHUB_SPOOL/$d" 2>/dev/null || return 1
+    done
+    return 0
+}
+
+# Записать звонок из аргументов в файл; печатает путь к файлу.
+write_call() {
+    umask 077
+    if ! spool_dirs; then
+        log "каталог очереди $ASRHUB_SPOOL недоступен на запись — звонок во временном файле"
+        ASRHUB_SPOOL="${TMPDIR:-/tmp}/asrhub-dialplan.$(id -u)"
+        spool_dirs || return 1
+    fi
+    uid=""
+    tmp="$ASRHUB_SPOOL/sending/.new.$$"
+    : >"$tmp" || return 1
+    for arg in "$@"; do
+        case "$arg" in
+            *=*) key=${arg%%=*}; value=${arg#*=} ;;
+            *) log "аргумент без «=» пропущен"; continue ;;
+        esac
+        [ -n "$value" ] || continue
+        if [ "$key" != "file" ]; then
+            case "$KNOWN_FIELDS" in
+                *" $key "*) ;;
+                *) log "поле «$key» неизвестно — пропущено"; continue ;;
+            esac
+        fi
+        if ! safe_value "$value"; then
+            log "поле «$key»: недопустимые символы — пропущено"
+            continue
+        fi
+        [ "$key" = "uniqueid" ] && uid=$value
+        printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    done
+    if [ -z "$uid" ]; then
+        rm -f "$tmp"
+        log "звонок без uniqueid — не отправлен"
+        return 1
+    fi
+    callfile="$ASRHUB_SPOOL/sending/$uid.$$.call"
+    mv "$tmp" "$callfile" || return 1
+    printf '%s\n' "$callfile"
+}
+
+# Направление по имени файла FreePBX (in-…, out-…, q-…, exten-…).
+direction_from_name() {
+    case "$(basename "$1")" in
+        in-*|q-*) echo in ;;
+        out-*) echo out ;;
+        exten-*|internal-*) echo internal ;;
+        *) echo "" ;;
+    esac
+}
+
+# Подождать, пока MixMonitor закроет файл: размер перестал меняться.
+wait_file() {
+    f=$1
+    waited=0
+    last=-1
+    stable=0
+    while [ "$waited" -lt "$ASRHUB_WAIT_S" ]; do
+        if [ -f "$f" ]; then
+            size=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+            if [ "$size" = "$last" ] && [ "${size:-0}" -gt 0 ]; then
+                stable=$((stable + 1))
+                [ "$stable" -ge 2 ] && return 0
+            else
+                stable=0
+            fi
+            last=$size
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    [ -f "$f" ]
+}
+
+# Одна попытка отправки. Печатает код ответа HTTP (000 — не дошли).
+# $1 — файл звонка, $2 — с записью (1) или без (0), $3 — проба (1/0).
+post_once() {
+    callfile=$1
+    with_file=$2
+    dry=$3
+    answer="$callfile.answer"
+    set --
+    file=""
+    ready=0
+    while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            file) file=$value ;;
+            ready) ready=1 ;;
+            *) set -- "$@" --form-string "$key=$value" ;;
+        esac
+    done <"$callfile"
+    if [ -n "$ASRHUB_STATION" ] && ! grep -q '^station=' "$callfile"; then
+        set -- "$@" --form-string "station=$ASRHUB_STATION"
+    fi
+    if [ -n "$file" ]; then
+        case "$file" in
+            /*) ;;
+            *) file="$ASRHUB_RECORDINGS/$file" ;;
+        esac
+        if ! grep -q '^direction=' "$callfile"; then
+            d=$(direction_from_name "$file")
+            [ -n "$d" ] && set -- "$@" --form-string "direction=$d"
+        fi
+    fi
+    if [ "$dry" = 1 ]; then
+        set -- "$@" --form-string "dry_run=1"
+    fi
+    if [ -n "$file" ] && [ "$with_file" = 1 ]; then
+        if [ "$ready" != 1 ] && [ "$dry" != 1 ]; then
+            wait_file "$file" || log "$(basename "$callfile"): записи $file нет — звонок уйдёт без неё"
+        fi
+        if [ -f "$file" ]; then
+            if [ "$ASRHUB_SEND_MODE" = "path" ]; then
+                set -- "$@" --form-string "recording=$file" --form-string "ready=1"
+            else
+                set -- "$@" -F "file=@$file"
+            fi
+        fi
+    fi
+    set -- "$@" --connect-timeout 10 --max-time "$ASRHUB_SEND_TIMEOUT_S"
+    [ -n "$ASRHUB_CACERT" ] && set -- "$@" --cacert "$ASRHUB_CACERT"
+    [ "$ASRHUB_INSECURE" = "yes" ] && set -- "$@" --insecure
+    printf 'header = "X-API-Key: %s"\n' "$ASRHUB_KEY" |
+        curl -sS --config - -o "$answer" -w '%{http_code}' "$@" \
+            "${ASRHUB_URL%/}/api/telephony/dialplan/call" 2>>"$ASRHUB_LOG" || true
+}
+
+# Короткий пересказ ответа сервера для журнала.
+summary() {
+    [ -f "$1" ] || return 0
+    tr -d '\n' <"$1" | sed -e 's/.*"result":"\([a-z_]*\)".*/\1/' -e 's/^{.*//' | head -c 40
+    job=$(tr -d '\n' <"$1" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')
+    [ -n "$job" ] && printf ' задание %s' "$job"
+    reason=$(tr -d '\n' <"$1" | sed -n 's/.*"\(skipped\|deferred\|message\)":"\([^"]*\)".*/\2/p')
+    [ -n "$reason" ] && printf ' (%s)' "$reason"
+    return 0
+}
+
+# Отправить звонок с повторами. $1 — файл звонка в sending/, $2 — сколько попыток.
+deliver() {
+    callfile=$1
+    tries=$2
+    name=$(basename "$callfile" .call)
+    attempt=1
+    with_file=1
+    for pause in $PAUSES; do
+        code=$(post_once "$callfile" "$with_file" 0)
+        case "$code" in
+            200|202)
+                log "$name: принят, ответ $code: $(summary "$callfile.answer")"
+                rm -f "$callfile" "$callfile.answer"
+                return 0 ;;
+            413|415)
+                # Запись не принята (велика или не тот формат) — звонок
+                # всё равно нужен в журнале: шлём его ещё раз без записи.
+                log "$name: запись отвергнута ($code: $(summary "$callfile.answer")) — шлём без неё"
+                with_file=0
+                continue ;;
+            000|408|409|423|425|429|5*)
+                log "$name: попытка $attempt — сервер недоступен или занят (код $code)" ;;
+            *)
+                log "$name: сервер отверг звонок (код $code): $(summary "$callfile.answer")"
+                mv "$callfile" "$ASRHUB_SPOOL/failed/" 2>/dev/null
+                mv "$callfile.answer" "$ASRHUB_SPOOL/failed/" 2>/dev/null
+                return 1 ;;
+        esac
+        [ "$attempt" -ge "$tries" ] && break
+        attempt=$((attempt + 1))
+        sleep "$pause"
+    done
+    log "$name: не отправлен за $attempt попыток — в очереди повтора"
+    rm -f "$callfile.answer"
+    mv "$callfile" "$ASRHUB_SPOOL/pending/" 2>/dev/null
+    return 1
+}
+
+# --- режимы ------------------------------------------------------------------
+
+send_mode() {
+    configured
+    callfile=$(write_call "$@") || exit 0
+    if [ "${ASRHUB_FOREGROUND:-0}" = 1 ]; then
+        deliver "$callfile" "$ASRHUB_RETRIES"
+        exit $?
+    fi
+    # В фон: Asterisk ждёт только этот процесс, а он уходит сразу. Вывод —
+    # в никуда, иначе System() держал бы канал до конца отправки.
+    (
+        trap '' HUP
+        deliver "$callfile" "$ASRHUB_RETRIES"
+    ) </dev/null >/dev/null 2>&1 &
+    exit 0
+}
+
+resend_mode() {
+    configured
+    spool_dirs || die "каталог очереди $ASRHUB_SPOOL недоступен"
+    from=pending
+    [ "$1" = failed ] && from=failed
+    # Брошенные отправки (процесс убит посреди повторов) — старше часа.
+    find "$ASRHUB_SPOOL/sending" -name '*.call' -mmin +60 -exec mv {} "$ASRHUB_SPOOL/pending/" \; 2>/dev/null
+    sent=0
+    left=0
+    for f in "$ASRHUB_SPOOL/$from"/*.call; do
+        [ -f "$f" ] || continue
+        target="$ASRHUB_SPOOL/sending/$(basename "$f")"
+        # mv в пределах одного каталога атомарен: второй --resend этот файл
+        # уже не возьмёт.
+        mv "$f" "$target" 2>/dev/null || continue
+        rm -f "$f.answer"
+        if deliver "$target" 1; then
+            sent=$((sent + 1))
+        else
+            left=$((left + 1))
+        fi
+    done
+    say "дослано $sent, осталось $left"
+}
+
+test_mode() {
+    configured
+    spool_dirs || ASRHUB_SPOOL="${TMPDIR:-/tmp}/asrhub-dialplan.$(id -u)"
+    spool_dirs || die "нет каталога для временного файла"
+    callfile=$(write_call "uniqueid=test.$(date +%s)" "src=79161234567" "dst=101" \
+        "direction=in" "billsec=42" "duration=50" "disposition=ANSWERED") ||
+        die "не удалось подготовить пробный звонок"
+    code=$(post_once "$callfile" 0 1)
+    printf 'Сервер: %s\nСтанция: %s\nОтвет: %s\n' "$ASRHUB_URL" \
+        "${ASRHUB_STATION:-(единственная станция приёма)}" "$code"
+    [ -f "$callfile.answer" ] && { cat "$callfile.answer"; echo; }
+    rm -f "$callfile" "$callfile.answer"
+    case "$code" in
+        200) say "проверка пройдена: адрес, ключ и станция в порядке"; exit 0 ;;
+        000) die "сервер не отвечает: проверьте адрес, сеть и сертификат (ASRHUB_URL, ASRHUB_CACERT)" ;;
+        401) die "ключ не принят: проверьте ASRHUB_KEY" ;;
+        403) die "ключу не хватает прав: нужен ключ с правом записи" ;;
+        *) die "сервер ответил $code — причина в ответе выше" ;;
+    esac
+}
+
+install_mode() {
+    [ "$(id -u)" = 0 ] || die "установка — от root"
+    target=/usr/local/bin/asrhub-dialplan
+    if [ "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "$target" ]; then
+        cp "$0" "$target" && chmod 755 "$target" || die "не удалось записать $target"
+        say "сценарий: $target"
+    fi
+    group=root
+    owner=root
+    if id asterisk >/dev/null 2>&1; then
+        group=$(id -gn asterisk)
+        owner=asterisk
+    fi
+    mkdir -p "$(dirname "$CONF")"
+    if [ ! -f "$CONF" ]; then
+        umask 027
+        cat >"$CONF" <<EOF
+# Настройки asrhub-dialplan. Права: root:$group, 0640 — ключ не для всех.
+ASRHUB_URL=$ASRHUB_URL
+ASRHUB_KEY=ah_ВАШ_КЛЮЧ
+ASRHUB_STATION=$ASRHUB_STATION
+# upload — отправлять файл записи; path — только путь (общий диск с сервером).
+ASRHUB_SEND_MODE=upload
+ASRHUB_RECORDINGS=$ASRHUB_RECORDINGS
+ASRHUB_WAIT_S=$ASRHUB_WAIT_S
+ASRHUB_RETRIES=$ASRHUB_RETRIES
+ASRHUB_SPOOL=$ASRHUB_SPOOL
+ASRHUB_LOG=$ASRHUB_LOG
+ASRHUB_CACERT=
+EOF
+        say "настройки: $CONF — впишите ключ доступа"
+    else
+        say "настройки уже есть: $CONF — не тронуты"
+    fi
+    chown "root:$group" "$CONF" 2>/dev/null
+    chmod 640 "$CONF"
+    for d in sending pending failed; do
+        mkdir -p "$ASRHUB_SPOOL/$d"
+    done
+    chown -R "$owner:$group" "$ASRHUB_SPOOL" 2>/dev/null
+    chmod 750 "$ASRHUB_SPOOL"
+    touch "$ASRHUB_LOG" 2>/dev/null && chown "$owner:$group" "$ASRHUB_LOG" 2>/dev/null
+    say "очередь повтора: $ASRHUB_SPOOL, журнал: $ASRHUB_LOG"
+    say "дальше: впишите ключ в $CONF и выполните: asrhub-dialplan --test"
+}
+
+case "${1:-}" in
+    --version) echo "asrhub-dialplan $VERSION" ;;
+    --test) test_mode ;;
+    --resend) resend_mode pending ;;
+    --resend-failed) resend_mode failed ;;
+    --install) install_mode ;;
+    --help|-h|"") sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -*) die "неизвестный ключ $1 (--help — справка)" ;;
+    *) send_mode "$@" ;;
+esac

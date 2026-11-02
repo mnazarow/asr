@@ -16,6 +16,28 @@ from ..errors import DependencyMissing, classify_exception
 from .base import Engine, ProgressCallback, Segment, TranscriptionResult
 
 
+def download_weights(source: str, models_dir: str | Path) -> Path:
+    """Скачивает веса openai-whisper туда, где их возьмёт `whisper.load_model`.
+
+    Тем же способом, что и сама библиотека (`whisper._download`): файл
+    `<имя>.pt` в каталоге моделей, с проверкой контрольной суммы из адреса.
+    Общая загрузка Hugging Face клала сюда веса faster-whisper — другой
+    формат, который openai-whisper не открывает.
+    """
+    try:
+        import whisper  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise DependencyMissing("whisper", "openai-whisper", cause=exc) from exc
+    адреса = getattr(whisper, "_MODELS", {})
+    if source not in адреса:
+        raise DependencyMissing("whisper", "openai-whisper").with_hint(
+            f"openai-whisper не знает модель «{source}»: "
+            f"{', '.join(sorted(адреса)) or 'список недоступен'}")
+    корень = Path(models_dir)
+    корень.mkdir(parents=True, exist_ok=True)
+    return Path(whisper._download(адреса[source], str(корень), False))
+
+
 class WhisperEngine(Engine):
     id = "whisper"
     supports_word_timestamps = True
@@ -71,7 +93,10 @@ class WhisperEngine(Engine):
             options["patience"] = float(patience)
         length_penalty = settings.get("length_penalty")
         if length_penalty and abs(float(length_penalty) - 1.0) > 1e-6:
-            options["length_penalty"] = float(length_penalty)
+            # openai-whisper принимает штраф длины только в 0…1 (ValueError
+            # «length_penalty (alpha) should be a value between 0 and 1»), а
+            # каталог разрешает до 2 ради faster-whisper: значение прижимается.
+            options["length_penalty"] = min(1.0, max(0.0, float(length_penalty)))
         prompt = str(settings.get("initial_prompt") or "").strip()
         if prompt:
             options["initial_prompt"] = prompt

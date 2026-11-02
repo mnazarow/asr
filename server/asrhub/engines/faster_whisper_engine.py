@@ -30,6 +30,7 @@ class FasterWhisperEngine(Engine):
     supports_word_timestamps = True
     supports_batching = True
     outputs_punctuation = True
+    режет_сам = True
 
     @classmethod
     def check_available(cls) -> tuple[bool, str]:
@@ -38,6 +39,42 @@ class FasterWhisperEngine(Engine):
             return True, ""
         except ModuleNotFoundError:
             return False, "Не установлен пакет faster-whisper: pip install faster-whisper"
+
+    @staticmethod
+    def _карт_ctranslate2() -> int | None:
+        """Сколько карт видит CTranslate2; None — спросить не у кого."""
+        try:
+            import ctranslate2  # type: ignore
+
+            return int(ctranslate2.get_cuda_device_count())
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def resolve_device(self, settings: dict[str, Any]) -> str:
+        """«auto» — по CTranslate2, а не по torch.
+
+        faster-whisper torch не нужен: сборка torch без CUDA (Windows,
+        requirements/cpu.txt) рядом с CTranslate2 и cuDNN уводила «auto» на
+        процессор при исправной карте. Не у кого спросить — как раньше.
+        """
+        if str(settings.get("device") or "auto").strip().lower() == "auto":
+            карт = self._карт_ctranslate2()
+            if карт is not None:
+                return "cuda" if карт > 0 else "cpu"
+        return super().resolve_device(settings)
+
+    def проверить_устройство(self, устройство: str) -> tuple[bool, str]:
+        if not устройство.startswith("cuda"):
+            return True, ""
+        карт = self._карт_ctranslate2()
+        if карт is None:
+            return super().проверить_устройство(устройство)
+        _, _, номер = устройство.partition(":")
+        нужна = int(номер) if номер.strip().isdigit() else 0
+        if карт <= нужна:
+            return False, (f"CTranslate2 видит карт: {карт}, а запрошена {нужна} "
+                           "(номера с 0). Проверьте CUDA_VISIBLE_DEVICES и cuDNN.")
+        return True, ""
 
     def cache_key(self, settings: dict[str, Any]) -> str:
         return "|".join([
@@ -162,6 +199,29 @@ class FasterWhisperEngine(Engine):
             opts["vad_filter"] = False
         return opts
 
+    @staticmethod
+    def _почему_не_пакетом(options: dict[str, Any]) -> list[str]:
+        """Что из настроек пакетный конвейер не исполнит; пусто — можно пакетом.
+
+        BatchedInferencePipeline (faster-whisper 1.1+) берёт только первую
+        температуру, жёстко ставит condition_on_previous_text=False и
+        hallucination_silence_threshold=None, а без VAD на записи от 30 с
+        бросает «No clip timestamps found». Пакет 8 стоял по умолчанию, и
+        каскад температур и пропуск длинной тишины, которые обещает пресет
+        «Whisper: устойчивый режим», молча не действовали. Проверено по
+        исходнику библиотеки, не запуском.
+        """
+        причины = []
+        if not options.get("vad_filter"):
+            причины.append("поиск речи выключен")
+        if len(options.get("temperature") or []) > 1:
+            причины.append("каскад температур")
+        if options.get("condition_on_previous_text"):
+            причины.append("учёт предыдущего текста")
+        if options.get("hallucination_silence_threshold"):
+            причины.append("пропуск длинной тишины")
+        return причины
+
     def _transcribe(self, audio_path: Path, settings: dict[str, Any],
                     progress: ProgressCallback | None) -> TranscriptionResult:
         options = self._build_options(settings)
@@ -169,7 +229,10 @@ class FasterWhisperEngine(Engine):
 
         model = self._model
         runner = model
-        if batch_size > 1 and self.supports_batching:
+        без_пакета = self._почему_не_пакетом(options) if batch_size > 1 else []
+        if без_пакета:
+            self.log.info("Пакетный режим не используется: %s", ", ".join(без_пакета))
+        if batch_size > 1 and self.supports_batching and not без_пакета:
             try:
                 from faster_whisper import BatchedInferencePipeline  # type: ignore
 
@@ -232,6 +295,7 @@ class FasterWhisperEngine(Engine):
             duration=duration,
             meta={
                 "batch_size": options.get("batch_size", 1),
+                **({"batched_skipped": без_пакета} if без_пакета else {}),
                 "vad_filter": options.get("vad_filter"),
                 "compute_type": self.resolve_compute_type(
                     settings, self.resolve_device(settings)),

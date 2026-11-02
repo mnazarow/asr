@@ -52,6 +52,12 @@ SPEAKER_RIGHT = "SPEAKER_01"
 #: Сколько ждать файл записи. У phone_asr тайм-аут 30 секунд на файл.
 DOWNLOAD_TIMEOUT_S = 30.0
 
+#: Сколько всего может длиться скачивание одного файла. Тайм-аут сокета
+#: действует на каждую операцию чтения, а не на файл: сервер, отдающий по
+#: байту в двадцать секунд, держал бы поток приёма вечно. Десять минут —
+#: с запасом на часовую запись по медленному каналу.
+DOWNLOAD_TOTAL_S = 600.0
+
 
 def normalise_base_url(value: str) -> str:
     """Приводит base_url к тому же виду, что и phone_asr.
@@ -260,6 +266,9 @@ def _fetch(url: str, target: Path, *, limit_bytes: int, check_url: Any = None) -
     opener = (открыватель_наружу(проверка=check_url) if check_url is not None
               else urllib.request.build_opener())
     written = 0
+    import time  # noqa: PLC0415
+
+    deadline = time.monotonic() + DOWNLOAD_TOTAL_S
     try:
         with opener.open(request, timeout=DOWNLOAD_TIMEOUT_S) as response, \
                 target.open("wb") as handle:
@@ -267,6 +276,11 @@ def _fetch(url: str, target: Path, *, limit_bytes: int, check_url: Any = None) -
                 chunk = response.read(1 << 16)
                 if not chunk:
                     break
+                if time.monotonic() > deadline:
+                    raise AudioError(
+                        f"Запись по адресу {url} не скачалась за "
+                        f"{int(DOWNLOAD_TOTAL_S // 60)} минут.",
+                        hint="Проверьте скорость канала до сервера записей.")
                 written += len(chunk)
                 # Предел проверяем по ходу, а не по заголовку: Content-Length
                 # приходит не всегда и не обязан быть правдой, а диск

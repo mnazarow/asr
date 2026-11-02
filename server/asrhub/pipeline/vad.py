@@ -20,6 +20,18 @@ from .audio import load_samples
 log = get_logger("vad")
 
 
+class Участки(list):
+    """Участки речи и имя детектора, который их нашёл.
+
+    Обычный список для всех, кому нужны участки, и `детектор` — для
+    конвейера: подмена выбранного детектора запасным раньше была видна
+    только в журнале сервера (info), а задание считало, что речь искал
+    Silero, хотя искал энергетический порог.
+    """
+
+    детектор: str = ""
+
+
 @dataclass(slots=True)
 class SpeechSegment:
     start: float
@@ -94,6 +106,12 @@ def _detect_silero(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | No
         import torch  # type: ignore
 
         samples, rate = load_samples(path)
+        if rate not in (8000, 16000) and rate % 16000:
+            # Silero принимает 8 и 16 кГц (и кратные 16), а «22,05 кГц» и
+            # «44,1 кГц» из настроек он отвергал ValueError — и поиск речи
+            # молча уходил к энергетическому порогу. Для поиска речи
+            # линейной передискретизации в 16 кГц достаточно.
+            samples, rate = _в_16_кгц(samples, rate)
         tensor = torch.as_tensor(samples, dtype=torch.float32)
         with _SILERO_LOCK:
             stamps = utils["get_speech_timestamps"](
@@ -111,6 +129,19 @@ def _detect_silero(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | No
     except Exception as exc:
         log.warning("Silero VAD дал сбой (%s), используется запасной детектор", exc)
         return None
+
+
+def _в_16_кгц(samples: Any, rate: int) -> tuple[Any, int]:
+    """Отсчёты в 16 кГц линейной интерполяцией — только для поиска речи."""
+    import numpy as np  # type: ignore
+
+    данные = np.asarray(samples, dtype=np.float32)
+    if not len(данные) or rate <= 0:
+        return данные, 16000
+    длина = int(round(len(данные) * 16000 / rate))
+    старые = np.arange(len(данные), dtype=np.float64) / rate
+    новые = np.arange(длина, dtype=np.float64) / 16000
+    return np.interp(новые, старые, данные).astype(np.float32), 16000
 
 
 def _detect_webrtc(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | None:
@@ -144,29 +175,68 @@ def _detect_webrtc(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | No
         return None
 
 
+#: Насколько речь должна быть громче шумовой полки, дБ: от 6 при самом мягком
+#: пороге (`vad_threshold` = 0) до 16 при самом строгом.
+_НАД_ШУМОМ_ДБ = (6.0, 16.0)
+
+#: Ниже этой доли громкого уровня (−30 дБ) кадр речью не считается ни при
+#: какой шумовой полке: иначе на записи с цифровой тишиной между фразами
+#: речью становился бы шум линии.
+_ДОЛЯ_ПИКА = 10 ** (-30.0 / 20)
+
+
+def _энергии_файла(path: Path, frame: int) -> list[float]:
+    """Громкость (RMS) кадров записи — по ходу чтения, без записи в памяти."""
+    from .audio import wav_блоками
+
+    energies: list[float] = []
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        np = None  # type: ignore
+    остаток: Any = None
+    # Блок — тысяча кадров (полминуты при 30 мс): кадр не режется на стыке
+    # блоков, хвост переносится в следующий.
+    for _, блок in wav_блоками(path, frame * 1000):
+        if np is not None:
+            данные = блок if остаток is None else np.concatenate([остаток, блок])
+            целых = (len(данные) // frame) * frame
+            if целых:
+                кадры = данные[:целых].reshape(-1, frame)
+                energies.extend(np.sqrt((кадры ** 2).mean(axis=1)).tolist())
+            остаток = данные[целых:]
+        else:
+            данные = блок if остаток is None else остаток + блок
+            целых = (len(данные) // frame) * frame
+            for offset in range(0, целых, frame):
+                кусок = данные[offset:offset + frame]
+                energies.append(math.sqrt(sum(v * v for v in кусок) / len(кусок)))
+            остаток = данные[целых:]
+    return energies
+
+
 def _detect_energy(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
     """Энергетический детектор без внешних зависимостей.
 
     Порог берётся адаптивно от медианной энергии кадров, поэтому детектор
     сносно работает и на тихих, и на громких записях.
+
+    Порог — от шумовой полки, а не от громкого уровня. Прежде он стоял на
+    15–60 % пути от шума к громкому собеседнику (при `vad_threshold` 0,5 —
+    37,5 %), и дальний собеседник монозвонка, на 10 дБ тише оператора,
+    целиком уходил в «тишину»: GigaAM и NeMo режут запись по этим участкам,
+    и его речь в модель не попадала. Теперь речью считается то, что громче
+    шума на 6–16 дБ (по `vad_threshold`), — но не строже прежнего порога и
+    не тише −30 дБ от громкого уровня.
+
+    Энергии считаются по ходу чтения файла (см. `_энергии_файла`): час
+    записи больше не поднимается в память целиком.
     """
-    samples, rate = load_samples(path)
+    with __import__("wave").open(str(path), "rb") as wf:
+        rate = wf.getframerate()
     frame_ms = 30
     frame = max(1, int(rate * frame_ms / 1000))
-    energies: list[float] = []
-    try:
-        import numpy as np  # type: ignore
-
-        arr = np.asarray(samples, dtype="float32")
-        usable = (len(arr) // frame) * frame
-        if usable == 0:
-            return []
-        blocks = arr[:usable].reshape(-1, frame)
-        energies = np.sqrt((blocks ** 2).mean(axis=1)).tolist()
-    except ModuleNotFoundError:
-        for offset in range(0, len(samples) - frame, frame):
-            block = samples[offset:offset + frame]
-            energies.append(math.sqrt(sum(v * v for v in block) / len(block)))
+    energies = _энергии_файла(path, frame)
     if not energies:
         return []
 
@@ -185,7 +255,7 @@ def _detect_energy(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
     if peak <= floor * 1.5 and loud > floor * 4:
         # Речь занимает меньше пяти процентов записи: перцентиль её не видит.
         peak = loud
-    sensitivity = float(opts.get("vad_threshold", 0.5))
+    sensitivity = min(1.0, max(0.0, float(opts.get("vad_threshold", 0.5))))
 
     # Порог ставим между шумом и пиком. Доля зависит от чувствительности:
     # чем выше vad_threshold, тем строже детектор.
@@ -193,6 +263,9 @@ def _detect_energy(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
     if span > peak * 0.15:
         # Есть выраженный контраст шум/речь — обычная запись.
         threshold = floor + span * (0.15 + 0.45 * sensitivity)
+        над_шумом = _НАД_ШУМОМ_ДБ[0] + (_НАД_ШУМОМ_ДБ[1] - _НАД_ШУМОМ_ДБ[0]) * sensitivity
+        от_шума = max(floor, 3e-4) * 10 ** (над_шумом / 20)
+        threshold = max(min(threshold, от_шума), peak * _ДОЛЯ_ПИКА)
     else:
         # Сигнал почти равномерный (сплошная речь, тон, шум).
         # Медианный порог здесь отбросил бы всё, поэтому опираемся на пик.
@@ -355,17 +428,21 @@ def detect(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
         with _НЕДАВНИЕ_LOCK:
             готово = _НЕДАВНИЕ.get(ключ)
         if готово is not None:
-            return [SpeechSegment(s.start, s.end) for s in готово]
+            копия = Участки(SpeechSegment(s.start, s.end) for s in готово)
+            копия.детектор = getattr(готово, "детектор", "")
+            return копия
     найдено = _detect(path, opts)
     if ключ is not None:
         with _НЕДАВНИЕ_LOCK:
             if len(_НЕДАВНИЕ) >= _НЕДАВНИЕ_ПРЕДЕЛ:
                 _НЕДАВНИЕ.pop(next(iter(_НЕДАВНИЕ)))
-            _НЕДАВНИЕ[ключ] = [SpeechSegment(s.start, s.end) for s in найдено]
+            запись = Участки(SpeechSegment(s.start, s.end) for s in найдено)
+            запись.детектор = найдено.детектор
+            _НЕДАВНИЕ[ключ] = запись
     return найдено
 
 
-def _detect(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
+def _detect(path: Path, opts: dict[str, Any]) -> Участки:
     backend = str(opts.get("vad_backend") or "auto")
     order: list[str]
     if backend == "auto" or backend == "silero":
@@ -389,8 +466,10 @@ def _detect(path: Path, opts: dict[str, Any]) -> list[SpeechSegment]:
         if result is not None:
             if name != backend and backend not in ("auto", ""):
                 log.info("Детектор «%s» недоступен, использован «%s»", backend, name)
-            return result
-    return []
+            итог = Участки(result)
+            итог.детектор = name
+            return итог
+    return Участки()
 
 
 def _detect_ten(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | None:
@@ -426,8 +505,16 @@ def _detect_ten(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | None:
 
 
 def chunk_plan(duration_s: float, opts: dict[str, Any],
-               segments: list[SpeechSegment] | None = None) -> list[SpeechSegment]:
-    """Итоговый план нарезки: по речи, если VAD дал результат, иначе механически."""
+               segments: list[SpeechSegment] | None = None, *,
+               предел_модели: float | None = None) -> list[SpeechSegment]:
+    """Итоговый план нарезки: по речи, если VAD дал результат, иначе механически.
+
+    `предел_модели` — сколько секунд модель принимает за проход (GigaAM —
+    25, Canary — 40). Механическая нарезка брала длину куска из
+    `chunk_length_s` (до 600 по каталогу) мимо этого предела, и при
+    выключенном поиске речи и `chunk_length_s: 30` задание GigaAM падало с
+    сырым «Too long wav file».
+    """
     max_len = float(opts.get("vad_max_speech_s") or 22.0)
     overlap = float(opts.get("chunk_overlap_s") or 0.0)
 
@@ -436,11 +523,19 @@ def chunk_plan(duration_s: float, opts: dict[str, Any],
         return merged
 
     chunk = float(opts.get("chunk_length_s") or 0) or max_len
+    if предел_модели:
+        chunk = min(chunk, float(предел_модели))
     step = max(1.0, chunk - overlap)
     plan: list[SpeechSegment] = []
     position = 0.0
     while position < duration_s:
         plan.append(SpeechSegment(position, min(duration_s, position + chunk)))
+        # Кусок дошёл до конца записи — следующего не нужно. Прежде цикл шёл
+        # дальше и добавлял хвост, целиком лежащий в зоне перекрытия
+        # (21,5 с → куски 0–21,5 и 21–21,5): его текст оставался в
+        # расшифровке, если не совпал с концом предыдущего дословно.
+        if position + chunk >= duration_s:
+            break
         position += step
     return plan
 

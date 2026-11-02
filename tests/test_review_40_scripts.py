@@ -369,6 +369,11 @@ def _стенд_удаления(tmp_path: Path) -> dict[str, Path]:
     for путь in пути.values():
         путь.mkdir(parents=True, exist_ok=True)
     (tmp_path / "opt" / "prog" / "server").mkdir(parents=True, exist_ok=True)
+    # С захода 54 удаление проверяет, что каталог — установка (VERSION,
+    # server и метка): посторонний каталог по --prefix больше не сносится.
+    (tmp_path / "opt" / "prog" / "VERSION").write_text("3.1.0\n", encoding="utf-8")
+    (tmp_path / "opt" / "prog" / ".asrhub-install").write_text(
+        f"prefix={tmp_path / 'opt' / 'prog'}\ndata_dir={tmp_path / 'data'}\n", encoding="utf-8")
     (пути["снимок"] / "config.yaml.snapshot").write_text("api_keys: {}\n", encoding="utf-8")
     (пути["данные"] / "asrhub.db").write_bytes(b"")
     return пути

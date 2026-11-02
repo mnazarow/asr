@@ -24,10 +24,28 @@ source "${SCRIPT_DIR}/lib/whispercpp.sh"
 # shellcheck source=lib/wizard.sh
 source "${SCRIPT_DIR}/lib/wizard.sh"
 
+# Права новых файлов — 0644/0755, независимо от umask вызывающего. На
+# серверах с ужесточённой umask (027/077, профили CIS) venv и код программы
+# создавались 0750 root:root, и служба от своего пользователя не могла
+# запустить собственный python. Секретам права задаются явно (write_file,
+# журнал, токен), им umask не нужна.
+umask 022
+
 # ---------------------------------------------------------------------------
 # Значения по умолчанию
 # ---------------------------------------------------------------------------
 
+# Всё, что сценарий читает позже, — заводим здесь, а не берём из окружения
+# вызывающего: SERVICE_NAME=ci-job-name из задачи CI создавал службу
+# ci-job-name.service, а VENV_OLD=<каталог> отправлял его в `rm -rf` в конце.
+SERVICE_NAME=""
+VENV_OLD=""
+# Прежний код, отложенный при установке поверх: удаляется в конце, при сбое
+# возвращается откатом.
+OLD_CODE=()
+PIN_DIR=""
+WHEELS_DIR=""
+MONITORING_URL=""
 PREFIX=""
 DATA_DIR=""
 PORT="${ASRHUB_DEFAULT_PORT}"
@@ -111,13 +129,27 @@ usage() {
   --force-gpu-driver    Ставить драйвер даже при включённом Secure Boot
                         (собранный модуль будет без подписи и не загрузится,
                         пока вы не зарегистрируете ключ MOK)
+  --no-gpu-driver       То же, что --gpu-driver none
 
 Служба и права
   --no-service          Не создавать службу автозапуска
-  --user ИМЯ            Пользователь, от которого работает служба
+  --user ИМЯ            Пользователь, от которого работает служба (должен
+                        существовать; без ключа заводится системный asrhub)
+  --name ИМЯ            Имя службы — для второй установки на той же машине
+                        (по умолчанию asrhub)
+
+Модели с ограниченным доступом
+  --hf-token ТОКЕН      Токен Hugging Face (виден в ps — лучше файлом)
+  --hf-token-file ФАЙЛ  Прочитать токен из файла
 
 Прочее
-  --offline             Не обращаться в интернет (пакеты из локального кеша)
+  --no-stream           Выключить распознавание на лету (раздел «Диктовка»)
+  --no-python-install   Не ставить проверенный Python, даже если найден
+                        слишком новый
+  --offline             Не обращаться к индексу пакетов: pip берёт пакеты
+                        только из каталога --wheels
+  --wheels КАТАЛОГ      Каталог с заранее скачанными колёсами (pip download);
+                        с --offline — единственный источник пакетов
   --force               Переустановить поверх существующей установки: код,
                         зависимости и окружение Python собираются заново.
                         config.yaml, ключи и данные не трогаются
@@ -182,7 +214,9 @@ while [[ $# -gt 0 ]]; do
     --user)        SERVICE_USER="${2:?имя пользователя}"; shift 2 ;;
     --skip-models) SKIP_MODELS=1; shift ;;
     --interactive) INTERACTIVE=1; shift ;;
-    --no-interactive) INTERACTIVE=0; shift ;;
+    # «Без вопросов» — и без последнего «Начать установку?»: вопросы,
+    # которые всё же встретятся, берут своё умолчание, как без терминала.
+    --no-interactive) INTERACTIVE=0; ASRHUB_NO_PROMPT=1; export ASRHUB_NO_PROMPT; shift ;;
     --alignment)   ALIGNMENT="${2:?none, mfa или whisperx}"; shift 2 ;;
     --gpu-driver)  GPU_DRIVER="${2:?auto, none, nvidia, amd или intel}"; shift 2 ;;
     --no-gpu-driver) GPU_DRIVER="none"; shift ;;
@@ -202,8 +236,14 @@ while [[ $# -gt 0 ]]; do
     # доступом — pyannote для диаризации требует его всегда, часть весов
     # GigaAM и Whisper тоже. Раньше его нельзя было задать при установке
     # вовсе: приходилось дописывать env.sh руками уже после.
-    --hf-token)    HF_TOKEN_VALUE="$2"; shift 2 ;;
-    --hf-token-file) HF_TOKEN_VALUE="$(cat "${2:?}")"; shift 2 ;;
+    --hf-token)    HF_TOKEN_VALUE="${2:?нужен токен: --hf-token hf_…}"; shift 2 ;;
+    # Без проверки чтения `cat` нечитаемого файла давал пустой токен, а
+    # сообщение «No such file» терялось среди баннера.
+    --hf-token-file)
+      [[ -r "${2:?нужен путь к файлу с токеном}" ]] \
+        || { printf 'Файл с токеном не читается: %s\n' "$2" >&2; exit 2; }
+      HF_TOKEN_VALUE="$(tr -d '\r\n' < "$2")"; shift 2 ;;
+    --wheels)      WHEELS_DIR="${2:?нужен каталог с колёсами}"; shift 2 ;;
     --yes|-y)      ASRHUB_ASSUME_YES=1; shift ;;
     --quiet|-q)    ASRHUB_QUIET=1; shift ;;
     --debug)       ASRHUB_DEBUG=1; shift ;;
@@ -221,10 +261,63 @@ print_banner
 # Ключи, которые уходят в юнит службы, проверяем сразу: `--port abc`
 # проходил молча и попадал в строку запуска — служба падала при старте, а
 # установка отчитывалась об успехе.
-if [[ -n "${PORT_EXPLICIT}" ]] && { ! [[ "${PORT}" =~ ^[0-9]{1,5}$ ]] || (( PORT < 1 || PORT > 65535 )); }; then
-  error "Неверный порт: ${PORT} — нужно число от 1 до 65535."
+#
+# Порт приводится к десятичному виду: «08080» bash читал как восьмеричное
+# («value too great for base»), а в YAML 1.1 «0100» — это 64.
+if [[ -n "${PORT_EXPLICIT}" ]]; then
+  if ! [[ "${PORT}" =~ ^[0-9]{1,5}$ ]] || (( 10#${PORT} < 1 || 10#${PORT} > 65535 )); then
+    error "Неверный порт: ${PORT} — нужно число от 1 до 65535."
+    exit 2
+  fi
+  PORT="$((10#${PORT}))"
+fi
+# Остальные значения — тоже до первого изменения: `--mode podman` доходил до
+# сборки окружения с пустым интерпретатором, `--profile bogus` молча ставил
+# набор «light», а адрес с пробелом и «;» уходил в строку запуска службы.
+case "${MODE}" in
+  native|docker) : ;;
+  *) error "Неверный режим: ${MODE} — native или docker."; exit 2 ;;
+esac
+if [[ -n "${PROFILE}" ]]; then
+  case "${PROFILE}" in
+    light|cpu|standard|full|apple|russian) : ;;
+    *) error "Неизвестный профиль: ${PROFILE}"
+       hint "Профили: light, cpu, standard, full, apple, russian"; exit 2 ;;
+  esac
+fi
+case "${ALIGNMENT}" in
+  ""|none|mfa|whisperx) : ;;
+  *) error "Неизвестное выравнивание: ${ALIGNMENT} — none, mfa или whisperx."; exit 2 ;;
+esac
+case "${GPU_DRIVER}" in
+  auto|none|nvidia|amd|intel) : ;;
+  *) error "Неверный --gpu-driver: ${GPU_DRIVER} — auto, none, nvidia, amd или intel."; exit 2 ;;
+esac
+if [[ -n "${HOST_EXPLICIT}" && ! "${HOST}" =~ ^[A-Za-z0-9.:_*%-]+$ ]]; then
+  error "Неверный адрес прослушивания: ${HOST}"
+  hint "Адрес IPv4 или IPv6 либо имя узла: --host 127.0.0.1, --host ::"
   exit 2
 fi
+if [[ -n "${SERVICE_USER}" ]] && ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+  error "Пользователя «${SERVICE_USER}» на этой машине нет."
+  hint "Заведите его заранее (useradd --system ${SERVICE_USER}) или уберите --user —"
+  hint "тогда установщик сам заведёт системного пользователя asrhub."
+  exit 2
+fi
+if [[ -n "${WHEELS_DIR}" && ! -d "${WHEELS_DIR}" ]]; then
+  error "Каталог с колёсами не найден: ${WHEELS_DIR}"
+  exit 2
+fi
+for _var in PREFIX DATA_DIR WHEELS_DIR; do
+  [[ -n "${!_var}" ]] || continue
+  if ! _abs="$(absolute_path "${!_var}")"; then
+    error "Нужен абсолютный путь: ${!_var}"
+    hint "Например: --prefix /opt/asrhub или --prefix ~/asrhub-app"
+    exit 2
+  fi
+  printf -v "${_var}" '%s' "${_abs}"
+done
+unset _var _abs
 if [[ -n "${NAME_EXPLICIT}" && ! "${SERVICE_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]]; then
   error "Неверное имя службы: ${SERVICE_NAME}"
   hint "Латинские буквы, цифры и знаки «_.@-», не длиннее 64 символов: --name asrhub2"
@@ -315,9 +408,53 @@ profile_disk_gb() {
   esac
 }
 
+# Движок, на котором работает модель профиля, — по её имени. Нужен, чтобы
+# `--engines vosk` без `--models` не качал faster-whisper-small и не делал
+# его моделью по умолчанию: модели профиля без поставленного движка — это
+# гигабайты, которыми сервер не сможет воспользоваться.
+model_engine() {
+  case "$1" in
+    gigaam-*)          printf 'gigaam' ;;
+    faster-whisper-*)  printf 'faster_whisper' ;;
+    whispercpp-*)      printf 'whisper_cpp' ;;
+    whisper-*)         printf 'whisper' ;;
+    parakeet-*|canary-*) printf 'nemo' ;;
+    tone-*)            printf 'tone' ;;
+    vosk-*)            printf 'vosk' ;;
+    *)                 printf '' ;;
+  esac
+}
+
+# Входит ли движок в список через запятую — по имени целиком. Сравнение по
+# подстроке ставило PyTorch для одного whisper_cpp («whisper» в имени).
+#
+#   engine_in_list ДВИЖОК СПИСОК
+engine_in_list() {
+  [[ ",$(printf '%s' "$2" | tr -d ' ')," == *",$1,"* ]]
+}
+
+profile_models_for_engines() {
+  local model out="" engine
+  local old_ifs="${IFS}"; IFS=','
+  for model in $(profile_models "$1"); do
+    IFS="${old_ifs}"
+    engine="$(model_engine "${model}")"
+    if [[ -n "${engine}" ]] && engine_in_list "${engine}" "$2"; then
+      out="${out:+${out},}${model}"
+    fi
+    IFS=','
+  done
+  IFS="${old_ifs}"
+  printf '%s' "${out}"
+}
+
 [[ -z "${ENGINES}" ]] && ENGINES="$(profile_engines "${PROFILE}")"
 if [[ -z "${MODELS}" && "${SKIP_MODELS}" -eq 0 ]]; then
-  MODELS="$(profile_models "${PROFILE}")"
+  if [[ -n "${ENGINES_EXPLICIT}" ]]; then
+    MODELS="$(profile_models_for_engines "${PROFILE}" "${ENGINES}")"
+  else
+    MODELS="$(profile_models "${PROFILE}")"
+  fi
 fi
 
 
@@ -368,11 +505,11 @@ run_wizard() {
   local ram_gb disk_gb accel_label
 
   ram_gb="$(detect_ram_gb 2>/dev/null || echo 0)"
-  # `|| true`: каталога данных на новой машине ещё нет, df на таком пути
-  # возвращает 1, и мастер молча выходил, не задав ни одного вопроса.
-  disk_gb="$(df -Pk "$(dirname "${DATA_DIR}")" 2>/dev/null \
-             | awk 'NR==2{printf "%d", $4/1048576}' || true)"
-  disk_gb="${disk_gb:-0}"
+  # Место — у ближайшего существующего предка: каталога данных (а на macOS
+  # и его родителя ~/Library/Application Support/ASRHub) на новой машине
+  # ещё нет, df на таком пути молчит, и мастер видел «0 ГБ свободно» —
+  # Enter на вопросе «Продолжить всё равно? [y/N]» выходил без установки.
+  disk_gb="$(free_space_gb "${DATA_DIR}" 2>/dev/null || true)"
   case "${ACCEL}" in
     cuda) accel_label="видеокарта NVIDIA" ;;
     rocm) accel_label="видеокарта AMD (ROCm)" ;;
@@ -441,11 +578,17 @@ run_wizard() {
 
   # Явно заданные --engines и --models мастер не перетирает.
   [[ -z "${ENGINES_EXPLICIT}" ]] && ENGINES="$(profile_engines "${PROFILE}")"
-  [[ -z "${MODELS_EXPLICIT}" ]] && MODELS="$(profile_models "${PROFILE}")"
+  if [[ -z "${MODELS_EXPLICIT}" ]]; then
+    if [[ -n "${ENGINES_EXPLICIT}" ]]; then
+      MODELS="$(profile_models_for_engines "${PROFILE}" "${ENGINES}")"
+    else
+      MODELS="$(profile_models "${PROFILE}")"
+    fi
+  fi
 
   # Предупреждаем до начала работы, а не на седьмом шаге.
   local need_gb; need_gb="$(profile_disk_gb "${PROFILE}")"
-  if [[ -n "${disk_gb}" && "${disk_gb}" -lt "${need_gb}" ]]; then
+  if [[ "${disk_gb}" =~ ^[0-9]+$ ]] && (( disk_gb < need_gb )); then
     warn "Профилю нужно около ${need_gb} ГБ, свободно ${disk_gb} ГБ."
     confirm "Продолжить всё равно?" "n" || exit 0
   fi
@@ -460,6 +603,9 @@ run_wizard() {
   wizard_ask PREFIX "Каталог программы" "${PREFIX}" wizard_valid_path
   wizard_ask DATA_DIR "Каталог данных" "${DATA_DIR}" wizard_valid_path \
     "Здесь будут веса моделей, загруженные файлы, результаты и база заданий."
+  # «~/asrhub-app» — путь от домашнего каталога, а не каталог «~» в текущем.
+  PREFIX="$(absolute_path "${PREFIX}")"
+  DATA_DIR="$(absolute_path "${DATA_DIR}")"
   VENV="${PREFIX}/venv"
 
   # --- 3. Сеть ------------------------------------------------------------
@@ -582,9 +728,9 @@ if [[ "${MODE}" == "docker" ]]; then
   _steps=8                                  # вместо venv и движков — сборка образа
 else
   for _engine in gigaam faster_whisper whisper nemo transformers whisperx qwen3_asr voxtral; do
-    [[ "${ENGINES}" == *"${_engine}"* ]] && { _steps=$((_steps + 1)); break; }
+    engine_in_list "${_engine}" "${ENGINES}" && { _steps=$((_steps + 1)); break; }
   done
-  [[ "${ENGINES}" == *whisper_cpp* ]] && _steps=$((_steps + 1))
+  engine_in_list whisper_cpp "${ENGINES}" && _steps=$((_steps + 1))
 fi
 [[ -n "${MODELS}" && "${SKIP_MODELS}" -eq 0 ]] && _steps=$((_steps + 1))
 [[ "${CREATE_SERVICE}" -eq 1 ]] && _steps=$((_steps + 1))
@@ -669,7 +815,27 @@ if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
   unset _OTHER
 fi
 
-check_disk_space "${DATA_DIR}" "$(profile_disk_gb "${PROFILE}")"
+# Место: модели — в каталоге данных (с --skip-models их не будет), окружение
+# Python на несколько гигабайт — в каталоге программы. Раньше проверялся
+# только каталог данных и всегда на полный объём профиля: установка с
+# --skip-models отказывалась на машине, где места хватало с запасом, а venv
+# на разделе программы не проверялся вовсе.
+_NEED_DATA="$(profile_disk_gb "${PROFILE}")"
+[[ "${SKIP_MODELS}" -eq 1 ]] && _NEED_DATA=1
+_NEED_PREFIX=3
+[[ "${MODE}" == "docker" ]] && _NEED_PREFIX=1
+_dev_of() {
+  local probe="$1"
+  while [[ ! -d "${probe}" && "${probe}" != "/" ]]; do probe="$(dirname "${probe}")"; done
+  df -Pk "${probe}" 2>/dev/null | awk 'NR==2{print $1}'
+}
+if [[ "$(_dev_of "${DATA_DIR}")" == "$(_dev_of "${PREFIX}")" ]]; then
+  check_disk_space "${DATA_DIR}" "$(( _NEED_DATA + _NEED_PREFIX ))"
+else
+  check_disk_space "${DATA_DIR}" "${_NEED_DATA}"
+  check_disk_space "${PREFIX}" "${_NEED_PREFIX}"
+fi
+unset _NEED_DATA _NEED_PREFIX
 check_memory 8
 
 if ! check_port_free "${PORT}"; then
@@ -703,14 +869,54 @@ if ! check_port_free "${PORT}"; then
   unset PORT_IS_OURS
 fi
 
-if [[ "${OFFLINE}" -eq 0 ]]; then
-  if check_network pypi.org; then
-    ok "Доступ в интернет есть"
+# Индекс пакетов проверяем тот, которым пользуется pip (зеркало из
+# PIP_INDEX_URL или pip.conf), и только сообщаем. Раньше неудача включала
+# --no-index — а он отменяет и внутреннее зеркало, и без каталога колёс не
+# ставит ничего: на машине без curl и wget (минимальный Debian, контейнер)
+# или в закрытом контуре с зеркалом установка падала на первом пакете,
+# хотя пакеты были доступны. Не обращаться к индексу — только ключом --offline.
+if [[ "${OFFLINE}" -eq 0 && "${MODE}" == "native" ]]; then
+  _INDEX_HOST="$(pip_index_host)"
+  if check_network "${_INDEX_HOST}"; then
+    ok "Индекс пакетов доступен: ${_INDEX_HOST}"
   else
-    warn "Нет доступа к pypi.org."
-    hint "Продолжаем в автономном режиме: пакеты берутся из локального кеша pip."
-    OFFLINE=1
+    warn "Индекс пакетов ${_INDEX_HOST} не ответил на проверку."
+    hint "pip попробует сам. Машина без сети — колёса заранее: pip download -d КАТАЛОГ …,"
+    hint "затем: bash scripts/install.sh --offline --wheels КАТАЛОГ"
   fi
+  unset _INDEX_HOST
+fi
+
+# Каталог программы уже есть, но это не установка ASR Hub: --prefix /opt
+# или /srv. Копирование подменяет в нём server, scripts, docker, examples —
+# и молча удаляло одноимённые каталоги чужих программ (/opt/docker с
+# docker-compose.yml другой системы, /opt/scripts с её резервным
+# копированием), а позже uninstall.sh удалил бы каталог целиком.
+if [[ -d "${PREFIX}" ]] && ! is_installation "${PREFIX}" \
+   && [[ "$(cd "${PREFIX}" 2>/dev/null && pwd -P)" != "$(cd "${REPO_DIR}" && pwd -P)" ]]; then
+  _FOREIGN=""
+  for _entry in "${PREFIX}"/* "${PREFIX}"/.[!.]*; do
+    [[ -e "${_entry}" || -L "${_entry}" ]] || continue
+    _name="${_entry##*/}"
+    case " ${ASRHUB_INSTALL_ITEMS} venv venv.before-force whisper.cpp ${ASRHUB_INSTALL_MARKER} .asrhub-install.lock " in
+      *" ${_name} "*) continue ;;
+    esac
+    case "${_name}" in .*.new|.*.old) continue ;; esac
+    [[ "${DATA_DIR}" == "${PREFIX}/${_name}" || "${DATA_DIR}" == "${PREFIX}/${_name}/"* ]] && continue
+    _FOREIGN="${_FOREIGN:+${_FOREIGN}, }${_name}"
+  done
+  if [[ -n "${_FOREIGN}" ]]; then
+    error "Каталог ${PREFIX} не пуст и не похож на установку ASR Hub: ${_FOREIGN}"
+    hint "Установка в него подменит одноимённые каталоги (server, scripts, docker, examples…),"
+    hint "а удаление потом снесёт каталог целиком. Укажите отдельный: --prefix ${PREFIX%/}/asrhub"
+    if [[ "${FORCE}" -eq 1 ]]; then
+      warn "Задан --force — ставим всё равно."
+    else
+      hint "Если это действительно каталог для ASR Hub — повторите с --force."
+      exit 2
+    fi
+  fi
+  unset _FOREIGN _entry _name
 fi
 
 if [[ -d "${PREFIX}" && "${FORCE}" -eq 0 ]]; then
@@ -722,9 +928,19 @@ fi
 
 confirm "Начать установку?" || { info "Отменено пользователем."; exit 0; }
 
+# Создаётся ли каталог программы заново — до замка: замок сам создаёт
+# каталог, и признак, считавшийся после него, был всегда нулём. Откат
+# неудачной свежей установки оставлял каталог с server, scripts и VERSION.
+CREATED_PREFIX=0
+[[ -d "${PREFIX}" ]] || CREATED_PREFIX=1
+
 # Замок ставим после согласия: до него ничего не меняется, и человек мог
 # просто посмотреть на сводку и выйти.
 acquire_install_lock "${PREFIX}" || exit 1
+if [[ "${CREATED_PREFIX}" -eq 1 ]]; then
+  # Сбой до шага каталогов: замок снимет очистка, пустой каталог — откат.
+  add_rollback "rm -f $(_q "${PREFIX}/.asrhub-install.lock"); rmdir $(_q "${PREFIX}") 2>/dev/null || true"
+fi
 
 # --- Проверки, которые дешевле сделать сейчас -------------------------------
 #
@@ -914,20 +1130,22 @@ fi
 
 step "Создание каталогов"
 
-CREATED_PREFIX=0
-[[ -d "${PREFIX}" ]] || CREATED_PREFIX=1
 ensure_dir "${PREFIX}"
+# Каталог данных уже принадлежит пользователю службы (повторная установка от
+# root) — дальше всё внутри него делается от имени владельца: см.
+# data_owner_init в common.sh.
+data_owner_init "${DATA_DIR}"
 ensure_dir "${DATA_DIR}" 0750
 for sub in uploads results models logs tmp; do ensure_dir "${DATA_DIR}/${sub}" 0750; done
 # На macOS каталог данных лежит внутри prefix, поэтому откат удаляет только
 # подкаталоги программы, а не prefix целиком: иначе снесёт модели и базу.
 if [[ "${CREATED_PREFIX}" -eq 1 ]]; then
   if [[ "${DATA_DIR}" == "${PREFIX}"/* ]]; then
-    for sub in server scripts config requirements docker examples venv; do
-      add_rollback "rm -rf '${PREFIX}/${sub}'"
+    for sub in ${ASRHUB_INSTALL_ITEMS} venv; do
+      add_rollback "rm -rf $(_q "${PREFIX}/${sub}")"
     done
   else
-    add_rollback "rm -rf '${PREFIX}'"
+    add_rollback "rm -rf $(_q "${PREFIX}")"
   fi
 fi
 ok "Каталоги готовы"
@@ -949,29 +1167,305 @@ if [[ "${SRC_REAL}" == "${DST_REAL}" ]]; then
 elif [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
   # examples тоже: раздел «Диктовка» и документация ссылаются на
   # examples/stream_microphone.py как на запасной путь без микрофона, а в
-  # установке этого файла не было вовсе.
-  for item in server scripts config requirements docker examples VERSION README.md; do
+  # установке этого файла не было вовсе. И agent — его отдаёт станциям сам
+  # сервер (список — ASRHUB_INSTALL_ITEMS в common.sh).
+  #
+  # Сначала всё копируется рядом во временные имена, потом подменяется, а
+  # прежний код откладывается до конца установки. Раньше каталоги
+  # удалялись и копировались по одному: сбой pip потом откатывал venv, но не
+  # код — установка оставалась с новым server над старым окружением.
+  for item in ${ASRHUB_INSTALL_ITEMS}; do
     [[ -e "${REPO_DIR}/${item}" ]] || continue
-    rm -rf "${PREFIX:?}/${item}"
-    cp -a "${REPO_DIR}/${item}" "${PREFIX}/"
+    [[ "${item}" == "docker" ]] && continue
+    rm -rf "${PREFIX:?}/.${item}.new"
+    register_temp "${PREFIX}/.${item}.new"
+    cp -a "${REPO_DIR}/${item}" "${PREFIX}/.${item}.new"
+  done
+  for item in ${ASRHUB_INSTALL_ITEMS}; do
+    [[ -e "${REPO_DIR}/${item}" ]] || continue
+    if [[ "${item}" == "docker" ]]; then
+      # Каталог docker — поверх, а не взамен: в нём лежат .env, certs/ и,
+      # возможно, data/ (см. overlay_docker_dir). Прежние файлы дистрибутива
+      # откладываются, чтобы откат вернул и их.
+      if [[ -d "${PREFIX}/docker" ]]; then
+        rm -rf "${PREFIX:?}/.docker.old"
+        register_temp "${PREFIX}/.docker.old"
+        copy_docker_dir_without_data "${PREFIX}/docker" "${PREFIX}/.docker.old"
+        add_rollback "overlay_docker_dir $(_q "${PREFIX}/.docker.old") $(_q "${PREFIX}/docker")"
+      else
+        add_rollback "rm -rf $(_q "${PREFIX}/docker")"
+      fi
+      overlay_docker_dir "${REPO_DIR}/docker" "${PREFIX}/docker"
+      continue
+    fi
+    if [[ -e "${PREFIX}/${item}" || -L "${PREFIX}/${item}" ]]; then
+      rm -rf "${PREFIX:?}/.${item}.old"
+      mv "${PREFIX}/${item}" "${PREFIX}/.${item}.old"
+      OLD_CODE+=("${PREFIX}/.${item}.old")
+      add_rollback "rm -rf $(_q "${PREFIX}/${item}") && mv $(_q "${PREFIX}/.${item}.old") $(_q "${PREFIX}/${item}")"
+    else
+      add_rollback "rm -rf $(_q "${PREFIX}/${item}")"
+    fi
+    mv "${PREFIX}/.${item}.new" "${PREFIX}/${item}"
   done
   chmod +x "${PREFIX}"/scripts/*.sh 2>/dev/null || true
   chmod +x "${PREFIX}"/scripts/client/asrctl 2>/dev/null || true
+  chmod +x "${PREFIX}"/agent/install.sh 2>/dev/null || true
 fi
 ok "Файлы скопированы в ${PREFIX}"
+
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
+# Строка YAML в двойных кавычках. Значения подставлялись в файл как есть:
+# `--host ::` (законный адрес) давал config.yaml, который сервер не читал
+# вовсе («mapping values are not allowed here»), путь с « #» обрезался как
+# комментарий, а с «: » ломал разбор.
+#
+# Простые значения (адрес, обычный путь, имя модели) остаются без кавычек —
+# их так читают и люди, и сценарии; в кавычки берётся всё, что YAML понял
+# бы иначе: двоеточия, решётки, пробелы, слова-логические, числа.
+yaml_str() {
+  local value="$1"
+  if [[ "${value}" =~ ^[A-Za-z0-9_./][A-Za-z0-9_./+-]*$ ]] \
+     && ! [[ "${value}" =~ ^[0-9.+-]+$ && ! "${value}" =~ \..*\. ]] \
+     && ! [[ "${value}" =~ ^([Tt]rue|TRUE|[Ff]alse|FALSE|[Yy]es|YES|[Nn]o|NO|[Oo]n|ON|[Oo]ff|OFF|[Nn]ull|NULL|y|Y|n|N)$ ]]; then
+    printf '%s' "${value}"
+    return 0
+  fi
+  printf '"%s"' "$(printf '%s' "${value}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+# Шаг «Создание конфигурации». Отдельной функцией, потому что в режиме
+# docker она идёт ДО запуска контейнера: раньше `up -d` стоял на шаге 6, а
+# файл писался на шаге 7 — от root, с правами 0640 и путями хоста. Сервер в
+# контейнере (uid тома, не root) после перезапуска не мог его прочитать и
+# уходил в бесконечный перезапуск, а models_dir с путём хоста указывал в
+# никуда внутри контейнера.
+create_configuration() {
+  local recommended gpu_block gpu_rc text workers
+  step "Создание конфигурации"
+  CONFIG_FILE="${DATA_DIR}/config.yaml"
+  if [[ -f "${CONFIG_FILE}" && "${RESET_CONFIG}" -eq 0 ]]; then
+    info "Конфигурация уже существует — оставляем без изменений."
+    [[ "${MODE}" == "native" ]] && \
+      info "Полный пример со всеми параметрами: ${DATA_DIR}/config.example.yaml"
+    [[ "${FORCE}" -eq 1 ]] && \
+      hint "--force конфигурацию не трогает. Заменить её шаблоном — ключ --reset-config."
+  else
+    if [[ -f "${CONFIG_FILE}" ]]; then
+      warn "Ключ --reset-config: config.yaml заменяется шаблоном."
+      hint "Пропадут ключи интеграций и агентов, токен Hugging Face и все настройки."
+      hint "Прежний файл останется рядом: ${CONFIG_FILE}.bak.<дата>."
+    fi
+    if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+      recommended="$(printf '%s' "${MODELS}" | cut -d, -f1)"
+      [[ -z "${recommended}" ]] && recommended="demo-simulator"
+      # Устройство и точность под найденную карту. Пусто — оставляем auto:
+      # сервер определит сам, и это правильное поведение для машины без карты
+      # и для той, где драйвер заработает только после перезагрузки.
+      # Карту для конфигурации выбирает nvidia-smi, а считать будет torch —
+      # и эти двое расходятся. Проверка нужна здесь, а не только при
+      # обновлении: «device: cuda», записанное на машине, где torch карты не
+      # видит, заводит сервер, у которого падает каждое задание. В контейнере
+      # проверять нечем (torch — в образе), там «auto»: сервер возьмёт карту сам.
+      gpu_block=""
+      if [[ "${MODE}" == "native" ]]; then
+        gpu_rc=0
+        gpu_block="$(gpu_config_lines_checked "${VENV}/bin/python" \
+                     "${PREFIX}/server" | sed 's/^/  /')" || gpu_rc=$?
+        if [[ "${gpu_rc}" -ne 0 ]]; then
+          warn "Карта видна системе, но не питону — оставляем device: auto."
+          hint "С жёстким устройством падало бы каждое задание; с «auto» сервер"
+          hint "уйдёт на процессор и возьмёт карту, как только она отзовётся."
+          gpu_runtime_diagnose asrhub
+          gpu_block=""
+        fi
+      fi
+      [[ -z "${gpu_block// /}" ]] && gpu_block="  device: auto
+  compute_type: auto"
+      workers=2
+      [[ "${ACCEL}" == "cpu" ]] && workers=1
+      text="# Конфигурация ASR Hub — создана установщиком $(date '+%Y-%m-%d %H:%M')
+# Все параметры также доступны в веб-интерфейсе в разделе «Настройки»."
+      if [[ "${MODE}" == "native" ]]; then
+        text="${text}
+# Полный список параметров с описаниями: ${DATA_DIR}/config.example.yaml
+
+data_dir: $(yaml_str "${DATA_DIR}")"
+      else
+        # В контейнере каталог данных — /data (переменная образа), а адрес и
+        # порт публикации живут в docker/.env. Пути хоста сюда не пишутся:
+        # внутри контейнера их нет.
+        text="${text}
+# Каталог данных в контейнере — /data; адрес и порт публикации — docker/.env."
+      fi
+      text="${text}
+
+model:
+  model: $(yaml_str "${recommended}")
+  engine: auto
+  language: ru
+
+server:"
+      if [[ "${MODE}" == "native" ]]; then
+        text="${text}
+  server_host: $(yaml_str "${HOST}")
+  server_port: ${PORT}"
+      fi
+      text="${text}
+  auth_enabled: true
+  max_upload_mb: 2048
+  log_level: INFO
+  # Распознавание на лету: раздел «Диктовка» и WebSocket /api/stream.
+  # stream_window_s — шаг гипотез для движков, которые не держат состояние
+  # между кусками: меньше значит чаще обновления и больше повторной работы.
+  stream_enabled: ${STREAM_ENABLED}
+  stream_window_s: 4
+
+batching:
+${gpu_block}
+
+queue:
+  max_concurrent_jobs: ${workers}
+  scheduling_policy: priority_fifo
+  result_retention_days: 30"
+      if [[ "${MODE}" == "native" ]]; then
+        text="${text}
+
+runtime:
+  models_dir: $(yaml_str "${DATA_DIR}/models")
+  temp_dir: $(yaml_str "${DATA_DIR}/tmp")"
+      fi
+      # Выбранное в мастере — отдельными секциями, чтобы шаблон выше
+      # оставался одинаковым для любой установки.
+      if [[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" ]]; then
+        text="${text}
+
+postprocess:
+  # Уточнение границ слов по звуку. Если выравниватель недоступен,
+  # задание доводится до конца на таймкодах модели.
+  alignment_backend: $(yaml_str "${ALIGNMENT}")"
+      fi
+      if [[ -n "${MONITORING}" ]]; then
+        text="${text}
+
+monitoring:
+  monitoring_push_enabled: true
+  monitoring_targets:
+    - kind: $(yaml_str "${MONITORING}")
+      url: $(yaml_str "${MONITORING_URL:-http://localhost:9091}")
+      interval_s: 60"
+      fi
+      # 0640: в config.yaml сервер дописывает ключи доступа с их группами и
+      # квотами. Читать его должен только владелец установки.
+      # Здесь-строка, а не конвейер: write_file регистрирует откат (возврат
+      # прежнего файла при --reset-config), а в подоболочке конвейера он
+      # потерялся бы.
+      write_file "${CONFIG_FILE}" 0640 <<<"${text}"
+      if [[ "${MODE}" == "docker" ]]; then
+        # Владелец — тот, от кого работает сервер в контейнере: entrypoint
+        # меняет владельца тома, только когда не совпал владелец каталога, и
+        # файл root:root 0640 так и оставался ему недоступным.
+        chown -h "${DOCKER_UID}:${DOCKER_GID}" "${CONFIG_FILE}" 2>/dev/null || true
+      fi
+      add_rollback "rm -f $(_q "${CONFIG_FILE}")"
+    fi
+    ok "Конфигурация: ${CONFIG_FILE}"
+  fi
+
+  # Токен Hugging Face. Пишем его в config.yaml, а не в env.sh: переменные
+  # окружения читает systemd, но не launchd на macOS и не запуск руками
+  # через asrctl, а конфигурацию читают все три. В режиме docker токен — в
+  # docker/.env (шаг 6).
+  #
+  # Строку заменяем, а не дописываем: два ключа hf_token в YAML — это молча
+  # выигравший последний, то есть потерянный только что введённый токен.
+  # Файл читается и пишется от имени владельца каталога данных
+  # (read_owned, write_file): подложенная вместо config.yaml ссылка не
+  # перенесёт в него чужой файл.
+  if [[ -n "${HF_TOKEN_VALUE}" && "${MODE}" == "native" ]]; then
+    if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+      info "[пробный запуск] hf_token записан бы в ${CONFIG_FILE}"
+    elif [[ -L "${CONFIG_FILE}" ]]; then
+      warn "${CONFIG_FILE} — символическая ссылка; токен Hugging Face не записан."
+      hint "Замените ссылку обычным файлом и повторите: --hf-token-file ФАЙЛ"
+    elif [[ -f "${CONFIG_FILE}" ]]; then
+      # awk дописывает перевод строки последней строке, если его не было:
+      # иначе ключ приклеился бы к ней, и YAML перестал бы читаться целиком.
+      { read_owned "${CONFIG_FILE}" | awk '!/^hf_token:/'
+        printf 'hf_token: %s\n' "$(yaml_str "${HF_TOKEN_VALUE}")"
+      } | write_file "${CONFIG_FILE}" 0640 nobackup
+      ok "Токен Hugging Face записан в конфигурацию (${HF_TOKEN_VALUE:0:6}…, ${#HF_TOKEN_VALUE} символов)"
+    else
+      warn "Файл конфигурации не найден — токен Hugging Face не записан."
+      hint "Дописать вручную: строка hf_token: \"${HF_TOKEN_VALUE:0:6}…\" в ${CONFIG_FILE}"
+    fi
+  fi
+
+  # Переменные окружения под видеокарту. Их читает служба (EnvironmentFile)
+  # и ручной запуск через asrctl. В конфигурацию они не идут: это настройки
+  # драйвера, а не сервера, и в разных машинах они разные.
+  if [[ "${MODE}" == "native" && -n "${GPU_ENV_OVERRIDE}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+    ENV_SH="${DATA_DIR}/env.sh"
+    # Строки с прошлого запуска убираем: иначе после смены видеокарты
+    # осталась бы подсказка про старую, и новая работала бы неправильно.
+    { if [[ -f "${ENV_SH}" && ! -L "${ENV_SH}" ]]; then
+        read_owned "${ENV_SH}" | grep -v '^# ASRHUB-GPU$' \
+          | grep -vE '^(HSA_OVERRIDE_GFX_VERSION|NEOReadDebugKeys|ClDeviceGlobalMemSizeAvailablePercent)=' || true
+      fi
+      printf '# ASRHUB-GPU\n'
+      printf '%s\n' "${GPU_ENV_OVERRIDE//;/$'\n'}"
+    } | write_file "${ENV_SH}" 0640 nobackup
+    ok "Переменные окружения видеокарты: ${ENV_SH}"
+  fi
+
+  if [[ "${MODE}" == "native" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
+    ( cd "${PREFIX}/server" && "${VENV}/bin/python" -m asrhub --print-config 2>/dev/null ) \
+      | write_file "${DATA_DIR}/config.example.yaml" 0644 nobackup || true
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Шаг 6. Развёртывание
 # ---------------------------------------------------------------------------
 
 if [[ "${MODE}" == "docker" ]]; then
-  step "Сборка и запуск контейнера"
-
   COMPOSE="docker compose"
   docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
   have "${COMPOSE%% *}" || { error "Не найден docker compose."; exit 127; }
 
   ENV_FILE="${PREFIX}/docker/.env"
+
+  # Владелец каталога данных, от которого работает сервер в контейнере.
+  #
+  # Под sudo id -u даёт ноль, и контейнер запускался от root, минуя
+  # понижение прав через gosu. Берём того, кто вызвал sudo.
+  #
+  # Запасной путь `id -u` тоже даёт ноль, если установщик работает от root
+  # БЕЗ sudo — из root-шелла, из Ansible, из образа сборки. Ноль здесь
+  # означает «контейнер побежит от root с примонтированным каталогом
+  # хоста», то есть ровно то, от чего понижение и защищает. Тогда берём
+  # владельца каталога данных, а если и он root — 1000, обычный первый
+  # пользователь.
+  DOCKER_UID="${SUDO_UID:-$(id -u)}"
+  DOCKER_GID="${SUDO_GID:-$(id -g)}"
+  if [[ "${DOCKER_UID}" == "0" ]]; then
+    DOCKER_UID="$(stat -c '%u' "${DATA_DIR}" 2>/dev/null \
+                  || stat -f '%u' "${DATA_DIR}" 2>/dev/null || echo 0)"
+    DOCKER_GID="$(stat -c '%g' "${DATA_DIR}" 2>/dev/null \
+                  || stat -f '%g' "${DATA_DIR}" 2>/dev/null || echo 0)"
+  fi
+  [[ "${DOCKER_UID}" == "0" ]] && DOCKER_UID=1000
+  [[ "${DOCKER_GID}" == "0" ]] && DOCKER_GID=1000
+
+  # Конфигурация — до сборки и запуска: сервер в контейнере читает её с
+  # первого старта и сохраняет в неё то, что меняют в интерфейсе (ключи,
+  # приёмники метрик, станции). Без файла всё это жило до перезапуска.
+  create_configuration
+
+  step "Сборка и запуск контейнера"
 
   # Список движков передаём образу только тогда, когда его задал человек
   # ключом --engines. Иначе там оказался бы набор профиля, посчитанный для
@@ -981,29 +1475,44 @@ if [[ "${MODE}" == "docker" ]]; then
   DOCKER_ENGINES=""
   [[ -n "${ENGINES_EXPLICIT}" ]] && DOCKER_ENGINES="${ENGINES}"
 
-  write_file "${ENV_FILE}" 0640 <<ENVEOF
-# Создано установщиком ASR Hub $(date '+%Y-%m-%d %H:%M')
+  # Индекс PyTorch под драйвер этой машины — тот же выбор, что у обычной
+  # установки. Надстройка с видеокартой раньше зашивала cu124, на котором
+  # последний torch не знает RTX 50xx (sm_120): карта видна, а вычисления
+  # падают с «no kernel image is available».
+  DOCKER_TORCH_INDEX=""
+  [[ "${ACCEL}" == "cuda" ]] && DOCKER_TORCH_INDEX="$(torch_index_url cuda)"
+
+  # Строки, которые установщик не пишет, — с прошлой установки: токен, тег
+  # образа, предел памяти, свои переменные. Раньше файл писался заново, и
+  # переустановка молча теряла токен Hugging Face.
+  ENV_KEEP=""
+  if [[ -f "${ENV_FILE}" ]]; then
+    ENV_KEEP="$(grep -vE '^[[:space:]]*(#|$)' "${ENV_FILE}" 2>/dev/null \
+                | grep -vE '^(ASRHUB_PORT|ASRHUB_HOST|ASRHUB_DATA|ASRHUB_PROFILE|ASRHUB_ENGINES|ASRHUB_ACCEL|ASRHUB_TORCH_INDEX|ASRHUB_UID|ASRHUB_GID)=' \
+                || true)"
+    [[ -n "${HF_TOKEN_VALUE}" ]] && ENV_KEEP="$(grep -v '^HF_TOKEN=' <<<"${ENV_KEEP}" || true)"
+  fi
+  ENV_TEXT="# Создано установщиком ASR Hub $(date '+%Y-%m-%d %H:%M')
 ASRHUB_PORT=${PORT}
 ASRHUB_HOST=${HOST}
 ASRHUB_DATA=${DATA_DIR}
 ASRHUB_PROFILE=${PROFILE}
 ASRHUB_ENGINES=${DOCKER_ENGINES}
 ASRHUB_ACCEL=${ACCEL}
-ENVEOF
-
-  # Токен пишем отдельной строкой и только если он есть: пустое значение в
-  # env.sh перекрыло бы токен из окружения службы. Файл уже 0640 — в нём
-  # лежит секрет, и читать его должен только владелец установки.
-  if [[ -n "${HF_TOKEN_VALUE}" ]]; then
-    if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
-      printf '%s[пробный запуск]%s HF_TOKEN дописан в %s\n' \
-        "${C_YELLOW}" "${C_RESET}" "${ENV_FILE}"
-    else
-      printf 'HF_TOKEN=%s\n' "${HF_TOKEN_VALUE}" >> "${ENV_FILE}"
-      chmod 0640 "${ENV_FILE}" 2>/dev/null || true
-      ok "Токен Hugging Face записан (${HF_TOKEN_VALUE:0:6}…, ${#HF_TOKEN_VALUE} символов)"
-    fi
-  fi
+ASRHUB_UID=${DOCKER_UID}
+ASRHUB_GID=${DOCKER_GID}"
+  [[ -n "${DOCKER_TORCH_INDEX}" ]] && ENV_TEXT="${ENV_TEXT}
+ASRHUB_TORCH_INDEX=${DOCKER_TORCH_INDEX}"
+  [[ -n "${HF_TOKEN_VALUE}" ]] && ENV_TEXT="${ENV_TEXT}
+HF_TOKEN=${HF_TOKEN_VALUE}"
+  [[ -n "${ENV_KEEP}" ]] && ENV_TEXT="${ENV_TEXT}
+${ENV_KEEP}"
+  write_file "${ENV_FILE}" 0640 <<<"${ENV_TEXT}"
+  unset ENV_TEXT ENV_KEEP
+  # Токен — в том же файле: он уже 0640, в нём лежит секрет, и читать его
+  # должен только владелец установки.
+  [[ -n "${HF_TOKEN_VALUE}" && "${ASRHUB_DRY_RUN}" != "1" ]] && \
+    ok "Токен Hugging Face записан (${HF_TOKEN_VALUE:0:6}…, ${#HF_TOKEN_VALUE} символов)"
 
   # Вариант с видеокартой — файл-надстройка, а не отдельный профиль: сервис
   # без профиля поднимается всегда, поэтому «--profile gpu up» запускал и
@@ -1011,43 +1520,7 @@ ENVEOF
   COMPOSE_FILES=(-f docker-compose.yml)
   if [[ "${ACCEL}" == "cuda" ]]; then
     COMPOSE_FILES+=(-f docker-compose.gpu.yml)
-    info "Сборка под видеокарту NVIDIA (docker-compose.gpu.yml)"
-  fi
-
-  # Владелец каталога данных: контейнер приведёт права к нему при запуске.
-  #
-  # Дописывание идёт мимо write_file, поэтому пробный запуск проверяется
-  # здесь отдельно. Без этого «--dry-run --mode docker» падал с «No such
-  # file or directory» на несозданном .env, а при переустановке поверх
-  # существующей — молча дописывал строки в настоящий файл. Пробный запуск
-  # не имеет права менять ничего.
-  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
-    printf '%s[пробный запуск]%s ASRHUB_UID/ASRHUB_GID дописаны в %s\n' \
-      "${C_YELLOW}" "${C_RESET}" "${ENV_FILE}"
-  else
-    {
-      # Под sudo id -u даёт ноль, и контейнер запускался от root, минуя
-      # понижение прав через gosu. Берём того, кто вызвал sudo.
-      #
-      # Запасной путь `id -u` тоже даёт ноль, если установщик работает от
-      # root БЕЗ sudo — из root-шелла, из Ansible, из образа сборки. Ноль
-      # здесь означает «контейнер побежит от root с примонтированным
-      # каталогом хоста», то есть ровно то, от чего понижение и защищает.
-      # Тогда берём владельца каталога данных, а если и он root — 1000,
-      # обычный первый пользователь.
-      docker_uid="${SUDO_UID:-$(id -u)}"
-      docker_gid="${SUDO_GID:-$(id -g)}"
-      if [[ "${docker_uid}" == "0" ]]; then
-        docker_uid="$(stat -c '%u' "${DATA_DIR}" 2>/dev/null \
-                      || stat -f '%u' "${DATA_DIR}" 2>/dev/null || echo 0)"
-        docker_gid="$(stat -c '%g' "${DATA_DIR}" 2>/dev/null \
-                      || stat -f '%g' "${DATA_DIR}" 2>/dev/null || echo 0)"
-      fi
-      [[ "${docker_uid}" == "0" ]] && docker_uid=1000
-      [[ "${docker_gid}" == "0" ]] && docker_gid=1000
-      echo "ASRHUB_UID=${docker_uid}"
-      echo "ASRHUB_GID=${docker_gid}"
-    } >> "${ENV_FILE}"
+    info "Сборка под видеокарту NVIDIA (docker-compose.gpu.yml), индекс PyTorch: ${DOCKER_TORCH_INDEX}"
   fi
 
   info "Сборка образа (первый раз занимает 10–25 минут)…"
@@ -1065,7 +1538,7 @@ ENVEOF
     ( cd "${PREFIX}/docker" \
         && run ${COMPOSE} --env-file .env "${COMPOSE_FILES[@]}" up -d )
   fi
-  add_rollback "cd '${PREFIX}/docker' && ${COMPOSE} ${COMPOSE_FILES[*]} down"
+  add_rollback "cd $(_q "${PREFIX}/docker") && ${COMPOSE} --env-file .env ${COMPOSE_FILES[*]} down"
   ok "Контейнер запущен"
 
 else
@@ -1097,7 +1570,7 @@ else
         VENV_OLD="${VENV}.before-force"
         run rm -rf "${VENV_OLD}"
         run mv "${VENV}" "${VENV_OLD}"
-        add_rollback "rm -rf '${VENV}' && mv '${VENV_OLD}' '${VENV}'"
+        add_rollback "rm -rf $(_q "${VENV}") && mv $(_q "${VENV_OLD}") $(_q "${VENV}")"
         hint "Прежнее отложено в ${VENV_OLD} и удалится в конце установки."
       else
         warn "Оставляем окружение на Python ${VENV_PY_VERSION}."
@@ -1115,7 +1588,7 @@ else
       VENV_OLD="${VENV}.before-force"
       run rm -rf "${VENV_OLD}"
       run mv "${VENV}" "${VENV_OLD}"
-      add_rollback "rm -rf '${VENV}' && mv '${VENV_OLD}' '${VENV}'"
+      add_rollback "rm -rf $(_q "${VENV}") && mv $(_q "${VENV_OLD}") $(_q "${VENV}")"
     else
       debug "окружение уже собрано на Python ${VENV_PY_VERSION} — переиспользуем"
     fi
@@ -1138,7 +1611,7 @@ else
       hint "Другой интерпретатор можно задать ключом: --python /usr/bin/python3.12"
       exit 1
     fi
-    add_rollback "rm -rf '${VENV}'"
+    add_rollback "rm -rf $(_q "${VENV}")"
   fi
   VPY="${VENV}/bin/python"
   VPIP="${VENV}/bin/pip"
@@ -1153,6 +1626,11 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
 
   PIP_FLAGS=(--disable-pip-version-check --no-input)
   [[ "${OFFLINE}" -eq 1 ]] && PIP_FLAGS+=(--no-index)
+  [[ -n "${WHEELS_DIR}" ]] && PIP_FLAGS+=(--find-links "${WHEELS_DIR}")
+  if [[ "${OFFLINE}" -eq 1 && -z "${WHEELS_DIR}" ]]; then
+    warn "Ключ --offline без --wheels: pip ставит только из каталога колёс, а он не задан."
+    hint "Без него не установится ничего, чего ещё нет в окружении."
+  fi
   [[ "${ASRHUB_QUIET}" == "1" ]] && PIP_FLAGS+=(-q)
 
   info "Обновление pip…"
@@ -1168,7 +1646,7 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
   # PyTorch ставим отдельно: у него свой индекс под каждый ускоритель
   NEEDS_TORCH=0
   for engine in gigaam faster_whisper whisper nemo transformers whisperx qwen3_asr voxtral; do
-    [[ "${ENGINES}" == *"${engine}"* ]] && NEEDS_TORCH=1
+    engine_in_list "${engine}" "${ENGINES}" && NEEDS_TORCH=1
   done
   if [[ "${NEEDS_TORCH}" -eq 1 ]]; then
     # Колёса выбираем под ту карту, что найдена на шине, а не под ту, что
@@ -1213,13 +1691,20 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
       continue
     fi
     info "Движок: ${engine}"
+    ENGINE_FLAGS=("${PIP_FLAGS[@]}")
     if [[ "${engine}" == "faster_whisper" && "${GPU_TARGET_ACCEL:-${ACCEL}}" == "cuda" ]]; then
-      # Пин ctranslate2 под установленный cuDNN — иначе типовая ошибка libcudnn
-      PIN="$(ctranslate2_pin "${ACCEL}")"
-      info "Версия CTranslate2 под вашу CUDA: ${PIN}"
-      retry 2 run "${VPIP}" install "${PIP_FLAGS[@]}" "${PIN}" || true
+      # Версия ctranslate2 под установленные CUDA и cuDNN — ограничением в
+      # той же команде, иначе типовая ошибка libcudnn. Отдельный `pip install
+      # ctranslate2==…` перед файлом требований тут же отменялся им.
+      PIN="$(ctranslate2_pin cuda "${VPY}")"
+      info "Версия CTranslate2 под вашу CUDA: $(printf '%s' "${PIN}" | tr '\n' ' ')"
+      if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+        [[ -n "${PIN_DIR:-}" ]] || make_temp_dir PIN_DIR
+        printf '%s\n' "${PIN}" > "${PIN_DIR}/faster-whisper-constraints.txt"
+        ENGINE_FLAGS+=(-c "${PIN_DIR}/faster-whisper-constraints.txt")
+      fi
     fi
-    if install_engine_requirements "${VPIP}" "${REQ}" "${PIP_FLAGS[@]}"; then
+    if install_engine_requirements "${VPIP}" "${REQ}" "${ENGINE_FLAGS[@]}"; then
       ok "  ${engine} установлен"
     else
       FAILED_ENGINES+=("${engine}")
@@ -1247,170 +1732,10 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
 fi
 
 # ---------------------------------------------------------------------------
-# Шаг 7. Конфигурация
+# Шаг 7. Конфигурация (в режиме docker — до запуска контейнера, см. шаг 6)
 # ---------------------------------------------------------------------------
 
-step "Создание конфигурации"
-
-CONFIG_FILE="${DATA_DIR}/config.yaml"
-if [[ -f "${CONFIG_FILE}" && "${RESET_CONFIG}" -eq 0 ]]; then
-  info "Конфигурация уже существует — оставляем без изменений."
-  info "Полный пример со всеми параметрами: ${DATA_DIR}/config.example.yaml"
-  [[ "${FORCE}" -eq 1 ]] && \
-    hint "--force конфигурацию не трогает. Заменить её шаблоном — ключ --reset-config."
-else
-  if [[ -f "${CONFIG_FILE}" ]]; then
-    warn "Ключ --reset-config: config.yaml заменяется шаблоном."
-    hint "Пропадут ключи интеграций и агентов, токен Hugging Face и все настройки."
-    hint "Прежний файл останется рядом: ${CONFIG_FILE}.bak.<дата>."
-  fi
-  if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
-    RECOMMENDED_MODEL="$(printf '%s' "${MODELS}" | cut -d, -f1)"
-    [[ -z "${RECOMMENDED_MODEL}" ]] && RECOMMENDED_MODEL="demo-simulator"
-    # Устройство и точность под найденную карту. Пусто — оставляем auto:
-    # сервер определит сам, и это правильное поведение для машины без карты
-    # и для той, где драйвер заработает только после перезагрузки.
-    # Карту для конфигурации выбирает nvidia-smi, а считать будет torch —
-    # и эти двое расходятся. Проверка нужна здесь, а не только при
-    # обновлении: «device: cuda», записанное на машине, где torch карты не
-    # видит, заводит сервер, у которого падает каждое задание.
-    GPU_RC=0
-    GPU_BATCHING_BLOCK="$(gpu_config_lines_checked "${VENV}/bin/python" \
-                          "${PREFIX}/server" | sed 's/^/  /')" || GPU_RC=$?
-    if [[ "${GPU_RC}" -ne 0 ]]; then
-      warn "Карта видна системе, но не питону — оставляем device: auto."
-      hint "С жёстким устройством падало бы каждое задание; с «auto» сервер"
-      hint "уйдёт на процессор и возьмёт карту, как только она отзовётся."
-      gpu_runtime_diagnose asrhub
-      GPU_BATCHING_BLOCK=""
-    fi
-    [[ -z "${GPU_BATCHING_BLOCK// /}" ]] && GPU_BATCHING_BLOCK="  device: auto
-  compute_type: auto"
-    # 0640: в config.yaml сервер дописывает ключи доступа с их группами и
-  # квотами. Читать его должен только владелец установки.
-  write_file "${CONFIG_FILE}" 0640 <<CFGEOF
-# Конфигурация ASR Hub — создана установщиком $(date '+%Y-%m-%d %H:%M')
-# Полный список параметров с описаниями: ${DATA_DIR}/config.example.yaml
-# Все параметры также доступны в веб-интерфейсе в разделе «Настройки».
-
-data_dir: ${DATA_DIR}
-
-model:
-  model: ${RECOMMENDED_MODEL}
-  engine: auto
-  language: ru
-
-server:
-  server_host: ${HOST}
-  server_port: ${PORT}
-  auth_enabled: true
-  max_upload_mb: 2048
-  log_level: INFO
-  # Распознавание на лету: раздел «Диктовка» и WebSocket /api/stream.
-  # stream_window_s — шаг гипотез для движков, которые не держат состояние
-  # между кусками: меньше значит чаще обновления и больше повторной работы.
-  stream_enabled: ${STREAM_ENABLED}
-  stream_window_s: 4
-
-batching:
-${GPU_BATCHING_BLOCK}
-
-queue:
-  max_concurrent_jobs: $( [[ "${ACCEL}" == "cpu" ]] && echo 1 || echo 2 )
-  scheduling_policy: priority_fifo
-  result_retention_days: 30
-
-runtime:
-  models_dir: ${DATA_DIR}/models
-  temp_dir: ${DATA_DIR}/tmp
-CFGEOF
-
-    # Выбранное в мастере дописывается отдельно, чтобы шаблон выше оставался
-    # одинаковым для любой установки.
-    if [[ -n "${ALIGNMENT}" && "${ALIGNMENT}" != "none" ]]; then
-      cat >> "${CONFIG_FILE}" <<CFGEOF
-
-postprocess:
-  # Уточнение границ слов по звуку. Если выравниватель недоступен,
-  # задание доводится до конца на таймкодах модели.
-  alignment_backend: ${ALIGNMENT}
-CFGEOF
-    fi
-
-    if [[ -n "${MONITORING}" ]]; then
-      cat >> "${CONFIG_FILE}" <<CFGEOF
-
-monitoring:
-  monitoring_push_enabled: true
-  monitoring_targets:
-    - kind: ${MONITORING}
-      url: ${MONITORING_URL:-http://localhost:9091}
-      interval_s: 60
-CFGEOF
-    fi
-
-    add_rollback "rm -f '${CONFIG_FILE}'"
-  fi
-  ok "Конфигурация: ${CONFIG_FILE}"
-fi
-
-# Токен Hugging Face. Пишем его в config.yaml, а не в env.sh: переменные
-# окружения читает systemd, но не launchd на macOS и не запуск руками через
-# asrctl, а конфигурацию читают все три. Раньше токен, введённый в мастере,
-# доходил только до docker/.env — при обычной установке он молча пропадал, и
-# диаризация падала на седьмом шаге с «нужен токен».
-#
-# Строку заменяем, а не дописываем: два ключа hf_token в YAML — это молча
-# выигравший последний, то есть потерянный только что введённый токен.
-if [[ -n "${HF_TOKEN_VALUE}" && "${MODE}" == "native" ]]; then
-  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
-    info "[пробный запуск] hf_token записан бы в ${CONFIG_FILE}"
-  elif [[ -f "${CONFIG_FILE}" ]]; then
-    HF_TMP="${CONFIG_FILE}.hf.$$"
-    # Права — до того, как в файл попадёт токен: иначе он лежит рядом с
-    # конфигурацией доступным всем на чтение до самого mv.
-    : > "${HF_TMP}"
-    chmod 0640 "${HF_TMP}" 2>/dev/null || true
-    grep -v '^hf_token:' "${CONFIG_FILE}" > "${HF_TMP}" 2>/dev/null || true
-    # Файл мог остаться без перевода строки в конце — тогда ключ приклеился бы
-    # к последней строке и YAML перестал бы читаться целиком.
-    if [[ -s "${HF_TMP}" ]] && [[ -n "$(tail -c1 "${HF_TMP}")" ]]; then
-      printf '\n' >> "${HF_TMP}"
-    fi
-    printf 'hf_token: "%s"\n' "${HF_TOKEN_VALUE}" >> "${HF_TMP}"
-    mv -f "${HF_TMP}" "${CONFIG_FILE}"
-    chmod 0640 "${CONFIG_FILE}" 2>/dev/null || true
-    ok "Токен Hugging Face записан в конфигурацию (${HF_TOKEN_VALUE:0:6}…, ${#HF_TOKEN_VALUE} символов)"
-  else
-    warn "Файл конфигурации не найден — токен Hugging Face не записан."
-    hint "Дописать вручную: строка hf_token: \"${HF_TOKEN_VALUE:0:6}…\" в ${CONFIG_FILE}"
-  fi
-fi
-
-# Переменные окружения под видеокарту. Их читает служба (EnvironmentFile) и
-# ручной запуск через asrctl. В конфигурацию они не идут: это настройки
-# драйвера, а не сервера, и в разных машинах они разные.
-if [[ -n "${GPU_ENV_OVERRIDE}" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
-  ENV_SH="${DATA_DIR}/env.sh"
-  # Строки с прошлого запуска убираем: иначе после смены видеокарты
-  # осталась бы подсказка про старую, и новая работала бы неправильно.
-  if [[ -f "${ENV_SH}" ]]; then
-    grep -v '^# ASRHUB-GPU$' "${ENV_SH}" 2>/dev/null \
-      | grep -vE '^(HSA_OVERRIDE_GFX_VERSION|NEOReadDebugKeys|ClDeviceGlobalMemSizeAvailablePercent)=' \
-      > "${ENV_SH}.new" || true
-    mv -f "${ENV_SH}.new" "${ENV_SH}"
-  fi
-  {
-    printf '# ASRHUB-GPU\n'
-    printf '%s\n' "${GPU_ENV_OVERRIDE//;/$'\n'}"
-  } >> "${ENV_SH}"
-  ok "Переменные окружения видеокарты: ${ENV_SH}"
-fi
-
-if [[ "${MODE}" == "native" && "${ASRHUB_DRY_RUN}" != "1" ]]; then
-  ( cd "${PREFIX}/server" && "${VENV}/bin/python" -m asrhub --print-config \
-      > "${DATA_DIR}/config.example.yaml" 2>/dev/null ) || true
-fi
+[[ "${MODE}" == "docker" ]] || create_configuration
 
 # ---------------------------------------------------------------------------
 # Выравнивание (по запросу мастера или ключа --alignment)
@@ -1542,8 +1867,14 @@ if [[ "${CREATE_SERVICE}" -eq 1 && "${MODE}" == "native" ]]; then
       hint "Запускать вручную: ${VENV}/bin/python -m asrhub --port ${PORT}"
     }
 else
-  info "Служба автозапуска не создаётся."
-  checklist_skip "выбран ключ --no-service"
+  # Пункт чек-листа — свой, а не «Создание конфигурации»: шаг службы здесь
+  # не открывался, и пропуск с чужой подписью гасил предупреждения
+  # предыдущего шага.
+  if [[ "${MODE}" == "docker" ]]; then
+    info "Автозапуск контейнера — его политика restart в docker-compose.yml."
+  else
+    info "Служба автозапуска не создаётся (--no-service)."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1621,12 +1952,24 @@ unset MARKER_SERVICE
 if [[ -n "${VENV_OLD:-}" && -d "${VENV_OLD}" ]]; then
   run rm -rf "${VENV_OLD}" || warn "Не удалось удалить ${VENV_OLD} — удалите вручную."
 fi
+for _old in ${OLD_CODE[@]+"${OLD_CODE[@]}"}; do
+  rm -rf "${_old:?}" 2>/dev/null || warn "Не удалось удалить ${_old} — удалите вручную."
+done
+unset _old
 
 API_KEY="$(cat "${DATA_DIR}/api-key.txt" 2>/dev/null || echo '')"
 
 printf '\n%s%sУстановка завершена%s\n\n' "${C_BOLD}" "${C_GREEN}" "${C_RESET}"
-printf '  Веб-интерфейс     %shttp://%s:%s%s\n' "${C_BOLD}" \
-  "$( [[ "${HOST}" == "0.0.0.0" ]] && hostname -I 2>/dev/null | awk '{print $1}' || echo "${HOST}" )" "${PORT}" "${C_RESET}"
+# Адрес машины для «0.0.0.0»: `hostname -I` есть только в Linux, на macOS
+# он падал, и в итоге печаталось «http://0.0.0.0:…».
+_SHOWN_HOST="${HOST}"
+if [[ "${HOST}" == "0.0.0.0" || "${HOST}" == "::" ]]; then
+  _SHOWN_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  [[ -n "${_SHOWN_HOST}" ]] || _SHOWN_HOST="$(ipconfig getifaddr en0 2>/dev/null || true)"
+  [[ -n "${_SHOWN_HOST}" ]] || _SHOWN_HOST="$(hostname 2>/dev/null || echo 127.0.0.1)"
+fi
+printf '  Веб-интерфейс     %shttp://%s:%s%s\n' "${C_BOLD}" "${_SHOWN_HOST}" "${PORT}" "${C_RESET}"
+unset _SHOWN_HOST
 printf '  Локально          http://127.0.0.1:%s\n' "${PORT}"
 printf '  Справочник API    http://127.0.0.1:%s/api/reference\n' "${PORT}"
 [[ -n "${API_KEY}" ]] && printf '  Ключ доступа      %s%s%s\n' "${C_BOLD}" "${API_KEY}" "${C_RESET}"

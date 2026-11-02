@@ -79,11 +79,22 @@ def snr_band(snr: float | None) -> str | None:
     return КОРЗИНЫ_SNR[-1][1]
 
 
+def snr_надёжен(профиль: dict[str, Any] | None) -> bool:
+    """Мерили ли отношение сигнал/шум по-настоящему — по паузам из VAD.
+
+    По перцентилям (VAD покрыл всю запись или выключен) «шумом» становятся
+    провалы между слогами, и меряется динамический диапазон речи, а не
+    шум: ровный сигнал давал «отношение речи к шуму −0 дБ» и попадал в
+    «плохой звук».
+    """
+    return bool(профиль) and str(профиль.get("method") or "vad") == "vad"
+
+
 def is_bad(профиль: dict[str, Any] | None) -> bool:
-    """Плохой звук: SNR ниже 10 дБ или клиппинг от одного процента."""
+    """Плохой звук: SNR ниже 10 дБ (измеренный по паузам) или клиппинг от процента."""
     if not профиль:
         return False
-    snr = профиль.get("snr_db")
+    snr = профиль.get("snr_db") if snr_надёжен(профиль) else None
     клип = профиль.get("clipping_share")
     return (snr is not None and float(snr) < SNR_ПЛОХОЙ) or \
         (клип is not None and float(клип) >= КЛИППИНГ_ПЛОХОЙ)
@@ -238,9 +249,16 @@ def profile(samples: Any, rate: int, *,
     шум: list[float] = []
     способ = "percentile"
     if speech_spans:
+        # Двумя указателями: кадры и участки идут по времени. Прежде каждый
+        # кадр перебирал все участки — 11,6 с на 20 минут с 300 участками.
+        участки = sorted((float(a), float(b)) for a, b in speech_spans)
+        j = 0
         for i, уровень in enumerate(уровни):
             t = (i + 0.5) * КАДР_С
-            (речь if any(a <= t < b for a, b in speech_spans) else шум).append(уровень)
+            while j < len(участки) and участки[j][1] <= t:
+                j += 1
+            внутри = j < len(участки) and участки[j][0] <= t < участки[j][1]
+            (речь if внутри else шум).append(уровень)
         способ = "vad"
     if not речь or not шум:
         # Разметка не оставила ни одного кадра под шум (VAD решил, что речь

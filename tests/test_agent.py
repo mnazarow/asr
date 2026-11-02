@@ -1143,12 +1143,13 @@ def установщик_в_песочнице(tmp_path: Path) -> Path:
         'INSTALL_DIR="/opt/asrhub-agent"': f'INSTALL_DIR="{корень}/opt/asrhub-agent"',
         'CONFIG_FILE="/etc/asrhub-agent.conf"': f'CONFIG_FILE="{корень}/etc/asrhub-agent.conf"',
         'STATE_DIR="/var/lib/asrhub-agent"': f'STATE_DIR="{корень}/var/lib/asrhub-agent"',
-        'LOG_FILE="/var/log/asrhub-agent.log"': f'LOG_FILE="{корень}/var/log/asrhub-agent.log"',
+        'LOG_DIR="/var/log/asrhub-agent"': f'LOG_DIR="{корень}/var/log/asrhub-agent"',
+        'OLD_LOG_FILE="/var/log/asrhub-agent.log"':
+            f'OLD_LOG_FILE="{корень}/var/log/asrhub-agent.log"',
+        'CA_FILE="/etc/asrhub-agent.ca.pem"': f'CA_FILE="{корень}/etc/asrhub-agent.ca.pem"',
         'UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"':
             f'UNIT_FILE="{корень}/etc/systemd/${{SERVICE_NAME}}.service"',
         'check_writable "/etc"': f'check_writable "{корень}/etc"',
-        "ReadWritePaths=${STATE_DIR} /var/log":
-            f"ReadWritePaths=${{STATE_DIR}} {корень}/var/log",
     }
     for было, стало in замены.items():
         assert было in текст, f"в установщике не нашлось: {было}"
@@ -1208,6 +1209,17 @@ def test_установщик_ставит_агента_целиком(tmp_path:
     assert "--follow" in юнит and "Restart=always" in юнит
     assert "RestartSec=10" in юнит and "NoNewPrivileges=true" in юнит
     assert "ReadWritePaths=" in юнит and "PrivateTmp=true" in юнит
+    # Заход 54: журнал в своём каталоге пользователя службы (ротация в /var/log
+    # у asterisk невозможна), вывод в UTF-8 при любой локали, быстрая
+    # остановка, /home — только на чтение, а не спрятан.
+    assert f"ReadWritePaths={корень}/var/lib/asrhub-agent {корень}/var/log/asrhub-agent" in юнит
+    assert "Environment=PYTHONIOENCODING=utf-8" in юнит and "TimeoutStopSec=30" in юнит
+    assert "ProtectHome=read-only" in юнит
+    assert f"log_file = {корень}/var/log/asrhub-agent/asrhub-agent.log" in \
+        (корень / "etc" / "asrhub-agent.conf").read_text(encoding="utf-8")
+    # Установщик сохранён рядом с агентом: им и удаляют.
+    assert (корень / "opt" / "asrhub-agent" / "install.sh").exists()
+    assert "/opt/asrhub-agent/install.sh --uninstall" in вывод
     команды = (tmp_path / "systemctl.log").read_text(encoding="utf-8")
     assert "daemon-reload" in команды and "restart asrhub-agent" in команды
 
@@ -1266,3 +1278,56 @@ def test_установщик_не_ставит_ничего_без_ключа()
     вывод = итог.stdout + итог.stderr
     assert "ключ" in вывод.lower()
     assert "Что делать" in вывод, "ошибка обязана объяснять, что делать"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="нужен bash")
+def test_установщик_сертификат_и_прежний_журнал(tmp_path: Path):
+    """Заход 54: `--cacert` и `--insecure` у установщика, переезд журнала.
+
+    Агент умел свой корневой сертификат и «не проверять», а установщик —
+    нет: к серверу с сертификатом своего удостоверяющего центра агента было
+    не поставить вовсе. Журнал прежних версий лежал прямо в /var/log, где
+    ротация от asterisk невозможна; повторная установка переносит его в
+    свой каталог и правит путь в настройках.
+    """
+    установщик = установщик_в_песочнице(tmp_path)
+    корень = tmp_path / "система"
+    (tmp_path / "Master.csv").write_text(строка_cdr("s.2"), encoding="utf-8")
+    wav(tmp_path / "monitor" / "s.2.wav")
+    сертификат = tmp_path / "ca.pem"
+    сертификат.write_text("-----BEGIN CERTIFICATE-----\nMII…\n-----END CERTIFICATE-----\n",
+                          encoding="utf-8")
+    окружение = {**os.environ, "PATH": f"{корень / 'bin'}:{os.environ.get('PATH', '')}",
+                 "SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"), "NO_COLOR": "1"}
+    with Станция() as станция:
+        первый = subprocess.run(
+            [shutil.which("bash"), str(установщик), "--url", станция.адрес,
+             "--key", "ah_test1234567890", "--cdr-file", str(tmp_path / "Master.csv"),
+             "--recordings", str(tmp_path / "monitor"), "--cacert", str(сертификат)],
+            capture_output=True, text=True, timeout=180, env=окружение)
+    assert первый.returncode == 0, первый.stdout + первый.stderr
+    настройки = корень / "etc" / "asrhub-agent.conf"
+    копия = корень / "etc" / "asrhub-agent.ca.pem"
+    assert копия.read_text(encoding="utf-8") == сертификат.read_text(encoding="utf-8")
+    assert f"cacert = {копия}" in настройки.read_text(encoding="utf-8")
+
+    # Настройки прежней версии: журнал прямо в /var/log, своего каталога нет.
+    shutil.rmtree(корень / "var" / "log" / "asrhub-agent")
+    старый = корень / "var" / "log" / "asrhub-agent.log"
+    старый.write_text("строка прежнего журнала\n", encoding="utf-8")
+    текст = настройки.read_text(encoding="utf-8")
+    текст = re.sub(r"(?m)^log_file = .*$", f"log_file = {старый}", текст)
+    настройки.write_text(текст, encoding="utf-8")
+    with Станция() as станция:
+        второй = subprocess.run(
+            [shutil.which("bash"), str(установщик), "--url", станция.адрес,
+             "--key", "ah_test1234567890", "--insecure"],
+            capture_output=True, text=True, timeout=180, env=окружение)
+    assert второй.returncode == 0, второй.stdout + второй.stderr
+    assert "--insecure" in второй.stderr or "выключена" in второй.stderr
+    новые = настройки.read_text(encoding="utf-8")
+    assert "insecure = да" in новые
+    журнал = корень / "var" / "log" / "asrhub-agent" / "asrhub-agent.log"
+    assert f"log_file = {журнал}" in новые
+    assert "строка прежнего журнала" in журнал.read_text(encoding="utf-8")
+    assert not старый.exists()

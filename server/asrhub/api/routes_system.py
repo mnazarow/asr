@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from typing import Any
 
@@ -20,7 +21,7 @@ from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
 from ..logging_setup import get_logger
 from ..logging_setup import recent as log_recent
-from ..maintenance import retention_days
+from ..maintenance import calls_file_days, retention_days
 from ..monitoring.collector import RUNTIME
 from .deps import (
     Principal,
@@ -30,6 +31,7 @@ from .deps import (
     require_admin,
     scope_owner,
     допуск_к_метрикам,
+    закрыть_сокеты,
 )
 
 log = get_logger("api.settings")
@@ -68,6 +70,11 @@ def _health_body(state: Any) -> tuple[dict[str, Any], int]:
         "uptime_s": round(time.time() - state.started_at, 1),
         "queue_paused": state.queue.is_paused,
         "catalog_date": catalog.CATALOG_DATE,
+        # Сдвиг часов сервера от всемирного времени: карты «час × день
+        # недели» считаются в поясе сервера, а остальное время на странице —
+        # в поясе браузера. Без этого числа интерфейс не мог ни подписать
+        # карту, ни заметить расхождение (сервер в Docker живёт по UTC).
+        "utc_offset_s": int(time.localtime().tm_gmtoff),
         "checks": checks,
     }
     return body, 200 if healthy else 503
@@ -196,7 +203,11 @@ def queue_retry_failed(request: Request,
                        principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    return {"requeued": state.queue.retry_failed(limit)}
+    # Отказ на одном задании (записи уже нет) не обрывает остальные — как в
+    # пакетных действиях: что поставлено и что нет, видно по ответу.
+    отказы: list[dict[str, str]] = []
+    поставлено = state.queue.retry_failed(limit, отказы)
+    return {"requeued": поставлено, "failed": отказы[:200]}
 
 
 @router.post("/queue/concurrency", summary="Изменить число одновременных заданий")
@@ -246,28 +257,50 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
     # становятся — см. Settings.без_заглушек.
     свои = catalog.coerce_all(state.settings.без_заглушек(
         {k: v for k, v in values.items() if k in catalog.PARAMS_BY_KEY}))
-    errors = catalog.validate_all(свои)
+    # Проверки сервера — до первого изменения (см. catalog.validate_all).
+    errors = catalog.validate_all(свои, server=True)
     if errors:
         raise error_response(ConfigError("; ".join(errors)))
     applied = {}
     for key, value in свои.items():
         state.settings.set(key, value, source="api")
         applied[key] = value
-    if "max_concurrent_jobs" in applied:
-        state.queue.set_concurrency(int(applied["max_concurrent_jobs"]))
-    if "model_cache_size" in applied or "model_idle_unload_s" in applied:
+    применить_на_ходу(state, applied)
+    state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
+    RUNTIME.inc("asrhub_config_reloads_total")
+    ответ: dict[str, Any] = {"applied": applied}
+    # Что вступит в силу только после перезапуска: честное «применено до
+    # перезапуска» вместо «применено» (см. Settings.ПОСЛЕ_ПЕРЕЗАПУСКА).
+    перезапуск = sorted(set(applied) & state.settings.ПОСЛЕ_ПЕРЕЗАПУСКА)
+    if перезапуск:
+        ответ["restart_required"] = перезапуск
+    if persist and applied:
+        ответ.update(state.settings.записать_ключи(applied))
+    return ответ
+
+
+def применить_на_ходу(state: Any, изменено: dict[str, Any] | None) -> None:
+    """То, что работающий сервер должен подхватить сразу после смены настроек.
+
+    Один шаг на все пути, которыми настройки меняются: PUT /api/settings и
+    сброс к умолчаниям. Сброс делал только `settings.set` — и очередь
+    продолжала считать на прежнем числе воркеров, а реестр моделей держал
+    прежний размер кеша и срок выгрузки, при том что страница показывала
+    новые значения. `изменено` None — «поменяться могло всё».
+    """
+    все = изменено is None
+    # Сервер «только интерфейс» (`--no-queue`) очередь не обрабатывает, и
+    # правка числа воркеров не должна поднимать в нём рабочие потоки.
+    if (все or "max_concurrent_jobs" in изменено) and getattr(state, "queue_enabled", True):
+        state.queue.set_concurrency(max(1, S.integer(state.settings,
+                                                     "max_concurrent_jobs", 2)))
+    if все or "model_cache_size" in изменено or "model_idle_unload_s" in изменено:
         # Ноль у `model_idle_unload_s` — «не выгружать никогда», и `or 900`
         # его терял: сохранение настроек включало автовыгрузку обратно.
         state.registry.configure(
             max(1, S.integer(state.settings, "model_cache_size", 2)),
             S.integer(state.settings, "model_idle_unload_s", 900))
-    _применить_мониторинг(state, applied)
-    state.db.add_event(None, "settings_changed", f"Изменено параметров: {len(applied)}")
-    RUNTIME.inc("asrhub_config_reloads_total")
-    ответ: dict[str, Any] = {"applied": applied}
-    if persist and applied:
-        ответ.update(state.settings.записать_ключи(applied))
-    return ответ
+    _применить_мониторинг(state, изменено)
 
 
 def _применить_мониторинг(state: Any, изменено: dict[str, Any] | None) -> None:
@@ -363,10 +396,13 @@ def reset_settings(request: Request,
                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    for key, value in catalog.defaults().items():
-        state.settings.set(key, value, source="default")
-    _применить_мониторинг(state, None)
-    return {"reset": True}
+    # К тому, что дал бы запуск, и только параметры распознавания: прежде
+    # каждому ключу ставилось умолчание каталога, и сброс включал вход без
+    # ключей, стирал станции, секреты и интеграции (см. Settings.сбросить).
+    изменено = state.settings.сбросить()
+    применить_на_ходу(state, None)
+    state.db.add_event(None, "settings_changed", f"Сброшено параметров: {len(изменено)}")
+    return {"reset": True, "changed": изменено}
 
 
 @router.get("/analytics", summary="Сводная аналитика")
@@ -509,7 +545,11 @@ def events(request: Request,
     if principal.is_admin:
         return {"items": items}
 
-    own = {j["id"] for j in state.db.list_jobs(owner=principal.name, limit=2000, light=True)}
+    # Охват — тот же, что у списка заданий и у «Проблем»: свои и коллег по
+    # подразделению. По одному имени ключ группы не видел в ленте событий
+    # заданий, которые видел в списке.
+    own = {j["id"] for j in state.db.list_jobs(owner=scope_owner(principal),
+                                               limit=2000, light=True)}
     # События без job_id — это ровно административные: создание и отзыв
     # ключей, изменение настроек, загрузка моделей. Условие «нет job_id —
     # значит можно» пропускало их всем, включая readonly, вместе с именами
@@ -530,9 +570,13 @@ def usage(request: Request,
     Без этого маршрута о квоте узнавали только в момент отказа — уже после
     того, как файл загружен.
     """
+    from .routes_jobs import СУТКИ_С, расход  # noqa: PLC0415
+
     state = get_state(request)
     scope = scope_owner(principal) or principal.name
-    used = state.db.owner_usage(scope, time.time() - 86400)
+    # Тот же расход, по которому считается квота: с удалёнными заданиями,
+    # повторами и потоком (см. `routes_jobs.учесть_расход`).
+    used = расход(state, scope, time.time() - СУТКИ_С)
     limits = {
         "jobs": principal.quota_jobs_per_day,
         "audio_hours": principal.quota_audio_hours_per_day,
@@ -673,11 +717,51 @@ def revoke_key(request: Request, preview: str,
             f"Под «{preview}» подходит несколько ключей ({len(matches)}).",
             hint="Передайте больше символов, чтобы совпадение было однозначным."))
 
-    name = str(state.settings.api_keys.get(matches[0], {}).get("name") or "")
-    state.settings.api_keys.pop(matches[0], None)
-    state.settings.persist_api_keys()
+    ключ = matches[0]
+    name = str(state.settings.api_keys.get(ключ, {}).get("name") or "")
+    state.settings.api_keys.pop(ключ, None)
+    saved = state.settings.persist_api_keys()
+    # Ключ, созданный при первом запуске, живёт ещё и в api-key.txt. Когда
+    # ключей в config.yaml не оставалось, запуск брал ключ из этого файла и
+    # заводил его заново с ролью admin: отозванный (а отзывают его обычно
+    # потому, что файл утёк) снова пускал после первого же перезапуска.
+    # Файл с отозванным ключом убирается; нужен будет ключ — запуск выпустит
+    # новый, а прежний не вернётся.
+    из_файла = _убрать_файл_ключа(state, ключ)
+    # Открытые веб-сокеты этого ключа закрываются сразу: права у сокета
+    # проверялись при рукопожатии, и лента событий продолжала идти ключу,
+    # которому REST уже отвечал 401.
+    закрыть_сокеты(request, lambda п: п.key == ключ, reason="Ключ доступа отозван")
     state.db.add_event(None, "key_revoked", f"Отозван ключ доступа «{name}»")
-    return {"revoked": True, "name": name}
+    ответ: dict[str, Any] = {"revoked": True, "name": name,
+                             "persisted": saved or из_файла}
+    import os  # noqa: PLC0415
+
+    if os.environ.get("ASRHUB_API_KEY", "").strip() == ключ:
+        ответ["persisted"] = False
+        ответ["warning"] = ("Ключ задан переменной окружения ASRHUB_API_KEY и вернётся "
+                            "после перезапуска — уберите переменную из окружения службы.")
+    elif not ответ["persisted"]:
+        ответ["warning"] = ("Отзыв действует до перезапуска: файл конфигурации "
+                            "недоступен для записи.")
+    return ответ
+
+
+def _убрать_файл_ключа(state: Any, ключ: str) -> bool:
+    """Убирает api-key.txt, если в нём лежит отзываемый ключ. True — убран."""
+    paths = getattr(state.settings, "paths", None)
+    if paths is None:
+        return False
+    файл = paths.data / "api-key.txt"
+    try:
+        if not файл.is_file() or файл.read_text(encoding="utf-8").strip() != ключ:
+            return False
+        файл.unlink()
+    except OSError as exc:
+        log.warning("Отозванный ключ остался в %s: %s", файл, exc)
+        return False
+    log.info("Отозванный ключ убран из %s", файл)
+    return True
 
 
 def _guard_metrics(request: Request, state: Any) -> None:
@@ -794,7 +878,8 @@ def cleanup(request: Request, principal: Principal = Depends(authenticate)) -> d
     require_admin(principal)
     removed = state.db.cleanup(
         results_days=retention_days(state.settings),
-        audit_days=S.integer(state.settings, "audit_days", 365))
+        audit_days=S.integer(state.settings, "audit_days", 365),
+        calls_file_days=calls_file_days(state.settings))
     # Очистка по кнопке — вся: и строки без задания со следами удалённых
     # разговоров, которые служебный цикл убирает раз в сутки.
     уборка = state.db.sweep_orphans()
@@ -806,6 +891,11 @@ def cleanup(request: Request, principal: Principal = Depends(authenticate)) -> d
 #: Самый короткий запрос на удаление по требованию. Три буквы нашли бы
 #: половину архива, а удаление необратимо.
 ERASE_MIN = 4
+
+#: Сколько порций по BULK_LIMIT удаляет один запрос «по требованию». Десять
+#: тысяч записей одного субъекта — это уже не постоянный клиент, а запрос
+#: по слишком общему слову; остаток удаляет повторный запрос (`more`).
+ERASE_PASSES = 20
 
 
 @router.post("/maintenance/erase", summary="Удалить записи по требованию")
@@ -834,30 +924,65 @@ def erase(request: Request,
         raise error_response(ConfigError(
             f"Запрос короче {ERASE_MIN} символов найдёт слишком многое.",
             hint="Укажите номер телефона, имя файла или фамилию целиком."))
-    найдено = state.db.list_jobs(search=запрос, limit=BULK_LIMIT)
-    номера = [str(j["id"]) for j in найдено]
-    # И звонки по номеру и имени звонящего: запись, названная
-    # `${UNIQUEID}.wav`, по номеру клиента не находилась ничем, если номер
-    # не произнесли вслух, — субъекту отвечали «удалено», а разговор
-    # оставался.
-    for номер in state.db.erase_call_job_ids(запрос, limit=BULK_LIMIT):
-        if номер not in номера and len(номера) < BULK_LIMIT:
-            задание = state.db.get_job(номер)
-            if задание is not None:
-                найдено.append(задание)
-                номера.append(номер)
+    def найти(уже: set[str]) -> list[dict[str, Any]]:
+        """Порция совпадений, ещё не удалённых в этом запросе, — до BULK_LIMIT."""
+        найдено = [j for j in state.db.list_jobs(search=запрос, limit=BULK_LIMIT)
+                   if str(j["id"]) not in уже]
+        номера = {str(j["id"]) for j in найдено}
+        # И звонки по номеру и имени звонящего: запись, названная
+        # `${UNIQUEID}.wav`, по номеру клиента не находилась ничем, если номер
+        # не произнесли вслух, — субъекту отвечали «удалено», а разговор
+        # оставался.
+        for номер in state.db.erase_call_job_ids(запрос, limit=BULK_LIMIT):
+            if номер not in номера and номер not in уже and len(номера) < BULK_LIMIT:
+                задание = state.db.get_job(номер)
+                if задание is not None:
+                    найдено.append(задание)
+                    номера.add(номер)
+        return найдено
+
     звонков = state.db.erase_calls_count(запрос)
     if dry_run:
-        return {"dry_run": True, "matched": len(номера), "ids": номера,
-                "calls": звонков, "limit": BULK_LIMIT}
-    for job in найдено:
-        _delete_one(state, job, principal)
+        найдено = найти(set())
+        # «Есть ещё» — только если за порцией правда что-то есть: ровно
+        # BULK_LIMIT совпадений прежде тоже отвечали `more`.
+        видно = {str(j["id"]) for j in найдено}
+        больше = len(найдено) >= BULK_LIMIT and (
+            state.db.count_jobs(search=запрос) > len(видно)
+            or any(н not in видно
+                   for н in state.db.erase_call_job_ids(запрос, limit=2 * BULK_LIMIT + 1)))
+        return {"dry_run": True, "matched": len(найдено),
+                "ids": [str(j["id"]) for j in найдено], "calls": звонков,
+                "limit": BULK_LIMIT, "more": больше}
+    # Удаление идёт порциями, пока совпадения не кончатся. Прежде за запрос
+    # удалялось не больше BULK_LIMIT заданий, а обезличивались все совпавшие
+    # звонки — и у тех заданий, что остались: повторный запрос отвечал
+    # «0 найдено», а остаток записей и расшифровок лежал до срока хранения,
+    # и по номеру его было уже не найти. Предел на число проходов — чтобы
+    # запрос не шёл бесконечно; остаток честно возвращается в `more`, а его
+    # звонки не трогаются, и следующий запрос их находит.
+    номера: list[str] = []
+    уже: set[str] = set()
+    ещё = False
+    for _ in range(ERASE_PASSES):
+        найдено = найти(уже)
+        if not найдено:
+            break
+        for job in найдено:
+            _delete_one(state, job, principal)
+            уже.add(str(job["id"]))
+            номера.append(str(job["id"]))
+        if len(найдено) < BULK_LIMIT:
+            break
+    else:
+        ещё = bool(найти(уже))
     # Звонки без задания (пропущенные — короткий, без записи, не отвечен)
     # хранят тот же номер: обезличиваются и они, ключ остаётся. Звонки
-    # удалённых записей обезличило уже само удаление — в ответе все, что
-    # нашлись по запросу.
+    # удалённых записей обезличило уже само удаление; звонки записей,
+    # которые остались (см. `more`), не трогаются — по ним субъекта найдёт
+    # следующий запрос.
     state.db.erase_calls(запрос)
-    обезличено = звонков
+    обезличено = звонков - state.db.erase_calls_count(запрос)
     # Ответы модели, положенные в кеш до того, как он узнал свои записи.
     из_кеша = state.db.llm_cache_forget_matching(запрос)
     # Следы в указателе поиска и словаре форм — сразу, а не суточной
@@ -871,7 +996,8 @@ def erase(request: Request,
                        {"count": len(номера), "calls": обезличено, "by": principal.name})
     return {"dry_run": False, "deleted": len(номера), "ids": номера,
             "calls": обезличено, "llm_cache": из_кеша,
-            "index_purged": bool(уборка.get("fts")), "limit": BULK_LIMIT}
+            "index_purged": bool(уборка.get("fts")), "limit": BULK_LIMIT,
+            "more": ещё}
 
 
 @router.get("/maintenance/consent", summary="Записи без отметки о согласии")
@@ -902,8 +1028,11 @@ def unload_models(request: Request,
                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     require_admin(principal)
-    state.registry.unload_all()
-    return {"unloaded": True}
+    # Сколько выгружено и сколько занято идущими заданиями: занятые модели
+    # не трогаются — выгрузка посреди распознавания роняла идущее задание
+    # (см. `EngineRegistry.unload_all`).
+    итог = state.registry.unload_all(кроме_занятых=True) or {}
+    return {"unloaded": True, **итог, "busy_kept": итог.get("busy", 0)}
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +1059,19 @@ def system_selfcheck(request: Request,
     сервер нездоров, незачем.
     """
     state = get_state(request)
-    свод = selfcheck.состояние(state, глубоко=bool(deep))
+    if deep and not principal.is_admin:
+        # Глубокая проверка — это PRAGMA quick_check по всей базе, разбор
+        # станций, проба сервера модели и соединения наружу, без паузы между
+        # вызовами. Любой ключ, вплоть до «только чтение», мог запускать её
+        # сколько угодно. Не администратору — последний глубокий свод, если
+        # он свежее пяти минут, и новый не чаще этого.
+        свод = _глубокий_свод_с_кешем(state)
+    else:
+        свод = selfcheck.состояние(state, глубоко=bool(deep))
+        if deep:
+            import copy  # noqa: PLC0415
+
+            _ГЛУБОКИЙ_СВОД.update(at=time.monotonic(), свод=copy.deepcopy(свод))
     # Запись в журнал — только по изменениям и только от администратора.
     # Иначе опрос панели обычным ключом наполнял бы ленту событий теми же
     # строками, а мы бы ещё и писали в базу на каждый GET.
@@ -944,6 +1085,27 @@ def system_selfcheck(request: Request,
     else:
         свод = selfcheck.спрятать_пути(свод, state.settings)
     return свод
+
+
+#: Последний глубокий свод самопроверки и когда он собран (`time.monotonic`).
+_ГЛУБОКИЙ_СВОД: dict[str, Any] = {"at": 0.0, "свод": None}
+
+#: Как долго глубокий свод годится для ответа не администратору.
+ГЛУБОКИЙ_СВОД_С = 300.0
+
+_ЗАМОК_ГЛУБОКОГО = threading.Lock()
+
+
+def _глубокий_свод_с_кешем(state: Any) -> dict[str, Any]:
+    """Глубокий свод не чаще раза в `ГЛУБОКИЙ_СВОД_С` для не администратора."""
+    import copy  # noqa: PLC0415
+
+    with _ЗАМОК_ГЛУБОКОГО:
+        свод = _ГЛУБОКИЙ_СВОД.get("свод")
+        if свод is None or time.monotonic() - float(_ГЛУБОКИЙ_СВОД["at"]) > ГЛУБОКИЙ_СВОД_С:
+            свод = selfcheck.состояние(state, глубоко=True)
+            _ГЛУБОКИЙ_СВОД.update(at=time.monotonic(), свод=свод)
+        return copy.deepcopy(свод)
 
 
 #: Виды событий, которые считаются неисправностями, и их уровень. Уровня у
@@ -1147,10 +1309,11 @@ def crm_test(request: Request, job_id: str = Query(default="", max_length=64),
         разбор: dict[str, Any] = {
             "sentiment": {"label": "нейтральная", "turn": {"shift": 0.1}},
             "compliance": {"score": 0.9}, "scorecard": {"score": 82},
-            "categories": {"topics": [{"name": "оплата"}]},
+            "categories": {"items": [{"id": "payment", "label": "Оплата", "count": 1}]},
             "llm": {"summary": "Клиент просит выставить счёт на оплату.",
                     "reason": "счёт", "outcome": "решено",
-                    "actions": [{"text": "выставить счёт"}]}}
+                    "actions": [{"what": "выставить счёт", "who": "сотрудник",
+                                 "when": "сегодня"}]}}
     else:
         разбор = dict((state.db.get_content(job_id) or {}).get("detail") or {})
         модель = state.db.llm_get(job_id)

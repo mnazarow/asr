@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -152,13 +153,17 @@ def собрать(job: dict[str, Any], разбор: dict[str, Any] | None = No
     # смысловой слой необязателен, и без него в карточку уйдёт всё
     # остальное, а не ничего.
     модель = разбор.get("llm") or {}
-    категории = (разбор.get("categories") or {}).get("topics") or []
+    # Категории записи — сработавшие пункты набора (`items` с ненулевым
+    # счётом), как их кладёт разбор. Ключа `topics` разбор не выдаёт вовсе,
+    # и поле «categories» уходило в CRM пустым всегда; показательный пример
+    # «Проверить» был собран как раз с `topics` и выглядел верно.
+    узел = разбор.get("categories") or {}
+    категории = ([к for к in (узел.get("items") or [])
+                  if not isinstance(к, dict) or к.get("count") is None or к.get("count")]
+                 or узел.get("topics") or [])
 
     текст = str(job.get("text") or "")
     пересказ = str(модель.get("summary") or "")
-    if mask:
-        текст = masking.mask_text(текст)
-        пересказ = masking.mask_text(пересказ)
 
     данные: dict[str, Any] = {
         "summary": пересказ,
@@ -170,11 +175,11 @@ def собрать(job: dict[str, Any], разбор: dict[str, Any] | None = No
         "score": оценка.get("score"),
         "compliance": скрипт.get("score"),
         "categories": ", ".join(
-            str(к.get("name") or к) if isinstance(к, dict) else str(к)
+            str(к.get("label") or к.get("name") or к.get("id") or "") if isinstance(к, dict)
+            else str(к)
             for к in категории[:10]),
-        "actions": "; ".join(
-            str(д.get("text") or д) if isinstance(д, dict) else str(д)
-            for д in _список(модель.get("actions"))[:10]),
+        "actions": "; ".join(д for д in (_действие(д) for д in _список(модель.get("actions"))[:10])
+                             if д),
         "duration_s": job.get("media_duration_s"),
         "agent": звонок.get("agent") or "",
         "phone": звонок.get("src") or "",
@@ -183,8 +188,32 @@ def собрать(job: dict[str, Any], разбор: dict[str, Any] | None = No
                  if base_url else str(job.get("id") or "")),
     }
     if mask:
-        данные["phone"] = masking.mask_text(str(данные["phone"]))
+        # Обезличивается всё текстовое, а не только расшифровка, пересказ и
+        # номер: действия к исполнению несут цитату («перезвоню на номер 8 916
+        # 123-45-67»), причина и исход — слова модели о разговоре.
+        for ключ, значение in данные.items():
+            if ключ != "link" and isinstance(значение, str) and значение:
+                данные[ключ] = masking.mask_text(значение)
     return данные
+
+
+def _действие(д: Any) -> str:
+    """Действие к исполнению строкой: «что (кто, срок)».
+
+    Модель кладёт действие объектом с полями what, who, when и quote, а
+    сборка читала `text` — которого нет — и подставляла весь словарь Питона:
+    в карточку сделки уходило «{'what': …, 'quote': '…8 916 123-45-67.'}»,
+    мимо обезличивания и с цитатой целиком.
+    """
+    if not isinstance(д, dict):
+        return str(д or "").strip()
+    что = str(д.get("what") or д.get("text") or "").strip()
+    if not что:
+        return ""
+    кто = str(д.get("who") or "").strip()
+    когда = str(д.get("when") or "").strip()
+    уточнение = ", ".join(ч for ч in (кто, когда) if ч)
+    return f"{что} ({уточнение})" if уточнение else что
 
 
 def _список(значение: Any) -> list[Any]:
@@ -290,6 +319,15 @@ def запросы(данные: dict[str, Any], настройки: Настр�
                 "Не указано, к какой сущности amoCRM добавлять примечание.",
                 hint="Идентификатор берётся из поля звонка userfield или "
                      "accountcode; задайте его на АТС или передайте в задании.")
+        # Номер сущности amoCRM — только число: он подставляется в путь
+        # запроса с токеном интеграции, и «../contacts/5» или
+        # «1/../../../private/api/v2/hooks?x=» уводили примечание (и токен)
+        # в чужую сущность и чужой раздел API.
+        if not re.fullmatch(r"[0-9]{1,20}", str(entity_id)):
+            raise CRMError(
+                f"Номер сущности amoCRM «{str(entity_id)[:40]}» — не число.",
+                hint="В amoCRM у сделки, контакта и компании номер из цифр; "
+                     "проверьте поле звонка или crm_entity_id задания.")
         сущность = {"lead": "leads", "contact": "contacts",
                     "company": "companies"}.get(настройки.entity, "leads")
         заголовки["Authorization"] = f"Bearer {настройки.token}"
@@ -405,14 +443,28 @@ def сущность_из(job: dict[str, Any], звонок: dict[str, Any] | No
     for поле in ПОЛЯ_СДЕЛКИ:
         значение = str((звонок or {}).get(поле) or "").strip()
         if значение:
-            return значение
+            return значение if _годный_номер(значение) else ""
     параметры = job.get("params") or {}
     if isinstance(параметры, dict):
         for ключ in ("crm_entity_id", "entity_id", "deal_id", "lead_id"):
             значение = str(параметры.get(ключ) or "").strip()
             if значение:
-                return значение
+                return значение if _годный_номер(значение) else ""
     return ""
+
+
+def _годный_номер(значение: str) -> bool:
+    """Номер сущности CRM — только цифры.
+
+    Номер подставляется в путь запроса с токеном интеграции: «../contacts/5»
+    из тела `/api/jobs/text` уводил примечание в чужой раздел amoCRM, а
+    «1/../../../private/api/v2/hooks?x=» — в служебный адрес. У amoCRM и
+    Bitrix24 номера сделок, лидов и контактов — целые числа.
+    """
+    if re.fullmatch(r"\d{1,20}", значение):
+        return True
+    log.warning("Номер сущности CRM «%s» отвергнут: ожидаются только цифры", значение[:60])
+    return False
 
 
 def отправить_разбор(db: Any, settings: Any, job_id: str, *,

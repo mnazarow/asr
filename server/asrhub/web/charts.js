@@ -49,10 +49,40 @@
     return node;
   }
 
+  /* Подпись, которая не шире `ширина`: длинная укорачивается многоточием,
+   * полная — во всплывающей подсказке.
+   *
+   * Подпись строки в горизонтальных столбцах прижата правым краем к
+   * столбцам, и всё, что шире поля имён, уходило за левый край рисунка:
+   * «Техническая поддержка корпоративных клиентов» читалась как
+   * «орпоративных клиентов». Очереди, причины и темы различаются обычно
+   * началом — его и сохраняем. Ширина меряется браузером; узел вне
+   * документа (ширина 0) — по оценке, шесть с половиной пикселей на знак. */
+  function уместить(node, текст, ширина) {
+    const полный = String(текст === null || текст === undefined ? '' : текст);
+    node.textContent = полный;
+    const мерить = () => {
+      try { return node.getComputedTextLength(); } catch (e) { return 0; }
+    };
+    let длина = мерить();
+    if (!длина) длина = полный.length * 6.5;
+    if (длина <= ширина || полный.length < 2) return node;
+    let знаков = Math.max(1, Math.floor(полный.length * ширина / длина));
+    node.textContent = `${полный.slice(0, знаков)}…`;
+    while (знаков > 1 && (мерить() || (знаков + 1) * 6.5) > ширина) {
+      знаков -= 1;
+      node.textContent = `${полный.slice(0, знаков)}…`;
+    }
+    // Полная — подсказкой, а не <title>: тот стал бы частью textContent.
+    node.dataset.full = полный;
+    attachTip(node, полный);
+    return node;
+  }
+
   /* Экранирование подписи для разметки.
  *
- * Единственное место в этом файле, где подпись попадает в innerHTML, а не
- * текстовым узлом (соседняя легенда делает createTextNode нарочно).
+ * Для тех мест этого файла, где текст попадает в innerHTML, а не текстовым
+ * узлом (легенда делает createTextNode нарочно): подписи и заглушка empty().
  * Подписи приходят с сервера, а часть из них — это значения настроек,
  * которые пишет администратор: «исходы разговора» задаются строками, и
  * строка с разметкой исполнялась бы у каждого, кто открыл раздел.
@@ -69,7 +99,12 @@ function escText(value) {
  * значение выглядело по-разному в двух местах. Запятая только в тексте:
  * в разметку (ширины, координаты) эти строки не попадают. */
 function fmtNum(value, digits) {
-    if (value === null || value === undefined || Number.isNaN(value)) return '—';
+    // Строка с числом («12.5» из ответа или поля ввода) падала на toFixed.
+    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+      value = Number(value);
+    }
+    if (value === null || value === undefined || typeof value !== 'number'
+        || Number.isNaN(value)) return '—';
     const abs = Math.abs(value);
     const запятая = (строка) => строка.replace('.', ',');
     if (abs >= 1e9) return запятая((value / 1e9).toFixed(1)) + ' млрд';
@@ -205,13 +240,30 @@ function fmtNum(value, digits) {
           : подписьДеления(value, знаков));
     });
     if (xLabels && xLabels.length) {
-      const step = Math.max(1, Math.ceil(xLabels.length / (opts && opts.xTicks || 7)));
-      xLabels.forEach((label, index) => {
-        if (index % step !== 0 && index !== xLabels.length - 1) return;
-        const x = pad.left + (xLabels.length === 1 ? iw / 2
-          : (index / (xLabels.length - 1)) * iw);
+      const n = xLabels.length;
+      const xOf = (index) => pad.left + (n === 1 ? iw / 2 : (index / (n - 1)) * iw);
+      // Шаг подписей — и по их числу, и по ширине самой длинной (около
+      // шести пикселей на знак при 10,5 px): «дд.мм чч:00» на узком графике
+      // слипались уже с семнадцати точек.
+      const ширина = Math.max(...xLabels.map((l) => String(l).length)) * 6 + 6;
+      const поШирине = n > 1 ? Math.ceil(ширина / (iw / (n - 1))) : 1;
+      const step = Math.max(1, Math.ceil(n / (opts && opts.xTicks || 7)), поШирине);
+      const показать = [];
+      for (let index = 0; index < n; index += step) показать.push(index);
+      // Последняя подпись — всегда, это правый край оси. Ставилась она и
+      // раньше, но независимо от шага и наезжала на предыдущую; теперь
+      // предыдущая уступает ей место.
+      if (n > 1 && показать[показать.length - 1] !== n - 1) {
+        if (xOf(n - 1) - xOf(показать[показать.length - 1]) < ширина) показать.pop();
+        показать.push(n - 1);
+      }
+      показать.forEach((index) => {
+        // Крайние сдвигаются внутрь рисунка: по центру над точкой они
+        // срезались его краем («10.10 01:0»).
+        const половина = String(xLabels[index]).length * 3 + 2;
+        const x = Math.max(половина, Math.min(ctx.width - половина, xOf(index)));
         el('text', { x, y: pad.top + ih + 15, 'text-anchor': 'middle',
-                     fill: faint(), 'font-size': 10.5 }, svg).textContent = label;
+                     fill: faint(), 'font-size': 10.5 }, svg).textContent = xLabels[index];
       });
     }
   }
@@ -282,7 +334,9 @@ function fmtNum(value, digits) {
     ctx.yMax = Math.max(max, ticks[ticks.length - 1]);
     axes(ctx, ticks, config.labels, config);
 
-    const count = Math.max(1, (config.labels || series[0].values).length - 1);
+    // Одна точка — посередине, под своей подписью: `Math.max(1, …)` делал
+    // ветку «count === 0» недостижимой, и точка вставала у левого края.
+    const count = Math.max(0, (config.labels || series[0].values).length - 1);
     const xAt = (i) => ctx.pad.left + (count === 0 ? ctx.iw / 2 : (i / count) * ctx.iw);
     const yAt = (v) => ctx.pad.top + ctx.ih -
       ((v - ctx.yMin) / (ctx.yMax - ctx.yMin)) * ctx.ih;
@@ -538,8 +592,9 @@ function fmtNum(value, digits) {
         ? Math.max(2, (Math.abs(значение) / предел) * (ctx.iw / 2))
         : Math.max(2, (Math.abs(по_модулю ? значение : Math.max(0, значение)) / max) * ctx.iw);
       const x = двусторонний && значение < 0 ? ноль - длина : ноль;
-      el('text', { x: ctx.pad.left - 10, y: y + rowHeight / 2 + 4, 'text-anchor': 'end',
-                   fill: ink(), 'font-size': 12 }, ctx.svg).textContent = item.label;
+      уместить(el('text', { x: ctx.pad.left - 10, y: y + rowHeight / 2 + 4, 'text-anchor': 'end',
+                            fill: ink(), 'font-size': 12 }, ctx.svg),
+               item.label, labelWidth - 14);
       const цвет = item.color || (двусторонний
         ? (значение < 0 ? s.err : значение > 0 ? s.ok : s.idle)
         : по_модулю ? s.err : colors[index % colors.length]);
@@ -675,11 +730,13 @@ function fmtNum(value, digits) {
       const row = document.createElement('div');
       row.className = 'row';
       row.style.gap = '7px';
-      row.innerHTML = `<i style="width:10px;height:10px;border-radius:2px;background:${
-        part.color || colors[index % colors.length]};display:inline-block"></i>` +
+      // Цвет — свойством стиля, а не текстом атрибута: строка с кавычкой
+      // в part.color закрыла бы атрибут и дописала разметку.
+      row.innerHTML = '<i style="width:10px;height:10px;border-radius:2px;display:inline-block"></i>' +
         `<span class="dim">${escText(part.label)}</span><span class="spacer"></span>` +
         `<b class="mono">${fmtNum(part.value)}</b>` +
         `<span class="faint mono">${((part.value / total) * 100).toFixed(0)} %</span>`;
+      row.firstElementChild.style.background = part.color || colors[index % colors.length];
       if (part.pick !== false) pickable(row, config, исходный(part), part);
       if (part.pick !== false && typeof config.onPick === 'function') row.classList.add('pick-row');
       list.appendChild(row);
@@ -725,14 +782,18 @@ function fmtNum(value, digits) {
     const height = cell + 26;
     const svg = el('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`,
                             width: '100%', height }, host);
-    const max = Math.max(...values) || 1;
+    // Отрицательные значения шкале не по силам: доля выходила меньше нуля,
+    // ramp[-1] — undefined, и клетка оставалась без заливки, то есть чёрной.
+    // Та же беда была в grid() и исправлена там; здесь отрицательное — «мало».
+    const max = Math.max(...values.map((v) => Math.max(0, Number(v) || 0))) || 1;
     // Последовательная шкала: один тон. На светлой поверхности идёт от светлого
     // к тёмному, на тёмной — наоборот, чтобы «мало» всегда сливалось с фоном,
     // а «много» контрастировало. Иначе шкала читается перевёрнуто.
     const rampLight = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95'];
     const ramp = mode() === 'light' ? rampLight : rampLight.slice().reverse();
     values.forEach((value, index) => {
-      const level = max ? Math.min(ramp.length - 1, Math.floor((value / max) * ramp.length)) : 0;
+      const level = max ? Math.max(0, Math.min(ramp.length - 1,
+        Math.floor((Math.max(0, Number(value) || 0) / max) * ramp.length))) : 0;
       const x = 30 + index * cell;
       const rect = el('rect', { x, y: 4, width: cell - 2, height: cell - 2, rx: 3,
                                 fill: value ? ramp[level] : gridColor() }, svg);
@@ -998,7 +1059,9 @@ function fmtNum(value, digits) {
   }
 
   function empty(host, text) {
-    host.innerHTML = `<div class="empty small">${text || 'Пока нет данных для графика'}</div>`;
+    // Текст — экранированным: сейчас его передают литералами, но функция
+    // общая, и строка с сервера в ней исполнилась бы разметкой.
+    host.innerHTML = `<div class="empty small">${escText(text || 'Пока нет данных для графика')}</div>`;
     return null;
   }
 
@@ -1293,7 +1356,51 @@ function fmtNum(value, digits) {
     return ctx.svg;
   }
 
-  global.Charts = { line, bars, hbars, stacked, donut, spark, heat, grid, waveform,
-                    combo, pareto, calendar, scatter,
+  /* Перерисовка по ширине окна.
+   *
+   * Ширина берётся из узла в момент отрисовки и зашивается в viewBox: окно
+   * сузили с 1600 до 1000 px — график сжимался вдвое, и подписи осей
+   * становились пятипиксельными. Графики, ширина которых зависит от узла,
+   * запоминают, чем и с чем нарисованы, и после изменения окна (с
+   * задержкой, раз на серию событий) перерисовываются сами — без запросов
+   * к серверу и без перерисовки раздела. */
+  const нарисованные = new Set();
+  function поШирине(рисовать) {
+    return function (host, config) {
+      const итог = рисовать(host, config);
+      if (host) delete host.__чертёж;
+      // Запоминается только нарисованное: заглушку «нет данных» по ширине
+      // перерисовывать незачем. Рисунок — чтобы узнать, не заменили ли его
+      // с тех пор чем-то другим (другим графиком или разметкой раздела).
+      if (host && итог && !(config && config.width)) {
+        host.__чертёж = { рисовать, config, ширина: host.clientWidth, рисунок: итог };
+        нарисованные.add(host);
+        if (нарисованные.size > 300) {
+          нарисованные.forEach((узел) => { if (!узел.isConnected) нарисованные.delete(узел); });
+        }
+      }
+      return итог;
+    };
+  }
+  let таймерШирины = null;
+  // Вне браузера (проверки гоняют файл в node с подставным global) окна нет.
+  if (typeof global.addEventListener === 'function') global.addEventListener('resize', () => {
+    clearTimeout(таймерШирины);
+    таймерШирины = setTimeout(() => {
+      нарисованные.forEach((узел) => {
+        if (!узел.isConnected) { нарисованные.delete(узел); return; }
+        const ч = узел.__чертёж;
+        if (!ч || !узел.contains(ч.рисунок)) { нарисованные.delete(узел); return; }
+        if (!узел.clientWidth || Math.abs(узел.clientWidth - ч.ширина) < 8) return;
+        ч.ширина = узел.clientWidth;
+        ч.рисунок = ч.рисовать(узел, ч.config);
+      });
+    }, 250);
+  });
+
+  global.Charts = { line: поШирине(line), bars: поШирине(bars), hbars: поШирине(hbars),
+                    stacked, donut, spark, heat, grid, waveform,
+                    combo: поШирине(combo), pareto: поШирине(pareto), calendar,
+                    scatter: поШирине(scatter),
                     palette, status, fmtNum, legend, empty, splitRuns, dotsFit };
 })(window);

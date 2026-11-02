@@ -47,7 +47,10 @@ class TicketStore:
             # цикл переподключения мог бы наращивать словарь без предела.
             if len(self._items) > 512:
                 self._items.clear()
-            self._items[ticket] = (time.time() + self._ttl, token)
+            # Срок — по монотонным часам: билет живёт в памяти процесса, и
+            # перевод системных часов назад продлевал бы его на час, а вперёд
+            # — гасил все разом.
+            self._items[ticket] = (time.monotonic() + self._ttl, token)
         return ticket, int(self._ttl)
 
     def redeem(self, ticket: str) -> str:
@@ -57,12 +60,12 @@ class TicketStore:
         with self._lock:
             self._prune()
             item = self._items.pop(ticket, None)
-        if not item or item[0] < time.time():
+        if not item or item[0] < time.monotonic():
             return ""
         return item[1]
 
     def _prune(self) -> None:
-        now = time.time()
+        now = time.monotonic()
         for key in [k for k, (expires, _) in self._items.items() if expires < now]:
             self._items.pop(key, None)
 
@@ -95,6 +98,13 @@ class AppState:
     #: Учётные записи и сессии веб-интерфейса. Ключи доступа живут отдельно и
     #: работают как раньше: они для программ, учётные записи — для людей.
     accounts: Accounts | None = None
+    #: Фоновая запись журнала доступа (`audit.Писатель`).
+    audit_writer: Any = None
+    #: Лента событий веб-сокетов (`app.EventHub`): обработчикам отзыва и
+    #: выхода нужно закрывать сокеты.
+    events: Any = None
+    #: Пул потоков диктовки (`app._в_потоке_диктовки`).
+    stream_pool: Any = None
     _rate: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     #: Замок к окнам частоты. Проверка ключа — обычная (не async)
     #: зависимость, а такие FastAPI выполняет в пуле потоков: два запроса
@@ -102,18 +112,38 @@ class AppState:
     #: запись, и второй `popleft()` падал `IndexError` на пустой очереди —
     #: пятисоткой на совершенно исправном запросе.
     _rate_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: С какого размера словаря окон пора его чистить (см. `_вычистить_окна`).
+    _rate_чистка: int = 1024
 
     def check_rate(self, key: str, limit: int) -> None:
         if limit <= 0:
             return
-        now = time.time()
+        # Монотонные часы: окно живёт в памяти процесса, и перевод системных
+        # часов на час назад запирал ключ с исчерпанным окном на час.
+        now = time.monotonic()
         with self._rate_lock:
+            self._вычистить_окна(now)
             window = self._rate[key]
             while window and now - window[0] > 60:
                 window.popleft()
             if len(window) >= limit:
                 raise RateLimited(limit, retry_after_s=int(60 - (now - window[0])) + 1)
             window.append(now)
+
+    def _вычистить_окна(self, now: float) -> None:
+        """Убирает окна, в которых за минуту ничего не было.
+
+        Словарь рос без предела: ключ «login:<адрес>» оставался навсегда, а
+        за доверенным прокси клиент наращивал его произвольными строками в
+        X-Forwarded-For. Чистим не на каждом запросе, а когда словарь
+        заметно вырос.
+        """
+        if len(self._rate) <= self._rate_чистка:
+            return
+        for ключ in [к for к, окно in self._rate.items()
+                     if not окно or now - окно[-1] > 60]:
+            self._rate.pop(ключ, None)
+        self._rate_чистка = max(1024, 2 * len(self._rate))
 
 
 def get_state(request: Request) -> AppState:
@@ -183,6 +213,11 @@ def _session_principal(request: Request, state: AppState) -> Principal | None:
     account = accounts.session_account(token)
     if account is None:
         return None
+    if getattr(account, "продлена_до", 0):
+        # Сессию продлили на сервере — продлеваем и куку (это сделает
+        # прослойка после ответа): иначе браузер выбрасывал её через неделю
+        # от входа при любой работе.
+        request.state.session_refresh = (token, float(account.продлена_до))
 
     # Проверка происхождения запроса. Кука уходит на сервер сама, поэтому
     # чужая страница могла бы отправить запрос от имени вошедшего человека.
@@ -199,23 +234,63 @@ def _session_principal(request: Request, state: AppState) -> Principal | None:
     limit = int(state.settings.get("rate_limit_per_minute") or 0)
     state.check_rate(f"user:{account.id}", limit)
 
-    peers: tuple[str, ...] = ()
-    if account.group:
-        names = {other.username for other in accounts.list()
-                 if other.group == account.group}
-        names.update(str(info.get("name") or "ключ")
-                     for info in state.settings.api_keys.values()
-                     if str(info.get("group") or "") == account.group)
-        peers = tuple(sorted(names))
-
-    principal = Principal(name=account.username, role=account.role,
-                          group=account.group, peers=peers,
-                          user_id=account.id,
-                          must_change_password=account.must_change_password)
+    principal = участник_записи(state, account)
     if principal.must_change_password \
             and request.url.path not in _PASSWORD_CHANGE_ALLOWED:
         raise PasswordChangeRequired()
     return principal
+
+
+def коллеги(state: AppState, group: str) -> tuple[str, ...]:
+    """Имена всех участников подразделения: и ключей, и учётных записей.
+
+    Одна сборка на оба пути входа. Раньше у сессии в коллеги попадали и
+    учётные записи группы, и её ключи, а у ключа — только ключи: учётная
+    запись видела задания ключа своей группы, а ключ задания учётной записи
+    той же группы — нет, и карточка отвечала ему 403.
+    """
+    if not group:
+        return ()
+    names = {str(info.get("name") or "ключ")
+             for info in state.settings.api_keys.values()
+             if str(info.get("group") or "") == group}
+    accounts = state.accounts
+    if accounts is not None:
+        try:
+            names.update(other.username for other in accounts.list()
+                         if other.group == group)
+        except Exception as exc:                               # noqa: BLE001
+            # Таблицы учётных записей может не быть (база до миграции): ключи
+            # обязаны работать и тогда — с коллегами-ключами.
+            log.debug("Коллеги по группе «%s» без учётных записей: %s", group, exc)
+    return tuple(sorted(names))
+
+
+def участник_ключа(state: AppState, token: str, info: dict[str, Any]) -> Principal:
+    """Участник по ключу доступа — одинаково для HTTP и веб-сокетов."""
+    group = str(info.get("group") or "")
+    return Principal(key=token, name=str(info.get("name") or "ключ"),
+                     group=group, peers=коллеги(state, group),
+                     quota_jobs_per_day=int(info.get("quota_jobs_per_day") or 0),
+                     quota_audio_hours_per_day=float(
+                         info.get("quota_audio_hours_per_day") or 0),
+                     quota_storage_gb=float(info.get("quota_storage_gb") or 0),
+                     mask_pii=bool(info.get("mask_pii")),
+                     role=str(info.get("role") or "user"))
+
+
+def участник_записи(state: AppState, account: Any) -> Principal:
+    """Участник по учётной записи — одинаково для HTTP и веб-сокетов."""
+    return Principal(name=account.username, role=account.role,
+                     group=account.group, peers=коллеги(state, account.group),
+                     user_id=account.id,
+                     must_change_password=account.must_change_password)
+
+
+def ключ_действует(state: AppState, token: str) -> bool:
+    """Жив ли ключ: не отозван и не отключён — проверка без базы."""
+    info = state.settings.api_keys.get(token) if token else None
+    return bool(info) and info.get("enabled") is not False
 
 
 def token_from(x_api_key: str | None, authorization: str | None,
@@ -315,21 +390,7 @@ def _проверить(request: Request, x_api_key: str | None,
 
     limit = int(info.get("rate_limit") or state.settings.get("rate_limit_per_minute") or 0)
     state.check_rate(token, limit)
-    group = str(info.get("group") or "")
-    peers: tuple[str, ...] = ()
-    if group:
-        peers = tuple(sorted({
-            str(other.get("name") or "ключ")
-            for other in state.settings.api_keys.values()
-            if str(other.get("group") or "") == group}))
-    return Principal(key=token, name=str(info.get("name") or "ключ"),
-                     group=group, peers=peers,
-                     quota_jobs_per_day=int(info.get("quota_jobs_per_day") or 0),
-                     quota_audio_hours_per_day=float(
-                         info.get("quota_audio_hours_per_day") or 0),
-                     quota_storage_gb=float(info.get("quota_storage_gb") or 0),
-                     mask_pii=bool(info.get("mask_pii")),
-                     role=str(info.get("role") or "user"))
+    return участник_ключа(state, token, info)
 
 
 async def authenticate_body_key(request: Request) -> Principal:
@@ -455,6 +516,22 @@ def допуск_к_метрикам(request: Request) -> None:
                                              request.headers.get("authorization"))
     except ASRHubError as exc:
         raise error_response(exc) from exc
+
+
+def закрыть_сокеты(request: Any, условие: Any, *, reason: str) -> None:
+    """Закрывает веб-сокеты по условию — для обработчиков, у которых есть запрос.
+
+    Ошибка здесь не должна отменять то, ради чего обработчик звали: ключ
+    уже отозван, запись уже отключена — сокет закроет перепроверка.
+    """
+    hub = getattr(getattr(request, "app", None), "state", None)
+    hub = getattr(hub, "events", None)
+    if hub is None:
+        return
+    try:
+        hub.close_where(условие, reason=reason)
+    except Exception as exc:                                # noqa: BLE001
+        log.debug("Сокеты не закрыты: %s", exc)
 
 
 def error_response(exc: ASRHubError) -> HTTPException:

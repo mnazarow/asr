@@ -1252,8 +1252,10 @@ def test_образ_ставит_движок_со_спутниками_треб
                    encoding="utf-8")
     pip.chmod(0o755)
     shutil.copytree(КОРЕНЬ / "requirements", tmp_path / "requirements")
-    блок = _блок_движков_из_dockerfile().replace("/opt/venv/.asrhub-engines",
-                                                  str(tmp_path / "engines.txt"))
+    # Заход 54: блок пишет ещё и ограничения версий torch — тоже в /opt/venv.
+    блок = (_блок_движков_из_dockerfile()
+            .replace("/opt/venv/.asrhub-engines", str(tmp_path / "engines.txt"))
+            .replace("/opt/venv/.asrhub-torch-constraints", str(tmp_path / "torch.txt")))
     итог = subprocess.run(["sh", "-c", блок], cwd=str(tmp_path), capture_output=True, text=True,
                           timeout=60, env={**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}",
                                            "ENGINES": "gigaam,postprocess", "PROFILE": "standard"})

@@ -68,10 +68,22 @@ class DependencyMissing(ASRHubError):
 
     def __init__(self, engine: str, package: str = "", cause: BaseException | None = None):
         pkg = package or engine
+        # Файл требований — из каталога движков: у qwen3_asr он называется
+        # qwen3-asr.txt, у faster_whisper — faster-whisper.txt, и подсказка
+        # отправляла ставить несуществующий файл.
+        файл = engine
+        try:
+            from .catalog import get_engine  # noqa: PLC0415
+
+            описание = get_engine(engine)
+            if описание is not None and описание.requirements_file:
+                файл = описание.requirements_file
+        except Exception:                                   # noqa: BLE001
+            pass
         super().__init__(
             f"Для движка «{engine}» не установлен пакет «{pkg}».",
             hint=(f"Выполните на сервере: bash scripts/models.sh install-engine {engine}\n"
-                  f"или вручную: pip install -r requirements/engines/{engine}.txt"),
+                  f"или вручную: pip install -r requirements/engines/{файл}.txt"),
             details={"engine": engine, "package": pkg},
             cause=cause,
         )
@@ -250,6 +262,24 @@ class FileTooLarge(ASRHubError):
             f"Размер файла {size_mb:.1f} МБ превышает предел {limit_mb} МБ.",
             hint=("Увеличьте max_upload_mb в настройках сервера или разбейте файл на части. "
                   "Не забудьте про client_max_body_size в nginx, если используете обратный прокси."),
+            details={"size_mb": size_mb, "limit_mb": limit_mb},
+        )
+
+
+class RequestTooLarge(FileTooLarge):
+    """Тело запроса без файла превышает допустимый размер.
+
+    Код тот же, что у слишком большого файла: клиенту важно одно — «413,
+    тело больше предела», — а различать их по коду незачем. Отличаются
+    объяснение и параметр, которым предел поднимают.
+    """
+
+    def __init__(self, size_mb: float, limit_mb: int):
+        ASRHubError.__init__(
+            self,
+            f"Тело запроса {size_mb:.1f} МБ превышает предел {limit_mb} МБ.",
+            hint=("Запросы без файла — JSON настроек, входа, переписки — ограничены "
+                  "параметром max_request_mb. Записи грузите файлом (multipart)."),
             details={"size_mb": size_mb, "limit_mb": limit_mb},
         )
 
@@ -514,6 +544,12 @@ class StorageError(ASRHubError):
 _OOM_MARKERS = (
     "out of memory", "cuda out of memory", "cublas_status_alloc_failed",
     "hip out of memory", "mps backend out of memory", "не хватает памяти",
+    # Нехватка обычной памяти, а не видеопамяти. Эти не считались нехваткой
+    # памяти вовсе — уходили в «ошибку движка» и повторялись с тем же
+    # пакетом: на сервере без видеокарты уменьшение пакета не срабатывало
+    # никогда. PyTorch на CPU, onnxruntime, C++-аллокатор, ENOMEM.
+    "can't allocate memory", "defaultcpuallocator", "std::bad_alloc",
+    "failed to allocate memory", "cannot allocate memory",
 )
 #: Признаки того, что видеокарты у процесса нет вовсе. Их легко спутать с
 #: нехваткой памяти или поломкой движка, а лечатся они совсем иначе: движок
@@ -539,6 +575,12 @@ _NETWORK_MARKERS = (
     "connection", "timed out", "temporary failure in name resolution",
     "max retries exceeded", "ssl", "proxy",
 )
+#: Те же признаки — целыми словами. Подстрокой «ssl» находилась в «lossless»,
+#: «connection» — в KeyError('connection_id'): отказ самого движка выдавался
+#: за сетевую ошибку с советом проверить интернет, а исходный текст
+#: выбрасывался.
+_NETWORK_RE = re.compile(
+    r"(?<![\w])(?:" + "|".join(re.escape(м) for м in _NETWORK_MARKERS) + r")(?![\w])")
 _GATED_MARKERS = (
     "gated repo", "awaiting a review", "accept the conditions", "401 client error",
     "you must be authenticated",
@@ -547,7 +589,11 @@ _GATED_MARKERS = (
 
 #: Абсолютный путь в тексте, который увидит человек. Достаточно широко,
 #: чтобы поймать и POSIX, и Windows.
-_ПУТЬ = re.compile(r"(?:[A-Za-z]:)?[/\\][^\s'\"<>|,;]{2,}")
+#:
+#: Путь начинается там, где перед ним нет буквы, цифры, двоеточия, косой или
+#: точки: иначе «https://huggingface.co/…/speaker-diarization-3.1» превращался
+#: в «httpspeaker-diarization-3.1», а «5/10» — в «510».
+_ПУТЬ = re.compile(r"(?<![\w:/.\\])(?:[A-Za-z]:)?[/\\][^\s'\"<>|,;]{2,}")
 
 
 def без_путей(текст: str) -> str:
@@ -584,6 +630,8 @@ def classify_exception(exc: BaseException, *, engine: str = "", model: str = "")
 
     text = f"{type(exc).__name__}: {exc}".lower()
 
+    if isinstance(exc, MemoryError):
+        return OutOfMemoryError(device="RAM", cause=exc)
     if any(m in text for m in _OOM_MARKERS):
         device = "GPU" if "cuda" in text or "hip" in text else "MPS" if "mps" in text else "RAM"
         return OutOfMemoryError(device=device, cause=exc)
@@ -644,8 +692,9 @@ def classify_exception(exc: BaseException, *, engine: str = "", model: str = "")
     if isinstance(exc, (TimeoutError, )) or "timed out" in text:
         return EngineError("Превышено время ожидания ответа движка.", cause=exc)
 
-    if any(m in text for m in _NETWORK_MARKERS):
-        err = EngineError("Сетевая ошибка при обращении к внешнему ресурсу.", cause=exc)
+    if isinstance(exc, ConnectionError) or _NETWORK_RE.search(text):
+        err = EngineError("Сетевая ошибка при обращении к внешнему ресурсу: "
+                          f"{без_путей(str(exc))[:300]}", cause=exc)
         err.retryable = True
         err.hint = ("Проверьте доступ в интернет с сервера. Если он закрыт, "
                     "загрузите модели заранее на машине с доступом и перенесите каталог моделей.")

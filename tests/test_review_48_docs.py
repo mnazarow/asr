@@ -223,21 +223,35 @@ def test_пример_мониторинга_видит_превышение_п�
     `recommendation`: он отвечал «отклонений нет» при горящей аварии. Порог
     включительный (`inclusive`) он не учитывал вовсе."""
     from asrhub.monitoring import exporters
+    from asrhub.monitoring.alerts import AlertEngine, default_rules
     from asrhub.monitoring.collector import Sample
 
-    снимок = exporters.json_snapshot([
+    образцы = [
         Sample("asrhub_confidence_drift_level", 2.0, {"model": "gigaam-v3-ctc"}),
         Sample("asrhub_queue_depth", 3.0),
-    ])
+    ]
+    снимок = exporters.json_snapshot(образцы)
+    # Заход 54: вердикты пример берёт у встроенного движка тревог сервера
+    # (/api/monitoring/alerts) — у части метрик порог относится к выражению,
+    # и сырое сравнение рисовало аварии на здоровом сервере. Движок здесь
+    # настоящий, срок срабатывания снят, чтобы тревога горела сразу.
+    правила = default_rules()
+    for правило in правила:
+        правило.for_seconds = 0
+    движок = AlertEngine(правила)
+    движок.evaluate(образцы)
+    движок.evaluate(образцы)
+    тревоги = {"summary": движок.summary(), "alerts": движок.states()}
     пример = _пример("monitoring_pull")
     monkeypatch.setattr(пример.requests, "get", lambda адрес, **_: _Ответ(
-        снимок if адрес.endswith("metrics.json") else {"status": "degraded"}))
+        снимок if адрес.endswith("metrics.json")
+        else тревоги if адрес.endswith("/alerts") else {"status": "degraded"}))
     monkeypatch.setattr("sys.argv", ["monitoring_pull.py"])
     assert пример.main() == 0
     вывод = capsys.readouterr().out
-    assert "✕ Дрейф уверенности: уровень (model=gigaam-v3-ctc): 2" in вывод, вывод
+    assert "✕ Дрейф уверенности: уровень: 2" in вывод, вывод
     assert "порог: >= 2" in вывод and "что делать:" in вывод
-    assert "Заданий ждёт" not in вывод and "Отклонений от порогов нет" not in вывод
+    assert "Заданий ждёт" not in вывод and "Тревог нет" not in вывод
 
 
 @pytest.mark.parametrize("пример", ["transcribe", "batch_folder"])

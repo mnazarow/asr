@@ -234,6 +234,12 @@ if [[ -n "${DATA_DIR}" && -d "${DATA_DIR}" ]]; then
   # исправным. «--fix» создавал недостающее от root с правами 0750 — и
   # служба теряла доступ к собственному каталогу окончательно.
   for sub in uploads results models logs tmp; do
+    if [[ -L "${DATA_DIR}/${sub}" && ! -d "${DATA_DIR}/${sub}" ]]; then
+      # Ссылка не на каталог — не трогаем и с --fix: chown от root прошёл бы
+      # по ней и отдал пользователю службы чужой файл (например /etc/shadow).
+      check "  ${sub}" fail "символическая ссылка не на каталог — исправьте вручную"
+      continue
+    fi
     if [[ -d "${DATA_DIR}/${sub}" ]] && writable_by_service "${DATA_DIR}/${sub}"; then
       check "  ${sub}" ok "доступен на запись${SERVICE_USER_NAME:+ пользователю ${SERVICE_USER_NAME}}"
     else
@@ -243,9 +249,11 @@ if [[ -n "${DATA_DIR}" && -d "${DATA_DIR}" ]]; then
       check "  ${sub}" fail "нет каталога или прав${SERVICE_USER_NAME:+ у пользователя ${SERVICE_USER_NAME}}" "${FIX_CMD}"
       if [[ "${FIX}" -eq 1 ]]; then
         mkdir -p "${DATA_DIR}/${sub}" 2>/dev/null && chmod 750 "${DATA_DIR}/${sub}" 2>/dev/null
+        # -h: если на месте каталога успели подложить ссылку, chown меняет
+        # её саму, а не то, на что она указывает.
         if [[ -n "${SERVICE_USER_NAME}" && "${SERVICE_USER_NAME}" != "root" ]]; then
-          chown "${SERVICE_USER_NAME}:" "${DATA_DIR}/${sub}" 2>/dev/null \
-            || chown "${SERVICE_USER_NAME}" "${DATA_DIR}/${sub}" 2>/dev/null || true
+          chown -h "${SERVICE_USER_NAME}:" "${DATA_DIR}/${sub}" 2>/dev/null \
+            || chown -h "${SERVICE_USER_NAME}" "${DATA_DIR}/${sub}" 2>/dev/null || true
         fi
       fi
     fi
@@ -274,17 +282,29 @@ if [[ -f "${DATA_DIR}/asrhub.db" ]]; then
   # Целостность спрашиваем у python из окружения, если нет sqlite3: модуль
   # sqlite3 есть в любой сборке, а утилиты в Ubuntu по умолчанию нет — и
   # проверка не выполнялась почти нигде.
+  # «Проверить нечем» — только когда нечем: база, которая не открывается
+  # вовсе («file is not a database»), давала пустой ответ и тоже выдавалась
+  # за «целостность проверить нечем» с зелёной галочкой.
   DB_CHECK=""
+  DB_TOOL=0
   if have sqlite3; then
-    DB_CHECK="$(sqlite3 "${DATA_DIR}/asrhub.db" "PRAGMA quick_check" 2>/dev/null | head -1 || true)"
+    DB_TOOL=1
+    DB_CHECK="$(sqlite3 "${DATA_DIR}/asrhub.db" "PRAGMA quick_check" 2>&1 | head -1 || true)"
   elif [[ -x "${PREFIX}/venv/bin/python" ]] || have python3; then
+    DB_TOOL=1
     DB_PY="${PREFIX}/venv/bin/python"; [[ -x "${DB_PY}" ]] || DB_PY="python3"
     DB_CHECK="$("${DB_PY}" -c 'import sqlite3,sys
-c=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True,timeout=5)
-print(c.execute("PRAGMA quick_check").fetchone()[0])' "${DATA_DIR}/asrhub.db" 2>/dev/null || true)"
+try:
+    c=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True,timeout=5)
+    print(c.execute("PRAGMA quick_check").fetchone()[0])
+except Exception as exc:
+    print(f"не открывается: {exc}")' "${DATA_DIR}/asrhub.db" 2>/dev/null || true)"
   fi
   if [[ "${DB_CHECK}" == "ok" ]]; then
     check "База заданий" ok "${DB_SIZE}, целостность в порядке"
+  elif [[ "${DB_TOOL}" -eq 1 && -z "${DB_CHECK}" ]]; then
+    check "База заданий" fail "не открывается" \
+      "Восстановите из копии: bash '${PREFIX}/scripts/service.sh' restore --from ПУТЬ (копии: ls ${DATA_DIR}/asrhub.db.bak.* и ${DATA_DIR}/backups)"
   elif [[ -n "${DB_CHECK}" ]]; then
     check "База заданий" fail "нарушена целостность" \
       "Восстановите из копии: bash '${PREFIX}/scripts/service.sh' restore --from ПУТЬ (копии: ls ${DATA_DIR}/asrhub.db.bak.* и ${DATA_DIR}/backups)"
@@ -386,11 +406,20 @@ done
 # Порт — у службы этой установки: `--port` в строке запуска юнита
 # перекрывает config.yaml, и проверка по файлу стучалась не туда.
 PORT="$(server_port_hint "${DATA_DIR}" "${PREFIX}" native "${SERVICE_NAME:-asrhub}")"
+# Адрес пробы — как у update.sh: сервер, привязанный к одному адресу в
+# локальной сети, на 127.0.0.1 не отвечает, и доктор объявлял его порт
+# «занятым другой программой».
+PROBE_HOST="127.0.0.1"
+HOST_CFG="$(config_yaml_value "${DATA_DIR}/config.yaml" server_host 2>/dev/null || true)"
+case "${HOST_CFG}" in
+  ""|0.0.0.0|::|"*"|localhost|127.0.0.1) : ;;
+  *) PROBE_HOST="${HOST_CFG}" ;;
+esac
 if check_port_free "${PORT}"; then
   check "Порт ${PORT}" warn "свободен — сервер не запущен" \
     "Запустить: bash '${PREFIX:-.}/scripts/service.sh' start"
 else
-  if http_probe "http://127.0.0.1:${PORT}/api/health" 3 && [[ "${HTTP_BODY}" == *'"status"'* ]]; then
+  if http_probe "http://${PROBE_HOST}:${PORT}/api/health" 3 && [[ "${HTTP_BODY}" == *'"status"'* ]]; then
     VERSION="$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<<"${HTTP_BODY}")"
     check "Сервер" ok "отвечает на порту ${PORT}, версия ${VERSION}"
   else
@@ -428,14 +457,16 @@ fi
 
 # Микрофон браузер отдаёт только в защищённом контексте — это ограничение
 # браузера, а не сервера, и о нём лучше узнать до, а не после установки.
-HOST_BOUND="$(grep -E '^[[:space:]]*server_host:' "${DATA_DIR}/config.yaml" 2>/dev/null \
-              | awk '{print $2}' | head -1 || true)"
-if [[ "${HOST_BOUND}" == "0.0.0.0" || -z "${HOST_BOUND}" ]]; then
-  check "Микрофон в браузере" warn "нужен https или localhost" \
-    "По http с другой машины браузер микрофон не отдаст. Поставьте перед сервером обратный прокси с сертификатом — пример есть в docker/nginx.conf."
-else
-  check "Микрофон в браузере" ok "сервер слушает локально — микрофон доступен"
-fi
+HOST_BOUND="$(config_yaml_value "${DATA_DIR}/config.yaml" server_host 2>/dev/null || true)"
+# Локальный — только петлевой адрес: «192.168.1.10» тоже не 0.0.0.0, но с
+# него браузер на другой машине микрофон по http не отдаст.
+case "${HOST_BOUND}" in
+  127.0.0.1|localhost|::1)
+    check "Микрофон в браузере" ok "сервер слушает локально — микрофон доступен" ;;
+  *)
+    check "Микрофон в браузере" warn "нужен https или localhost" \
+      "По http с другой машины браузер микрофон не отдаст. Поставьте перед сервером обратный прокси с сертификатом — пример есть в docker/nginx.conf." ;;
+esac
 
 # Ключи с подразделениями и квотами: сводка по config.yaml.
 if [[ -f "${DATA_DIR}/config.yaml" ]] && have python3; then
@@ -470,7 +501,7 @@ if have curl && [[ -r "${KEY_FILE}" ]]; then
   # делает ровно так же и объясняет почему.
   QUEUE_JSON="$(printf 'header = "X-API-Key: %s"\n' "$(cat "${KEY_FILE}")" \
                 | curl -fsS --max-time 3 --config - \
-                  "http://127.0.0.1:${PORT_CAP}/api/queue" 2>/dev/null || true)"
+                  "http://${PROBE_HOST:-127.0.0.1}:${PORT_CAP}/api/queue" 2>/dev/null || true)"
   if [[ -n "${QUEUE_JSON}" ]] && have python3; then
     INSTANCES="$(printf '%s' "${QUEUE_JSON}" | python3 -c "
 import json, sys

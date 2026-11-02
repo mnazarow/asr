@@ -1,28 +1,34 @@
-# Каталоги сборки и выгрузки
-build/
-dist/
-*.egg-info/
+# Что не должно попадать в репозиторий.
+#
+# Каталог docker — рабочий: установка и запуск по README кладут туда .env
+# (с токеном Hugging Face), data/ (база, модели, расшифровки) и certs/.
+docker/.env
+docker/data/
+docker/certs/
 
-# Кеши интерпретатора и инструментов
+# Окружения и кеши
+venv/
+.venv/
 __pycache__/
-*.py[cod]
+*.pyc
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.venv/
-venv/
+*.egg-info/
 
-# Данные работающего сервера
+# Сборки и пакеты
+build/
+*.whl
+
+# Рабочая машина: данные сервера, запущенного из клона, и служебное
+# редакторов (перенесено из прежнего локального .gitignore)
+dist/
+*.py[co]
 data/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
 api-key.txt
-
-# Пакеты, скачанные для установки
-*.whl
-
-# Служебное от macOS и редакторов
 .DS_Store
 .idea/
 .vscode/

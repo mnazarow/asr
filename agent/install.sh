@@ -39,7 +39,14 @@ INSTALL_DIR="/opt/asrhub-agent"
 AGENT_FILE="${INSTALL_DIR}/asrhub-agent.py"
 CONFIG_FILE="/etc/asrhub-agent.conf"
 STATE_DIR="/var/lib/asrhub-agent"
-LOG_FILE="/var/log/asrhub-agent.log"
+# Журнал — в своём каталоге, а не прямо в /var/log: каталог /var/log
+# принадлежит root, и служба от asterisk не могла создать
+# asrhub-agent.log.1 при ротации — после первых 10 МБ журнал переставал
+# писаться, а в journal на каждую строку уходила трассировка.
+LOG_DIR="/var/log/asrhub-agent"
+LOG_FILE="${LOG_DIR}/asrhub-agent.log"
+#: Где журнал лежал до 3.1.26: при повторной установке он переносится.
+OLD_LOG_FILE="/var/log/asrhub-agent.log"
 SERVICE_NAME="asrhub-agent"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -58,6 +65,10 @@ ASSUME_YES=0
 PYTHON_BIN=""
 SERVICE_USER="root"
 SERVICE_GROUP="root"
+INSECURE=0
+CACERT=""
+CA_FILE="/etc/asrhub-agent.ca.pem"
+UTF8_LOCALE=""
 TMP_DIR=""
 
 # ---------------------------------------------------------------------------
@@ -127,6 +138,9 @@ usage() {
   sudo bash install.sh --url http://сервер:8081 --key ah_… [параметры]
   sudo bash install.sh --uninstall [--yes]
 
+Ключ лучше передавать файлом (--key-file): аргумент --key виден в `ps`
+любому пользователю станции и остаётся в истории команд и журнале sudo.
+
 Параметры:
   --url АДРЕС         адрес сервера ASR Hub (обязателен, если сервер не
                       подставил свой при выдаче файла)
@@ -140,6 +154,10 @@ usage() {
   --recordings ПУТЬ   каталог записей (по умолчанию
                       /var/spool/asterisk/monitor)
   --interval СЕКУНД   пауза между заходами службы (по умолчанию 60)
+  --cacert ФАЙЛ       свой корневой сертификат сервера (PEM): для https
+                      с сертификатом своего удостоверяющего центра
+  --insecure          не проверять сертификат сервера вовсе (только для
+                      наладки: так ключ уйдёт любому, кто встал посередине)
   --no-service        не заводить службу systemd, только поставить файлы
   --force             перезаписать существующие настройки целиком и
                       поставить службу даже при неуспешной самопроверке
@@ -189,6 +207,9 @@ parse_args() {
       --cdr-file=*)   CDR_FILE="${1#*=}"; shift ;;
       --recordings=*) RECORDINGS="${1#*=}"; shift ;;
       --interval=*)   INTERVAL="${1#*=}"; shift ;;
+      --cacert)      need_value "$1" $#; CACERT="$2"; shift 2 ;;
+      --cacert=*)    CACERT="${1#*=}"; shift ;;
+      --insecure)    INSECURE=1; shift ;;
       --no-service)  CREATE_SERVICE=0; shift ;;
       --force)       FORCE=1; shift ;;
       --uninstall)   UNINSTALL=1; shift ;;
@@ -268,37 +289,62 @@ check_writable() {
 # и прежде ключ уходил ему аргументом; теперь в этом случае качает python
 # (он у агента есть всегда), а ключ получает переменной окружения — её
 # видит только root.
+#: Как проверять сертификат сервера — одинаково для curl, wget и python.
+#: По строке на аргумент, каждая с переводом строки: `read` без него
+#: последнюю строку теряет.
+tls_curl() {
+  if [ "${INSECURE}" -eq 1 ]; then printf -- '--insecure\n'; return 0; fi
+  if [ -n "${CACERT}" ]; then printf -- '--cacert\n%s\n' "${CACERT}"; fi
+  return 0
+}
+
+tls_wget() {
+  if [ "${INSECURE}" -eq 1 ]; then printf -- '--no-check-certificate\n'; return 0; fi
+  if [ -n "${CACERT}" ]; then printf -- '--ca-certificate=%s\n' "${CACERT}"; fi
+  return 0
+}
+
+# `download адрес файл [необязательно]`: необязательное скачивание при
+# отказе сервера возвращает 1, а не обрывает установку.
 download() {
-  local address="$1" dest="$2" code=""
+  local address="$1" dest="$2" optional="${3:-}" code=""
+  local tls=()
   if have curl; then
+    while IFS= read -r part; do [ -n "${part}" ] && tls+=("${part}"); done < <(tls_curl)
     ( umask 077; printf 'header = "X-API-Key: %s"\n' "${KEY}" >"${TMP_DIR}/curl.cfg" )
     # Код ответа — только то, что напечатал сам curl. Прежнее
     # «… -w '%{http_code}' … || printf '000'» при недоступном сервере
     # давало «000000»: curl печатает 000 и выходит с ошибкой, и к его
     # ответу дописывался ещё один.
     code="$(curl -sS --connect-timeout 10 --max-time 300 -K "${TMP_DIR}/curl.cfg" \
-             -o "${dest}" -w '%{http_code}' "${address}" \
+             ${tls[@]+"${tls[@]}"} -o "${dest}" -w '%{http_code}' "${address}" \
              2>"${TMP_DIR}/curl.err")" || true
   elif wget --help 2>&1 | grep -q -- '--config'; then
     ( umask 077; printf 'header = X-API-Key: %s\n' "${KEY}" >"${TMP_DIR}/wgetrc" )
-    if wget -q --timeout=30 --tries=2 "--config=${TMP_DIR}/wgetrc" \
+    while IFS= read -r part; do [ -n "${part}" ] && tls+=("${part}"); done < <(tls_wget)
+    if wget -q --timeout=30 --tries=2 "--config=${TMP_DIR}/wgetrc" ${tls[@]+"${tls[@]}"} \
             -O "${dest}" "${address}" 2>"${TMP_DIR}/wget.err"; then
       code="200"
     else
       code="000"
     fi
   elif [ -n "${PYTHON_BIN}" ]; then
-    code="$(ASRHUB_AGENT_KEY="${KEY}" "${PYTHON_BIN}" - "${address}" "${dest}" \
+    code="$(ASRHUB_AGENT_KEY="${KEY}" ASRHUB_TLS_INSECURE="${INSECURE}" \
+             ASRHUB_TLS_CACERT="${CACERT}" "${PYTHON_BIN}" - "${address}" "${dest}" \
              2>"${TMP_DIR}/curl.err" <<'PYEOF' || true
-import os, sys
+import os, ssl, sys
 try:
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
 except ImportError:
     print("000"); sys.exit(0)
 request = Request(sys.argv[1], headers={"X-API-Key": os.environ.get("ASRHUB_AGENT_KEY", "")})
+context = ssl.create_default_context(cafile=os.environ.get("ASRHUB_TLS_CACERT") or None)
+if os.environ.get("ASRHUB_TLS_INSECURE") == "1":
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
 try:
-    response = urlopen(request, timeout=300)
+    response = urlopen(request, timeout=300, context=context)
     with open(sys.argv[2], "wb") as target:
         target.write(response.read())
     print(response.getcode())
@@ -316,6 +362,9 @@ PYEOF
   case "${code}" in
     ''|000*) code="000" ;;
   esac
+  if [ -n "${optional}" ] && [ "${code}" != "200" ]; then
+    return 1
+  fi
   case "${code}" in
     200) return 0 ;;
     401|403)
@@ -339,15 +388,17 @@ PYEOF
 }
 
 check_server() {
-  local code=""
+  local code="" tls=()
   if have curl; then
-    code="$(curl -sS --connect-timeout 10 --max-time 30 -o /dev/null \
-            -w '%{http_code}' "${URL}/api/health" 2>/dev/null)" || true
+    while IFS= read -r part; do [ -n "${part}" ] && tls+=("${part}"); done < <(tls_curl)
+    code="$(curl -sS --connect-timeout 10 --max-time 30 ${tls[@]+"${tls[@]}"} -o /dev/null \
+            -w '%{http_code}' "${URL}/api/health" 2>"${TMP_DIR}/health.err")" || true
     case "${code}" in
       ''|000*) code="000" ;;
     esac
   else
-    if wget -q --timeout=15 --tries=1 -O /dev/null "${URL}/api/health" 2>/dev/null; then
+    while IFS= read -r part; do [ -n "${part}" ] && tls+=("${part}"); done < <(tls_wget)
+    if wget -q --timeout=15 --tries=1 ${tls[@]+"${tls[@]}"} -O /dev/null "${URL}/api/health" 2>/dev/null; then
       code="200"
     else
       code="000"
@@ -359,6 +410,12 @@ check_server() {
       # агента это не мешает, звонки подождут в очереди.
       ok "Сервер отвечает: ${URL} (HTTP ${code})" ;;
     000)
+      if grep -qiE 'certificate|SSL' "${TMP_DIR}/health.err" 2>/dev/null; then
+        die "Сертификат сервера ${URL} не проверяется." \
+            "Если сертификат выдан своим удостоверяющим центром — передайте его \
+корневой сертификат ключом --cacert ФАЙЛ. Подробности: \
+$(tr '\n' ' ' <"${TMP_DIR}/health.err")"
+      fi
       die "Сервер ${URL} со станции не отвечает." \
           "Проверьте адрес и порт, а также что со станции есть выход наружу: \
 curl -sS -m 10 ${URL}/api/health. Агент ходит на сервер сам — входящие \
@@ -419,6 +476,13 @@ write_config() {
     set_option "cdr_file" "${CDR_FILE}" "${CONFIG_FILE}"
     set_option "recordings_dir" "${RECORDINGS}" "${CONFIG_FILE}"
     set_option "interval" "${INTERVAL}" "${CONFIG_FILE}"
+    if [ -n "${CACERT}" ]; then set_option "cacert" "${CA_FILE}" "${CONFIG_FILE}"; fi
+    if [ "${INSECURE}" -eq 1 ]; then set_option "insecure" "да" "${CONFIG_FILE}"; fi
+    # Журнал прежнего места переезжает в свой каталог (см. LOG_DIR).
+    if grep -qE "^[[:space:]]*log_file[[:space:]]*=[[:space:]]*${OLD_LOG_FILE}[[:space:]]*$" \
+         "${CONFIG_FILE}" 2>/dev/null; then
+      set_option "log_file" "${LOG_FILE}" "${CONFIG_FILE}"
+    fi
     ok "Настройки обновлены: ${CONFIG_FILE}"
     return 0
   fi
@@ -449,7 +513,12 @@ write_config() {
     printf '# min_duration_s = 10\n'
     printf '# skip_unanswered = да\n'
     printf '# max_file_mb =\n'
-    printf '# insecure = нет\n'
+    if [ -n "${CACERT}" ]; then printf 'cacert = %s\n' "${CA_FILE}"; fi
+    if [ "${INSECURE}" -eq 1 ]; then
+      printf 'insecure = да\n'
+    else
+      printf '# insecure = нет\n'
+    fi
   } >>"${tmp}"
   mv -f "${tmp}" "${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
@@ -474,6 +543,46 @@ pick_service_user() {
   fi
 }
 
+# UTF-8-локаль станции для службы и cron: C.UTF-8 есть не везде (на
+# CentOS 7 её нет), поэтому берём ту, что действительно установлена.
+pick_utf8_locale() {
+  local found=""
+  if have locale; then
+    found="$(locale -a 2>/dev/null | grep -i -m1 -E '^(c|en_us|ru_ru)\.utf-?8$' || true)"
+  fi
+  UTF8_LOCALE="${found:-C.UTF-8}"
+}
+
+# Как запустить агента руками от пользователя службы. От root нельзя:
+# файл блокировки и состояние создались бы с правами root, и служба от
+# asterisk после этого не запускалась бы вовсе.
+as_service() {
+  if [ "${SERVICE_USER}" != "root" ]; then
+    printf 'runuser -u %s -- ' "${SERVICE_USER}"
+  else
+    printf 'sudo '
+  fi
+}
+
+# Сам установщик — в каталог программы: глава 24 и итог установки отсылают
+# удалять агента через него, а при «curl | bash» на станции его не было.
+save_installer() {
+  local source="${BASH_SOURCE[0]:-}"
+  if [ -n "${source}" ] && [ -f "${source}" ] && [ -r "${source}" ]; then
+    install -m 0755 "${source}" "${INSTALL_DIR}/install.sh" 2>/dev/null && return 0
+  fi
+  if download "${URL}/api/telephony/agent/install.sh" "${TMP_DIR}/install.sh" optional; then
+    case "$(head -c 200 "${TMP_DIR}/install.sh")" in
+      *bash*)
+        install -m 0755 "${TMP_DIR}/install.sh" "${INSTALL_DIR}/install.sh"
+        return 0 ;;
+    esac
+  fi
+  warn "Установщик не сохранён в ${INSTALL_DIR}: удалять агента придётся той же \
+командой, что и ставили, с ключом --uninstall."
+  return 0
+}
+
 write_unit() {
   cat >"${UNIT_FILE}" <<ЮНИТ
 [Unit]
@@ -489,13 +598,23 @@ Group=${SERVICE_GROUP}
 ExecStart=${PYTHON_BIN} ${AGENT_FILE} --config ${CONFIG_FILE} --follow
 Restart=always
 RestartSec=10
+# Python 3.6 в локали C/POSIX не приводит её к UTF-8 сам: печать самопроверки
+# и имена записей с кириллицей ломались. Вывод — всегда в UTF-8.
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUTF8=1
+Environment=LANG=${UTF8_LOCALE}
+# Агент останавливается быстро (паузы прерываются сигналом), а звонок,
+# взятый из журнала, кладёт в отложенные: полминуты хватает с запасом.
+TimeoutStopSec=30
 # Агенту нечего запускать с повышением прав и незачем видеть чужой /tmp.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=true
+# Только чтение, а не «спрятать»: записи иногда лежат в /home, и служба
+# их не видела, хотя самопроверка (вне песочницы) проходила.
+ProtectHome=read-only
 # Пишет он ровно в два места: своё состояние и свой журнал.
-ReadWritePaths=${STATE_DIR} /var/log
+ReadWritePaths=${STATE_DIR} ${LOG_DIR}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=asrhub-agent
@@ -572,6 +691,9 @@ do_uninstall() {
   rm -f "${CONFIG_FILE}"
   rm -rf "${STATE_DIR}"
   rm -f "${LOG_FILE}" "${LOG_FILE}".[0-9] "${LOG_FILE}".[0-9].*
+  rmdir "${LOG_DIR}" 2>/dev/null || true
+  rm -f "${OLD_LOG_FILE}" "${OLD_LOG_FILE}".[0-9] "${OLD_LOG_FILE}".[0-9].*
+  if [ -f "${CA_FILE}" ]; then rm -f "${CA_FILE}"; fi
   ok "Агент удалён со станции."
   info "Если агент больше не нужен и на сервере, уберите его в разделе «АТС»."
   exit 0
@@ -605,21 +727,36 @@ do_install() {
   fi
   install -m 0755 "${TMP_DIR}/asrhub-agent.py" "${AGENT_FILE}"
   ok "Агент установлен: ${AGENT_FILE}"
+  save_installer
+  if [ -n "${CACERT}" ]; then
+    # Копия рядом с настройками: файл из домашнего каталога администратора
+    # служба не увидит, а путь, которого завтра не станет, — тем более.
+    install -m 0644 "${CACERT}" "${CA_FILE}"
+    ok "Корневой сертификат: ${CA_FILE}"
+  fi
 
   step "Настройки"
   write_config
   chmod 700 "${STATE_DIR}"
 
   pick_service_user
+  pick_utf8_locale
+  # Каталог журнала — свой и пользователя службы: ротации нужно создавать в
+  # нём файлы (asrhub-agent.log.1), а в /var/log у asterisk прав нет.
+  mkdir -p "${LOG_DIR}" 2>/dev/null || warn "Каталог журнала ${LOG_DIR} не создаётся."
+  chmod 750 "${LOG_DIR}" 2>/dev/null || true
+  if [ -f "${OLD_LOG_FILE}" ]; then
+    # Прежний журнал — в новый каталог; если там уже пишется новый, рядом.
+    if [ -f "${LOG_FILE}" ]; then
+      mv -f "${OLD_LOG_FILE}" "${LOG_DIR}/asrhub-agent.old.log" 2>/dev/null || true
+    else
+      mv -f "${OLD_LOG_FILE}" "${LOG_FILE}" 2>/dev/null || true
+    fi
+  fi
   if [ "${SERVICE_USER}" != "root" ]; then
     chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${STATE_DIR}" || \
       warn "Не удалось передать ${STATE_DIR} пользователю ${SERVICE_USER}."
-    # Журнал создаём заранее и от нужного пользователя: иначе первая же
-    # запись службы упрётся в права на /var/log, и агент уйдёт писать
-    # только в journal — там его никто искать не станет.
-    touch "${LOG_FILE}" 2>/dev/null || true
-    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${LOG_FILE}" 2>/dev/null || true
-    chmod 640 "${LOG_FILE}" 2>/dev/null || true
+    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${LOG_DIR}" 2>/dev/null || true
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_FILE}" 2>/dev/null || true
   fi
 
@@ -631,7 +768,7 @@ do_install() {
 секунд и выглядела бы работающей."
     info ""
     info "Исправьте отмеченное и повторите:"
-    info "  sudo ${PYTHON_BIN} ${AGENT_FILE} --selftest"
+    info "  $(as_service)${PYTHON_BIN} ${AGENT_FILE} --config ${CONFIG_FILE} --selftest"
     info "  sudo systemctl enable --now ${SERVICE_NAME}   # когда всё [ ок ]"
     if [ "${CREATE_SERVICE}" -eq 1 ] && have systemctl; then
       write_unit
@@ -642,7 +779,7 @@ do_install() {
 
   if [ "${CREATE_SERVICE}" -eq 0 ]; then
     step "Служба не заводится (--no-service)"
-    info "Запуск вручную: ${PYTHON_BIN} ${AGENT_FILE} --once"
+    info "Запуск вручную: $(as_service)${PYTHON_BIN} ${AGENT_FILE} --config ${CONFIG_FILE} --once"
     print_summary
     return 0
   fi
@@ -650,8 +787,9 @@ do_install() {
   if ! have systemctl; then
     step "systemd на станции нет"
     warn "Служба не заведена. Запускайте агента из cron или из своей системы \
-запуска:"
-    info "  */5 * * * * ${PYTHON_BIN} ${AGENT_FILE} --once >/dev/null 2>&1"
+запуска — например, строкой в /etc/cron.d/asrhub-agent:"
+    info "  */5 * * * * ${SERVICE_USER} PYTHONIOENCODING=utf-8 LANG=${UTF8_LOCALE} \
+${PYTHON_BIN} ${AGENT_FILE} --config ${CONFIG_FILE} --once >/dev/null 2>&1"
     print_summary
     return 0
   fi
@@ -670,7 +808,7 @@ do_install() {
     systemctl status "${SERVICE_NAME}" --no-pager --lines 20 || true
     die "Служба ${SERVICE_NAME} не запустилась." \
         "Посмотрите журнал: journalctl -u ${SERVICE_NAME} -n 50 --no-pager \
-— и запустите самопроверку: ${PYTHON_BIN} ${AGENT_FILE} --selftest"
+— и запустите самопроверку: $(as_service)${PYTHON_BIN} ${AGENT_FILE} --config ${CONFIG_FILE} --selftest"
   fi
   print_summary
 }
@@ -693,11 +831,12 @@ print_summary() {
   посмотреть журнал     journalctl -u ${SERVICE_NAME} -f
                         tail -f ${LOG_FILE}
   состояние службы      systemctl status ${SERVICE_NAME}
-  проверить настройку   ${PYTHON_BIN} ${AGENT_FILE} --selftest
-  собрать весь архив    ${PYTHON_BIN} ${AGENT_FILE} --all
-                        (или кнопкой «Собрать всё» в разделе «АТС»)
+  проверить настройку   $(as_service)${PYTHON_BIN} ${AGENT_FILE} --config ${CONFIG_FILE} --selftest
+  собрать весь архив    кнопкой «Собрать всё» в разделе «АТС» (служба
+                        заберёт задание сама; руками — только от того же
+                        пользователя, что служба, и при остановленной службе)
   остановить            systemctl stop ${SERVICE_NAME}
-  удалить               sudo bash install.sh --uninstall
+  удалить               sudo bash ${INSTALL_DIR}/install.sh --uninstall
 
 Станция появится в разделе «АТС» веб-интерфейса после первого обращения
 агента к серверу — обычно в течение минуты.
@@ -746,6 +885,14 @@ main() {
     die "Не задан ключ доступа." \
         "Заведите ключ с правом записи в разделе «Доступ» веб-интерфейса \
 и добавьте --key-file ФАЙЛ (или --key ah_…)"
+  fi
+
+  if [ -n "${CACERT}" ] && [ ! -r "${CACERT}" ]; then
+    die "Файл сертификата ${CACERT} не читается." "Проверьте путь: ls -l ${CACERT}"
+  fi
+  if [ "${INSECURE}" -eq 1 ]; then
+    warn "Проверка сертификата сервера выключена (--insecure): ключ доступа уйдёт \
+любому, кто встанет между станцией и сервером. Только для наладки."
   fi
 
   TMP_DIR="$(mktemp -d /tmp/asrhub-agent.XXXXXX)" || die \

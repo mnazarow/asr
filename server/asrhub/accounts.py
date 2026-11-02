@@ -57,6 +57,20 @@ MIN_PASSWORD_LEN = 8
 
 _USERNAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9._@-]{2,64}$")
 
+#: Логин записи, пришедшей из каталога. Шире своего: Active Directory
+#: разрешает в имени скобки, апостроф, пробел и многое другое, и человек с
+#: логином «o(brien» проходил проверку в каталоге, а потом получал 400 от
+#: заведения местной записи — вопреки обещанию, что скобки больше не
+#: отвергаются. Запрещено здесь то же, что запрещает сам Active Directory,
+#: плюс управляющие знаки.
+_ЛОГИН_КАТАЛОГА = re.compile(r'^[^\x00-\x1f\x7f"/\\\[\]:;|=,+*?<>]{1,64}$')
+
+#: Единый ответ на любую неудачу входа: нет такого логина, неверный пароль,
+#: вход временно заблокирован. Разные ответы позволяли собирать список
+#: существующих логинов перебором: «заблокирован» отвечал только
+#: существующий, и до проверки пароля.
+НЕВЕРНЫЙ_ВХОД = "Неверный логин или пароль, или вход временно заблокирован."
+
 ROLES = ("admin", "user", "readonly")
 
 
@@ -184,6 +198,9 @@ class Account:
     #: «local» — своя запись со своим паролем; «ldap» — запись из каталога
     #: предприятия: пароля у неё нет, роль приходит из групп при каждом входе.
     source: str = "local"
+    #: Новый срок сессии, если `session_account` её только что продлил, — чтобы
+    #: продлить и куку. Ноль — не продлевалась.
+    продлена_до: float = 0.0
 
     @property
     def from_directory(self) -> bool:
@@ -232,10 +249,39 @@ def _поле(row: Any, имя: str) -> Any:
 class Accounts:
     """Учётные записи и сессии поверх базы."""
 
-    def __init__(self, db: Database, session_ttl_hours: float = 168.0) -> None:
+    def __init__(self, db: Database, session_ttl_hours: float = 168.0,
+                 settings: Any = None) -> None:
         self.db = db
         self.session_ttl_s = max(1.0, float(session_ttl_hours)) * 3600.0
         self._warned = False
+        #: Настройки сервера — ради срока сессии из каталога, который
+        #: администратор может поменять на ходу.
+        self.settings = settings
+        #: Имена ключей доступа (см. `тёзка_ключа`): ставит приложение.
+        self.имена_ключей: Any = None
+
+    @property
+    def ldap_session_s(self) -> float:
+        """Абсолютный срок сессии человека из каталога, секунд."""
+        значение = 12.0
+        if self.settings is not None:
+            try:
+                значение = float(self.settings.get("auth_ldap_session_hours") or 12.0)
+            except (TypeError, ValueError):
+                значение = 12.0
+        return max(0.05, значение) * 3600.0
+
+    def тёзка_ключа(self, username: str) -> bool:
+        """Есть ли ключ доступа с тем же именем, что у этой учётной записи.
+
+        Владелец задания — голое имя, общее для ключей и учётных записей.
+        Учётная запись «alice» при ключе интеграции «alice» видела весь его
+        архив, а запись из каталога заводилась сама при первом входе — без
+        единого действия администратора. Заводить такую запись нельзя.
+        """
+        имена = self.имена_ключей() if callable(self.имена_ключей) else ()
+        искомое = str(username or "").casefold()
+        return any(str(имя).casefold() == искомое for имя in имена or ())
 
     # --- записи ---------------------------------------------------------
 
@@ -271,9 +317,28 @@ class Accounts:
     def by_username(self, username: str) -> Account | None:
         # Имя нечувствительно к регистру: «Admin» и «admin» — один человек,
         # и заводить двоих с такими именами нельзя.
+        row = self._строка_по_имени(username)
+        return _account(row) if row else None
+
+    def _строка_по_имени(self, username: str) -> Any:
+        """Строка учётной записи по имени без учёта регистра — и кириллицы тоже.
+
+        COLLATE NOCASE в SQLite складывает регистр только у латиницы:
+        «Иванов» и «иванов» были двумя записями и двумя владельцами, а вход
+        с другим регистром отвергался. Сначала — быстрый поиск указателем,
+        не нашлось — сверка casefold по всем записям: их десятки, не миллионы.
+        """
         row = self.db.query_one(
             "SELECT * FROM users WHERE username = ? COLLATE NOCASE", [username])
-        return _account(row) if row else None
+        if row is not None:
+            return row
+        искомое = str(username or "").casefold()
+        if not искомое or искомое.isascii():
+            return None
+        for строка in self.db.query("SELECT * FROM users"):
+            if str(строка["username"]).casefold() == искомое:
+                return строка
+        return None
 
     def create(self, username: str, password: str, *, role: str = "user",
                display_name: str = "", group: str = "",
@@ -288,6 +353,12 @@ class Accounts:
         must_change_password = поле_да_нет("must_change_password", must_change_password)
         if self.by_username(username):
             raise AccountError(f"Пользователь «{username}» уже есть.")
+        if self.тёзка_ключа(username):
+            raise AccountError(
+                f"Имя «{username}» носит ключ доступа: учётная запись с этим именем "
+                "видела бы все его задания.",
+                hint="Выберите другое имя. Владелец задания — имя, общее для ключей "
+                     "и учётных записей.")
         now = time.time()
         user_id = uuid.uuid4().hex[:16]
         self.db.execute(
@@ -319,9 +390,19 @@ class Accounts:
             raise AccountError(f"Неизвестная роль «{role}».")
         запись = self.by_username(username)
         if запись is None:
-            проблема = username_problem(username)
-            if проблема:
-                raise AccountError(проблема)
+            if not _ЛОГИН_КАТАЛОГА.match(username or ""):
+                raise AccountError("Логин из каталога содержит недопустимые знаки.")
+            if self.тёзка_ключа(username):
+                # Запись из каталога заводится сама, при первом входе: тёзка
+                # ключа интеграции получил бы весь его архив, и никто бы об
+                # этом не узнал. Отказ — до администратора.
+                log.warning("Вход через каталог «%s» отклонён: так называется ключ доступа",
+                            username)
+                raise AccountError(
+                    "Логин совпадает с именем ключа доступа сервера.",
+                    hint="Обратитесь к администратору: ключ надо переименовать "
+                         "(выпустить заново с другим именем), иначе учётная "
+                         "запись видела бы его задания.")
             now = time.time()
             user_id = uuid.uuid4().hex[:16]
             self.db.execute(
@@ -439,24 +520,27 @@ class Accounts:
         Разные ответы на «нет такого пользователя» и «неверный пароль»
         позволяют собирать список существующих логинов простым перебором.
         """
-        row = self.db.query_one(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE", [username])
+        row = self._строка_по_имени(username)
         now = time.time()
+        отказ = AuthError(НЕВЕРНЫЙ_ВХОД, hint=(
+            "Проверьте раскладку и регистр. После "
+            f"{MAX_FAILED_ATTEMPTS} неудачных попыток подряд вход блокируется "
+            f"на {int(LOCKOUT_S / 60)} мин."))
         if row is None:
             # Считаем хеш и для несуществующего пользователя: иначе ответ на
             # неизвестный логин приходит заметно быстрее, и это тоже способ
             # выяснить, какие логины существуют.
             hash_password(password)
-            raise AuthError("Неверный логин или пароль.",
-                            hint="Проверьте раскладку и регистр.")
+            raise отказ
         locked_until = float(row["locked_until"] or 0)
         if locked_until > now:
-            raise AuthError(
-                "Вход временно заблокирован после неудачных попыток.",
-                hint=f"Повторите через {int((locked_until - now) / 60) + 1} мин.")
-        if not bool(row["enabled"]):
-            raise AuthError("Учётная запись отключена.",
-                            hint="Обратитесь к администратору сервера.")
+            # Пароль во время блокировки не проверяется вовсе — иначе ответ
+            # подсказывал бы подбирающему, что пароль угадан, и блокировка
+            # ничего бы не останавливала. Хеш считаем ради одинакового
+            # времени ответа, а ответ — тот же, что на любую неудачу: раньше
+            # «заблокирован» отвечал только существующий логин.
+            hash_password(password)
+            raise отказ
         if not verify_password(password, str(row["password_hash"])):
             # Счёт ведёт сама база, а не мы по прочитанному снимку. Между
             # чтением строки и записью обратно стоит scrypt — около ста
@@ -470,8 +554,13 @@ class Accounts:
             if locked:
                 log.warning("Учётная запись «%s» заблокирована на %d мин: %d неудачных попыток",
                             row["username"], int(LOCKOUT_S / 60), attempts)
-            raise AuthError("Неверный логин или пароль.",
-                            hint="Проверьте раскладку и регистр.")
+            raise отказ
+        # Отключённость — после пароля: тому, кто пароль знает, честно
+        # сказать «отключена» можно, а по быстрому ответу на неверный пароль
+        # раньше узнавали, что такая запись есть и отключена.
+        if not bool(row["enabled"]):
+            raise AuthError("Учётная запись отключена.",
+                            hint="Обратитесь к администратору сервера.")
         self.db.execute(
             "UPDATE users SET failed_attempts = 0, locked_until = 0, last_login = ? "
             "WHERE id = ?", [now, row["id"]])
@@ -485,13 +574,22 @@ class Accounts:
         попытки складываются, а не затирают друг друга. Читаем после — уже
         просто чтобы знать, что получилось, и записать это в журнал.
         """
+        # Истёкшая блокировка начинает счёт заново. Раньше счётчик после неё
+        # оставался на пяти, и одна неверная попытка раз в пятнадцать минут —
+        # в предел частоты входа это укладывается — держала запись (обычно
+        # admin) запертой бесконечно, а верный пароль всё это время
+        # отвергался. Выражения UPDATE в SQLite видят прежние значения
+        # строки, поэтому «новый счёт» в обоих местах один и тот же.
+        новый_счёт = ("CASE WHEN COALESCE(locked_until, 0) > 0 AND locked_until <= ? "
+                      "THEN 1 ELSE COALESCE(failed_attempts, 0) + 1 END")
         self.db.execute(
-            "UPDATE users SET failed_attempts = COALESCE(failed_attempts, 0) + 1, "
+            f"UPDATE users SET failed_attempts = {новый_счёт}, "
             "    locked_until = CASE "
-            "        WHEN COALESCE(failed_attempts, 0) + 1 >= ? THEN ? "
+            f"        WHEN {новый_счёт} >= ? THEN ? "
+            "        WHEN COALESCE(locked_until, 0) <= ? THEN 0 "
             "        ELSE locked_until END "
             "WHERE id = ?",
-            [MAX_FAILED_ATTEMPTS, now + LOCKOUT_S, user_id])
+            [now, now, MAX_FAILED_ATTEMPTS, now + LOCKOUT_S, now, user_id])
         строка = self.db.query_one(
             "SELECT failed_attempts FROM users WHERE id = ?", [user_id])
         return int(строка["failed_attempts"] or 0) if строка else MAX_FAILED_ATTEMPTS
@@ -504,6 +602,11 @@ class Accounts:
         token = secrets.token_urlsafe(32)
         now = time.time()
         expires = now + self.session_ttl_s
+        запись = self.get(user_id)
+        if запись is not None and запись.from_directory:
+            # Сессия из каталога — со своим, абсолютным сроком: продления у
+            # неё нет (см. `session_account`).
+            expires = now + min(self.session_ttl_s, self.ldap_session_s)
         self.db.execute(
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, "
             "last_seen, user_agent, address) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -525,7 +628,8 @@ class Accounts:
         try:
             row = self.db.query_one(
                 "SELECT s.user_id AS user_id, s.expires_at AS expires_at, "
-                "s.last_seen AS last_seen FROM sessions s WHERE s.token_hash = ?",
+                "s.last_seen AS last_seen, s.created_at AS created_at "
+                "FROM sessions s WHERE s.token_hash = ?",
                 [_token_hash(token)])
         except Exception as exc:                               # noqa: BLE001
             self._warn_unavailable(exc)
@@ -542,12 +646,29 @@ class Accounts:
             self.db.execute("DELETE FROM sessions WHERE token_hash = ?",
                             [_token_hash(token)])
             return None
+        if account.from_directory:
+            # Каталог спрашивается только при входе: пароля человека у нас
+            # нет, и проверить, не отключили ли его там, нечем. Поэтому
+            # сессия из каталога живёт абсолютный срок от входа и не
+            # продлевается: уволенного, отключённого в каталоге, прежде
+            # пускала его старая кука — при обращении раз в неделю бессрочно.
+            начало = float(row["created_at"] or 0) or float(row["last_seen"] or 0)
+            if now >= начало + self.ldap_session_s:
+                self.db.execute("DELETE FROM sessions WHERE token_hash = ?",
+                                [_token_hash(token)])
+                return None
+            return account
         # Срок продлеваем, но не чаще раза в пять минут: иначе каждый опрос
         # состояния очереди — а он идёт секундами — писал бы в базу.
         if now - float(row["last_seen"] or 0) > 300:
+            новый_срок = now + self.session_ttl_s
             self.db.execute(
                 "UPDATE sessions SET last_seen = ?, expires_at = ? WHERE token_hash = ?",
-                [now, now + self.session_ttl_s, _token_hash(token)])
+                [now, новый_срок, _token_hash(token)])
+            # Продлённый срок надо донести и до куки браузера: иначе сервер
+            # сессию продлевал, а кука кончалась через неделю от входа при
+            # любой работе (см. `deps._session_principal`).
+            account.продлена_до = новый_срок
         return account
 
     def close_session(self, token: str) -> None:

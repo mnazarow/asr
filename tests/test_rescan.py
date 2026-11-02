@@ -383,8 +383,8 @@ def test_белый_список_не_растёт_молча():
     """
     assert set(ПОЛЯ_ПЕРЕРАСПОЗНАВАНИЯ) == {
         "engine", "model", "language", "task", "beam_size", "temperature",
-        "vad_enabled", "diarization_enabled", "punctuation", "compute_type",
-        "device", "initial_prompt", "num_speakers", "align_words",
+        "vad_enabled", "diarization_enabled", "punctuation", "punctuation_enabled",
+        "compute_type", "device", "initial_prompt", "num_speakers", "align_words",
     }
     for опасное in ("webhook_url", "output_dir", "api_keys", "auth_enabled",
                     "data_dir", "max_upload_mb"):

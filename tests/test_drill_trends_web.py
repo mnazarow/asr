@@ -197,21 +197,28 @@ def test_точка_графика_раскрывается_в_записи_св
 def test_плитка_раскрывается_в_записи_последней_корзины(вкладка):
     с = вкладка.тренды()
     свод = вкладка.своды["/api/trends"]
+    # Заход 54: у счётных показателей пустая корзина — ноль, а «последнее»
+    # — последняя ЦЕЛАЯ корзина (текущая неполная в него не идёт). У «С
+    # ошибкой» она обычно ноль, и раскрывать там нечего: число без кнопки.
     итог = next(строка for строка in свод["summary"] if строка["id"] == "failed")
-    ряд = next(ряд for ряд in свод["series"] if ряд["id"] == "failed")
+    if итог["last"] == 0:
+        плитка = с.locator("#tr-groups .kpi", has_text="С ошибкой").first
+        assert плитка.locator("button.drill").count() == 0
+    итог = next(строка for строка in свод["summary"] if строка["id"] == "jobs")
+    ряд = next(ряд for ряд in свод["series"] if ряд["id"] == "jobs")
+    assert свод["partial_last"] and итог["last_at"] == len(свод["buckets"]) - 2
     в_корзине = ряд["n"][итог["last_at"]]
-    плитка = с.locator("#tr-groups .kpi", has_text="С ошибкой").first
+    плитка = с.locator("#tr-groups .kpi", has_text="Заданий").first
     кнопка = плитка.locator("button.drill")
     assert _число(кнопка.inner_text()) == в_корзине == итог["last"] > 0
     кнопка.click()
     с.wait_for_selector("#tr-groups .drill-panel tbody tr")
-    assert _строк(с, "#tr-groups") == в_корзине
-    assert с.locator("#tr-groups .drill-title").inner_text().startswith("Задания с ошибкой · ")
-    assert set(с.locator("#tr-groups .drill-panel tbody tr td:nth-child(6)")
-               .all_inner_texts()) == {"ошибка"}
+    assert _строк(с, "#tr-groups") == min(50, в_корзине)
+    assert с.locator("#tr-groups .drill-title").inner_text().startswith("Задания · ")
     запрос = вкладка.за_списком()[-1]
     assert float(запрос["since"][0]) == свод["buckets"][итог["last_at"]]
-    assert запрос["f"] == ["status:failed"]
+    assert float(запрос["until"][0]) == свод["buckets"][итог["last_at"] + 1]
+    assert "f" not in запрос
     # «Последнее» — последняя НЕПУСТАЯ корзина. У WER она позавчерашняя:
     # под числом плитки — записи именно её, а не самой свежей корзины.
     итог = next(строка for строка in свод["summary"] if строка["id"] == "wer")
@@ -229,6 +236,8 @@ def test_плитка_раскрывается_в_записи_последне�
     качество.locator(".drill-panel tbody tr").first.wait_for()
     assert качество.locator(".drill-panel tbody tr").count() == ряд["n"][итог["last_at"]]
     # Щелчок по числу ряд на график не вынес: это действие плитки, а не числа.
+    # «Заданий» стоит на графике с самого начала — проверяем на «С ошибкой».
+    плитка = с.locator("#tr-groups .kpi", has_text="С ошибкой").first
     assert "на графике" not in плитка.inner_text()
     плитка.locator(".kpi-label").click()
     с.wait_for_function("""() => Array.from(document.querySelectorAll('#tr-groups .kpi'))

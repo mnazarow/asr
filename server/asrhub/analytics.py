@@ -61,6 +61,21 @@ def _корзина(нижние: list[float], момент: float) -> int:
     return min(max(bisect_right(нижние, момент) - 1, 0), len(нижние) - 1)
 
 
+def _номер_корзины(нижние: list[float], столбец: str = "created_at") -> tuple[str, list[float]]:
+    """Выражение SQL с номером корзины ряда — по тем же границам, что `_корзина`.
+
+    Не деление, а сравнение с теми же числами: «меньше второй границы —
+    нулевая, меньше третьей — первая…», и всё, что позже последней нижней
+    границы, — в последнюю корзину. Ровно так выбирает `_корзина`, и ровно
+    так режет базу список под точкой графика: запись на самой границе
+    попадает в одну и ту же корзину и в число, и в список.
+    """
+    if len(нижние) <= 1:
+        return "0", []
+    ветви = " ".join(f"WHEN {столбец} < ? THEN {i}" for i in range(len(нижние) - 1))
+    return f"CASE {ветви} ELSE {len(нижние) - 1} END", list(нижние[1:])
+
+
 def _escape_label(value: Any) -> str:
     """Экранирует значение метки по правилам формата Prometheus."""
     text = str(value if value is not None else "")
@@ -112,36 +127,102 @@ class Analytics:
             self._окна[period] = _since(period)
         return self._окна[period]
 
-    def _jobs(self, *, since: float | None = None,
-              status: str | None = None,
-              owner: str | list[str] | None = None,
-              limit: int = 100000) -> list[dict[str, Any]]:
-        """Выборка заданий для разреза — с общим кешом внутри отчёта.
+    #: Сколько строк самое большее читает выборка значений одного разреза.
+    #: Это предохранитель, а не размер окна: разрезы, которым нужны
+    #: отдельные значения (перцентили, распределения), читают только свои
+    #: несколько колонок, и миллион строк таких колонок — десятки мегабайт.
+    #: Раньше каждый разрез брал сто тысяч самых свежих заданий целиком,
+    #: вместе с началом расшифровки, и сверх этого молча считал период по
+    #: свежей части; теперь упор в предел виден признаком `truncated`.
+    ПРЕДЕЛ_ЗНАЧЕНИЙ = 1_000_000
 
-        Сводный отчёт собирает два десятка разрезов, и каждый читал базу
-        сам: на архиве в сто тысяч заданий это два десятка полных проходов
-        по одному и тому же окну ради одних и тех же строк. Ключ кеша —
-        сам запрос, так что разрезы по завершённым и по упавшим остаются
-        отдельными выборками, а не сводятся к одной «на все случаи».
+    @property
+    def _усечено(self) -> bool:
+        return bool(getattr(self._местное, "усечено", False))
 
-        Строки только читают: ни один разрез не пишет в них, поэтому общий
-        список можно отдавать всем сразу.
+    @_усечено.setter
+    def _усечено(self, значение: bool) -> None:
+        self._местное.усечено = значение
+
+    def _условие(self, *, since: float | None = None,
+                 status: str | list[str] | None = None,
+                 owner: str | list[str] | None = None,
+                 where: tuple[str, ...] = ()) -> tuple[str, list[Any]]:
+        """WHERE разреза: окно, статус, владелец — тем же правилом, что у
+        списка заданий (`Database._jobs_where`) и у раскрытия числа."""
+        части: list[str] = []
+        args: list[Any] = []
+        if since:
+            части.append("created_at>=?")
+            args.append(since)
+        if status:
+            статусы = [status] if isinstance(status, str) else list(status)
+            части.append("status IN (" + ",".join("?" for _ in статусы) + ")")
+            args.extend(статусы)
+        отбор, свои = self.db._owner_clause(owner, "jobs")
+        if отбор:
+            части.append(отбор)
+            args.extend(свои)
+        части.extend(where)
+        return (" WHERE " + " AND ".join(части)) if части else "", args
+
+    def _группы(self, выражения: str, *, group: str = "",
+                args_before: list[Any] | tuple[Any, ...] = (),
+                **условия: Any) -> list[dict[str, Any]]:
+        """Счётный разрез группировкой в базе: строки «группа → числа».
+
+        Так считаются тренды, и так теперь считаются счётные разрезы
+        аналитики. Прежде они читали в память сто тысяч заданий целиком и
+        сверх этого молча считали период по свежей части: на потоке в пять
+        тысяч звонков в сутки месячный отчёт показывал 4900 часов звука из
+        6370, а раздел ошибок в том же отчёте — все 130 000 заданий. Счёт в
+        базе не упирается ни в какой предел и не тащит строк в память.
+
+        `args_before` — параметры выражений SELECT (границы корзин, подписи
+        пустых значений): в тексте запроса они стоят раньше условий.
         """
+        где, args = self._условие(**условия)
+        запрос = f"SELECT {выражения} FROM jobs{где}"
+        if group:
+            запрос += f" GROUP BY {group}"
+        return [dict(r) for r in self.db.query(запрос, [*args_before, *args])]
+
+    def _значения(self, столбцы: str, **условия: Any) -> list[dict[str, Any]]:
+        """Отдельные значения для разреза — только нужные колонки, новые первыми.
+
+        Перцентилям и распределениям нужны сами значения, и группировкой в
+        базе их не заменить. Но им нужны две-три колонки, а не задание
+        целиком с началом расшифровки: месячная выборка в 130 000 заданий
+        стоила 12 с и 330 МБ, из них 19,6 млн знаков `text_preview`, которые
+        аналитике не нужны вовсе. Внутри одного сводного отчёта одинаковые
+        выборки берутся из кеша (см. `_общая_выборка`).
+        """
+        отбор = условия.get("owner")
+        статус = условия.get("status")
         # Владелец бывает списком: ключ в подразделении видит задания всей
         # группы, и `scope_owner` отдаёт перечень. Список нехешируем, и без
         # этого приведения любой такой ключ получал 500 на всей аналитике —
         # ровно там, где разграничение по владельцу и работает.
-        ключ = (since, status,
-                tuple(owner) if isinstance(owner, (list, tuple)) else owner,
-                limit)
+        ключ = (столбцы, условия.get("since"),
+                tuple(статус) if isinstance(статус, (list, tuple)) else статус,
+                tuple(отбор) if isinstance(отбор, (list, tuple)) else отбор,
+                tuple(условия.get("where") or ()))
         готовое = self._выборки.get(ключ) if self._выборки is not None else None
         if готовое is not None:
             return готовое
-        строки = self.db.list_jobs(since=since, status=status, limit=limit,
-                                   owner=owner, light=True)
+        где, args = self._условие(**условия)
+        строки = self.db.query(
+            f"SELECT {столбцы} FROM jobs{где} ORDER BY created_at DESC LIMIT ?",
+            [*args, self.ПРЕДЕЛ_ЗНАЧЕНИЙ + 1])
+        if len(строки) > self.ПРЕДЕЛ_ЗНАЧЕНИЙ:
+            строки = строки[:self.ПРЕДЕЛ_ЗНАЧЕНИЙ]
+            self._усечено = True
+            log.warning("Выборка аналитики упёрлась в предел %d строк: часть разреза "
+                        "посчитана по свежей части окна", self.ПРЕДЕЛ_ЗНАЧЕНИЙ)
+        итог = [dict(r) for r in строки]
         if self._выборки is not None:
-            self._выборки[ключ] = строки
-        return строки
+            self._выборки[ключ] = итог
+        return итог
 
     @contextmanager
     def _общая_выборка(self) -> Iterator[None]:
@@ -155,6 +236,7 @@ class Analytics:
         if свой:
             self._выборки = {}
             self._окна = {}
+            self._усечено = False
         try:
             yield
         finally:
@@ -164,64 +246,122 @@ class Analytics:
 
     # --- сводка ---------------------------------------------------------
 
+    #: Колонки этапов обработки и их подписи — для разбивки «Время по этапам».
+    ЭТАПЫ: dict[str, str] = {
+        "audio_prep_s": "Подготовка аудио",
+        "vad_s": "Поиск речи",
+        "model_load_s": "Загрузка модели",
+        "inference_s": "Распознавание",
+        "alignment_s": "Выравнивание",
+        "diarization_s": "Разделение по говорящим",
+        "postprocess_s": "Постобработка",
+    }
+
+    #: Счёт заданий одной группы: сколько и чем кончились, звук и слова по
+    #: готовым. Одно выражение на сводку, модели, языки, владельцев и
+    #: движки — чтобы «готовых» и «часов звука» не считали пять раз пятью
+    #: способами.
+    _СЧЁТ = (
+        "COUNT(*) AS jobs, "
+        "SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed, "
+        "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed, "
+        "SUM(CASE WHEN status='completed' THEN COALESCE(media_duration_s,0) ELSE 0 END) "
+        "AS audio, "
+        "SUM(CASE WHEN status='completed' THEN COALESCE(processing_time_s,0) ELSE 0 END) "
+        "AS proc, "
+        "SUM(CASE WHEN status='completed' THEN COALESCE(words_count,0) ELSE 0 END) AS words, "
+        # Средние — по тем же правилам, что прежде в Питоне: RTF и
+        # уверенность без нулей и пропусков, WER — всё записанное.
+        "AVG(CASE WHEN status='completed' AND rtf <> 0 THEN rtf END) AS rtf_avg, "
+        "AVG(CASE WHEN status='completed' AND avg_confidence <> 0 THEN avg_confidence END) "
+        "AS confidence_avg, "
+        "AVG(CASE WHEN status='completed' THEN wer END) AS wer_avg")
+
     def overview(self, period: str = "day", owner: str | None = None) -> dict[str, Any]:
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
-        done = [j for j in jobs if j["status"] == "completed"]
-        failed = [j for j in jobs if j["status"] == "failed"]
-        cancelled = [j for j in jobs if j["status"] == "cancelled"]
+        этапы = ", ".join(
+            f"SUM(CASE WHEN status='completed' THEN COALESCE({к},0) ELSE 0 END) AS {к}"
+            for к in self.ЭТАПЫ)
+        по_статусам = {str(с["status"]): с for с in self._группы(
+            "status, COUNT(*) AS n, "
+            "SUM(CASE WHEN COALESCE(cached_from,'') <> '' THEN 1 ELSE 0 END) AS cached, "
+            "SUM(COALESCE(media_duration_s,0)) AS audio, "
+            "SUM(COALESCE(processing_time_s,0)) AS proc, "
+            "SUM(COALESCE(words_count,0)) AS words, SUM(COALESCE(chars_count,0)) AS chars, "
+            "SUM(COALESCE(segments_count,0)) AS segments, MIN(created_at) AS first, " + этапы,
+            group="status", since=since or None, owner=owner)}
+
+        def сколько(*статусы: str) -> int:
+            return sum(int((по_статусам.get(с) or {}).get("n") or 0) for с in статусы)
+
+        готовые = по_статусам.get("completed") or {}
+        всего = sum(int(с["n"] or 0) for с in по_статусам.values())
+        done = сколько("completed")
         # Без речи и короткие — итоги, а не ошибки: в «успешные» они идут
         # (задание дошло до конца без сбоя), в объём и скорость — нет.
-        без_речи = sum(1 for j in jobs if j["status"] == "no_speech")
-        коротких = sum(1 for j in jobs if j["status"] == "short")
+        без_речи, коротких = сколько("no_speech"), сколько("short")
+        audio_s = float(готовые.get("audio") or 0)
+        proc_s = float(готовые.get("proc") or 0)
+        words = int(готовые.get("words") or 0)
 
-        audio_s = sum(float(j.get("media_duration_s") or 0) for j in done)
-        proc_s = sum(float(j.get("processing_time_s") or 0) for j in done)
-        words = sum(int(j.get("words_count") or 0) for j in done)
-        rtf_values = [float(j["rtf"]) for j in done if j.get("rtf")]
+        # Значения для перцентилей — пять колонок готовых заданий, а не
+        # задания целиком.
+        значения = self._значения(
+            "rtf, processing_time_s, queue_time_s, avg_confidence, wer",
+            status="completed", since=since or None, owner=owner)
+        rtf_values = [float(j["rtf"]) for j in значения if j.get("rtf")]
         # `is not None`, а не «истинно»: ноль — это законное ожидание
         # (задание из кеша отвечает мгновенно), и выбрасывание нулей
         # завышало перцентиль в разы. Соседний раздел «Ожидание в очереди»
         # всегда считал по этому правилу, и одно и то же число в одной
         # выгрузке отличалось впятеро.
-        queue_values = [float(j["queue_time_s"]) for j in done
+        queue_values = [float(j["queue_time_s"]) for j in значения
                         if j.get("queue_time_s") is not None]
-        conf_values = [float(j["avg_confidence"]) for j in done if j.get("avg_confidence")]
-        wer_values = [float(j["wer"]) for j in done if j.get("wer") is not None]
+        conf_values = [float(j["avg_confidence"]) for j in значения if j.get("avg_confidence")]
+        wer_values = [float(j["wer"]) for j in значения if j.get("wer") is not None]
 
+        первое = min((float(с["first"]) for с in по_статусам.values()
+                      if с.get("first") is not None), default=time.time())
         span_h = ((time.time() - since) / 3600) if since else max(
-            1.0, (time.time() - min((float(j["created_at"]) for j in jobs), default=time.time()))
-            / 3600)
+            1.0, (time.time() - первое) / 3600)
+        # Доля успеха — среди ЗАВЕРШЁННЫХ, тем же знаменателем, что в
+        # таблице моделей: задания в очереди, в работе и отменённые — не
+        # неудачи. Делитель «все задания окна» давал на одном экране 0,56 в
+        # сводке и 0,71 в таблице моделей при одной модели, а очередь на
+        # паузе — «0 % успеха» при нуле отказов.
+        успешно = done + без_речи + коротких
+        завершено = успешно + сколько("failed")
 
         return {
             "period": period,
             "generated_at": time.time(),
             "jobs": {
-                "total": len(jobs),
-                "completed": len(done),
-                "failed": len(failed),
-                "cancelled": len(cancelled),
+                "total": всего,
+                "completed": done,
+                "failed": сколько("failed"),
+                "cancelled": сколько("cancelled"),
                 "no_speech": без_речи,
                 "short": коротких,
-                "in_progress": sum(1 for j in jobs if j["status"] in ("queued", "running", "retry")),
-                "cached": sum(1 for j in jobs if j.get("cached_from")),
-                "success_rate": (round((len(done) + без_речи + коротких) / len(jobs), 4)
-                                 if jobs else None),
+                "in_progress": сколько("queued", "running", "retry"),
+                "cached": sum(int(с.get("cached") or 0) for с in по_статусам.values()),
+                "finished": завершено,
+                "success_rate": round(успешно / завершено, 4) if завершено else None,
             },
             "volume": {
                 "audio_seconds": round(audio_s, 1),
                 "audio_hours": round(audio_s / 3600, 2),
                 "processing_seconds": round(proc_s, 1),
                 "words": words,
-                "characters": sum(int(j.get("chars_count") or 0) for j in done),
-                "segments": sum(int(j.get("segments_count") or 0) for j in done),
-                "files_per_hour": round(len(done) / span_h, 2) if span_h else 0,
+                "characters": int(готовые.get("chars") or 0),
+                "segments": int(готовые.get("segments") or 0),
+                "files_per_hour": round(done / span_h, 2) if span_h else 0,
                 "audio_hours_per_hour": round(audio_s / 3600 / span_h, 2) if span_h else 0,
             },
             "performance": {
                 "rtf": M.summarize(rtf_values),
                 "processing_time_s": M.summarize(
-                    [float(j["processing_time_s"]) for j in done if j.get("processing_time_s")]),
+                    [float(j["processing_time_s"]) for j in значения
+                     if j.get("processing_time_s")]),
                 "queue_time_s": M.summarize(queue_values),
                 "speedup": round(audio_s / proc_s, 2) if proc_s else None,
             },
@@ -231,7 +371,8 @@ class Analytics:
                 "low_confidence_jobs": sum(1 for c in conf_values if c < НИЗКАЯ_УВЕРЕННОСТЬ),
                 "confidence_distribution": self._корзины_уверенности(conf_values),
             },
-            "stages": self._stage_breakdown(done),
+            "stages": self._stage_breakdown(
+                {к: float(готовые.get(к) or 0) for к in self.ЭТАПЫ}),
         }
 
     @staticmethod
@@ -249,34 +390,24 @@ class Analytics:
             корзины[-1]["inclusive"] = True
         return корзины
 
-    def _stage_breakdown(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
-        keys = {
-            "audio_prep_s": "Подготовка аудио",
-            "vad_s": "Поиск речи",
-            "model_load_s": "Загрузка модели",
-            "inference_s": "Распознавание",
-            "alignment_s": "Выравнивание",
-            "diarization_s": "Разделение по говорящим",
-            "postprocess_s": "Постобработка",
-        }
-        totals: dict[str, float] = {}
-        for key in keys:
-            totals[key] = sum(float(j.get(key) or 0) for j in jobs)
+    def _stage_breakdown(self, totals: dict[str, float]) -> dict[str, Any]:
+        """Разбивка времени готовых заданий по этапам — по суммам колонок."""
+        keys = dict(self.ЭТАПЫ)
         # Поиск речи, выравнивание и разделение по говорящим хранятся с
         # версии 3.1.17 и бывают не у всех заданий. Стадия, которой в периоде
         # не было, в разбивку не идёт: «Выравнивание — 0 с» в легенде читается
         # как «выравнивание ничего не стоит», а его просто не включали.
         keys = {k: v for k, v in keys.items()
-                if totals[k] or k in ("audio_prep_s", "model_load_s",
-                                      "inference_s", "postprocess_s")}
-        grand = sum(totals.values()) or 1.0
+                if totals.get(k) or k in ("audio_prep_s", "model_load_s",
+                                          "inference_s", "postprocess_s")}
+        grand = sum(totals.get(k, 0.0) for k in self.ЭТАПЫ) or 1.0
         return {
             # Колонки заданий в том же порядке, что подписи: по ним доля
             # раскрывается в список заданий, у которых этот этап был.
             "keys": list(keys),
             "labels": [keys[k] for k in keys],
-            "seconds": [round(totals[k], 2) for k in keys],
-            "share": [round(totals[k] / grand, 4) for k in keys],
+            "seconds": [round(totals.get(k, 0.0), 2) for k in keys],
+            "share": [round(totals.get(k, 0.0) / grand, 4) for k in keys],
             "total_seconds": round(grand, 2),
         }
 
@@ -287,55 +418,50 @@ class Analytics:
         since = self._since(period) or (time.time() - PERIODS["week"])
         span = max(time.time() - since, 60.0)
         width = span / buckets
-        jobs = self._jobs(since=since, limit=100000, owner=owner)
         # Границы корзин — одни на подсчёт и на раскрытие точки в список.
         # Последняя корзина закрывается моментом после выборки: в неё, как
         # и раньше, попадает всё, что создано позже расчётного конца окна.
         нижние = [since + slot * width for slot in range(buckets)]
+        номер, границы = _номер_корзины(нижние)
+        grid = {int(с["slot"]): с for с in self._группы(
+            f"{номер} AS slot, "
+            "SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed, "
+            "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed, "
+            # Без речи и короткие — свой ряд: не ошибки и не расшифровки.
+            "SUM(CASE WHEN status IN ('no_speech','short') THEN 1 ELSE 0 END) AS empty, "
+            "SUM(CASE WHEN status='completed' THEN COALESCE(media_duration_s,0) ELSE 0 END) "
+            "AS audio, "
+            "SUM(CASE WHEN status='completed' THEN COALESCE(words_count,0) ELSE 0 END) AS words, "
+            "AVG(CASE WHEN status='completed' AND rtf <> 0 THEN rtf END) AS rtf, "
+            # `is not None`, а не «истинно»: ноль — законное ожидание
+            # (задание из кеша, пустая очередь), и выброшенные нули
+            # завышали среднее ряда против сводки и трендов.
+            "AVG(CASE WHEN status='completed' THEN queue_time_s END) AS queue",
+            group="slot", args_before=границы, since=since, owner=owner)}
         конец = max(time.time(), нижние[-1])
 
-        series = {
+        series: dict[str, Any] = {
             "labels": [], "completed": [], "failed": [], "empty": [], "audio_minutes": [],
             "rtf": [], "queue_time": [], "words": [],
         }
-        grid: dict[int, dict[str, list[float] | int]] = {}
-        for job in jobs:
-            slot = _корзина(нижние, float(job["created_at"]))
-            cell = grid.setdefault(slot, {"completed": 0, "failed": 0, "empty": 0, "audio": 0.0,
-                                          "rtf": [], "queue": [], "words": 0})
-            if job["status"] == "completed":
-                cell["completed"] = int(cell["completed"]) + 1        # type: ignore[assignment]
-                cell["audio"] = float(cell["audio"]) + float(job.get("media_duration_s") or 0)
-                cell["words"] = int(cell["words"]) + int(job.get("words_count") or 0)
-                if job.get("rtf"):
-                    cell["rtf"].append(float(job["rtf"]))             # type: ignore[union-attr]
-                # `is not None`, а не «истинно»: ноль — законное ожидание
-                # (задание из кеша, пустая очередь), и выброшенные нули
-                # завышали среднее ряда против сводки и трендов.
-                if job.get("queue_time_s") is not None:
-                    cell["queue"].append(float(job["queue_time_s"]))  # type: ignore[union-attr]
-            elif job["status"] == "failed":
-                cell["failed"] = int(cell["failed"]) + 1              # type: ignore[assignment]
-            elif job["status"] in ("no_speech", "short"):
-                # Без речи и короткие — свой ряд: не ошибки и не расшифровки.
-                cell["empty"] = int(cell["empty"]) + 1                # type: ignore[assignment]
-
         for slot in range(buckets):
-            cell = grid.get(slot, {"completed": 0, "failed": 0, "empty": 0, "audio": 0.0,
-                                   "rtf": [], "queue": [], "words": 0})
+            cell = grid.get(slot) or {}
             series["labels"].append(нижние[slot])
-            series["completed"].append(cell["completed"])
-            series["failed"].append(cell["failed"])
-            series["empty"].append(cell["empty"])
-            series["audio_minutes"].append(round(float(cell["audio"]) / 60, 2))
-            rtf_list = cell["rtf"]                                     # type: ignore[assignment]
-            queue_list = cell["queue"]                                 # type: ignore[assignment]
-            series["rtf"].append(round(sum(rtf_list) / len(rtf_list), 4) if rtf_list else None)
-            series["queue_time"].append(
-                round(sum(queue_list) / len(queue_list), 2) if queue_list else None)
-            series["words"].append(cell["words"])
+            series["completed"].append(int(cell.get("completed") or 0))
+            series["failed"].append(int(cell.get("failed") or 0))
+            series["empty"].append(int(cell.get("empty") or 0))
+            series["audio_minutes"].append(round(float(cell.get("audio") or 0) / 60, 2))
+            series["rtf"].append(round(float(cell["rtf"]), 4)
+                                 if cell.get("rtf") is not None else None)
+            series["queue_time"].append(round(float(cell["queue"]), 2)
+                                        if cell.get("queue") is not None else None)
+            series["words"].append(int(cell.get("words") or 0))
 
-        samples = self.db.system_samples(since, limit=2000)
+        # Замеры железа и очереди — всего сервера, а не владельца: обычному
+        # ключу они отдавались здесь целиком, хотя в трендах те же ряды
+        # закрыты для не администратора («знать её — уже разведка»). Разрез
+        # по владельцу (`owner`) бывает только у не администратора.
+        samples = self.db.system_samples(since, limit=2000) if owner is None else []
         series["system"] = {
             "ts": [s["ts"] for s in samples],
             "cpu": [s.get("cpu_percent") for s in samples],
@@ -357,46 +483,54 @@ class Analytics:
 
     def by_model(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for job in jobs:
-            grouped.setdefault(str(job.get("model") or "—"), []).append(job)
+        # Движок — у самого свежего задания модели: SQLite отдаёт голую
+        # колонку из той строки, на которой достигнут MAX (единственный
+        # MIN/MAX в запросе). Так было и прежде — первое задание списка,
+        # упорядоченного «сначала новые».
+        группы = self._группы(
+            "COALESCE(NULLIF(model,''),'—') AS model, engine, MAX(created_at) AS last, "
+            + self._СЧЁТ, group="1", since=since or None, owner=owner)
+        # p90 RTF — по значениям: перцентиль группировкой в базе не посчитать.
+        по_rtf: dict[str, list[float]] = {}
+        for j in self._значения("model, rtf", status="completed", since=since or None,
+                                owner=owner, where=("rtf <> 0",)):
+            по_rtf.setdefault(str(j.get("model") or "—"), []).append(float(j["rtf"]))
 
         rows: list[dict[str, Any]] = []
-        for model, items in grouped.items():
-            done = [j for j in items if j["status"] == "completed"]
-            отказов = sum(1 for j in items if j["status"] == "failed")
+        for г in группы:
+            model = str(г["model"])
+            done = int(г["completed"] or 0)
+            отказов = int(г["failed"] or 0)
             # Доля успеха — среди ЗАВЕРШЁННЫХ: задания в очереди, в работе и
             # отменённые — не неудачи. Раньше знаменателем были все задания
             # окна, и очередь на паузе или ночной пакет давали «0 % успеха»
             # и критическую тревогу при нуле отказов.
-            завершено = len(done) + отказов
-            rtf = [float(j["rtf"]) for j in done if j.get("rtf")]
-            conf = [float(j["avg_confidence"]) for j in done if j.get("avg_confidence")]
-            wer = [float(j["wer"]) for j in done if j.get("wer") is not None]
-            audio = sum(float(j.get("media_duration_s") or 0) for j in done)
-            proc = sum(float(j.get("processing_time_s") or 0) for j in done)
+            завершено = done + отказов
+            audio = float(г["audio"] or 0)
+            proc = float(г["proc"] or 0)
+            rtf = по_rtf.get(model) or []
             spec = get_model(model)
             rows.append({
                 "model": model,
                 "name": spec.name if spec else model,
                 "family": spec.family if spec else "",
-                "engine": items[0].get("engine") if items else "",
+                "engine": г.get("engine"),
                 "license": spec.license if spec else "",
-                "jobs": len(items),
-                "completed": len(done),
+                "jobs": int(г["jobs"] or 0),
+                "completed": done,
                 "failed": отказов,
                 "finished": завершено,
-                "success_rate": round(len(done) / завершено, 4) if завершено else None,
+                "success_rate": round(done / завершено, 4) if завершено else None,
                 "audio_hours": round(audio / 3600, 3),
                 "processing_hours": round(proc / 3600, 3),
                 "speedup": round(audio / proc, 2) if proc else None,
-                "rtf_avg": round(sum(rtf) / len(rtf), 4) if rtf else None,
+                "rtf_avg": round(float(г["rtf_avg"]), 4) if г.get("rtf_avg") is not None else None,
                 "rtf_p90": round(M.percentile(rtf, 0.9), 4) if rtf else None,
-                "confidence_avg": round(sum(conf) / len(conf), 4) if conf else None,
-                "wer_avg": round(sum(wer) / len(wer), 4) if wer else None,
-                "words": sum(int(j.get("words_count") or 0) for j in done),
-                "avg_duration_s": round(audio / len(done), 1) if done else None,
+                "confidence_avg": (round(float(г["confidence_avg"]), 4)
+                                   if г.get("confidence_avg") is not None else None),
+                "wer_avg": round(float(г["wer_avg"]), 4) if г.get("wer_avg") is not None else None,
+                "words": int(г["words"] or 0),
+                "avg_duration_s": round(audio / done, 1) if done else None,
                 "catalog_ru_wer": spec.best_ru_wer if spec else None,
                 "catalog_rtfx": spec.rtfx if spec else None,
             })
@@ -420,33 +554,37 @@ class Analytics:
     def by_source(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
         return self._group(period, "source", "api", owner)
 
+    #: Колонки, по которым бывает простой разрез: имя в базе — из этого
+    #: перечня, а не из запроса.
+    _РАЗРЕЗЫ = frozenset({"language", "owner", "engine", "source"})
+
     def _group(self, period: str, field: str, fallback: str,
                owner: str | None = None) -> list[dict[str, Any]]:
+        if field not in self._РАЗРЕЗЫ:
+            raise ValueError(f"неизвестный разрез: {field}")
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for job in jobs:
-            grouped.setdefault(str(job.get(field) or fallback), []).append(job)
-        rows = []
-        for key, items in grouped.items():
-            done = [j for j in items if j["status"] == "completed"]
-            rtf = [float(j["rtf"]) for j in done if j.get("rtf")]
-            rows.append({
-                "key": key,
-                "jobs": len(items),
-                "completed": len(done),
-                "failed": sum(1 for j in items if j["status"] == "failed"),
-                "audio_hours": round(
-                    sum(float(j.get("media_duration_s") or 0) for j in done) / 3600, 3),
-                "words": sum(int(j.get("words_count") or 0) for j in done),
-                "rtf_avg": round(sum(rtf) / len(rtf), 4) if rtf else None,
-            })
+        rows = [{
+            "key": str(г["k"]),
+            "jobs": int(г["jobs"] or 0),
+            "completed": int(г["completed"] or 0),
+            "failed": int(г["failed"] or 0),
+            "audio_hours": round(float(г["audio"] or 0) / 3600, 3),
+            "words": int(г["words"] or 0),
+            "rtf_avg": round(float(г["rtf_avg"]), 4) if г.get("rtf_avg") is not None else None,
+        } for г in self._группы(f"COALESCE(NULLIF({field},''), ?) AS k, " + self._СЧЁТ,
+                                group="1", args_before=[fallback],
+                                since=since or None, owner=owner)]
         rows.sort(key=lambda r: r["jobs"], reverse=True)
         return rows
 
     def errors(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         since = self._since(period)
-        jobs = self._jobs(status="failed", since=since or None, limit=10000, owner=owner)
+        # Упавшие — своей узкой выборкой без предела в десять тысяч: на
+        # большом периоде коды переставали расти после десятитысячного
+        # отказа, а «всего отказов» строкой ниже считалось честно.
+        jobs = self._значения(
+            "id, filename, created_at, model, error_code, error_message, error_hint",
+            status="failed", since=since or None, owner=owner)
         by_code: dict[str, dict[str, Any]] = {}
         for job in jobs:
             code = str(job.get("error_code") or "unknown")
@@ -482,9 +620,9 @@ class Analytics:
     def duration_histogram(self, period: str = "month", bins: int = 10,
                           owner: str | None = None) -> dict[str, Any]:
         since = self._since(period)
-        jobs = [j for j in self._jobs(status="completed", since=since or None, limit=100000, owner=owner)
-                if j.get("media_duration_s")]
-        durations = [float(j["media_duration_s"]) for j in jobs]
+        durations = [float(j["media_duration_s"]) for j in self._значения(
+            "media_duration_s", status="completed", since=since or None, owner=owner,
+            where=("media_duration_s <> 0",))]
         if not durations:
             return {"edges": [], "counts": [], "labels": []}
         edges = [0, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 1e9]
@@ -504,27 +642,41 @@ class Analytics:
 
     def slowest(self, period: str = "month", limit: int = 15,
                 owner: str | None = None) -> list[dict[str, Any]]:
+        """Самые медленные готовые задания по RTF — запросом с пределом.
+
+        Задания из кеша сюда не идут: у клона RTF чужой (оригинала), а
+        обработка — ноль секунд, и в «самых медленных» стояли повторы
+        одного и того же файла, которые сервер не считал вовсе.
+        """
         since = self._since(period)
-        jobs = self._jobs(status="completed", since=since or None, limit=100000, owner=owner)
-        jobs = [j for j in jobs if j.get("rtf")]
-        jobs.sort(key=lambda j: float(j["rtf"]), reverse=True)
+        где, args = self._условие(status="completed", since=since or None, owner=owner,
+                                  where=("rtf <> 0", "COALESCE(cached_from,'') = ''"))
+        строки = self.db.query(
+            "SELECT id, filename, model, rtf, media_duration_s, processing_time_s, created_at "
+            f"FROM jobs{где} ORDER BY rtf DESC, created_at DESC LIMIT ?",
+            [*args, max(1, int(limit))])
         return [{
-            "id": j["id"], "filename": j.get("filename"), "model": j.get("model"),
-            "rtf": j.get("rtf"), "duration_s": j.get("media_duration_s"),
-            "processing_time_s": j.get("processing_time_s"),
-            "created_at": j.get("created_at"),
-        } for j in jobs[:limit]]
+            "id": j["id"], "filename": j["filename"], "model": j["model"],
+            "rtf": j["rtf"], "duration_s": j["media_duration_s"],
+            "processing_time_s": j["processing_time_s"],
+            "created_at": j["created_at"],
+        } for j in строки]
+
+    #: Час суток и день недели задания — по местному времени сервера, тем же
+    #: выражением, каким режет список раскрытия (`hour:`, `weekday:`).
+    #: `%w` в SQLite — 0 у воскресенья; здесь неделя с понедельника.
+    _ЧАС = "CAST(strftime('%H', created_at, 'unixepoch', 'localtime') AS INTEGER)"
+    _ДЕНЬ = "((CAST(strftime('%w', created_at, 'unixepoch', 'localtime') AS INTEGER) + 6) % 7)"
 
     def hourly_profile(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         """Распределение нагрузки по часам суток и дням недели."""
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         hours = [0] * 24
         weekdays = [0] * 7
-        for job in jobs:
-            local = time.localtime(float(job["created_at"]))
-            hours[local.tm_hour] += 1
-            weekdays[local.tm_wday] += 1
+        for г in self._группы(f"{self._ДЕНЬ} AS d, {self._ЧАС} AS h, COUNT(*) AS n",
+                              group="1, 2", since=since or None, owner=owner):
+            hours[int(г["h"])] += int(г["n"])
+            weekdays[int(г["d"])] += int(г["n"])
         return {
             "hours": hours,
             "hour_labels": [f"{h:02d}" for h in range(24)],
@@ -533,8 +685,15 @@ class Analytics:
             "peak_hour": max(range(24), key=lambda h: hours[h]) if any(hours) else None,
         }
 
+    #: Цена работы своими силами: звук и время обработки готовых заданий,
+    #: посчитанных сервером, а не взятых из кеша.
+    _СВОИ = ("SUM(CASE WHEN status='completed' AND COALESCE(cached_from,'') = '' "
+             "THEN COALESCE(media_duration_s,0) ELSE 0 END) AS own_audio, "
+             "SUM(CASE WHEN status='completed' AND COALESCE(cached_from,'') = '' "
+             "THEN COALESCE(processing_time_s,0) ELSE 0 END) AS own_proc")
+
     @staticmethod
-    def _measured_rtf(jobs: list[dict[str, Any]]) -> float:
+    def _measured_rtf(строка: dict[str, Any] | list[dict[str, Any]]) -> float:
         """Во сколько раз обработка медленнее реального времени.
 
         Считается по заданиям, которые сервер действительно считал сам:
@@ -546,21 +705,34 @@ class Analytics:
         величине, а в другом — по вбитой в код 0.2, и на одной странице
         стояли два числа про одно и то же, различавшиеся вдвое.
         """
-        свои = [j for j in jobs
-                if j.get("status") == "completed" and not j.get("cached_from")]
-        звук = sum(float(j.get("media_duration_s") or 0) for j in свои)
-        время = sum(float(j.get("processing_time_s") or 0) for j in свои)
+        if isinstance(строка, list):
+            # Список заданий — тот же счёт в Питоне: строка свода из базы
+            # (`_СВОИ`) и список дают одно число.
+            свои = [j for j in строка
+                    if j.get("status") == "completed" and not j.get("cached_from")]
+            строка = {"own_audio": sum(float(j.get("media_duration_s") or 0) for j in свои),
+                      "own_proc": sum(float(j.get("processing_time_s") or 0) for j in свои)}
+        звук = float(строка.get("own_audio") or 0)
+        время = float(строка.get("own_proc") or 0)
         return (время / звук) if звук else 0.0
 
     def efficiency(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
         """Оценка эффективности: сколько ресурсов уходит на час аудио."""
         since = self._since(period)
-        jobs = self._jobs(status="completed", since=since or None, limit=100000, owner=owner)
-        audio = sum(float(j.get("media_duration_s") or 0) for j in jobs)
-        proc = sum(float(j.get("processing_time_s") or 0) for j in jobs)
-        load = sum(float(j.get("model_load_s") or 0) for j in jobs)
-        из_кеша = [j for j in jobs if j.get("cached_from")]
-        rtf = self._measured_rtf(jobs)
+        строка = (self._группы(
+            "COUNT(*) AS jobs, SUM(COALESCE(media_duration_s,0)) AS audio, "
+            "SUM(COALESCE(processing_time_s,0)) AS proc, "
+            "SUM(COALESCE(model_load_s,0)) AS load, "
+            "SUM(CASE WHEN COALESCE(cached_from,'') <> '' THEN 1 ELSE 0 END) AS hits, "
+            "SUM(CASE WHEN COALESCE(cached_from,'') <> '' THEN COALESCE(media_duration_s,0) "
+            "ELSE 0 END) AS hit_audio, " + self._СВОИ,
+            status="completed", since=since or None, owner=owner) or [{}])[0]
+        jobs = int(строка.get("jobs") or 0)
+        audio = float(строка.get("audio") or 0)
+        proc = float(строка.get("proc") or 0)
+        load = float(строка.get("load") or 0)
+        попаданий = int(строка.get("hits") or 0)
+        rtf = self._measured_rtf(строка)
         return {
             "audio_hours": round(audio / 3600, 2),
             "compute_hours": round(proc / 3600, 2),
@@ -569,14 +741,15 @@ class Analytics:
             "compute_per_audio_hour": round(proc / audio, 3) if audio else None,
             "model_load_share": round(load / proc, 4) if proc else None,
             "model_load_seconds": round(load, 1),
-            "cache_hits": len(из_кеша),
-            "cache_hit_rate": round(len(из_кеша) / len(jobs), 4) if jobs else 0.0,
+            "cache_hits": попаданий,
+            # Доля попаданий — среди готовых, как в разделе «Повторы»: там
+            # знаменателем были все задания окна, и одна и та же доля на
+            # одной странице выходила 0,2 и 0,11.
+            "cache_hit_rate": round(попаданий / jobs, 4) if jobs else None,
             # А здесь — нет: экономия считается по цене работы, которую
             # пришлось бы выполнить, то есть по скорости своих заданий.
             "assumed_rtf": round(rtf, 4) if rtf else None,
-            "saved_compute_hours": round(
-                sum(float(j.get("media_duration_s") or 0) for j in из_кеша)
-                * rtf / 3600, 3),
+            "saved_compute_hours": round(float(строка.get("hit_audio") or 0) * rtf / 3600, 3),
         }
 
     # --- сводный отчёт -------------------------------------------------------
@@ -593,18 +766,15 @@ class Analytics:
         и воскресенье в десять вечера — это разные миры.
         """
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
         счёт = [[0] * 24 for _ in range(7)]
         часы = [[0.0] * 24 for _ in range(7)]
-        for job in jobs:
-            ts = float(job.get("created_at") or 0)
-            if not ts:
-                continue
-            стамп = time.localtime(ts)
-            день = стамп.tm_wday
-            час = стамп.tm_hour
-            счёт[день][час] += 1
-            часы[день][час] += float(job.get("media_duration_s") or 0) / 3600
+        for г in self._группы(
+                f"{self._ДЕНЬ} AS d, {self._ЧАС} AS h, COUNT(*) AS n, "
+                "SUM(COALESCE(media_duration_s,0)) AS audio",
+                group="1, 2", since=since or None, owner=owner,
+                where=("COALESCE(created_at,0) <> 0",)):
+            счёт[int(г["d"])][int(г["h"])] = int(г["n"])
+            часы[int(г["d"])][int(г["h"])] = float(г["audio"] or 0) / 3600
 
         плоско = [v for строка in счёт for v in строка]
         пик = max(плоско) if плоско else 0
@@ -634,42 +804,48 @@ class Analytics:
         сэкономило — то есть стоило ли оно того.
         """
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
-        из_кеша = [j for j in jobs if j.get("cached_from")]
-        свои = [j for j in jobs if not j.get("cached_from") and j["status"] == "completed"]
-
+        строка = (self._группы(
+            "SUM(CASE WHEN COALESCE(cached_from,'') <> '' THEN 1 ELSE 0 END) AS hits, "
+            "SUM(CASE WHEN COALESCE(cached_from,'') = '' AND status='completed' "
+            "THEN 1 ELSE 0 END) AS misses, "
+            "SUM(CASE WHEN COALESCE(cached_from,'') <> '' THEN COALESCE(media_duration_s,0) "
+            "ELSE 0 END) AS hit_audio, " + self._СВОИ,
+            since=since or None, owner=owner) or [{}])[0]
+        попаданий = int(строка.get("hits") or 0)
+        промахов = int(строка.get("misses") or 0)
         # Стоимость повтора считаем по средней скорости своих заданий: у
         # взятого из кеша задания собственного времени обработки нет.
-        звук_кеш = sum(float(j.get("media_duration_s") or 0) for j in из_кеша)
-        rtf = self._measured_rtf(jobs)
+        звук_кеш = float(строка.get("hit_audio") or 0)
+        rtf = self._measured_rtf(строка)
 
         # Самые частые повторы: по ним видно, не шлёт ли клиент одно и то же
-        # по кругу из-за ошибки в своей очереди.
-        повторы: dict[str, dict[str, Any]] = {}
-        for job in из_кеша:
-            ключ = str(job.get("file_hash") or job.get("cached_from") or "")
-            if not ключ:
-                continue
-            # Ключ уходит в ответ: по нему строка «файл пришёл N раз»
-            # раскрывается в сами эти N заданий.
-            запись = повторы.setdefault(ключ, {"key": ключ, "hits": 0,
-                                               "filename": job.get("filename") or "",
-                                               "audio_hours": 0.0})
-            запись["hits"] += 1
-            запись["audio_hours"] += float(job.get("media_duration_s") or 0) / 3600
-        топ = sorted(повторы.values(), key=lambda r: r["hits"], reverse=True)[:10]
-        for запись in топ:
-            запись["audio_hours"] = round(запись["audio_hours"], 3)
+        # по кругу из-за ошибки в своей очереди. Ключ уходит в ответ: по нему
+        # строка «файл пришёл N раз» раскрывается в сами эти N заданий. Имя
+        # файла — у самого свежего повтора (голая колонка при MAX).
+        топ = [{"key": str(г["k"]), "hits": int(г["n"]),
+                "filename": г.get("filename") or "",
+                "audio_hours": round(float(г["audio"] or 0) / 3600, 3)}
+               for г in self._группы(
+                   "COALESCE(NULLIF(file_hash,''), cached_from) AS k, COUNT(*) AS n, "
+                   "filename, MAX(created_at) AS last, "
+                   "SUM(COALESCE(media_duration_s,0)) AS audio",
+                   group="1", since=since or None, owner=owner,
+                   where=("COALESCE(cached_from,'') <> ''",
+                          "COALESCE(NULLIF(file_hash,''), cached_from, '') <> ''"))]
+        топ.sort(key=lambda r: -r["hits"])
 
         return {
             "period": period,
-            "hits": len(из_кеша),
-            "misses": len(свои),
-            "hit_rate": round(len(из_кеша) / len(jobs), 4) if jobs else None,
+            "hits": попаданий,
+            "misses": промахов,
+            # Доля попаданий — среди выданных результатов (из кеша и своих
+            # готовых), тем же знаменателем, что в «Эффективности».
+            "hit_rate": (round(попаданий / (попаданий + промахов), 4)
+                         if попаданий + промахов else None),
             "audio_hours_saved": round(звук_кеш / 3600, 3),
             "processing_seconds_saved": round(звук_кеш * rtf, 1),
             "assumed_rtf": round(rtf, 4) if rtf else None,
-            "repeats": топ,
+            "repeats": топ[:10],
         }
 
     # --- надёжность --------------------------------------------------------
@@ -683,47 +859,47 @@ class Analytics:
         прошло с первой, — а это разные состояния сервера.
         """
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
-        готово = [j for j in jobs if j["status"] == "completed"]
-        с_повтором = [j for j in готово if int(j.get("retries") or 0) > 0]
-        отменены = [j for j in jobs if j["status"] == "cancelled"]
-
-        кем: dict[str, int] = {}
-        for job in отменены:
-            кем[str(job.get("cancelled_by") or "неизвестно")] = \
-                кем.get(str(job.get("cancelled_by") or "неизвестно"), 0) + 1
-
-        вебхуки: dict[str, int] = {}
-        for job in jobs:
-            статус = str(job.get("webhook_status") or "")
-            if статус:
-                вебхуки[статус] = вебхуки.get(статус, 0) + 1
-
+        окно = {"since": since or None, "owner": owner}
         распределение: dict[int, int] = {}
-        for job in jobs:
-            n = int(job.get("retries") or 0)
-            распределение[n] = распределение.get(n, 0) + 1
-
+        всего = готово = с_повтором = отказов = 0
+        for г in self._группы("COALESCE(retries,0) AS r, status, COUNT(*) AS n",
+                              group="1, 2", **окно):
+            n, r = int(г["n"]), int(г["r"])
+            распределение[r] = распределение.get(r, 0) + n
+            всего += n
+            if г["status"] == "completed":
+                готово += n
+                с_повтором += n if r > 0 else 0
+            elif г["status"] == "failed":
+                отказов += n
+        кем = sorted(((str(г["k"]), int(г["n"])) for г in self._группы(
+            "COALESCE(NULLIF(cancelled_by,''),'неизвестно') AS k, COUNT(*) AS n",
+            group="1", status="cancelled", **окно)), key=lambda kv: -kv[1])
+        вебхуки = sorted(((str(г["k"]), int(г["n"])) for г in self._группы(
+            "webhook_status AS k, COUNT(*) AS n", group="1",
+            where=("COALESCE(webhook_status,'') <> ''",), **окно)), key=lambda kv: -kv[1])
+        # Доля «с первой попытки» — среди завершённых (готовые и упавшие),
+        # как доля успеха в таблице моделей: стоящие в очереди и отменённые
+        # первую попытку ещё не сделали или не доделали.
+        завершено = готово + отказов
         return {
             "period": period,
-            "total": len(jobs),
-            "first_attempt_success": len(готово) - len(с_повтором),
-            "first_attempt_rate": round((len(готово) - len(с_повтором)) / len(jobs), 4)
-                                  if jobs else None,
+            "total": всего,
+            "first_attempt_success": готово - с_повтором,
+            "first_attempt_rate": round((готово - с_повтором) / завершено, 4)
+                                  if завершено else None,
             # Названия здесь важнее обычного: «повторялось: 0» рядом с
             # «повторов всего: 7» читается как противоречие, хотя это разные
             # вопросы — сколько заданий дошло со второй попытки и сколько
             # повторов было вообще (включая те, что так и не дошли).
-            "completed_after_retry": len(с_повтором),
-            "jobs_with_retries": sum(1 for j in jobs if int(j.get("retries") or 0) > 0),
-            "retry_total": sum(int(j.get("retries") or 0) for j in jobs),
+            "completed_after_retry": с_повтором,
+            "jobs_with_retries": sum(v for k, v in распределение.items() if k > 0),
+            "retry_total": sum(k * v for k, v in распределение.items()),
             "retry_distribution": [{"retries": k, "jobs": v}
                                    for k, v in sorted(распределение.items())],
-            "cancelled": len(отменены),
-            "cancelled_by": [{"who": k, "jobs": v}
-                             for k, v in sorted(кем.items(), key=lambda kv: -kv[1])],
-            "webhooks": [{"status": k, "jobs": v}
-                         for k, v in sorted(вебхуки.items(), key=lambda kv: -kv[1])],
+            "cancelled": sum(v for _, v in кем),
+            "cancelled_by": [{"who": k, "jobs": v} for k, v in кем],
+            "webhooks": [{"status": k, "jobs": v} for k, v in вебхуки],
         }
 
     # --- каким бывает звук --------------------------------------------------
@@ -738,9 +914,11 @@ class Analytics:
         источник записи.
         """
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000,
-                                   owner=owner)
-                if j["status"] == "completed"]
+        jobs = self._значения(
+            "filename, media_duration_s, file_size, words_count, speakers_count, "
+            "segments_count, source, snr_db, loudness_lufs, peak_dbfs, silence_share, "
+            "clipping_share, avg_confidence, wer, suspect_share",
+            status="completed", since=since or None, owner=owner)
 
         форматы: dict[str, dict[str, float]] = {}
         темпы: list[float] = []
@@ -881,9 +1059,9 @@ class Analytics:
         главное: сколько заданий разом карта выдержит.
         """
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000,
-                                   owner=owner)
-                if j["status"] == "completed"]
+        jobs = self._значения(
+            "model, peak_memory_mb, peak_memory_jobs, device, media_duration_s, "
+            "processing_time_s", status="completed", since=since or None, owner=owner)
 
         по_модели: dict[str, list[float]] = {}
         по_одновременности: dict[int, list[float]] = {}
@@ -940,9 +1118,8 @@ class Analytics:
         — источник записей, модель или параметры.
         """
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000,
-                                   owner=owner)
-                if j["status"] == "completed"]
+        jobs = self._значения("created_at, avg_confidence, wer", status="completed",
+                              since=since or None, owner=owner)
         if not jobs:
             return {"period": period, "buckets": [], "edges": [], "bucket_seconds": 0,
                     "confidence": [], "wer": [], "jobs": [],
@@ -1008,8 +1185,9 @@ class Analytics:
         # значит, нет и «до»: сравнивать не с чем, вердикт — unknown.
         конец_базы = since or time.time()
         база_от = (конец_базы - self.БАЗА_ДНЕЙ * 86400) if since else None
-        все = [j for j in self._jobs(since=база_от, limit=200000, owner=owner)
-               if j["status"] == "completed" and j.get("avg_confidence") is not None]
+        все = self._значения("created_at, model, avg_confidence", status="completed",
+                             since=база_от, owner=owner,
+                             where=("avg_confidence IS NOT NULL",))
         сейчас = [j for j in все if float(j["created_at"]) >= конец_базы] if since else все
         база = [j for j in все if float(j["created_at"]) < конец_базы] if since else []
 
@@ -1060,8 +1238,9 @@ class Analytics:
         конец = time.time()
         начало = since or конец - 30 * 86400
         база_от = начало - self.БАЗА_ДНЕЙ * 86400
-        все = [j for j in self._jobs(since=база_от, limit=200000, owner=owner)
-               if j["status"] == "completed"]
+        все = self._значения(
+            "created_at, avg_confidence, quality_flags, segments_count, suspect_segments",
+            status="completed", since=база_от, owner=owner)
         дней = max(1, int(round((конец - начало) / 86400)))
         # Период короче суток сравнивать с суточными пределами нельзя:
         # база собрана по дням, и одна часовая точка на восьми разговорах
@@ -1074,10 +1253,11 @@ class Analytics:
             шаг = max(1.0, (до - от) / n)
             return [от + i * шаг for i in range(n)]
 
-        def по_дням(от: float, до: float, n: int) -> list[dict[str, list[float]]]:
+        def по_дням(от: float, до: float, n: int) -> list[dict[str, Any]]:
             нижние = границы_дней(от, до, n)
-            корзины: list[dict[str, list[float]]] = [
-                {"conf": [], "low": [], "suspect": [], "jobs": []} for _ in range(n)]
+            корзины: list[dict[str, Any]] = [
+                {"conf": [], "low": [], "suspect": 0.0, "segments": 0.0, "assessed": 0,
+                 "jobs": 0} for _ in range(n)]
             for j in все:
                 t = float(j["created_at"])
                 if not от <= t < до:
@@ -1088,26 +1268,61 @@ class Analytics:
                     корзины[i]["conf"].append(float(c))
                     корзины[i]["low"].append(1.0 if float(c) < НИЗКАЯ_УВЕРЕННОСТЬ else 0.0)
                 if j.get("quality_flags") is not None and int(j.get("segments_count") or 0):
-                    корзины[i]["suspect"].append(
-                        100.0 * float(j.get("suspect_segments") or 0)
-                        / float(j["segments_count"]))
-                корзины[i]["jobs"].append(1.0)
+                    # Доля подозрительных — сумма к сумме, как в разделе
+                    # «Подозрительные расшифровки»: среднее долей по заданиям
+                    # под тем же названием давало 25 % там, где раздел рядом
+                    # показывал 0,1 % (запись 1 из 2 сегментов весила столько
+                    # же, сколько 0 из 998).
+                    корзины[i]["suspect"] += float(j.get("suspect_segments") or 0)
+                    корзины[i]["segments"] += float(j["segments_count"])
+                    корзины[i]["assessed"] += 1
+                корзины[i]["jobs"] += 1
             return корзины
 
         база = по_дням(база_от, начало, self.БАЗА_ДНЕЙ)
         текущие = по_дням(начало, конец, дней)
         шаг = max(1.0, (конец - начало) / дней)
         среднее = lambda xs: (sum(xs) / len(xs)) if xs else None  # noqa: E731
+
+        def значение(k: dict[str, Any], поле: str) -> float | None:
+            if поле == "suspect":
+                return 100.0 * k["suspect"] / k["segments"] if k["segments"] else None
+            v = среднее(k[поле])
+            return v * (100.0 if поле == "low" else 1.0) if v is not None else None
+
+        def записей(k: dict[str, Any], поле: str) -> int:
+            return k["assessed"] if поле == "suspect" else len(k[поле])
+
         карты = []
-        for ключ, поле, подпись, лучше, множитель in (
-                ("confidence", "conf", "Средняя уверенность", 1, 1.0),
-                ("low_confidence_share", "low", "Доля заданий с уверенностью ниже 0,75, %",
-                 -1, 100.0),
-                ("suspect_share", "suspect", "Доля подозрительных сегментов, %", -1, 1.0)):
-            ряд_базы = [(среднее(k[поле]) * множитель if k[поле] else None) for k in база]
-            пределы = stats.control_limits([x for x in ряд_базы if x is not None])
-            точки = [(среднее(k[поле]) * множитель if k[поле] else None) for k in текущие]
-            отметки = [] if короткий_период else stats.spc_flags(точки, пределы)
+        for ключ, поле, подпись, лучше in (
+                ("confidence", "conf", "Средняя уверенность", 1),
+                ("low_confidence_share", "low", "Доля заданий с уверенностью ниже 0,75, %", -1),
+                ("suspect_share", "suspect", "Доля подозрительных сегментов, %", -1)):
+            ряд_базы = [значение(k, поле) for k in база]
+            годные = [x for x in ряд_базы if x is not None]
+            # Нижняя граница σ. Месяц без единого подозрительного сегмента
+            # или без единого неуверенного задания — обычное состояние
+            # чистой установки, и при σ = 0 «за 3σ» оказывалось любое
+            # отклонение: одна неуверенная запись из пятидесяти — «критично».
+            # У долей граница биномиальная (по числу записей в точке базы;
+            # у подозрительных — по числу сегментов), у уверенности — полсотой.
+            в_точке = [записей(k, поле) for k in база if значение(k, поле) is not None]
+            сегментов = [k["segments"] for k in база if k["segments"]]
+            if поле == "conf":
+                граница = 0.005
+            else:
+                μ = sum(годные) / len(годные) if годные else 0.0
+                n = (sum(сегментов) / len(сегментов) if поле == "suspect" and сегментов
+                     else sum(в_точке) / len(в_точке) if в_точке else 0.0)
+                граница = stats.binomial_std(μ, n)
+            пределы = stats.control_limits(годные, min_std=граница)
+            точки = [значение(k, поле) for k in текущие]
+            # Точка из одной-двух записей вердикта не получает, а у долей за
+            # предел выходит точка, где лишних против среднего хотя бы двое:
+            # одна запись из пятидесяти — не отклонение процесса.
+            отметки = [] if короткий_период else stats.spc_flags(
+                точки, пределы, counts=[записей(k, поле) for k in текущие],
+                min_n=stats.МИН_В_ТОЧКЕ, share=поле == "low", min_excess=2)
             карты.append({
                 "key": ключ, "title": подпись, "good": лучше, "limits": пределы,
                 "baseline": [{"ts": round(база_от + i * (начало - база_от) / self.БАЗА_ДНЕЙ, 1),
@@ -1115,7 +1330,10 @@ class Analytics:
                              for i, v in enumerate(ряд_базы)],
                 "points": [{"ts": round(начало + i * шаг, 1),
                             "value": (round(v, 4) if v is not None else None),
-                            "jobs": len(текущие[i]["jobs"])}
+                            "jobs": текущие[i]["jobs"],
+                            # По скольким записям посчитана точка: у доли
+                            # подозрительных это оценённые задания с сегментами.
+                            "n": записей(текущие[i], поле)}
                            for i, v in enumerate(точки)],
                 "flags": отметки,
                 "worst": max((ф["level"] for ф in отметки),
@@ -1206,8 +1424,10 @@ class Analytics:
         WER − MER показывает избыток вставок, то есть галлюцинации.
         """
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000, owner=owner)
-                if j["status"] == "completed" and j.get("wer") is not None]
+        jobs = self._значения(
+            "id, filename, model, source, language, media_duration_s, wer, mer, ref_words, "
+            "sub_words, del_words, ins_words", status="completed", since=since or None,
+            owner=owner, where=("wer IS NOT NULL",))
 
         def срез(ключ: Any) -> list[dict[str, Any]]:
             группы: dict[str, list[dict[str, Any]]] = {}
@@ -1245,8 +1465,9 @@ class Analytics:
         from .pipeline import calibration as C  # noqa: PLC0415
 
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000, owner=owner)
-                if j["status"] == "completed" and j.get("calibration")]
+        jobs = [j for j in self._значения(
+            "model, calibration", status="completed", since=since or None, owner=owner,
+            where=("calibration IS NOT NULL",)) if j.get("calibration")]
         по_моделям: dict[str, list[Any]] = {}
         for j in jobs:
             по_моделям.setdefault(str(j.get("model") or "—"), []).append(j["calibration"])
@@ -1279,9 +1500,10 @@ class Analytics:
         то, что видит каждый двадцатый.
         """
         since = self._since(period)
-        jobs = [j for j in self._jobs(status="completed", since=since or None,
-                                      limit=100000, owner=owner)
-                if not j.get("cached_from") and j.get("processing_time_s") is not None]
+        jobs = self._значения(
+            "model, media_duration_s, processing_time_s, rtf, queue_time_s",
+            status="completed", since=since or None, owner=owner,
+            where=("COALESCE(cached_from,'') = ''", "processing_time_s IS NOT NULL"))
 
         def свод(items: list[dict[str, Any]]) -> dict[str, Any]:
             время = [float(j["processing_time_s"]) for j in items]
@@ -1309,10 +1531,16 @@ class Analytics:
                     sorted(группы.items(), key=lambda kv: -len(kv[1]))]
 
         # Поток: сессии не оставляют заданий, их задержка живёт в метриках.
+        # Метрики — без владельца: это сессии всего сервера с названиями
+        # моделей, которыми пользуются другие. Поэтому — только
+        # администратору, как замеры железа в рядах по времени.
         поток: dict[str, list[float]] = {}
-        for строка in self.db.metric_values("stream_first_text_s", since):
-            поток.setdefault(str(строка.get("model") or "—"), []).append(float(строка["value"]))
-        сессии = self.db.metric_values("stream_session_s", since)
+        сессии: list[dict[str, Any]] = []
+        if owner is None:
+            for строка in self.db.metric_values("stream_first_text_s", since):
+                поток.setdefault(str(строка.get("model") or "—"), []).append(
+                    float(строка["value"]))
+            сессии = self.db.metric_values("stream_session_s", since)
         все_первые = [x for v in поток.values() for x in v]
         return {
             "period": period,
@@ -1424,8 +1652,10 @@ class Analytics:
         from . import quality  # noqa: PLC0415
 
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000, owner=owner)
-                if j["status"] == "completed" and j.get("segments_count")]
+        jobs = self._значения(
+            "id, filename, model, source, created_at, segments_count, suspect_segments, "
+            "suspect_share, quality_flags", status="completed", since=since or None,
+            owner=owner, where=("segments_count <> 0",))
         # Задания, сделанные до появления признаков, не считаются ни
         # подозрительными, ни чистыми — их просто не смотрели.
         оценённые = [j for j in jobs if j.get("quality_flags") is not None]
@@ -1497,7 +1727,8 @@ class Analytics:
         для отчётности она важнее прочих разрезов.
         """
         since = self._since(period)
-        jobs = self._jobs(since=since or None, limit=100000, owner=owner)
+        jobs = self._значения("tags, status, media_duration_s, processing_time_s, words_count",
+                              since=since or None, owner=owner)
         собрано: dict[str, dict[str, Any]] = {}
         for job in jobs:
             # Без повторов: «срочно, срочно» — одна метка, а не две. Иначе
@@ -1550,9 +1781,8 @@ class Analytics:
         покажет «всё хорошо».
         """
         since = self._since(period)
-        jobs = [j for j in self._jobs(since=since or None, limit=100000,
-                                   owner=owner)
-                if j.get("queue_time_s") is not None]
+        jobs = self._значения("queue_time_s, priority, source", since=since or None,
+                              owner=owner, where=("queue_time_s IS NOT NULL",))
 
         по_приоритету: dict[str, list[float]] = {}
         по_источнику: dict[str, list[float]] = {}
@@ -1601,6 +1831,10 @@ class Analytics:
         # граница — конец сборки: задания, созданные позже, в отчёт не вошли.
         начало = self._since(period)
         отчёт["window"] = {"since": начало or None, "until": time.time()}
+        # Упёрлась ли хоть одна выборка значений в предел: тогда часть
+        # перцентилей посчитана по свежей части окна, и отчёт говорит это
+        # прямо, а не молча.
+        отчёт["truncated"] = self._усечено
         return отчёт
 
     def _разрезы(self, period: str, owner: str | None) -> dict[str, Any]:

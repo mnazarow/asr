@@ -53,6 +53,46 @@ def _slot(request: Request) -> tuple[Any, Any, Any]:
     return state, state.llm, state.llm_worker
 
 
+def _клиент_наружу(сведения: dict[str, Any], principal: Principal) -> dict[str, Any]:
+    """Состояние клиента модели — без того, что знать не положено.
+
+    Адрес сервера модели уходил любому ключу вместе с «user:pass@» — если
+    так задан, — а с ним список моделей и текст последней ошибки, в котором
+    тот же адрес. Неадминистратору это — разведка инфраструктуры; учётные
+    данные в адресе не нужны и администратору (он их задал).
+    """
+    from ..monitoring.pushers import скрыть_адрес  # noqa: PLC0415
+
+    итог = dict(сведения)
+    if итог.get("url"):
+        итог["url"] = скрыть_адрес(str(итог["url"]))
+    if not principal.is_admin:
+        for ключ in ("url", "models", "last_error", "reason"):
+            итог.pop(ключ, None)
+    return итог
+
+
+def _поток_наружу(state: Any, сведения: dict[str, Any],
+                  principal: Principal) -> dict[str, Any]:
+    """Состояние потока разбора: чужое текущее задание — без идентификатора.
+
+    Рядом с этим ответом «current» уже прятал чужую запись словами «чужая
+    запись», а `worker.current` отдавал её идентификатор как есть (в
+    колл-центре он нередко повторяет номер клиента), и `last_error` — текст
+    чужой ошибки.
+    """
+    итог = dict(сведения)
+    if principal.is_admin:
+        return итог
+    текущее = str(итог.get("current") or "")
+    if текущее:
+        задание = state.db.get_job(текущее) or {}
+        if not same_scope(principal, str(задание.get("owner") or "")):
+            итог["current"] = ""
+    итог.pop("last_error", None)
+    return итог
+
+
 @router.get("/llm/status", summary="Состояние языковой модели")
 def llm_status(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Как подключено, доступен ли сервер модели, учёт вызовов, очередь
@@ -65,9 +105,14 @@ def llm_status(request: Request, principal: Principal = Depends(authenticate)) -
     годные = [г for г in свод["groups"] if г["ok"]]
     разобрано = sum(int(г["n"]) - int(г["stale"] or 0) for г in годные)
     ошибок = sum(int(г["n"]) for г in свод["groups"] if not г["ok"])
+    # Адрес сервера модели — без логина и пароля для всех; сам адрес, список
+    # моделей на нём и чужая текущая запись — только администратору
+    # (`_клиент_наружу`, `_поток_наружу`): «только чтение» получал
+    # `http://user:PASSWORD@10.0.0.5:8000`, а `worker.current` и `last_error`
+    # отдавали номер чужой записи (в колл-центре — номер клиента).
     return {
-        **клиент.status(),
-        "worker": поток.status(),
+        **_клиент_наружу(клиент.status(), principal),
+        "worker": _поток_наружу(state, поток.status(), principal),
         "version": tasks.VERSION,
         "coverage": {"total": свод["total"], "analyzed": разобрано,
                      "errors": ошибок,
@@ -116,6 +161,9 @@ def llm_job(request: Request, job_id: str,
 @router.post("/content/jobs/{job_id}/llm", summary="Разобрать запись моделью сейчас")
 def llm_job_run(request: Request, job_id: str,
                 force: bool = Query(default=True),
+                fresh: bool = Query(default=False, description=(
+                    "Спросить модель заново, мимо кеша ответов: прежние ответы на "
+                    "ту же подсказку не берутся, новые их заменяют")),
                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Синхронно, в обработчике: ответ приходит вместе с результатом.
     Длинная запись — несколько вызовов; ждать столько, сколько задано
@@ -133,12 +181,28 @@ def llm_job_run(request: Request, job_id: str,
     if job.get("status") != "completed":
         raise error_response(ConfigError("Запись ещё не распознана."))
     try:
-        результат = поток.analyze_job(job_id, force=force)
+        результат = поток.analyze_job(job_id, force=force or fresh, fresh=fresh)
     except LLMError as exc:
         raise error_response(ASRHubError(
             f"Модель не ответила: {exc}",
             hint="Проверьте сервер модели: GET /api/llm/status и POST /api/llm/test.")) from exc
     return {"job_id": job_id, "result": результат, "version": tasks.VERSION}
+
+
+@router.delete("/llm/cache", summary="Сбросить кеш ответов модели")
+def llm_cache_clear(request: Request,
+                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Забывает все ответы модели, положенные в кеш.
+
+    Кеш отвечает за повторы: та же подсказка второй раз модель не спрашивает.
+    Но после смены модели на сервере с тем же именем, после ручной правки
+    шаблона Ollama или просто чтобы разобрать архив заново, прежние ответы
+    мешают — а сбросить их было нечем. Сами разборы записей не трогаются.
+    """
+    state, _клиент, _поток = _slot(request)
+    require_admin(principal)
+    убрано = int(state.db.execute("DELETE FROM llm_cache") or 0)
+    return {"removed": убрано}
 
 
 @router.post("/llm/backfill", summary="Разобрать архив моделью")
@@ -203,7 +267,7 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
             "since": состояние.get("current_since"),
         }
     return {
-        "worker": состояние,
+        "worker": _поток_наружу(state, состояние, principal),
         "current": текущее,
         "counts": state.db.llmq_counts(owner=свой),
         # Сводка — по тому же промежутку, что и график: [с_какого, сейчас).
@@ -218,7 +282,7 @@ def llm_queue(request: Request, state_filter: str = Query(default="", alias="sta
                    "bucket_seconds": (сейчас - с_какого) / корзин, "rows": ряд},
         "queue": state.db.llmq_list(state=state_filter, limit=limit,
                                     offset=offset, owner=свой),
-        "client": клиент.status(),
+        "client": _клиент_наружу(клиент.status(), principal),
         "settings": {
             "paused": bool(state.settings.get("llm_queue_paused", False)),
             "auto": bool(state.settings.get("llm_auto", True)),
@@ -293,14 +357,15 @@ def llm_queue_add(request: Request, данные: dict[str, Any] = Body(default=
             if not начало or конец <= начало:
                 raise error_response(ConfigError(
                     "Для отбора за период нужны начало и конец промежутка."))
-            # У `list_jobs` есть «с какого», но нет «по какое»: верхнюю
-            # границу отсекаем сами. Брать с запасом и резать в питоне
-            # дешевле, чем заводить ещё один разрез в базе ради кнопки.
-            задания = state.db.list_jobs(status="completed", since=начало,
-                                         limit=предел, light=True,
-                                         owner=scope_owner(principal))
-            ids = [str(з["id"]) for з in задания
-                   if float(з.get("created_at") or 0) <= конец]
+            # Обе границы — в запросе. У `list_jobs` нет «по какое», и
+            # верхнюю границу отсекали после предела: самые новые записи
+            # занимали весь предел, и отбор за прошлый месяц при живом потоке
+            # после него оказывался пустым.
+            отбор_владельца, свои = state.db._owner_clause(scope_owner(principal), "jobs")
+            ids = [str(з["id"]) for з in state.db.query(
+                "SELECT id FROM jobs WHERE status='completed' AND created_at>=? "
+                "AND created_at<=?" + (f" AND {отбор_владельца}" if отбор_владельца else "")
+                + " ORDER BY created_at DESC LIMIT ?", [начало, конец, *свои, предел])]
         else:
             raise error_response(ConfigError(
                 f"Неизвестный отбор: «{отбор}».",
@@ -611,6 +676,9 @@ def _часть_по_спискам(state: Any, since: float,
 def llm_report(request: Request, period: str = ПЕРИОД,
                part: str = Query(default="", pattern="^(|fast|heavy)$"),
                since: float | None = Query(default=None, ge=0),
+               until: float | None = Query(
+                   default=None, ge=0,
+                   description="Верхняя граница окна, секунды эпохи; пусто — «сейчас»"),
                agent: str = Query(default="", max_length=64,
                                   description="Только разговоры этого добавочного"),
                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
@@ -627,9 +695,9 @@ def llm_report(request: Request, period: str = ПЕРИОД,
     - `part=heavy` — то, что лежит в ответах списками: обязательства,
       трекеры, скоркарта, «ответ мимо списка». Читает каждый ответ окна.
 
-    Без `part` — обе части разом, как раньше. `since` — нижняя граница
+    Без `part` — обе части разом, как раньше. `since` и `until` — границы
     окна вместо отсчёта от «сейчас»: вторую часть спрашивают позже первой,
-    и считаться она должна по тому же окну (`window.since` первой части).
+    и считаться она должна по тому же окну (`window` первой части).
 
     `agent` — только разговоры этого добавочного (из журнала звонков).
     Разрез по добавочным (`agents`, в счётной части) от него не зависит:
@@ -640,28 +708,36 @@ def llm_report(request: Request, period: str = ПЕРИОД,
     """
     state, клиент, поток = _slot(request)
     секунд = PERIODS.get(period, 7 * 86400)
+    # Верхняя граница — одна на весь ответ и берётся до счёта. Без неё свод
+    # был открыт в будущее: вторая часть, посчитанная через десяток секунд
+    # после первой, брала и записи, пришедшие за эти секунды, а список под
+    # её числом раскрывается окном первой части — трекер «сработал в 12»
+    # раскрывался в десять разговоров. Позже «сейчас» граница не ставится.
+    сейчас = time.time()
+    конец = сейчас if until is None else min(float(until), сейчас)
     начало = float(since) if since is not None else (
-        (time.time() - секунд) if секунд else 0.0)
+        (конец - секунд) if секунд else 0.0)
     владелец = scope_owner(principal)
     ответ: dict[str, Any] = {"period": period, "enabled": клиент.enabled, "model": клиент.model}
     добавочный = agent.strip()
     if part != "heavy":
-        ответ.update(_счётная_часть(state, начало, владелец, agent=добавочный))
-        ответ["rows"] = _построчно(state, начало, владелец, agent=добавочный)
-        ответ.update(_по_добавочным(state, начало, владелец))
+        ответ.update(_счётная_часть(state, начало, владелец, until=конец, agent=добавочный))
+        ответ["rows"] = _построчно(state, начало, владелец, until=конец, agent=добавочный)
+        ответ.update(_по_добавочным(state, начало, владелец, until=конец))
         ответ["worker"] = поток.status()
     if part != "fast":
-        ответ.update(_часть_по_спискам(state, начало, владелец, agent=добавочный))
+        ответ.update(_часть_по_спискам(state, начало, владелец, until=конец,
+                                       agent=добавочный))
     if добавочный:
         ответ["agent"] = добавочный
     if part:
         ответ["part"] = part
     # Окно свода — в ответ: числа раздела раскрываются в список записей
     # отдельным запросом (`GET /api/drill`) и позже, а «неделя до сейчас»
-    # через минуту — уже другая неделя. Нижняя граница одна на весь ответ,
-    # верхняя — момент, когда он посчитан. Режется, как и список, временем
-    # записи (`j.created_at`), а не временем ответа модели.
-    ответ["window"] = {"since": начало or None, "until": time.time()}
+    # через минуту — уже другая неделя. Обе границы одни на весь ответ: те,
+    # по которым он посчитан. Режется, как и список, временем записи
+    # (`j.created_at`), а не временем ответа модели.
+    ответ["window"] = {"since": начало or None, "until": конец}
     return ответ
 
 

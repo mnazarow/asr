@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -241,6 +243,54 @@ def про_think(exc: Exception) -> bool:
     return getattr(exc, "status", None) == 400 and "think" in тело
 
 
+def без_учётных_данных(адрес: str) -> str:
+    """Адрес сервера модели без логина и пароля: «http://u:p@h:8000» → «http://h:8000».
+
+    Адрес показывается в состоянии слоя, и пароль из него уходил всем, кто
+    это состояние видит.
+    """
+    try:
+        части = urllib.parse.urlsplit(str(адрес or ""))
+    except ValueError:
+        return ""
+    if "@" not in части.netloc:
+        return str(адрес or "")
+    узел = части.netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit((части.scheme, узел, части.path, части.query, части.fragment))
+
+
+def мимо_прокси(адрес: str) -> bool:
+    """Ходить ли к адресу напрямую, мимо прокси из окружения.
+
+    `urlopen` берёт `http_proxy` из окружения, и без `no_proxy` запрос к
+    локальной Ollama уходил на корпоративный прокси: «Сервер модели
+    ответил 403: proxy: access to 127.0.0.1 denied». Петлевой адрес, имя
+    localhost и адреса частных сетей прокси не нужны никогда.
+    """
+    try:
+        узел = urllib.parse.urlsplit(str(адрес or "")).hostname or ""
+    except ValueError:
+        return False
+    if узел in ("localhost", "") or узел.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(узел)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
+#: Открыватель без прокси — для локальных и частных адресов.
+_НАПРЯМУЮ = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def открыть(запрос: urllib.request.Request, timeout: float) -> Any:
+    """`urlopen`, который к локальному серверу модели идёт напрямую."""
+    if мимо_прокси(запрос.full_url):
+        return _НАПРЯМУЮ.open(запрос, timeout=timeout)
+    return urllib.request.urlopen(запрос, timeout=timeout)  # noqa: S310
+
+
 def _годится(ответ: str, validate: Any) -> bool:
     """Разбирается ли ответ так, как его собирается читать вызывающий."""
     if validate is None:
@@ -336,6 +386,21 @@ class LLMClient:
             yield
         finally:
             self._запись.job_id = прежняя
+
+    @contextmanager
+    def мимо_кеша(self) -> Iterator[None]:
+        """Вызовы внутри спрашивают модель заново, не читая кеш ответов.
+
+        Новый ответ в кеш кладётся как обычно — он и заменяет прежний.
+        Нужен «Разобрать заново»: без него кнопка возвращала прежний ответ из
+        кеша, не спросив модель ни разу.
+        """
+        прежнее = getattr(self._запись, "мимо", False)
+        self._запись.мимо = True
+        try:
+            yield
+        finally:
+            self._запись.мимо = прежнее
 
     # --- настройки ------------------------------------------------------
 
@@ -452,7 +517,7 @@ class LLMClient:
             raise LLMError("Языковая модель выключена (llm_backend = off).")
         max_tokens = int(max_tokens or предел_ответа(self.settings))
         ключ = self.cache_key(kind, system, user)
-        if use_cache and self.db is not None:
+        if use_cache and self.db is not None and not getattr(self._запись, "мимо", False):
             готовое = self.db.llm_cache_get(ключ)
             if готовое is not None and _годится(готовое, validate):
                 with self._lock:
@@ -475,9 +540,11 @@ class LLMClient:
 
                     ответ = stub.reply(system, user)
                 elif self.backend == "ollama":
-                    ответ = self._ollama(system, user, json_mode, max_tokens)
+                    ответ = self._ollama(system, user, json_mode, max_tokens,
+                                         validate=validate)
                 else:
-                    ответ = self._openai(system, user, json_mode, max_tokens)
+                    ответ = self._openai(system, user, json_mode, max_tokens,
+                                         validate=validate)
             except LLMError as exc:
                 with self._lock:
                     self.calls += 1
@@ -509,8 +576,17 @@ class LLMClient:
             log.debug("Запись кеша не убрана: %s", exc)
 
     def cache_key(self, kind: str, system: str, user: str) -> str:
+        """Отпечаток вызова: сервер, модель, подсказка — и как генерировать.
+
+        Предел ответа, глубина рассуждения и окно — в отпечатке: ответ,
+        оборванный на пределе в 1200 токенов, после подъёма предела до 8000
+        лежал в кеше под тем же ключом, и «Разобрать заново» возвращало
+        прежний обрывок, ни разу не спросив модель.
+        """
         отпечаток = hashlib.sha256()
-        for часть in (self.backend, self.model, kind, system, user):
+        генерация = (f"{предел_ответа(self.settings)}|{уровень_рассуждения(self.settings)}|"
+                     f"{окно_контекста(self.settings, self.model) if self.backend == 'ollama' else ''}")
+        for часть in (self.backend, self.model, kind, system, user, генерация):
             отпечаток.update(часть.encode("utf-8"))
             отпечаток.update(b"\x00")
         return отпечаток.hexdigest()
@@ -519,10 +595,35 @@ class LLMClient:
         порог = float(self.settings.get("llm_min_free_vram_gb") or 0)
         if порог <= 0 or self.backend == "stub":
             return
+        # Модель, которая уже загружена, памяти больше не просит: занятое ею
+        # — её же. Без этой проверки первый вызов проходил, модель ложилась в
+        # видеопамять на полчаса (keep_alive), и все следующие вызовы видели
+        # «свободно меньше порога» — отказ временный, попытки не тратились, и
+        # запись крутилась в очереди без конца.
+        if self.backend == "ollama" and self._загружена():
+            return
         свободно = self._free_vram_gb()
         if свободно is not None and свободно < порог:
             raise _временная(f"Свободной видеопамяти {свободно:.1f} ГБ — меньше порога "
                              f"{порог:g} ГБ; вызов отложен.")
+
+    def _загружена(self) -> bool:
+        """Загружена ли модель в Ollama сейчас — по /api/ps, с кешем на полминуты."""
+        сейчас = time.time()
+        with self._lock:
+            запомнено = getattr(self, "_ps", None)
+            if запомнено and запомнено[0] == self.model and сейчас - запомнено[1] < 30.0:
+                return запомнено[2]
+        try:
+            данные = self._http("GET", f"{self.url}/api/ps", None, timeout=3.0)
+            имена = [str(м.get("name") or м.get("model") or "")
+                     for м in (данные.get("models") or []) if isinstance(м, dict)]
+            есть = any(та_же_модель(и, self.model) for и in имена)
+        except LLMError:
+            есть = False
+        with self._lock:
+            self._ps = (self.model, сейчас, есть)
+        return есть
 
     def _free_vram_gb(self) -> float | None:
         """Свободная память первой видеокарты — по nvidia-smi, если он есть."""
@@ -555,7 +656,8 @@ class LLMClient:
                 return None
         return поле_think(self.model, уровень)
 
-    def _ollama(self, system: str, user: str, json_mode: bool, max_tokens: int) -> str:
+    def _ollama(self, system: str, user: str, json_mode: bool, max_tokens: int,
+                validate: Any = None) -> str:
         """Один вызов Ollama — и не больше одного повтора по диагнозу.
 
         Пустой ответ бывает четырёх видов, и лечатся они по-разному:
@@ -578,6 +680,23 @@ class LLMClient:
         предел = max_tokens + бюджет_рассуждения(think, уровень)
         первый = self._ollama_раз(system, user, think=think, num_predict=предел,
                                   num_ctx=окно, json_mode=json_mode)
+        if первый.текст and первый.причина == "length" and not _годится(первый.текст, validate):
+            # Ответ есть, но оборван на пределе: JSON не закрыт. Прежде такой
+            # обрывок принимался за ответ — разбор доставал из него первый
+            # целый вложенный объект (одно действие из списка), а не весь
+            # ответ, и запись ложилась «разобранной» с пустыми полями.
+            # Один повтор с пределом вдвое больше; не хватило — ошибка.
+            предел2 = предел * 2
+            log.info("Ответ модели оборвался на пределе %d токенов — спрашиваем с "
+                     "пределом %d", предел, предел2)
+            второй = self._ollama_раз(system, user, think=think, num_predict=предел2,
+                                      num_ctx=окно, json_mode=json_mode)
+            if второй.текст and (второй.причина != "length" or _годится(второй.текст, validate)):
+                return второй.текст
+            raise LLMError(
+                f"Ответ модели оборвался на пределе ({предел2} токенов) — JSON не "
+                f"закрыт. Поднимите «Предел ответа модели» (llm_max_tokens) или "
+                f"уменьшите «Предел текста на один вызов» (llm_context_chars).")
         if первый.текст:
             return первый.текст
 
@@ -674,7 +793,8 @@ class LLMClient:
                 f"«{ответ.причина or 'не названа'}», сказано токенов: "
                 f"{ответ.сказано}{повтор}.")
 
-    def _openai(self, system: str, user: str, json_mode: bool, max_tokens: int) -> str:
+    def _openai(self, system: str, user: str, json_mode: bool, max_tokens: int,
+                validate: Any = None) -> str:
         """Вызов OpenAI-совместимого сервера — с тем же лечением пустоты.
 
         Поля, выключающего рассуждение, у совместимых серверов общего нет
@@ -683,6 +803,15 @@ class LLMClient:
         обрывом на пределе — повтор с пределом вдвое больше.
         """
         текст, мысли, причина = self._openai_раз(system, user, json_mode, max_tokens)
+        if текст and причина == "length" and not _годится(текст, validate):
+            # Оборванный на пределе ответ — не ответ (см. `_ollama`).
+            предел2 = max_tokens * 2
+            текст, мысли, причина = self._openai_раз(system, user, json_mode, предел2)
+            if текст and (причина != "length" or _годится(текст, validate)):
+                return текст
+            raise LLMError(
+                f"Ответ модели оборвался на пределе ({предел2} токенов) — JSON не "
+                f"закрыт. Поднимите «Предел ответа модели» (llm_max_tokens).")
         if текст:
             return текст
         if мысли or причина == "length":
@@ -737,10 +866,19 @@ class LLMClient:
         if ключ:
             заголовки["Authorization"] = f"Bearer {ключ}"
         данные = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-        запрос = urllib.request.Request(url, data=данные, method=method, headers=заголовки)  # noqa: S310
         try:
-            with urllib.request.urlopen(запрос, timeout=timeout) as ответ:  # noqa: S310
+            # Адрес без схемы («ollama» вместо «http://ollama:11434») и ключ
+            # с не-латинской буквой падали здесь ValueError и
+            # UnicodeEncodeError — мимо перехватов ниже: состояние слоя
+            # отвечало 500, а разбор по кнопке оставлял строку очереди
+            # «идёт» навсегда.
+            запрос = urllib.request.Request(url, data=данные, method=method,  # noqa: S310
+                                            headers=заголовки)
+            with открыть(запрос, timeout) as ответ:
                 сырое = ответ.read()
+        except ValueError as exc:
+            raise LLMError(f"Негодный адрес или ключ сервера модели: {exc}. Проверьте "
+                           f"llm_url (нужна схема: http://…) и llm_api_key.") from exc
         except urllib.error.HTTPError as exc:
             кусок = ""
             try:

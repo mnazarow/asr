@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from ..catalog import ModelSpec
-from ..errors import ASRHubError, EngineError, HardwareError, classify_exception
+from ..errors import (
+    ASRHubError,
+    EngineError,
+    HardwareError,
+    ModelLoadError,
+    classify_exception,
+    без_путей,
+)
 from ..hardware import проверить_ускоритель
 from ..logging_setup import get_logger
 
@@ -172,6 +179,11 @@ class Engine(ABC):
     supports_streaming: bool = False
     supports_diarization: bool = False
     outputs_punctuation: bool = False
+    #: Режет ли движок запись по речи сам (свой VAD или нарезка по пределу
+    #: модели). Тем, кто не режет, конвейер подаёт запись кусками по найденной
+    #: речи (см. `processor._по_речи`): группа VAD заявлена «для всех
+    #: движков», а до модели она доходила у шести из семнадцати.
+    режет_сам: bool = False
 
     def __init__(self, spec: ModelSpec, settings: dict[str, Any]):
         self.spec = spec
@@ -221,7 +233,7 @@ class Engine(ABC):
         # cudaGetDeviceCount, transformers — про «тензор на cpu, а ждали
         # meta». Ни одна из этих строк не содержала ответа «карты нет».
         устройство = self.resolve_device(settings)
-        годно, причина = проверить_ускоритель(устройство)
+        годно, причина = self.проверить_устройство(устройство)
         if not годно:
             raise HardwareError(
                 f"Устройство «{устройство}» недоступно: {причина}",
@@ -238,6 +250,15 @@ class Engine(ABC):
             self._model = self._load(settings)
         except ASRHubError:
             raise
+        except FileNotFoundError as exc:
+            # Нет файла при ЗАГРУЗКЕ МОДЕЛИ — это веса, а не запись. Общий
+            # разбор называл это «битым звуком» (audio_error: «проверьте, что
+            # файл не повреждён»), без повтора и без резервной модели.
+            raise ModelLoadError(
+                f"Файл модели «{self.spec.id}» не найден: "
+                f"{без_путей(str(exc.filename or exc))}", cause=exc,
+            ).with_hint(f"Скачайте модель заново: раздел «Модели» или на сервере "
+                        f"bash scripts/models.sh download {self.spec.id} --force") from exc
         except Exception as exc:
             raise classify_exception(exc, engine=self.id, model=self.spec.id) from exc
         self._loaded_key = key
@@ -296,6 +317,16 @@ class Engine(ABC):
 
     def resolve_device(self, settings: dict[str, Any]) -> str:
         return device_for(settings)
+
+    def проверить_устройство(self, устройство: str) -> tuple[bool, str]:
+        """Годится ли устройство этому движку. По умолчанию — проверка через torch.
+
+        Движки без torch (CTranslate2, whisper.cpp) переопределяют: сборка
+        torch без CUDA не значит, что карты нет у них, и «CUDA не видит ни
+        одной карты» на каждом задании faster-whisper при исправной карте
+        было ложью.
+        """
+        return проверить_ускоритель(устройство)
 
     def resolve_compute_type(self, settings: dict[str, Any], device: str) -> str:
         value = str(settings.get("compute_type") or "auto")

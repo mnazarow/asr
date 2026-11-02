@@ -76,6 +76,16 @@ def huggingface_repo(source: str) -> str:
     return _FASTER_WHISPER_REPOS.get(source, source)
 
 
+#: Имена openai-whisper, под которыми библиотека кладёт другой файл весов.
+_ФАЙЛЫ_WHISPER = {"large.pt": "large-v3.pt", "turbo.pt": "large-v3-turbo.pt"}
+
+
+def файл_whisper(models_dir: Path, revision: str) -> Path:
+    """Файл весов openai-whisper: `whisper.load_model(имя, download_root=…)`
+    кладёт `<каталог моделей>/<имя>.pt` (имя — последняя часть адреса)."""
+    return Path(models_dir) / _ФАЙЛЫ_WHISPER.get(revision, revision)
+
+
 def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None:
     """Веса модели на диске, если они уже скачаны.
 
@@ -93,6 +103,10 @@ def find_local(models_dir: Path, source: str, revision: str = "") -> Path | None
         return файл_весов(models_dir, source)
     if not models_dir.exists():
         return None
+    if revision.endswith(".pt") and "/" not in source:
+        # Веса openai-whisper: один файл `<имя>.pt` (см. каталог моделей).
+        файл = файл_whisper(models_dir, revision)
+        return файл if файл.is_file() else None
     if source.startswith("ai-sage/GigaAM"):
         from .engines.gigaam_engine import weights_file
         candidate = models_dir / weights_file(source, revision)

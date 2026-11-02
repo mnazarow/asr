@@ -1,0 +1,16 @@
+# Надстройка «сервер только за прокси».
+#
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+#   (с видеокартой — третьим -f docker-compose.gpu.yml)
+#
+# С одним `--profile proxy` сервер по-прежнему публиковался на 0.0.0.0:8080
+# рядом с nginx: ограничение /api/monitoring по сетям и TLS обходились
+# обращением на :8080 напрямую. Здесь у сервера порты сняты совсем — он
+# доступен только nginx по внутренней сети Compose, — а nginx поднимается
+# без --profile.
+
+services:
+  asrhub:
+    ports: !reset []
+  nginx:
+    profiles: !reset []

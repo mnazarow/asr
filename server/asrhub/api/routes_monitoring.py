@@ -11,7 +11,6 @@ import json
 import re
 import time
 from typing import Any
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -25,7 +24,7 @@ from ..errors import (
 from ..monitoring import METRICS, MetricSpec, exporters, probes
 from ..monitoring import catalog as metric_catalog
 from ..monitoring.alerts import Rule
-from ..monitoring.pushers import KINDS, Target
+from ..monitoring.pushers import KINDS, Target, адрес_для_всех
 from .deps import (
     Principal,
     authenticate,
@@ -346,7 +345,9 @@ def resources(request: Request, minutes: int = Query(default=60, ge=1, le=10080)
 def alerts(request: Request, only_firing: bool = False,
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     service = _monitoring(request)
-    service.samples()
+    # По последнему расчёту, без нового сбора: этот адрес интерфейс зовёт
+    # каждые четыре секунды с любой страницы (см. `MonitoringService.последний`).
+    service.последний()
     engine = service.alerts
     return {
         "summary": engine.summary(),
@@ -381,7 +382,7 @@ def set_alert_rules(request: Request, rules: list[dict[str, Any]] = Body(...),
     service = _monitoring(request)
     try:
         parsed = [Rule.from_dict(item) for item in rules]
-    except (KeyError, ValueError, TypeError) as exc:
+    except (KeyError, ValueError, TypeError, OverflowError) as exc:
         raise error_response(ConfigError(
             f"Неверное описание правила: {exc}",
             hint='Каждое правило: {"metric": "...", "direction": "above|below", '
@@ -456,19 +457,10 @@ def _hide_url(url: str) -> str:
     """Оставляет от адреса схему и узел — по ним видно, куда идёт отправка.
 
     Полностью прятать нельзя: страница мониторинга должна отвечать на
-    вопрос «а куда мы вообще шлём», и «***» на него не отвечает.
+    вопрос «а куда мы вообще шлём», и «***» на него не отвечает. Сама
+    обрезка — общая с GET /api/settings (`pushers.адрес_для_всех`).
     """
-    if not url:
-        return ""
-    try:
-        разбор = urlsplit(url)
-    except ValueError:
-        return "***"
-    if not разбор.scheme or not разбор.hostname:
-        return "***"
-    порт = f":{разбор.port}" if разбор.port else ""
-    хвост = "/…" if разбор.path not in ("", "/") or разбор.query else ""
-    return f"{разбор.scheme}://{разбор.hostname}{порт}{хвост}"
+    return адрес_для_всех(url)
 
 
 _ПОДСКАЗКА_ПРИЁМНИКА = ('Каждый приёмник: {"kind": "' + "|".join(KINDS) + '", '
@@ -495,7 +487,7 @@ def _разобрать_приёмники(service: Any, targets: list[Any]) -> 
         имя = str(item.get("name") or item.get("kind") or "")
         try:
             приёмник = Target.from_dict(item, прежний=прежние.get(имя))
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, OverflowError) as exc:
             raise error_response(ConfigError(
                 f"Неверное описание приёмника: {exc}", hint=_ПОДСКАЗКА_ПРИЁМНИКА)) from exc
         if not приёмник.url.strip():
@@ -578,7 +570,7 @@ def test_target(request: Request, target: dict[str, Any] = Body(...),
     try:
         parsed = Target.from_dict(target, прежний=прежние.get(
             str((target or {}).get("name") or "")) if isinstance(target, dict) else None)
-    except (KeyError, ValueError, TypeError) as exc:
+    except (KeyError, ValueError, TypeError, OverflowError) as exc:
         raise error_response(ConfigError(f"Неверное описание приёмника: {exc}")) from exc
     return service.push.push_once(parsed, проба=True)
 

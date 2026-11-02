@@ -22,13 +22,21 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 # процесса: наследуют их лишь программы, запущенные из этого сценария.
 $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
+# TLS 1.2 для всего модуля, а не только для клиента asrctl.ps1. Windows
+# PowerShell 5.1 на Server 2016 и ранних Windows 10 по умолчанию знает
+# SSL3/TLS 1.0, а pypi.org их не принимает: Test-Internet отвечал «сети нет»
+# при рабочей сети, установка уходила в автономный режим и падала.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 
 # Версия — из файла VERSION рядом с деревом скриптов; вписанное число
 # расходится с файлом при первом же выпуске.
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.25'
+    $script:AsrHubVersion = '3.1.26'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
@@ -137,12 +145,18 @@ function Add-Rollback {
 function Invoke-Rollback {
     if ($script:RollbackActions.Count -eq 0) { return }
     Write-Warn "Откат изменений ($($script:RollbackActions.Count) действ.)…"
+    $failedCount = 0
     for ($i = $script:RollbackActions.Count - 1; $i -ge 0; $i--) {
         $item = $script:RollbackActions[$i]
-        try { & $item.Action } catch { Write-Warn "  не удалось: $($item.Description)" }
+        try { & $item.Action } catch { Write-Warn "  не удалось: $($item.Description)"; $failedCount++ }
     }
     $script:RollbackActions.Clear()
-    Write-Ok 'Откат завершён — система возвращена в исходное состояние.'
+    # «Система возвращена» — только когда это правда.
+    if ($failedCount -gt 0) {
+        Write-Warn "Откат выполнен не полностью: не удалось $failedCount действ. — проверьте каталоги выше вручную."
+    } else {
+        Write-Ok 'Откат завершён — система возвращена в исходное состояние.'
+    }
 }
 
 function Clear-Rollback { $script:RollbackActions.Clear() }
@@ -1014,10 +1028,20 @@ function Get-TorchIndexUrl {
 }
 
 function Get-CTranslate2Pin {
+    <#
+    .SYNOPSIS
+        Строки файла ограничений pip (-c) для faster-whisper под CUDA.
+    .DESCRIPTION
+        Как ctranslate2_pin в detect.sh. Раньше версия ставилась отдельной
+        командой, а следующая ставила файл требований — и тут же её
+        отменяла. Ограничение в той же команде pip обязан соблюсти. Под
+        CUDA 11 вместе с ctranslate2 3.24 нужен и faster-whisper 0.10.x:
+        версии 1.x требуют ctranslate2 4.x.
+    #>
     param([string]$Accelerator, [string]$CudaVersion)
-    if ($Accelerator -ne 'cuda') { return 'ctranslate2>=4.5' }
-    if ($CudaVersion -like '11.*') { return 'ctranslate2==3.24.0' }
-    return 'ctranslate2>=4.5'
+    if ($Accelerator -ne 'cuda') { return @('ctranslate2>=4.5') }
+    if ($CudaVersion -like '11.*') { return @('ctranslate2==3.24.0', 'faster-whisper<1.0') }
+    return @('ctranslate2>=4.5')
 }
 
 function Get-RecommendedProfile {
@@ -1282,6 +1306,8 @@ if устройство in ("", "auto"):
         есть = False
     print("ok|auto -> cuda|" if есть else "cpu|auto -> cpu|карта не отвечает, сервер уйдёт на процессор")
     raise SystemExit(0)
+# Причина — в одну строку: текст исключения CUDA многострочный, а разбор
+# ниже читает последнюю строку вывода.
 if проверить_ускоритель is not None:
     годно, причина = проверить_ускоритель(устройство)
 else:
@@ -1294,6 +1320,7 @@ else:
             torch.cuda.get_device_name(0)
         except Exception as exc:
             годно, причина = False, f"Карта не отвечает: {exc}"
+причина = " ".join(str(причина).split())
 print(f"ok|{устройство}|" if годно else f"fail|{устройство}|{причина}")
 '@
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("asrhub-gpu-{0}.py" -f ([guid]::NewGuid()))
@@ -1315,7 +1342,18 @@ print(f"ok|{устройство}|" if годно else f"fail|{устройст�
         Write-Info 'Видеокарту проверить нечем: проба не выполнилась.'
         return $true
     }
-    $parts = ($out | Select-Object -Last 1) -split '\|', 3
+    # Строка ответа — последняя с известным началом, а не просто последняя:
+    # многострочная причина от CUDA оставляла в конце строку без «|», и под
+    # Set-StrictMode обращение к $parts[2] роняло проверку исключением — а с
+    # ним и установку (откат уже собранной) или обновление.
+    $answer = @($out | ForEach-Object { "$_" } | Where-Object { $_ -match '^(ok|skip|cpu|fail)\|' }) |
+        Select-Object -Last 1
+    if (-not $answer) {
+        Write-Info 'Видеокарту проверить нечем: проба ответила не по форме.'
+        return $true
+    }
+    $parts = @($answer -split '\|', 3)
+    while ($parts.Count -lt 3) { $parts += '' }
     switch ($parts[0]) {
         'ok'   { Write-Ok "Видеокарта доступна процессу: $($parts[1])"; return $true }
         'skip' { Write-Info "Видеокарту проверить нечем: $($parts[2])"; return $true }
@@ -1368,7 +1406,7 @@ function Show-GpuRuntimeDiagnosis {
 #
 # Двойник раздела «Какая это установка» из common.sh. Сценарии обслуживания
 # искали установку в двух стандартных каталогах, а команда удаления, которую
-# печатает установщик, — `powershell -File "<каталог>\scripts\uninstall.ps1"`
+# печатает установщик, — `powershell -ExecutionPolicy Bypass -File "<каталог>\scripts\uninstall.ps1"`
 # — ключа -Prefix не несла. Для установки в свой каталог (-Prefix D:\ASRHub)
 # это кончалось так: стандартных каталогов нет, $Prefix пуст,
 # `$_.Path.StartsWith('')` истинно для любого пути — и удаление
@@ -1410,6 +1448,14 @@ function ConvertTo-AsrFullPath {
     param([AllowEmptyString()][AllowNull()][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
     $full = $Path.Trim().Trim('"')
+    # Относительный путь — от текущего каталога PowerShell ($PWD), а не от
+    # каталога процесса: .NET разрешает GetFullPath от второго, и «-Prefix
+    # .\ASRHub» после cd уходил совсем в другой каталог.
+    try {
+        if (-not [System.IO.Path]::IsPathRooted($full)) {
+            $full = [System.IO.Path]::Combine((Get-Location -PSProvider FileSystem).ProviderPath, $full)
+        }
+    } catch { }
     try { $full = [System.IO.Path]::GetFullPath($full) } catch { }
     $root = ''
     try { $root = [System.IO.Path]::GetPathRoot($full) } catch { }
@@ -1804,7 +1850,7 @@ function Show-AmbiguousInstallation {
     param([string[]]$Candidates, [string]$Script)
     Write-Err 'На машине несколько установок ASR Hub — какую именно, не сказано:'
     foreach ($candidate in @($Candidates)) { Write-Host "    $candidate" }
-    Write-Hint "Запустите сценарий из каталога нужной установки: powershell -File `"<каталог>\scripts\$Script`""
+    Write-Hint "Запустите сценарий из каталога нужной установки: powershell -ExecutionPolicy Bypass -File `"<каталог>\scripts\$Script`""
     Write-Hint 'или укажите её ключом -Prefix.'
 }
 
@@ -1958,9 +2004,18 @@ function Test-AsrPortOurs {
     #>
     param([int]$Port, [AllowEmptyString()][string]$Prefix)
     if (-not $Prefix -or -not (Test-Path -LiteralPath $Prefix -PathType Container)) { return $false }
-    $probe = Invoke-AsrHealth -Url "http://127.0.0.1:$Port/api/health"
-    if ($probe.Status -eq 0 -or $probe.Body -notmatch '"status"') { return $false }
+    # Сначала — кто держит порт, по пути процесса; HTTP — по адресу, к
+    # которому привязан сервер установки. Проба шла только на 127.0.0.1, а
+    # сервер с server_host: 192.168.1.10 там не отвечает: переустановка
+    # считала порт чужим и уводила службу на 8081.
     $owner = Get-PortOwnerPath -Port $Port
+    if ($owner -and (Test-AsrPathInside -Path $owner -Parent $Prefix)) { return $true }
+    $address = Get-AsrServerAddress -Prefix $Prefix
+    $probe = Invoke-AsrHealth -Url "http://$($address.ProbeHost):$Port/api/health"
+    if ($probe.Status -eq 0 -and $address.ProbeHost -ne '127.0.0.1') {
+        $probe = Invoke-AsrHealth -Url "http://127.0.0.1:$Port/api/health"
+    }
+    if ($probe.Status -eq 0 -or $probe.Body -notmatch '"status"') { return $false }
     if ($owner) {
         if (Test-AsrPathInside -Path $owner -Parent $Prefix) { return $true }
         if ($owner -match '(?i)docker|vpnkit|wslrelay') {
@@ -2090,6 +2145,90 @@ function Set-AsrPrivateAcl {
         return $false
     }
     Write-Debug2 "права закрыты: $Path"
+    return $true
+}
+
+# Что копируется из дистрибутива в каталог программы — один список на все
+# сценарии. agent в нём не было, и сервер установки отдавал на команду из
+# главы про агента ответ 500: агент лежит в <каталог программы>\agent.
+$script:AsrInstallItems = @('server', 'scripts', 'config', 'requirements', 'docker',
+                            'examples', 'agent', 'VERSION', 'README.md')
+function Get-AsrInstallItems { return $script:AsrInstallItems }
+
+# Местные файлы каталога docker: .env (порт, адрес, каталог данных, токен),
+# certs для nginx и data при запуске по README из самого каталога.
+$script:AsrDockerLocal = @('.env', 'certs', 'data')
+
+function Copy-AsrDockerOverlay {
+    <#
+    .SYNOPSIS
+        Файлы дистрибутива из каталога docker поверх установленного, не
+        трогая местные (.env, certs, data).
+    .DESCRIPTION
+        Обновление подменяло каталог docker целиком: .env пропадал, и
+        контейнер пересоздавался с умолчаниями — 0.0.0.0:8080, пустой том,
+        без токена и карты, — а при порте 8080 проверка ещё и отвечала
+        «обновление успешно».
+    #>
+    param([Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$To)
+    if (-not (Test-Path -LiteralPath $To)) { New-Item -ItemType Directory -Path $To -Force | Out-Null }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $From -Force)) {
+        if ($script:AsrDockerLocal -contains $entry.Name) { continue }
+        $target = Join-Path $To $entry.Name
+        if ($entry.PSIsContainer) {
+            $staged = "$target.new"
+            if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
+            Copy-Item -LiteralPath $entry.FullName -Destination $staged -Recurse -Force
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+            Move-Item -LiteralPath $staged -Destination $target
+        } else {
+            Copy-Item -LiteralPath $entry.FullName -Destination $target -Force
+        }
+    }
+}
+
+function Copy-AsrDockerWithoutData {
+    <# Копия каталога docker для снимка — без data: база и модели в снимок не входят. #>
+    param([Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$To)
+    if (-not (Test-Path -LiteralPath $To)) { New-Item -ItemType Directory -Path $To -Force | Out-Null }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $From -Force)) {
+        if ($entry.Name -eq 'data') { continue }
+        Copy-Item -LiteralPath $entry.FullName -Destination (Join-Path $To $entry.Name) -Recurse -Force
+    }
+}
+
+function Set-AsrProgramAcl {
+    <#
+    .SYNOPSIS
+        Каталог программы вне Program Files — на запись только
+        администраторам и SYSTEM, остальным — чтение и запуск.
+    .DESCRIPTION
+        Каталог в корне диска (C:\ASRHub, D:\ASRHub — пример из документации)
+        наследует «Прошедшие проверку: изменение»: любой пользователь машины
+        правил server\asrhub\*.py или venv\Scripts\python.exe, и это
+        исполнялось от учётной записи службы — с доступом к ключам, токену
+        и расшифровкам. Внутри Program Files права и так такие.
+    .OUTPUTS
+        $true — права выставлены (или уже правильные); $false — нечем или отказ.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    if (-not (Test-CommandExists 'icacls')) { return $false }
+    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($base -and ((Test-AsrPathInside -Path $Path -Parent $base) -or (Test-AsrSamePath $Path $base))) {
+            return $true
+        }
+    }
+    $grants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
+    if ($script:DryRun) {
+        Write-Host "  [пробный запуск] icacls $Path /inheritance:r /grant:r $($grants -join ' ')" -ForegroundColor Yellow
+        return $true
+    }
+    $null = Invoke-Native -Command 'icacls' -Arguments (@($Path, '/inheritance:r', '/grant:r') + $grants + @('/Q'))
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Не удалось закрыть $Path на запись (icacls, код $LASTEXITCODE)."
+        return $false
+    }
     return $true
 }
 

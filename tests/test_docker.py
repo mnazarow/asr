@@ -94,7 +94,10 @@ def test_compose_gpu_overlay_replaces_the_same_service():
     assert result.stdout.count("container_name: asrhub") == 1, \
         "контейнер должен остаться один"
     assert "ACCEL: cuda" in result.stdout
-    assert "cu124" in result.stdout, "индекс пакетов PyTorch не переключился на CUDA"
+    # Заход 54: индекс — из ASRHUB_TORCH_INDEX (.env пишет установщик по
+    # версии CUDA), без него cu128; прежний зашитый cu124 не знал RTX 50xx.
+    assert "download.pytorch.org/whl/cu" in result.stdout, \
+        "индекс пакетов PyTorch не переключился на CUDA"
 
 
 @needs_compose

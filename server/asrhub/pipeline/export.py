@@ -317,6 +317,20 @@ def _prepare_subtitles(result: dict[str, Any], min_duration: float) -> list[dict
 # --------------------------------------------------------------------------
 
 def to_table(result: dict[str, Any], settings: dict[str, Any], delimiter: str = "\t") -> str:
+    """Таблица реплик: TSV для машин (`delimiter="\\t"`) или CSV для Excel.
+
+    CSV (любой разделитель, кроме табуляции, — так его просят выгрузка и
+    скачивание) собирается под Excel с русскими настройками, как в выгрузке
+    аналитики: разделитель «;», дробь через запятую, метка порядка байтов в
+    начале и клетки, которые Excel принял бы за формулу («=…», «+7 916…»,
+    «- Да, слушаю», имя говорящего из speaker_names), — с апострофом. Прежде
+    CSV шёл с «,» и точкой в дробях — Excel показывал одну колонку, — а
+    реплика «=cmd|' /C calc'!A0» становилась живой формулой. TSV остаётся
+    машинным: без этих поправок.
+    """
+    для_excel = delimiter != "\t"
+    if для_excel:
+        return "\ufeff" + _таблица_excel(result, settings)
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=delimiter, lineterminator="\n",
                         quoting=csv.QUOTE_MINIMAL)
@@ -333,6 +347,34 @@ def to_table(result: dict[str, Any], settings: dict[str, Any], delimiter: str = 
         if settings.get("include_confidence", True):
             conf = seg.get("confidence")
             row.append(f"{conf:.4f}" if conf is not None else "")
+        row += [len(text.split()), len(text)]
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def _таблица_excel(result: dict[str, Any], settings: dict[str, Any]) -> str:
+    """CSV для Excel с русскими настройками (см. `to_table`)."""
+    from ..analytics_export import _безопасно  # noqa: PLC0415
+
+    def дробь(значение: float, знаков: int) -> str:
+        return f"{значение:.{знаков}f}".replace(".", ",")
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n",
+                        quoting=csv.QUOTE_MINIMAL)
+    header = ["№", "начало_с", "конец_с", "длительность_с", "говорящий", "текст"]
+    if settings.get("include_confidence", True):
+        header.append("уверенность")
+    header += ["слов", "символов"]
+    writer.writerow(header)
+    for idx, seg in enumerate(result.get("segments", []), start=1):
+        text = str(seg.get("text", "") or "")
+        начало, конец = float(seg.get("start", 0) or 0), float(seg.get("end", 0) or 0)
+        row = [idx, дробь(начало, 3), дробь(конец, 3), дробь(конец - начало, 3),
+               _безопасно(str(seg.get("speaker") or "")), _безопасно(text)]
+        if settings.get("include_confidence", True):
+            conf = seg.get("confidence")
+            row.append(дробь(float(conf), 4) if conf is not None else "")
         row += [len(text.split()), len(text)]
         writer.writerow(row)
     return buffer.getvalue()
@@ -436,12 +478,22 @@ def safe_basename(basename: str) -> str:
     Одно правило на всех: по нему пишет выгрузка и по нему же клон из кеша
     переименовывает скопированные файлы под своё задание.
     """
-    return re.sub(r"[^\w\-. ]+", "_", str(basename or "")).strip() or "result"
+    # Не длиннее 200 байт: имя из 130 кириллических знаков — это 259 байт, и
+    # «File name too long» не давал записать ни одного формата.
+    имя = re.sub(r"[^\w\-. ]+", "_", str(basename or "")).strip()
+    return _в_байтах(имя, 200) or "result"
 
 
 def write_all(result: dict[str, Any], settings: dict[str, Any], outdir: Path,
-              basename: str) -> dict[str, str]:
-    """Сохраняет все запрошенные форматы. Возвращает соответствие формат → путь."""
+              basename: str, warnings: list[str] | None = None) -> dict[str, str]:
+    """Сохраняет все запрошенные форматы. Возвращает соответствие формат → путь.
+
+    `warnings` — куда сказать о формате, который не записался. Прежде ошибка
+    записи уходила только в журнал: имя из 130 кириллических знаков (259
+    байт) давало «File name too long» для всех форматов, управляющий символ
+    в тексте — сбой DOCX, а задание было «готово» с пустыми предупреждениями.
+    Имя файла — в пределах 200 байт: дальше файловые системы отказывают.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
     formats = settings.get("output_formats") or ["txt", "json"]
     if isinstance(formats, str):
@@ -457,7 +509,9 @@ def write_all(result: dict[str, Any], settings: dict[str, Any], outdir: Path,
         "vtt": lambda p: p.write_text(to_vtt(result, settings), encoding="utf-8"),
         "ass": lambda p: p.write_text(to_ass(result, settings), encoding="utf-8"),
         "tsv": lambda p: p.write_text(to_table(result, settings, "\t"), encoding="utf-8"),
-        "csv": lambda p: p.write_text(to_table(result, settings, ","), encoding="utf-8-sig"),
+        # Метку порядка байтов CSV несёт сам (см. `to_table`): так она есть
+        # и у файла, и у выгрузки на лету.
+        "csv": lambda p: p.write_text(to_table(result, settings, ";"), encoding="utf-8"),
     }
 
     for fmt in formats:
@@ -475,4 +529,15 @@ def write_all(result: dict[str, Any], settings: dict[str, Any], outdir: Path,
             written[fmt] = str(path)
         except Exception as exc:
             log.error("Не удалось сохранить формат %s: %s", fmt, exc)
+            if warnings is not None:
+                warnings.append(f"Файл результата {fmt} не записан: {exc}. Скачивание "
+                                "соберёт его заново из реплик.")
     return written
+
+
+def _в_байтах(имя: str, предел: int) -> str:
+    """Имя, укороченное до `предел` байт UTF-8, не разрезая знак."""
+    сырое = имя.encode("utf-8")
+    if len(сырое) <= предел:
+        return имя
+    return сырое[:предел].decode("utf-8", errors="ignore").rstrip() or "result"

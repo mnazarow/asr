@@ -113,6 +113,24 @@ if (-not $Prefix -and (Test-AsrInstallation -Path $ownDir)) {
 if (-not $Prefix) {
     $Prefix = if ($isAdmin) { 'C:\Program Files\ASRHub' } else { Join-Path $env:LOCALAPPDATA 'ASRHub' }
 }
+# Полный путь без хвостовой черты — сразу. «-Prefix D:\ASRHub\» (автодополнение
+# дописывает «\») не совпадал с «D:\ASRHub» при сравнении с каталогом
+# источника, защита от копирования в себя не срабатывала, и server
+# удалялся. Относительный путь — от текущего каталога консоли.
+$Prefix = ConvertTo-AsrFullPath $Prefix
+if ($DataDir) { $DataDir = ConvertTo-AsrFullPath $DataDir }
+# Установка поверх стоящей без -DataDir: каталог данных — её собственный (из
+# метки или автозапуска), а не умолчание. Иначе служба пересоздавалась с
+# %ProgramData%\ASRHub — новая база, новый ключ, пустой список заданий, — и
+# сервер «всё терял», хотя данные лежали на месте. Адрес и порт так уже
+# берутся (заход 47), каталог данных — нет.
+if (-not $DataDir -and (Test-Path -LiteralPath $Prefix)) {
+    $existingInstall = Resolve-AsrInstallation -Prefix $Prefix
+    if ($existingInstall.DataDirSource -in @('marker', 'service')) {
+        $DataDir = $existingInstall.DataDir
+        Write-Info "Каталог данных — у стоящей установки: $DataDir"
+    }
+}
 if (-not $DataDir) {
     $DataDir = if ($isAdmin) { Join-Path $env:ProgramData 'ASRHub' } else { Join-Path $env:LOCALAPPDATA 'ASRHub\data' }
 }
@@ -244,9 +262,9 @@ function Invoke-InstallWizard {
         }
     }
 
-    $script:Prefix = Read-WizardValue -Question 'Каталог программы' -Default $script:Prefix
-    $script:DataDir = Read-WizardValue -Question 'Каталог данных' -Default $script:DataDir `
-        -Note 'Здесь будут веса моделей, загруженные файлы, результаты и база заданий.'
+    $script:Prefix = ConvertTo-AsrFullPath (Read-WizardValue -Question 'Каталог программы' -Default $script:Prefix)
+    $script:DataDir = ConvertTo-AsrFullPath (Read-WizardValue -Question 'Каталог данных' -Default $script:DataDir `
+        -Note 'Здесь будут веса моделей, загруженные файлы, результаты и база заданий.')
 
     # Порт, занятый сервером этой же установки, — свой: установщик
     # запускают повторно при работающем сервере, и он будет перезапущен.
@@ -450,12 +468,24 @@ if (-not (Test-PortFree -Port $Port) -and (Test-AsrPortOurs -Port $Port -Prefix 
     }
 }
 
-if (-not $Offline) {
+# Только сообщаем: автономный режим — ключом -Offline. Раньше неудача
+# проверки включала --no-index, а он отменяет и зеркало из pip.ini и без
+# каталога колёс не ставит ничего — установка падала при рабочей сети
+# (прокси, закрытый контур с зеркалом, старый TLS).
+if (-not $Offline -and $Mode -eq 'native') {
     if (Test-Internet) { Write-Ok 'Доступ в интернет есть' }
     else {
-        Write-Warn 'Нет доступа к pypi.org — переходим в автономный режим.'
-        $Offline = $true
+        Write-Warn 'pypi.org не ответил на проверку — pip попробует сам (и зеркало из pip.ini, если оно задано).'
+        Write-Hint 'Машина без сети — колёса заранее (pip download) и -Offline.'
     }
+}
+
+# Каталог данных совпадает с каталогом программы — удаление потом не сможет
+# отличить программу от данных (и сносило базу и модели без -Purge).
+if (Test-AsrSamePath $Prefix $DataDir) {
+    Write-Err 'Каталог данных не может совпадать с каталогом программы.'
+    Write-Hint "Например: -DataDir `"$(Join-Path $Prefix 'data')`""
+    exit 2
 }
 
 if (-not (Confirm-Action 'Начать установку?')) { Write-Info 'Отменено.'; exit 0 }
@@ -509,9 +539,23 @@ if (-not $hw.Ffmpeg) {
     Write-Warn 'Не найден ffmpeg — без него доступны только файлы WAV 16 кГц.'
     if ((Test-CommandExists 'winget') -and (Confirm-Action 'Установить ffmpeg через winget?')) {
         try {
-            Invoke-Checked -Command 'winget' -Arguments @('install', '--id', 'Gyan.FFmpeg',
-                '-e', '--accept-package-agreements', '--accept-source-agreements') -IgnoreExitCode
-            Write-Ok 'ffmpeg установлен (может потребоваться перезапуск консоли для обновления PATH)'
+            # --scope machine от администратора: переносимый пакет без него
+            # ложится в профиль администратора и его личный PATH — служба
+            # ffmpeg не видит, сервер принимает только WAV, а doctor.ps1
+            # (он смотрит PATH своей консоли) говорит «найден».
+            $wingetArgs = @('install', '--id', 'Gyan.FFmpeg', '-e',
+                            '--accept-package-agreements', '--accept-source-agreements')
+            if ($isAdmin) { $wingetArgs += @('--scope', 'machine') }
+            Invoke-Checked -Command 'winget' -Arguments $wingetArgs -IgnoreExitCode | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok 'ffmpeg установлен (может потребоваться перезапуск консоли для обновления PATH)'
+                if (-not $isAdmin) {
+                    Write-Hint 'Поставлен для текущего пользователя: сервер, запущенный от другой учётной записи, его не увидит.'
+                }
+            } else {
+                Write-Warn "winget не поставил ffmpeg (код $LASTEXITCODE)."
+                Write-Hint 'Установите вручную: winget install Gyan.FFmpeg --scope machine'
+            }
         } catch { Write-Warn 'Автоматическая установка не удалась.' }
     } else {
         Write-Hint 'Установите вручную: winget install Gyan.FFmpeg  или  choco install ffmpeg'
@@ -582,6 +626,13 @@ foreach ($dir in @($Prefix, $DataDir,
                                     -ErrorAction SilentlyContinue }).GetNewClosure() "удалить $captured"
     }
 }
+# Каталог программы вне Program Files (C:\ASRHub, D:\ASRHub из примеров)
+# наследует «Прошедшие проверку: изменение»: любой пользователь машины мог
+# править server\asrhub\*.py или venv\Scripts\python.exe, а исполнялось это
+# от учётной записи службы с доступом к ключам и расшифровкам.
+if ($isAdmin -and -not (Get-DryRun)) {
+    if (Set-AsrProgramAcl -Path $Prefix) { Write-Debug2 "каталог программы закрыт на запись: $Prefix" }
+}
 # Каталог данных — только для администраторов, SYSTEM и того, кто ставит:
 # %ProgramData% по умолчанию читают все пользователи машины, и api-key.txt,
 # config.yaml с токеном и база со всеми расшифровками были открыты любому,
@@ -599,31 +650,143 @@ Write-Step 'Копирование файлов приложения'
 # путь вида "C:\Program Files\ASRHub\scripts\update.ps1". Без проверки
 # цикл удалял каталог и тут же копировал его сам в себя: установка
 # оставалась без server, а откат ничего не возвращал.
-$srcReal = [System.IO.Path]::GetFullPath($RepoDir)
-$dstReal = [System.IO.Path]::GetFullPath($Prefix)
-if ($srcReal -eq $dstReal) {
+$oldCode = [System.Collections.ArrayList]::new()
+if (Test-AsrSamePath $RepoDir $Prefix) {
     Write-Info 'Источник совпадает с установкой — файлы уже на месте, копирование пропущено.'
 } elseif (-not (Get-DryRun)) {
-    # examples: интерфейс «Диктовки» ссылается на stream_microphone.py.
-    foreach ($item in @('server', 'scripts', 'config', 'requirements', 'docker', 'examples', 'VERSION', 'README.md')) {
+    # Свой автозапуск — до копирования: рабочий каталог службы и задачи —
+    # <prefix>\server, а Windows не даёт удалить каталог, текущий у живого
+    # процесса. Remove-Item удалял содержимое и падал на самом каталоге:
+    # server пуст, установка прервана. Откат поднимет службу обратно.
+    if (@(Get-AsrOwnAutostart -Prefix $Prefix | Where-Object { $_.Prefix }).Count -gt 0) {
+        try {
+            & (Join-Path $PSScriptRoot 'service.ps1') -Action stop -Prefix $Prefix -DataDir $DataDir | Out-Null
+            Add-Rollback ({ & (Join-Path $PSScriptRoot 'service.ps1') -Action start -Prefix $Prefix `
+                -DataDir $DataDir | Out-Null }.GetNewClosure()) 'запустить прежнюю службу'
+        } catch { Write-Warn "Службу остановить не удалось: $($_.Exception.Message)" }
+    }
+    # examples: интерфейс «Диктовки» ссылается на stream_microphone.py;
+    # agent — его отдаёт станциям сам сервер. Сначала копия рядом, потом
+    # подмена; прежний код откладывается до конца и при сбое возвращается.
+    foreach ($item in @(Get-AsrInstallItems)) {
         $source = Join-Path $RepoDir $item
-        if (Test-Path $source) {
-            $target = Join-Path $Prefix $item
-            if (Test-Path $target) { Remove-Item $target -Recurse -Force }
-            Copy-Item $source $target -Recurse -Force
+        if (-not (Test-Path -LiteralPath $source)) { continue }
+        $target = Join-Path $Prefix $item
+        if ($item -eq 'docker') {
+            # Поверх: .env, certs и data в нём местные (Copy-AsrDockerOverlay).
+            if (Test-Path -LiteralPath $target) {
+                $old = Join-Path $Prefix '.docker.old'
+                if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+                Copy-AsrDockerWithoutData -From $target -To $old
+                [void]$oldCode.Add($old)
+                Add-Rollback ({ Copy-AsrDockerOverlay -From $old -To $target }.GetNewClosure()) 'вернуть файлы docker'
+            }
+            Copy-AsrDockerOverlay -From $source -To $target
+            continue
         }
+        $staged = Join-Path $Prefix ".$item.new"
+        if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
+        Copy-Item -LiteralPath $source -Destination $staged -Recurse -Force
+        if (Test-Path -LiteralPath $target) {
+            $old = Join-Path $Prefix ".$item.old"
+            if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+            Move-Item -LiteralPath $target -Destination $old
+            [void]$oldCode.Add($old)
+            Add-Rollback ({
+                if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+                Move-Item -LiteralPath $old -Destination $target
+            }.GetNewClosure()) "вернуть $item"
+        } else {
+            Add-Rollback ({ Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue }.GetNewClosure()) "убрать $item"
+        }
+        Move-Item -LiteralPath $staged -Destination $target
     }
 }
 Write-Ok "Файлы скопированы в $Prefix"
 
 # ---------------------------------------------------------------------------
 
+function New-AsrConfigFile {
+    <#
+      config.yaml установщика. В режиме docker — без data_dir, models_dir и
+      temp_dir: внутри контейнера каталог данных — /data, а пути Windows
+      («C:/ProgramData/ASRHub/models») там становились относительными путями
+      под /app/server — вне тома: веса терялись при пересоздании контейнера,
+      а temp_dir не существовал, и движки падали на FileNotFoundError.
+      И пишется он до запуска контейнера, а не после.
+    #>
+    $configFile = Join-Path $DataDir 'config.yaml'
+    $script:configFile = $configFile
+    if ((Test-Path $configFile) -and -not $ResetConfig) {
+        Write-Info 'Конфигурация уже существует — оставляем без изменений.'
+        if ($Force) { Write-Hint '-Force конфигурацию не трогает. Заменить её шаблоном — ключ -ResetConfig.' }
+        return
+    }
+    if (Get-DryRun) { Write-Host "[пробный запуск] запись $configFile" -ForegroundColor Yellow; return }
+    $configBackup = ''
+    if (Test-Path $configFile) {
+        $configBackup = "$configFile.bak.$(Get-Date -Format 'yyyyMMddHHmmss')"
+        Copy-Item $configFile $configBackup -Force
+        Write-Warn 'Ключ -ResetConfig: config.yaml заменяется шаблоном.'
+        Write-Hint "Прежний файл: $configBackup"
+    }
+    $firstModel = ($Models -split ',')[0]
+    if (-not $firstModel) { $firstModel = 'demo-simulator' }
+    $concurrent = if ($hw.Accelerator -eq 'cpu') { 1 } else { 2 }
+    $lines = @(
+        "# Конфигурация ASR Hub — создана установщиком $(Get-Date -Format 'yyyy-MM-dd HH:mm')",
+        '# Те же параметры доступны в веб-интерфейсе в разделе «Настройки».')
+    if ($Mode -eq 'native') {
+        $lines += @("# Полный список параметров: $DataDir\config.example.yaml", '',
+                    "data_dir: `"$($DataDir -replace '\\', '/')`"")
+    } else {
+        $lines += '# Каталог данных в контейнере — /data; адрес и порт публикации — docker\.env.'
+    }
+    $lines += @('', 'model:', "  model: $firstModel", '  engine: auto', '  language: ru', '', 'server:')
+    if ($Mode -eq 'native') { $lines += @("  server_host: `"$BindHost`"", "  server_port: $Port") }
+    $lines += @('  auth_enabled: true', '  max_upload_mb: 2048', '  log_level: INFO', '',
+                'batching:', '  device: auto', '  compute_type: auto', '',
+                'queue:', "  max_concurrent_jobs: $concurrent", '  scheduling_policy: priority_fifo',
+                '  result_retention_days: 30')
+    if ($Mode -eq 'native') {
+        $lines += @('', 'runtime:',
+                    "  models_dir: `"$(($DataDir + '\models') -replace '\\', '/')`"",
+                    "  temp_dir: `"$(($DataDir + '\tmp') -replace '\\', '/')`"")
+    }
+    # Выравнивание — как в install.sh: ключ -Alignment и пункт мастера
+    # раньше не делали ничего, кроме строки в сводке.
+    if ($Alignment -and $Alignment -ne 'none') {
+        $lines += @('', 'postprocess:',
+                    '  # Уточнение границ слов по звуку. Если выравниватель недоступен,',
+                    '  # задание доводится до конца на таймкодах модели.',
+                    "  alignment_backend: $Alignment")
+    }
+    $lines | Set-Content -Path $configFile -Encoding UTF8
+    # Откат после -ResetConfig возвращает прежний файл, а не удаляет его.
+    $file = $configFile
+    if ($configBackup) {
+        Add-Rollback ({ Copy-Item -LiteralPath $configBackup -Destination $file -Force }).GetNewClosure() `
+            'вернуть прежний config.yaml'
+    } else {
+        Add-Rollback ({ Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }).GetNewClosure() `
+            'удалить config.yaml'
+    }
+    Write-Ok "Конфигурация: $configFile"
+}
+
 if ($Mode -eq 'docker') {
+    Write-Step 'Создание конфигурации'
+    New-AsrConfigFile
     Write-Step 'Сборка и запуск контейнера'
     $envFile = Join-Path $Prefix 'docker\.env'
     $envLines = @("ASRHUB_PORT=$Port", "ASRHUB_HOST=$BindHost",
                   "ASRHUB_DATA=$DataDir", "ASRHUB_PROFILE=$Profile",
                   "ASRHUB_ACCEL=$($hw.Accelerator)")
+    # Индекс PyTorch под драйвер — как у обычной установки; надстройка с
+    # видеокартой раньше зашивала cu124 (без поддержки RTX 50xx).
+    if ($hw.Accelerator -eq 'cuda') {
+        $envLines += "ASRHUB_TORCH_INDEX=$(Get-TorchIndexUrl -Accelerator 'cuda' -CudaVersion $hw.CudaVersion)"
+    }
     # Список движков — только заданный явно, как в install.sh. Иначе в .env
     # попадал набор профиля из установщика, а он у образа свой: без vad,
     # postprocess и diarization, зато в «full» с nemo и qwen3_asr, которых в
@@ -632,6 +795,16 @@ if ($Mode -eq 'docker') {
     # Токен — отдельной строкой и только если он есть: пустое значение в .env
     # перекрыло бы токен из окружения контейнера.
     if ($HfToken) { $envLines += "HF_TOKEN=$HfToken" }
+    # Строки прежнего .env, которые установщик не пишет (свой токен, тег
+    # образа, предел памяти), — сохраняются: раньше файл писался заново.
+    if (Test-Path -LiteralPath $envFile) {
+        $written = @($envLines | ForEach-Object { ($_ -split '=', 2)[0] })
+        foreach ($line in @(Get-Content -LiteralPath $envFile -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*(#|$)') { continue }
+            $key = ($line -split '=', 2)[0].Trim()
+            if ($key -and $written -notcontains $key -and $key -notin @('ASRHUB_ENGINES')) { $envLines += $line }
+        }
+    }
     if (Get-DryRun) {
         Write-Host "[пробный запуск] запись $envFile ($($envLines.Count) строк)" -ForegroundColor Yellow
         Write-Host '[пробный запуск] docker compose build && docker compose up -d' -ForegroundColor Yellow
@@ -750,10 +923,17 @@ if ($Mode -eq 'docker') {
         if (-not (Test-Path $req)) { Write-Warn "Нет файла зависимостей для «$engine»"; continue }
         Write-Info "Движок: $engine"
 
+        $enginePipFlags = $pipFlags
         if ($engine -eq 'faster_whisper' -and $hw.Accelerator -eq 'cuda') {
-            $pin = Get-CTranslate2Pin -Accelerator $hw.Accelerator -CudaVersion $hw.CudaVersion
-            Write-Info "Версия CTranslate2 под вашу CUDA: $pin"
-            Invoke-Checked -Command $venvPip -Arguments (@('install') + $pipFlags + @($pin)) -IgnoreExitCode | Out-Null
+            # Ограничением в той же команде: отдельная установка версии тут же
+            # отменялась файлом требований движка.
+            $pin = @(Get-CTranslate2Pin -Accelerator $hw.Accelerator -CudaVersion $hw.CudaVersion)
+            Write-Info "Версия CTranslate2 под вашу CUDA: $($pin -join ' ')"
+            if (-not (Get-DryRun)) {
+                $constraints = Join-Path ([System.IO.Path]::GetTempPath()) "asrhub-ct2-$([guid]::NewGuid().ToString('N')).txt"
+                [System.IO.File]::WriteAllLines($constraints, [string[]]$pin, [System.Text.UTF8Encoding]::new($false))
+                $enginePipFlags = $pipFlags + @('-c', $constraints)
+            }
         }
         if ($engine -eq 'tone') {
             Write-Warn 'T-one требует KenLM, который не собирается нативно под Windows.'
@@ -768,7 +948,7 @@ if ($Mode -eq 'docker') {
                 # неполностью, а GigaAM — не ставится вовсе (его пакет
                 # только в no-deps\gigaam.txt). Раньше их здесь не знали,
                 # и скрипт печатал «установлен» про движок, которого нет.
-                Install-EngineRequirements -Pip $venvPip -Requirements $req -PipFlags $pipFlags
+                Install-EngineRequirements -Pip $venvPip -Requirements $req -PipFlags $enginePipFlags
             } | Out-Null
             Write-Ok "  $engine установлен"
         } catch {
@@ -787,72 +967,11 @@ if ($Mode -eq 'docker') {
 
 # ---------------------------------------------------------------------------
 
-Write-Step 'Создание конфигурации'
-
-$configFile = Join-Path $DataDir 'config.yaml'
-# -Force конфигурацию не трогает: его советуют для починки окружения, а он
-# стирал ключи интеграций, токен и настройки. Заменить её шаблоном — отдельный
-# ключ -ResetConfig, и прежний файл остаётся рядом копией.
-if ((Test-Path $configFile) -and -not $ResetConfig) {
-    Write-Info 'Конфигурация уже существует — оставляем без изменений.'
-    if ($Force) { Write-Hint '-Force конфигурацию не трогает. Заменить её шаблоном — ключ -ResetConfig.' }
-} elseif (-not (Get-DryRun)) {
-    $configBackup = ''
-    if (Test-Path $configFile) {
-        $configBackup = "$configFile.bak.$(Get-Date -Format 'yyyyMMddHHmmss')"
-        Copy-Item $configFile $configBackup -Force
-        Write-Warn 'Ключ -ResetConfig: config.yaml заменяется шаблоном.'
-        Write-Hint "Прежний файл: $configBackup"
-    }
-    $firstModel = ($Models -split ',')[0]
-    if (-not $firstModel) { $firstModel = 'demo-simulator' }
-    $concurrent = if ($hw.Accelerator -eq 'cpu') { 1 } else { 2 }
-    @"
-# Конфигурация ASR Hub — создана установщиком $(Get-Date -Format 'yyyy-MM-dd HH:mm')
-# Полный список параметров: $DataDir\config.example.yaml
-# Те же параметры доступны в веб-интерфейсе в разделе «Настройки».
-
-data_dir: $($DataDir -replace '\\', '/')
-
-model:
-  model: $firstModel
-  engine: auto
-  language: ru
-
-server:
-  server_host: $BindHost
-  server_port: $Port
-  auth_enabled: true
-  max_upload_mb: 2048
-  log_level: INFO
-
-batching:
-  device: auto
-  compute_type: auto
-
-queue:
-  max_concurrent_jobs: $concurrent
-  scheduling_policy: priority_fifo
-  result_retention_days: 30
-
-runtime:
-  models_dir: $(($DataDir + '\models') -replace '\\', '/')
-  temp_dir: $(($DataDir + '\tmp') -replace '\\', '/')
-"@ | Set-Content -Path $configFile -Encoding UTF8
-    # Откат после -ResetConfig возвращает прежний файл, а не удаляет его:
-    # раньше неудачная установка с этим ключом оставляла машину вовсе без
-    # config.yaml — без ключей интеграций, токена и настроек, — хотя копия
-    # лежала рядом.
-    if ($configBackup) {
-        Add-Rollback ({ Copy-Item -LiteralPath $configBackup -Destination $configFile -Force }).GetNewClosure() `
-            'вернуть прежний config.yaml'
-    } else {
-        Add-Rollback ({ Remove-Item -LiteralPath $configFile -Force -ErrorAction SilentlyContinue }).GetNewClosure() `
-            'удалить config.yaml'
-    }
-    Write-Ok "Конфигурация: $configFile"
+if ($Mode -eq 'native') {
+    Write-Step 'Создание конфигурации'
+    New-AsrConfigFile
 }
-
+$configFile = Join-Path $DataDir 'config.yaml'
 # Токен Hugging Face кладём в config.yaml, а не в переменную окружения: её
 # пришлось бы прописывать службе, задаче планировщика и своей консоли по
 # отдельности, а конфигурацию читают все три. Строку заменяем, а не
@@ -871,6 +990,21 @@ if ($HfToken -and $Mode -eq 'native') {
     } else {
         Write-Warn 'Файл конфигурации не найден — токен Hugging Face не записан.'
         Write-Hint "Дописать вручную: строка hf_token: в $configFile"
+    }
+}
+
+# Выравнивание: alignment_backend записан в config.yaml, движок — ставим.
+# Раньше -Alignment и пункт мастера ничего не делали, кроме строки в сводке.
+if ($Alignment -and $Alignment -ne 'none' -and $Mode -eq 'native') {
+    Write-Info "Установка выравнивания «$Alignment»…"
+    try {
+        $global:LASTEXITCODE = 0
+        & (Join-Path $PSScriptRoot 'models.ps1') -Action install-engine -Engine $Alignment `
+            -Prefix $Prefix -DataDir $DataDir -Yes
+        if ($LASTEXITCODE -ne 0) { throw "models.ps1: код $LASTEXITCODE" }
+    } catch {
+        Write-Warn 'Выравнивание не установлено — распознавание это не затронет.'
+        Write-Hint "Повторить: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\models.ps1`" -Action install-engine -Engine $Alignment"
     }
 }
 
@@ -907,7 +1041,7 @@ if ($Models -and -not $SkipModels -and $Mode -eq 'native') {
             if ($LASTEXITCODE -ne 0) { throw "models.ps1: код $LASTEXITCODE" }
         } catch {
             Write-Warn "  не удалось загрузить $model"
-            Write-Hint "  Повторить: powershell -File `"$Prefix\scripts\models.ps1`" -Action download -Model $model"
+            Write-Hint "  Повторить: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\models.ps1`" -Action download -Model $model"
         }
     }
 }
@@ -982,15 +1116,21 @@ if (Test-Path $venvPython) {
 $probeHost = if ($BindHost -and $BindHost -notin @('0.0.0.0', '::', '*', 'localhost', '127.0.0.1')) {
     if ($BindHost -match ':' -and -not $BindHost.StartsWith('[')) { "[$BindHost]" } else { $BindHost }
 } else { '127.0.0.1' }
-$probe = Wait-AsrHealth -Port $Port -HostName $probeHost -Seconds 40
-if ($probe.Status -ge 200 -and $probe.Status -lt 300) {
+# Без автозапуска сервер никто не запускал — ждать его сорок секунд и
+# советовать «состояние службы» незачем.
+$probe = if (-not $serviceCreated -and $Mode -eq 'native') { [pscustomobject]@{ Status = -1; Body = '' } }
+         else { Wait-AsrHealth -Port $Port -HostName $probeHost -Seconds 40 }
+if ($probe.Status -eq -1) {
+    Write-Info 'Автозапуск не создавался — сервер нужно запустить вручную.'
+    Write-Hint "  cd `"$Prefix\server`"; & `"$venvPython`" -m asrhub --port $Port"
+} elseif ($probe.Status -ge 200 -and $probe.Status -lt 300) {
     Write-Ok "Сервер отвечает на http://${probeHost}:$Port"
 } elseif ($probe.Status -gt 0) {
     Write-Warn "Сервер отвечает, но сообщает о неисправности (код $($probe.Status))."
-    Write-Hint "Подробности: powershell -File `"$Prefix\scripts\doctor.ps1`""
+    Write-Hint "Подробности: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\doctor.ps1`""
 } else {
     Write-Warn 'Сервер пока не отвечает.'
-    Write-Hint "Состояние службы: powershell -File `"$Prefix\scripts\service.ps1`" -Action status"
+    Write-Hint "Состояние службы: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\service.ps1`" -Action status"
 }
 
 Clear-Rollback
@@ -1023,11 +1163,11 @@ Write-Host "  Каталог данных    $DataDir"
 Write-Host "  Журнал установки  $logFile"
 Write-Host ''
 Write-Host 'Что дальше' -ForegroundColor White
-Write-Host "  Проверить окружение  powershell -File `"$Prefix\scripts\doctor.ps1`""
-Write-Host "  Управлять моделями   powershell -File `"$Prefix\scripts\models.ps1`" -Action list"
-Write-Host "  Управлять службой    powershell -File `"$Prefix\scripts\service.ps1`" -Action status"
-Write-Host "  Обновить             powershell -File `"$Prefix\scripts\update.ps1`" -Source <каталог новой версии>"
-Write-Host "  Удалить              powershell -File `"$Prefix\scripts\uninstall.ps1`""
+Write-Host "  Проверить окружение  powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\doctor.ps1`""
+Write-Host "  Управлять моделями   powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\models.ps1`" -Action list"
+Write-Host "  Управлять службой    powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\service.ps1`" -Action status"
+Write-Host "  Обновить             powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\update.ps1`" -Source <каталог новой версии>"
+Write-Host "  Удалить              powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\uninstall.ps1`""
 if ($failed) {
     Write-Host ''
     Write-Warn "Не установились движки: $($failed -join ', ')"
@@ -1038,6 +1178,6 @@ if ($script:GpuRebootRequired) {
     Write-Host 'Нужна перезагрузка' -ForegroundColor Yellow
     Write-Host '  Драйвер видеокарты установлен, но вступит в силу после перезагрузки.'
     Write-Host '  До неё сервер считает на процессоре.'
-    Write-Host "  После перезагрузки проверьте: powershell -File `"$Prefix\scripts\doctor.ps1`""
+    Write-Host "  После перезагрузки проверьте: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\doctor.ps1`""
 }
 Write-Host ''

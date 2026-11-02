@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.25"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.26"
 # Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
 # пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
 # сменить каталог, и относительный путь указывал бы в никуда. Те же
@@ -338,6 +338,14 @@ on_error() {
   local exit_code=$?
   local line_no="${1:-?}"
   local command="${2:-?}"
+  # Ловушка ERR наследуется подоболочками (errtrace), а список отката у
+  # подоболочки — копия родительского. Сбой внутри `( … )` или `< <(…)`
+  # выполнял откат в дочернем процессе, и основной сценарий шёл дальше по
+  # уже снесённым каталогам, а в конце печатал «Установка завершена». Здесь
+  # только выходим с тем же кодом: решать, откатывать ли, — родителю.
+  if (( BASH_SUBSHELL > 0 )); then
+    exit "${exit_code}"
+  fi
   set +o errexit
   printf '\n'
   error "Сбой на шаге: ${_STEP_CURRENT:-неизвестный шаг}"
@@ -412,18 +420,41 @@ enable_error_handling() {
 # Откат и очистка
 # ---------------------------------------------------------------------------
 
-add_rollback() { _ROLLBACK_ACTIONS+=("$1"); debug "откат зарегистрирован: $1"; }
+# Пробный запуск ничего не меняет — значит, и откатывать ему нечего. Раньше
+# действия отката регистрировались по-настоящему, хотя сами изменения только
+# печатались: `install.sh --dry-run --force`, прерванный на шаге движков,
+# выполнял «rm -rf venv && mv venv.before-force venv» — рабочее окружение
+# стиралось, а отложенного, которое вернулось бы на место, не было.
+add_rollback() {
+  [[ "${ASRHUB_DRY_RUN}" == "1" ]] && return 0
+  _ROLLBACK_ACTIONS+=("$1"); debug "откат зарегистрирован: $1"
+}
+
+# Путь для строки отката, которая исполняется через eval. Одинарные кавычки
+# вокруг пути ломались на первом же апострофе («John's Drive»): все действия
+# отката падали, а итог всё равно говорил «система возвращена».
+_q() { printf '%q' "$1"; }
 
 run_rollback() {
+  [[ "${ASRHUB_DRY_RUN}" == "1" ]] && { _ROLLBACK_ACTIONS=(); return 0; }
   [[ ${#_ROLLBACK_ACTIONS[@]} -eq 0 ]] && return 0
   warn "Откат изменений (${#_ROLLBACK_ACTIONS[@]} действ.)…"
-  local i
+  local i failed=0
   for (( i=${#_ROLLBACK_ACTIONS[@]}-1; i>=0; i-- )); do
     debug "откат: ${_ROLLBACK_ACTIONS[i]}"
-    eval "${_ROLLBACK_ACTIONS[i]}" >/dev/null 2>&1 || warn "  не удалось выполнить: ${_ROLLBACK_ACTIONS[i]}"
+    if ! eval "${_ROLLBACK_ACTIONS[i]}" >/dev/null 2>&1; then
+      warn "  не удалось выполнить: ${_ROLLBACK_ACTIONS[i]}"
+      failed=$((failed + 1))
+    fi
   done
   _ROLLBACK_ACTIONS=()
-  ok "Откат завершён — система возвращена в исходное состояние."
+  # «Система возвращена» — только когда это правда: после неудавшихся
+  # действий отката прежнее состояние восстановлено не целиком.
+  if [[ ${failed} -gt 0 ]]; then
+    warn "Откат выполнен не полностью: не удалось ${failed} действ. — проверьте каталоги выше вручную."
+  else
+    ok "Откат завершён — система возвращена в исходное состояние."
+  fi
 }
 
 clear_rollback() { _ROLLBACK_ACTIONS=(); }
@@ -438,11 +469,17 @@ cleanup_temp() {
   _CLEANUP_PATHS=()
 }
 
+# Временный каталог (0700, имя случайное), который уберёт очистка при выходе.
+#
+#   make_temp_dir ИМЯ_ПЕРЕМЕННОЙ
+#
+# Результат — в переменную, а не в вывод: в `$(make_temp_dir)` регистрация
+# шла в подоболочке и терялась, и каталог оставался лежать.
 make_temp_dir() {
-  local dir
-  dir="$(mktemp -d "${TMPDIR:-/tmp}/asrhub.XXXXXXXX")"
-  register_temp "${dir}"
-  printf '%s' "${dir}"
+  local __var="$1" __dir
+  __dir="$(mktemp -d "${TMPDIR:-/tmp}/asrhub.XXXXXXXX")" || return 1
+  register_temp "${__dir}"
+  printf -v "${__var}" '%s' "${__dir}"
 }
 
 # ---------------------------------------------------------------------------
@@ -499,10 +536,10 @@ acquire_install_lock() {
     return 0
   fi
   owner="$(cat "${lock}" 2>/dev/null || true)"
-  # Свой же замок: обновление после неудачной проверки делает `exec` в откат
-  # с тем же номером процесса, и без этой строки откат упирался в замок,
-  # поставленный им самим.
-  if [[ "${owner}" == "$$" ]]; then
+  # Свой же замок — или замок родителя: обновление после неудачной проверки
+  # зовёт откат дочерним процессом (ASRHUB_LOCK_PARENT — его номер), и без
+  # этой строки откат упирался в замок, поставленный обновлением.
+  if [[ "${owner}" == "$$" || ( -n "${ASRHUB_LOCK_PARENT:-}" && "${owner}" == "${ASRHUB_LOCK_PARENT}" ) ]]; then
     register_temp "${lock}"
     return 0
   fi
@@ -1404,9 +1441,14 @@ confirm() {
   # согласие означало, что `ssh машина 'bash uninstall.sh'`, задача Ansible
   # или строка в cron выполняли полное удаление, ни о чём не спросив, —
   # притом что вопрос задан именно с умолчанием «нет».
-  if [[ ! -t 0 ]]; then
-    printf '%s? %s %s — нет терминала, взято умолчание: %s%s\n' \
-      "${C_YELLOW}" "${C_RESET}" "${prompt}" "${default}" "${C_RESET}" >&2
+  #
+  # Так же при --no-interactive: «без вопросов» на терминале всё равно
+  # спрашивало «Начать установку? [Y/n]» и ждало Enter.
+  if [[ ! -t 0 || "${ASRHUB_NO_PROMPT:-0}" == "1" ]]; then
+    printf '%s? %s %s — %s, взято умолчание: %s%s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${prompt}" \
+      "$( [[ -t 0 ]] && echo 'без вопросов (--no-interactive)' || echo 'нет терминала' )" \
+      "${default}" "${C_RESET}" >&2
     [[ "${default}" == "y" ]]
     return
   fi
@@ -1644,14 +1686,46 @@ find_free_port() {
   return 1
 }
 
+# Доступен ли узел по https. Спрашивает тем, что есть: curl, wget, а без них
+# — python3. На минимальном Debian и в контейнере нет ни curl, ни wget, и
+# проверка отвечала «сети нет» на машине с рабочей сетью.
 check_network() {
-  local host="${1:-pypi.org}"
+  local host="${1:-pypi.org}" py
   if have curl; then
     curl -fsS --max-time 8 -o /dev/null "https://${host}" 2>/dev/null && return 0
-  elif have wget; then
-    wget -q --timeout=8 --spider "https://${host}" 2>/dev/null && return 0
+    return 1
   fi
+  if have wget; then
+    wget -q --timeout=8 --spider "https://${host}" 2>/dev/null && return 0
+    return 1
+  fi
+  for py in "${ASRHUB_PROBE_PYTHON:-}" python3 python; do
+    [[ -n "${py}" ]] && have "${py}" || continue
+    "${py}" -c 'import sys, urllib.request
+urllib.request.urlopen("https://" + sys.argv[1], timeout=8).close()' "${host}" \
+      >/dev/null 2>&1 && return 0
+    return 1
+  done
   return 1
+}
+
+# Узел индекса пакетов, которым пользуется pip: внутреннее зеркало из
+# PIP_INDEX_URL или pip.conf, иначе pypi.org. Проверять pypi.org в закрытом
+# контуре с зеркалом — значит объявить «сети нет» там, где она есть.
+pip_index_host() {
+  local url="${PIP_INDEX_URL:-}" host file
+  if [[ -z "${url}" ]]; then
+    for file in "${PIP_CONFIG_FILE:-}" "${HOME}/.config/pip/pip.conf" "${HOME}/.pip/pip.conf" \
+                /etc/pip.conf /etc/xdg/pip/pip.conf; do
+      [[ -n "${file}" && -r "${file}" ]] || continue
+      url="$(sed -n 's/^[[:space:]]*index-url[[:space:]]*=[[:space:]]*//p' "${file}" 2>/dev/null \
+             | head -1 || true)"
+      [[ -n "${url}" ]] && break
+    done
+  fi
+  host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"
+  [[ -n "${url}" && -n "${host}" ]] || { printf 'pypi.org'; return 0; }
+  printf '%s' "${host}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1749,6 +1823,25 @@ port_owner() {
   printf '%s' "${line}"
 }
 
+# Процессы сервера ЭТОЙ установки: строка запуска называет её окружение
+# или рабочий каталог — её server. Чужие установки и сервер, запущенный
+# руками из клона, сюда не попадают.
+#
+#   own_server_pids КАТАЛОГ_ПРОГРАММЫ
+own_server_pids() {
+  local prefix="${1%/}" pid cmd cwd
+  [[ -n "${prefix}" ]] && have pgrep || return 0
+  for pid in $(pgrep -f -- '-m asrhub|/uvicorn' 2>/dev/null || true); do
+    [[ "${pid}" == "$$" ]] && continue
+    cmd="$(process_command "${pid}")"
+    cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+    if [[ "${cmd}" == *"${prefix}/venv/"* || "${cwd}" == "${prefix}/server" ]]; then
+      printf '%s\n' "${pid}"
+    fi
+  done
+  return 0
+}
+
 # Порт, на котором сервер слушает на самом деле.
 #
 # Единственный надёжный источник — не файл, а сама работающая служба.
@@ -1758,17 +1851,22 @@ port_owner() {
 # но не то, что слушает сервер. Проверка, доверявшая файлу, стучалась не
 # туда и объявляла работающий сервер мёртвым.
 #
-#   running_server_port [ИМЯ_СЛУЖБЫ]
+#   running_server_port [ИМЯ_СЛУЖБЫ] [КАТАЛОГ_ПРОГРАММЫ]
+#
+# Запасной поиск по процессам — только процессы ЭТОЙ установки. Раньше
+# брался первый попавшийся `-m asrhub`: на машине с двумя установками,
+# когда служба второй упала (MainPID 0), её проверка после обновления
+# стучалась в порт первой и отвечала «обновление успешно».
 running_server_port() {
-  local name="${1:-asrhub}" pid="" exec_line="" port="" line=""
+  local name="${1:-asrhub}" prefix="${2:-}" pid="" exec_line="" port="" line=""
   if have systemctl; then
     pid="$(systemctl show -p MainPID --value "${name}.service" 2>/dev/null || true)"
     if [[ -z "${pid}" || "${pid}" == "0" ]]; then
       pid="$(systemctl --user show -p MainPID --value "${name}.service" 2>/dev/null || true)"
     fi
   fi
-  if [[ -z "${pid}" || "${pid}" == "0" ]] && have pgrep; then
-    pid="$(set +o pipefail; pgrep -f 'm asrhub' 2>/dev/null | head -1 || true)"
+  if [[ -z "${pid}" || "${pid}" == "0" ]] && [[ -n "${prefix}" ]]; then
+    pid="$(own_server_pids "${prefix}" | head -1 || true)"
   fi
 
   # Что слушает процесс — самый прямой ответ, какой вообще есть.
@@ -1801,7 +1899,7 @@ running_server_port() {
 server_port_hint() {
   local data_dir="${1:-}" prefix="${2:-}" mode="${3:-native}" name="${4:-asrhub}" port=""
   if [[ "${mode}" != "docker" ]]; then
-    port="$(running_server_port "${name}" || true)"
+    port="$(running_server_port "${name}" "${prefix}" || true)"
     if [[ "${port}" =~ ^[0-9]{1,5}$ ]]; then printf '%s' "${port}"; return 0; fi
   fi
   if [[ "${mode}" == "docker" && -n "${prefix}" ]]; then
@@ -1826,9 +1924,17 @@ service_state() {
   local name="${1:-asrhub}" state="" label=""
   if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && have launchctl; then
     label="$(plist_label_for "${name}")"
-    if [[ "$(set +o pipefail; launchctl list 2>/dev/null \
-             | grep -cF -- "${label}" || true)" -gt 0 ]]; then
+    # Работает — когда у агента есть процесс («"PID" = 123;» в его
+    # карточке). Строка в `launchctl list` остаётся и у упавшего агента —
+    # с «-» вместо номера, — и сервер, падавший при запуске, объявлялся
+    # запущенным, а start отвечал «✓ Служба запущена».
+    local card
+    card="$(launchctl list "${label}" 2>/dev/null || true)"
+    if grep -qE '"PID"[[:space:]]*=[[:space:]]*[0-9]+' <<<"${card}"; then
       printf 'running'; return 0
+    fi
+    if grep -qE '"LastExitStatus"[[:space:]]*=[[:space:]]*[1-9]' <<<"${card}"; then
+      printf 'failed'; return 1
     fi
     printf 'inactive'; return 1
   fi
@@ -2102,7 +2208,7 @@ diagnose_server_down() {
   # запуска юнита и в docker/.env, — и они расходятся молча.
   local real_port=""
   if [[ "${mode}" != "docker" ]]; then
-    real_port="$(running_server_port "${name}" || true)"
+    real_port="$(running_server_port "${name}" "${prefix}" || true)"
   fi
   if [[ -n "${real_port}" && "${real_port}" != "${port}" ]]; then
     printf '\n' >&2
@@ -2178,11 +2284,14 @@ sqlite_backup() {
     printf '  [пробный запуск] копия базы %s → %s\n' "${src}" "${dst}"
     return 0
   fi
-  rm -f "${dst}" "${dst}-wal" "${dst}-shm" 2>/dev/null || true
+  # Копия ложится в каталог данных — от имени его владельца (см.
+  # data_owner_init): имя копии предсказуемо, и root, пишущий по нему,
+  # прошёл бы по подложенной ссылке.
+  as_data_owner_for "${dst}" rm -f "${dst}" "${dst}-wal" "${dst}-shm" 2>/dev/null || true
   for candidate in "${py_hint}" python3 python; do
     [[ -n "${candidate}" ]] || continue
     [[ -x "${candidate}" ]] || have "${candidate}" || continue
-    if "${candidate}" - "${src}" "${dst}" <<'PYEOF' 2>/dev/null; then
+    if as_data_owner_for "${dst}" "${candidate}" - "${src}" "${dst}" <<'PYEOF' 2>/dev/null; then
 import sqlite3, sys
 src = sqlite3.connect(sys.argv[1], timeout=30)
 dst = sqlite3.connect(sys.argv[2])
@@ -2200,13 +2309,13 @@ PYEOF
       return 0
     fi
   done
-  if have sqlite3 && sqlite3 "${src}" ".backup '${dst}'" 2>/dev/null; then
+  if have sqlite3 && as_data_owner_for "${dst}" sqlite3 "${src}" ".backup '${dst}'" 2>/dev/null; then
     _sqlite_backup_owner "${src}"
     return 0
   fi
-  cp -a "${src}" "${dst}" 2>/dev/null || return 1
-  [[ -f "${src}-wal" ]] && { cp -a "${src}-wal" "${dst}-wal" 2>/dev/null || return 1; }
-  [[ -f "${src}-shm" ]] && { cp -a "${src}-shm" "${dst}-shm" 2>/dev/null || return 1; }
+  as_data_owner_for "${dst}" cp -a "${src}" "${dst}" 2>/dev/null || return 1
+  [[ -f "${src}-wal" ]] && { as_data_owner_for "${dst}" cp -a "${src}-wal" "${dst}-wal" 2>/dev/null || return 1; }
+  [[ -f "${src}-shm" ]] && { as_data_owner_for "${dst}" cp -a "${src}-shm" "${dst}-shm" 2>/dev/null || return 1; }
   return 0
 }
 
@@ -2217,7 +2326,8 @@ _sqlite_backup_owner() {
   owner="$(stat -c '%u:%g' "${db}" 2>/dev/null || stat -f '%u:%g' "${db}" 2>/dev/null || true)"
   [[ -n "${owner}" ]] || return 0
   for f in "${db}-wal" "${db}-shm"; do
-    [[ -e "${f}" ]] && chown "${owner}" "${f}" 2>/dev/null || true
+    # -h: по ссылке на месте спутника chown передал бы владельцу чужой файл.
+    [[ -e "${f}" && ! -L "${f}" ]] && chown -h "${owner}" "${f}" 2>/dev/null || true
   done
   return 0
 }
@@ -2230,40 +2340,44 @@ backup_file() {
   local path="$1"
   [[ -e "${path}" ]] || return 0
   local backup="${path}.bak.$(date +%Y%m%d%H%M%S)"
-  cp -a "${path}" "${backup}"
-  add_rollback "mv -f '${backup}' '${path}'"
+  as_data_owner_for "${path}" cp -a "${path}" "${backup}"
+  add_rollback "mv -f $(_q "${backup}") $(_q "${path}")"
   debug "резервная копия: ${backup}"
   printf '%s' "${backup}"
 }
 
 write_file() {
-  # write_file <путь> [права] <<'EOF' ... EOF — атомарная запись с копией.
+  # write_file <путь> [права] [nobackup] <<'EOF' ... EOF — атомарная запись
+  # с копией прежнего файла (третий аргумент «nobackup» — без копии: для
+  # правки одной строки копия на каждый запуск только множит секреты).
   # Права выставляются до переноса на место: config.yaml с ключами доступа
   # не должен существовать даже мгновение доступным всем на чтение.
-  local path="$1" mode="${2:-}"
+  local path="$1" mode="${2:-}" backup="${3:-}"
   local dir; dir="$(dirname "${path}")"
   if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
     cat > /dev/null
     printf '%s[пробный запуск]%s запись %s\n' "${C_YELLOW}" "${C_RESET}" "${path}"
     return 0
   fi
-  mkdir -p "${dir}"
-  [[ -e "${path}" ]] && backup_file "${path}" >/dev/null
+  as_data_owner_for "${path}" mkdir -p "${dir}"
+  if [[ "${backup}" != "nobackup" ]] && { [[ -e "${path}" ]] || [[ -L "${path}" ]]; }; then
+    backup_file "${path}" >/dev/null
+  fi
   local tmp="${path}.tmp.$$"
-  # Права ставим ДО записи, а не после: `cat >` создаёт временный файл под
-  # текущей umask (обычно 0644), и до chmod содержимое лежало доступным на
-  # чтение всем. Для config.yaml это ключи доступа и токен Hugging Face —
-  # «даже мгновение» здесь и есть окно. Пустой файл создаём отдельно.
-  : > "${tmp}"
-  [[ -n "${mode}" ]] && chmod "${mode}" "${tmp}"
-  cat > "${tmp}"
-  [[ -n "${mode}" ]] && chmod "${mode}" "${tmp}"
-  mv -f "${tmp}" "${path}"
+  # Права — с самого создания, а не после: `cat >` создаёт файл под текущей
+  # umask (обычно 0644), и до chmod содержимое лежало доступным на чтение
+  # всем. Для config.yaml это ключи доступа и токен Hugging Face — «даже
+  # мгновение» здесь и есть окно. `set -C` создаёт временный файл только
+  # новым (O_EXCL): подложенная на его место ссылка не сработает.
+  as_data_owner_for "${path}" rm -f "${tmp}"
+  as_data_owner_for "${path}" sh -c 'umask 077 && set -C && cat > "$1"' sh "${tmp}"
+  [[ -n "${mode}" ]] && as_data_owner_for "${path}" chmod "${mode}" "${tmp}"
+  as_data_owner_for "${path}" mv -f "${tmp}" "${path}"
   debug "записан файл: ${path}"
 }
 
 ensure_dir() {
-  local path="$1" mode="${2:-0755}"
+  local path="$1" mode="${2:-0755}" old want drop
   # Создание каталога — изменение на диске, значит подчиняется пробному
   # запуску наравне с командами. Раньше не подчинялось: `--dry-run` оставлял
   # после себя каталог программы и весь каталог данных с подкаталогами и тут
@@ -2274,14 +2388,111 @@ ensure_dir() {
     return 0
   fi
   if [[ ! -d "${path}" ]]; then
-    mkdir -p "${path}"
-    add_rollback "rmdir '${path}' 2>/dev/null || true"
+    as_data_owner_for "${path}" mkdir -p "${path}"
+    as_data_owner_for "${path}" chmod "${mode}" "${path}" 2>/dev/null || true
+    add_rollback "rmdir $(_q "${path}") 2>/dev/null || true"
     debug "создан каталог: ${path}"
+    return 0
   fi
-  # chmod и для существующего каталога: иначе права зависели от того, кто
-  # создал его первым. Каталог данных так и оставался 0755 — а в нём лежит
-  # config.yaml с ключами доступа, их группами и квотами.
-  chmod "${mode}" "${path}" 2>/dev/null || true
+  # Существующему каталогу — недостающие права и снятие лишних у «прочих»,
+  # но не у группы. chmod целиком делал права независимыми от того, кто
+  # создал каталог первым (каталог данных оставался 0755 рядом с ключами в
+  # config.yaml), — и заодно снимал групповую запись, которую сам же
+  # установщик советует для нескольких экземпляров над общим каталогом:
+  # `install.sh --force` на одном превращал 2770 в 2750, и соседи теряли
+  # запись в собственную базу.
+  old="$(stat -c '%a' "${path}" 2>/dev/null || stat -f '%Lp' "${path}" 2>/dev/null || true)"
+  if [[ "${old}" =~ ^[0-7]+$ && "${mode}" =~ ^[0-7]+$ ]]; then
+    want=$(( 8#${mode} ))
+    drop=$(( 7 & ~(want & 7) ))
+    as_data_owner_for "${path}" chmod "$(printf '%o' $(( (8#${old} | want) & ~drop )))" \
+      "${path}" 2>/dev/null || true
+  else
+    as_data_owner_for "${path}" chmod "${mode}" "${path}" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Запись в чужой каталог данных — от имени его владельца
+# ---------------------------------------------------------------------------
+#
+# После первой установки каталог данных принадлежит пользователю службы.
+# Установщик, запущенный повторно от root, писал в него по постоянным и
+# предсказуемым именам (config.example.yaml, env.sh.new, config.yaml.hf.N,
+# config.yaml.tmp.N), читал config.yaml и отдавал всё службе. Каталог не
+# «липкий», защита fs.protected_symlinks на нём не действует, и
+# скомпрометированная служба могла заранее подложить на эти места
+# символические ссылки: root затирал свой файл, создавал authorized_keys со
+# строкой атакующего, копировал /etc/shadow в config.yaml службы.
+#
+# Поэтому всё, что root делает внутри такого каталога, идёт от имени его
+# владельца. Ссылка тогда ведёт запись лишь туда, куда владелец и так может
+# писать, — то есть не даёт ему ничего нового.
+
+ASRHUB_DATA_OWNER_DIR=""
+ASRHUB_DATA_OWNER_UID=""
+ASRHUB_DATA_OWNER_GID=""
+
+# Запоминает владельца каталога, если мы root, а он — нет.
+#
+#   data_owner_init КАТАЛОГ
+data_owner_init() {
+  local dir="${1%/}" uid="" gid=""
+  ASRHUB_DATA_OWNER_DIR=""; ASRHUB_DATA_OWNER_UID=""; ASRHUB_DATA_OWNER_GID=""
+  [[ -n "${dir}" && -d "${dir}" ]] || return 0
+  is_root || return 0
+  uid="$(stat -c '%u' "${dir}" 2>/dev/null || stat -f '%u' "${dir}" 2>/dev/null || true)"
+  gid="$(stat -c '%g' "${dir}" 2>/dev/null || stat -f '%g' "${dir}" 2>/dev/null || true)"
+  [[ "${uid}" =~ ^[0-9]+$ && "${uid}" != "0" ]] || return 0
+  [[ "${gid}" =~ ^[0-9]+$ ]] || gid="${uid}"
+  ASRHUB_DATA_OWNER_DIR="${dir}"
+  ASRHUB_DATA_OWNER_UID="${uid}"
+  ASRHUB_DATA_OWNER_GID="${gid}"
+  debug "записи в ${dir} — от имени владельца ${uid}:${gid}"
+}
+
+# Выполняет команду от имени владельца каталога данных (или как есть, если
+# владелец не запомнен). Окружение и стандартный ввод сохраняются.
+as_data_owner() {
+  if [[ -z "${ASRHUB_DATA_OWNER_UID}" ]] || ! is_root; then
+    "$@"; return
+  fi
+  local uid="${ASRHUB_DATA_OWNER_UID}" gid="${ASRHUB_DATA_OWNER_GID:-${ASRHUB_DATA_OWNER_UID}}" py
+  if have setpriv; then
+    setpriv --reuid="${uid}" --regid="${gid}" --clear-groups "$@"; return
+  fi
+  for py in python3 python; do
+    if have "${py}"; then
+      "${py}" -c 'import os, sys
+os.setgroups([]); os.setgid(int(sys.argv[2])); os.setuid(int(sys.argv[1]))
+os.execvp(sys.argv[3], sys.argv[3:])' "${uid}" "${gid}" "$@"
+      return
+    fi
+  done
+  if have sudo; then
+    sudo -n -u "#${uid}" -g "#${gid}" -- "$@"; return
+  fi
+  error "Нечем понизить права до владельца каталога данных (нет setpriv, python3 и sudo)."
+  return 1
+}
+
+# Содержимое файла, прочитанное от имени владельца каталога данных: root,
+# читающий подложенную ссылку, переписал бы /etc/shadow в config.yaml службы.
+#
+#   read_owned ФАЙЛ
+read_owned() { as_data_owner_for "$1" cat "$1"; }
+
+# То же, но только для путей внутри запомненного каталога.
+#
+#   as_data_owner_for ПУТЬ КОМАНДА…
+as_data_owner_for() {
+  local path="$1"; shift
+  if [[ -n "${ASRHUB_DATA_OWNER_DIR}" ]] \
+     && { [[ "${path}" == "${ASRHUB_DATA_OWNER_DIR}" ]] || [[ "${path}" == "${ASRHUB_DATA_OWNER_DIR}/"* ]]; }; then
+    as_data_owner "$@"
+    return
+  fi
+  "$@"
 }
 
 download() {
@@ -2325,6 +2536,23 @@ verify_checksum() {
 
 is_root() { [[ "$(id -u)" -eq 0 ]]; }
 
+# Абсолютный путь из введённого: ведущая «~» — домашний каталог, хвостовые
+# косые снимаются. Относительный путь — код 1. Тильду в значении ключа или
+# ответе мастера никто не раскрывал: установка уходила в «<текущий
+# каталог>/~/asrhub-app», а в config.yaml попадало буквальное «~/…».
+#
+#   absolute_path ПУТЬ
+absolute_path() {
+  local path="${1:-}"
+  case "${path}" in
+    "~")   path="${HOME}" ;;
+    "~/"*) path="${HOME%/}/${path#\~/}" ;;
+  esac
+  [[ "${path}" == /* ]] || return 1
+  while [[ "${path}" == */ && "${path}" != "/" ]]; do path="${path%/}"; done
+  printf '%s' "${path}"
+}
+
 as_root() {
   # Пробный запуск обязан быть пробным и от имени root. Раньше ветка для
   # root вызывала команду напрямую, минуя run, и `install.sh --dry-run`,
@@ -2356,11 +2584,17 @@ setup_logging() {
   fi
   local dir="${1:-/tmp}"
   mkdir -p "${dir}" 2>/dev/null || dir="/tmp"
-  ASRHUB_LOG_FILE="${dir}/asrhub-$(basename "${0%.sh}")-$(date +%Y%m%d-%H%M%S).log"
   # Только владельцу: в журнал попадают хвосты журнала службы, а в них имена
   # файлов записей — в колл-центре это номера телефонов. С правами 0644 в
   # общем /tmp их читал любой пользователь машины.
-  ( umask 077; : > "${ASRHUB_LOG_FILE}" ) 2>/dev/null || ASRHUB_LOG_FILE=""
+  #
+  # Имя — через mktemp, со случайным хвостом: прежнее «<сценарий>-<дата-время>.log»
+  # открывалось простым `: >`, и любой пользователь машины мог заранее
+  # создать файлы на ближайшие секунды — журнал root ложился в чужой файл,
+  # и владелец его читал. mktemp создаёт файл неделимо и только новым.
+  # Хвост X — в конце имени: BSD mktemp на macOS заменяет только хвостовые.
+  ASRHUB_LOG_FILE="$( umask 077; mktemp "${dir}/asrhub-$(basename "${0%.sh}")-$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null )" \
+    || ASRHUB_LOG_FILE=""
   [[ -n "${ASRHUB_LOG_FILE}" ]] && chmod 0600 "${ASRHUB_LOG_FILE}" 2>/dev/null || true
   [[ -n "${ASRHUB_LOG_FILE}" ]] && debug "журнал: ${ASRHUB_LOG_FILE}"
   export ASRHUB_LOG_FILE
@@ -2385,6 +2619,75 @@ setup_logging() {
 # службе, которая работает из их каталога.
 
 ASRHUB_INSTALL_MARKER=".asrhub-install"
+
+# Что копируется из дистрибутива в каталог программы. Один список на все
+# сценарии: agent/ в нём не было, и сервер установки отдавал на команду из
+# главы про агента (`curl …/api/telephony/agent/install.sh | bash`) ответ 500 —
+# агент лежит в <каталог программы>/agent, а туда его не клал никто.
+ASRHUB_INSTALL_ITEMS="server scripts config requirements docker examples agent VERSION README.md"
+
+# Скопированное от root — владельцу каталога программы. `cp -a` сохраняет
+# владельца источника, и после `sudo bash ~/asr-hub/scripts/update.sh` код
+# сервера и сценарии в /opt/asrhub принадлежали тому, кто распаковал
+# дистрибутив, — он мог править код службы без прав root.
+#
+#   own_like КАТАЛОГ_ОБРАЗЕЦ ПУТЬ…
+own_like() {
+  local ref="$1" owner; shift
+  is_root || return 0
+  owner="$(stat -c '%u:%g' "${ref}" 2>/dev/null || stat -f '%u:%g' "${ref}" 2>/dev/null || true)"
+  [[ -n "${owner}" ]] || return 0
+  chown -R -h "${owner}" "$@" 2>/dev/null || true
+}
+
+# Каталог docker установки — не только файлы дистрибутива. Рядом с ними
+# лежат .env (порт, адрес, каталог данных, токен, uid тома), certs/ для
+# nginx и — при запуске по README из самого каталога — data/ с базой и
+# моделями. Подменять каталог целиком нельзя: обновление стирало .env и
+# поднимало контейнер с умолчаниями на пустом томе. Поверх кладутся только
+# файлы дистрибутива, местные остаются.
+ASRHUB_DOCKER_LOCAL=".env certs data"
+
+# Файлы дистрибутива из ИСТОЧНИКА поверх НАЗНАЧЕНИЯ, не трогая местные.
+#
+#   overlay_docker_dir ИСТОЧНИК НАЗНАЧЕНИЕ
+overlay_docker_dir() {
+  local src="${1%/}" dst="${2%/}" entry name
+  [[ -d "${src}" ]] || return 1
+  mkdir -p "${dst}" || return 1
+  for entry in "${src}"/* "${src}"/.[!.]*; do
+    [[ -e "${entry}" || -L "${entry}" ]] || continue
+    name="${entry##*/}"
+    case " ${ASRHUB_DOCKER_LOCAL} " in *" ${name} "*) continue ;; esac
+    if [[ -d "${entry}" && ! -L "${entry}" ]]; then
+      rm -rf "${dst:?}/${name}.new"
+      cp -a "${entry}" "${dst}/${name}.new" || { rm -rf "${dst:?}/${name}.new"; return 1; }
+      rm -rf "${dst:?}/${name}"
+      mv "${dst}/${name}.new" "${dst}/${name}" || return 1
+    else
+      cp -a "${entry}" "${dst}/${name}.new" || { rm -f "${dst}/${name}.new"; return 1; }
+      mv -f "${dst}/${name}.new" "${dst}/${name}" || return 1
+    fi
+  done
+  return 0
+}
+
+# Копия каталога docker для снимка или отката — без data/: база и модели
+# в снимок не входят (их там гигабайты), а откат, вернувший старую копию
+# data/, стёр бы всё, что записано после обновления.
+#
+#   copy_docker_dir_without_data ИСТОЧНИК НАЗНАЧЕНИЕ
+copy_docker_dir_without_data() {
+  local src="${1%/}" dst="${2%/}" entry
+  [[ -d "${src}" ]] || return 1
+  mkdir -p "${dst}" || return 1
+  for entry in "${src}"/* "${src}"/.[!.]*; do
+    [[ -e "${entry}" || -L "${entry}" ]] || continue
+    [[ "${entry##*/}" == "data" ]] && continue
+    cp -a "${entry}" "${dst}/" || return 1
+  done
+  return 0
+}
 
 # Каталоги юнитов systemd и агентов launchd. Переменные — для проверок: так
 # им не нужно подменять /etc.
@@ -2504,6 +2807,9 @@ is_installation() {
     [[ "${line}" == "${dir}" ]] && return 0
   done < <(asrhub_services)
   [[ -d "${dir}/venv" && ! -e "${dir}/.git" ]] && return 0
+  # Установка в контейнере прежних версий: ни метки, ни venv, ни службы —
+  # но docker/.env пишет только установщик в режиме docker.
+  [[ -f "${dir}/docker/.env" && ! -e "${dir}/.git" ]] && return 0
   return 1
 }
 

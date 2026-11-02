@@ -41,11 +41,6 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements/base.txt
 
-# PyTorch ставим отдельно: у каждого ускорителя свой индекс пакетов
-RUN if [ "${PROFILE}" != "minimal" ]; then \
-        pip install --index-url "${TORCH_INDEX}" torch torchaudio ; \
-    fi
-
 # Движки: явный список важнее профиля.
 #
 # Установщик с ключом --engines писал свой список в docker/.env, а образ его
@@ -78,6 +73,21 @@ RUN if [ "${PROFILE}" != "minimal" ]; then \
 #   спросить некого, и без них молчаливо отключаются нарезка по тишине,
 #   расстановка знаков препинания и разделение по говорящим. Диаризация
 #   тяжёлая, поэтому только в «full» — в остальных профилях её нет.
+#
+# PyTorch ставится здесь же, перед движками, и только если он нужен хоть
+# одному движку списка (без него обходятся vosk, tone, whisper-cpp, mfa и
+# sherpa-onnx). Раньше он ставился по имени профиля: PROFILE=minimal
+# ENGINES=gigaam собирал образ без torch, и GigaAM в нём не работал. Версии
+# поставленного torch записываются файлом ограничений: движки ставятся с
+# обычного индекса и иначе могли заменить torch под CUDA сборкой с PyPI.
+#
+# Сбой движка, заданного явно (ENGINES), роняет сборку: образ, который
+# «собрался», но рапортует о движке, которого в нём нет, — хуже отказа, а
+# слой с ним ещё и кешировался, и повторная сборка брала его из кеша.
+# Опечатка в имени (файла требований нет) по-прежнему только пропускается —
+# она видна сразу, а не на пятнадцатой минуте. Движки профиля — мягче:
+# несобравшийся пропускается с предупреждением. В .asrhub-engines пишется
+# то, что действительно встало, а не то, что просили.
 RUN set -eux; \
     if [ -n "${ENGINES}" ]; then \
       LIST="$(echo "${ENGINES}" | tr ',_' ' -')"; \
@@ -93,28 +103,52 @@ RUN set -eux; \
         *)        LIST="faster-whisper" ;; \
       esac; \
     fi; \
-    printf '%s' "${LIST}" > /opt/venv/.asrhub-engines; \
+    STRICT=0; [ -n "${ENGINES}" ] && STRICT=1; \
+    NEED_TORCH=0; \
+    for engine in ${LIST}; do \
+      case "${engine}" in vosk|tone|whisper-cpp|mfa|sherpa-onnx) ;; *) NEED_TORCH=1 ;; esac; \
+    done; \
+    : > /opt/venv/.asrhub-torch-constraints; \
+    if [ "${NEED_TORCH}" = "1" ]; then \
+      pip install --index-url "${TORCH_INDEX:-https://download.pytorch.org/whl/cpu}" torch torchaudio; \
+      pip freeze | grep -iE '^(torch|torchaudio)==' > /opt/venv/.asrhub-torch-constraints || true; \
+    fi; \
+    C=""; [ -s /opt/venv/.asrhub-torch-constraints ] && C="-c /opt/venv/.asrhub-torch-constraints"; \
+    : > /opt/venv/.asrhub-engines; \
+    FAILED=""; \
     for engine in ${LIST}; do \
       if [ ! -f "requirements/engines/${engine}.txt" ]; then \
         echo "ВНИМАНИЕ: нет файла зависимостей для движка ${engine} — пропускаем"; \
         continue; \
       fi; \
       echo "=== установка движка ${engine} ==="; \
-      if ! pip install -r "requirements/engines/${engine}.txt"; then \
-        echo "ВНИМАНИЕ: движок ${engine} установить не удалось, продолжаем"; \
+      if ! pip install ${C} -r "requirements/engines/${engine}.txt"; then \
+        echo "ВНИМАНИЕ: движок ${engine} установить не удалось"; \
+        FAILED="${FAILED} ${engine}"; \
         continue; \
       fi; \
       if [ -f "requirements/engines/no-deps/${engine}.txt" ]; then \
-        pip install --no-deps -r "requirements/engines/no-deps/${engine}.txt" || \
+        if ! pip install --no-deps -r "requirements/engines/no-deps/${engine}.txt"; then \
           echo "ВНИМАНИЕ: движок ${engine} установился без собственного пакета"; \
+          FAILED="${FAILED} ${engine}"; \
+          continue; \
+        fi; \
       fi; \
       if [ -f "requirements/engines/optional/${engine}.txt" ]; then \
-        { pip install -r "requirements/engines/optional/${engine}.txt" && \
+        { pip install ${C} -r "requirements/engines/optional/${engine}.txt" && \
           { [ ! -f "requirements/engines/optional/no-deps/${engine}.txt" ] || \
             pip install --no-deps -r "requirements/engines/optional/no-deps/${engine}.txt"; }; } || \
           echo "ВНИМАНИЕ: необязательная часть движка ${engine} не установилась"; \
       fi; \
-    done
+      printf '%s ' "${engine}" >> /opt/venv/.asrhub-engines; \
+    done; \
+    if [ -n "${FAILED}" ]; then \
+      echo "Не установились движки:${FAILED}"; \
+      if [ "${STRICT}" = "1" ]; then \
+        echo "Движки заданы явно (ENGINES) — сборка остановлена."; \
+        exit 1; \
+      fi; \
+    fi
 
 # Версии, которые мы держим вопреки требованиям движков. Ставится последним
 # и с --no-deps — ровно как в scripts/install.sh: движки ставятся по одному,
@@ -136,7 +170,7 @@ ARG ACCEL=cpu
 # Версия образа. Значение по умолчанию обязано совпадать с файлом VERSION —
 # это проверяется тестом: раньше оно было вписано числом и тихо отставало от
 # файла на каждом выпуске, а docker inspect показывал прошлогоднюю версию.
-ARG VERSION=3.1.25
+ARG VERSION=3.1.26
 
 LABEL org.opencontainers.image.title="ASR Hub" \
       org.opencontainers.image.description="Сервер распознавания речи на свободных моделях" \
@@ -170,11 +204,41 @@ WORKDIR /app
 COPY server/ ./server/
 COPY scripts/ ./scripts/
 COPY requirements/ ./requirements/
+# Агент для АТС: сервер отдаёт его станциям из <корень программы>/agent
+# (/api/telephony/agent/install.sh). Без этой строки адрес из главы про
+# агента отвечал в контейнере ошибкой 500.
+COPY agent/ ./agent/
 COPY VERSION ./
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh && \
     mkdir -p /data/uploads /data/results /data/models /data/logs /data/tmp && \
     chown -R asrhub:asrhub /data /app
+
+# Проверка движков уже в рабочем образе: пакет поставился — ещё не значит,
+# что импортируется (нет системной библиотеки, сломанная зависимость). В
+# список «Движки в образе» попадают только те, что сервер признаёт доступными.
+RUN cd /app/server && python - <<'PYEOF'
+import pathlib
+from asrhub.engines import ENGINE_CLASSES
+path = pathlib.Path("/opt/venv/.asrhub-engines")
+wanted = path.read_text().split() if path.exists() else []
+ok = []
+for name in wanted:
+    cls = ENGINE_CLASSES.get(name.replace("-", "_"))
+    if cls is None:          # дополнение (vad, postprocess, diarization) — без своего класса
+        ok.append(name)
+        continue
+    try:
+        available, reason = cls.check_available()
+    except Exception as exc:  # проверка не должна ронять сборку — только честно сказать
+        available, reason = False, str(exc)
+    if available:
+        ok.append(name)
+    else:
+        print(f"ВНИМАНИЕ: движок {name} в образе, но недоступен: {reason}")
+path.write_text(" ".join(ok))
+print("Движки в образе:", ", ".join(ok) or "нет")
+PYEOF
 
 # Пользователь не переключается здесь: смонтированный том принадлежит
 # владельцу с хоста, и права на него можно поправить только от root.

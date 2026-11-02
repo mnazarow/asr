@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from ..errors import ASRHubError, ConfigError
-from ..trends import PERIODS, Trends
+from ..trends import PERIODS, ПОКАЗАТЕЛИ, Trends
 from .deps import Principal, authenticate, error_response, get_state, scope_owner
 
 router = APIRouter(prefix="/api/trends", tags=["Тренды"])
@@ -36,7 +36,9 @@ def _показатели(metrics: str | None) -> list[str]:
     """Список показателей из строки запроса; пусто — значит все."""
     if not metrics:
         return []
-    return [м.strip() for м in metrics.split(",") if м.strip()][:60]
+    # Предел — число показателей каталога: «[:60]» при шестидесяти двух
+    # молча отбрасывал последние два из явного списка.
+    return [м.strip() for м in metrics.split(",") if м.strip()][:len(ПОКАЗАТЕЛИ)]
 
 
 @router.get("/catalog", summary="Каталог показателей трендов")
@@ -58,8 +60,9 @@ def series(request: Request, period: str = ПЕРИОД, bucket: str = ШАГ,
     периода: «выросло» без «по сравнению с чем» — не утверждение.
 
     Точка ряда раскрывается в записи через `GET /api/drill`: `window` —
-    границы окна, корзина `i` — от `buckets[i]` до `buckets[i] + step_s`
-    (последняя обрезана концом окна); у ряда и строки свода `drill` —
+    границы окна, корзина `i` — от `buckets[i]` до `buckets[i+1]`
+    (последняя — до конца окна, она текущая и неполная: `partial_last`).
+    Корзины календарные — местная полночь, понедельник, первое число; у ряда и строки свода `drill` —
     основа, отборы и порядок списка, `n` — сколько в нём записей (по
     корзинам и за окно). У показателей железа и контрольных прогонов
     `drill` пуст: за ними нет записей с временем записи.
@@ -121,8 +124,10 @@ def export(request: Request, period: str = ПЕРИОД, bucket: str = ШАГ,
     from ..analytics_export import _собрать_csv, _собрать_xlsx  # noqa: PLC0415
     from .routes_jobs import content_disposition  # noqa: PLC0415
 
+    # С прошлым периодом: без него столбцы «Изменение, %» и «Вердикт» были
+    # пусты у всех строк свода всегда.
     свод = _слой(request).series(period, bucket=bucket, metrics=_показатели(metrics),
-                                 owner=scope_owner(principal), compare=False,
+                                 owner=scope_owner(principal), compare=True,
                                  is_admin=principal.is_admin)
     ряды = свод["series"]
 
@@ -136,9 +141,10 @@ def export(request: Request, period: str = ПЕРИОД, bucket: str = ШАГ,
         строки.append([time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
                        *[(р["values"][i] if i < len(р["values"]) else None) for р in ряды]])
     свод_строки = [["Показатель", "Единица", "Среднее", "Минимум", "Максимум",
-                    "Последнее", "Изменение, %", "Вердикт"]]
+                    "Последнее", "Прошлый период", "Изменение, %", "Вердикт"]]
     свод_строки += [[с["label"], с["unit"], с["avg"], с["min"], с["max"], с["last"],
-                     с["change_percent"], с["verdict"]] for с in свод["summary"]]
+                     с["previous"], с["change_percent"], с["verdict"]]
+                    for с in свод["summary"]]
     таблицы = [("Ряды", заголовки, строки),
                ("Свод", свод_строки[0], свод_строки[1:])]
     метка = time.strftime("%Y-%m-%d")

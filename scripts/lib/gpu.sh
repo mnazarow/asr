@@ -29,10 +29,17 @@ PCI_VENDOR_INTEL="0x8086"
 ASRHUB_ROCM_VERSION="${ASRHUB_ROCM_VERSION:-7.2.4}"
 ASRHUB_ROCM_PKG="${ASRHUB_ROCM_PKG:-7.2.4.70204-1}"
 
+# Каталог загруженных модулей ядра — переменной по той же причине, что и
+# ASRHUB_PCI_ROOT: состояние драйвера иначе проверяется только на машине с
+# нужной картой.
+ASRHUB_SYS_MODULE="${ASRHUB_SYS_MODULE:-/sys/module}"
+
 # Заполняется gpu_tune: переменные окружения, без которых карта работает
 # не так, как могла бы. Читается установщиком при создании службы.
 # shellcheck disable=SC2034  # читается в install.sh, а не здесь
 GPU_ENV_OVERRIDE=""
+# Окружение службы для пробы видеокарты (см. gpu_runtime_report).
+GPU_PROBE_ENV=()
 
 # ---------------------------------------------------------------------------
 # Обнаружение
@@ -238,8 +245,12 @@ gpu_driver_state() {
     amd)
       if have rocminfo && rocminfo >/dev/null 2>&1; then printf 'ready'; return 0; fi
       if have rocm-smi && rocm-smi --showid >/dev/null 2>&1; then printf 'ready'; return 0; fi
-      # amdgpu входит в ядро, поэтому «модуль есть» ещё не значит «ROCm есть».
-      if [[ -d /sys/module/amdgpu ]]; then printf 'installed-noload'; return 0; fi
+      # amdgpu входит в ядро и загружен на любой машине с картой Radeon,
+      # поэтому «модуль есть» не значит «ROCm есть». Раньше это и считалось
+      # «драйвер установлен, нужна перезагрузка»: ROCm не ставился никогда,
+      # а перезагрузку просили после каждой. «Установлен» — когда есть сам
+      # ROCm (rocminfo или rocm-smi), но он не отвечает.
+      if have rocminfo || have rocm-smi; then printf 'installed-noload'; return 0; fi
       printf 'absent' ;;
     intel)
       # Через подоболочку без pipefail: `clinfo` печатает сотни строк, и
@@ -250,7 +261,11 @@ gpu_driver_state() {
            | grep -ci 'Intel.*Graphics' || true)" -gt 0 ]]; then
         printf 'ready'; return 0
       fi
-      if [[ -e /dev/dri/renderD128 && -d /sys/module/i915 ]] || [[ -d /sys/module/xe ]]; then
+      # i915 и xe — драйверы вывода изображения из ядра, они есть всегда.
+      # Набор для вычислений — это OpenCL/Level Zero от Intel: установлен,
+      # если его ICD на месте, но clinfo карту не видит.
+      if have clinfo && { [[ -e /etc/OpenCL/vendors/intel.icd ]] \
+           || ls /etc/OpenCL/vendors/intel*.icd >/dev/null 2>&1; }; then
         printf 'installed-noload'; return 0
       fi
       printf 'absent' ;;
@@ -330,7 +345,12 @@ _nvidia_install_apt() {
   # сама и не превращается в просроченный ключ через год.
   repo="$(printf '%s%s' "${distro}" "${version//./}")"
   info "Подключаем репозиторий NVIDIA для ${repo}."
-  local keyring="/tmp/cuda-keyring.deb"
+  # Во временный каталог со случайным именем, а не в /tmp/<постоянное имя>:
+  # пакет ставится от root, а заранее подложенный другим пользователем файл
+  # с тем же именем dpkg установил бы вместо настоящего.
+  local tmpd keyring
+  make_temp_dir tmpd || return 1
+  keyring="${tmpd}/cuda-keyring.deb"
   download "https://developer.download.nvidia.com/compute/cuda/repos/${repo}/x86_64/cuda-keyring_1.1-1_all.deb" \
     "${keyring}" || {
       error "Репозитория NVIDIA для «${repo}» нет."
@@ -341,8 +361,8 @@ _nvidia_install_apt() {
   as_root apt-get update -qq || return 1
   # nvidia-open — открытые модули ядра; на картах Turing и новее это
   # рекомендованный вариант, на более старых работают только закрытые.
-  DEBIAN_FRONTEND=noninteractive as_root apt-get install -y -qq nvidia-open \
-    || DEBIAN_FRONTEND=noninteractive as_root apt-get install -y -qq cuda-drivers \
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-open \
+    || as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cuda-drivers \
     || return 1
 }
 
@@ -403,7 +423,8 @@ gpu_install_amd() {
       local codename; codename="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_CODENAME:-}")"
       [[ -z "${codename}" ]] && { error "Не удалось определить выпуск Ubuntu."; return 1; }
       url="https://repo.radeon.com/amdgpu-install/${ASRHUB_ROCM_VERSION}/ubuntu/${codename}/amdgpu-install_${ASRHUB_ROCM_PKG}_all.deb"
-      pkg="/tmp/amdgpu-install.deb"
+      local tmpd; make_temp_dir tmpd || return 1
+      pkg="${tmpd}/amdgpu-install.deb"
       download "${url}" "${pkg}" || {
         error "Пакета amdgpu-install для «${codename}» нет по адресу ${url}."
         hint "Список выпусков: https://repo.radeon.com/amdgpu-install/"
@@ -411,9 +432,9 @@ gpu_install_amd() {
       }
       as_root apt-get install -y -qq "${pkg}" || return 1
       as_root apt-get update -qq || return 1
-      DEBIAN_FRONTEND=noninteractive as_root apt-get install -y -qq \
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" || true
-      DEBIAN_FRONTEND=noninteractive as_root apt-get install -y -qq amdgpu-dkms rocm || return 1 ;;
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq amdgpu-dkms rocm || return 1 ;;
     dnf|yum)
       local ver major; ver="$(detect_distro_version)"; major="${ver%%.*}"
       url="https://repo.radeon.com/amdgpu-install/${ASRHUB_ROCM_VERSION}/rhel/${ver}/amdgpu-install-${ASRHUB_ROCM_PKG}.el${major}.noarch.rpm"
@@ -445,7 +466,8 @@ gpu_install_intel() {
       # Через файл, а не конвейером из curl: в конвейере обёртка run видит
       # только правую половину, и при пробном запуске левая выполняется
       # по-настоящему, а сбой загрузки маскируется кодом возврата gpg.
-      local key="/tmp/intel-graphics.key"
+      local tmpd key; make_temp_dir tmpd || return 1
+      key="${tmpd}/intel-graphics.key"
       download "https://repositories.intel.com/gpu/intel-graphics.key" "${key}" || {
         error "Не удалось получить ключ репозитория Intel."
         return 1
@@ -453,10 +475,10 @@ gpu_install_intel() {
       as_root gpg --dearmor --yes -o /usr/share/keyrings/intel-graphics.gpg "${key}" || return 1
       local codename; codename="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_CODENAME:-}")"
       printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu %s unified\n' \
-        "${codename}" > /tmp/intel-gpu.list
-      as_root install -m 0644 /tmp/intel-gpu.list /etc/apt/sources.list.d/intel-gpu.list || return 1
+        "${codename}" > "${tmpd}/intel-gpu.list"
+      as_root install -m 0644 "${tmpd}/intel-gpu.list" /etc/apt/sources.list.d/intel-gpu.list || return 1
       as_root apt-get update -qq || return 1
-      DEBIAN_FRONTEND=noninteractive as_root apt-get install -y -qq \
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         intel-opencl-icd intel-level-zero-gpu libze1 clinfo || return 1
       local target_user="${SERVICE_USER:-${SUDO_USER:-${USER:-}}}"
       [[ -n "${target_user}" ]] && as_root usermod -a -G render,video "${target_user}" 2>/dev/null || true ;;
@@ -512,7 +534,14 @@ gpu_ensure_driver() {
       return 0 ;;
     installed-noload)
       warn "Драйвер установлен, но модуль ядра не загружен."
-      if as_root modprobe "$([[ "${key}" == "nvidia" ]] && echo nvidia || echo amdgpu)" 2>/dev/null \
+      # Модуль — по производителю: для Intel раньше звался amdgpu.
+      local module=""
+      case "${key}" in
+        nvidia) module="nvidia" ;;
+        amd)    module="amdgpu" ;;
+        intel)  module="$([[ -d "${ASRHUB_SYS_MODULE}/xe" ]] && echo xe || echo i915)" ;;
+      esac
+      if [[ -n "${module}" ]] && as_root modprobe "${module}" 2>/dev/null \
          && [[ "$(gpu_driver_state "${vendor}")" == "ready" ]]; then
         ok "Модуль загружен, карта доступна."
         return 0
@@ -738,15 +767,22 @@ nvidia_userspace_version() {
          | sed -n 's/.*NVML library version: *\([0-9][0-9.]*\).*/\1/p' | head -1)"
     [[ -z "${v}" ]] && v="$( { nvidia-smi --query-gpu=driver_version \
                                --format=csv,noheader 2>/dev/null || true; } | head -1)"
+    # Только вид номера версии: отказы («Unable to determine the device
+    # handle…») nvidia-smi печатает туда же, в вывод, и разбор принимал текст
+    # ошибки за версию библиотек — «разошлись», совет пересобирать модуль.
+    [[ "${v}" =~ ^[0-9]+(\.[0-9]+)+$ ]] || v=""
   fi
   # Запасной путь — имя файла userspace. Версия в нём полная (595.99.02),
   # а NVML печатает укороченную (595.99), поэтому сравнение идёт по началу.
+  # Образец — без кавычек: в кавычках он не раскрывался, и путь не
+  # срабатывал никогда.
   if [[ -z "${v}" ]]; then
-    for so in "${ASRHUB_NVIDIA_LIB_GLOB:-/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*}" \
+    # shellcheck disable=SC2086
+    for so in ${ASRHUB_NVIDIA_LIB_GLOB:-/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*} \
               /usr/lib64/libnvidia-ml.so.* /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.*; do
       [[ -e "${so}" ]] || continue
       case "${so##*libnvidia-ml.so.}" in
-        [0-9]*) v="${so##*libnvidia-ml.so.}"; break ;;
+        [0-9]*.[0-9]*) v="${so##*libnvidia-ml.so.}"; break ;;
       esac
     done
   fi
@@ -898,7 +934,12 @@ gpu_torch_probe() {
      && id -u "${run_as}" >/dev/null 2>&1; then
     runner=(runuser -u "${run_as}" --)
   fi
-  ${runner[@]+"${runner[@]}"} "${py}" - "${code_dir}" "${device}" 2>/dev/null <<'PYEOF' || printf 'skip|%s|проба не выполнилась' "${device}"
+  # Окружение службы (GPU_PROBE_ENV, заполняет gpu_runtime_report): проба в
+  # оболочке администратора не видела CUDA_VISIBLE_DEVICES службы, и при
+  # «CUDA_VISIBLE_DEVICES=5» без такой карты отвечала «карта доступна», а у
+  # службы падало каждое задание.
+  ${runner[@]+"${runner[@]}"} env ${GPU_PROBE_ENV[@]+"${GPU_PROBE_ENV[@]}"} \
+    "${py}" - "${code_dir}" "${device}" 2>/dev/null <<'PYEOF' || printf 'skip|%s|проба не выполнилась' "${device}"
 import sys
 
 sys.path.insert(0, sys.argv[1])
@@ -962,6 +1003,15 @@ if устройство in ("", "auto"):
         есть = False
     if есть:
         print(f"ok|auto → cuda|{имя_карты()}")
+        raise SystemExit(0)
+    # Apple Silicon: сервер при auto берёт mps, и «уйдёт на процессор» про
+    # Mac было неправдой.
+    try:
+        mps = bool(torch.backends.mps.is_available())
+    except Exception:                               # noqa: BLE001
+        mps = False
+    if mps:
+        print("ok|auto → mps|Apple Silicon (Metal)")
     else:
         print("cpu|auto → cpu|карта не отвечает, сервер уйдёт на процессор")
     raise SystemExit(0)
@@ -980,11 +1030,16 @@ gpu_runtime_report() {
   # процесса нет. Второе сознательно не считается «просто предупреждением»:
   # на таком сервере падает каждое задание.
   local py="$1" data_dir="$2" code_dir="$3" service="${4:-asrhub}"
-  local device probe state shown detail run_as=""
+  local device probe state shown detail run_as="" line
   device="$(config_device "${data_dir}")"
   [[ -z "${device}" ]] && device="auto"
   # Спрашиваем от имени пользователя службы — того, кто будет считать.
   run_as="$(installed_service_value "${service}" "" user 2>/dev/null || true)"
+  # И с её окружением: переменные, от которых зависит, какие карты видны.
+  GPU_PROBE_ENV=()
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && GPU_PROBE_ENV+=("${line}")
+  done < <(service_gpu_environment "${service}" "${data_dir}")
 
   probe="$(gpu_torch_probe "${py}" "${code_dir}" "${device}" "${run_as}")"
   state="$(printf '%s' "${probe}" | cut -d'|' -f1)"
@@ -998,6 +1053,13 @@ gpu_runtime_report() {
     cpu)
       if [[ "${device}" == "cpu" ]]; then
         info "Распознавание настроено на процессор — видеокарту проверять незачем."
+        return 0
+      fi
+      # Карты нет вовсе — это не поломка, а машина без видеокарты: тревога
+      # и разбор драйвера NVIDIA на каждом doctor.sh и update.sh только
+      # приучали не читать предупреждения.
+      if ! have nvidia-smi && [[ "$(gpu_primary | cut -d'|' -f4)" != "1" ]]; then
+        info "Видеокарты нет — распознавание идёт на процессоре (${shown})."
         return 0
       fi
       warn "Видеокарта не отвечает: ${shown}."
@@ -1014,6 +1076,28 @@ gpu_runtime_report() {
       hint "Чтобы приём не стоял, пока карта чинится: device: cpu в ${data_dir}/config.yaml"
       return 1 ;;
   esac
+}
+
+# Переменные окружения службы, от которых зависит, какие карты видны
+# процессу: из работающего процесса (/proc/<MainPID>/environ), из Environment
+# юнита и из env.sh каталога данных (EnvironmentFile). По строке ИМЯ=ЗНАЧЕНИЕ.
+#
+#   service_gpu_environment СЛУЖБА КАТАЛОГ_ДАННЫХ
+service_gpu_environment() {
+  local service="${1:-asrhub}" data_dir="${2:-}" pid="" filter
+  filter='^(CUDA_VISIBLE_DEVICES|HIP_VISIBLE_DEVICES|ROCR_VISIBLE_DEVICES|HSA_OVERRIDE_GFX_VERSION|CUDA_DEVICE_ORDER|NVIDIA_VISIBLE_DEVICES|PYTORCH_[A-Z_]+)='
+  {
+    if [[ -n "${data_dir}" && -r "${data_dir}/env.sh" ]]; then
+      sed -E 's/^export[[:space:]]+//' "${data_dir}/env.sh" 2>/dev/null || true
+    fi
+    if have systemctl; then
+      { systemctl show "${service}" -p Environment --value 2>/dev/null || true; } | tr ' ' '\n'
+      pid="$( { systemctl show -p MainPID --value "${service}.service" 2>/dev/null || true; } | head -1)"
+    fi
+    if [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/environ" ]]; then
+      tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || true
+    fi
+  } | grep -E "${filter}" | tr -d '"' | awk -F= '{ v[$1] = $0 } END { for (k in v) print v[k] }' || true
 }
 
 nvidia_repair_hint() {

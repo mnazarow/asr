@@ -98,21 +98,81 @@ class ErrorCounts:
 _MATRIX_LIMIT = 4_000_000
 
 
+#: До какой площади матрицы точный расчёт идёт построчно на numpy. Сотни
+#: миллионов ячеек — это двадцать тысяч слов против двадцати тысяч, около
+#: трёх часов речи; строка считается векторно, и на это уходят секунды.
+_MATRIX_LIMIT_NUMPY = 400_000_000
+
+
+def _levenshtein_numpy(ref: Sequence[str], hyp: Sequence[str]) -> ErrorCounts | None:
+    """Точный Левенштейн построчно на numpy; None — numpy нет.
+
+    Счётчики ошибок восстанавливаются без обратного хода: в ячейке лежит
+    одно число «стоимость × K − совпадения» (K больше любого числа
+    совпадений), и минимум по нему — это минимум стоимости, а среди равных
+    по стоимости — путь с наибольшим числом совпадений. Зная стоимость D и
+    совпадения H, остальное следует из длин: пропусков D − (M − H),
+    вставок D − (N − H), замен N − H − пропуски.
+
+    Вставка в строке — зависимость от соседней ячейки той же строки, и
+    считается она одним проходом: min по префиксу от (t[j] − j·K) плюс j·K.
+    """
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        return None
+    n, m = len(ref), len(hyp)
+    if n == 0:
+        return ErrorCounts(insertions=m)
+    if m == 0:
+        return ErrorCounts(deletions=n)
+    словарь: dict[str, int] = {}
+    ref_ids = np.fromiter((словарь.setdefault(x, len(словарь)) for x in ref), dtype=np.int64, count=n)
+    hyp_ids = np.fromiter((словарь.setdefault(x, len(словарь)) for x in hyp), dtype=np.int64, count=m)
+    K = np.int64(n + m + 1)
+    шаги = np.arange(m + 1, dtype=np.int64) * K
+    prev = шаги.copy()                              # i = 0: одни вставки
+    for i in range(1, n + 1):
+        совпало = hyp_ids == ref_ids[i - 1]
+        # по диагонали: совпадение даёт −1 (одно совпадение), замена — K
+        диагональ = prev[:-1] + np.where(совпало, np.int64(-1), K)
+        cur = np.empty(m + 1, dtype=np.int64)
+        cur[0] = i * K                              # одни пропуски
+        cur[1:] = np.minimum(диагональ, prev[1:] + K)
+        cur = np.minimum.accumulate(cur - шаги) + шаги
+        prev = cur
+    значение = int(prev[m])
+    стоимость = (значение + n + m) // int(K)        # совпадений не больше n+m < K
+    hits = стоимость * int(K) - значение
+    deletions = стоимость - (m - hits)
+    insertions = стоимость - (n - hits)
+    substitutions = n - hits - deletions
+    return ErrorCounts(substitutions=substitutions, deletions=deletions,
+                       insertions=insertions, hits=hits)
+
+
 def _levenshtein_chunked(ref: Sequence[str], hyp: Sequence[str]) -> ErrorCounts:
     """Расстояние Левенштейна, пригодное для многочасовых расшифровок.
 
-    Прямой расчёт квадратичен: на часовой записи посимвольный разбор
-    (около 55 000 знаков) занимал больше получаса, и всё это время задание
-    висело на 96 % и не отменялось.
+    Прямой расчёт на чистом Python квадратичен и медленен: на часовой
+    записи посимвольный разбор (около 55 000 знаков) занимал больше получаса.
+    Поэтому сверх `_MATRIX_LIMIT` расчёт идёт построчно на numpy — тот же
+    точный ответ, только векторно (`_levenshtein_numpy`).
 
-    Здесь длинные последовательности сначала разбиваются на совпадающие
-    участки и промежутки между ними (`difflib` делает это быстро), а точный
-    расчёт применяется только к промежуткам — они на порядки короче. Ответ
-    получается тот же, что и при прямом расчёте: совпадающие участки в
-    оптимальное выравнивание входят целиком.
+    Без numpy, или когда и для него матрица велика, длинные
+    последовательности разбиваются на совпадающие участки и промежутки
+    между ними (`difflib`), и точный расчёт идёт только по промежуткам. Это
+    оценка СВЕРХУ, а не точное число: участки difflib не обязаны входить в
+    оптимальное выравнивание — на двух тысячах слов с ошибкой около трети
+    завышение доходило до двух процентных пунктов. Прежде здесь стояло
+    «ответ получается тот же», и WER длинных записей молча завышался.
     """
     if len(ref) * len(hyp) <= _MATRIX_LIMIT:
         return _levenshtein(ref, hyp)
+    if len(ref) * len(hyp) <= _MATRIX_LIMIT_NUMPY:
+        точно = _levenshtein_numpy(ref, hyp)
+        if точно is not None:
+            return точно
 
     import difflib
 
@@ -163,6 +223,10 @@ def _char_counts(ref_words: Sequence[str], hyp_words: Sequence[str]) -> ErrorCou
     hyp_chars = sum(len(w) for w in hyp_words) + max(0, len(hyp_words) - 1)
     if ref_chars * hyp_chars <= _MATRIX_LIMIT:
         return _levenshtein(list(" ".join(ref_words)), list(" ".join(hyp_words)))
+    if ref_chars * hyp_chars <= _MATRIX_LIMIT_NUMPY:
+        точно = _levenshtein_numpy(list(" ".join(ref_words)), list(" ".join(hyp_words)))
+        if точно is not None:
+            return точно
 
     import difflib
 

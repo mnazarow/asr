@@ -70,7 +70,8 @@ def run_checks(settings: Settings) -> bool:
                         else ""),
            "Меньше четырёх ядер: обработка на процессоре будет медленной.")
     _check("Оперативная память",
-           "ok" if hardware.ram_total_gb >= 16 else ("warn" if hardware.ram_total_gb >= 6 else "fail"),
+           # 15, а не 16: машина «на 16 ГБ» отдаёт MemTotal 15,6 ГБ.
+           "ok" if hardware.ram_total_gb >= 15 else ("warn" if hardware.ram_total_gb >= 6 else "fail"),
            f"{hardware.ram_total_gb} ГБ",
            "Для моделей уровня large рекомендуется 16 ГБ.")
     _check("Свободно на диске",

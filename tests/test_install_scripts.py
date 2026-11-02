@@ -185,31 +185,14 @@ def test_generated_config_is_readable_by_the_server(repo_root: Path, tmp_path: P
     файле конфигурации», и сервер не стартует. Опечатка в шаблоне
     установщика стоила бы ровно этого, причём на чужой машине.
     """
-    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
-    body = re.search(r"write_file \"\$\{CONFIG_FILE\}\" 0640 <<CFGEOF\n(.*?)\nCFGEOF",
-                     source, re.S)
-    assert body, "не найден шаблон config.yaml в install.sh"
-    text = body.group(1)
-    # Подставляем значения оболочки так, как это сделал бы установщик.
-    substitutions = {
-        "${DATA_DIR}": str(tmp_path / "данные"),
-        "${RECOMMENDED_MODEL}": "demo-simulator",
-        "${HOST}": "0.0.0.0",
-        "${PORT}": "8080",
-        "${STREAM_ENABLED}": "true",
-        "${GPU_BATCHING_BLOCK}": "  device: auto\n  compute_type: auto",
-        "${ALIGNMENT}": "none",
-        "${MONITORING}": "prometheus_pushgateway",
-        "${MONITORING_URL:-http://localhost:9091}": "http://localhost:9091",
-    }
-    for key, value in substitutions.items():
-        text = text.replace(key, value)
-    # Остатки подстановок оболочки: строки с ними в проверку не берём —
-    # они зависят от найденного железа, а не от схемы.
-    lines = [line for line in text.splitlines()
-             if "$(" not in line and "${" not in line]
-    config = tmp_path / "config.yaml"
-    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # С захода 54 шаблон собирается в функции create_configuration, а не
+    # здесь-документом: проверяем то, что установщик действительно пишет —
+    # прогоном с подменёнными командами (см. test_review_40_scripts).
+    from test_review_40_scripts import _установка
+    итог = _установка(tmp_path, "--port 8080")
+    assert итог.returncode == 0, итог.stdout[-3000:] + итог.stderr[-3000:]
+    config = tmp_path / "data" / "config.yaml"
+    assert config.exists(), "установщик не создал config.yaml"
 
     from asrhub.config import load
 
@@ -281,12 +264,23 @@ def test_examples_are_installed(repo_root: Path):
     install, ни update.
     """
     assert (repo_root / "examples" / "stream_microphone.py").exists()
+    # Список копируемого — один на все сценарии (ASRHUB_INSTALL_ITEMS в
+    # common.sh); установщик и обновление идут по нему.
+    common = (repo_root / "scripts" / "lib" / "common.sh").read_text(encoding="utf-8")
+    items = re.search(r'^ASRHUB_INSTALL_ITEMS="([^"]*)"', common, re.M)
+    assert items and "examples" in items.group(1).split(), "examples нет в списке"
     for name in ("install.sh", "update.sh"):
         text = (repo_root / "scripts" / name).read_text(encoding="utf-8")
-        assert re.search(r"for item in .*\bexamples\b", text), f"{name} не ставит examples"
+        assert re.search(r"for item in \$\{ASRHUB_INSTALL_ITEMS\}", text), \
+            f"{name} не ставит examples"
+    # На Windows список тоже один — $script:AsrInstallItems в Common.psm1
+    # (заход 54: в нём появился agent), сценарии берут его Get-AsrInstallItems.
+    module = (repo_root / "scripts" / "lib" / "Common.psm1").read_text(encoding="utf-8-sig")
+    ps_items = re.search(r"\$script:AsrInstallItems\s*=\s*@\(([^)]*)\)", module)
+    assert ps_items and "'examples'" in ps_items.group(1), "examples нет в списке Windows"
     for name in ("install.ps1", "update.ps1"):
-        text = (repo_root / "scripts" / name).read_text(encoding="utf-8")
-        assert "'examples'" in text, f"{name} не ставит examples"
+        text = (repo_root / "scripts" / name).read_text(encoding="utf-8-sig")
+        assert "Get-AsrInstallItems" in text, f"{name} не ставит examples"
 
 
 # ---------------------------------------------------------------------------
@@ -822,12 +816,14 @@ ENVEOF
     assert oct(env_file.stat().st_mode)[-3:] == "640", "секрет доступен на чтение всем"
 
 
-def test_empty_token_does_not_overwrite_the_environment(repo_root: Path):
+def test_empty_token_does_not_overwrite_the_environment(repo_root: Path, tmp_path: Path,
+                                                        monkeypatch):
     """Пустое значение в env.sh перекрыло бы токен из окружения службы."""
-    text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
-    block = text.split("ASRHUB_ACCEL=${ACCEL}", 1)[1][:1200]
-    assert 'if [[ -n "${HF_TOKEN_VALUE}" ]]; then' in block, \
-        "токен пишется безусловно, даже пустой"
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    итог, env, _ = _установка_в_контейнере(repo_root, tmp_path)
+    assert итог.returncode == 0, итог.stdout[-2000:]
+    assert "HF_TOKEN" not in env, "токен пишется безусловно, даже пустой"
 
 
 # ---------------------------------------------------------------------------
@@ -939,28 +935,19 @@ def test_token_reaches_the_configuration_the_server_reads(repo_root: Path,
     с «нужен токен». Переменные окружения читает systemd, но не launchd и не
     запуск руками, а config.yaml читают все три.
     """
-    source = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
-    block = re.search(r'(if \[\[ -n "\$\{HF_TOKEN_VALUE\}" && "\$\{MODE\}" == "native" '
-                      r'\]\]; then\n.*?\nfi\n)\n# Переменные окружения',
-                      source, re.S)
-    assert block, "в install.sh не найдена запись токена при обычной установке"
-
-    config = tmp_path / "config.yaml"
-    # Файл без перевода строки в конце — так его оставляет дописанный раздел.
-    config.write_text(f'data_dir: {tmp_path}\nhf_token: "hf_старый"\n\nserver:\n'
-                      '  server_port: 8080', encoding="utf-8")
-    common = repo_root / "scripts" / "lib" / "common.sh"
-    script = f'''
-      set -Eeuo pipefail
-      source "{common}"
-      CONFIG_FILE="{config}"
-      MODE=native
-      ASRHUB_DRY_RUN=0
-      HF_TOKEN_VALUE=hf_новый12345678901234
-{block.group(1)}
-    '''
-    result = run_bash(script)
-    assert result.returncode == 0, result.stderr
+    # Прогоном установщика с подменёнными командами (заход 54: запись токена
+    # теперь внутри create_configuration и идёт от имени владельца каталога
+    # данных). Первая установка создаёт файл, затем в него дописывается
+    # старый токен без перевода строки в конце — так его оставляет
+    # дописанный раздел, — и повторная установка с новым токеном.
+    from test_review_40_scripts import _установка
+    первая = _установка(tmp_path, "--port 8080")
+    assert первая.returncode == 0, первая.stdout[-3000:]
+    config = tmp_path / "data" / "config.yaml"
+    with config.open("a", encoding="utf-8") as файл:
+        файл.write('hf_token: "hf_старый"')
+    result = _установка(tmp_path, "--hf-token hf_новый12345678901234")
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
 
     body = config.read_text(encoding="utf-8")
     assert body.count("hf_token:") == 1, "старая строка осталась — YAML возьмёт последнюю"

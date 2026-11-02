@@ -69,10 +69,28 @@ fi
 # справочник моделей есть и там.
 [[ -z "${PREFIX}" ]] && PREFIX="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_DIR="${DATA_DIR:-${HOME}/.local/share/asrhub}"
-MODELS_DIR="${DATA_DIR}/models"
 
 PY="${PREFIX}/venv/bin/python"
 [[ -x "${PY}" ]] || PY="$(check_python 2>/dev/null || echo python3)"
+
+# Каталог моделей — тот же, что у сервера: переменная ASRHUB_MODELS_DIR,
+# потом models_dir из конфигурации установки, и только потом
+# <данные>/models. Раньше всегда брался последний: переменная из рецепта
+# для закрытого сервера (docs/11-troubleshooting.md) перезаписывалась, и
+# скачанное уходило не туда, а установка с models_dir на другом диске
+# качала, показывала и удаляла модели в каталоге, которого сервер не видит.
+MODELS_DIR="${ASRHUB_MODELS_DIR:-}"
+# Относительный путь — от каталога, где запустили сценарий: python ниже
+# работает из каталога server, и «./модели» указывали бы туда.
+[[ -n "${MODELS_DIR}" && "${MODELS_DIR}" != /* ]] && MODELS_DIR="$(pwd)/${MODELS_DIR#./}"
+if [[ -z "${MODELS_DIR}" && -d "${PREFIX}/server" ]]; then
+  MODELS_DIR="$(cd "${PREFIX}/server" && ASRHUB_DATA_DIR="${DATA_DIR}" "${PY}" -c '
+from asrhub.config import load
+print(load(apply_hardware=False, ensure_key=False).get("models_dir") or "")' 2>/dev/null || true)"
+  # Относительный models_dir сервер понимает от своего рабочего каталога.
+  [[ -n "${MODELS_DIR}" && "${MODELS_DIR}" != /* ]] && MODELS_DIR="${PREFIX}/server/${MODELS_DIR#./}"
+fi
+MODELS_DIR="${MODELS_DIR:-${DATA_DIR}/models}"
 
 run_python() {
   ( cd "${PREFIX}/server" 2>/dev/null || cd "${SCRIPT_DIR}/../server" ; \
@@ -104,6 +122,12 @@ G, Y, R, D, B, RS = "\033[32m", "\033[33m", "\033[31m", "\033[90m", "\033[1m", "
 from asrhub import model_files
 
 def local_path(spec):
+    # openai-whisper кладёт веса одним файлом «<имя>.pt» в корень каталога
+    # (whisper.load_model с download_root), а короткое имя у него то же, что
+    # у faster-whisper: общий поиск находил чужой каталог CTranslate2.
+    if spec.engine == "whisper":
+        candidate = models_dir / f"{spec.source}.pt"
+        return candidate if candidate.exists() else None
     return model_files.find_local(models_dir, spec.source, spec.revision or "")
 
 def size_mb(path):
@@ -288,6 +312,30 @@ if spec.engine == "whisper_cpp":
     print(f"\nГотово: {target}")
     raise SystemExit(0)
 
+# openai-whisper — один файл «<имя>.pt» его же загрузчиком. Общая дорога ниже
+# брала короткое имя («large-v3») за модель faster-whisper и клала на диск
+# веса CTranslate2, которые openai-whisper не открывает.
+if spec.engine == "whisper":
+    from asrhub.engines.whisper_engine import download_weights
+    from asrhub.errors import ASRHubError
+    from asrhub.model_files import файл_whisper
+    target = файл_whisper(models_dir, spec.revision or f"{spec.source}.pt")
+    if target.exists() and not force:
+        print(f"Уже загружено: {target}")
+        raise SystemExit(0)
+    if force:
+        target.unlink(missing_ok=True)
+    print(f"Скачивание {spec.source}.pt (примерно {spec.disk_mb or '?'} МБ)")
+    try:
+        target = download_weights(spec.source, models_dir)
+    except ASRHubError as exc:
+        print(f"\nОшибка загрузки: {exc.message}")
+        if exc.hint:
+            print(exc.hint)
+        raise SystemExit(1)
+    print(f"Готово: {target}")
+    raise SystemExit(0)
+
 if spec.source.startswith("http"):
     import zipfile, urllib.request
     target = models_dir / "vosk"
@@ -348,7 +396,11 @@ PYEOF
 
 remove)
   MODEL="${ARGS[0]:?Укажите модель}"
-  run_python "${MODEL}" "${MODELS_DIR}" <<'PYEOF'
+  # Сначала — что именно будет удалено, и вопрос; удаление — вторым
+  # проходом. Раньше удаляло сразу: `remove whisper-small` молча стирал
+  # веса faster-whisper-small (общий поиск путал модели двух движков с
+  # одинаковым коротким именем).
+  REMOVE_PY="$(cat <<'PYEOF'
 import shutil, sys
 from pathlib import Path
 sys.path.insert(0, ".")
@@ -356,33 +408,53 @@ from asrhub.catalog import get_model
 
 spec = get_model(sys.argv[1])
 models_dir = Path(sys.argv[2])
+apply = sys.argv[3] == "1"
 if spec is None:
     print("Модель не найдена в каталоге."); raise SystemExit(1)
 from asrhub import model_files
 
 candidates = []
-found = model_files.find_local(models_dir, spec.source, spec.revision or "")
-if found is not None:
-    candidates.append(found)
-# Прямые ссылки распаковываются в несколько каталогов сразу, поэтому здесь
-# берём их все, а не только первый.
-if spec.source.startswith("http"):
-    name = spec.source.rsplit("/", 1)[-1].replace(".zip", "")
-    candidates += [p for p in models_dir.rglob(f"*{name}*") if p not in candidates]
-removed = 0
-for path in candidates:
-    if path.exists():
-        size = model_files.directory_size(path)
-        # Веса GigaAM — один файл: rmtree на файле не работает.
-        if path.is_file():
-            path.unlink(missing_ok=True)
-        else:
-            shutil.rmtree(path, ignore_errors=True)
-        print(f"Удалено: {path} ({size/1024/1024:.0f} МБ)")
-        removed += 1
-if removed == 0:
+if spec.engine == "whisper":
+    # openai-whisper — один файл «<имя>.pt»; каталог Systran/faster-whisper-<имя>
+    # принадлежит другой модели и другому движку.
+    single = models_dir / f"{spec.source}.pt"
+    if single.exists():
+        candidates.append(single)
+else:
+    found = model_files.find_local(models_dir, spec.source, spec.revision or "")
+    if found is not None:
+        candidates.append(found)
+    # Прямые ссылки распаковываются в несколько каталогов сразу, поэтому
+    # здесь берём их все, а не только первый.
+    if spec.source.startswith("http"):
+        name = spec.source.rsplit("/", 1)[-1].replace(".zip", "")
+        candidates += [p for p in models_dir.rglob(f"*{name}*") if p not in candidates]
+if not candidates:
     print("Веса модели на диске не найдены.")
+    raise SystemExit(3)
+for path in candidates:
+    size = model_files.directory_size(path)
+    if not apply:
+        print(f"  {path} ({size/1024/1024:.0f} МБ)")
+        continue
+    # Веса GigaAM и openai-whisper — один файл: rmtree на файле не работает.
+    if path.is_file():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+    print(f"Удалено: {path} ({size/1024/1024:.0f} МБ)")
 PYEOF
+)"
+  REMOVE_RC=0
+  run_python "${MODEL}" "${MODELS_DIR}" 0 <<<"${REMOVE_PY}" || REMOVE_RC=$?
+  if [[ "${REMOVE_RC}" -eq 3 ]]; then exit 0; fi
+  [[ "${REMOVE_RC}" -eq 0 ]] || exit "${REMOVE_RC}"
+  confirm "Удалить перечисленное?" "n" || { info "Отменено."; exit 0; }
+  if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
+    printf '  [пробный запуск] веса модели %s не удалены\n' "${MODEL}"
+    exit 0
+  fi
+  run_python "${MODEL}" "${MODELS_DIR}" 1 <<<"${REMOVE_PY}"
   ;;
 
 verify)
@@ -401,7 +473,12 @@ if spec is None:
 models_dir = Path(sys.argv[2])
 from asrhub import model_files
 
-path = model_files.find_local(models_dir, spec.source, spec.revision or "")
+if spec.engine == "whisper":
+    # Веса openai-whisper — «<имя>.pt»; общий поиск нашёл бы faster-whisper.
+    path = models_dir / f"{spec.source}.pt"
+    path = path if path.exists() else None
+else:
+    path = model_files.find_local(models_dir, spec.source, spec.revision or "")
 print(f"Веса на диске:   {'да, ' + str(path) if path else 'нет'}")
 if path:
     files = [path] if path.is_file() else [f for f in path.rglob("*") if f.is_file()]
@@ -439,6 +516,11 @@ PYEOF
 
 install-engine)
   ENGINE="${ARGS[0]:?Укажите движок: bash scripts/models.sh install-engine <движок>}"
+  # Имя — к одному виду, с подчёркиванием, как у сервера. Подсказка
+  # «Доступные:» печатает имена файлов через дефис («faster-whisper»), и с
+  # таким именем ветка закрепления CTranslate2 не срабатывала, а проверка
+  # после установки отвечала «движок неизвестен».
+  ENGINE="${ENGINE//-/_}"
   # whisper.cpp — не пакет Python, а программа, её собирают из исходников.
   # Раньше команда ставила пустой список зависимостей и отвечала «установлен»,
   # а сервер по-прежнему не находил whisper-cli — и подсказка ошибки
@@ -466,10 +548,17 @@ install-engine)
   [[ -x "${VPIP}" ]] || { error "Не найдено виртуальное окружение: ${VPIP}"; exit 1; }
 
   ACCEL="$(detect_gpu)"
+  ENGINE_FLAGS=(--disable-pip-version-check)
   if [[ "${ENGINE}" == "faster_whisper" && "${ACCEL}" == "cuda" ]]; then
-    PIN="$(ctranslate2_pin cuda)"
-    info "Совместимая версия CTranslate2 для вашей CUDA: ${PIN}"
-    retry 2 run "${VPIP}" install --disable-pip-version-check "${PIN}" || true
+    # Ограничением в ту же команду: отдельная установка ctranslate2==3.24.0
+    # тут же отменялась файлом требований движка (см. ctranslate2_pin).
+    PIN="$(ctranslate2_pin cuda "${PREFIX}/venv/bin/python")"
+    info "Совместимая версия CTranslate2 для вашей CUDA: $(printf '%s' "${PIN}" | tr '\n' ' ')"
+    if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+      make_temp_dir PIN_DIR
+      printf '%s\n' "${PIN}" > "${PIN_DIR}/faster-whisper-constraints.txt"
+      ENGINE_FLAGS+=(-c "${PIN_DIR}/faster-whisper-constraints.txt")
+    fi
   fi
   if [[ "${ENGINE}" == "nemo" ]]; then
     warn "NeMo тянет тяжёлый и конфликтный стек зависимостей."
@@ -479,7 +568,12 @@ install-engine)
   # MFA живёт в conda-forge: Kaldi и OpenFst в PyPI отсутствуют, поэтому
   # обычной установкой пакетов Python здесь не обойтись.
   if [[ "${ENGINE}" == "mfa" ]]; then
+    # Команда MFA: из PATH или внутри окружения conda. Окружение
+    # создаётся рядом, а не в PATH, и загрузка моделей голым `mfa` сразу
+    # после установки падала на «command not found».
+    MFA_CMD=()
     if have mfa; then
+      MFA_CMD=(mfa)
       ok "MFA уже установлен: $(mfa version 2>/dev/null | head -1)"
     else
       MAMBA=""
@@ -501,12 +595,14 @@ install-engine)
       [[ -n "${MFA_BIN}" ]] && info "MFA установлен: ${MFA_BIN}"
       hint "Добавьте каталог MFA в PATH службы, иначе сервер его не найдёт:"
       hint "  export PATH=\"\$(dirname ${MFA_BIN:-<путь>}):\${PATH}\""
+      if [[ -n "${MFA_BIN}" && -x "${MFA_BIN}" ]]; then MFA_CMD=("${MFA_BIN}")
+      else MFA_CMD=("${MAMBA}" run -n mfa mfa); fi
     fi
 
     LANG_MODEL="${ARGS[1]:-russian_mfa}"
     info "Загрузка акустической модели и словаря «${LANG_MODEL}»…"
-    run mfa model download acoustic "${LANG_MODEL}" || warn "Модель не загружена — загрузите вручную."
-    run mfa model download dictionary "${LANG_MODEL}" || warn "Словарь не загружен — загрузите вручную."
+    run "${MFA_CMD[@]}" model download acoustic "${LANG_MODEL}" || warn "Модель не загружена — загрузите вручную."
+    run "${MFA_CMD[@]}" model download dictionary "${LANG_MODEL}" || warn "Словарь не загружен — загрузите вручную."
   fi
 
   if [[ "${ENGINE}" == "whisperx" ]]; then
@@ -521,13 +617,16 @@ install-engine)
   export ASRHUB_REQUIREMENTS_DIR="${REQ_ROOT}"
 
   info "Установка движка «${ENGINE}»…"
-  if install_engine_requirements "${VPIP}" "${REQ}" --disable-pip-version-check; then
+  if install_engine_requirements "${VPIP}" "${REQ}" "${ENGINE_FLAGS[@]}"; then
     ok "Движок «${ENGINE}» установлен"
-    "${PREFIX}/venv/bin/python" -c "
-import sys; sys.path.insert(0,'${PREFIX}/server')
+    # Каталог и имя — аргументами, а не текстом программы: путь с апострофом
+    # ломал проверку, а имя движка — ввод пользователя.
+    "${PREFIX}/venv/bin/python" -c '
+import sys; sys.path.insert(0, sys.argv[1])
 from asrhub.engines import ENGINE_CLASSES
-cls = ENGINE_CLASSES.get('${ENGINE}')
-print('Проверка:', cls.check_available() if cls else 'движок неизвестен')" 2>/dev/null || true
+cls = ENGINE_CLASSES.get(sys.argv[2])
+print("Проверка:", cls.check_available() if cls else "движок без собственного класса — это дополнение")' \
+      "${PREFIX}/server" "${ENGINE}" 2>/dev/null || true
     # Движок ставится в общее окружение и тянет за собой чужие пакеты. Если
     # он подвинул версию, на которой держится сосед, узнать об этом лучше
     # здесь, а не через неделю по необъяснимому отказу загрузки.

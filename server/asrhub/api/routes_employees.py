@@ -17,6 +17,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+import functools
+import json
 import time
 from typing import Any
 
@@ -347,11 +350,23 @@ async def импорт(request: Request,
                     hint="Проверьте, что выбран файл выгрузки: "
                          "curl -F file=@employees.xml …"))
     elif тип_тела in ("application/json", ""):
-        try:
-            разобрано = await request.json()
-        except Exception:                                    # noqa: BLE001
-            разобрано = None
-        тело = разобрано if isinstance(разобрано, dict) else {}
+        сырое = await request.body()
+        if сырое.strip():
+            # Тело с ошибкой в JSON прежде молча становилось пустым — и импорт
+            # шёл по адресу из настроек и с увольнением пропавших, хотя
+            # человек просил другой адрес и `deactivate_missing: false`.
+            try:
+                разобрано = json.loads(сырое)
+            except ValueError as exc:
+                raise error_response(ConfigError(
+                    f"Тело запроса — не JSON: {exc}.",
+                    hint='Пришлите объект: {"url": "…", "deactivate_missing": false}. '
+                         "Пустое тело — импорт по адресу из настроек.")) from exc
+            if not isinstance(разобрано, dict):
+                raise error_response(ConfigError(
+                    "Тело запроса должно быть объектом JSON.",
+                    hint='Например: {"url": "https://portal/staff.xml"}.'))
+            тело = разобрано
     else:
         raise error_response(ConfigError(
             f"Тело запроса вида «{тип_тела}» не принимается.",
@@ -370,15 +385,25 @@ async def импорт(request: Request,
     # Предпросмотр: разобрать и сравнить со справочником, ничего не записав.
     # Флаг — полем формы или тела, а также параметром адреса (?dry_run=true).
     пробно = _флаг(тело.get("dry_run", dry_run), False)
+    # Предохранитель от массового «увольнения» (см. `справочник.ДОЛЯ_УВОЛЬНЕНИЙ`)
+    # снимается только явно.
+    силой = _флаг(тело.get("force"), False)
+    # Импорт — в потоке: это скачивание выгрузки (до тридцати секунд на
+    # каждую операцию сокета), разбор и запись в базу. Обработчик здесь
+    # асинхронный ради разбора тела, и прямой вызов останавливал весь сервер
+    # на время скачивания: при медленном портале /health ждал секунды.
     try:
-        итог = справочник.импорт(state.db, url=адрес, данные=данные,
-                                 source=источник, deactivate_missing=убирать,
-                                 тип=str(тело.get("format") or ""), dry_run=пробно)
+        итог = await asyncio.to_thread(
+            functools.partial(справочник.импорт, state.db, url=адрес, данные=данные,
+                              source=источник, deactivate_missing=убирать,
+                              тип=str(тело.get("format") or ""), dry_run=пробно,
+                              force=силой))
     except ASRHubError as exc:
         raise error_response(exc) from exc
     if пробно:
         return итог
-    state.db.add_event(
+    await asyncio.to_thread(
+        state.db.add_event,
         None, "employees_imported",
         f"Справочник «{источник}»: +{итог.get('added')} новых, "
         f"{итог.get('updated')} изменено, {итог.get('deactivated')} уволено",

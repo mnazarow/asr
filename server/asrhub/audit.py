@@ -28,20 +28,38 @@ from __future__ import annotations
 
 import functools
 import ipaddress
+import logging
+import queue
 import re
+import threading
+import time
 from typing import Any
+
+log = logging.getLogger("asrhub.audit")
 
 #: Что считается чтением, за которым стоит следить: выдача самой записи,
 #: расшифровки или выгрузки. Обычный просмотр списков и графиков сюда не
 #: входит — он ничего не выносит за пределы сервера.
+#:
+#: Образцы сверяются со списком маршрутов (tests/test_review_54_storage.py):
+#: четыре из семи прежних не соответствовали ни одному маршруту
+#: (`jobs/X/text`, `/api/export`, `backup/X/download`, запись звонка), а
+#: скачивание резервной копии — вся база и все секреты одним файлом — следа
+#: не оставляло. Не считались чувствительными и отредактированная копия
+#: записи, и карточка задания, в которой лежит полный текст разговора.
 ЧУВСТВИТЕЛЬНОЕ_ЧТЕНИЕ = (
-    re.compile(r"^/api/jobs/[^/]+/(media|download|audio)"),
+    re.compile(r"^/api/jobs/[^/]+/(media|download|audio|redacted)"),
     re.compile(r"^/api/jobs/[^/]+/segments"),
-    re.compile(r"^/api/jobs/[^/]+/text"),
-    re.compile(r"^/api/(analytics|content|trends|employees)/export"),
-    re.compile(r"^/api/export"),
-    re.compile(r"^/api/backup/[^/]+/download"),
-    re.compile(r"^/api/telephony/calls/[^/]+/recording"),
+    re.compile(r"^/api/jobs/(?!models$)[^/]+$"),
+    re.compile(r"^/api/(analytics|content|trends)/export"),
+    re.compile(r"^/api/backup/[^/]+/file$"),
+)
+
+#: Чтения, которые пишутся всегда, даже без `audit_reads`. Скачивание
+#: резервной копии — это выдача наружу всей базы разговоров и всех секретов
+#: сервера, и событие это редкое: потока строк оно не даёт.
+ВСЕГДА_В_ЖУРНАЛ = (
+    re.compile(r"^/api/backup/[^/]+/file$"),
 )
 
 #: Адрес → название объекта по-русски. Порядок важен: первое совпадение и
@@ -54,7 +72,9 @@ from typing import Any
     (re.compile(r"^/api/keys"), "ключи доступа"),
     (re.compile(r"^/api/settings"), "настройки"),
     (re.compile(r"^/api/jobs/[^/]+/redact"), "редакция записи"),
-    (re.compile(r"^/api/jobs/[^/]+/erase"), "удаление по требованию"),
+    (re.compile(r"^/api/maintenance/erase"), "удаление по требованию"),
+    (re.compile(r"^/api/maintenance"), "обслуживание"),
+    (re.compile(r"^(/api)?/process-call"), "приём звонка (phone_asr)"),
     (re.compile(r"^/api/jobs"), "записи"),
     (re.compile(r"^/api/models"), "модели"),
     (re.compile(r"^/api/telephony/stations"), "станции АТС"),
@@ -96,7 +116,8 @@ def описать(method: str, path: str) -> str:
     что = объект(path)
     if метод == "GET":
         # Отдельные названия у того, за чем чаще всего и приходят проверять.
-        if re.search(r"/(media|download|audio|recording)", path):
+        if re.search(r"/(media|download|audio|recording|redacted)$", path) \
+                or re.search(r"^/api/backup/[^/]+/file$", path):
             return f"скачал: {что}"
         if "/export" in path:
             return f"выгрузил: {что}"
@@ -115,9 +136,13 @@ def записывать(method: str, path: str, *, reads: bool) -> bool:
     включено: иначе один взгляд на раздел аналитики даёт полсотни строк, и
     журнал перестают открывать.
     """
-    if not path.startswith("/api/"):
+    # Приём звонка по схеме phone_asr живёт и в корне (`/process-call`):
+    # так его зовут прежние клиенты, и в журнал он не попадал вовсе.
+    if not (path.startswith("/api/") or path.rstrip("/") == "/process-call"):
         return False
     if (method or "").upper() != "GET":
+        return True
+    if any(образец.search(path) for образец in ВСЕГДА_В_ЖУРНАЛ):
         return True
     return bool(reads) and чувствительное_чтение(path)
 
@@ -186,3 +211,142 @@ def адрес(headers: Any, client: Any, доверенные: str | None = Non
         реальный = ""
     return (реальный or сокет)[:64]
 
+
+
+#: Сколько строк журнала может ждать записи. Больше — значит база стоит
+#: давно, и копить в памяти без предела нельзя: лишнее отбрасывается с
+#: предупреждением.
+ОЧЕРЕДЬ_ПРЕДЕЛ = 20000
+
+#: Сколько анонимных отказов (401, 404 без участника) с одного адреса в
+#: минуту записывать строками. Перебор адресов и ключей — это сотни строк в
+#: секунду, каждая живёт в журнале год; дальше предела пишется одна
+#: сводная строка за минуту.
+АНОНИМНЫХ_В_МИНУТУ = 30
+
+
+class Писатель:
+    """Пишет журнал доступа из своего потока, а не из цикла событий.
+
+    Журнал писался прямо из прослойки — синхронным INSERT под процессным
+    замком записи базы, в потоке цикла событий. Пока замок держал кто-то
+    другой — сжатие базы кнопкой «Очистка», суточная уборка, копия в режиме
+    журнала отката, — первый же не-GET запрос, хоть анонимный с ответом 401,
+    вставал на этом замке и останавливал весь сервер: /health не отвечал, и
+    оркестратор перезапускал сервер посреди сжатия базы.
+
+    Теперь прослойка кладёт строку в очередь и сразу отвечает, а пишет её
+    один фоновый поток. Чтение журнала (`flush`) дожидается записанного:
+    человек, открывший журнал, видит и своё последнее действие.
+    """
+
+    def __init__(self, db: Any) -> None:
+        self.db = db
+        self._очередь: queue.Queue[Any] = queue.Queue(maxsize=ОЧЕРЕДЬ_ПРЕДЕЛ)
+        self._поток: threading.Thread | None = None
+        self._замок = threading.Lock()
+        self._остановлен = False
+        self._отброшено = 0
+        #: адрес → (начало минуты, сколько записано, сколько пропущено)
+        self._анонимы: dict[str, list[float]] = {}
+
+    def записать(self, строка: dict[str, Any]) -> bool:
+        """Ставит строку в очередь записи; False — строка не принята."""
+        if self._остановлен:
+            return self._сразу(строка)
+        if not self._сводить_анонимов(строка):
+            return False
+        self._запустить()
+        try:
+            self._очередь.put_nowait(("строка", строка))
+        except queue.Full:
+            self._отброшено += 1
+            if self._отброшено in (1, 100) or self._отброшено % 1000 == 0:
+                log.warning("Журнал доступа: база не успевает, отброшено строк: %d",
+                            self._отброшено)
+            return False
+        return True
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Ждёт, пока записано всё, что поставлено до вызова."""
+        поток = self._поток
+        if поток is None or not поток.is_alive():
+            return True
+        готово = threading.Event()
+        try:
+            self._очередь.put(("метка", готово), timeout=timeout)
+        except queue.Full:
+            return False
+        return готово.wait(timeout)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Дописывает очередь и останавливает поток (при остановке сервера)."""
+        self.flush(timeout)
+        self._остановлен = True
+        поток = self._поток
+        if поток is not None and поток.is_alive():
+            try:
+                self._очередь.put(("стоп", None), timeout=1.0)
+            except queue.Full:
+                pass
+            поток.join(timeout=timeout)
+
+    def _запустить(self) -> None:
+        with self._замок:
+            if self._поток is not None and self._поток.is_alive():
+                return
+            self._поток = threading.Thread(target=self._цикл, name="asrhub-audit",
+                                           daemon=True)
+            self._поток.start()
+
+    def _цикл(self) -> None:
+        while True:
+            вид, значение = self._очередь.get()
+            if вид == "стоп":
+                return
+            if вид == "метка":
+                значение.set()
+                continue
+            self._сразу(значение)
+
+    def _сразу(self, строка: dict[str, Any]) -> bool:
+        try:
+            self.db.audit_add(**строка)
+            return True
+        except Exception as exc:                            # noqa: BLE001
+            # Ошибка записи не должна ронять ответ, который уже готов и
+            # верен, и не должна убивать поток: следующая строка запишется.
+            log.warning("Журнал доступа не записан: %s", exc)
+            return False
+
+    def _сводить_анонимов(self, строка: dict[str, Any]) -> bool:
+        """Анонимные отказы с одного адреса — не больше предела в минуту."""
+        if строка.get("kind") != "anon" or int(строка.get("status") or 0) not in (401, 404):
+            return True
+        адрес_узла = str(строка.get("ip") or "")
+        мгновение = time.monotonic()
+        пропущено = 0
+        with self._замок:
+            if len(self._анонимы) > 10000:
+                self._анонимы = {к: з for к, з in self._анонимы.items()
+                                 if мгновение - з[0] < 60}
+            запись = self._анонимы.get(адрес_узла)
+            if запись is not None and мгновение - запись[0] < 60:
+                if запись[1] >= АНОНИМНЫХ_В_МИНУТУ:
+                    запись[2] += 1
+                    return False
+                запись[1] += 1
+                return True
+            пропущено = int(запись[2]) if запись is not None else 0
+            self._анонимы[адрес_узла] = [мгновение, 1, 0]
+        if пропущено:
+            # Сводная строка за прошлую минуту: что перебор был и сколько,
+            # журнал знать обязан, даже если каждую попытку он не хранит.
+            сводка = {**строка, "path": "/api/…",
+                      "action": f"анонимные отказы сверх предела: {пропущено} за минуту"}
+            self._запустить()
+            try:
+                self._очередь.put_nowait(("строка", сводка))
+            except queue.Full:
+                pass
+        return True

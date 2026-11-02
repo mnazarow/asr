@@ -26,17 +26,36 @@ class VoskEngine(Engine):
             return False, "Не установлен пакет vosk: pip install vosk"
 
     def _model_dir(self, settings: dict[str, Any]) -> Path:
-        base = Path(settings.get("models_dir") or ".") / "vosk"
+        """Каталог модели — по точному имени, а не по подстроке.
+
+        Поиск по подстроке путал версии: у `vosk-ru-0.54` источник —
+        репозиторий «alphacep/vosk-model-ru», и под «vosk-model-ru» подходил
+        каталог «vosk-model-ru-0.42». Выбрана 0.54 — распознавала 0.42, а
+        подписано было 0.54. Здесь годится только каталог с ровно этим
+        именем — прямо в `vosk/` или на уровень глубже (архив бывает
+        распакован с лишней вложенностью), — и снимок Hugging Face, если
+        источник — репозиторий.
+        """
+        models_dir = Path(settings.get("models_dir") or ".")
+        base = models_dir / "vosk"
         source = self.spec.source
         name = source.rsplit("/", 1)[-1].replace(".zip", "")
         target = base / name
-        if target.exists():
+        if target.is_dir():
             return target
-        # Модель могла быть распакована на уровень глубже
-        if base.exists():
+        if base.is_dir():
             for child in base.iterdir():
-                if child.is_dir() and name in child.name:
-                    return child
+                вложенный = child / name
+                if child.is_dir() and вложенный.is_dir():
+                    return вложенный
+        if not source.startswith("http") and "/" in source:
+            from ..model_files import find_local  # noqa: PLC0415
+
+            снимок = find_local(models_dir, source, self.spec.revision or "")
+            if снимок is not None:
+                ревизии = sorted((снимок / "snapshots").glob("*")) if (
+                    снимок / "snapshots").is_dir() else []
+                return ревизии[-1] if ревизии else снимок
         raise ModelNotDownloaded(self.spec.id, self.spec.disk_mb)
 
     def download(self, settings: dict[str, Any]) -> Path:
@@ -86,7 +105,11 @@ class VoskEngine(Engine):
             rate = wf.getframerate()
             total_frames = wf.getnframes()
             recognizer = KaldiRecognizer(self._model, rate)
-            recognizer.SetWords(bool(settings.get("word_timestamps", True)))
+            # Слова просим всегда: только по ним у реплики есть начало и
+            # конец. С SetWords(False) все реплики выходили 0.0–0.0, и
+            # субтитры, диаризация и переход к реплике в записи ломались.
+            # Не просили слов — отбрасываем их на выходе.
+            recognizer.SetWords(True)
             recognizer.SetPartialWords(False)
 
             results: list[dict[str, Any]] = []

@@ -88,6 +88,44 @@ def восстановить(request: Request, данные: dict[str, Any] = Bo
     return итог
 
 
+@router.delete("/pending", summary="Отменить подготовленное восстановление данных")
+def отменить_восстановление(request: Request,
+                            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Снимает базу, подготовленную «Вернуть данные» и ждущую перезапуска.
+
+    Раньше передумать было нельзя: файл лежал до любого следующего запуска,
+    и плановый перезапуск через две недели подменял базу двухнедельной
+    копией. Маршрут стоит выше `/{name}`: иначе «pending» приняли бы за имя
+    копии.
+    """
+    require_admin(require_write(principal))
+    state = get_state(request)
+    снято = backup.отменить_ожидающее(state.settings, причина=f"отменил {principal.name}")
+    if снято:
+        state.db.add_event(None, "restore_cancelled",
+                           f"Подготовленное восстановление базы отменено ({principal.name})")
+    return {"cancelled": снято}
+
+
+@router.post("/pending/confirm", summary="Подтвердить подготовленное восстановление данных")
+def подтвердить_восстановление(request: Request,
+                               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """«Да, поставить при перезапуске» — для копии, ждущей дольше срока.
+
+    Копию, подготовленную давно, запуск молча не ставит (см.
+    `backup.СРОК_ОЖИДАНИЯ_С`); подтверждение начинает отсчёт заново.
+    """
+    require_admin(require_write(principal))
+    state = get_state(request)
+    try:
+        итог = backup.подтвердить_ожидающее(state.settings)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    state.db.add_event(None, "restore_confirmed",
+                       f"Подготовленное восстановление базы подтверждено ({principal.name})")
+    return итог
+
+
 @router.delete("/{name}", summary="Убрать копию")
 def убрать(request: Request, name: str,
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:

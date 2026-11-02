@@ -420,7 +420,11 @@ def test_при_auto_отказа_нет_но_уход_на_процессор_�
     assert "auto" in пункт["value"]
 
 
-def test_при_auto_на_карте_подсказки_нет():
+def test_при_auto_на_карте_подсказки_нет(monkeypatch: pytest.MonkeyPatch):
+    # Заход 54: «auto» проверяется по тому, куда пойдут движки (torch видит
+    # карту), а не только по железу в машине — поэтому torch с картой.
+    подложить_torch(monkeypatch, карт=1)
+    sys.modules["torch"].cuda.is_available = lambda: True  # type: ignore[attr-defined]
     пункт = _устройство(_Состояние(device="auto"), ускоритель="cuda")
     assert пункт["state"] == "ok"
     assert пункт["hint"] == ""
@@ -566,10 +570,14 @@ def test_модуля_нет_ни_под_одним_ядром(tmp_path, monkeyp
 
 
 def test_версии_сходятся_дело_не_в_драйвере(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    from asrhub import hardware
     from asrhub.hardware import проверить_драйвер
 
     драйвер_на_диске(tmp_path, monkeypatch, загружен="595.91.07",
                      библиотеки="595.91")
+    # Заход 54: строку «NVML library version» nvidia-smi печатает только при
+    # отказе «version mismatch» — когда версии сходятся, её нет.
+    monkeypatch.setattr(hardware, "_библиотеки", lambda: ("595.91", False))
     assert проверить_драйвер()["state"] == "ok"
 
 
@@ -621,6 +629,9 @@ def test_панель_молчит_когда_версии_сходятся(tmp_
 
     драйвер_на_диске(tmp_path, monkeypatch, загружен="595.91.07",
                      библиотеки="595.91")
+    # Заход 54: при сходящихся версиях nvidia-smi на расхождение не жалуется.
+    from asrhub import hardware
+    monkeypatch.setattr(hardware, "_библиотеки", lambda: ("595.91", False))
     проверки: list[dict[str, Any]] = []
     selfcheck._драйвер_проверка(проверки)
     assert проверки[0]["state"] == "ok"

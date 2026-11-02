@@ -30,12 +30,61 @@ def имя_говорящего(метка: Any) -> str:
     return f"Говорящий {int(цифры) + 1}"
 
 
+def _слова_реплики(item: dict[str, Any], пословно: bool) -> list[dict[str, Any]]:
+    """Слова реплики WhisperX; слово без выравнивания — между соседями.
+
+    У слов, которым выравнивание не нашло границ (числа, символы вне алфавита
+    wav2vec2), нет ни start, ни end, ни score. Прежде им ставились границы
+    всей реплики и уверенность 0,0: «2024» занимал всю реплику — ломались
+    пословная диаризация и субтитры, — и слово подсвечивалось как самое
+    сомнительное. Теперь время берётся между концом предыдущего выровненного
+    слова и началом следующего, а уверенности нет (None): её и не было.
+    """
+    сырые = [w for w in item.get("words") or [] if w.get("word")]
+    начало_реплики = float(item.get("start", 0.0) or 0.0)
+    конец_реплики = float(item.get("end", начало_реплики) or начало_реплики)
+    слова: list[dict[str, Any]] = []
+    for номер, w in enumerate(сырые):
+        if w.get("start") is not None and w.get("end") is not None:
+            начало, конец = float(w["start"]), float(w["end"])
+        else:
+            слева = next((float(п["end"]) for п in reversed(сырые[:номер])
+                          if п.get("end") is not None), начало_реплики)
+            справа = next((float(п["start"]) for п in сырые[номер + 1:]
+                           if п.get("start") is not None), конец_реплики)
+            начало, конец = слева, max(слева, справа)
+        оценка = w.get("score")
+        слово = {
+            "word": str(w.get("word", "")).strip(),
+            "start": round(начало, 3),
+            "end": round(конец, 3),
+            "confidence": round(float(оценка), 4) if оценка is not None else None,
+        }
+        if пословно and w.get("speaker"):
+            слово["speaker"] = имя_говорящего(w["speaker"])
+        слова.append(слово)
+    return слова
+
+
 class WhisperXEngine(Engine):
     id = "whisperx"
     supports_word_timestamps = True
     supports_batching = True
     supports_diarization = True
     outputs_punctuation = True
+    режет_сам = True              # свой VAD внутри whisperx.load_model
+
+    def _устройство(self, settings: dict[str, Any]) -> tuple[str, int]:
+        """Устройство и номер карты в том виде, в каком их ждёт WhisperX.
+
+        Прежде «cuda:1» сводилось к «cuda» без номера, и модель садилась на
+        карту 0 — на ту, что занята, ради чего и задавали первую.
+        """
+        device = self.resolve_device(settings)
+        if not device.startswith("cuda"):
+            return "cpu", 0
+        _, _, номер = device.partition(":")
+        return "cuda", int(номер) if номер.strip().isdigit() else 0
 
     @classmethod
     def check_available(cls) -> tuple[bool, str]:
@@ -54,15 +103,18 @@ class WhisperXEngine(Engine):
         except ModuleNotFoundError as exc:
             raise DependencyMissing("whisperx", "whisperx", cause=exc) from exc
 
-        device = self.resolve_device(settings)
-        device = "cuda" if device.startswith("cuda") else "cpu"
+        device, номер = self._устройство(settings)
         compute = self.resolve_compute_type(settings, device)
         if device == "cpu" and compute in ("float16", "int8_float16"):
             compute = "int8"
+        # Язык в load_model не передаётся: модель с заданным языком берёт его
+        # из своего токенизатора и при `language: auto` определение не
+        # запускает, а в ключ кеша язык не входит — язык первого задания
+        # «прилипал», и русская запись после английской шла английской.
+        # Язык задаётся каждому вызову transcribe.
         try:
             return whisperx.load_model(
-                self.spec.source, device, compute_type=compute,
-                language=self.language_for(settings),
+                self.spec.source, device, device_index=номер, compute_type=compute,
                 download_root=str(settings.get("models_dir") or "") or None)
         except Exception as exc:
             raise classify_exception(exc, engine=self.id, model=self.spec.id) from exc
@@ -71,7 +123,9 @@ class WhisperXEngine(Engine):
                     progress: ProgressCallback | None) -> TranscriptionResult:
         import whisperx  # type: ignore
 
-        device = "cuda" if self.resolve_device(settings).startswith("cuda") else "cpu"
+        device, номер = self._устройство(settings)
+        if device == "cuda":
+            device = f"cuda:{номер}"
         audio = whisperx.load_audio(str(audio_path))
         batch = int(settings.get("batch_size") or 16)
 
@@ -153,21 +207,9 @@ class WhisperXEngine(Engine):
             text = str(item.get("text", "")).strip()
             if not text:
                 continue
-            words = []
-            for w in item.get("words") or []:
-                if not w.get("word"):
-                    continue
-                слово = {
-                    "word": str(w.get("word", "")).strip(),
-                    "start": round(float(w.get("start", item.get("start", 0.0))), 3),
-                    "end": round(float(w.get("end", item.get("end", 0.0))), 3),
-                    "confidence": round(float(w.get("score", 0.0)), 4),
-                }
-                if пословно and w.get("speaker"):
-                    слово["speaker"] = имя_говорящего(w["speaker"])
-                words.append(слово)
+            words = _слова_реплики(item, пословно)
             speaker = item.get("speaker")
-            scores = [w["confidence"] for w in words if w["confidence"]]
+            scores = [w["confidence"] for w in words if w.get("confidence")]
             segments.append(Segment(
                 start=float(item.get("start", 0.0)),
                 end=float(item.get("end", 0.0)),

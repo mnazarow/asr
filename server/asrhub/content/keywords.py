@@ -14,7 +14,7 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
-from .lexicons import СТОП_СЛОВА
+from .lexicons import СТОП_СЛОВА, служебное_составное
 from .stemmer import stem, words
 
 #: Короткие слова и основы почти всегда служебные, а не значимые.
@@ -40,7 +40,13 @@ def _значимые(текст: str) -> list[tuple[str, str]]:
     """Пары «основа, исходное слово» — без служебных, коротких и мусора."""
     out = []
     for слово in words(_МУСОР.sub(" ", текст or "")):
-        if len(слово) < МИН_ДЛИНА or слово.isdigit():
+        # Без единой буквы — не слово, а число: «10-15», «916-123-45-67»,
+        # «4111-1111-1111-1111». `isdigit()` пропускал их из-за дефиса, и
+        # телефон с номером карты уезжали в ключевые слова, сочетания и
+        # корпус тем — мимо маскирования, которое смотрит на текст.
+        if len(слово) < МИН_ДЛИНА or not any(знак.isalpha() for знак in слово):
+            continue
+        if служебное_составное(слово):
             continue
         основа = stem(слово)
         if len(основа) < MIN_STEM or основа in СТОП_СЛОВА:

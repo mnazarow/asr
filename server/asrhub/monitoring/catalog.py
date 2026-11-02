@@ -44,11 +44,25 @@ class Threshold:
     #: для Prometheus выкладывалось с тем же строгим знаком, так что и
     #: внешнее наблюдение молчало ровно так же.
     inclusive: bool = False
+    #: К чему относится порог. «value» — к самому значению ряда. Остальное
+    #: — к величине, которую из ряда ещё надо получить: «ratio» — доля
+    #: (отказов среди всех заданий, 5xx среди ответов), «percent» — процент
+    #: от общего объёма, «increase» — прирост накопительного счётчика за
+    #: окно, «absent» — само отсутствие ряда, «restart» — сброс после роста.
+    #: Прежде это было видно только из текста `note`, а перечень таких
+    #: метрик вёлся в трёх местах; пример опроса сравнивал сырой счётчик
+    #: заданий с долей 0,2 и объявлял аварию на здоровом сервере.
+    kind: Literal["value", "ratio", "percent", "increase", "absent", "restart"] = "value"
+    #: У рядов со срезами (`stat`) — к какому срезу порог: p95 или avg.
+    #: Сравнивать с порогом для p95 среднее и p99 — значит поднимать тревогу
+    #: по p99, который всегда выше.
+    stat: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"direction": self.direction, "warning": self.warning,
                 "critical": self.critical, "for_seconds": self.for_seconds,
-                "note": self.note, "inclusive": self.inclusive}
+                "note": self.note, "inclusive": self.inclusive,
+                "kind": self.kind, "stat": self.stat}
 
 
 def оператор_порога(direction: str, inclusive: bool) -> str:
@@ -168,7 +182,7 @@ _m(MetricSpec(
         "Проверять сам факт равенства единице бессмысленно."
     ),
     normal="1",
-    threshold=Threshold("below", warning=1, critical=1, for_seconds=300,
+    threshold=Threshold("below", warning=1, critical=1, kind="absent", for_seconds=300,
                         note="Отслеживается через absent(), а не сравнением значения"),
     troubleshooting="scripts/service.sh status, затем scripts/service.sh logs -n 200",
 ))
@@ -197,7 +211,7 @@ _m(MetricSpec(
         "и журнал на предмет нехватки памяти."
     ),
     normal="растёт непрерывно",
-    threshold=Threshold("below", warning=600, for_seconds=0,
+    threshold=Threshold("below", warning=600, kind="restart", for_seconds=0,
                         note="Значение меньше десяти минут после того, как было больше, "
                              "означает недавний перезапуск"),
     troubleshooting="Частые перезапуски — почти всегда OOM-killer. dmesg | grep -i oom",
@@ -337,7 +351,7 @@ _m(MetricSpec(
         "секунды, а p95 — часы, значит, часть заданий систематически проигрывает "
         "борьбу за воркер; посмотрите на приоритеты и политику планирования."
     ),
-    threshold=Threshold("above", warning=900, critical=3600, for_seconds=900,
+    threshold=Threshold("above", warning=900, critical=3600, stat="p95", for_seconds=900,
                         note="Порог применяйте к квантили 0.95"),
 ))
 
@@ -406,7 +420,7 @@ _m(MetricSpec(
         "rate(asrhub_jobs_total[30m]). Оповещение по доле, а не по числу — иначе "
         "ночной прогон архива поднимет тревогу на ровном месте."
     ),
-    threshold=Threshold("above", warning=0.05, critical=0.20, for_seconds=1800,
+    threshold=Threshold("above", warning=0.05, critical=0.20, kind="ratio", for_seconds=1800,
                         note="Порог для доли отказов, не для самого счётчика"),
 ))
 
@@ -537,7 +551,7 @@ _m(MetricSpec(
         "изменилось в железе — троттлинг видеокарты, вытеснение памяти, сосед по машине."
     ),
     normal="0,03–0,15 на видеокарте, 0,8–1,5 на процессоре",
-    threshold=Threshold("above", warning=0.5, critical=1.0, for_seconds=1800,
+    threshold=Threshold("above", warning=0.5, critical=1.0, stat="p95", for_seconds=1800,
                         note="Порог по квантили 0.95; для процессорной установки поднимите вдвое"),
     troubleshooting=(
         "Проверьте, что задействован ускоритель: GET /api/system → device. "
@@ -604,7 +618,7 @@ _m(MetricSpec(
         "модель перегружена файловыми заданиями."
     ),
     normal="ниже 2 с для окна 4 с",
-    threshold=Threshold("above", warning=3.0, critical=6.0, for_seconds=1800,
+    threshold=Threshold("above", warning=3.0, critical=6.0, stat="p95", for_seconds=1800,
                         note="Порог по stat=p95"),
     troubleshooting="Раздел «Аналитика» → «Латентность» → «Поток»",
 ))
@@ -645,12 +659,17 @@ _m(MetricSpec(
 
 _m(MetricSpec(
     name="asrhub_throughput_audio_hours", type="gauge", group="performance",
-    label="Пропускная способность", unit="ч/ч",
-    description="Сколько часов аудио сервер обрабатывает за час календарного времени.",
+    label="Обработано аудио в час", unit="ч/ч",
+    description=(
+        "Сколько часов аудио сервер обработал за последние сутки, в пересчёте на "
+        "час: обработанное за сутки, делённое на 24. Это фактический поток, а не "
+        "мощность: простаивающий сервер с большим запасом показывает здесь столько "
+        "же, сколько ему прислали."
+    ),
     recommendation=(
-        "Прямо отвечает на вопрос «хватит ли мощности». Если суточный поток — "
-        "200 часов записей, а пропускная способность 6 ч/ч, то за сутки сервер "
-        "осилит 144 часа и очередь будет расти каждый день."
+        "Сравнивайте с тем, сколько звука приходит: если очередь растёт, а это "
+        "число не растёт вслед, сервер упёрся в предел. Сколько он может, видно по "
+        "RTF (asrhub_rtf): часов аудио в час — это число воркеров, делённое на RTF."
     ),
 ))
 
@@ -671,7 +690,7 @@ _m(MetricSpec(
         "означает, что изменилось качество входного звука."
     ),
     normal="0,85–0,95 на разборчивой речи",
-    threshold=Threshold("below", warning=0.75, critical=0.6, for_seconds=3600),
+    threshold=Threshold("below", warning=0.75, critical=0.6, stat="avg", for_seconds=3600),
     troubleshooting="Включите audio_normalize и audio_highpass_hz; проверьте, "
                     "не сменился ли источник записей",
 ))
@@ -978,7 +997,7 @@ _m(MetricSpec(
         "присылать тишину: сломался микрофон, отвалилась дорожка при перекодировании "
         "или в файлах видео без звука."
     ),
-    threshold=Threshold("above", warning=5, critical=20, for_seconds=1800,
+    threshold=Threshold("above", warning=5, critical=20, kind="increase", for_seconds=1800,
                         note="Порог для прироста за полчаса"),
 ))
 
@@ -1067,7 +1086,7 @@ _m(MetricSpec(
         "машине с моделями заканчивается тем, что процесс убивает OOM-killer, и "
         "выглядит это как необъяснимый перезапуск службы."
     ),
-    threshold=Threshold("above", warning=85, critical=95, for_seconds=600,
+    threshold=Threshold("above", warning=85, critical=95, kind="percent", for_seconds=600,
                         note="Порог для процента от общего объёма"),
     troubleshooting="Уменьшите max_concurrent_jobs и model_cache_size",
 ))
@@ -1099,7 +1118,7 @@ _m(MetricSpec(
         "out_of_memory. Порог 90 % даёт время среагировать: снизить batch_size "
         "или число воркеров до того, как задания начнут падать."
     ),
-    threshold=Threshold("above", warning=90, critical=97, for_seconds=600,
+    threshold=Threshold("above", warning=90, critical=97, kind="percent", for_seconds=600,
                         note="Порог для процента от общего объёма видеопамяти"),
     troubleshooting="Уменьшите batch_size, смените compute_type на int8_float16, "
                     "снизьте max_concurrent_jobs до 1",
@@ -1240,7 +1259,7 @@ _m(MetricSpec(
         "адреса — иначе метки размножились бы по числу заданий и уронили Prometheus. "
         "Доля пятисотых: rate(...{status=~\"5..\"}[5m]) / rate(...[5m])."
     ),
-    threshold=Threshold("above", warning=0.01, critical=0.05, for_seconds=600,
+    threshold=Threshold("above", warning=0.01, critical=0.05, kind="ratio", for_seconds=600,
                         note="Порог для доли ответов 5xx"),
 ))
 
@@ -1271,7 +1290,7 @@ _m(MetricSpec(
         "Единичные — обычно забытый ключ в интеграции. Поток с одного адреса — "
         "перебор ключей; закройте сервис на уровне сети, а не приложения."
     ),
-    threshold=Threshold("above", warning=50, critical=500, for_seconds=600,
+    threshold=Threshold("above", warning=50, critical=500, kind="increase", for_seconds=600,
                         note="Порог для прироста за десять минут"),
 ))
 
@@ -1316,6 +1335,22 @@ _m(MetricSpec(
 ))
 
 _m(MetricSpec(
+    name="asrhub_api_errors_total", type="counter", group="errors",
+    label="Отказов API по кодам", labels=("code",), since_restart=True,
+    description=(
+        "Счётчик отказов API по коду: неверный ключ, нет прав, не найдено, негодный "
+        "запрос. Отдельно от ошибок заданий: отказ — ответ клиенту, а не сбой "
+        "сервера, и время последней ошибки (asrhub_last_error_timestamp_seconds) "
+        "он не сдвигает."
+    ),
+    recommendation=(
+        "Рост auth_error — чей-то ключ отозван или подбирают ключи; рост "
+        "validation_error — интеграция шлёт не то. Ни то ни другое не авария "
+        "распознавания."
+    ),
+))
+
+_m(MetricSpec(
     name="asrhub_retries_total", type="counter", group="errors",
     label="Повторов заданий", since_restart=True,
     description="Сколько раз задания перепланировались на повтор.",
@@ -1347,7 +1382,7 @@ _m(MetricSpec(
         "сами задания это не влияет — они выполнены, — но клиент о результатах "
         "не узнает и, скорее всего, пришлёт их повторно."
     ),
-    threshold=Threshold("above", warning=10, critical=50, for_seconds=1800,
+    threshold=Threshold("above", warning=10, critical=50, kind="increase", for_seconds=1800,
                         note="Порог для прироста неудачных доставок за полчаса"),
 ))
 

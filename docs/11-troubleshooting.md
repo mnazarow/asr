@@ -152,11 +152,16 @@ fatal error: fst/util.h: No such file or directory
 
 ### Установка PyTorch падает или тянет не ту сборку
 
-Скрипт выбирает индекс по найденному ускорителю. Если определение ошиблось, укажите явно:
+Скрипт выбирает индекс по найденному ускорителю: отвечает `nvidia-smi` — сборка CUDA под версию драйвера, `rocm-smi` — ROCm, Apple Silicon — обычный пакет, иначе — сборка для процессора. Переменной окружения это не переопределяется: `ASRHUB_ACCEL` установщик только записывает в `docker/.env` (что нашёл), а не читает. Если определение ошиблось:
+
+- карта есть, а `nvidia-smi` не отвечает — нет драйвера: установщик по умолчанию (`--gpu-driver auto`) ставит его до шага с PyTorch, и колёса берутся под карту, даже если до перезагрузки она ещё не видна; с `--no-gpu-driver` или при включённом Secure Boot драйвер не ставится — тогда сначала драйвер (глава «Установка», «Видеокарта: обнаружение и драйвер»), потом установка заново;
+- нужна сборка другого ускорителя, чем нашлась, — переставьте PyTorch в готовом окружении с нужного индекса:
 
 ```bash
-ASRHUB_ACCEL=cpu bash scripts/install.sh --profile cpu
-ASRHUB_ACCEL=cuda bash scripts/install.sh --profile standard
+# только процессор — на машине с картой
+venv/bin/pip install --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+# CUDA 12.8 и новее
+venv/bin/pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
 ```
 
 Проверить, что получилось:
@@ -291,7 +296,7 @@ sudo bash /opt/asrhub/scripts/install.sh --python /usr/bin/python3.13 --force
 Верхнюю границу можно сдвинуть переменной `ASRHUB_MAX_PYTHON`, если вы знаете, что нужные колёса уже вышли:
 
 ```bash
-ASRHUB_MAX_PYTHON=3.14 sudo bash scripts/install.sh
+sudo ASRHUB_MAX_PYTHON=3.14 bash scripts/install.sh
 ```
 
 Ключ `--python` установщик уважает всегда: заданный вручную интерпретатор он берёт даже за пределами диапазона, но предупреждает.

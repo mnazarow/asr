@@ -179,13 +179,16 @@ def _align_whisperx(audio_path: Path, segments: list[Any], settings: Any) -> lis
     """Выравнивание моделью wav2vec2 через whisperx."""
     import whisperx  # type: ignore
 
-    device = str(settings.get("device") or "auto")
-    if device == "auto":
-        try:
-            import torch  # type: ignore
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        except ModuleNotFoundError:
-            device = "cpu"
+    # Устройство — тем же правилом, что у движков и диаризации: «rocm» и
+    # «hip» — это «cuda» в сборке PyTorch для AMD, а строку «rocm» torch не
+    # принимает, и выравнивание на такой машине падало.
+    from ..engines.base import device_for  # noqa: PLC0415
+
+    device = device_for(settings)
+    if device == "mps" and str(settings.get("device") or "auto") == "auto":
+        # При «auto» выравнивание и прежде шло на процессор, а не на Metal:
+        # поведение на Mac не меняем без проверки на нём.
+        device = "cpu"
     language = str(settings.get("language") or "ru")
     if language in ("auto", ""):
         language = next((s.language for s in segments if getattr(s, "language", None)), "ru")
@@ -295,10 +298,33 @@ def _слова_сегмента(source_words: list[str], chunk: list[dict[str, 
 
     out: list[dict[str, Any]] = []
     i = 0
-    for исходное in source_words:
-        if i >= len(chunk):
-            break
+    конец_прошлого = float(chunk[0]["start"]) if chunk else 0.0
+    for номер, исходное in enumerate(source_words):
         цель = _normalize(исходное)
+        if not цель:
+            # Одни знаки («—», «…»): выравниватель их не видит вовсе, и
+            # отдавать такому «слову» чужую границу значит сдвинуть все
+            # следующие.
+            continue
+        if i >= len(chunk):
+            # Выровненные слова кончились раньше исходных: хвост реплики
+            # остаётся в словах — у конца последнего выровненного. Прежде он
+            # пропадал, а пословная диаризация собирала текст части из слов
+            # и теряла его из расшифровки.
+            out.append(_слово_между(исходное, конец_прошлого, конец_прошлого))
+            continue
+        текущее = _normalize(str(chunk[i].get("word", "")))
+        впереди = [_normalize(w) for w in source_words[номер + 1:номер + 4]]
+        if (текущее and not цель.startswith(текущее)
+                and any(н and н.startswith(текущее) for н in впереди)):
+            # Тот же взгляд вперёд, что и в `_match_length`: выравниватель
+            # это слово потерял (цифры, «%» — у wav2vec2 нет таких букв), и
+            # текущее выровненное принадлежит следующему исходному. Прежде
+            # потерянному отдавалась граница соседа, и сдвиг шёл до конца
+            # реплики: «2024» получал время «году», «году» — «выручка», а
+            # последние слова исчезали.
+            out.append(_слово_между(исходное, конец_прошлого, float(chunk[i]["start"])))
+            continue
         взяли = [chunk[i]]
         i += 1
         собрано = _normalize(взяли[0]["word"])
@@ -311,9 +337,20 @@ def _слова_сегмента(source_words: list[str], chunk: list[dict[str, 
             собрано += _normalize(chunk[i]["word"])
             i += 1
         out.append(_слово(исходное, взяли[0], взяли[-1]))
+        конец_прошлого = float(взяли[-1]["end"])
     # Хвост выровненных слов, которому не нашлось исходных, — своим текстом.
     out.extend(_слово(item["word"], item, item) for item in chunk[i:])
     return out
+
+
+def _слово_между(текст: str, начало: float, конец: float) -> dict[str, Any]:
+    """Слово, которому выравниватель границ не дал: между соседями, без оценки.
+
+    Время — промежуток между концом предыдущего выровненного слова и началом
+    следующего: там это слово и прозвучало. Уверенности нет — её и не было.
+    """
+    return {"word": текст, "start": round(float(начало), 3),
+            "end": round(max(float(начало), float(конец)), 3)}
 
 
 def _слово(текст: str, первый: dict[str, Any], последний: dict[str, Any]

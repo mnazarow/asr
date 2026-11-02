@@ -21,7 +21,7 @@ if [[ -s /opt/venv/.asrhub-engines ]]; then
   echo "Движки в образе: $(tr ' ' ',' < /opt/venv/.asrhub-engines)"
 fi
 
-SUBDIRS=(uploads results models logs tmp)
+SUBDIRS=(uploads results models logs tmp cache)
 
 if [[ "$(id -u)" == "0" ]]; then
   # Каталог тома создаёт Docker от имени root, поэтому на первом запуске
@@ -44,6 +44,19 @@ if [[ "$(id -u)" == "0" ]]; then
       echo "ВНИМАНИЕ: сменить владельца не удалось (сетевой том?)." >&2
     fi
   fi
+  # Владелец верхнего каталога — ещё не владелец всего. Подкаталог, которого
+  # не было (каталог на хосте заранее создан пользователем, `data/tmp`
+  # удалили, новая версия добавила подкаталог), только что создал root, и
+  # проверка записи ниже падала с кодом 13 — на каждом перезапуске, потому
+  # что верхний каталог «уже свой». Поэтому — каждый подкаталог отдельно, и
+  # файлы, которые сервер читает при старте: config.yaml, записанный
+  # установщиком от root, иначе оставался ему недоступным.
+  for path in "${SUBDIRS[@]/#/${DATA_DIR}/}" "${DATA_DIR}/config.yaml" "${DATA_DIR}/api-key.txt"; do
+    [[ -e "${path}" && ! -L "${path}" ]] || continue
+    [[ "$(stat -c '%u' "${path}")" == "${RUN_USER}" ]] && continue
+    chown -R "${RUN_USER}:${RUN_GROUP}" "${path}" 2>/dev/null || \
+      echo "ВНИМАНИЕ: не удалось сменить владельца ${path}." >&2
+  done
 
   if [[ "${RUN_USER}" != "0" ]]; then
     # Проверяем запись уже от имени будущего пользователя.
@@ -72,13 +85,63 @@ else
   done
 fi
 
+# От имени рабочего пользователя — всё, что после подготовки тома.
+as_user() {
+  if [[ "$(id -u)" == "0" && "${RUN_USER}" != "0" ]]; then
+    gosu "${RUN_USER}:${RUN_GROUP}" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Домашний каталог и кеши — на томе. gosu выставляет HOME, только если он
+# пуст, а у root он /root: всё, что пишет в ~/.cache (кеш numba у librosa,
+# torch hub, pyannote), упиралось в закрытый каталог. При ASRHUB_UID не 1000
+# у процесса нет даже записи в passwd. Те же переменные, что задаёт юнит
+# systemd.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${DATA_DIR}/cache}"
+export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-${DATA_DIR}/cache/numba}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${DATA_DIR}/cache/matplotlib}"
+if [[ "$(id -u)" == "0" && "${RUN_USER}" != "0" ]]; then
+  run_home="$(getent passwd "${RUN_USER}" 2>/dev/null | cut -d: -f6 || true)"
+  if [[ -z "${run_home}" ]] || ! gosu "${RUN_USER}:${RUN_GROUP}" test -w "${run_home}"; then
+    run_home="${DATA_DIR}/cache/home"
+  fi
+  export HOME="${run_home}"
+fi
+as_user mkdir -p "${HOME}" "${NUMBA_CACHE_DIR}" "${MPLCONFIGDIR}" 2>/dev/null || true
+
+# Файл конфигурации на свежем томе. Без него сервер жил на умолчаниях, а
+# всё, что сохраняют в интерфейсе, — ключи доступа, приёмники метрик,
+# правила тревог, станции АТС, настройки — оставалось в памяти процесса:
+# пересоздание контейнера при обновлении — и интеграция получает 401.
+# Создаётся от имени рабочего пользователя, чтобы сервер мог в него писать.
+if [[ ! -e "${DATA_DIR}/config.yaml" && -z "${ASRHUB_CONFIG:-}" ]]; then
+  echo "Создаю ${DATA_DIR}/config.yaml — в него сервер сохраняет настройки из интерфейса."
+  as_user sh -c 'umask 027 && cat > "$1"' sh "${DATA_DIR}/config.yaml" <<'CFGEOF' || \
+    echo "ВНИМАНИЕ: не удалось создать ${DATA_DIR}/config.yaml — настройки не переживут перезапуск." >&2
+# Конфигурация ASR Hub в контейнере. Сюда сервер сохраняет то, что меняют
+# в разделе «Настройки»: ключи доступа, приёмники метрик, станции АТС.
+# Полный список параметров: docker compose exec asrhub python -m asrhub --print-config
+CFGEOF
+fi
+
+# Прежнее имя числа одновременных заданий в .env. Раньше Compose сам
+# переводил его в ASRHUB_MAX_CONCURRENT_JOBS (с умолчанием 2, которое
+# перекрывало настройку из интерфейса); теперь переменная передаётся как есть,
+# и строку «ASRHUB_WORKERS=4», дописанную руками, переводим здесь.
+if [[ -n "${ASRHUB_WORKERS:-}" && -z "${ASRHUB_MAX_CONCURRENT_JOBS:-}" ]]; then
+  export ASRHUB_MAX_CONCURRENT_JOBS="${ASRHUB_WORKERS}"
+fi
+
 # Без ffmpeg доступны только файлы WAV
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "ВНИМАНИЕ: ffmpeg не найден в образе — читаться будут только WAV" >&2
 fi
 
-# Сообщаем об обнаруженном ускорителе
-python - <<'PYEOF' || true
+# Сообщаем об обнаруженном ускорителе — от имени рабочего пользователя:
+# проба от root при каждом старте создавала в кеше файлы root.
+as_user python - <<'PYEOF' || true
 try:
     import torch
     if torch.cuda.is_available():

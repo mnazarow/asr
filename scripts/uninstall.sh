@@ -106,34 +106,112 @@ if [[ "${PURGE}" -eq 1 && "${ASRHUB_DATA_DIR_SOURCE:-}" == "guess" && -n "${DATA
   confirm "Удалять именно ${DATA_DIR}?" "n" || { info "Отменено."; exit 0; }
 fi
 
+# --- Что именно удаляем ------------------------------------------------------
+#
+# Пути, заданные ключами, раньше не проверялись ничем: `--prefix /не/тот`
+# удалял посторонний каталог целиком (${PREFIX:?} защищал только от пустого),
+# а признак «данные внутри программы» сравнивал строки — при --data, равном
+# --prefix, или при prefix через символическую ссылку база и модели
+# удалялись вместе с программой без всякого --purge. Теперь сравниваются
+# настоящие пути, каталог программы обязан быть установкой, а каталог
+# данных для --purge — похож на данные ASR Hub.
+real_dir() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "${1%/}"; }
+dangerous_dir() {
+  local path="$1" home_real
+  home_real="$(real_dir "${HOME:-/nonexistent}")"
+  case "${path}" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var|/var/lib|/Users|/Applications|/Library|/System)
+      return 0 ;;
+  esac
+  [[ "${path}" == "${home_real}" ]] && return 0
+  return 1
+}
+PREFIX_REAL=""; DATA_REAL=""
+[[ -n "${PREFIX}" && -d "${PREFIX}" ]] && PREFIX_REAL="$(real_dir "${PREFIX}")"
+[[ -n "${DATA_DIR}" && -d "${DATA_DIR}" ]] && DATA_REAL="$(real_dir "${DATA_DIR}")"
+if [[ -n "${PREFIX_REAL}" ]]; then
+  if dangerous_dir "${PREFIX_REAL}"; then
+    error "Каталог программы ${PREFIX} (${PREFIX_REAL}) — системный или домашний; удалять его нельзя."
+    exit 2
+  fi
+  if ! is_installation "${PREFIX}"; then
+    error "${PREFIX} не похож на установку ASR Hub (нет VERSION, server и метки установки)."
+    hint "Удаление снесло бы его целиком. Проверьте путь: --prefix КАТАЛОГ_УСТАНОВКИ"
+    exit 2
+  fi
+fi
+if [[ "${PURGE}" -eq 1 && -n "${DATA_REAL}" ]]; then
+  if dangerous_dir "${DATA_REAL}"; then
+    error "Каталог данных ${DATA_DIR} (${DATA_REAL}) — системный или домашний; удалять его нельзя."
+    exit 2
+  fi
+  _looks_like_data=0
+  for _probe in asrhub.db config.yaml api-key.txt models results uploads; do
+    [[ -e "${DATA_DIR}/${_probe}" ]] && { _looks_like_data=1; break; }
+  done
+  # Пустой каталог (данные ещё не появлялись) удалять не страшно.
+  [[ -z "$(ls -A "${DATA_DIR}" 2>/dev/null)" ]] && _looks_like_data=1
+  if [[ "${_looks_like_data}" -eq 0 ]]; then
+    error "${DATA_DIR} не похож на каталог данных ASR Hub (нет asrhub.db, config.yaml, models…)."
+    hint "С --purge он был бы удалён целиком. Проверьте путь: --data КАТАЛОГ_ДАННЫХ"
+    exit 2
+  fi
+  unset _looks_like_data _probe
+fi
+# Данные внутри программы — по настоящим путям, и совпадение тоже: тогда
+# программа удаляется выборочно, а каталог целиком — только с --purge.
+DATA_INSIDE=0
+if [[ -n "${PREFIX_REAL}" && -n "${DATA_REAL}" ]] \
+   && [[ "${DATA_REAL}" == "${PREFIX_REAL}" || "${DATA_REAL}" == "${PREFIX_REAL}/"* ]]; then
+  DATA_INSIDE=1
+fi
+
+# Модели спасаются переносом — место под них проверяем ДО того, как что-то
+# остановлено и удалено. Раньше проверка шла уже после снятия службы, а для
+# ещё не созданного --models-to отвечала «свободно 0 Б» и обрывала удаление
+# на полпути.
+MODELS_KEEP=""
+if [[ "${PURGE}" -eq 1 && "${KEEP_MODELS}" -eq 1 && -d "${DATA_DIR}/models" ]]; then
+  MODELS_KEEP="${MODELS_TO:-${HOME}/asrhub-models-$(date +%Y%m%d)}"
+  # Перенос на другой раздел — это копирование десятков гигабайт: если
+  # места не хватит, mv оборвётся на середине.
+  MODELS_KB="$(du -sk "${DATA_DIR}/models" 2>/dev/null | awk '{print $1}' || echo 0)"
+  TARGET_PARENT="$(dirname "${MODELS_KEEP}")"
+  _probe_parent="${TARGET_PARENT}"
+  while [[ ! -d "${_probe_parent}" && "${_probe_parent}" != "/" && "${_probe_parent}" != "." ]]; do
+    _probe_parent="$(dirname "${_probe_parent}")"
+  done
+  if [[ "$(df -Pk "${DATA_DIR}/models" 2>/dev/null | awk 'NR==2{print $1}')" \
+        != "$(df -Pk "${_probe_parent}" 2>/dev/null | awk 'NR==2{print $1}')" ]]; then
+    FREE_KB="$(df -Pk "${_probe_parent}" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
+    if [[ "${MODELS_KB:-0}" =~ ^[0-9]+$ && "${FREE_KB:-0}" =~ ^[0-9]+$ ]] \
+       && (( FREE_KB < MODELS_KB + 1048576 )); then
+      error "Для моделей ($(human_size $((MODELS_KB * 1024)))) в ${TARGET_PARENT} не хватит места:"
+      error "свободно $(human_size $((FREE_KB * 1024)))."
+      hint "Укажите другой каталог: --models-to ПУТЬ"
+      exit 1
+    fi
+  fi
+  unset _probe_parent
+fi
+
 # Два удаления (или удаление и обновление) одновременно портят друг другу
 # снимки и каталоги — тот же замок, что у установщика.
 if [[ -n "${PREFIX}" && -d "${PREFIX}" ]]; then
   acquire_install_lock "${PREFIX}" || exit 1
 fi
 
-# Процессы ЭТОЙ установки: строка запуска называет её окружение или рабочий
-# каталог — её server. Прежний запасной поиск по ASRHUB_DATA_DIR ловил и
-# сервер соседней установки над тем же каталогом данных (так делают, см.
-# «Общий каталог данных» в главе установки): сосед получал kill, а через две
-# секунды kill -9 — даже без --purge.
-own_server_pids() {
-  local pid cmd cwd
-  [[ -n "${PREFIX}" ]] && have pgrep || return 0
-  for pid in $(pgrep -f -- '-m asrhub|/uvicorn' 2>/dev/null || true); do
-    [[ "${pid}" == "$$" ]] && continue
-    cmd="$(process_command "${pid}")"
-    cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-    if [[ "${cmd}" == *"${PREFIX}/venv/"* || "${cwd}" == "${PREFIX}/server" ]]; then
-      printf '%s\n' "${pid}"
-    fi
-  done
-}
+# Процессы ЭТОЙ установки — own_server_pids из библиотеки: строка запуска
+# называет её окружение или рабочий каталог — её server. Прежний запасной
+# поиск по ASRHUB_DATA_DIR ловил и сервер соседней установки над тем же
+# каталогом данных (так делают, см. «Общий каталог данных» в главе
+# установки): сосед получал kill, а через две секунды kill -9 — даже без
+# --purge.
 
 # Серверы других установок этой машины над тем же каталогом данных.
 # other_instances видит только чужие машины: своя — «своя» по имени хоста.
 local_neighbours() {
-  local pid own=" $(own_server_pids | tr '\n' ' ') "
+  local pid own=" $(own_server_pids "${PREFIX}" | tr '\n' ' ') "
   [[ -n "${DATA_DIR}" ]] && have pgrep || return 0
   for pid in $(pgrep -f -- '-m asrhub' 2>/dev/null || true); do
     [[ "${own}" == *" ${pid} "* ]] && continue
@@ -203,7 +281,7 @@ else
 fi
 
 # Останавливаем процессы ЭТОЙ установки, запущенные вручную.
-PIDS="$(own_server_pids | tr '\n' ' ' || true)"
+PIDS="$(own_server_pids "${PREFIX}" | tr '\n' ' ' || true)"
 PIDS="${PIDS% }"
 if [[ -n "${PIDS}" ]]; then
   info "Останавливаем процессы: ${PIDS}"
@@ -297,24 +375,7 @@ step "Удаление файлов"
 # `--purge --keep-models` модели удалялись вместе с ним, и к моменту
 # переноса каталога уже не было — скрипт дважды отчитывался об успехе, а
 # весов на диске не оставалось.
-MODELS_KEEP=""
-if [[ "${PURGE}" -eq 1 && "${KEEP_MODELS}" -eq 1 && -d "${DATA_DIR}/models" ]]; then
-  MODELS_KEEP="${MODELS_TO:-${HOME}/asrhub-models-$(date +%Y%m%d)}"
-  # Перенос на другой раздел — это копирование десятков гигабайт: если
-  # места не хватит, mv оборвётся на середине. Проверяем заранее.
-  MODELS_KB="$(du -sk "${DATA_DIR}/models" 2>/dev/null | awk '{print $1}' || echo 0)"
-  TARGET_PARENT="$(dirname "${MODELS_KEEP}")"
-  if [[ "$(df -Pk "${DATA_DIR}/models" 2>/dev/null | awk 'NR==2{print $1}')" \
-        != "$(df -Pk "${TARGET_PARENT}" 2>/dev/null | awk 'NR==2{print $1}')" ]]; then
-    FREE_KB="$(df -Pk "${TARGET_PARENT}" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)"
-    if [[ "${MODELS_KB:-0}" =~ ^[0-9]+$ && "${FREE_KB:-0}" =~ ^[0-9]+$ ]] \
-       && (( FREE_KB < MODELS_KB + 1048576 )); then
-      error "Для моделей ($(human_size $((MODELS_KB * 1024)))) в ${TARGET_PARENT} не хватит места:"
-      error "свободно $(human_size $((FREE_KB * 1024)))."
-      hint "Укажите другой каталог: --models-to ПУТЬ"
-      exit 1
-    fi
-  fi
+if [[ -n "${MODELS_KEEP}" ]]; then
   if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
     printf '  [пробный запуск] mv %s %s\n' "${DATA_DIR}/models" "${MODELS_KEEP}"
   else
@@ -333,12 +394,14 @@ fi
 # prefix. Снести prefix целиком означало бы удалить модели, базу и
 # результаты, о сохранности которых мы тут же отчитываемся ниже.
 if [[ -n "${PREFIX}" && -d "${PREFIX}" ]]; then
-  if [[ "${PURGE}" -eq 0 && "${DATA_DIR}" == "${PREFIX}"/* ]]; then
+  if [[ "${PURGE}" -eq 0 && "${DATA_INSIDE}" -eq 1 ]]; then
     info "Каталог данных находится внутри каталога программы — удаляем выборочно."
     # whisper.cpp собирается внутри каталога программы и вместе с каталогом
     # build занимает несколько гигабайт. В списке его не было, и после
-    # «полного удаления» он оставался на диске.
-    for sub in server scripts config requirements docker venv whisper.cpp VERSION README.md; do
+    # «полного удаления» он оставался на диске. examples, agent и метка
+    # установки — тоже: без них «программа удалена» оставляла каталог,
+    # который сценарии по-прежнему принимали за установку.
+    for sub in ${ASRHUB_INSTALL_ITEMS} venv venv.before-force whisper.cpp "${ASRHUB_INSTALL_MARKER}"; do
       if [[ "${ASRHUB_DRY_RUN}" == "1" ]]; then
         printf '  [пробный запуск] rm -rf %s\n' "${PREFIX}/${sub}"
       else
@@ -386,7 +449,28 @@ LEFTOVERS=()
 # только когда он известен: с пустым PREFIX «${PREFIX%/}.snapshot»
 # превращался в «.snapshot» ТЕКУЩЕГО каталога, и его удаляли по вопросу с
 # умолчанием «да».
-CANDIDATES=(/etc/asrhub /usr/local/bin/asrctl)
+# /etc/asrhub (сервер ищет там config.yaml у ЛЮБОЙ установки) и
+# /usr/local/bin/asrctl — общие для машины. Раньше они удалялись вместе с
+# остатками по вопросу с умолчанием «да», без --purge и без копии: удаление
+# второй установки стирало конфигурацию с ключами, которой жила первая.
+# Теперь — только с --purge и когда других установок на машине нет.
+CANDIDATES=()
+SHARED=()
+# Список — переменной только ради проверок: настоящие /etc и /usr/local им
+# трогать незачем.
+for path in ${ASRHUB_SHARED_PATHS:-/etc/asrhub /usr/local/bin/asrctl}; do
+  [[ -e "${path}" ]] && SHARED+=("${path}")
+done
+OTHER_INSTALLS="$(known_installations 2>/dev/null | grep -vxF -- "${PREFIX%/}" || true)"
+if [[ ${#SHARED[@]} -gt 0 ]]; then
+  if [[ "${PURGE}" -eq 1 && -z "${OTHER_INSTALLS}" ]]; then
+    CANDIDATES+=("${SHARED[@]}")
+  else
+    info "Общие для машины файлы оставлены: ${SHARED[*]}"
+    [[ -n "${OTHER_INSTALLS}" ]] && hint "Ими пользуются и другие установки: $(printf '%s' "${OTHER_INSTALLS}" | tr '\n' ' ')"
+    [[ "${PURGE}" -eq 0 ]] && hint "Удаляются только вместе с --purge."
+  fi
+fi
 if [[ -n "${SERVICE_NAME}" ]]; then
   CANDIDATES+=("${ASRHUB_SYSTEMD_DIR:-/etc/systemd/system}/${SERVICE_NAME}.service"
                "$(plist_path_for "${SERVICE_NAME}")")
@@ -395,7 +479,7 @@ if [[ -n "${PREFIX}" ]]; then
   CANDIDATES+=("${PREFIX}/whisper.cpp" "${PREFIX%/}.snapshot"
                "$(dirname "${PREFIX}")/asrhub-snapshot")
 fi
-for path in "${CANDIDATES[@]}"; do
+for path in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
   [[ -e "${path}" ]] && LEFTOVERS+=("${path}")
 done
 if [[ ${#LEFTOVERS[@]} -gt 0 ]]; then

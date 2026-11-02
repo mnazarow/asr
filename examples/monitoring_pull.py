@@ -6,6 +6,12 @@
 обычного формата Prometheus: к каждому числу приложены описание, обычное
 значение и порог.
 
+Вердикты — от самого сервера (GET /api/monitoring/alerts), а не сравнением
+сырого числа с порогом: у части метрик порог относится к выражению — доле
+ответов 5xx, доле отказов, проценту занятой памяти, — и пример, сравнивавший
+сам, рисовал «аварии» на здоровом сервере («Заданий обработано: 4 — порог
+> 0.2»). Сервер считает эти выражения так же, как правила Prometheus.
+
     python3 examples/monitoring_pull.py
     python3 examples/monitoring_pull.py --group queue --all
 """
@@ -35,36 +41,10 @@ def human(value: float, unit: str) -> str:
     return f"{value:g}{(' ' + unit) if unit else ''}"
 
 
-def level_of(value: float, threshold: dict) -> str:
-    """«авария», «внимание» или пусто — по порогу из справочника метрики.
-
-    Порог бывает включительным (`inclusive`): у метрик, где он стоит на краю
-    шкалы, — например у уровня дрейфа (0, 1, 2) критический порог 2, и
-    строгое «больше двух» не сработало бы никогда.
-    """
-    direction = threshold.get("direction")
-    inclusive = bool(threshold.get("inclusive"))
-
-    def past(limit) -> bool:
-        if limit is None:
-            return False
-        if direction == "above":
-            return value >= limit if inclusive else value > limit
-        return value <= limit if inclusive else value < limit
-
-    if not direction:
-        return ""
-    if past(threshold.get("critical")):
-        return "авария"
-    if past(threshold.get("warning")):
-        return "внимание"
-    return ""
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Снимок метрик с разбором порогов")
     parser.add_argument("--group", default="", help="только одна группа метрик")
-    parser.add_argument("--all", action="store_true", help="показать и те, что в норме")
+    parser.add_argument("--all", action="store_true", help="показать и все метрики (справочно)")
     args = parser.parse_args()
 
     params = {"group": args.group} if args.group else {}
@@ -82,40 +62,57 @@ def main() -> int:
     print(f"Состояние сервиса: {state}")
     print(f"Метрик в снимке: {len(payload.get('metrics', []))}\n")
 
+    # Тревоги — от встроенного движка сервера: он знает, к какому выражению
+    # относится порог (доля, прирост за окно, процент), и держит for_seconds.
+    response = requests.get(f"{SERVER}/api/monitoring/alerts", headers=HEADERS, timeout=30)
+    if not response.ok:
+        print(f"Не удалось получить тревоги: HTTP {response.status_code}", file=sys.stderr)
+        return 1
+    alerts = response.json().get("alerts") or []
     warned = 0
-    for metric in payload.get("metrics", []):
-        # У гистограммы порога нет: её ведра сравнивать не с чем.
-        if metric.get("type") == "histogram":
+    for alert in alerts:
+        if alert.get("state") not in ("firing", "pending"):
             continue
-        threshold = metric.get("threshold") or {}
-        unit = metric.get("unit") or ""
-        # У метрики не одно значение, а по значению на каждый набор меток:
-        # по модели, по диску, по очереди.
-        for sample in metric.get("values") or []:
-            value = sample.get("value")
-            if value is None:
+        firing = alert.get("state") == "firing"
+        warned += 1
+        level = "авария" if alert.get("severity") == "critical" else "внимание"
+        mark = {"авария": "✕", "внимание": "!"}[level] if firing else "…"
+        name = alert.get("label") or alert.get("summary") or alert.get("metric")
+        labels = alert.get("labels") or {}
+        if labels:
+            name += " (" + ", ".join(f"{k}={v}" for k, v in labels.items()) + ")"
+        unit = alert.get("unit") or ""
+        value = alert.get("value")
+        shown = human(float(value), unit) if isinstance(value, (int, float)) else "—"
+        print(f"{mark} {name}: {shown}{'' if firing else ' (ещё не дольше срока — ждём)'}")
+        sign = (">" if alert.get("direction") == "above" else "<") + \
+            ("=" if alert.get("inclusive") else "")
+        threshold = alert.get("threshold")
+        if isinstance(threshold, (int, float)):
+            print(f"    порог: {sign} {human(float(threshold), unit)}")
+        if alert.get("hint"):
+            print(f"    что делать: {alert['hint']}")
+
+    if args.all:
+        # Сами числа — справочно, с порогом из справочника: к сырому
+        # значению он относится не всегда (см. note у метрики).
+        print("\nВсе метрики:")
+        for metric in payload.get("metrics", []):
+            if metric.get("type") == "histogram":
                 continue
-            level = level_of(float(value), threshold)
-            if not level and not args.all:
-                continue
-            if level:
-                warned += 1
-            labels = sample.get("labels") or {}
-            name = metric.get("label") or metric["name"]
-            if labels:
-                name += " (" + ", ".join(f"{k}={v}" for k, v in labels.items()) + ")"
-            mark = {"авария": "✕", "внимание": "!"}.get(level, " ")
-            print(f"{mark} {name}: {human(float(value), unit)}")
-            if level:
-                limit = threshold.get("critical") if level == "авария" else threshold.get("warning")
-                sign = (">" if threshold.get("direction") == "above" else "<") + \
-                    ("=" if threshold.get("inclusive") else "")
-                print(f"    порог: {sign} {human(float(limit), unit)}")
-                if metric.get("recommendation"):
-                    print(f"    что делать: {metric['recommendation']}")
+            unit = metric.get("unit") or ""
+            for sample in metric.get("values") or []:
+                value = sample.get("value")
+                if value is None:
+                    continue
+                labels = sample.get("labels") or {}
+                name = metric.get("label") or metric["name"]
+                if labels:
+                    name += " (" + ", ".join(f"{k}={v}" for k, v in labels.items()) + ")"
+                print(f"  {name}: {human(float(value), unit)}")
 
     if not warned:
-        print("Отклонений от порогов нет.")
+        print("Тревог нет.")
     return 0
 
 

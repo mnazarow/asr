@@ -150,7 +150,8 @@ def test_control_runs_do_not_hang_in_the_pending_count(tmp_path):
     _запись(db, "c-контроль", source="control")
     db.save_content("c-обычная", {"version": 1, "sentiment": 0.1})
     свод = db.content_stats(version=1)
-    assert свод == {"total": 1, "analyzed": 1, "pending": 0}, свод
+    # Заход 54: в своде ещё и «failed» — сколько разобранных на деле заглушки.
+    assert свод == {"total": 1, "analyzed": 1, "pending": 0, "failed": 0}, свод
 
 
 def test_the_llm_cache_is_cleaned_by_retention(tmp_path):

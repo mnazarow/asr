@@ -432,6 +432,11 @@ def test_form_field_examples_name_real_parameters():
     root = Path(__file__).resolve().parent.parent
     reserved = {"file", "files", "settings", "priority", "group_id", "tags",
                 "reference_text", "webhook_url"}
+    # Приём из диалплана (глава 31) — свой адрес со своими полями звонка:
+    # `-F uniqueid=…` там настоящее поле, а не параметр распознавания.
+    from asrhub.telephony.dialplan import ИМЕНА as ПОЛЯ_ДИАЛПЛАНА
+
+    reserved |= set(ПОЛЯ_ДИАЛПЛАНА)
     pattern = re.compile(r"-F ['\"]?([a-z_0-9]+)=")
 
     bad: list[str] = []

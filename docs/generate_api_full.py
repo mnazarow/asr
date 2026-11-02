@@ -175,10 +175,50 @@ ADMIN_ROUTES = {
     # администратора и по существу, и по осторожности.
     ("/api/llm/models", "get"), ("/api/llm/setup", "post"),
     ("/api/llm/setup/status", "get"), ("/api/llm/setup/cancel", "post"),
-    ("/api/llm/models/delete", "post"),
+    ("/api/llm/models/delete", "post"), ("/api/llm/cache", "delete"),
     # Проверка связи с АТС и заход по требованию — работа со станцией
     # целиком, и ответ проверки несёт адрес источника: только администратор.
     ("/api/telephony/test", "post"), ("/api/telephony/scan", "post"),
+    # Дальше — маршруты, которые сервер давно закрыл ролью администратора, а
+    # справочник по общему правилу называл открытыми «любому действующему
+    # ключу» или «ключу с правом записи» (заход 54: ключ с ролью user на
+    # каждый получает 403). Станции, сбор и агенты на АТС — настройка
+    # телефонии всего сервера; копии несут пароли и ключи; журнал доступа —
+    # о других людях; пауза и сброс — очередь всего сервера.
+    ("/api/telephony/stations", "post"), ("/api/telephony/stations/{station_id}", "delete"),
+    ("/api/telephony/stations/{station_id}/enabled", "post"),
+    ("/api/telephony/diagnose", "post"), ("/api/telephony/rewind", "post"),
+    ("/api/telephony/collect", "get"), ("/api/telephony/collect", "post"),
+    ("/api/telephony/agents", "get"), ("/api/telephony/agents/{agent_id}", "delete"),
+    ("/api/telephony/agents/{agent_id}/command", "post"),
+    ("/api/telephony/agents/{agent_id}/enabled", "post"),
+    ("/api/backup", "get"), ("/api/backup", "post"), ("/api/backup/cleanup", "post"),
+    ("/api/backup/restore", "post"), ("/api/backup/upload", "post"),
+    ("/api/backup/{name}", "delete"), ("/api/backup/{name}/file", "get"),
+    ("/api/audit", "get"),
+    ("/api/maintenance/erase", "post"), ("/api/maintenance/consent", "get"),
+    ("/api/settings/hf-token", "get"), ("/api/settings/hf-token", "put"),
+    ("/api/queue/pause", "post"), ("/api/queue/resume", "post"),
+    ("/api/queue/retry-failed", "post"),
+    ("/api/llm/queue/pause", "post"), ("/api/llm/queue/clear", "post"),
+    ("/api/models/{model_id}/download", "post"), ("/api/presets/{preset_id}/apply", "post"),
+    ("/api/monitoring/targets", "post"), ("/api/monitoring/targets/{name}", "delete"),
+    ("/api/employees/import", "post"), ("/api/employees/{employee_id}", "delete"),
+    ("/api/crm/test", "post"), ("/api/qa/sample", "post"),
+    # Приём из диалплана (заход 54): журнал обращений несёт номера телефонов
+    # и адреса станций — только администратору.
+    ("/api/telephony/dialplan/status", "get"), ("/api/telephony/dialplan/log", "delete"),
+    # Отложенное восстановление копии и передача агента другому ключу.
+    ("/api/backup/pending", "delete"), ("/api/backup/pending/confirm", "post"),
+    ("/api/telephony/agents/{agent_id}/owner", "post"),
+}
+#: Чтение, которому нужен ключ с правом записи: то, что отдаётся станции для
+#: установки (агент, сценарий отправки, файлы настройки), и задание агента.
+#: Ключу только на чтение здесь делать нечего, и сервер отвечает ему 403.
+WRITE_GET_ROUTES = {
+    "/api/telephony/agent/asrhub-agent.py", "/api/telephony/agent/install.sh",
+    "/api/telephony/agent/command",
+    "/api/telephony/dialplan/config", "/api/telephony/dialplan/asrhub-dialplan",
 }
 #: Вход и выход ключа не требуют вовсе: это и есть способ его получить.
 OPEN_AUTH_ROUTES = {"/api/auth/login", "/api/auth/logout"}
@@ -209,7 +249,7 @@ def access_note(path: str, method: str) -> str:
         return "любой ключ; выборка сужается до его заданий"
     if path in MONITORING_OPEN:
         return "без ключа при `monitoring_public: true`, иначе любой ключ"
-    if method in WRITE_METHODS:
+    if method in WRITE_METHODS or path in WRITE_GET_ROUTES:
         return "ключ с правом записи (**admin** или **user**)"
     return "любой действующий ключ"
 
@@ -428,7 +468,8 @@ EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
                 f"     -F 'model=gigaam-v3-e2e-rnnt' {HOST}/api/jobs/batch",
         "note": "Общий объём ограничен параметром `max_upload_mb`, число "
                 "файлов — `max_batch_files`. Задания получают общий "
-                "`batch_id`, по нему их удобно отбирать в списке.",
+                "`group_id` (он же в ответе), по нему их удобно отбирать в "
+                "списке: `GET /api/jobs?group_id=…`.",
     },
     ("/api/queue", "get"): {
         "curl": f"curl -H 'X-API-Key: {K}' {HOST}/api/queue",

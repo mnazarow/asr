@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
+from typing import Any
 
 
 def _users_command(settings: object, args: object) -> int:
@@ -194,11 +197,73 @@ def main(argv: list[str] | None = None) -> int:
 
     from .api import create_app
 
+    _временный_каталог(settings)
     app = create_app(settings, start_queue=not args.no_queue)
+    _не_умирать_от_sighup()
     uvicorn.run(app, host=host, port=port,
                 log_level=str(settings.get("log_level") or "info").lower(),
-                access_log=False)
+                access_log=False,
+                # Без срока uvicorn ждёт незакрытые запросы бесконечно, и до
+                # lifespan — возврата идущих заданий в очередь — дело не
+                # доходило: медленное тело POST /api/jobs держало остановку,
+                # пока systemd (45 с) или Docker (10 с) не присылали SIGKILL,
+                # и каждое идущее задание теряло попытку.
+                timeout_graceful_shutdown=ОСТАНОВКА_ЗАПРОСОВ_С)
     return 0
+
+
+#: Сколько при остановке ждать незавершённые запросы, прежде чем закрыть их
+#: и перейти к остановке очереди. Меньше срока остановки у systemd и Docker
+#: с запасом на возврат заданий (см. `api.app.lifespan`).
+ОСТАНОВКА_ЗАПРОСОВ_С = 5
+
+
+def _временный_каталог(settings: Any) -> None:
+    """Временные файлы процесса — в каталог временных файлов сервера.
+
+    Тело загрузки Starlette складывает в SpooledTemporaryFile без каталога,
+    то есть в системный /tmp: до max_upload_mb на запрос, а /tmp бывает
+    tmpfs (это память) или разделом в сотню мегабайт. `temp_dir` при этом
+    обещал «место промежуточных файлов». Здесь — то же, что для SQLite
+    (`SQLITE_TMPDIR`): каталог сервера, если он есть и доступен на запись.
+    Только в самом сервере — не при импорте пакета.
+    """
+    import tempfile  # noqa: PLC0415
+
+    каталог = str(settings.get("temp_dir") or settings.paths.tmp)
+    try:
+        Path(каталог).mkdir(parents=True, exist_ok=True)
+        if os.access(каталог, os.W_OK):
+            tempfile.tempdir = каталог
+    except OSError as exc:
+        sys.stderr.write(f"Каталог временных файлов {каталог} недоступен: {exc}\n")
+
+
+def _не_умирать_от_sighup() -> None:
+    """SIGHUP больше не убивает сервер.
+
+    Юнит systemd объявлял `ExecReload=kill -HUP`, а обработчика SIGHUP не
+    было ни у нас, ни у uvicorn: `systemctl reload` (так делают средства
+    автоматизации) убивал процесс без остановки очереди, а при
+    Restart=on-failure гибель от SIGHUP считалась чистым выходом — служба
+    не поднималась. Перечитывать настройки на ходу сервер не умеет, поэтому
+    сигнал только записывается в журнал.
+    """
+    import logging  # noqa: PLC0415
+    import signal  # noqa: PLC0415
+
+    if not hasattr(signal, "SIGHUP"):
+        return
+
+    def обработать(_signum: int, _frame: Any) -> None:
+        logging.getLogger("asrhub.app").warning(
+            "Получен SIGHUP: перечитывать настройки на ходу сервер не умеет — "
+            "изменения из config.yaml вступят в силу после перезапуска службы")
+
+    try:
+        signal.signal(signal.SIGHUP, обработать)
+    except (ValueError, OSError):                       # не главный поток
+        pass
 
 
 if __name__ == "__main__":

@@ -83,6 +83,14 @@ log = get_logger("insights")
     ("compliance", "Скрипт", 1),
 )
 
+#: Нижняя граница σ карт, где величина — не доля: балл оператора в баллах
+#: из ста, тональность от −1 до +1, скрипт — доля выполненного от 0 до 1.
+#: Это то, что на экране неразличимо: полбалла, две сотых тональности,
+#: процент скрипта (у доли отрицательных граница своя, биномиальная).
+КАРТЫ_МИН_СИГМА: dict[str, float] = {
+    "agent_score": 1.0, "sentiment": 0.02, "compliance": 0.01,
+}
+
 #: Сколько записей берётся на расчёт связей. Коэффициент по двадцати тысячам
 #: отличается от коэффициента по ста тысячам в третьем знаке — при пороге в
 #: две десятых это не имеет значения.
@@ -587,6 +595,9 @@ class Insights:
     def __init__(self, db: Database, index: Any = None):
         self.db = db
         self.index = index
+        #: Подставлять ли к добавочному имя и отдел из справочника сотрудников
+        #: (настройка `employees_match_ext`; маршрут ставит её значение).
+        self.имена = True
         #: Замороженные границы окон на время сборки отчёта — своя для
         #: каждого потока, как в аналитике заданий.
         self._местное = threading.local()
@@ -804,6 +815,8 @@ class Insights:
                           "sparse": свод["records"] < МИН_ГРУППА,
                           **свод})
         отсеяно = len(группы) - len(items)
+        if dimension == "agent":
+            self._подписать_сотрудников(items)
         if описание.get("ordered"):
             items.sort(key=lambda з: self._ключ_порядка(dimension, з["key"]))
         else:
@@ -881,6 +894,30 @@ class Insights:
         набор = (self.index.categories() if self.index
                  else категории_модуль.compile(категории_модуль.ГОТОВЫЕ))
         return {к.id: {"label": к.label, "kind": к.kind} for к in набор}
+
+    def _подписать_сотрудников(self, items: list[dict[str, Any]]) -> None:
+        """Добавочный из журнала АТС — с именем, отделом и должностью.
+
+        Справочник сотрудников был ни к чему не подключён: в «Аналитике по
+        сотрудникам» и в карточке оператора стояло «1043», хотя карточка
+        с фамилией лежала рядом, а описание `employees_match_ext` обещало
+        «там появляется фамилия, должность и отдел». Подпись — «Фамилия
+        Имя · 1043»: по номеру человека ищут в журнале АТС, и он остаётся
+        виден. Ключ строки не меняется — по нему раскрывается список.
+        """
+        if not self.имена or not items:
+            return
+        люди = self.db.employees_by_ext(
+            [п["key"] for п in items if п.get("key") and п["key"] != "—"])
+        for пункт in items:
+            человек = люди.get(str(пункт.get("key") or ""))
+            if not человек or not человек.get("name"):
+                continue
+            пункт["name"] = человек["name"]
+            пункт["department"] = человек.get("department") or ""
+            пункт["position"] = человек.get("position") or ""
+            пункт["employee_active"] = bool(человек.get("active"))
+            пункт["label"] = f"{человек['name']} · {пункт['key']}"
 
     @staticmethod
     def _подпись(dimension: str, ключ: str) -> str:
@@ -1239,8 +1276,12 @@ class Insights:
         items = []
         for n, ключ in enumerate(столбцы):
             значения = [float(р[n]) for р in база if р[n] is not None]
-            норма = stats.norm_band(значения, знаков=4)
             описание = ПРИЗНАКИ_ПО_КЛЮЧУ.get(ключ, {})
+            # Коридор не уже двух единиц того знака, с которым показатель
+            # показывают: разница в третьем знаке тональности, которую на
+            # экране не видно, «выбросом» быть не может.
+            норма = stats.norm_band(значения, знаков=4,
+                                    min_spread=2 * 10 ** -int(описание.get("digits", 2)))
             свои = [float(р[n]) for р in текущее if р[n] is not None]
             сейчас = stats.percentile(свои, 0.5)
             items.append({
@@ -1249,7 +1290,9 @@ class Insights:
                 "digits": описание.get("digits", 2), "hint": описание.get("hint"),
                 **норма, "current": _округлить(сейчас, описание.get("digits", 2) + 2),
                 "current_n": len(свои),
-                "status": stats.against_norm(сейчас, норма),
+                # По одной-двум записям периода вердикта нет: их медиана —
+                # это сами записи, а не «как стало».
+                "status": stats.against_norm(сейчас, норма, n=len(свои)),
             })
         return {"period": period, "baseline_days": БАЗА_ДНЕЙ,
                 "baseline_from": round(база_от, 1), "baseline_to": round(конец, 1),
@@ -1297,12 +1340,33 @@ class Insights:
             v = с.get(ключ)
             return float(v) if v is not None else None
 
+        def записей(с: dict[str, Any] | None, ключ: str) -> int:
+            if not с:
+                return 0
+            return int(с.get("scored" if ключ == "negative_share" else "records") or 0)
+
         карты = []
         for ключ, подпись, лучше in КАРТЫ:
             ряд_базы = [значение(по_б.get(k), ключ) for k in range(n_б)]
-            пределы = stats.control_limits([x for x in ряд_базы if x is not None])
+            годные = [x for x in ряд_базы if x is not None]
+            # Нижняя граница σ: у доли — биномиальная по среднему числу
+            # записей в точке базы, у остальных — из `КАРТЫ_МИН_СИГМА`. Без
+            # неё нулевой разброс базы делал «критичным» любое отклонение.
+            в_точке = [записей(по_б.get(k), ключ) for k in range(n_б)
+                       if ряд_базы[k] is not None]
+            среднее_n = sum(в_точке) / len(в_точке) if в_точке else 0.0
+            if ключ == "negative_share":
+                μ = sum(годные) / len(годные) if годные else 0.0
+                граница = stats.binomial_std(μ, среднее_n)
+            else:
+                граница = КАРТЫ_МИН_СИГМА.get(ключ, 0.0)
+            пределы = stats.control_limits(годные, min_std=граница)
             точки = [значение(по_т.get(k), ключ) for k in range(n_т)]
-            отметки = [] if короткий_период else stats.spc_flags(точки, пределы)
+            # Точка из одной-двух записей вердикта не получает: один
+            # отрицательный разговор за сутки — это «100 % отрицательных».
+            отметки = [] if короткий_период else stats.spc_flags(
+                точки, пределы, counts=[записей(по_т.get(k), ключ) for k in range(n_т)],
+                min_n=stats.МИН_В_ТОЧКЕ, share=ключ == "negative_share", min_excess=2)
             карты.append({
                 "key": ключ, "title": подпись, "good": лучше,
                 "limits": пределы,
@@ -1474,8 +1538,14 @@ class Insights:
                                      since=начало, owner=owner, agent=оператор,
                                      where="c.agent_score IS NOT NULL", limit=5)
         очередь = self.coaching(period, owner, agent=оператор, limit=20)
+        человек: dict[str, Any] = {"key": key}
+        if by == "agent":
+            self._подписать_сотрудников([человек])
         return {
             "by": by, "key": key, "period": period,
+            # Кто это — по справочнику сотрудников (имя, отдел, должность),
+            # если добавочный в нём есть.
+            **{к: з for к, з in человек.items() if к != "key"},
             "summary": свой, "team": команда, "previous": прошлый_свой,
             # Окно столбца «Прошлый период» — чтобы и его числа раскрывались
             # в свои записи, а не в записи текущего окна.

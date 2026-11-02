@@ -15,7 +15,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="3.1.25"
+VERSION="3.1.26"
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/asrctl"
 CONFIG_FILE="${CONFIG_DIR}/profiles"
 PROFILE="${ASRCTL_PROFILE:-default}"
@@ -82,7 +82,10 @@ safe_name() {
 # ---------------------------------------------------------------------------
 
 load_profile() {
-  [[ -f "${CONFIG_FILE}" ]] || return 0
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    [[ "${PROFILE_EXPLICIT:-0}" == "1" ]] && die "Профиля «${PROFILE}» нет: профилей не заведено. Добавить: asrctl config add ${PROFILE} АДРЕС" 2
+    return 0
+  fi
   local name url key
   while IFS='|' read -r name url key; do
     [[ "${name}" == "${PROFILE}" ]] || continue
@@ -96,6 +99,11 @@ load_profile() {
     fi
     return 0
   done < "${CONFIG_FILE}"
+  # Неизвестный профиль, заданный явно, — ошибка: раньше он молча уходил на
+  # 127.0.0.1:8080, и задания ехали не на тот сервер.
+  if [[ "${PROFILE_EXPLICIT:-0}" == "1" ]]; then
+    die "Профиля «${PROFILE}» нет. Список: asrctl config list" 2
+  fi
 }
 
 save_profile() {
@@ -210,7 +218,7 @@ api() {
   local errfile
   errfile="$(mktemp "${TMPDIR:-/tmp}/asrctl-err.XXXXXX")"
   if ! response="$(printf '%s' "${config}" \
-      | curl "${args[@]}" --config - -w '\n%{http_code}' \
+      | curl "${args[@]}" --config - -w '\n%{http_code} %{redirect_url}' \
              "${SERVER}${path}" "$@" 2>"${errfile}")"; then
     local reason
     reason="$(tr -d '\r' < "${errfile}" | tail -1)"
@@ -223,8 +231,18 @@ api() {
     die "Сервер ${SERVER} недоступен. Проверьте адрес и сеть." 3
   fi
   rm -f "${errfile}"
-  status="$(printf '%s' "${response}" | tail -1)"
+  local last location
+  last="$(printf '%s' "${response}" | tail -1)"
+  status="${last%% *}"
+  location="${last#* }"; [[ "${location}" == "${last}" ]] && location=""
   body="$(printf '%s' "${response}" | sed '$d')"
+  # Перенаправление — не ответ. Раньше разбирались только 401 и 4xx/5xx, а
+  # остальное возвращалось как тело: профиль с http:// за прокси, который
+  # отвечает 301 на https, давал «✓ Сервер доступен» с пустой версией и
+  # «Сервер не вернул идентификатор задания» на отправке.
+  if [[ "${status}" =~ ^3 ]]; then
+    die "Сервер ответил перенаправлением ${status}${location:+ на ${location}}. Укажите этот адрес: --server ${location:-…} (или asrctl config add)" 3
+  fi
   if [[ "${status}" == "401" ]]; then
     die "Неверный или отсутствующий ключ доступа. Задайте: asrctl config add ${PROFILE} ${SERVER} <ключ>"
   fi
@@ -237,6 +255,15 @@ api() {
     # 502–504 и 503 — прокси или сервер в перезапуске: тоже временное.
     [[ "${status}" =~ ^50[234]$ ]] && exit 4
     exit 1
+  fi
+  if [[ ! "${status}" =~ ^2 ]]; then
+    die "Неожиданный ответ сервера: код ${status:-нет}." 3
+  fi
+  # Успех — только с JSON: страница входа прокси или заглушка балансировщика
+  # с кодом 200 разбиралась как пустой ответ и давала «успех» с пустыми полями.
+  local trimmed="${body#"${body%%[![:space:]]*}"}"
+  if [[ -n "${trimmed}" && "${trimmed:0:1}" != "{" && "${trimmed:0:1}" != "[" ]]; then
+    die "По адресу ${SERVER}${path} ответил не ASR Hub (не JSON: «$(printf '%s' "${trimmed:0:60}" | tr -d '\r\n')»). Проверьте адрес сервера." 3
   fi
   printf '%s' "${body}"
 }
@@ -262,7 +289,10 @@ for part in '${key}'.split('.'):
     if data is None: sys.exit(0)
 print(data if not isinstance(data, (dict, list)) else json.dumps(data, ensure_ascii=False))"
   else
-    printf '%s' "${json}" | sed -n "s/.*\"${key##*.}\"[: ]*\"\?\([^,\"}]*\)\"\?.*/\1/p" | head -1
+    # -E и «?» вместо «\?»: «\?» в простом выражении sed — расширение GNU,
+    # BSD sed на macOS читает его как буквальный «?», и без python любое
+    # поле выходило пустым — тот самый режим «только bash и curl».
+    printf '%s' "${json}" | sed -n -E "s/.*\"${key##*.}\"[: ]*\"?([^,\"}]*)\"?.*/\1/p" | head -1
   fi
 }
 
@@ -284,7 +314,10 @@ cmd_send() {
       --wait) wait_done=1; shift ;;
       --output|-o) output_dir="$2"; shift 2 ;;
       -*) die "Неизвестный параметр: $1" ;;
-      *) file="$1"; shift ;;
+      # Второй файл — ошибка, а не замена первого: `asrctl send *.mp3`
+      # отправлял один последний файл и отвечал успехом.
+      *) [[ -z "${file}" ]] || die "Команда send отправляет один файл, а указано несколько (${file}, $1). Каталог целиком: asrctl send-dir КАТАЛОГ" 2
+         file="$1"; shift ;;
     esac
   done
   [[ -z "${file}" ]] && die "Укажите файл: asrctl send запись.mp3"
@@ -295,7 +328,12 @@ cmd_send() {
   # молча пропадали: задание уходило на модель сервера по умолчанию, а
   # клиент рапортовал об успехе. При этом в заголовке файла написано, что
   # нужны только bash и curl.
-  settings="$(build_settings "${settings}" "${model}" "${language}" "${formats}")"
+  #
+  # Код проверяется явно: send-dir зовёт cmd_send внутри `if !`, где
+  # errexit не действует, и опечатка в --settings отправляла тысячу файлов
+  # на модель по умолчанию.
+  settings="$(build_settings "${settings}" "${model}" "${language}" "${formats}")" \
+    || die "Задание не отправлено: --settings не разобран." 2
 
   # Имя файла берём в кавычки: curl трактует запятую как разделитель
   # нескольких файлов, а точку с запятой — как начало параметра, и запись
@@ -317,6 +355,8 @@ cmd_send() {
   job_id="$(json_get "${response}" id)"
   [[ -z "${job_id}" ]] && die "Сервер не вернул идентификатор задания."
   ok "Задание создано: ${job_id}"
+  # Для send-dir: задание создано — исход ожидания дальше уже другое дело.
+  [[ -n "${ASRCTL_CREATED_FILE:-}" ]] && printf '%s\n' "${job_id}" > "${ASRCTL_CREATED_FILE}"
 
   if [[ "${wait_done}" -eq 1 ]]; then
     cmd_wait "${job_id}" --output "${output_dir}" --formats "${formats:-txt}"
@@ -388,24 +428,49 @@ cmd_send_dir() {
       ${pattern:+-name "${pattern}"} -print0 | sort -z)
 
   [[ ${#files[@]} -eq 0 ]] && die "В каталоге нет поддерживаемых файлов."
+  # --settings проверяется один раз до отправки: иначе опечатка в нём
+  # выяснялась на каждом из тысячи файлов по отдельности.
+  local i=0
+  while [[ ${i} -lt ${#rest[@]} ]]; do
+    if [[ "${rest[${i}]}" == "--settings" && $((i + 1)) -lt ${#rest[@]} ]]; then
+      build_settings "${rest[$((i + 1))]}" "" "" "" >/dev/null \
+        || die "Ни один файл не отправлен: --settings не разобран." 2
+    fi
+    i=$((i + 1))
+  done
   say "Найдено файлов: ${#files[@]}"
-  local index=0 failed=0
+  local index=0 failed=0 wait_failed=0 created_file rc
+  created_file="$(mktemp "${TMPDIR:-/tmp}/asrctl-created.XXXXXX")"
   for f in "${files[@]}"; do
     index=$((index + 1))
     printf '%s[%d/%d]%s %s\n' "${C_BLUE}" "${index}" "${#files[@]}" "${C_RESET}" "$(basename "${f}")"
-    if ! cmd_send "${f}" ${rest[@]+"${rest[@]}"} 2>&1 | sed 's/^/    /'; then
+    : > "${created_file}"
+    rc=0
+    ASRCTL_CREATED_FILE="${created_file}" cmd_send "${f}" ${rest[@]+"${rest[@]}"} 2>&1 \
+      | sed 's/^/    /' || rc=$?
+    # Задание создано — файл отправлен, что бы ни случилось с ожиданием.
+    # Раньше перенос зависел от общего кода cmd_send, а с --wait в него
+    # входили ожидание и скачивание: истёк срок или задание упало — файл
+    # оставался во входном каталоге, и каждый запуск из cron заводил ещё
+    # одно задание-копию.
+    if [[ -s "${created_file}" ]]; then
+      [[ "${rc}" -ne 0 ]] && { wait_failed=$((wait_failed + 1)); warn "    задание создано, но результата не дождались"; }
+      if [[ -n "${move_to}" ]] && ! move_sent "${f}" "${dir}" "${move_to}"; then
+        warn "    отправлен, но не перенесён в ${move_to}: следующий запуск отправит его снова"
+      fi
+    else
       failed=$((failed + 1))
       warn "    не отправлен — продолжаем"
-    elif [[ -n "${move_to}" ]] && ! move_sent "${f}" "${dir}" "${move_to}"; then
-      warn "    отправлен, но не перенесён в ${move_to}: следующий запуск отправит его снова"
     fi
   done
+  rm -f "${created_file}"
   ok "Отправлено: $(( ${#files[@]} - failed )) из ${#files[@]}"
   # Последней командой функции было `[[ ${failed} -gt 0 ]] && warn …`: при
   # нуле ошибок она ложна, и полный успех давал код возврата 1, а неудача —
   # 0. Ровно наоборот тому, чего ждёт любой вызывающий сценарий.
-  if [[ ${failed} -gt 0 ]]; then
-    warn "Не отправлено: ${failed}"
+  if [[ ${failed} -gt 0 || ${wait_failed} -gt 0 ]]; then
+    [[ ${failed} -gt 0 ]] && warn "Не отправлено: ${failed}"
+    [[ ${wait_failed} -gt 0 ]] && warn "Отправлено без результата: ${wait_failed} — asrctl list --status queued"
     return 1
   fi
   return 0
@@ -566,12 +631,14 @@ cmd_get() {
   fi
 
   if [[ "${looks_like_dir}" -eq 1 ]]; then
-    local name="result"
-    if have_python; then
-      name="$(api GET "/api/jobs/${job_id}" | python3 -c "
-import json,sys,os
-d=json.load(sys.stdin); print(os.path.splitext(str(d.get('filename') or 'result'))[0])" || echo result)"
-    fi
+    # Имя — из карточки задания, тем же json_get, что и всё остальное: без
+    # python имя всегда было «result», и два файла из `send-dir --wait`
+    # перезаписывали один и тот же result.txt.
+    local name="" card
+    card="$(api GET "/api/jobs/${job_id}")" || card=""
+    name="$(json_get "${card}" filename || true)"
+    name="${name%.*}"
+    [[ -n "${name}" ]] || name="result"
     name="$(safe_name "${name}")"
     mkdir -p "${output}"
     output="${output%/}/${name}.${format}"
@@ -747,7 +814,10 @@ cmd_health() {
   ok "Сервер ${SERVER} доступен"
   printf '  Версия      %s\n' "$(json_get "${response}" version)"
   printf '  Время работы %s с\n' "$(json_get "${response}" uptime_s)"
-  printf '  Очередь     %s\n' "$( [[ "$(json_get "${response}" queue_paused)" == "True" ]] && echo 'на паузе' || echo 'работает' )"
+  # Без учёта регистра: python печатает True, разбор через sed — true, и
+  # без python очередь на паузе выдавалась за работающую.
+  local paused; paused="$(json_get "${response}" queue_paused | tr 'A-Z' 'a-z')"
+  printf '  Очередь     %s\n' "$( [[ "${paused}" == "true" ]] && echo 'на паузе' || echo 'работает' )"
 }
 
 usage() {
@@ -817,11 +887,15 @@ ARGS=()
 # считаются явным заданием — иначе профиль отменял бы ASRHUB_SERVER.
 SERVER_EXPLICIT=0
 KEY_EXPLICIT=0
+PROFILE_EXPLICIT=0
+[[ -n "${ASRCTL_PROFILE:-}" ]] && PROFILE_EXPLICIT=1
 [[ -n "${ASRHUB_SERVER:-}" ]] && SERVER_EXPLICIT=1
+# Косая черта на конце адреса давала «//api/…» и 404 на каждом запросе.
+SERVER="${SERVER%/}"
 [[ -n "${ASRHUB_KEY:-}" ]] && KEY_EXPLICIT=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --profile) PROFILE="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
     --server)  SERVER="${2%/}"; SERVER_EXPLICIT=1; shift 2 ;;
     --key)     API_KEY="$2"; KEY_EXPLICIT=1; shift 2 ;;
     --key-file) KEY_FILE="$2"; shift 2 ;;

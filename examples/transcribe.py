@@ -125,6 +125,14 @@ def main() -> int:
         fail(response)
 
     target = args.out or args.file.with_suffix(".txt")
+    # Без --out рядом с записью часто уже лежит запись.txt — эталонный текст
+    # или прежняя расшифровка. Её не затираем: результат получает своё имя.
+    if not args.out and target.exists():
+        target = args.file.with_suffix(".asrhub.txt")
+        number = 1
+        while target.exists():
+            number += 1
+            target = args.file.with_suffix(f".asrhub-{number}.txt")
     target.write_text(response.text, encoding="utf-8")
     print(f"Расшифровка: {target}")
     return 0

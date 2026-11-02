@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import threading
@@ -134,7 +135,17 @@ class Runtime:
         with self._lock:
             self.in_flight = max(0, self.in_flight - 1)
 
-    def note_error(self, code: str, retryable: bool) -> None:
+    def note_error(self, code: str, retryable: bool, *, api: bool = False) -> None:
+        """Учитывает ошибку: задания — в `asrhub_errors_total`, отказ API — отдельно.
+
+        Отказы API (неверный ключ, 404, 422) раньше шли в тот же счётчик,
+        что и сбои заданий, и сдвигали «время последней ошибки»: анонимный
+        запрос без ключа обнулял «время без ошибок» и выглядел как сбой
+        распознавания. Отказ API — ответ клиенту, а не ошибка сервера.
+        """
+        if api:
+            self.inc("asrhub_api_errors_total", {"code": code})
+            return
         self.inc("asrhub_errors_total", {"code": code, "retryable": str(retryable).lower()})
         with self._lock:
             self.last_error_ts = time.time()
@@ -191,6 +202,15 @@ def _file_size(path: Any) -> int:
     except OSError:
         return 0
 
+#: Сколько живут посчитанные суточные разрезы аналитики (производительность,
+#: качество, содержание). Снимок кешируется на пять секунд, а интерфейс зовёт
+#: тревоги каждые четыре с любой открытой страницы: каждый сбор заново читал
+#: задания за сутки — восемь раз за сбор, — и на десяти тысячах заданий в
+#: сутки ядро было занято сбором почти постоянно. Суточные величины за
+#: минуту не меняются заметно; дешёвое (очередь, ресурсы, счётчики) по-прежнему
+#: свежее на каждом снимке.
+СУТОЧНЫЕ_С = 60.0
+
 #: Сколько файлов обходит замер размера каталогов для метрики. Обход идёт
 #: в фоне, поэтому предел широкий: он защищает не опрос, а сам сервер от
 #: получаса стат-вызовов по каталогу на десяток миллионов файлов.
@@ -218,19 +238,38 @@ class Collector:
         self._неполные: set[str] = set()
         self._lock = threading.Lock()
         self._collect_id = 0
-        self._by_model_at = -1
-        self._by_model_cache: list[dict[str, Any]] = []
+        self.суточные_с = СУТОЧНЫЕ_С
+        self._разрезы: dict[str, tuple[float, Any]] = {}
+        #: Сбои частей источника за текущий сбор: {источник: [что не вышло]}.
+        self._части: dict[str, list[str]] = {}
+        self._источник = ""
+
+    def _разрез(self, имя: str, вызов: Any) -> Any:
+        """Суточный разрез аналитики — посчитанный раз в `суточные_с` секунд."""
+        сейчас = time.monotonic()
+        готовое = self._разрезы.get(имя)
+        if готовое is not None and сейчас - готовое[0] < self.суточные_с:
+            return готовое[1]
+        значение = вызов()
+        self._разрезы[имя] = (сейчас, значение)
+        return значение
+
+    def _сбой_части(self, что: str, exc: BaseException) -> None:
+        """Часть источника не посчиталась — об этом знает снимок, а не только журнал.
+
+        Внутренние перехваты писали в журнал уровнем DEBUG и молча
+        пропускали метрики: дрейф, калибровка, профиль звука, согласие и
+        латентность пропадали, тревоги по ним снимались через пять минут, а
+        `asrhub_collector_source_up` оставался единицей — хотя ровно для
+        этого случая он и заведён.
+        """
+        self._части.setdefault(self._источник or "?", []).append(
+            f"{что}: {type(exc).__name__}: {exc}")
+        log.warning("Метрики «%s» не посчитаны: %s", что, exc)
 
     def _by_model(self) -> list[dict[str, Any]]:
-        """Разрез по моделям, посчитанный один раз за сбор.
-
-        Вызывается из двух мест — производительности и моделей; без кеша это
-        были бы две полные выборки заданий за сутки на каждый опрос метрик.
-        """
-        if self._by_model_at != self._collect_id:
-            self._by_model_cache = self.state.analytics.by_model("day")
-            self._by_model_at = self._collect_id
-        return self._by_model_cache
+        """Разрез по моделям за сутки — общий для производительности и моделей."""
+        return self._разрез("by_model", lambda: self.state.analytics.by_model("day"))
 
     # -- вспомогательное -----------------------------------------------------
 
@@ -254,11 +293,22 @@ class Collector:
         errors: list[str] = []
         self._collect_id += 1
         здоровье: list[Sample] = []
-        for source in self.ИСТОЧНИКИ:
-            fn = getattr(self, "_runtime_series" if source == "runtime" else f"_{source}")
-            удалось = self._safe(source, fn, out, errors)
-            здоровье.append(Sample("asrhub_collector_source_up", 1.0 if удалось else 0.0,
-                                   {"source": source}))
+        self._части = {}
+        # Разрезы аналитики внутри одного сбора — под общей выборкой: одна и
+        # та же суточная выборка значений не читается заново каждым разрезом.
+        общая = getattr(getattr(self.state, "analytics", None), "_общая_выборка", None)
+        with (общая() if callable(общая) else contextlib.nullcontext()):
+            for source in self.ИСТОЧНИКИ:
+                fn = getattr(self, "_runtime_series" if source == "runtime" else f"_{source}")
+                self._источник = source
+                удалось = self._safe(source, fn, out, errors)
+                части = self._части.get(source) or []
+                if части:
+                    errors.extend(f"{source}/{ч}" for ч in части)
+                    удалось = False
+                здоровье.append(Sample("asrhub_collector_source_up", 1.0 if удалось else 0.0,
+                                       {"source": source}))
+            self._источник = ""
         удалось = self._safe("storage_size", lambda acc: acc.extend(self._expensive()),
                              out, errors)
         if удалось and self._expensive_error:
@@ -364,9 +414,15 @@ class Collector:
         out.append(Sample("asrhub_queue_oldest_seconds",
                           round(max(0.0, time.time() - float(stamp)), 1) if stamp else 0.0))
 
+        # Самые свежие пять тысяч, а не первые по индексу времени: без
+        # ORDER BY запрос шёл по idx_jobs_finished по возрастанию и брал
+        # задания суточной давности. Очередь встала час назад, последние
+        # задания ждали по 5000 с — а метрика показывала p95 в секунду, и
+        # тревоги с порогами 900 и 3600 с молчали.
         waits = [float(r["queue_time_s"]) for r in self.state.db.query(
             "SELECT queue_time_s FROM jobs WHERE queue_time_s IS NOT NULL "
-            "AND finished_at>=? LIMIT 5000", (time.time() - 86400,))]
+            "AND finished_at>=? ORDER BY finished_at DESC LIMIT 5000",
+            (time.time() - 86400,))]
         for stat, value in self._quantiles(waits).items():
             out.append(Sample("asrhub_queue_wait_seconds", value, {"stat": stat}))
 
@@ -374,18 +430,23 @@ class Collector:
 
     def _jobs(self, out: list[Sample]) -> None:
         since = time.time() - 86400
-        rows = self.state.db.query(
-            "SELECT model, engine, source, status, media_duration_s, processing_time_s "
-            "FROM jobs WHERE created_at>=? LIMIT 100000", (since,))
-
+        # Счёт — группировкой в базе: выборка в сто тысяч строк без порядка
+        # сверх предела молча теряла часть суток.
         by_model: Counter[tuple[str, str]] = Counter()
         by_source: Counter[str] = Counter()
+        for row in self.state.db.query(
+                "SELECT COALESCE(model,'') m, COALESCE(engine,'') e, COUNT(*) n FROM jobs "
+                "WHERE created_at>=? GROUP BY 1, 2", (since,)):
+            by_model[(row["m"], row["e"])] += int(row["n"])
+        for row in self.state.db.query(
+                "SELECT COALESCE(NULLIF(source,''),'unknown') s, COUNT(*) n FROM jobs "
+                "WHERE created_at>=? GROUP BY 1", (since,)):
+            by_source[row["s"]] += int(row["n"])
         обработка: list[float] = []
         записи: list[float] = []
-
-        for row in rows:
-            by_model[(row["model"] or "", row["engine"] or "")] += 1
-            by_source[row["source"] or "unknown"] += 1
+        for row in self.state.db.query(
+                "SELECT media_duration_s, processing_time_s FROM jobs WHERE created_at>=? "
+                "ORDER BY created_at DESC LIMIT 100000", (since,)):
             if row["processing_time_s"]:
                 обработка.append(float(row["processing_time_s"]))
             if row["media_duration_s"]:
@@ -411,7 +472,7 @@ class Collector:
     # -- производительность --------------------------------------------------
 
     def _performance(self, out: list[Sample]) -> None:
-        overview = self.state.analytics.overview("day")
+        overview = self._разрез("overview", lambda: self.state.analytics.overview("day"))
         performance = overview.get("performance") or {}
 
         rtf = performance.get("rtf") or {}
@@ -438,7 +499,7 @@ class Collector:
                 out.append(Sample("asrhub_stage_seconds", round(float(stages[stage]), 4),
                                   {"stage": stage}))
 
-        efficiency = self.state.analytics.efficiency("day")
+        efficiency = self._разрез("efficiency", lambda: self.state.analytics.efficiency("day"))
         if efficiency.get("model_load_share") is not None:
             out.append(Sample("asrhub_model_load_share", float(efficiency["model_load_share"])))
         audio_hours = float(efficiency.get("audio_hours") or 0)
@@ -448,9 +509,9 @@ class Collector:
         # видит каждый двадцатый, а не среднее. Поток — отдельно: секунды до
         # первого текста, которые файловые задания не измеряют вовсе.
         try:
-            латентность = self.state.analytics.latency("day")
+            латентность = self._разрез("latency", lambda: self.state.analytics.latency("day"))
         except Exception as exc:                             # noqa: BLE001
-            log.debug("Латентность для метрик не посчитана: %s", exc)
+            self._сбой_части("latency", exc)
             return
         for row in (латентность.get("by_model") or [])[:40]:
             метки = {"model": str(row.get("key") or "")}
@@ -471,9 +532,10 @@ class Collector:
 
     def _quality(self, out: list[Sample]) -> None:
         since = time.time() - 86400
+        # Свежие первыми — по той же причине, что у ожидания в очереди.
         confidences = [float(r["avg_confidence"]) for r in self.state.db.query(
             "SELECT avg_confidence FROM jobs WHERE avg_confidence IS NOT NULL "
-            "AND finished_at>=? LIMIT 20000", (since,))]
+            "AND finished_at>=? ORDER BY finished_at DESC LIMIT 20000", (since,))]
         for stat, value in self._quantiles(confidences).items():
             out.append(Sample("asrhub_confidence", round(value, 4), {"stat": stat}))
         if confidences:
@@ -520,9 +582,9 @@ class Collector:
                                   {"model": str(row["model"] or "")}))
         # Звук на входе за сутки: доля плохих записей и перцентили SNR.
         try:
-            звук = self.state.analytics.audio_profile("day")
+            звук = self._разрез("audio", lambda: self.state.analytics.audio_profile("day"))
         except Exception as exc:                             # noqa: BLE001
-            log.debug("Профиль звука для метрик не посчитан: %s", exc)
+            self._сбой_части("audio_profile", exc)
             звук = {}
         if звук.get("bad_audio_share") is not None:
             out.append(Sample("asrhub_bad_audio_share", float(звук["bad_audio_share"])))
@@ -535,7 +597,8 @@ class Collector:
         try:
             out.append(Sample("asrhub_review_pending",
                               float(self.state.db.review_counts()["pending"])))
-            согласие = self.state.analytics.agreement("week")
+            согласие = self._разрез("agreement",
+                                    lambda: self.state.analytics.agreement("week"))
             for пара in согласие.get("by_pair") or []:
                 if пара.get("wer_avg") is not None:
                     # Метка на обе модели пары: разрез считается по паре, и
@@ -547,7 +610,7 @@ class Collector:
                                       {"model": str(пара.get("model") or ""),
                                        "control_model": str(пара.get("control_model") or "")}))
         except Exception as exc:                             # noqa: BLE001
-            log.debug("Метрики проверки не посчитаны: %s", exc)
+            self._сбой_части("review/agreement", exc)
         # Смысловой слой — только когда включён.
         клиент = getattr(self.state, "llm", None)
         if клиент is not None and клиент.enabled:
@@ -578,13 +641,14 @@ class Collector:
                     out.append(Sample("asrhub_llm_coverage",
                                       round(ответов / свод["total"], 4)))
             except Exception as exc:                         # noqa: BLE001
-                log.debug("Метрики языковой модели не посчитаны: %s", exc)
+                self._сбой_части("llm", exc)
         # Калибровка — за неделю: за сутки эталонных записей обычно единицы,
         # и ECE по ним — совпадение, а не мера.
         try:
-            калибровка = self.state.analytics.calibration("week")
+            калибровка = self._разрез("calibration",
+                                      lambda: self.state.analytics.calibration("week"))
         except Exception as exc:                             # noqa: BLE001
-            log.debug("Калибровка для метрик не посчитана: %s", exc)
+            self._сбой_части("calibration", exc)
             калибровка = {}
         for м in (калибровка.get("by_model") or [])[:40]:
             if м.get("ece") is not None and int(м.get("words") or 0) >= 500:
@@ -611,9 +675,9 @@ class Collector:
         # Только те, где выборки хватило на вердикт: p по десяти заданиям
         # — не число, а совпадение.
         try:
-            дрейф = self.state.analytics.drift("day")
+            дрейф = self._разрез("drift", lambda: self.state.analytics.drift("day"))
         except Exception as exc:                             # noqa: BLE001
-            log.debug("Дрейф для метрик не посчитан: %s", exc)
+            self._сбой_части("drift", exc)
             return
         уровни = {"ok": 0.0, "warning": 1.0, "critical": 2.0}
         for м in [дрейф.get("overall") or {}, *(дрейф.get("models") or [])]:
@@ -779,7 +843,8 @@ class Collector:
 
         from ..insights import Insights  # noqa: PLC0415
 
-        за_сутки = Insights(self.state.db, свод).summary("day")
+        за_сутки = self._разрез("content",
+                                lambda: Insights(self.state.db, свод).summary("day"))
         if not за_сутки.get("records"):
             return
         # Соблюдение скрипта и балл оператора — только при скрипте, заданном
@@ -818,9 +883,10 @@ class Collector:
         # сутки и срабатывания трекеров. Только сработавшие: набор из двухсот
         # категорий с нулями — это двести рядов, которые никто не смотрит.
         try:
-            категории = Insights(self.state.db, свод).categories("day")
+            категории = self._разрез("categories",
+                                     lambda: Insights(self.state.db, свод).categories("day"))
         except Exception as exc:                             # noqa: BLE001
-            log.debug("Категории для метрик не посчитаны: %s", exc)
+            self._сбой_части("categories", exc)
             return
         for к in категории.get("items") or []:
             if к.get("records") and к.get("share") is not None:

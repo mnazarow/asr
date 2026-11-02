@@ -52,7 +52,12 @@ if (-not $DataDir) {
     exit 2
 }
 $ownAutostart = @($resolved.Autostart)
-$items = @('server', 'scripts', 'config', 'requirements', 'docker', 'examples', 'VERSION', 'README.md')
+# Список — общий с установщиком (Get-AsrInstallItems): в нём и agent, который
+# сервер отдаёт станциям.
+$items = @(Get-AsrInstallItems)
+# Отложенные при подмене прежние каталоги — удаляются после успеха,
+# возвращаются при сбое (Add-Rollback ниже).
+$script:OldItems = [System.Collections.ArrayList]::new()
 
 # Снимок — СВОЙ у каждой установки. Прежний путь «рядом с каталогом
 # программы, имя общее» совпадал у всех установок под одним родителем:
@@ -103,14 +108,69 @@ function Copy-Staged {
       Каталог за каталогом через временное имя рядом: сорвётся копирование
       на середине — прежний каталог останется целым. Копия поверх оставляла
       файлы, которых в новой версии уже нет.
+
+      Каталог docker — иначе: поверх, без местных .env, certs и data
+      (Copy-AsrDockerOverlay). Подмена целиком стирала docker\.env, и
+      контейнер пересоздавался с умолчаниями: 0.0.0.0:8080, пустой том,
+      без токена и карты.
+
+      С -KeepOld прежний каталог не удаляется, а откладывается в .<имя>.old,
+      и откат возвращает его на место.
     #>
-    param([string]$From, [string]$Item)
+    param([string]$From, [string]$Item, [switch]$KeepOld)
     $target = Join-Path $Prefix $Item
+    if ($Item -eq 'docker') {
+        if ($KeepOld -and (Test-Path -LiteralPath $target)) {
+            $old = Join-Path $Prefix '.docker.old'
+            if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+            Copy-AsrDockerWithoutData -From $target -To $old
+            [void]$script:OldItems.Add($old)
+            Add-Rollback ({ Copy-AsrDockerOverlay -From $old -To $target }.GetNewClosure()) 'вернуть файлы docker'
+        }
+        Copy-AsrDockerOverlay -From $From -To $target
+        return
+    }
     $staged = Join-Path $Prefix ".$Item.staged"
     if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
     Copy-Item -LiteralPath $From -Destination $staged -Recurse -Force
-    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+    if (Test-Path -LiteralPath $target) {
+        if ($KeepOld) {
+            $old = Join-Path $Prefix ".$Item.old"
+            if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+            Move-Item -LiteralPath $target -Destination $old
+            [void]$script:OldItems.Add($old)
+            Add-Rollback ({
+                if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+                Move-Item -LiteralPath $old -Destination $target
+            }.GetNewClosure()) "вернуть $Item"
+        } else {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+    } elseif ($KeepOld) {
+        Add-Rollback ({ Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue }.GetNewClosure()) "убрать $Item"
+    }
     Move-Item -LiteralPath $staged -Destination $target
+}
+
+function Complete-Update {
+    # Обновление дошло до конца (каким бы ни был ответ сервера): откат по
+    # списку больше не нужен — дальше откатывает только -Rollback из
+    # снимка, — прежние каталоги можно удалить.
+    Clear-Rollback
+    foreach ($old in @($script:OldItems)) {
+        Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $script:OldItems.Clear()
+}
+
+function Invoke-AsrComposeRebuild {
+    # Пересборка и запуск контейнера из файлов в каталоге docker.
+    $compose = Get-AsrCompose -Prefix $Prefix
+    Push-Location -LiteralPath $compose.Directory
+    try {
+        Invoke-Checked -Command $compose.Command -Arguments ($compose.Arguments + @('build')) | Out-Null
+        Invoke-Checked -Command $compose.Command -Arguments ($compose.Arguments + @('up', '-d')) | Out-Null
+    } finally { Pop-Location }
 }
 
 # --- Откат ------------------------------------------------------------------
@@ -148,6 +208,10 @@ if ($Rollback) {
         exit 0
     }
     try { Invoke-ServiceScript -Action stop } catch { Write-Info 'Служба не остановлена — возможно, уже стоит.' }
+    if ($dockerMode -and -not (Test-CommandExists 'docker')) {
+        Write-Err 'Установка в контейнере, а docker не найден — откатить контейнер нечем.'
+        exit 1
+    }
     foreach ($item in $items) {
         $snapshotItem = Join-Path $fromSnapshot $item
         if (Test-Path -LiteralPath $snapshotItem) { Copy-Staged -From $snapshotItem -Item $item }
@@ -165,19 +229,56 @@ if ($Rollback) {
         Copy-Item -LiteralPath $configSnapshot -Destination $configFile -Force
         Write-Ok 'Конфигурация возвращена к виду до обновления'
     }
-    try { Invoke-ServiceScript -Action start } catch { Write-Warn "Службу запустить не удалось: $($_.Exception.Message)" }
+    # Пакеты окружения — к виду до обновления: обновление ставит всё с
+    # --upgrade, и прежний код без этого шага оставался на новых пакетах.
+    $freezeFile = Join-Path $fromSnapshot 'pip-freeze.txt'
+    if (-not $dockerMode -and (Test-Path -LiteralPath $freezeFile) -and (Test-Path $venvPip)) {
+        try {
+            Invoke-Checked -Command $venvPip -Arguments @('install', '--no-deps', '--disable-pip-version-check',
+                '-r', $freezeFile) | Out-Null
+            Write-Ok 'Пакеты окружения возвращены к снимку'
+        } catch {
+            Write-Warn 'Пакеты вернуть не удалось — прежний код работает на пакетах новой версии.'
+            Write-Hint "Повторить: & `"$venvPip`" install --no-deps -r `"$freezeFile`""
+        }
+    } elseif (-not $dockerMode) {
+        Write-Hint 'В снимке нет списка пакетов — пакеты окружения остались от новой версии:'
+        Write-Hint "  & `"$venvPip`" install -r `"$Prefix\requirements\base.txt`""
+    }
+    $rollbackOk = $true
+    if ($dockerMode) {
+        # Контейнер — тоже прежней версии: файлы возвращены, а работающий
+        # образ собран из новых. Раньше откат его не трогал вовсе.
+        try { Invoke-AsrComposeRebuild }
+        catch { Write-Err "Контейнер прежней версии не поднят: $($_.Exception.Message)"; $rollbackOk = $false }
+    } else {
+        try { Invoke-ServiceScript -Action start } catch { Write-Warn "Службу запустить не удалось: $($_.Exception.Message)"; $rollbackOk = $false }
+    }
+    # После отката сервер проверяется так же, как после обновления.
+    if ($dockerMode -or $ownAutostart) {
+        $mode = if ($dockerMode) { 'docker' } else { 'native' }
+        $address = Get-AsrServerAddress -Prefix $Prefix -DataDir $DataDir -Mode $mode -Autostart $ownAutostart
+        $probe = Wait-AsrHealth -Port $address.Port -HostName $address.ProbeHost -Seconds 60
+        if ($probe.Status -ge 200 -and $probe.Status -lt 300) { Write-Ok 'Сервер отвечает на прежней версии' }
+        else { Write-Err 'Сервер не отвечает и после отката.'; $rollbackOk = $false }
+    }
     $restored = if (Test-Path (Join-Path $Prefix 'VERSION')) { (Get-Content (Join-Path $Prefix 'VERSION') -Raw).Trim() } else { '?' }
-    Write-Ok "Откат выполнен: версия $restored"
-    # Зависимости и база в снимок не входят.
-    Write-Hint 'Пакеты окружения остались от новой версии. Вернуть прежние:'
-    Write-Hint "  & `"$venvPip`" install -r `"$Prefix\requirements\base.txt`""
-    $lastCopy = Get-ChildItem -LiteralPath $DataDir -Filter 'asrhub.db.bak.*' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    Write-Ok "Файлы возвращены: версия $restored"
+    $lastCopy = $null
+    $dbPathFile = Join-Path $fromSnapshot 'db-backup.path'
+    if (Test-Path -LiteralPath $dbPathFile) {
+        $candidate = (Get-Content -LiteralPath $dbPathFile -Raw).Trim()
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { $lastCopy = Get-Item -LiteralPath $candidate }
+    }
+    if (-not $lastCopy) {
+        $lastCopy = Get-ChildItem -LiteralPath $DataDir -Filter 'asrhub.db.bak.*' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -First 1
+    }
     if ($lastCopy) {
         Write-Hint 'База — в том виде, в каком её оставила новая версия. Копия до обновления:'
         Write-Hint "  $($lastCopy.FullName)"
     }
-    exit 0
+    if ($rollbackOk) { exit 0 } else { exit 1 }
 }
 
 # --- Проверка ---------------------------------------------------------------
@@ -228,6 +329,15 @@ if ($dockerMode -and -not (Test-CommandExists 'docker')) {
     Write-Hint 'Запустите Docker Desktop (или поставьте его) и повторите обновление.'
     exit 1
 }
+# Без docker\.env контейнер поднялся бы с умолчаниями Compose: 0.0.0.0:8080,
+# том в docker\data, без токена и карты. Get-AsrCompose такой файл молча
+# пропускает — поэтому остановка здесь, до первого изменения.
+if ($dockerMode -and -not (Test-Path -LiteralPath (Join-Path $Prefix 'docker\.env'))) {
+    Write-Err "У установки в контейнере нет файла $(Join-Path $Prefix 'docker\.env')."
+    Write-Hint 'В нём порт, адрес, каталог данных и токен; без него контейнер поднимется с умолчаниями.'
+    Write-Hint 'Верните файл (из резервной копии или заново: install.ps1 -Mode docker) и повторите.'
+    exit 1
+}
 
 # Понижение версии — не обновление: новая схема базы прежнему коду может
 # быть незнакома. Спрашиваем с умолчанием «нет».
@@ -235,7 +345,7 @@ $parsedCurrent = $null; $parsedNew = $null
 if (-not $EnginesOnly -and [version]::TryParse($currentVersion, [ref]$parsedCurrent) -and
     [version]::TryParse($newVersion, [ref]$parsedNew) -and $parsedNew -lt $parsedCurrent) {
     Write-Warn "Источник старше установки: $newVersion < $currentVersion."
-    Write-Hint "Вернуться к версии до обновления надёжнее откатом: powershell -File `"$Prefix\scripts\update.ps1`" -Rollback"
+    Write-Hint "Вернуться к версии до обновления надёжнее откатом: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\update.ps1`" -Rollback"
     if (-not (Confirm-Action 'Всё равно поставить более старую версию?' 'n')) { Write-Info 'Отменено.'; exit 0 }
 }
 
@@ -264,8 +374,22 @@ if ($keepSnapshot) {
         # печатал «Файлы обновлены»: обновление на Windows не меняло кода вовсе.
         $installedItem = Join-Path $Prefix $item
         if (Test-Path -LiteralPath $installedItem) {
-            Copy-Item -LiteralPath $installedItem -Destination $snapshotDir -Recurse -Force
+            if ($item -eq 'docker') {
+                # Без data: база и модели в снимок не входят.
+                Copy-AsrDockerWithoutData -From $installedItem -To (Join-Path $snapshotDir 'docker')
+            } else {
+                Copy-Item -LiteralPath $installedItem -Destination $snapshotDir -Recurse -Force
+            }
         }
+    }
+    # Пакеты окружения — в снимок: откат ставит их обратно.
+    if (-not $dockerMode -and (Test-Path $venvPip)) {
+        try {
+            $freeze = @(Invoke-Native -Command $venvPip -Arguments @('freeze', '--all', '--exclude-editable') |
+                Where-Object { "$_" -and "$_" -notmatch '^(pip|setuptools|wheel)==' -and "$_" -notmatch '^-e ' })
+            [System.IO.File]::WriteAllLines((Join-Path $snapshotDir 'pip-freeze.txt'), [string[]]$freeze,
+                [System.Text.UTF8Encoding]::new($false))
+        } catch { Write-Warn 'Список пакетов в снимок не записан — откат пакеты не вернёт.' }
     }
     # Конфигурация лежит в каталоге данных и обновлением не трогается, но
     # откат без неё неполон: новая версия могла записать в файл параметры,
@@ -277,7 +401,7 @@ if ($keepSnapshot) {
     # В снимке — config.yaml с ключами и токеном: закрываем от остальных.
     $null = Set-AsrPrivateAcl -Path $snapshotDir
     Write-Ok "Снимок: $snapshotDir"
-    Write-Hint "Откат при проблемах: powershell -File `"$Prefix\scripts\update.ps1`" -Rollback"
+    Write-Hint "Откат при проблемах: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\update.ps1`" -Rollback"
 }
 
 Write-Step 'Остановка службы'
@@ -289,7 +413,19 @@ if ($dockerMode) {
     Write-Info 'Автозапуска у этой установки нет — сервер, запущенный вручную, перезапустите сами.'
 } else {
     $wasRunning = Test-ServerRunning
-    try { Invoke-ServiceScript -Action stop } catch { Write-Info 'Служба не запущена.' }
+    if ($wasRunning) {
+        # Отказ остановки — ошибка, а не «служба не запущена»: файлы
+        # менялись бы под живым процессом.
+        try { Invoke-ServiceScript -Action stop }
+        catch {
+            Write-Err "Службу остановить не удалось: $($_.Exception.Message)"
+            Write-Hint 'Файлы не тронуты. Запустите консоль от имени администратора и повторите.'
+            exit 1
+        }
+        # Любой сбой дальше — откат подменённых каталогов и запуск службы:
+        # раньше обновление, упавшее после остановки, оставляло её стоять.
+        Add-Rollback { Invoke-ServiceScript -Action start } 'запустить службу'
+    }
     Write-Ok 'Служба остановлена'
 }
 
@@ -302,14 +438,19 @@ if ((Test-Path -LiteralPath $dbFile) -and -not (Get-DryRun)) {
     $dbBackup = "$dbFile.bak.$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     if (Backup-AsrDatabase -Source $dbFile -Destination $dbBackup -Python $venvPython) {
         Write-Ok "Копия базы: $(Split-Path -Leaf $dbBackup) ($(Format-Size (Get-Item -LiteralPath $dbBackup).Length))"
+        # Копия до ЭТОГО обновления — в снимок: подсказка отката брала
+        # самую свежую, а после повторного запуска это уже копия после миграции.
+        if (-not $keepSnapshot -and (Test-Path -LiteralPath $snapshotDir)) {
+            [System.IO.File]::WriteAllText((Join-Path $snapshotDir 'db-backup.path'), $dbBackup,
+                [System.Text.UTF8Encoding]::new($false))
+        }
         Get-ChildItem -LiteralPath $DataDir -Filter 'asrhub.db.bak.*' |
             Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
             Remove-Item -Force -ErrorAction SilentlyContinue
     } else {
+        # Службу поднимет откат (он зарегистрирован при остановке).
         Write-Err 'Копию базы сделать не удалось — обновление остановлено, файлы не тронуты.'
-        if ($wasRunning -and -not $dockerMode) {
-            try { Invoke-ServiceScript -Action start } catch { }
-        }
+        Invoke-Rollback
         exit 1
     }
 } elseif ((Get-DryRun) -and (Test-Path -LiteralPath $dbFile)) {
@@ -330,7 +471,7 @@ if (-not $EnginesOnly) {
     } elseif (-not (Get-DryRun)) {
         foreach ($item in $items) {
             $sourcePath = Join-Path $Source $item
-            if (Test-Path -LiteralPath $sourcePath) { Copy-Staged -From $sourcePath -Item $item }
+            if (Test-Path -LiteralPath $sourcePath) { Copy-Staged -From $sourcePath -Item $item -KeepOld }
         }
     }
     Write-Ok "Файлы обновлены до версии $newVersion"
@@ -340,10 +481,15 @@ Write-Step 'Обновление зависимостей'
 if ($dockerMode) {
     Write-Info 'Зависимости живут в образе — обновятся при пересборке.'
 } elseif (Test-Path $venvPip) {
-    Invoke-WithRetry -Attempts 2 -Description 'базовые зависимости' -Action {
-        Invoke-Checked -Command $venvPip -Arguments @('install', '--upgrade',
-            '--disable-pip-version-check', '-r', (Join-Path $Prefix 'requirements\base.txt'))
-    } | Out-Null
+    # Сбой базовых зависимостей — предупреждение, как в update.sh, а не
+    # обрыв: раньше моргнувший PyPI уводил в trap, и сервер оставался
+    # остановленным с новым кодом и старыми пакетами.
+    try {
+        Invoke-WithRetry -Attempts 2 -Description 'базовые зависимости' -Action {
+            Invoke-Checked -Command $venvPip -Arguments @('install', '--upgrade',
+                '--disable-pip-version-check', '-r', (Join-Path $Prefix 'requirements\base.txt'))
+        } | Out-Null
+    } catch { Write-Warn 'Часть базовых зависимостей не обновилась.' }
     foreach ($req in (Get-ChildItem (Join-Path $Prefix 'requirements\engines') -Filter '*.txt')) {
         # Установлен ли движок — по его собственному пакету, как в update.sh.
         # Раньше годилась любая строка файла: whisperx считался установленным
@@ -392,7 +538,12 @@ $markerService = if ($ownAutostart) { $ownAutostart[0].Name } else { '' }
 Write-Step 'Запуск и проверка'
 if ($NoRestart) {
     Write-Info 'Перезапуск пропущен (-NoRestart).'
+    Complete-Update
     $null = Write-InstallMarker -Prefix $Prefix -DataDir $DataDir -Service $markerService -Mode $mode
+    if ($wasRunning) {
+        Write-Warn 'Служба остановлена на время обновления и не запущена (-NoRestart).'
+        Write-Hint "Запустить: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\service.ps1`" -Action start"
+    }
     exit 0
 }
 if (Get-DryRun) { Write-Ok 'Пробный запуск завершён.'; exit 0 }
@@ -401,24 +552,24 @@ if ($dockerMode) {
     # Без пересборки образа новый код в контейнер не попадает: проверка
     # живости отвечала бы 200 от старой версии, и обновление объявлялось
     # успешным, ничего не изменив.
-    $compose = Get-AsrCompose -Prefix $Prefix
-    Push-Location -LiteralPath $compose.Directory
     try {
         Write-Info 'Пересборка образа (может занять несколько минут)…'
-        Invoke-Checked -Command $compose.Command -Arguments ($compose.Arguments + @('build')) | Out-Null
-        Invoke-Checked -Command $compose.Command -Arguments ($compose.Arguments + @('up', '-d')) | Out-Null
+        Invoke-AsrComposeRebuild
     } catch {
+        # Файлы возвращает откат: прежний контейнер работает на прежних файлах.
         Write-Err 'Пересборка образа не удалась. Прежний контейнер не тронут.'
+        Invoke-Rollback
         exit 1
-    } finally { Pop-Location }
+    }
 } elseif ($wasRunning) {
     try { Invoke-ServiceScript -Action start } catch { Write-Warn "Службу запустить не удалось: $($_.Exception.Message)" }
 } else {
     Write-Info 'До обновления сервер не работал — не запускаем.'
+    Complete-Update
     $null = Write-InstallMarker -Prefix $Prefix -DataDir $DataDir -Service $markerService -Mode $mode
     Write-Host ''
     Write-Host "Обновление завершено: $currentVersion → $newVersion" -ForegroundColor Green
-    if ($ownAutostart) { Write-Hint "Запустить: powershell -File `"$Prefix\scripts\service.ps1`" -Action start" }
+    if ($ownAutostart) { Write-Hint "Запустить: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\service.ps1`" -Action start" }
     exit 0
 }
 
@@ -428,6 +579,8 @@ if ($dockerMode) {
 # шла в порт из файла и всегда на 127.0.0.1.
 $address = Get-AsrServerAddress -Prefix $Prefix -DataDir $DataDir -Mode $mode -Autostart $ownAutostart
 $probe = Wait-AsrHealth -Port $address.Port -HostName $address.ProbeHost -Seconds 60
+# Дальше откатывает только -Rollback из снимка (он возвращает и пакеты).
+Complete-Update
 
 if ($probe.Status -ge 200 -and $probe.Status -lt 300) {
     Write-Ok 'Сервер отвечает — обновление успешно'
@@ -441,7 +594,7 @@ if ($probe.Status -ge 200 -and $probe.Status -lt 300) {
     $null = Write-InstallMarker -Prefix $Prefix -DataDir $DataDir -Service $markerService -Mode $mode
     Write-Host ''
     Write-Host "Обновление завершено: $currentVersion → $newVersion" -ForegroundColor Green
-    Write-Hint "Откат при необходимости: powershell -File `"$Prefix\scripts\update.ps1`" -Rollback"
+    Write-Hint "Откат при необходимости: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\update.ps1`" -Rollback"
 } elseif ($probe.Status -gt 0) {
     # Сервер поднялся, но сам сообщает о неисправности. Это не повод для
     # отката: код обновился и работает, сломано что-то под ним — чаще всего
@@ -449,16 +602,16 @@ if ($probe.Status -ge 200 -and $probe.Status -lt 300) {
     # считался неудачей, и с -Yes обновление откатывалось само.
     Write-Warn "Сервер отвечает, но сообщает о неисправности (код $($probe.Status))."
     ($probe.Body -split "`n") | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" }
-    Write-Hint "Подробности: powershell -File `"$Prefix\scripts\doctor.ps1`""
-    Write-Hint "Журнал службы: powershell -File `"$Prefix\scripts\service.ps1`" -Action logs -Lines 100"
+    Write-Hint "Подробности: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\doctor.ps1`""
+    Write-Hint "Журнал службы: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\service.ps1`" -Action logs -Lines 100"
     exit 1
 } else {
     Write-Err "Сервер не отвечает после обновления (http://$($address.ProbeHost):$($address.Port))."
-    Write-Hint "Журнал службы: powershell -File `"$Prefix\scripts\service.ps1`" -Action logs -Lines 100"
+    Write-Hint "Журнал службы: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\service.ps1`" -Action logs -Lines 100"
     if (Confirm-Action 'Откатиться к предыдущей версии?') {
         & $PSCommandPath -Rollback -Prefix $Prefix -DataDir $DataDir -Yes
         exit 1
     }
-    Write-Hint "Откатиться позже: powershell -File `"$Prefix\scripts\update.ps1`" -Rollback"
+    Write-Hint "Откатиться позже: powershell -ExecutionPolicy Bypass -File `"$Prefix\scripts\update.ps1`" -Rollback"
     exit 1
 }

@@ -23,7 +23,7 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from . import catalog
 from .errors import ConfigError
@@ -32,6 +32,40 @@ from .hardware import detect, recommended_settings
 log = logging.getLogger("asrhub.config")
 
 ENV_PREFIX = "ASRHUB_"
+
+#: Переменные ASRHUB_*, которые не параметры каталога, но и не опечатки: их
+#: читают сервер отдельно (каталог данных, файл настроек, пути к сборкам
+#: whisper.cpp и моделям шумоподавления), сценарии установки и обслуживания,
+#: Compose, агент на АТС и примеры. О похожих на параметр именах из этого
+#: перечня сервер не предупреждает: ASRHUB_ENGINES — список движков
+#: установщика, а не опечатка в ASRHUB_ENGINE.
+СЛУЖЕБНЫЕ_ПЕРЕМЕННЫЕ = frozenset({
+    "data_dir", "hf_token", "api_key", "config", "whisper_cpp", "whisper_cpp_models",
+    "whisper_cpp_vad", "rupunct_onnx", "deepfilter", "arnndn_model",
+    "accel", "agent_key", "assume_yes", "build_accel", "build_profile", "certs",
+    "checklist_title", "data", "data_dir_source", "debug", "default_port", "dkms_src",
+    "dry_run", "engines", "force_gpu_driver", "gid", "host", "https_port", "http_port",
+    "installations", "install_marker", "invocation", "key", "key_file",
+    "launchagents_dir", "lib_dir", "log_file", "max_python", "memory_limit",
+    "min_python", "modules_root", "no_color", "nvidia_dev", "nvidia_lib_glob",
+    "nvidia_proc", "pci_ids", "pci_root", "port", "probe_python", "profile", "python",
+    "python_for_packages", "quiet", "requirements_dir", "restore_from", "retry_label",
+    "rocm_pkg", "rocm_version", "server", "systemd_dir", "systemd_user_dir", "tag",
+    "uid", "url", "version", "vpip", "wait_limit", "workers",
+    # Сценарий отправки звонков из диалплана (agent/asrhub-dialplan): его
+    # настройки живут в /etc/asrhub/dialplan.conf станции, а не у сервера.
+    "send_mode", "send_timeout_s",
+})
+
+
+def _похожий_параметр(имя: str) -> str:
+    """Параметр каталога, на который похоже незнакомое имя переменной, или пусто."""
+    import difflib  # noqa: PLC0415
+
+    if имя in СЛУЖЕБНЫЕ_ПЕРЕМЕННЫЕ or имя in catalog.УБРАННЫЕ:
+        return ""
+    похожие = difflib.get_close_matches(имя, list(catalog.PARAMS_BY_KEY), n=1, cutoff=0.8)
+    return похожие[0] if похожие else ""
 _TRUE = {"1", "true", "yes", "on", "да", "истина"}
 _FALSE = {"0", "false", "no", "off", "нет", "ложь"}
 
@@ -232,11 +266,14 @@ def _приёмники_наружу(значение: Any, for_admin: bool) -> 
     Приёмники пишутся в настройки разделом «Мониторинг» вместе с
     заголовками — а в заголовке Authorization лежит токен InfluxDB или
     Pushgateway. Значения заголовков не отдаются никому (как пароли
-    станций), адрес без учётных данных — всем, кроме администратора.
+    станций). Адрес — целиком только администратору, остальным — схема и
+    узел, как в /api/monitoring/targets: токен входящего адреса чата лежит
+    в пути, и прежняя обрезка одних параметров запроса отдавала его ключу
+    «только чтение».
     """
     if not isinstance(значение, list):
         return значение
-    from .monitoring.pushers import скрыть_адрес  # noqa: PLC0415
+    from .monitoring.pushers import адрес_для_всех  # noqa: PLC0415
 
     наружу = []
     for приёмник in значение:
@@ -247,27 +284,35 @@ def _приёмники_наружу(значение: Any, for_admin: bool) -> 
         if isinstance(копия.get("headers"), dict):
             копия["headers"] = dict.fromkeys(копия["headers"], Settings.ЗАГЛУШКА)
         if not for_admin and копия.get("url"):
-            копия["url"] = скрыть_адрес(str(копия["url"]))
+            копия["url"] = адрес_для_всех(str(копия["url"]))
         наружу.append(копия)
     return наружу
 
 
 def _приёмники_с_заголовками(новые: list[Any], прежние: Any) -> list[Any]:
-    """Возвращает приёмникам заголовки, спрятанные за «***», — по имени."""
-    по_имени = {str(п.get("name") or п.get("kind") or ""): п
-                for п in (прежние if isinstance(прежние, list) else [])
+    """Возвращает приёмникам заголовки, спрятанные за «***», — по имени и адресу.
+
+    Только по имени было нельзя: имя по умолчанию — вид приёмника, и у двух
+    InfluxDB без `name` оно одно, так что первому доставался токен второго.
+    Адрес отличает их; приёмник со сменённым адресом прежнего токена не
+    получает — заглушка остаётся заглушкой и в заголовок не идёт.
+    """
+    def ключ(п: dict[str, Any]) -> tuple[str, str]:
+        return (str(п.get("name") or п.get("kind") or ""), str(п.get("url") or ""))
+
+    по_ключу = {ключ(п): п for п in (прежние if isinstance(прежние, list) else [])
                 if isinstance(п, dict)}
     итог = []
     for приёмник in новые:
         if isinstance(приёмник, dict) and isinstance(приёмник.get("headers"), dict):
-            было = по_имени.get(str(приёмник.get("name") or приёмник.get("kind") or ""), {})
+            было = по_ключу.get(ключ(приёмник), {})
             заголовки_были = было.get("headers") if isinstance(было.get("headers"), dict) else {}
             заголовки = {}
-            for ключ, значение in приёмник["headers"].items():
+            for заголовок, значение in приёмник["headers"].items():
                 if значение != Settings.ЗАГЛУШКА:
-                    заголовки[ключ] = значение
-                elif ключ in заголовки_были:
-                    заголовки[ключ] = заголовки_были[ключ]
+                    заголовки[заголовок] = значение
+                elif заголовок in заголовки_были:
+                    заголовки[заголовок] = заголовки_были[заголовок]
             приёмник = {**приёмник, "headers": заголовки}
         итог.append(приёмник)
     return итог
@@ -316,6 +361,16 @@ class Settings:
     #: Что в конфигурации не сошлось: лишний ключ, значение не того вида.
     #: Сервер при этом работает на умолчаниях — см. `load`.
     problems: list[str] = field(default_factory=list)
+    #: Ключи доступа, пришедшие только из окружения (ASRHUB_API_KEY), и
+    #: токен Hugging Face из окружения. В файл они не пишутся: прежде ключ из
+    #: переменной уходил в config.yaml при создании любого другого ключа, и
+    #: после смены переменной прежний ключ продолжал работать — с ролью admin.
+    api_keys_env: set[str] = field(default_factory=set)
+    hf_token_env: str = ""
+    #: Ключи доступа из файла на момент загрузки — чтобы при записи отличить
+    #: ключ, отозванный здесь, от ключа, который в тот же файл дописал
+    #: соседний сервер (см. `persist_keys`).
+    api_keys_file: set[str] = field(default_factory=set)
 
     # --- доступ ---------------------------------------------------------
 
@@ -338,6 +393,24 @@ class Settings:
             raise ConfigError(msg)
         self.values[key] = value
         self.sources[key] = source
+        if key == "log_level":
+            # Уровень журнала — сразу: «DEBUG на время диагностики» через
+            # «Применить» прежде отвечал «применено» и не действовал до
+            # перезапуска.
+            logging.getLogger("asrhub").setLevel(
+                getattr(logging, str(value).upper(), logging.INFO))
+        if key == "model":
+            # Выбор модели снимает закреплённый движок, который её не умеет:
+            # иначе модель из одного пресета и движок из другого давали
+            # результат не той модели (см. `_модель_и_движок`).
+            движок = str(self.values.get("engine") or "auto")
+            spec = catalog.get_model(str(value))
+            if spec is not None and движок not in ("", "auto") \
+                    and движок not in catalog.engines_for_model(spec):
+                log.info("Движок «%s» не умеет модель «%s» — движок сброшен на auto",
+                         движок, value)
+                self.values["engine"] = "auto"
+                self.sources["engine"] = source
 
     def merged(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
         """Настройки задания поверх серверных, с проверкой значений.
@@ -356,12 +429,45 @@ class Settings:
             свои = catalog.coerce_all(
                 {k: v for k, v in overrides.items()
                  if k in catalog.PARAMS_BY_KEY and not self.чужое_заданию(k, v)})
+            self.выражения_задания(свои)
             errors = catalog.validate_all(свои)
             if errors:
                 raise ConfigError("; ".join(errors))
             self._в_пределах_сервера(свои)
             result.update(свои)
+        _модель_и_движок(result, свои_ключи=set(overrides or {}))
         return result
+
+    def выражения_задания(self, свои: dict[str, Any]) -> None:
+        """Регулярные выражения в словаре замен задания — только серверные.
+
+        Ключ «re:…» словаря замен компилируется и применяется как есть, а
+        модуль `re` при катастрофическом откате не отпускает GIL: одно
+        выражение вида «(\\w+\\s?)+$» на реплике из тридцати слов
+        останавливало весь сервер — HTTP, отметку жизни, все воркеры — на
+        часы, и после перезапуска задание вешало его снова. Принимать такое
+        от любого ключа с правом записи нельзя. Задание может повторить
+        выражения из настроек сервера (интерфейс так и присылает словарь
+        целиком), но своих — не может: их задаёт администратор, и там они
+        ещё и проверяются на вложенные повторы (`safe_regex`).
+        """
+        словарь = (свои or {}).get("glossary")
+        if not isinstance(словарь, dict):
+            return
+        серверный = self.values.get("glossary")
+        серверный = серверный if isinstance(серверный, dict) else {}
+        чужие = sorted(str(ключ) for ключ, значение in словарь.items()
+                       if str(ключ).startswith("re:")
+                       and серверный.get(ключ) != значение)
+        if чужие:
+            raise ConfigError(
+                "Регулярные выражения в словаре замен (ключи «re:») задаются только "
+                "в настройках сервера — их задаёт администратор: "
+                f"{', '.join(чужие[:5])}.",
+                hint="Уберите их из параметров задания или попросите "
+                     "администратора добавить их в словарь замен сервера "
+                     "(«Настройки» → «Постобработка»). Обычные замены слов "
+                     "заданию по-прежнему доступны.")
 
     def _в_пределах_сервера(self, свои: dict[str, Any]) -> None:
         """Тайм-аут и число повторов задания — не больше серверных.
@@ -403,10 +509,15 @@ class Settings:
     #: организации, и каталог обещал «хранится вместе с прочими секретами»,
     #: а GET /api/settings отдавал оба ключу «только чтение». Ссылка на
     #: выгрузку сотрудников открывается без пароля — сама ссылка и есть
-    #: пропуск к списку сотрудников.
+    #: пропуск к списку сотрудников. Адрес уведомлений о тревогах — того же
+    #: рода, что адрес сводки.
     SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token",
                    "llm_api_key", "telephony_secret", "tracker_url",
-                   "crm_url", "crm_token", "employees_url")
+                   "crm_url", "crm_token", "employees_url", "alert_url")
+
+    #: Секреты, которые не отдаются и администратору (см. `to_dict`).
+    СЕКРЕТЫ_ВСЕГДА = ("webhook_secret", "hf_token", "llm_api_key", "telephony_secret",
+                      "crm_token", "crm_url")
 
     #: Что не уносится в параметры задания. Параметры задания — снимок
     #: настроек на момент постановки, и отдаются они владельцу задания:
@@ -422,10 +533,19 @@ class Settings:
     СВОЁ_У_ЗАДАНИЯ = ("webhook_url",)
 
     #: Параметры, которые решает только сервер (см. `_только_серверу`).
-    ТОЛЬКО_СЕРВЕРУ: frozenset[str] = frozenset()
+    #: ClassVar, а не поле: с аннотацией без него dataclass делал перечень
+    #: полем экземпляра с пустым умолчанием, и `self.ТОЛЬКО_СЕРВЕРУ` у
+    #: настроек был пуст — «Сбросить» возвращало адрес АТС к умолчанию.
+    ТОЛЬКО_СЕРВЕРУ: ClassVar[frozenset[str]] = frozenset()
 
     #: Так интерфейс показывает секрет тому, кому его знать не положено.
     ЗАГЛУШКА = "***"
+
+    #: Параметры, которые читаются один раз при запуске: изменение
+    #: сохраняется, но действует со следующего запуска. PUT /api/settings
+    #: называет их в `restart_required` — прежде они уходили в «применено».
+    ПОСЛЕ_ПЕРЕЗАПУСКА = frozenset({"session_ttl_hours", "cors_origins", "webhook_workers",
+                                   "server_host", "server_port", "db_journal_mode"})
 
     @classmethod
     def чужое_заданию(cls, ключ: str, значение: Any) -> bool:
@@ -489,20 +609,64 @@ class Settings:
     ПОЛЯ_СТАНЦИИ_АДМИНУ = ("host", "port", "username", "cdr_file",
                            "recordings_dir", "filename", "owner_map")
 
+    #: Адреса и пути инфраструктуры — не секреты, но и не дело ключа «только
+    #: чтение»: то же, что ПОЛЯ_СТАНЦИИ_АДМИНУ у станций и `paths` у
+    #: раскладки каталогов, только отдельными параметрами. Прежде станция
+    #: в списке прятала адрес АТС, а параметр `telephony_host` рядом его
+    #: отдавал; `paths` скрывались, а `models_dir` и `backup_dir` — нет.
+    АДМИНУ = ("telephony_host", "telephony_username", "telephony_cdr_file",
+              "telephony_recordings_dir", "models_dir", "temp_dir", "backup_dir",
+              "auth_ldap_url", "auth_ldap_base_dn", "auth_ldap_bind_template",
+              "auth_ldap_user_filter", "llm_url")
+
+    #: Секреты, которые не отдаются и администратору: ключ модели, секрет
+    #: подписи, пароль AMI, токен CRM. Каталог обещает «хранится вместе с
+    #: прочими секретами», а GET /api/settings отдавал их открытым текстом.
+    #: Показывать их незачем — их и так знает тот, кто задал, а заглушка
+    #: «***» при сохранении значения не меняет (см. `без_заглушек`).
+    НИКОМУ = ("webhook_secret", "llm_api_key", "telephony_secret", "crm_token")
+
     def to_dict(self, for_admin: bool = False) -> dict[str, Any]:
         """Настройки для выдачи наружу.
 
-        `for_admin` расширяет ответ ровно двумя вещами: раскладкой каталогов
-        и адресами обратных вызовов. Ключи доступа и токен Hugging Face не
+        `for_admin` расширяет ответ параметрами самого сервера (всё, что
+        задание задать не вправе, — `ТОЛЬКО_СЕРВЕРУ`), раскладкой каталогов и
+        адресами обратных вызовов. Ключи доступа и токен Hugging Face не
         отдаются никому и никогда: у токена есть своя ручка, которая
         показывает шесть знаков и длину, а полное значение не нужно даже
-        тому, кто его задал, — он его и так знает.
+        тому, кто его задал, — он его и так знает. То же — с паролем АМИ,
+        ключом модели, токеном и адресом CRM (`СЕКРЕТЫ_ВСЕГДА`).
         """
         values = dict(self.values)
+        sources = dict(self.sources)
         if not for_admin:
-            for key in self.SECRET_KEYS:
+            # Неадминистратору — только то, что задание вправе задать само.
+            # Прятались секреты и `paths`, а остальное уходило целиком: пути на
+            # диске (models_dir, temp_dir, backup_dir — та самая раскладка),
+            # адрес контроллера домена и шаблон присоединения, адрес модели
+            # вместе с «user:pass@», узел и пути АТС, адреса приёмников метрик
+            # с токеном в пути. Из карточки задания эти же параметры убирали
+            # намеренно, а здесь они лежали в одном запросе. Секреты остаются
+            # ключом с заглушкой: интерфейсу нужно знать, что значение задано.
+            # Через класс, а не через self: у экземпляра (это dataclass) поле
+            # ТОЛЬКО_СЕРВЕРУ своё и пустое, перечень заполняется на классе.
+            серверные = type(self).ТОЛЬКО_СЕРВЕРУ
+            values = {к: з for к, з in values.items()
+                      if к not in серверные or к in self.SECRET_KEYS}
+            sources = {к: з for к, з in sources.items() if к in values}
+            for key in (*self.SECRET_KEYS, *self.АДМИНУ):
                 if values.get(key):
-                    values[key] = "***"
+                    values[key] = self.ЗАГЛУШКА
+        else:
+            # Секреты в собственном смысле не отдаются и администратору —
+            # так обещает каталог («не показывается наружу», «показывается
+            # замаскированным»): тот, кто задал, и так его знает, а ответ
+            # оседает в кеше браузера и журналах прокси. Сохранение заглушку
+            # понимает как «не менял» (см. `без_заглушек`). Адреса уведомлений
+            # и трекера администратор видит: он их правит.
+            for key in (*self.СЕКРЕТЫ_ВСЕГДА, *self.НИКОМУ):
+                if values.get(key):
+                    values[key] = self.ЗАГЛУШКА
         # Секреты станций лежат не отдельным ключом, а внутри значения
         # telephony_stations, и перечень SECRET_KEYS до них не доставал:
         # пароль AMI уходил ключу «только чтение» открытым текстом, притом
@@ -516,7 +680,7 @@ class Settings:
                 values["monitoring_targets"], for_admin)
         data = {
             "values": values,
-            "sources": dict(self.sources),
+            "sources": sources,
             # Путь к файлу настроек — путь к файлу, в котором лежат ключи
             # доступа и токен Hugging Face. Соседний GET /api/system прячет
             # его за правами администратора; здесь он уходил любому ключу,
@@ -538,16 +702,32 @@ class Settings:
         return data
 
     def save(self, path: Path | None = None) -> Path:
-        """Сохраняет текущие значения в файл конфигурации."""
+        """Сохраняет в файл конфигурации то, что задано людьми.
+
+        Только значения из файла, из интерфейса и API, из пресетов — не
+        умолчания, не подбор под оборудование и не переменные окружения.
+        Прежде «Сохранить в конфигурацию» записывало всё: секрет подписи из
+        `ASRHUB_WEBHOOK_SECRET`, который каталог велит держать вне файла,
+        `beam_size` из окружения поверх записанного в файле, `device: cpu`
+        и абсолютные каталоги этой машины. В уже существующем файле меняются
+        только эти ключи (`persist_keys`): незнакомые разделы остаются.
+        """
         target = path or self.config_file
         if target is None:
             raise ConfigError("Не задан путь к файлу конфигурации.")
-        target = Path(target)
-        # Сохранения — по одному, от снимка значений до переименования: иначе
-        # второе сохранение, снявшее значения раньше, но записавшее позже,
-        # затирало ключ доступа, только что заведённый первым.
-        with _ЗАМОК_СОХРАНЕНИЯ:
-            return self._save_locked(target)
+        ключи = [ключ for ключ in self.values
+                 if ключ in catalog.PARAMS_BY_KEY and self._своё(ключ)]
+        return self.persist_keys([*ключи, *self.ОСОБЫЕ_ЗАПИСИ], target=Path(target))
+
+    def _своё(self, ключ: str) -> bool:
+        """Задано ли значение людьми (файл, интерфейс, API, пресет), а не взято само."""
+        откуда = str(self.sources.get(ключ) or "default")
+        return not (откуда in ("default", "hardware") or откуда.startswith("env:"))
+
+    def _ключи_в_файл(self) -> dict[str, dict[str, Any]]:
+        """Ключи доступа для записи в файл — без пришедших из окружения."""
+        return {ключ: запись for ключ, запись in self.api_keys.items()
+                if ключ not in self.api_keys_env}
 
     #: Записи файла конфигурации, которые не параметры каталога, но тоже
     #: сохраняются по одной (см. `persist_keys`).
@@ -591,7 +771,22 @@ class Settings:
                              for ключ, значение in raw.items())
             for ключ in keys:
                 if ключ in self.ОСОБЫЕ_ЗАПИСИ:
-                    значение = self.api_keys if ключ == "api_keys" else self.hf_token
+                    if ключ == "api_keys":
+                        # Два сервера над одним файлом затирали ключи друг
+                        # друга: каждый писал свой словарь из памяти. Ключи,
+                        # которых не было при нашей загрузке, — дописаны
+                        # соседом, и они остаются; бывшие при загрузке, но
+                        # пропавшие у нас — отозваны здесь.
+                        в_файле = raw.get("api_keys") if isinstance(raw.get("api_keys"), dict) else {}
+                        значение: Any = {к: з for к, з in в_файле.items()
+                                         if к not in self.api_keys_file and к not in self.api_keys
+                                         and к not in self.api_keys_env}
+                        значение.update(self._ключи_в_файл())
+                        self.api_keys_file = set(значение)
+                    else:
+                        if self.hf_token_env and self.hf_token == self.hf_token_env:
+                            continue        # токен из окружения в файл не пишем
+                        значение = self.hf_token
                     if значение:
                         raw[ключ] = значение
                     else:
@@ -642,7 +837,10 @@ class Settings:
         """Сохранение под `_ЗАМОК_СОХРАНЕНИЯ` — см. `save`."""
         grouped: dict[str, dict[str, Any]] = {}
         for spec in catalog.PARAMS:
-            if spec.key in self.values:
+            # Только заданное людьми (см. `save`): умолчания и подбор под
+            # оборудование в файл не уходят — иначе они переживали переезд
+            # на другую машину и перекрывали её собственный подбор.
+            if spec.key in self.values and self._своё(spec.key):
                 grouped.setdefault(spec.group, {})[spec.key] = self.values[spec.key]
         payload = {
             "_generated": "ASR Hub",
@@ -652,13 +850,13 @@ class Settings:
         # Ключи доступа хранятся в том же файле и не относятся ни к одной
         # группе параметров. Без этой строки сохранение настроек стирало их
         # целиком, и после перезапуска доступ к серверу терялся.
-        if self.api_keys:
-            payload["api_keys"] = self.api_keys
+        if self._ключи_в_файл():
+            payload["api_keys"] = self._ключи_в_файл()
         # Токен Hugging Face — тоже не параметр каталога, и его тоже стирало
         # первое же сохранение: сервер, создавая ключ доступа при первом
         # запуске, переписывал файл и терял записанный установщиком токен.
         # Диаризация после этого падала с «нужен токен» на ровном месте.
-        if self.hf_token:
+        if self.hf_token and self.hf_token != self.hf_token_env:
             payload["hf_token"] = self.hf_token
         return self._write_locked(target, payload)
 
@@ -705,6 +903,67 @@ class Settings:
         return target
 
 
+    def базовые_значения(self) -> tuple[dict[str, Any], dict[str, str]]:
+        """Что дал бы запуск: умолчания, подбор под оборудование, файл, окружение.
+
+        Тот же порядок источников, что у `load`, — без ключей доступа и без
+        создания чего бы то ни было: это эталон для «Сбросить» и для снятия
+        прошлого пресета.
+        """
+        свежие = load(self.config_file, apply_hardware=True, ensure_key=False,
+                      искать_файл=False)
+        return dict(свежие.values), dict(свежие.sources)
+
+    def сбросить(self) -> list[str]:
+        """Возвращает параметры распознавания к тому, что дал бы запуск.
+
+        Прежде каждому ключу ставилось умолчание каталога — мимо файла,
+        окружения и подбора по оборудованию: `auth_enabled` становился
+        True на сервере без ключей (следующий запрос — 401), `models_dir` и
+        `temp_dir` пустели, станции, секреты, LDAP и CRM очищались, а
+        следующее «Сохранить» записывало опустошение в файл. Параметры
+        самого сервера (доступ, каталоги, телефония, интеграции, очередь)
+        сброс не трогает вовсе. Ответ — какие ключи изменились.
+        """
+        значения, источники = self.базовые_значения()
+        изменено: list[str] = []
+        for ключ in catalog.PARAMS_BY_KEY:
+            if ключ in self.ТОЛЬКО_СЕРВЕРУ or ключ in self.НЕ_В_ЗАДАНИИ or ключ not in значения:
+                continue
+            if self.values.get(ключ) != значения[ключ] or self.sources.get(ключ) != источники.get(ключ):
+                self.values[ключ] = значения[ключ]
+                self.sources[ключ] = источники.get(ключ, "default")
+                изменено.append(ключ)
+        return изменено
+
+    def применить_пресет(self, пресет_id: str, значения: dict[str, Any]) -> dict[str, Any]:
+        """Ставит значения пресета, сняв значения прошлого пресета.
+
+        Пресет задаёт только то, что отличается от умолчаний, а писался
+        поверх текущего: после «Колл-центра» и «Совещания» оставались
+        `audio_channels: split`, `vad_min_speech_ms: 200` и `speaker_names:
+        «Оператор, Клиент»` — участники совещания получали имена оператора и
+        клиента. Теперь ключи прошлого пресета, которых нет в новом,
+        возвращаются к тому, что дал бы запуск (см. `базовые_значения`).
+        """
+        прошлые = [ключ for ключ, откуда in self.sources.items()
+                   if str(откуда).startswith("preset:") and ключ not in значения]
+        if прошлые:
+            базовые, источники = self.базовые_значения()
+            for ключ in прошлые:
+                if ключ in базовые:
+                    self.values[ключ] = базовые[ключ]
+                    self.sources[ключ] = источники.get(ключ, "default")
+        применено: dict[str, Any] = {}
+        for ключ, значение in значения.items():
+            try:
+                self.set(ключ, значение, source=f"preset:{пресет_id}")
+                применено[ключ] = значение
+            except ConfigError as exc:
+                log.warning("Пресет %s: параметр %s не применён (%s)",
+                            пресет_id, ключ, exc.message)
+        return применено
+
     def persist_api_keys(self) -> bool:
         """Записывает ключи доступа в файл конфигурации.
 
@@ -730,6 +989,81 @@ class Settings:
 _ЗАМОК_СОХРАНЕНИЯ = threading.Lock()
 
 
+#: Роли ключа доступа.
+_РОЛИ = ("admin", "user", "readonly")
+
+
+def _ключи_доступа(записи: dict[Any, Any], файл: str,
+                   problems: list[str]) -> dict[str, dict[str, Any]]:
+    """Ключи доступа из файла: только годные записи.
+
+    `ah_…: admin` — роль строкой вместо раздела — грузилась без замечаний, а
+    первый же запрос с этим ключом отвечал 500: разбор ждал словарь.
+    Короткая запись принимается как роль; прочее — в `problems`.
+    """
+    итог: dict[str, dict[str, Any]] = {}
+    for ключ, запись in записи.items():
+        if not isinstance(ключ, str) or not ключ.strip():
+            problems.append(f"{файл}: в api_keys ключ «{ключ}» — не строка. Пропущен")
+            continue
+        if isinstance(запись, str) and запись.strip().lower() in _РОЛИ:
+            запись = {"role": запись.strip().lower()}
+        if not isinstance(запись, dict):
+            problems.append(f"{файл}: у ключа доступа «{ключ[:6]}…» вместо раздела с "
+                            "role записано значение. Ключ не действует")
+            continue
+        роль = str(запись.get("role") or "admin").strip().lower()
+        if роль not in _РОЛИ:
+            problems.append(f"{файл}: у ключа доступа «{ключ[:6]}…» неизвестная роль "
+                            f"«{роль}» — допустимы {', '.join(_РОЛИ)}. Ключ не действует")
+            continue
+        итог[ключ] = запись
+    return итог
+
+
+def _модель_и_движок(настройки: dict[str, Any], *, свои_ключи: set[str]) -> None:
+    """Сверяет модель с движком и с тем, исполняется ли она вообще.
+
+    Пару раньше не сверял никто. Все пресеты закрепляют `engine`, быстрый
+    выбор модели при загрузке меняет только `model` — и задание с моделью
+    `gigaam-v3-e2e-rnnt` проходило «готово» с текстом демонстрационного
+    движка: в карточке одна модель, текст — другой. Правило:
+
+    * движок не задан заданием, а модель задана — значит, человек выбрал
+      модель, и закреплённый у сервера чужой движок сбрасывается на auto;
+    * оба заданы явно и не сходятся — отказ с объяснением;
+    * модель вспомогательная или неисполняемая — отказ: прежде такие
+      модели принимались, ставили движок, качали веса и падали на первом
+      задании.
+    """
+    spec = catalog.get_model(str(настройки.get("model") or ""))
+    if spec is None:
+        return                          # неизвестную модель называет реестр движков
+    if not spec.runnable:
+        raise ConfigError(
+            f"Модель «{spec.id}» в задание не берётся: {spec.role_note or 'не исполняется'}.",
+            hint="Выберите модель распознавания из раздела «Модели».")
+    движок = str(настройки.get("engine") or "auto")
+    if движок in ("", "auto"):
+        return
+    допустимые = catalog.engines_for_model(spec)
+    if движок in допустимые:
+        return
+    if движок == "demo" and "engine" in свои_ключи:
+        # Демонстрационный движок, названный заданием ЯВНО, — осознанный
+        # выбор: симуляция под именем любой модели нужна нагрузочным
+        # прогонам и проверкам очереди, и в карточке честно стоит «demo».
+        # Подмена опасна, когда движок унаследован от пресета сервера.
+        return
+    if "engine" not in свои_ключи or "model" not in свои_ключи:
+        настройки["engine"] = "auto"
+        return
+    raise ConfigError(
+        f"Движок «{движок}» не умеет модель «{spec.id}».",
+        hint="Подходят: " + ", ".join(["auto", *допустимые])
+             + ". Не указывайте движок — он возьмётся от модели.")
+
+
 def _целое(значение: Any, умолчание: int) -> int:
     """Целое с честным нулём; мусор — умолчание."""
     if значение is None or значение == "":
@@ -744,7 +1078,13 @@ def _целое(значение: Any, умолчание: int) -> int:
 #: на диске, наблюдение, языковая модель, телефония, CRM, справочник
 #: сотрудников, контроль качества. Задание в них ничего не решает.
 ГРУППЫ_СЕРВЕРА = frozenset({"server", "access", "runtime", "monitoring", "llm",
-                            "llm_queue", "telephony", "crm", "employees", "health"})
+                            "llm_queue", "telephony", "crm", "employees", "health",
+                            # Разбор содержания читает только настройки
+                            # сервера (content_index): `content_script` или
+                            # `content_pause_s` из задания принимались,
+                            # хранились и не действовали, а отпечаток кеша от
+                            # них менялся.
+                            "content"})
 
 #: Параметры сервера в группах, где остальное задание задаёт само: очередь
 #: целиком (предел, число воркеров, политика), хранение и копии, фоновый
@@ -756,6 +1096,15 @@ def _целое(значение: Any, умолчание: int) -> int:
     "backup_enabled", "backup_time", "backup_kind", "backup_keep_days",
     "backup_include_results", "backup_interval_hours", "backup_keep", "backup_dir",
     "content_backfill", "content_backfill_batch", "digest_content",
+    # Имена вспомогательных моделей уходят прямо в загрузчик —
+    # `Pipeline.from_pretrained(имя, token=<токен сервера>)`,
+    # `SortformerEncLabelModel.from_pretrained`, `whisperx.load_align_model`,
+    # аргументы mfa. Это тот же класс, что `models_dir`, закрытый от
+    # заданий в заходе 41: обычный ключ называл чужой репозиторий, и сервер
+    # качал его с токеном Hugging Face сервера и разворачивал (контрольные
+    # точки pyannote и NeMo — это pickle). Выбирать их — дело администратора.
+    "diarization_model", "align_model", "alignment_acoustic_model",
+    "alignment_dictionary",
 })
 
 #: Из группы сервера сессия диктовки вправе задать себе окно гипотез: это
@@ -764,9 +1113,13 @@ def _целое(значение: Any, умолчание: int) -> int:
 
 
 def _только_серверу() -> frozenset[str]:
+    # `server_only` каталога — то же, что КЛЮЧИ_СЕРВЕРА, но объявлено у
+    # самого параметра: имена моделей диаризации и выравнивания уходили
+    # из задания прямо в from_pretrained с токеном сервера — тот же класс
+    # дефекта, что был закрыт для models_dir.
     return frozenset(
         p.key for p in catalog.PARAMS
-        if (p.group in ГРУППЫ_СЕРВЕРА or p.key in КЛЮЧИ_СЕРВЕРА)
+        if (p.group in ГРУППЫ_СЕРВЕРА or p.key in КЛЮЧИ_СЕРВЕРА or p.server_only)
         and p.key not in СВОЁ_У_СЕССИИ and p.key not in Settings.СВОЁ_У_ЗАДАНИЯ)
 
 
@@ -791,7 +1144,26 @@ def _dump_yaml(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+#: Слова, которые YAML 1.1 (его читает PyYAML) понимает не как строку:
+#: `off` — это false, `~` — null. Без кавычек `profanity_filter: off` из
+#: примера конфигурации читался логическим «нет» и не проходил проверку.
+_СЛОВА_YAML = frozenset({"y", "n", "yes", "no", "on", "off", "true", "false",
+                         "null", "none", "~"})
+#: Запись, которую YAML прочтёт числом: в том числе 0x1F, 0o17, .inf и .nan.
+_YAML_NUMBER = re.compile(r"^[-+]?(\.\d+|\d[\d_]*(\.\d*)?)([eE][-+]?\d+)?$|^0[xob][0-9a-fA-F_]+$"
+                          r"|^[-+]?\.(inf|nan)$", re.I)
+
+
 def _yaml_scalar(value: Any) -> str:
+    """Значение для config.yaml, которое PyYAML прочтёт ровно этим значением.
+
+    Строки, которые YAML понял бы иначе — с двоеточием, решёткой, переводом
+    строки, похожие на число или на логическое слово, — пишутся в кавычках
+    через json.dumps: строка JSON — законная строка YAML в двойных кавычках.
+    Раньше перевод строки в значении (`auth_ldap_group_map`, `crm_fields`)
+    уходил в файл как есть, вторая строка оказывалась вне комментария, и
+    пример `--print-config`, который советует doctor.sh, сервер не читал вовсе.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
     if value is None:
@@ -803,9 +1175,31 @@ def _yaml_scalar(value: Any) -> str:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False)
     text = str(value)
-    if text == "" or any(ch in text for ch in ":#{}[]," ) or text.strip() != text:
+    # В кавычки (JSON — подмножество YAML) — всё, что YAML прочёл бы иначе:
+    # перевод строки (вторая строка значения из примера вылезала из
+    # комментария и ломала весь файл), служебные знаки, слова-логические и
+    # запись, похожая на число.
+    if (text == "" or any(ch in text for ch in ":#{}[],&*!|>'\"%@`\n\r\t\\")
+            or text.strip() != text or text[0] in "-?"
+            or text.lower() in _СЛОВА_YAML or _похоже_на_число(text)):
         return json.dumps(text, ensure_ascii=False)
     return text
+
+
+def _похоже_на_число(text: str) -> bool:
+    if _YAML_NUMBER.match(text):
+        return True
+    try:
+        float(text.replace("_", ""))
+    except ValueError:
+        return False
+    return True
+
+
+def _comment_text(value: Any) -> str:
+    """Текст для строки комментария — в одну строку: перевод строки внутри
+    закончил бы комментарий, и остаток стал бы строкой YAML."""
+    return " ".join(str(value).split())
 
 
 def default_data_dir() -> Path:
@@ -867,7 +1261,8 @@ def _видимое(key: str, value: Any) -> str:
 
 
 def load(config_path: str | os.PathLike[str] | None = None,
-         *, apply_hardware: bool = True, ensure_key: bool = True) -> Settings:
+         *, apply_hardware: bool = True, ensure_key: bool = True,
+         искать_файл: bool = True) -> Settings:
     """Собирает конфигурацию из всех источников.
 
     `ensure_key=False` просит ничего не создавать: ни ключа доступа, ни
@@ -892,10 +1287,16 @@ def load(config_path: str | os.PathLike[str] | None = None,
         except Exception:  # определение железа не должно ломать запуск
             hardware_hint = "Не удалось определить оборудование, используются значения по умолчанию."
 
-    cfg_file = find_config_file(config_path)
+    # `искать_файл=False` — только названный файл, без поиска по известным
+    # местам: эталон для сброса берётся из того же файла, что у сервера, а
+    # сервер без файла не должен вдруг найти чужой config.yaml в каталоге.
+    cfg_file = (find_config_file(config_path) if (искать_файл or config_path)
+                else None)
     data_dir_value: str | None = None
     api_keys: dict[str, dict[str, Any]] = {}
     hf_token = ""
+    ключи_окружения: set[str] = set()
+    токен_окружения = ""
 
     if cfg_file is not None:
         try:
@@ -906,11 +1307,23 @@ def load(config_path: str | os.PathLike[str] | None = None,
                 hint="Проверьте синтаксис YAML: отступы пробелами, двоеточие после ключа.",
             ) from exc
         flat: dict[str, Any] = {}
+        if raw is not None and not isinstance(raw, dict):
+            # Файл-список или одно значение: прежде AttributeError на
+            # `.items()` не пускал сервер вовсе.
+            problems.append(f"{cfg_file.name}: ожидается словарь параметров «ключ: "
+                            "значение», а записан список или одно значение. Файл пропущен")
+            raw = {}
         for key, value in (raw or {}).items():
+            if not isinstance(key, str):
+                # «8080:» или «on:» без кавычек — YAML читает число или
+                # логическое, и `key.startswith` ронял запуск.
+                problems.append(f"{cfg_file.name}: ключ «{key}» — не имя параметра "
+                                "(число или да/нет). Пропущен; имя пишется словом")
+                continue
             if key == "data_dir" and isinstance(value, str):
                 data_dir_value = value
             elif key == "api_keys" and isinstance(value, dict):
-                api_keys = value
+                api_keys = _ключи_доступа(value, cfg_file.name, problems)
             elif key == "hf_token" and isinstance(value, str):
                 hf_token = value
             elif isinstance(value, dict) and key in catalog.GROUPS_BY_ID:
@@ -970,12 +1383,26 @@ def load(config_path: str | os.PathLike[str] | None = None,
             continue
         if name == "hf_token":
             hf_token = env_val
+            токен_окружения = env_val
             continue
         if name == "api_key":
+            if env_val not in api_keys:
+                ключи_окружения.add(env_val)
             api_keys.setdefault(env_val, {"role": "admin", "name": "из переменной окружения"})
             continue
         spec = catalog.PARAMS_BY_KEY.get(name)
         if spec is None:
+            # Неизвестный ключ в config.yaml попадает в `problems`, а
+            # неизвестная переменная молча пропускалась: ASRHUB_SERVER_PROT=9000
+            # — сервер на 8080, и нигде ни слова. Сказать нельзя только про
+            # всё подряд: ASRHUB_* читают и сценарии установки, и Compose.
+            # Поэтому — про имя, похожее на параметр каталога, и не из
+            # перечня служебных.
+            похожее = _похожий_параметр(name)
+            if похожее:
+                problems.append(
+                    f"Переменная {env_key}: такого параметра нет — возможно, имелась в "
+                    f"виду {ENV_PREFIX}{похожее.upper()}. Значение не применено")
             continue
         try:
             parsed = _parse_env_value(env_val, spec.type)
@@ -992,6 +1419,19 @@ def load(config_path: str | os.PathLike[str] | None = None,
         values[name] = parsed
         sources[name] = f"env:{env_key}"
 
+    # Ключ, который прежние версии унесли в файл из ASRHUB_API_KEY (его имя —
+    # «из переменной окружения»), действует, только пока переменная та же:
+    # после смены переменной прежний ключ с ролью admin продолжал работать.
+    из_окружения = os.environ.get(f"{ENV_PREFIX}API_KEY", "")
+    for ключ in [к for к, з in api_keys.items()
+                 if isinstance(з, dict) and з.get("name") == "из переменной окружения"]:
+        if ключ == из_окружения:
+            ключи_окружения.add(ключ)
+        else:
+            api_keys.pop(ключ, None)
+            log.warning("Ключ доступа «из переменной окружения» в %s больше не совпадает "
+                        "с ASRHUB_API_KEY и не действует", cfg_file.name if cfg_file else "файле")
+
     paths = Paths.create(data_dir_value or default_data_dir())
 
     if not values.get("models_dir"):
@@ -999,8 +1439,10 @@ def load(config_path: str | os.PathLike[str] | None = None,
     if not values.get("temp_dir"):
         values["temp_dir"] = str(paths.tmp)
 
-    hf_token = hf_token or os.environ.get("HF_TOKEN", "") or os.environ.get(
-        "HUGGING_FACE_HUB_TOKEN", "")
+    if not hf_token:
+        токен_окружения = (os.environ.get("HF_TOKEN", "")
+                           or os.environ.get("HUGGING_FACE_HUB_TOKEN", ""))
+    hf_token = hf_token or токен_окружения
 
     settings = Settings(
         values=values,
@@ -1011,6 +1453,9 @@ def load(config_path: str | os.PathLike[str] | None = None,
         hardware_hint=hardware_hint,
         sources=sources,
         problems=problems,
+        api_keys_env=ключи_окружения,
+        hf_token_env=токен_окружения,
+        api_keys_file=set(api_keys) - ключи_окружения,
     )
     for проблема in problems:
         log.error("Конфигурация: %s", проблема)
@@ -1115,8 +1560,8 @@ def generate_example_config() -> str:
                 lines.append("  # Примеры:")
                 for ex in spec.examples[:3]:
                     val = _yaml_scalar(ex.value)
-                    comment = f"  — {ex.comment}" if ex.comment else ""
-                    lines.append(f"  #   {ex.title}: {val}{comment}")
+                    comment = f"  — {_comment_text(ex.comment)}" if ex.comment else ""
+                    lines.append(f"  #   {_comment_text(ex.title)}: {val}{comment}")
             rng = []
             if spec.minimum is not None:
                 rng.append(f"мин. {spec.minimum:g}")
@@ -1127,7 +1572,7 @@ def generate_example_config() -> str:
             if rng:
                 lines.append(f"  # Диапазон: {', '.join(rng)}")
             if spec.options:
-                opts = ", ".join(str(o["value"]) for o in spec.options)
+                opts = ", ".join(_comment_text(o["value"]) for o in spec.options)
                 lines.append(f"  # Допустимые значения: {opts}")
             lines.append(f"  {spec.key}: {_yaml_scalar(spec.default)}")
     return "\n".join(lines) + "\n"

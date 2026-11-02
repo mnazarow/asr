@@ -825,7 +825,13 @@ def test_настройки_мониторинга_действуют_сразу
              "severity": "critical", "for_seconds": 0}]
     assert client.put("/api/settings", json={"monitoring_rules": своё}).status_code == 200
     правила = client.get("/api/monitoring/alerts/rules").json()["rules"]
-    assert [(п["metric"], п["threshold"]) for п in правила] == [("asrhub_queue_depth", 5.0)]
+    # Заход 54: своё правило ложится поверх каталога, а не вместо него —
+    # оно первое, правило каталога с той же метрикой и важностью заменено,
+    # остальные пороги каталога на месте.
+    assert (правила[0]["metric"], правила[0]["threshold"]) == ("asrhub_queue_depth", 5.0)
+    assert [п for п in правила[1:] if (п["metric"], п["severity"])
+            == ("asrhub_queue_depth", "critical") and not п.get("labels")] == []
+    assert len(правила) > 20
     assert client.put("/api/settings", json={"monitoring_rules": []}).status_code == 200
     assert len(client.get("/api/monitoring/alerts/rules").json()["rules"]) > 20
 

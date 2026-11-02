@@ -28,7 +28,7 @@ from typing import Any
 
 from . import settings_access as S
 from .catalog import get_model
-from .engines import EngineRegistry, Segment
+from .engines import EngineRegistry, Segment, TranscriptionResult
 from .errors import ASRHubError, AudioTooShort, JobCancelled, JobTimeout, NoSpeechDetected
 from .logging_setup import get_logger
 from .pipeline import audio as audio_mod
@@ -185,6 +185,96 @@ def _peak_memory_mb(device: str) -> float:
         return 0.0
 
 
+#: Самый длинный кусок, который конвейер подаёт движку без своей нарезки
+#: (см. `_куски_по_речи`). Тридцать секунд — окно Whisper и предел, на котором
+#: обучены SenseVoice и Moonshine; Omnilingual принимает сорок.
+КУСОК_ПО_РЕЧИ_С = 30.0
+
+
+def _куски_по_речи(engine: Any, spec: Any, settings: dict[str, Any], spans: list[Any],
+                   длительность: float) -> list[Any] | None:
+    """Куски записи для движка, который сам по речи не режет; None — целиком.
+
+    Группа «Поиск речи» заявлена для всех движков, а участки речи до модели
+    доходили у шести из семнадцати: GigaAM, faster-whisper, whisper.cpp,
+    Voxtral, NeMo и демо режут сами, остальным (openai-whisper,
+    Transformers, Vosk, T-one, Qwen3, FunASR, Moonshine, Omnilingual)
+    конвейер отдавал запись целиком — вместе с тишиной, на которой модели
+    семейства Whisper сочиняют текст, и длиннее, чем модель принимает за
+    проход. Теперь таким движкам запись подаётся кусками по найденной речи:
+    соседние участки склеиваются через паузы до секунды, кусок не длиннее
+    `КУСОК_ПО_РЕЧИ_С` и окна модели. Поиск речи выключен — запись целиком,
+    а если она длиннее окна модели, — ровными кусками с перекрытием.
+    """
+    if getattr(engine, "режет_сам", False):
+        return None
+    окно = float(getattr(spec, "max_audio_s", None) or 0.0)
+    предел = min(окно, КУСОК_ПО_РЕЧИ_С) if окно > 0 else КУСОК_ПО_РЕЧИ_С
+    if settings.get("vad_enabled", True) and spans:
+        куски = vad._enforce_max_length([vad.SpeechSegment(float(s.start), float(s.end))
+                                         for s in spans], предел)
+        return vad._merge_adjacent(куски, предел, gap=1.0)
+    if окно > 0 and длительность > окно:
+        return vad.chunk_plan(длительность, {**settings, "vad_max_speech_s": предел}, None,
+                              предел_модели=предел)
+    return None
+
+
+def _распознать_кусками(engine: Any, prepared: Path, settings: dict[str, Any],
+                        куски: list[Any], progress: ProgressFn, workdir: Path,
+                        длительность: float) -> TranscriptionResult:
+    """Распознаёт куски записи по одному и собирает результат в её координатах."""
+    from .pipeline import stitch  # noqa: PLC0415
+
+    сегменты: list[Segment] = []
+    загрузка = 0.0
+    язык = ""
+    сведения: dict[str, Any] = {}
+    замечания: list[str] = []
+    каталог = workdir / "pieces"
+    каталог.mkdir(parents=True, exist_ok=True)
+    всего = max(1, len(куски))
+    try:
+        for номер, кусок in enumerate(куски):
+            if кусок.end - кусок.start < 0.15:
+                continue
+            путь = каталог / f"piece{номер:05d}.wav"
+            audio_mod.slice_wav(prepared, путь, кусок.start, кусок.end)
+
+            def доля(value: float, stage: str, _n: int = номер) -> None:
+                progress((_n + max(0.0, min(1.0, value))) / всего, stage)
+
+            try:
+                ответ = engine.transcribe(путь, settings, доля)
+            finally:
+                путь.unlink(missing_ok=True)
+            загрузка += ответ.model_load_s
+            язык = язык or ответ.language
+            сведения.update(ответ.meta)
+            for замечание in сведения.pop("warnings", None) or []:
+                if замечание not in замечания:
+                    замечания.append(замечание)
+            сдвиг = float(кусок.start)
+            for segment in ответ.segments:
+                segment.start = round(float(segment.start) + сдвиг, 3)
+                segment.end = round(float(segment.end) + сдвиг, 3)
+                for word in segment.words or []:
+                    for key in ("start", "end"):
+                        if isinstance(word.get(key), (int, float)):
+                            word[key] = round(float(word[key]) + сдвиг, 3)
+                сегменты.append(segment)
+    finally:
+        shutil.rmtree(каталог, ignore_errors=True)
+    перекрытие = float(settings.get("chunk_overlap_s") or 0.0)
+    if not (settings.get("vad_enabled", True)) and перекрытие > 0:
+        сегменты = stitch.убрать_повторы(сегменты, перекрытие)
+    if замечания:
+        сведения["warnings"] = замечания
+    сведения["speech_pieces"] = len(куски)
+    return TranscriptionResult(segments=сегменты, language=язык, duration=длительность,
+                               model_load_s=загрузка, meta=сведения)
+
+
 def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry,
                 *, workdir: Path, outdir: Path, basename: str,
                 filename: str = "",
@@ -297,6 +387,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     # не обнаружена в каналах», и отказ «молчат все» написаны для обоих.
     silent_channels: list[str] = list(prepared_audio.silent)
     профили: list[dict[str, Any]] = []
+    # Участки речи всех каналов — для общей доли речи (см. ниже).
+    все_участки: list[tuple[float, float]] = []
+    длина_записи = 0.0
 
     for channel_index, (label, prepared) in enumerate(channels):
         check_cancel()
@@ -311,10 +404,23 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             report(0.14 if channel_index == 0
                    else 0.18 + 0.64 * channel_index / max(1, len(channels)), "поиск речи")
             spans = vad.detect(prepared, settings)
-            speech_stats = vad.speech_statistics(spans, info.duration_s)
+            # Доля речи — от длины ПОДГОТОВЛЕННОГО звука: участки найдены в
+            # нём. От длины исходника она врала при обрезке тишины и при
+            # смене темпа (audio_speed 0,5 давал «речи 120 %»).
+            длина_канала = _длина_wav(prepared) or info.duration_s
+            speech_stats = vad.speech_statistics(spans, длина_канала)
             timer.stop()
             outcome.stats.setdefault("speech", {})[label or "моно"] = speech_stats
-            outcome.stats["speech_ratio"] = speech_stats.get("speech_ratio")
+            все_участки.extend((float(s.start), float(s.end)) for s in spans)
+            длина_записи = max(длина_записи, длина_канала)
+            выбран = str(settings.get("vad_backend") or "auto")
+            найден = str(getattr(spans, "детектор", "") or "")
+            if найден and выбран not in ("auto", "", найден):
+                замечание = (f"Поиск речи: детектор «{выбран}» недоступен, использован "
+                             f"«{найден}». Энергетический порог хуже отличает тихого "
+                             "собеседника от шума — установите набор vad.")
+                if замечание not in outcome.warnings:
+                    outcome.warnings.append(замечание)
         # Профиль звука — по подготовленному каналу и участкам речи: SNR,
         # пик, клиппинг, громкость, тишина. Считается и для молчащего
         # канала: тишина — тоже факт о записи. Сбой замера результат не
@@ -352,10 +458,26 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
 
         # lease() держит модель занятой: пока идёт распознавание, её не
         # выгрузит ни сборщик простоя, ни вытеснение из кеша.
+        ждём_модель = time.monotonic()
         with registry.lease(settings) as engine:
+            # Срок задания — на работу, а не на очередь к модели: lease()
+            # ждёт замок движка без предела, и второй воркер на той же
+            # модели, простояв за длинной записью соседа дольше срока,
+            # получал JobTimeout на первом же докладе — не начав
+            # распознавание и без повтора.
+            if deadline is not None:
+                deadline += time.monotonic() - ждём_модель
             timer.start("inference")
-            result = engine.transcribe(prepared, settings,
-                                       make_progress(channel_index, len(channels)))
+            куски = _куски_по_речи(engine, spec, settings, spans,
+                                   _длина_wav(prepared) or info.duration_s)
+            if куски:
+                result = _распознать_кусками(
+                    engine, prepared, settings, куски,
+                    make_progress(channel_index, len(channels)), workdir,
+                    _длина_wav(prepared) or info.duration_s)
+            else:
+                result = engine.transcribe(prepared, settings,
+                                           make_progress(channel_index, len(channels)))
             timer.stop()
         # Загрузка весов происходит внутри transcribe(), поэтому вычитаем её
         # из времени распознавания: иначе она считалась бы дважды и завышала RTF.
@@ -390,6 +512,13 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
 
     # Текст получен — дальше тайм-аут его не выбрасывает (см. `deadline`).
     распознано = True
+
+    # Доля речи записи — по всем каналам сразу: в какой доле записи говорит
+    # хоть кто-то. Прежде бралась доля последнего канала, и молчащий второй
+    # канал звонка давал «речи 0 %» при говорящем первом.
+    if длина_записи > 0:
+        outcome.stats["speech_ratio"] = round(
+            min(1.0, _длина_объединения(все_участки) / длина_записи), 4)
 
     # Речи нет ни в одном канале — вот это уже отказ. Если молчал только
     # один, отмечаем это предупреждением и работаем с остальными.
@@ -494,7 +623,8 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         outcome.stats["audio_profile"] = профиль
         if audio_profile.is_bad(профиль):
             части = []
-            if профиль.get("snr_db") is not None and профиль["snr_db"] < audio_profile.SNR_ПЛОХОЙ:
+            if (профиль.get("snr_db") is not None and audio_profile.snr_надёжен(профиль)
+                    and профиль["snr_db"] < audio_profile.SNR_ПЛОХОЙ):
                 части.append(f"отношение речи к шуму {профиль['snr_db']:.0f} дБ")
             if (профиль.get("clipping_share") or 0) >= audio_profile.КЛИППИНГ_ПЛОХОЙ:
                 части.append(f"клиппинг {100 * профиль['clipping_share']:.1f} % отсчётов")
@@ -506,6 +636,9 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     timer.start("postprocess")
     report(0.90, "постобработка текста")
     raw_segments = [s.to_dict() for s in all_segments]
+    # Копия текста движка до постобработки — для точности по эталону:
+    # `postprocess.process` меняет тексты прямо в этих словарях.
+    сырые_реплики = [dict(s) for s in raw_segments]
     model_punct = bool(engine_meta.get("punctuation_from_model")) or (
         spec is not None and spec.punctuation)
     try:
@@ -531,6 +664,11 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         postprocess.build_paragraphs(processed, str(settings.get("paragraph_mode") or "speaker")))
     outcome.language = languages[0] if languages else str(settings.get("language") or "")
     outcome.speakers = sorted({s["speaker"] for s in processed if s.get("speaker")})
+    # Замечания постобработки (запасная пунктуация, пропущенные выражения
+    # словаря) — в предупреждения задания, а не в служебную статистику.
+    for замечание in pp_stats.pop("warnings", None) or []:
+        if замечание not in outcome.warnings:
+            outcome.warnings.append(замечание)
     outcome.stats.update(pp_stats)
 
     confidences = [s["confidence"] for s in processed if s.get("confidence") is not None]
@@ -604,11 +742,22 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     if reference:
         # Точность считаем по тексту без меток говорящих: в эталоне их нет,
         # и каждая реплика добавляла две лишние вставки, завышая WER.
+        #
+        # И по тексту ДВИЖКА, до постобработки. Нормализация чисел, словарь
+        # замен, фильтры мата и паразитов меняют слова, а эталон записан
+        # тем, что сказано: безошибочно распознанная фраза с числами
+        # «двадцать пять процентов» против «25 %» давала WER 0,6. Числа
+        # приводятся с обеих сторон одной и той же нормализацией: эталон
+        # бывает записан и цифрами, а модели с готовой пунктуацией сами
+        # пишут цифры.
         plain = "\n\n".join(postprocess.build_paragraphs(
-            processed, str(settings.get("paragraph_mode") or "speaker"),
-            speaker_labels=False))
+            сырые_реплики, "none", speaker_labels=False))
+        эталон = reference
+        if (outcome.language or str(settings.get("language") or "ru")) in ("ru", "auto", ""):
+            эталон = postprocess._builtin_itn_ru(reference)
+            plain = postprocess._builtin_itn_ru(plain)
         try:
-            detail = metrics.detailed(reference, plain)
+            detail = metrics.detailed(эталон, plain)
         except Exception as exc:                            # noqa: BLE001
             log.warning("Точность не рассчитана: %s", exc)
             outcome.warnings.append(f"Точность не рассчитана: {exc}")
@@ -619,7 +768,7 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         try:
             from .pipeline import calibration  # noqa: PLC0415
 
-            outcome.stats["calibration"] = calibration.per_job(processed, reference)
+            outcome.stats["calibration"] = calibration.per_job(сырые_реплики, reference)
         except Exception as exc:                            # noqa: BLE001
             log.warning("Калибровка не рассчитана: %s", exc)
 
@@ -658,7 +807,8 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
             краткое = ""
         if краткое:
             result_payload["summary"] = краткое
-    outcome.files = export.write_all(result_payload, settings, outdir, basename)
+    outcome.files = export.write_all(result_payload, settings, outdir, basename,
+                                     warnings=outcome.warnings)
 
     # Окончательные замеры — уже со временем записи файлов; они уходят в базу
     # и в метрики, где точность важнее совпадения с содержимым файла.
@@ -674,6 +824,30 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
     return outcome
 
 
+def _длина_wav(путь: Path) -> float:
+    """Длительность подготовленного WAV, с; 0 — прочитать не вышло."""
+    import wave  # noqa: PLC0415
+
+    try:
+        with wave.open(str(путь), "rb") as файл:
+            частота = файл.getframerate()
+            return файл.getnframes() / частота if частота else 0.0
+    except (OSError, EOFError, wave.Error):
+        return 0.0
+
+
+def _длина_объединения(отрезки: list[tuple[float, float]]) -> float:
+    """Сколько секунд покрывают отрезки вместе, без двойного счёта наложений."""
+    итог = 0.0
+    конец = float("-inf")
+    for начало, кон in sorted(отрезки):
+        if кон <= конец:
+            continue
+        итог += кон - max(начало, конец)
+        конец = кон
+    return итог
+
+
 def settings_digest(settings: dict[str, Any], *, weights: str = "") -> str:
     """Короткий отпечаток настроек — входит в ключ кеша результатов.
 
@@ -684,7 +858,7 @@ def settings_digest(settings: dict[str, Any], *, weights: str = "") -> str:
     import hashlib
 
     from .catalog import PARAMS_BY_KEY
-    from .config import Settings
+    from .config import СВОЁ_У_СЕССИИ, Settings
 
     # Секреты и параметры сервера в отпечаток не входят: на расшифровку они
     # не влияют, а их присутствие делало отпечаток задания, поставленного
@@ -694,11 +868,18 @@ def settings_digest(settings: dict[str, Any], *, weights: str = "") -> str:
     # Судьба задания — приоритет, повторы, уведомление, удалить ли исходник,
     # искать ли в кеше — на расшифровку тоже не влияет: с ними одна и та же
     # запись переставала находиться в кеше у того же владельца.
+    # Настройки потока (диктовки) файловое распознавание не читает вовсе,
+    # а от них отпечаток менялся: правка порога паузы диктовки — и
+    # «Пропускать дубликаты» промахивался по всему архиву. Окно гипотез
+    # диктовки (`stream_window_s`) числится в группе сервера, но задание
+    # вправе его нести (СВОЁ_У_СЕССИИ) — и оно тоже не про файл. Разбор
+    # содержания — параметры сервера и сюда не входит (см. ГРУППЫ_СЕРВЕРА).
     relevant = {k: v for k, v in sorted(settings.items())
                 if k in PARAMS_BY_KEY and k not in (
                     "priority", "max_retries", "job_timeout_s", "webhook_url",
                     "result_retention_days", "output_formats", "retry_backoff_s",
                     "delete_source_after", "deduplicate_jobs", "webhook_waveform")
+                and PARAMS_BY_KEY[k].group != "streaming" and k not in СВОЁ_У_СЕССИИ
                 and k not in Settings.НЕ_В_ЗАДАНИИ and k not in Settings.ТОЛЬКО_СЕРВЕРУ}
     blob = json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str)
     if weights:

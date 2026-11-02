@@ -7,14 +7,17 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import math
 import re
 import time
 from typing import Any
 
 from .. import __version__
 from .catalog import (
+    GROUPS,
     GROUPS_BY_ID,
     METRICS,
     METRICS_BY_NAME,
@@ -32,12 +35,40 @@ _ESCAPE = str.maketrans({"\\": r"\\", '"': r"\"", "\n": r"\n"})
 _INVALID_NAME = re.compile(r"[^a-zA-Z0-9_:]")
 
 
-def _labels(labels: dict[str, str]) -> str:
+def _labels(labels: dict[str, str], *, openmetrics: bool = False) -> str:
     if not labels:
         return ""
-    inner = ",".join(f'{_INVALID_NAME.sub("_", k)}="{str(v).translate(_ESCAPE)}"'
+    inner = ",".join(f'{_INVALID_NAME.sub("_", k)}="{_значение_метки(k, v, openmetrics)}"'
                      for k, v in sorted(labels.items()))
     return "{" + inner + "}"
+
+
+def _значение_метки(ключ: str, значение: Any, openmetrics: bool) -> str:
+    """Значение метки; `le` в OpenMetrics — каноническим числом с точкой.
+
+    OpenMetrics требует у границы корзины запись числа с плавающей точкой:
+    le="1" эталонный разборщик prometheus_client отвергает, ждёт "1.0".
+    В формате Prometheus граница остаётся как была — смена записи метки
+    разорвала бы уже накопленные ряды.
+    """
+    текст = str(значение)
+    if openmetrics and ключ == "le" and текст not in ("+Inf", "-Inf"):
+        try:
+            текст = repr(float(текст))
+        except ValueError:
+            pass
+    return текст.translate(_ESCAPE)
+
+
+def конечные(samples: list[Sample]) -> list[Sample]:
+    """Только конечные значения — для JSON, OTLP и Influx.
+
+    NaN и ±Inf в этих форматах не числа: json.dumps пишет токены NaN и
+    Infinity, которых нет в стандарте JSON (строгий разборщик отвергает
+    весь снимок, а не одну метрику), а InfluxDB отвергает «value=NaN».
+    Prometheus и OpenMetrics такие значения понимают — там они остаются.
+    """
+    return [s for s in samples if math.isfinite(float(s.value))]
 
 
 def _base_name(name: str) -> str:
@@ -91,7 +122,8 @@ def prometheus(samples: list[Sample], *, openmetrics: bool = False) -> str:
                 lines.append(f"# HELP {family} {help_text}")
                 lines.append(f"# TYPE {family} {kind}")
         for sample in items:
-            lines.append(f"{sample.name}{_labels(sample.labels)} {_format(sample.value)}")
+            lines.append(f"{sample.name}{_labels(sample.labels, openmetrics=openmetrics)} "
+                         f"{_format(sample.value)}")
 
     if openmetrics:
         lines.append("# EOF")
@@ -108,6 +140,7 @@ def json_snapshot(samples: list[Sample], errors: list[str] | None = None,
     """
     from .collector import describe
 
+    samples = конечные(samples)
     payload: dict[str, Any] = {
         "timestamp": time.time(),
         "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -131,7 +164,12 @@ def _influx_tag(value: str) -> str:
     То же и с обратной косой в конце: она экранировала бы наш собственный
     разделитель.
     """
-    text = str(value).replace("\\", "\\\\")
+    # Обратная коса — прямой: удвоенная «\\» в конце значения InfluxDB 1.x
+    # и 2.x разбирают по-разному, и у части разборщиков следующий за ней
+    # разделитель считается экранированным — строка съезжает. Косая в
+    # значении метки бывает только в пути Windows («C:\\data»), и «C:/data»
+    # читается так же.
+    text = str(value).replace("\\", "/")
     for знак in ("\r", "\n", "\t", "\x00"):
         text = text.replace(знак, " ")
     for char in (",", " ", "="):
@@ -147,7 +185,7 @@ def influx_line(samples: list[Sample], *, measurement_prefix: str = "") -> str:
     """
     stamp = int(time.time() * 1_000_000_000)
     lines = []
-    for sample in samples:
+    for sample in конечные(samples):
         name = measurement_prefix + sample.name
         tags = "".join(f",{k}={_influx_tag(v)}"
                        for k, v in sorted(sample.labels.items()) if v != "")
@@ -155,10 +193,40 @@ def influx_line(samples: list[Sample], *, measurement_prefix: str = "") -> str:
     return "\n".join(lines) + "\n"
 
 
+_ЛАТИНИЦЕЙ = dict(zip(
+    "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+    ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o",
+     "p", "r", "s", "t", "u", "f", "kh", "ts", "ch", "sh", "shch", "", "y", "", "e",
+     "yu", "ya"], strict=True))
+
+
 def _графит_часть(value: str) -> str:
-    """Часть имени метрики Graphite: только безопасные знаки."""
-    очищено = re.sub(r"[^0-9A-Za-z_\-]+", "_", value).strip("_")
-    return очищено or "нет"
+    """Часть имени метрики Graphite: латиница, цифры, «_» и «-».
+
+    Кириллица — транслитерацией: прежде всё, кроме латиницы, становилось
+    «_», и имена категорий, которые сервер сам строит из русских подписей
+    («жалоба_на_доставку», «просит_руководителя»), обе давали «нет» —
+    ряды сливались в один. Если что-то всё же пришлось выбросить (иероглифы,
+    знаки), к имени добавляется короткий отпечаток исходного значения,
+    чтобы два разных значения не совпали.
+    """
+    части: list[str] = []
+    выброшено = False
+    for знак in str(value):
+        малая = знак.lower()
+        if малая in _ЛАТИНИЦЕЙ:
+            латиницей = _ЛАТИНИЦЕЙ[малая]
+            части.append(латиницей.upper() if знак.isupper() and латиницей else латиницей)
+        elif re.fullmatch(r"[0-9A-Za-z_\-]", знак):
+            части.append(знак)
+        else:
+            выброшено = выброшено or not знак.isspace() and знак not in "./:"
+            части.append("_")
+    очищено = re.sub(r"_+", "_", "".join(части)).strip("_")
+    if выброшено:
+        отпечаток = hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:6]
+        очищено = f"{очищено}_{отпечаток}" if очищено else отпечаток
+    return очищено or "none"
 
 
 def graphite(samples: list[Sample], *, prefix: str = "asrhub") -> str:
@@ -378,6 +446,7 @@ def otlp_payload(samples: list[Sample], service_name: str = "asrhub",
     stamp = int(time.time() * 1_000_000_000)
     start = int((started_at if started_at is not None else RUNTIME.started_at)
                 * 1_000_000_000)
+    samples = конечные(samples)
     по_имени: dict[str, dict[str, Any]] = {}
     гистограммы: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
 
@@ -637,6 +706,10 @@ def _grafana_target(spec: MetricSpec) -> tuple[str, str, str]:
     return _с_отбором(spec.name, spec.name), подпись, единица
 
 
+#: Сколько рядов на одной панели Grafana: больше — легенда закрывает график.
+РЯДОВ_НА_ПАНЕЛИ = 8
+
+
 def grafana_dashboard(title: str = "ASR Hub") -> dict[str, Any]:
     """Готовая панель Grafana, собранная по группам каталога.
 
@@ -668,20 +741,29 @@ def grafana_dashboard(title: str = "ASR Hub") -> dict[str, Any]:
     y += 4
 
     столбец = 0
-    for group in ("queue", "jobs", "performance", "quality", "resources", "storage",
-                  "api", "errors", "webhooks", "content"):
+    # Все группы каталога, в его порядке: прежде список был свой, без service
+    # и models, и их метрики (кроме двух плиток «Состояния») на панель не
+    # попадали вовсе.
+    for group in (g["id"] for g in GROUPS):
         по_единице: dict[str, list[tuple[str, str]]] = {}
         for spec in METRICS:
             if spec.group != group or spec.type == "info" or spec.deprecated_for:
                 continue
             выражение, подпись, единица = _grafana_target(spec)
             по_единице.setdefault(единица, []).append((выражение, подпись))
-        for единица, запросы in по_единице.items():
-            запросы = запросы[:8]
+        # Длинный набор — на несколько панелей по восемь рядов, а не срез
+        # первых восьми: «[:8]» молча выбрасывал остальное (на панели не было
+        # asrhub_content_pending и ещё шести метрик «Содержания»).
+        наборы = [(единица, все[с:с + РЯДОВ_НА_ПАНЕЛИ], с // РЯДОВ_НА_ПАНЕЛИ + 1,
+                   len(все) > РЯДОВ_НА_ПАНЕЛИ)
+                  for единица, все in по_единице.items()
+                  for с in range(0, len(все), РЯДОВ_НА_ПАНЕЛИ)]
+        for единица, запросы, часть, частей_много in наборы:
             panels.append({
                 "type": "timeseries",
                 "title": f"{GROUPS_BY_ID[group]['title']} — "
-                         f"{_UNIT_TITLES.get(единица, единица)}",
+                         f"{_UNIT_TITLES.get(единица, единица)}"
+                         + (f" ({часть})" if частей_много else ""),
                 "description": GROUPS_BY_ID[group]["description"],
                 "datasource": _DS,
                 "gridPos": {"h": 8, "w": 12, "x": столбец, "y": y},

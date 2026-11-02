@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -33,8 +34,11 @@ from .deps import (
 router = APIRouter(prefix="/api/content", tags=["Аналитика записей"])
 
 #: Сколько записей можно пересчитать одним запросом. Пересчёт по списку идёт
-#: прямо в обработчике, синхронно, — по семь-восемь миллисекунд на запись;
-#: пятьсот штук это уже четыре секунды в одном запросе.
+#: прямо в обработчике, синхронно: обычный звонок в тысячу слов — десятки
+#: миллисекунд, часовой разговор — до секунды (с наборами в двести
+#: категорий — дольше), и сотня записей — уже секунды в одном запросе.
+#: Сверх предела записи не теряются молча: ответ называет, сколько их
+#: осталось (`skipped`).
 ПРЕДЕЛ_ПЕРЕСЧЁТА = 100
 
 #: Периоды разрезов — те же, что в аналитике сервера.
@@ -78,6 +82,10 @@ def _insights(request: Request) -> Insights:
     state = get_state(request)
     свод = Insights(state.db, _index(request))
     свод._окна = {}
+    # Имена из справочника сотрудников — под той же настройкой, что в
+    # карточке звонка и в списке под числом (`employees_match_ext`).
+    настройки = getattr(state, "settings", None)
+    свод.имена = bool(настройки.get("employees_match_ext", True)) if настройки else True
     return свод
 
 
@@ -495,6 +503,13 @@ def categories_check(request: Request, body: dict[str, Any] = Body(default={}),
     набор = body.get("categories")
     if набор is not None and not isinstance(набор, list):
         raise error_response(ConfigError("Поле categories должно быть списком."))
+    # Предел — до применения, а не после: набор из тела прогоняется по
+    # записи целиком, и десять тысяч категорий в черновике занимали поток
+    # запроса на минуты, чтобы в конце сообщить «категорий больше 200».
+    if набор is not None and len(набор) > категории.МАКС_КАТЕГОРИЙ:
+        raise error_response(ConfigError(
+            f"Категорий больше {категории.МАКС_КАТЕГОРИЙ}: такой набор не сохранить, "
+            f"и проверять его незачем."))
     индекс = _index(request)
     сегменты = _реплики_записи(state, задание)
     # Стороны — те же, что у разбора записи: оператор из настройки (у
@@ -648,6 +663,7 @@ def recompute(request: Request, body: dict[str, Any] = Body(default={}),
                 "Поле job_ids должно быть списком идентификаторов."))
         state = get_state(request)
         разрешённые = []
+        сверх = max(0, len(задания) - ПРЕДЕЛ_ПЕРЕСЧЁТА)
         for job_id in [str(j) for j in задания][:ПРЕДЕЛ_ПЕРЕСЧЁТА]:
             задание = state.db.get_job(job_id)
             if задание:
@@ -655,8 +671,9 @@ def recompute(request: Request, body: dict[str, Any] = Body(default={}),
                 разрешённые.append(job_id)
         # Пустой список после отсева — это «нечего пересчитывать», а не
         # «пересчитать всё».
-        return {"recomputed": 0, "queued": 0} if not разрешённые \
-            else _index(request).recompute(разрешённые)
+        итог = ({"recomputed": 0, "queued": 0} if not разрешённые
+                else _index(request).recompute(разрешённые))
+        return {**итог, "skipped": сверх, "limit": ПРЕДЕЛ_ПЕРЕСЧЁТА} if сверх else итог
     require_admin(principal)
     return _index(request).recompute()
 
@@ -703,7 +720,7 @@ def export(request: Request,
 
 @router.get("/discover", summary="Темы без правил: о чём говорят, а правила нет")
 def discover_topics(request: Request, period: str = ПЕРИОД,
-                  threshold: float = Query(default=0.0, ge=0.0, le=0.95),
+                  threshold: float = Query(default=0.0, ge=0.0, le=0.8),
                   min_size: int = Query(default=0, ge=0, le=500),
                   name: bool = Query(default=True),
                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
@@ -715,7 +732,11 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
     двухсот разговоров, у которых не сработало ни одной категории.
 
     Считается по требованию, а не фоном: проход по архиву стоит секунд, а
-    смотрят этот отчёт раз в неделю.
+    смотрят этот отчёт раз в неделю. Тот же ответ на тот же вопрос в
+    пределах `СРОК_ТЕМ` берётся готовым: кнопку жмут по нескольку раз, а
+    каждый раз — проход по таблице основ и до двадцати вызовов модели.
+    Названия моделью — только ключу с правом записи: ключ «только чтение»
+    тратил видеокарту, общую с разбором записей.
     """
     from .. import topics as темы_модуль  # noqa: PLC0415
 
@@ -724,6 +745,13 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
     свод = _insights(request)
     начало, _ = свод.window(period)
     владелец = scope_owner(principal)
+    name = bool(name and principal.can_write)
+    ключ = (period, tuple(владелец) if isinstance(владелец, list) else владелец,
+            threshold, min_size, name)
+    with _ТЕМЫ_ЗАМОК:
+        готовое = _ТЕМЫ.get(ключ)
+        if готовое and time.time() - готовое[0] < СРОК_ТЕМ:
+            return готовое[1]
 
     записи = состояние.db.terms_matrix(since=начало, owner=владелец)
     частоты, корпус = индекс.corpus_frequency()
@@ -740,12 +768,16 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
     if name and клиент is not None and getattr(клиент, "enabled", False):
         # Выдержки нужны только для названия, поэтому поднимаются лишь у тех
         # записей, что пойдут в подсказку: по три на тему, а не весь архив.
+        from ..content import masking  # noqa: PLC0415
+
         нужные = [ид for тема in найденные for ид in тема.jobs[:3]]
         тексты = {}
         for ид in нужные:
             задание = состояние.db.get_job(ид)
             if задание:
-                тексты[ид] = str(задание.get("text") or "")[:1200]
+                # Выдержка уходит в подсказку модели — обезличенной: модели
+                # для названия темы нужны слова разговора, а не номер карты.
+                тексты[ид] = masking.mask_text(str(задание.get("text") or "")[:1200])
 
         def спросить(подсказка: str) -> str:
             return клиент.chat(
@@ -753,10 +785,12 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
                 подсказка, kind="topic_name", json_mode=False, max_tokens=40)
 
         темы_модуль.назвать(найденные, спросить, тексты)
-        назвали = True
+        # «Названо моделью» — когда она назвала хоть одну тему, а не когда её
+        # спросили: лежащая модель давала true при названиях по словам.
+        назвали = any(т.title for т in найденные)
 
     всего = len(записи)
-    return _с_окном(свод, period, {
+    ответ = _с_окном(свод, period, {
         "period": period, "since": начало,
         "records": всего,
         "topics": [т.to_dict(всего) for т in найденные],
@@ -766,3 +800,17 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
         "threshold": threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
         "min_size": min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ,
     })
+    with _ТЕМЫ_ЗАМОК:
+        _ТЕМЫ[ключ] = (time.time(), ответ)
+        # Старые ответы — вон: ключей немного, но копить их незачем.
+        for старый in [к for к, (когда, _) in _ТЕМЫ.items()
+                       if time.time() - когда >= СРОК_ТЕМ]:
+            _ТЕМЫ.pop(старый, None)
+    return ответ
+
+
+#: Сколько живёт готовый ответ «Тем без правил». Темы за неделю за пять
+#: минут не меняются, а пересчёт — проход по таблице основ и вызовы модели.
+СРОК_ТЕМ = 300.0
+_ТЕМЫ: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_ТЕМЫ_ЗАМОК = threading.Lock()

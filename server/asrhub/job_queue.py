@@ -78,6 +78,64 @@ def движок_задания(settings: dict[str, Any]) -> str:
     return spec.engine if spec is not None else ""
 
 
+def _важность(priority: int | None, settings: dict[str, Any]) -> int:
+    """Важность задания в пределах 0–100 — из аргумента или из параметров."""
+    try:
+        значение = int(priority if priority is not None else settings.get("priority", 50))
+    except (TypeError, ValueError):
+        значение = 50
+    return max(0, min(100, значение))
+
+
+def разобрать_срок(значение: Any, *, сейчас: float | None = None) -> float | None:
+    """Срок выполнения задания — в секунды эпохи. None — срока нет.
+
+    Политике «По сроку выполнения» (`scheduling_policy: deadline`) неоткуда
+    было взять срок: колонку заполнял только аргумент `submit`, а его не
+    передавал ни один вызывающий, и политика всегда была «по приоритету».
+    Срок принимается так, как его напишет человек или интеграция:
+
+    * секунды эпохи — `1767225600`;
+    * время ISO-8601 — `2026-11-01T18:00:00+03:00` (без пояса — местное);
+    * относительно сейчас — `+30` (минут), `30m`, `2h`, `1d`.
+    """
+    if значение is None or значение == "":
+        return None
+    момент = time.time() if сейчас is None else float(сейчас)
+    if isinstance(значение, (int, float)) and not isinstance(значение, bool):
+        число = float(значение)
+        if число <= 0:
+            return None
+        return число if число > 1e9 else момент + число * 60
+    текст = str(значение).strip().lower()
+    import re  # noqa: PLC0415
+
+    относительный = re.fullmatch(r"\+?\s*(\d+(?:[.,]\d+)?)\s*(m|min|мин|h|ч|d|д)?", текст)
+    if относительный and (текст.startswith("+") or относительный.group(2)):
+        число = float(относительный.group(1).replace(",", "."))
+        множитель = {"h": 3600, "ч": 3600, "d": 86400, "д": 86400}.get(
+            относительный.group(2) or "m", 60)
+        return момент + число * множитель
+    try:
+        число = float(текст.replace(",", "."))
+    except ValueError:
+        число = None
+    if число is not None:
+        if число <= 0:
+            return None
+        return число if число > 1e9 else момент + число * 60
+    from datetime import datetime  # noqa: PLC0415
+
+    try:
+        разобрано = datetime.fromisoformat(str(значение).strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ConfigError(
+            f"Срок выполнения «{значение}» не разобран.",
+            hint="Принимаются секунды эпохи, время ISO-8601 (2026-11-01T18:00:00+03:00) "
+                 "или «через сколько»: +30 (минут), 30m, 2h, 1d.") from exc
+    return разобрано.timestamp()
+
+
 #: Кто мы такие среди серверов на общей базе (см. `instance`). Имя
 #: сохранено здесь же: на него ссылается и код, и тесты.
 INSTANCE_ID = _INSTANCE_ID
@@ -118,6 +176,51 @@ ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY, STATUS_PAUSED)
 EMPTY_STATUSES = (STATUS_NO_SPEECH, STATUS_SHORT)
 #: Все конечные состояния: дальше задание само никуда не двинется.
 FINISHED_STATUSES = (STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, *EMPTY_STATUSES)
+
+#: Паузы между заходами доставки уведомления, секунд. Уведомление — это
+#: состояние задания (`webhook_status`), а не разовая попытка: заход —
+#: несколько быстрых попыток подряд (на мгновенный сбой сети), а неудачный
+#: заход переносится на следующую паузу из этого списка — их досылает
+#: служебный цикл, в том числе после перезапуска. Прежде всё укладывалось в
+#: пять попыток за пятнадцать секунд, и минутная недоступность приёмника,
+#: остановка сервера посреди доставки или отказ instance_lost означали, что
+#: результат не придёт никогда: интеграция phone_asr ждёт обратный вызов как
+#: единственный канал результата. Последняя пауза — через сутки.
+ПАУЗЫ_УВЕДОМЛЕНИЯ = (60.0, 300.0, 900.0, 1800.0, 3600.0, 3 * 3600.0, 6 * 3600.0,
+                     12 * 3600.0, 24 * 3600.0)
+#: Попыток в одном заходе доставки и паузы между ними.
+ПОПЫТОК_ЗА_ЗАХОД = 3
+#: На сколько секунд заход доставки «берёт» уведомление себе. Дольше —
+#: значит, процесс умер посреди доставки, и уведомление снова ждёт.
+СРОК_ЗАХОДА_ДОСТАВКИ_С = 300.0
+
+#: Флаг «очередь приостановлена» в `kv`. Пауза жила в памяти одного
+#: процесса: перезапуск снимал её молча, а на общей базе «Приостановить»
+#: через балансировщик останавливало один сервер из нескольких.
+КЛЮЧ_ПАУЗЫ = "queue.paused"
+#: Как часто воркеры перечитывают флаг паузы из базы, секунд.
+ПАУЗА_ПЕРЕЧИТАТЬ_С = 2.0
+
+#: Не чаще, чем раз в столько секунд, доклад прогресса пишется в базу (смена
+#: стадии пишется всегда). Запись на каждый кусок звука — в режиме журнала
+#: отката на сетевом хранилище это fsync на каждый кусок.
+ПРОГРЕСС_В_БАЗУ_С = 1.0
+
+#: Через сколько секунд своё задание «выполняется» без живого исполнителя в
+#: этом процессе возвращается в очередь (см. `_сверить_свои`). С запасом на
+#: зазор между захватом задания и пометкой «идёт».
+СИРОТА_ЧЕРЕЗ_С = 2 * HEARTBEAT_S
+
+#: Временные файлы старше этого в каталоге временных файлов сервера —
+#: брошенные: падение процесса посреди задания, выгрузка DOCX, черновики
+#: копий. Рабочие каталоги идущих заданий не трогаются никогда.
+ВОЗРАСТ_ВРЕМЕННЫХ_С = 86400.0
+
+#: Начала имён во временном каталоге, которые даёт сам сервер: рабочие
+#: каталоги и выгрузки заданий, приём записей по ссылке (phone_asr), поток
+#: диктовки, распаковка копий, временные каталоги движков.
+СВОИ_ВРЕМЕННЫЕ = ("job_", "phone-", "stream-", "asrhub-", "nemo-", "gigaam-",
+                  "voxtral-", "whispercpp-")
 
 #: Код «отказа» процессора → итог без расшифровки. Процессор сообщает о
 #: молчащей и о короткой записи исключением — это единственный способ
@@ -204,12 +307,63 @@ def _адреса_узла(host: str) -> list[Any]:
 
 
 def _внутренний(address: Any) -> bool:
-    """Адрес смотрит внутрь: сам сервер, локальная сеть, служебные диапазоны."""
+    """Адрес смотрит внутрь: сам сервер, локальная сеть, служебные диапазоны.
+
+    Наружу — только глобальные адреса (`is_global`). Набор отдельных
+    признаков (частный, петля, служебный…) не покрывал 100.64.0.0/10 —
+    общий адрес провайдера, где в том числе живут метаданные Alibaba Cloud
+    (100.100.100.200), — и такие адреса считались внешними.
+    """
     mapped = getattr(address, "ipv4_mapped", None)
     if mapped is not None:
         address = mapped
-    return bool(address.is_loopback or address.is_private or address.is_link_local
-                or address.is_reserved or address.is_multicast or address.is_unspecified)
+    return bool(not address.is_global or address.is_loopback or address.is_private
+                or address.is_link_local or address.is_reserved or address.is_multicast
+                or address.is_unspecified)
+
+
+def _класс_с_проверкой(базовый: Any, допуск: Callable[[Any, int], None]) -> Any:
+    """Класс соединения http.client, который сам узнаёт адрес и проверяет его.
+
+    Проверка адреса и соединение узнавали имя каждый своё: между ними ответ
+    DNS мог смениться (имя с TTL 0 — сначала внешний адрес, при соединении
+    127.0.0.1 или 169.254.169.254), и запрос уходил внутрь, а поле
+    webhook_status отвечало, дошёл ли он. Здесь имя узнаётся один раз, все
+    его адреса проверяются, и соединение идёт на тот же, проверенный, адрес.
+    Имя узла остаётся прежним в заголовке Host и в SNI: соединение HTTPS
+    поверх этого сокета строит сам http.client.
+    """
+    import ipaddress
+    import socket
+
+    class Проверенное(базовый):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._create_connection = self._проверенное_соединение
+
+        def _проверенное_соединение(self, address: tuple[str, int],
+                                    timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,  # noqa: SLF001
+                                    source_address: Any = None) -> Any:
+            host, port = address
+            ответы = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            for *_, адрес_сокета in ответы:
+                допуск(ipaddress.ip_address(str(адрес_сокета[0]).split("%", 1)[0]), port)
+            ошибка: OSError | None = None
+            for семейство, тип, протокол, _, адрес_сокета in ответы:
+                сокет = socket.socket(семейство, тип, протокол)
+                try:
+                    if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:  # noqa: SLF001
+                        сокет.settimeout(timeout)
+                    if source_address:
+                        сокет.bind(source_address)
+                    сокет.connect(адрес_сокета)
+                    return сокет
+                except OSError as exc:
+                    ошибка = exc
+                    сокет.close()
+            raise ошибка or OSError(f"Не удалось соединиться с {host}")
+
+    return Проверенное
 
 
 def открыватель_наружу(allow_internal: bool = False,
@@ -221,6 +375,7 @@ def открыватель_наружу(allow_internal: bool = False,
     сходить туда самому, а поле webhook_status работало оракулом. `проверка`
     заменяет проверку по умолчанию — у маршрута /process-call она своя.
     """
+    import http.client
     import urllib.request
 
     def проверить(адрес: str) -> None:
@@ -229,12 +384,47 @@ def открыватель_наружу(allow_internal: bool = False,
         else:
             check_outbound_url(адрес, allow_internal)
 
+    def допуск(адрес: Any, порт: int) -> None:
+        # Тот же закон, что у проверки адреса, — но для адреса, на который
+        # соединение пойдёт на самом деле (см. `_класс_с_проверкой`).
+        запись = f"[{адрес}]" if getattr(адрес, "version", 4) == 6 else str(адрес)
+        проверить(f"http://{запись}:{порт}/")
+
     class Проверенные(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
             проверить(newurl)
+            # POST остаётся POST с тем же телом и заголовками (смысл 307/308).
+            # urllib на 301/302/303 превращал его в GET без тела, а ответ 200
+            # финального адреса записывался как `ok:200`: адрес http://,
+            # который прокси переводит на https://, или путь без завершающей
+            # косой (APPEND_SLASH) — и приёмник получал пустой GET, а сервер
+            # считал, что уведомление дошло.
+            if req.get_method() == "POST" and code in (301, 302, 303, 307, 308):
+                return urllib.request.Request(
+                    newurl.replace(" ", "%20"), data=req.data,
+                    headers=dict(req.headers), method="POST",
+                    origin_req_host=req.origin_req_host, unverifiable=True)
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    return urllib.request.build_opener(Проверенные)
+    def через_прокси(req: Any) -> bool:
+        # Через прокси имя узнаёт прокси, а не мы: соединение идёт к нему, и
+        # закрепить адрес назначения здесь нечем. Остаётся проверка адреса
+        # до отправки — как и раньше.
+        return bool(getattr(req, "_tunnel_host", None)) or req.has_proxy()
+
+    class ПроверенныйHTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):  # noqa: ANN001
+            класс = (http.client.HTTPConnection if через_прокси(req)
+                     else _класс_с_проверкой(http.client.HTTPConnection, допуск))
+            return self.do_open(класс, req)
+
+    class ПроверенныйHTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):  # noqa: ANN001
+            класс = (http.client.HTTPSConnection if через_прокси(req)
+                     else _класс_с_проверкой(http.client.HTTPSConnection, допуск))
+            return self.do_open(класс, req, context=self._context)
+
+    return urllib.request.build_opener(Проверенные, ПроверенныйHTTP, ПроверенныйHTTPS)
 
 
 def _внутри(корень: Path, путь: str) -> Path | None:
@@ -247,6 +437,30 @@ def _внутри(корень: Path, путь: str) -> Path | None:
     except OSError:
         return None
     return итог if база in итог.parents else None
+
+
+def _для_владельца(error: ASRHubError) -> dict[str, Any]:
+    """Ошибка в том виде, в каком её видит владелец задания: без сырой причины.
+
+    `to_dict()` кладёт в `cause` текст исключения как есть — с полными путями
+    к весам модели и к каталогу загрузок. Он уходил в событие задания и по
+    WebSocket владельцу, в обход `без_путей()`, который введён именно против
+    показа раскладки хранилища. Причина целиком — в журнале сервера, с
+    трассировкой (см. `_трассировка`).
+    """
+    данные = error.to_dict()
+    данные.pop("cause", None)
+    return данные
+
+
+def _трассировка(error: ASRHubError) -> Any:
+    """Что передать `exc_info`: исходное исключение с трассировкой, если оно есть."""
+    причина = getattr(error, "cause", None)
+    if isinstance(причина, BaseException):
+        return (type(причина), причина, причина.__traceback__)
+    if error.__traceback__ is not None:
+        return (type(error), error, error.__traceback__)
+    return None
 
 
 @dataclass
@@ -329,6 +543,16 @@ class JobQueue:
         #: попадает раньше захвата, и отметка жизни по нему сочла бы
         #: незахваченное задание отобранным.
         self._идут: set[str] = set()
+        #: Владелец каждого идущего задания — для справедливого разделения:
+        #: нагрузку владельца больше не нужно поднимать из базы под общей
+        #: блокировкой очереди по запросу на каждое идущее задание.
+        self._чьи_идут: dict[str, str] = {}
+        #: Когда в последний раз начиналось задание каждого владельца (по
+        #: монотонным часам процесса) — кого обслуживали давнее всех.
+        self._последний_старт: dict[str, float] = {}
+        #: Потоки воркеров по номеру — чтобы поднять заново умерший.
+        self._потоки: dict[int, threading.Thread] = {}
+        self._пауза_прочитана = 0.0
         self._started = False
 
     @property
@@ -371,13 +595,15 @@ class JobQueue:
             return
         count = int(workers or self.settings.get("max_concurrent_jobs") or 2)
         self.recover()
+        self._пауза_из_базы(сразу=True)
+        try:
+            self._подмести_временные(при_запуске=True)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Временные файлы прежнего запуска не убраны: %s", exc)
         self._states = {i: WorkerState(index=i) for i in range(count)}
         self._worker_count = count
         for index in range(count):
-            thread = threading.Thread(target=self._worker_loop, args=(index,),
-                                      name=f"asrhub-worker-{index}", daemon=True)
-            thread.start()
-            self._workers.append(thread)
+            self._поднять_воркера(index)
         janitor = threading.Thread(target=self._janitor_loop, name="asrhub-janitor", daemon=True)
         janitor.start()
         self._workers.append(janitor)
@@ -391,6 +617,17 @@ class JobQueue:
         self._workers.append(heartbeat)
         self._started = True
         log.info("Очередь запущена: воркеров %d", count)
+        # Уведомления, не дошедшие до прошлой остановки, — сразу, не дожидаясь
+        # первого оборота служебного цикла.
+        self._дослать_уведомления()
+
+    def _поднять_воркера(self, index: int) -> None:
+        """Заводит поток воркера с этим номером. Под общей блокировкой или до запуска."""
+        thread = threading.Thread(target=self._worker_loop, args=(index,),
+                                  name=f"asrhub-worker-{index}", daemon=True)
+        thread.start()
+        self._workers.append(thread)
+        self._потоки[index] = thread
 
     def stop(self, timeout: float = 10.0) -> None:
         """Останавливает очередь. Недосчитанное возвращается без траты попытки.
@@ -432,8 +669,23 @@ class JobQueue:
         return вернулось
 
     def _вернуть_свои_при_остановке(self) -> int:
+        """Все свои «выполняется» — обратно в очередь без траты попытки.
+
+        Не только те, что в `_идут`: задание, чью завершающую запись не
+        удалось сделать (диск полон, база занята дольше busy_timeout), уже
+        не числится ни у одного воркера, а в базе — «выполняется, 100 %»
+        за этим экземпляром. Раньше остановка его не видела, и запуск
+        списывал попытку.
+        """
         with self._lock:
-            свои = list(self._идут)
+            свои = set(self._идут)
+        try:
+            for строка in self.db.query(
+                    "SELECT id FROM jobs WHERE status=? AND instance_id=?",
+                    (STATUS_RUNNING, INSTANCE_ID)):
+                свои.add(str(строка["id"]))
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Свои идущие задания не перечислены: %s", exc)
         return sum(1 for job_id in свои if self._вернуть_в_очередь_без_попытки(job_id))
 
     def recover(self) -> int:
@@ -497,6 +749,7 @@ class JobQueue:
                 job_id, [STATUS_RUNNING],
                 status=STATUS_FAILED, finished_at=now(), stage="ошибка",
                 progress=0.0, instance_id=None, heartbeat_at=None,
+                **self._уведомление_ждёт(строка, кроме_отката=True),
                 error_code="instance_lost",
                 error_message=(f"Сервер перезапускался посреди этого задания "
                                f"{retries + 1} раз подряд — оно снято."),
@@ -511,6 +764,8 @@ class JobQueue:
                 self.db.add_event(job_id, "failed",
                                   f"Задание снято: сервер перезапускался посреди него "
                                   f"{retries + 1} раз подряд")
+                self._итог_потерянного(job_id, "Повторное распознавание не удалось: "
+                                               "сервер перезапускался посреди него")
             return
         вернулось = self.db.update_job_if_status(
             job_id, [STATUS_RUNNING],
@@ -521,6 +776,28 @@ class JobQueue:
             self.db.add_event(job_id, "recovered",
                               f"Задание возвращено в очередь после перезапуска сервера "
                               f"(попытка {retries + 1} из {предел})")
+
+    def _итог_потерянного(self, job_id: str, причина: str) -> None:
+        """После снятия задания с «instance_lost»: прежний результат или уведомление.
+
+        Обе ветки instance_lost (здесь и у брошенных соседями) не делали ни
+        того, ни другого. Повтор готового задания, на котором процесс падал
+        (убит по нехватке памяти), оставлял задание «ошибкой», а готовая
+        расшифровка лежала в `results/<id>.prev`; обычное задание кончалось
+        без обратного вызова, и интеграция ждала его вечно.
+        """
+        # Сбой здесь не должен срывать подбор остальных заданий: снятие уже
+        # записано, а уведомление, заведённое той же записью, дошлёт
+        # служебный цикл.
+        try:
+            if self._вернуть_прежний(job_id, причина, ожидаемые=[STATUS_FAILED]):
+                # Откат — не итог для заказчика: уведомление не уходит, как и
+                # при обычной неудаче повтора (см. `_уведомление_ждёт`).
+                return
+            self._send_webhook(job_id)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Итог снятого задания %s не доведён: %s", job_id, exc,
+                        extra={"job_id": job_id})
 
     # --- добавление -----------------------------------------------------
 
@@ -540,6 +817,7 @@ class JobQueue:
         if target:
             target = self._check_webhook_url(target)
         webhook_url = target
+        deadline = разобрать_срок(deadline)
         depth = self.db.count_jobs(status=[STATUS_QUEUED, STATUS_RETRY])
         if depth >= self._max_queue:
             raise QueueFull(f"В очереди уже {depth} заданий (предел {self._max_queue}).")
@@ -569,7 +847,10 @@ class JobQueue:
             if cached is not None:
                 job_id = self._clone_cached(cached, filename, str(path), owner,
                                             group_id, settings, webhook_url,
-                                            reference_text=reference_text)
+                                            reference_text=reference_text,
+                                            api_key_name=api_key_name, source=source,
+                                            tags=tags, priority=priority,
+                                            deadline=deadline)
                 RUNTIME.inc("asrhub_cached_jobs_total")
                 self._emit("job.cached", {"id": job_id, "source": cached["id"]})
                 # Задание завершено мгновенно, но для отправителя оно
@@ -606,8 +887,7 @@ class JobQueue:
             # Тот же предел 0–100, что у POST /{id}/priority: без него поле
             # формы priority=1000000 при политике priority_fifo ставило
             # задание впереди всех чужих, а отрицательное — позади навсегда.
-            "priority": max(0, min(100, int(priority if priority is not None
-                                            else settings.get("priority", 50)))),
+            "priority": _важность(priority, settings),
             "owner": owner,
             "api_key_name": api_key_name,
             "source": source,
@@ -662,12 +942,21 @@ class JobQueue:
     def _clone_cached(self, cached: dict[str, Any], filename: str, path: str,
                       owner: str, group_id: str | None,
                       settings: dict[str, Any], webhook_url: str = "",
-                      reference_text: str = "") -> str:
+                      reference_text: str = "", *, api_key_name: str = "",
+                      source: str = "api", tags: str = "",
+                      priority: int | None = None,
+                      deadline: float | None = None) -> str:
         job_id = self.db.create_job({
             "id": new_id(),
             "group_id": group_id,
             "filename": filename,
             "file_path": path,
+            # Как в обычной ветке `submit` — см. ниже.
+            "api_key_name": api_key_name,
+            "source": source,
+            "tags": tags,
+            "priority": _важность(priority, settings),
+            "deadline": deadline,
             # Адрес уведомления переносим в клон: без него задание
             # завершалось молча и повторить отправку было нечем.
             "webhook_url": webhook_url or None,
@@ -716,9 +1005,17 @@ class JobQueue:
             quality_flags=",".join(cached.get("quality_flags") or [])
             if isinstance(cached.get("quality_flags"), list) else cached.get("quality_flags"),
             quality_detail=cached.get("quality_detail"),
-            # Профиль звука — свойство записи, а запись та же.
+            # Профиль звука — свойство записи, а запись та же. Полоса
+            # громкости — тоже: без неё у клона пустой проигрыватель.
             **audio_profile.for_job(cached),
+            waveform=cached.get("waveform"),
             progress=1.0, stage="из кеша")
+        # Имя ключа, источник, метки, важность и срок — те, что пришли с
+        # этой загрузкой, как в обычной ветке `submit`. Клон их терял:
+        # запись, совпавшая по содержимому с уже распознанной (повторный
+        # забор с АТС, одинаковое приветствие автоответчика), попадала в срез
+        # «по источникам» как «api», а без метки согласия — в список записей
+        # без согласия.
         segments = self.db.get_segments(cached["id"])
         if segments:
             self.db.save_segments(job_id, segments)
@@ -906,13 +1203,35 @@ class JobQueue:
         # моделью («Распознать заново» с выбором модели) менял только
         # параметры: карточка, статистика моделей и метрики приписывали
         # новую расшифровку прежней модели.
-        self.db.update_job(job_id, status=STATUS_QUEUED, error_code=None,
-                           error_message=None, error_hint=None, progress=0.0,
-                           stage="", started_at=None, finished_at=None,
-                           retries=0, params=params, queued_at=now(),
-                           model=str(params.get("model") or job.get("model") or ""),
-                           engine=движок_задания(
-                               {**params, "model": params.get("model") or job.get("model")}))
+        #
+        # Условной записью — из того состояния, что прочитано: между чтением
+        # и записью задание мог захватить воркер (его поставил в очередь
+        # кто-то ещё), и безусловная запись возвращала идущее задание в
+        # очередь из-под него — лишний прогон и два исхода на одно задание.
+        поставлено = self.db.update_job_if_status(
+            job_id, [str(job["status"])], status=STATUS_QUEUED, error_code=None,
+            error_message=None, error_hint=None, progress=0.0,
+            stage="", started_at=None, finished_at=None,
+            retries=0, params=params, queued_at=now(),
+            webhook_status=None, webhook_attempts=0, webhook_next_at=None,
+            model=str(params.get("model") or job.get("model") or ""),
+            engine=движок_задания(
+                {**params, "model": params.get("model") or job.get("model")}))
+        if not поставлено:
+            # Отложенный только что каталог — на место, без записи в базу:
+            # задание уже в чужих руках, и его состояние не наше.
+            прежний = self._прежний_путь(job_id)
+            текущий = Path(self.settings.paths.results) / job_id
+            if прежний.is_dir() and not текущий.exists():
+                try:
+                    прежний.rename(текущий)
+                except OSError as exc:
+                    log.warning("Прежний результат %s не возвращён на место: %s",
+                                job_id, exc, extra={"job_id": job_id})
+            self._забыть_прежние_параметры(job_id)
+            raise ConfigError(
+                "Задание изменилось, пока его ставили на повтор, — повтор не поставлен.",
+                hint="Обновите карточку задания и повторите, если это ещё нужно.")
         self.db.add_event(job_id, "retry", "Задание поставлено в очередь повторно")
         with self._lock:
             self._cancelled.discard(job_id)
@@ -920,16 +1239,51 @@ class JobQueue:
         self._emit("job.queued", {"id": job_id})
         return self.get(job_id)
 
-    def retry_failed(self, limit: int = 100) -> int:
-        jobs = self.db.list_jobs(status=STATUS_FAILED, limit=limit)
+    def retry_failed(self, limit: int = 100,
+                     отказы: list[dict[str, str]] | None = None) -> int:
+        """Ставит неудавшиеся задания заново. Возвращает, сколько поставлено.
+
+        Отказ на одном задании (записи уже нет — «файл не найден», запись
+        удалена АТС) — обычное содержимое списка неудавшихся, и он больше не
+        обрывает весь проход: прежде маршрут отвечал 400 после первого
+        такого задания, часть уже стояла в очереди, остальные не тронуты, и
+        в ответе об этом не было ни слова. Отказы собираются в `отказы`, как
+        у пакетных действий.
+        """
+        jobs = self.db.list_jobs(status=STATUS_FAILED, limit=limit, light=True)
+        поставлено = 0
         for job in jobs:
-            self.retry(job["id"])
-        return len(jobs)
+            try:
+                self.retry(job["id"])
+                поставлено += 1
+            except ASRHubError as exc:
+                if отказы is not None:
+                    отказы.append({"id": str(job["id"]), "error": exc.message})
+        return поставлено
 
     def set_priority(self, job_id: str, priority: int) -> dict[str, Any]:
         priority = max(0, min(100, int(priority)))
         self.db.update_job(job_id, priority=priority)
         self.db.add_event(job_id, "priority", f"Приоритет изменён на {priority}")
+        self._wake.set()
+        return self.get(job_id)
+
+    def set_deadline(self, job_id: str, deadline: Any) -> dict[str, Any]:
+        """Срок выполнения ждущего задания (см. `разобрать_срок`); пусто — без срока.
+
+        Только у ждущих: у идущего и завершённого срок уже ничего не решает,
+        а запись поверх «выполняется» гонялась бы с воркером.
+        """
+        срок = разобрать_срок(deadline)
+        if not self.db.update_job_if_status(
+                job_id, [STATUS_QUEUED, STATUS_RETRY, STATUS_PAUSED], deadline=срок):
+            self.get(job_id)
+            raise ConfigError("Срок меняется только у ждущего задания.",
+                              hint="Задание уже выполняется или завершено.")
+        self.db.add_event(job_id, "deadline",
+                          "Срок выполнения снят" if срок is None else
+                          "Срок выполнения: " + time.strftime("%d.%m.%Y %H:%M",
+                                                              time.localtime(срок)))
         self._wake.set()
         return self.get(job_id)
 
@@ -940,16 +1294,17 @@ class JobQueue:
         return self.set_priority(job_id, 0)
 
     def pause_job(self, job_id: str) -> dict[str, Any]:
-        job = self.get(job_id)
-        if job["status"] == STATUS_QUEUED:
-            self.db.update_job(job_id, status=STATUS_PAUSED, stage="приостановлено")
+        # Условной записью: безусловная превращала в «приостановлено»
+        # задание, которое воркер захватил между чтением и записью, — оно
+        # досчитывалось, а в списке висело на паузе.
+        if self.db.update_job_if_status(job_id, [STATUS_QUEUED], status=STATUS_PAUSED,
+                                        stage="приостановлено"):
             self.db.add_event(job_id, "paused", "Задание приостановлено")
         return self.get(job_id)
 
     def resume_job(self, job_id: str) -> dict[str, Any]:
-        job = self.get(job_id)
-        if job["status"] == STATUS_PAUSED:
-            self.db.update_job(job_id, status=STATUS_QUEUED, stage="")
+        if self.db.update_job_if_status(job_id, [STATUS_PAUSED], status=STATUS_QUEUED,
+                                        stage=""):
             self.db.add_event(job_id, "resumed", "Задание возобновлено")
             self._wake.set()
         return self.get(job_id)
@@ -957,19 +1312,42 @@ class JobQueue:
     def pause(self) -> None:
         with self._lock:
             self._paused = True
+        self._пауза_в_базу(True)
         self.db.add_event(None, "queue_paused", "Очередь приостановлена")
         self._emit("queue.paused", {})
 
     def resume(self) -> None:
         with self._lock:
             self._paused = False
+        self._пауза_в_базу(False)
         self._wake.set()
         self.db.add_event(None, "queue_resumed", "Очередь возобновлена")
         self._emit("queue.resumed", {})
 
+    def _пауза_в_базу(self, значение: bool) -> None:
+        """Флаг паузы — в общую базу (см. `КЛЮЧ_ПАУЗЫ`)."""
+        try:
+            self.db.set_kv(КЛЮЧ_ПАУЗЫ, bool(значение))
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Пауза очереди не записана в базу — действует только на "
+                        "этом сервере до перезапуска: %s", exc)
+        self._пауза_прочитана = time.monotonic()
+
+    def _пауза_из_базы(self, *, сразу: bool = False) -> bool:
+        """Флаг паузы из общей базы — не чаще раза в `ПАУЗА_ПЕРЕЧИТАТЬ_С`."""
+        прочитана = getattr(self, "_пауза_прочитана", 0.0)
+        if not сразу and time.monotonic() - прочитана < ПАУЗА_ПЕРЕЧИТАТЬ_С:
+            return self._paused
+        try:
+            self._paused = bool(self.db.get_kv(КЛЮЧ_ПАУЗЫ, False))
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Флаг паузы очереди не прочитан: %s", exc)
+        self._пауза_прочитана = time.monotonic()
+        return self._paused
+
     @property
     def is_paused(self) -> bool:
-        return self._paused
+        return self._пауза_из_базы()
 
     def set_concurrency(self, workers: int) -> None:
         """Меняет число воркеров на ходу.
@@ -980,6 +1358,16 @@ class JobQueue:
         живых воркеров при заявленных двух.
         """
         workers = max(1, min(64, int(workers)))
+        if not self._started:
+            # Очередь не запущена (`--no-queue`, «только интерфейс» над
+            # общей базой) — число только запоминается, потоков нет. Раньше
+            # любая правка `max_concurrent_jobs` (сохранение настроек,
+            # восстановление копии) поднимала воркеры от нуля: узел без
+            # движков начинал брать задания и ронять их, а с движками —
+            # считать без отметки жизни, и сосед через пять минут забирал
+            # задание и считал его второй раз.
+            self.settings.set("max_concurrent_jobs", workers)
+            return
         with self._lock:
             # Считаем по заявленному числу, а не по длине словаря: ушедший
             # воркер уже убрал своё состояние, и по длине выходило, что
@@ -1009,10 +1397,7 @@ class JobQueue:
                     if index in self._states:
                         continue
                     self._states[index] = WorkerState(index=index)
-                    thread = threading.Thread(target=self._worker_loop, args=(index,),
-                                              name=f"asrhub-worker-{index}", daemon=True)
-                    thread.start()
-                    self._workers.append(thread)
+                    self._поднять_воркера(index)
             elif workers < current:
                 self._retiring.update(range(workers, current))
             self._worker_count = workers
@@ -1027,8 +1412,11 @@ class JobQueue:
     # --- выбор следующего задания ----------------------------------------
 
     def _next_job(self, worker_index: int) -> dict[str, Any] | None:
+        # Флаг паузы — общий для всех серверов над базой; читается вне
+        # общей блокировки очереди, она нужна идущим заданиям.
+        приостановлена = self._пауза_из_базы()
         with self._lock:
-            if self._paused or worker_index >= int(
+            if приостановлена or worker_index >= int(
                     self.settings.get("max_concurrent_jobs") or 2):
                 return None
             active = len(self._running)
@@ -1054,9 +1442,17 @@ class JobQueue:
                 "fair_share": "created_at ASC",
             }.get(policy, "priority DESC")
             window = int(self.settings.get("scheduling_window") or 500)
-            candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
-                                           limit=window, order=preselect, light=True,
-                                           ready_before=now())
+            if policy == "fair_share":
+                # По нескольку старших заданий на владельца, а не верх общей
+                # очереди: иначе окно целиком состоит из заданий того, кто
+                # поставил больше всех (см. `fair_share_candidates`).
+                candidates = self.db.fair_share_candidates(
+                    per_owner=max(3, per_model_limit + 2), ready_before=now(),
+                    owners=max(1, window))
+            else:
+                candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
+                                               limit=window, order=preselect, light=True,
+                                               ready_before=now())
             candidates = [c for c in candidates if c["id"] not in self._running]
             if per_model_limit > 0:
                 candidates = [c for c in candidates
@@ -1073,12 +1469,25 @@ class JobQueue:
             self._note_concurrency()
             model = chosen.get("model") or ""
             self._model_counts[model] = self._model_counts.get(model, 0) + 1
+            владелец = str(chosen.get("owner") or "anonymous")
+            if "_чьи_идут" not in self.__dict__:
+                # Очередь, собранная проверкой через `__new__`, без `__init__`.
+                self._чьи_идут, self._последний_старт = {}, {}
+            self._чьи_идут[chosen["id"]] = владелец
+            self._последний_старт[владелец] = time.monotonic()
+            if len(self._последний_старт) > 4096:
+                # Словарь не растёт без предела: забываем тех, кого
+                # обслуживали давнее всех, — они и так впереди.
+                for старый in sorted(self._последний_старт,
+                                     key=self._последний_старт.get)[:2048]:
+                    self._последний_старт.pop(старый, None)
 
         # Слот занят. Дальше два обращения к базе, и любой их срыв обязан
         # слот вернуть: освобождение живёт в _worker_loop, но только для
         # заданий, которые тот успел получить. Без отката одна ошибка «база
         # заблокирована» навсегда съедала слот, а при достижении предела
         # очередь переставала брать работу до перезапуска.
+        claimed = False
         try:
             # Захват атомарный: UPDATE ... WHERE status IN (...) выполняет
             # только один процесс, остальным вернётся False. Без этого два
@@ -1100,6 +1509,18 @@ class JobQueue:
             job = self.db.get_job(chosen["id"])
         except Exception:
             self._release_slot(chosen["id"], model)
+            if claimed:
+                # Захват прошёл, а чтение — нет: задание «выполняется» за
+                # нами, но ни один воркер его не считает. Откатываем захват;
+                # не вышло и это — его подберёт сверка своих заданий
+                # (`_сверить_свои`), а не только следующий запуск.
+                try:
+                    self.db.update_job_if_status(
+                        chosen["id"], [STATUS_RUNNING], expected_instance=INSTANCE_ID,
+                        status=STATUS_QUEUED, stage="", progress=0.0, started_at=None,
+                        instance_id=None, heartbeat_at=None)
+                except Exception as exc:                    # noqa: BLE001
+                    log.debug("Захват %s не откатан: %s", chosen["id"], exc)
             raise
         if job is None:
             # Задание удалили между выборкой и чтением.
@@ -1125,6 +1546,7 @@ class JobQueue:
         with self._lock:
             self._running.pop(job_id, None)
             self._concurrency.pop(job_id, None)
+            getattr(self, "_чьи_идут", {}).pop(job_id, None)
             self._note_concurrency()
             if model in self._model_counts:
                 self._model_counts[model] = max(0, self._model_counts[model] - 1)
@@ -1169,16 +1591,24 @@ class JobQueue:
             return max(candidates, key=lambda c: (int(c.get("priority") or 0),
                                                   -float(c.get("created_at") or 0)))
         if policy == "fair_share":
-            # Круговое обслуживание владельцев: берём задание того, у кого
-            # сейчас меньше всего выполняющихся заданий.
+            # Круговое обслуживание владельцев: задание того, у кого сейчас
+            # меньше всего идущих, а при равенстве — кого обслуживали давнее
+            # всех. Прежде второго ключа не было: при одном воркере в момент
+            # выбора не идёт ничего, все владельцы равны, и бралось самое
+            # старое задание — то есть FIFO: отдел, поставивший пятьсот
+            # записей, держал одинокую запись соседа до конца своих. При
+            # нескольких воркерах политика не помнила, кого обслужила
+            # последним, и третий владелец ждал, пока кончатся задания
+            # второго.
             load: dict[str, int] = {}
+            чьи = getattr(self, "_чьи_идут", {})
             for job_id in self._running:
-                job = self.db.get_job(job_id)
-                if job:
-                    owner = job.get("owner") or "anonymous"
-                    load[owner] = load.get(owner, 0) + 1
+                owner = чьи.get(job_id) or "anonymous"
+                load[owner] = load.get(owner, 0) + 1
+            когда = getattr(self, "_последний_старт", {})
             return min(candidates,
                        key=lambda c: (load.get(c.get("owner") or "anonymous", 0),
+                                      когда.get(c.get("owner") or "anonymous", 0.0),
                                       -int(c.get("priority") or 0),
                                       float(c.get("created_at") or 0)))
         # priority_fifo
@@ -1259,10 +1689,11 @@ class JobQueue:
             merged["_fallback_reason"] = str(params.get("_fallback_reason") or "")
 
         paths = self.settings.paths
-        workdir = safe_workdir(paths.tmp, job_id)
+        workdir = safe_workdir(self._каталог_временных(), self._имя_рабочего(job_id))
         outdir = paths.results / job_id
         timeout = max(0, S.integer(merged, "job_timeout_s", 0))
         started = time.time()
+        записано: dict[str, Any] = {"при": 0.0, "стадия": None}
 
         def progress(value: float, stage: str) -> None:
             # Полоса только вперёд: этапы конвейера и движки докладывают
@@ -1271,6 +1702,17 @@ class JobQueue:
             value = max(float(value), state.progress)
             state.progress = value
             state.stage = stage
+            # В базу — не чаще раза в секунду (смена стадии — всегда): в
+            # режиме журнала отката на сетевом хранилище запись на каждый
+            # кусок звука — это fsync на каждый кусок. Отметку жизни ставит
+            # и свой поток (см. `_отметить_живые`), так что пропуск записи
+            # её не задерживает. Рассылка по WebSocket идёт как прежде.
+            сейчас = time.monotonic()
+            if stage == записано["стадия"] and сейчас - записано["при"] < ПРОГРЕСС_В_БАЗУ_С:
+                self._emit("job.progress", {"id": job_id, "progress": round(value, 4),
+                                            "stage": stage})
+                return
+            записано["при"], записано["стадия"] = сейчас, stage
             # Запись — только пока задание за нами. Безусловная запись
             # переписывала стадию и прогресс уже отменённого задания: отмена,
             # пришедшая на соседний сервер, жила только в памяти его
@@ -1329,6 +1771,31 @@ class JobQueue:
                 # между записью «готово» и этой строкой.
                 self._cancelled.discard(job_id)
 
+    def _каталог_временных(self) -> Path:
+        """Где заводить рабочие каталоги заданий: `temp_dir` или `<данные>/tmp`.
+
+        Рабочий каталог всегда был `<данные>/tmp/<id>`, хотя параметр
+        `temp_dir` обещает «где создавать промежуточные файлы предобработки
+        — укажите быстрый локальный диск», а doctor и самопроверка проверяют
+        именно его. При каталоге данных на сетевом диске многогигабайтные
+        подготовленные записи писались на сетевой диск.
+        """
+        задан = str(self.settings.get("temp_dir") or "").strip() \
+            if hasattr(self.settings, "get") else ""
+        return Path(задан) if задан else Path(self.settings.paths.tmp)
+
+    @staticmethod
+    def _имя_рабочего(job_id: str) -> str:
+        """Имя рабочего каталога задания — со своим экземпляром.
+
+        Путь `tmp/<id>` общий у всех серверов над общим каталогом данных, и
+        «оживший» экземпляр (замер дольше отметки жизни) сносил в `finally`
+        рабочий каталог задания, которое за это время взял и считал сосед.
+        """
+        from .phone_compat import safe_path_key  # noqa: PLC0415
+
+        return f"{job_id}.{safe_path_key(INSTANCE_ID)[:40] or 'экземпляр'}"
+
     def _отобрано(self, job_id: str) -> None:
         """Задание больше не за нами: его отменили на соседнем сервере,
         удалили или отдали другому экземпляру. Останавливаем конвейер на
@@ -1371,33 +1838,30 @@ class JobQueue:
 
         elapsed = time.time() - started
         accuracy = outcome.stats.get("accuracy") or {}
-        # Реплики пишутся ДО отметки «готово», а не после. Порядок решает:
-        # между отметкой и записью реплик стоял незащищённый вызов, и любое
-        # исключение там (занятая база — обычное дело на общем архиве)
-        # оставляло задание в состоянии «готово» с `segments_count = 40` и
-        # пустой таблицей реплик. Восстановиться из этого состояния не
-        # может ничто: подхват зависших ищет «выполняется», а обработчик
-        # сбоя пишет только из него же.
+        # Реплики и отметка «готово» — одной транзакцией и одним условием
+        # (см. `Database.finish_job`). Прежде реплики писались первыми, а при
+        # провале отметки стирались без проверки, чьё задание: «оживший»
+        # экземпляр так уничтожал реплики, которые за это время записал
+        # досчитавший задание сосед.
         #
-        # Если отметка ниже не пройдёт (задание отменили или отобрали),
-        # реплики останутся без задания — их уберёт `delete_job` или
-        # подметание сирот в уборке. Это несравнимо дешевле, чем «готово»
-        # без текста.
-        self.db.save_segments(job_id, outcome.segments)
         # Только из состояния «выполняется». Отмена аккуратно сверяет статус
         # перед записью, а обратное направление было незащищено: отмена,
         # пришедшая между последней проверкой в конвейере и этой записью,
         # затиралась, и пользователь, которому уже ответили «отменено»,
         # получал задание в состоянии «готово».
-        finished = self.db.update_job_if_status(
-            job_id,
-            [STATUS_RUNNING],
+        finished = self.db.finish_job(
+            job_id, outcome.segments,
+            expected=[STATUS_RUNNING],
             # Задание могли отобрать, пока мы считали: если отметка жизни
             # устарела, его уже перезапустил сосед. Своё имя в условии
             # означает «пишем, только если оно всё ещё за нами».
             expected_instance=INSTANCE_ID,
             status=STATUS_COMPLETED, finished_at=now(), progress=1.0, stage="готово",
             instance_id=None, heartbeat_at=None,
+            # Уведомление ждёт доставки с той же записью, что и «готово»:
+            # процесс, упавший сразу после неё, иначе не оставлял следа, что
+            # уведомление должно было уйти (см. `_дослать_уведомления`).
+            **self._уведомление_ждёт(job),
             # Ошибка прошлой попытки уходит вместе с неудачей. Повтор и
             # переход на резервную модель пишут её в задание, чтобы в
             # очереди было видно, почему оно ждёт, — а удачное завершение её
@@ -1434,14 +1898,20 @@ class JobQueue:
             **audio_profile.for_job(outcome.stats.get("audio_profile") or {}),
         )
         if not finished:
-            # Задание успели отменить или удалить, пока оно считалось.
-            # Записывать результат некуда — убираем и файлы выгрузки.
+            # Задание успели отменить или удалить, пока оно считалось, или
+            # его отобрал сосед. Записывать результат некуда — убираем свои
+            # файлы выгрузки (чужие не трогаем, см. `_discard_unless_taken`).
+            # Реплики не писались вовсе: отметка и они — одна транзакция.
             log.info("Задание %s завершилось, но его состояние уже изменено — "
                      "результат отброшен", job_id, extra={"job_id": job_id})
             self._discard_unless_taken(outdir, job_id)
-            self.db.clear_segments(job_id)
             with self._lock:
                 self._cancelled.discard(job_id)
+            # Поздняя отмена повтора готового задания: прежний результат —
+            # на место. Без этого задание оставалось «отменено» без
+            # расшифровки, а она лежала в `results/<id>.prev`.
+            self._вернуть_прежний(job_id, "Повторное распознавание отменено",
+                                  ожидаемые=[STATUS_CANCELLED])
             return
         with self._lock:
             self._cancelled.discard(job_id)
@@ -1501,20 +1971,28 @@ class JobQueue:
             RUNTIME.observe("asrhub_media_duration_seconds",
                             float(job["media_duration_s"]), buckets=MEDIA_DURATION_BUCKETS)
 
-        self.db.bump_model_stats(
-            str(job.get("model") or ""), str(job.get("engine") or ""), ok=True,
-            audio_s=float(job.get("media_duration_s") or 0.0),
-            processing_s=elapsed, words=int(outcome.stats.get("words") or 0),
-            rtf=outcome.rtf, confidence=outcome.stats.get("avg_confidence"),
-            wer=accuracy.get("wer"))
-        for name, value in (("rtf", outcome.rtf),
-                            ("processing_time_s", elapsed),
-                            ("queue_time_s", float(job.get("queue_time_s") or 0.0)),
-                            ("confidence", outcome.stats.get("avg_confidence") or 0.0)):
-            self.db.add_metric(name, value, job_id=job_id, model=str(job.get("model")),
-                               engine=str(job.get("engine")))
-        for warning in outcome.warnings:
-            self.db.add_event(job_id, "warning", warning)
+        # Статистика, показатели и события — после «готово», и сбой любого
+        # (занятая база — обычное дело на общем архиве) не должен уводить
+        # готовое задание в обработчик отказа: тот пытался записать «ошибка»
+        # поверх «готово», не мог, и до уведомления дело не доходило.
+        try:
+            self.db.bump_model_stats(
+                str(job.get("model") or ""), str(job.get("engine") or ""), ok=True,
+                audio_s=float(job.get("media_duration_s") or 0.0),
+                processing_s=elapsed, words=int(outcome.stats.get("words") or 0),
+                rtf=outcome.rtf, confidence=outcome.stats.get("avg_confidence"),
+                wer=accuracy.get("wer"))
+            for name, value in (("rtf", outcome.rtf),
+                                ("processing_time_s", elapsed),
+                                ("queue_time_s", float(job.get("queue_time_s") or 0.0)),
+                                ("confidence", outcome.stats.get("avg_confidence") or 0.0)):
+                self.db.add_metric(name, value, job_id=job_id, model=str(job.get("model")),
+                                   engine=str(job.get("engine")))
+            for warning in outcome.warnings:
+                self.db.add_event(job_id, "warning", warning)
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Задание %s готово, но статистика и события не записаны: %s",
+                        job_id, exc, extra={"job_id": job_id})
 
         log.info("Задание %s: готово за %.1f с, RTF %.3f", job_id, elapsed, outcome.rtf,
                  extra={"job_id": job_id, "model": job.get("model")})
@@ -1529,8 +2007,12 @@ class JobQueue:
         # задание: сбой здесь уходил в общий обработчик, а тот пытался
         # записать «ошибка» поверх «готово», не мог и не писал ничего —
         # даже в журнал событий задания.
-        self.db.add_event(job_id, "completed",
-                          f"Готово за {elapsed:.1f} с, RTF {outcome.rtf:.3f}")
+        try:
+            self.db.add_event(job_id, "completed",
+                              f"Готово за {elapsed:.1f} с, RTF {outcome.rtf:.3f}")
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Событие «готово» для %s не записано: %s", job_id, exc,
+                        extra={"job_id": job_id})
         self._emit("job.completed", {"id": job_id, "rtf": outcome.rtf,
                                      "duration_s": elapsed})
         self._send_webhook(job_id)
@@ -1751,11 +2233,12 @@ class JobQueue:
         RUNTIME.note_error(error.code, error.retryable)
         сообщение = (f"Модель {основная} не справилась ({error.message}) — задание "
                      f"поставлено в очередь с резервной моделью {spec.id}")
-        self.db.add_event(job_id, "model_fallback", сообщение, error.to_dict())
+        self.db.add_event(job_id, "model_fallback", сообщение, _для_владельца(error))
         log.warning("Задание %s: %s", job_id, сообщение,
-                    extra={"job_id": job_id, "error_code": error.code})
+                    extra={"job_id": job_id, "error_code": error.code},
+                    exc_info=_трассировка(error))
         self._emit("job.fallback", {"id": job_id, "from": основная, "to": spec.id,
-                                    "error": error.to_dict()})
+                                    "error": _для_владельца(error)})
         self._wake.set()
         return True
 
@@ -1772,11 +2255,19 @@ class JobQueue:
         try:
             ошибка = classify_exception(exc, engine=str(job.get("engine") or ""),
                                         model=str(job.get("model") or ""))
-            merged = self.settings.merged(dict(job.get("params") or {}))
         except Exception:                                    # noqa: BLE001
             # Код у базовой ошибки уже «internal_error» — этого хватает.
-            ошибка = ASRHubError(f"Внутренняя ошибка сервера: {type(exc).__name__}")
-            merged = dict(self.settings.values)
+            ошибка = ASRHubError(f"Внутренняя ошибка сервера: {type(exc).__name__}",
+                                 cause=exc)
+        # Параметры — отдельно от разбора ошибки. Стояли в одном `try`, и
+        # задание с параметрами, которые новая версия уже не принимает
+        # («Ширина луча: максимум 20»), получало вместо этой понятной причины
+        # «Внутренняя ошибка сервера: ConfigError»: `merged` падал второй раз
+        # на тех же параметрах и затирал уже разобранную ошибку.
+        try:
+            merged = self.settings.merged(dict(job.get("params") or {}))
+        except Exception:                                    # noqa: BLE001
+            merged = dict(getattr(self.settings, "values", {}) or {})
         try:
             self._handle_failure(job, ошибка, merged)
         except Exception as повторный:                       # noqa: BLE001
@@ -1879,7 +2370,8 @@ class JobQueue:
         if not self._write_own(
                 job_id, status=STATUS_FAILED, finished_at=now(), progress=0.0,
                 stage="ошибка", error_code=error.code, error_message=error.message,
-                error_hint=error.hint, instance_id=None, heartbeat_at=None):
+                error_hint=error.hint, instance_id=None, heartbeat_at=None,
+                **self._уведомление_ждёт(job)):
             self._discard_unless_taken(outdir, job_id)
             return
         self.db.bump_model_stats(str(job.get("model") or ""), str(job.get("engine") or ""),
@@ -1888,9 +2380,15 @@ class JobQueue:
         RUNTIME.note_error(error.code, error.retryable)
         if error.code == "no_speech":
             RUNTIME.inc("asrhub_no_speech_total")
-        self.db.add_event(job_id, "failed", error.message, error.to_dict())
+        self.db.add_event(job_id, "failed", error.message, _для_владельца(error))
+        # Исходная причина — в журнал сервера, с трассировкой: здесь её
+        # искали, а находили только `error.message` («Непредвиденная ошибка
+        # движка: KeyError: 'segments'»), и найти место в коде было нечем.
+        # Владельцу задания, наоборот, сырой текст исключения (полные пути к
+        # весам и загрузкам) больше не уходит — см. `_для_владельца`.
         log.error("Задание %s провалено: %s", job_id, error.message,
-                  extra={"job_id": job_id, "error_code": error.code})
+                  extra={"job_id": job_id, "error_code": error.code},
+                  exc_info=_трассировка(error))
         # Подсказка — это и есть причина с лечением. В журнал она не
         # попадала вовсе: там оставался тот же факт, что и в карточке
         # задания, и разбираться приходилось наугад.
@@ -1899,7 +2397,7 @@ class JobQueue:
                 if строка.strip():
                     log.error("Задание %s: %s", job_id, строка.strip(),
                               extra={"job_id": job_id, "error_code": error.code})
-        self._emit("job.failed", {"id": job_id, "error": error.to_dict()})
+        self._emit("job.failed", {"id": job_id, "error": _для_владельца(error)})
         self._discard_results(outdir)
         self._send_webhook(job_id)
 
@@ -1916,7 +2414,8 @@ class JobQueue:
             "status": статус, "finished_at": now(), "progress": 1.0,
             "stage": "без речи" if статус == STATUS_NO_SPEECH else "короткая запись",
             "error_code": error.code, "error_message": error.message,
-            "error_hint": error.hint, "instance_id": None, "heartbeat_at": None}
+            "error_hint": error.hint, "instance_id": None, "heartbeat_at": None,
+            **self._уведомление_ждёт(job)}
         длительность = (error.details or {}).get("duration_s")
         if длительность is not None and not float(job.get("media_duration_s") or 0):
             поля["media_duration_s"] = float(длительность)
@@ -1926,7 +2425,7 @@ class JobQueue:
         RUNTIME.inc("asrhub_jobs_total", {"status": статус})
         if статус == STATUS_NO_SPEECH:
             RUNTIME.inc("asrhub_no_speech_total")
-        self.db.add_event(job_id, статус, error.message, error.to_dict())
+        self.db.add_event(job_id, статус, error.message, _для_владельца(error))
         log.info("Задание %s: %s", job_id, error.message,
                  extra={"job_id": job_id, "error_code": error.code})
         данные = {"id": job_id, "status": статус, "message": error.message}
@@ -1998,18 +2497,101 @@ class JobQueue:
 
     # --- уведомления -----------------------------------------------------
 
+    def _уведомление_ждёт(self, job: dict[str, Any], *,
+                          кроме_отката: bool = False) -> dict[str, Any]:
+        """Поля «уведомление ждёт доставки» — к той же записи, что и исход задания.
+
+        Пишутся вместе с исходом: процесс, упавший сразу после записи «готово»
+        или «ошибка», иначе не оставлял следа, что уведомление должно было
+        уйти. `кроме_отката` — для исхода, за которым последует возврат
+        прежнего результата (повтор готового задания): такой откат — не итог
+        для заказчика, и уведомление по нему не уходит, как и прежде.
+        """
+        if not job.get("webhook_url"):
+            return {}
+        job_id = str(job.get("id") or "")
+        if кроме_отката and job_id and self._прежний_путь(job_id).is_dir():
+            return {}
+        return {"webhook_status": "pending", "webhook_attempts": 0,
+                "webhook_next_at": now()}
+
     def _send_webhook(self, job_id: str) -> None:
+        """Заводит уведомление об исходе задания и сразу пробует его доставить.
+
+        Уведомление — состояние задания: «pending» ждёт доставки, «sending» —
+        доставка идёт, «ok:<код>», «failed» и «blocked» — итог. Не дошедшее
+        с первого захода досылает служебный цикл (`_дослать_уведомления`) с
+        растущей паузой, в том числе после перезапуска сервера.
+        """
         job = self.db.get_job(job_id)
         if not job or not job.get("webhook_url"):
             return
+        if str(job.get("webhook_status") or "") not in ("pending", "sending"):
+            self.db.update_job(job_id, webhook_status="pending", webhook_attempts=0,
+                               webhook_next_at=now())
         if self._stop.is_set():
             # После остановки пул заводить нельзя: `stop` уже обнулил ссылку
             # на него, и новый оказался бы непогашенным — его потоки не
-            # демоны и держали бы выход из процесса.
-            log.info("Уведомление для %s не отправлено: очередь остановлена",
+            # демоны и держали бы выход из процесса. Уведомление не теряется:
+            # оно ждёт в базе и уйдёт после запуска.
+            log.info("Уведомление для %s уйдёт после запуска: очередь остановлена",
                      job_id, extra={"job_id": job_id})
             return
-        self._webhook_pool().submit(self._webhook_worker, job)
+        self._webhook_pool().submit(self._доставить, job_id)
+
+    def _дослать_уведомления(self) -> int:
+        """Уведомления, которым пора: ждущие и брошенные посреди доставки."""
+        if self._stop.is_set():
+            return 0
+        try:
+            номера = self.db.webhook_due(limit=max(1, S.integer(self.settings,
+                                                                "webhook_workers", 4)) * 5)
+        except Exception as exc:                            # noqa: BLE001
+            log.debug("Ждущие уведомления не перечислены: %s", exc)
+            return 0
+        пул = self._webhook_pool() if номера else None
+        for job_id in номера:
+            пул.submit(self._доставить, job_id)
+        return len(номера)
+
+    def _доставить(self, job_id: str) -> None:
+        """Один заход доставки — если его не взял себе другой поток или сервер.
+
+        Исключения задач пула никто не читал: сбой доставки исчезал без
+        следа. Теперь он в журнале, а уведомление остаётся ждать.
+        """
+        try:
+            if not self.db.webhook_claim(job_id, hold_s=СРОК_ЗАХОДА_ДОСТАВКИ_С):
+                return
+            job = self.db.get_job(job_id)
+            if not job or not job.get("webhook_url"):
+                return
+            self._webhook_worker(job)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Доставка уведомления для %s дала сбой: %s", job_id, exc,
+                        extra={"job_id": job_id})
+
+    def _отложить_уведомление(self, job: dict[str, Any], причина: str, *,
+                              без_попытки: bool = False) -> None:
+        """Неудачный заход доставки — на следующую паузу, после последней — «failed»."""
+        job_id = str(job["id"])
+        строка = self.db.get_job(job_id) or {}
+        попыток = int(строка.get("webhook_attempts") or 0) + (0 if без_попытки else 1)
+        if без_попытки:
+            self.db.update_job(job_id, webhook_status="pending", webhook_next_at=now())
+            return
+        if попыток > len(ПАУЗЫ_УВЕДОМЛЕНИЯ):
+            self.db.update_job(job_id, webhook_status="failed", webhook_attempts=попыток,
+                               webhook_next_at=None)
+            RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
+            log.warning("Уведомление для %s так и не доставлено после %d заходов: %s",
+                        job_id, попыток, причина, extra={"job_id": job_id})
+            return
+        пауза = ПАУЗЫ_УВЕДОМЛЕНИЯ[попыток - 1]
+        self.db.update_job(job_id, webhook_status="pending", webhook_attempts=попыток,
+                           webhook_next_at=now() + пауза)
+        log.info("Уведомление для %s не доставлено (%s) — следующий заход через %.0f с",
+                 job_id, причина, пауза, extra={"job_id": job_id})
 
     def _webhook_pool(self) -> Any:
         """Ограниченный пул для доставки уведомлений.
@@ -2112,49 +2694,53 @@ class JobQueue:
         except ConfigError as exc:
             log.warning("Уведомление для %s не отправлено: %s", job["id"], exc.message,
                         extra={"job_id": job["id"]})
-            self.db.update_job(job["id"], webhook_status="blocked")
+            self.db.update_job(job["id"], webhook_status="blocked", webhook_next_at=None)
             RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
             return
         opener = открыватель_наружу(allow_internal)
 
-        attempts = 5
+        attempts = ПОПЫТОК_ЗА_ЗАХОД
+        причина = ""
         for attempt in range(attempts):
             if self._stop.is_set():
-                log.info("Доставка уведомления для %s не начата: очередь "
+                log.info("Доставка уведомления для %s отложена до запуска: очередь "
                          "остановлена", job["id"], extra={"job_id": job["id"]})
+                self._отложить_уведомление(job, "остановка", без_попытки=True)
                 return
             try:
                 request = urllib.request.Request(target, data=payload,
                                                  headers=headers, method="POST")
                 with opener.open(request, timeout=15) as response:
                     if 200 <= response.status < 300:
-                        self.db.update_job(job["id"], webhook_status=f"ok:{response.status}")
+                        self.db.update_job(job["id"], webhook_status=f"ok:{response.status}",
+                                           webhook_next_at=None)
                         RUNTIME.inc("asrhub_webhooks_total", {"result": "ok"})
                         return
+                    причина = f"ответ {response.status}"
             except ConfigError as exc:
-                # Перенаправление внутрь сети — повторять незачем.
+                # Перенаправление внутрь сети (или адрес, ставший внутренним
+                # к моменту соединения) — повторять незачем.
                 log.warning("Уведомление для %s не отправлено: %s", job["id"], exc.message,
                             extra={"job_id": job["id"]})
-                self.db.update_job(job["id"], webhook_status="blocked")
+                self.db.update_job(job["id"], webhook_status="blocked", webhook_next_at=None)
                 RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
                 return
             except (urllib.error.URLError, OSError, ValueError) as exc:
+                причина = str(exc)
                 log.info("Уведомление для %s не доставлено (попытка %d из %d): %s",
                          job["id"], attempt + 1, attempts, exc)
             if attempt < attempts - 1:      # после последней попытки ждать незачем
-                # Ждём на событии остановки, а не в sleep: пауза между
-                # попытками доходит до минуты, а всего попыток пять. Пул
-                # доставки гасится без ожидания, и уже запущенная попытка
-                # продолжала жить своей жизнью — процесс не завершался ещё
-                # полторы минуты после «Очередь остановлена», при недоступном
-                # приёмнике дольше. Остановка — это причина бросить доставку,
-                # а не повод её дождаться.
+                # Ждём на событии остановки, а не в sleep: пул доставки
+                # гасится без ожидания, и уже запущенная попытка иначе
+                # продолжала бы жить своей жизнью — процесс не завершался
+                # после «Очередь остановлена». Остановка — причина отложить
+                # доставку до запуска, а не повод её дождаться.
                 if self._stop.wait(timeout=min(60, 2 ** attempt)):
                     log.info("Доставка уведомления для %s прервана остановкой",
                              job["id"], extra={"job_id": job["id"]})
+                    self._отложить_уведомление(job, "остановка", без_попытки=True)
                     return
-        self.db.update_job(job["id"], webhook_status="failed")
-        RUNTIME.inc("asrhub_webhooks_total", {"result": "failed"})
+        self._отложить_уведомление(job, причина or "нет ответа")
 
     def _owner_of(self, job_id: str) -> str:
         """Владелец задания для адресной рассылки событий.
@@ -2232,6 +2818,7 @@ class JobQueue:
                     status=STATUS_FAILED, finished_at=now(),
                     stage="", progress=0.0,
                     instance_id=None, heartbeat_at=None,
+                    **self._уведомление_ждёт(job, кроме_отката=True),
                     error_code="instance_lost",
                     error_message=(f"Экземпляр «{row['instance_id']}» перестал "
                                    f"отвечать, попыток израсходовано: {retries}."),
@@ -2248,6 +2835,9 @@ class JobQueue:
                         job_id, "failed",
                         f"Задание снято: экземпляры теряются на нём {retries} "
                         "раз подряд")
+                    self._итог_потерянного(
+                        job_id, "Повторное распознавание не удалось: экземпляры "
+                                "теряются на этой записи")
                 continue
 
             returned = self.db.update_job_if_status(
@@ -2334,6 +2924,21 @@ class JobQueue:
                             log.warning("Служебный шаг %s дал сбой (%d-й раз): %s",
                                         getattr(step_fn, "__name__", step_fn), failures, exc)
                 self._reclaim_stale_jobs()
+                # Свои «выполняется» без исполнителя, умершие воркеры и
+                # недошедшие уведомления — каждый оборот: это дешёвые
+                # запросы по указателям, а цена пропуска — задание, висящее
+                # «выполняется» до перезапуска, и результат, не дошедший до
+                # заказчика.
+                for шаг in (self._сверить_свои, self._поднять_умерших,
+                            self._дослать_уведомления):
+                    try:
+                        шаг()
+                    except Exception as exc:            # noqa: BLE001
+                        сбой_на_обороте = True
+                        failures += 1
+                        if failures <= 3 or failures % 180 == 0:
+                            log.warning("Служебный шаг %s дал сбой (%d-й раз): %s",
+                                        getattr(шаг, "__name__", шаг), failures, exc)
                 # Обслуживание по расписанию: копия базы и сводка о работе.
                 # Свой заход, а не внутри уборки: у уборки собственный час,
                 # а у этих дел — собственные сроки из настроек, и связывать
@@ -2350,12 +2955,22 @@ class JobQueue:
                         log.warning("Обслуживание по расписанию дало сбой "
                                     "(%d-й раз): %s", failures, exc)
                 if time.time() - last_cleanup > 3600:
-                    from .maintenance import retention_days  # noqa: PLC0415
+                    from .maintenance import calls_file_days, retention_days  # noqa: PLC0415
+
+                    # Брошенные временные файлы — тем же часовым заходом:
+                    # `tmp/` не чистил никто, а после падения процесса там
+                    # оставались рабочие каталоги заданий — самые большие
+                    # файлы сервера.
+                    try:
+                        self._подмести_временные()
+                    except Exception as exc:            # noqa: BLE001
+                        log.warning("Временные файлы не убраны: %s", exc)
 
                     retention = retention_days(self.settings)
                     removed = self.db.cleanup(
                         results_days=retention,
-                        audit_days=S.integer(self.settings, "audit_days", 365))
+                        audit_days=S.integer(self.settings, "audit_days", 365),
+                        calls_file_days=calls_file_days(self.settings))
                     if any(removed.values()):
                         log.info("Очистка хранилища: %s", removed)
                     # Если уборка упёрлась в предел на заход, следующий
@@ -2375,6 +2990,143 @@ class JobQueue:
                 if failures and not сбой_на_обороте:
                     log.info("Служебный цикл восстановился после %d сбоев", failures)
                     failures = 0
+
+    def _сверить_свои(self) -> int:
+        """Свои «выполняется» без исполнителя — обратно в очередь без траты попытки.
+
+        Свои задания экземпляр не подбирал никогда: возврат брошенных берёт
+        только чужие, `recover()` идёт при запуске, а `stop()` возвращал лишь
+        те, что в `_идут`. Задание оставалось «выполняется» за нами вне
+        `_running` и `_идут`, если запись исхода не удалась и в обработчике
+        отказа (диск полон, база занята дольше busy_timeout), если сорвалось
+        чтение после захвата или поток воркера умер, — и висело так до
+        перезапуска, а тот ещё и списывал попытку. Попытку здесь не тратим:
+        процесс жив, отказ был в записи исхода, а не в самом задании.
+
+        Задание, захваченное мгновение назад, ещё может не значиться у
+        воркера, поэтому возвращаются только те, чья отметка жизни старше
+        `СИРОТА_ЧЕРЕЗ_С`.
+        """
+        строки = self.db.query(
+            "SELECT id FROM jobs WHERE status=? AND instance_id=? "
+            "  AND COALESCE(heartbeat_at, started_at, 0) < ? LIMIT 200",
+            (STATUS_RUNNING, INSTANCE_ID, now() - СИРОТА_ЧЕРЕЗ_С))
+        возвращено = 0
+        for строка in строки:
+            job_id = str(строка["id"])
+            with self._lock:
+                занято = job_id in self._running or job_id in self._идут
+            if занято:
+                continue
+            вернулось = self.db.update_job_if_status(
+                job_id, [STATUS_RUNNING], expected_instance=INSTANCE_ID,
+                status=STATUS_QUEUED, stage="возвращено в очередь", progress=0.0,
+                started_at=None, instance_id=None, heartbeat_at=None, queued_at=now())
+            if вернулось:
+                возвращено += 1
+                log.warning("Задание %s возвращено в очередь: оно числилось за этим "
+                            "сервером, но его не считал ни один воркер", job_id,
+                            extra={"job_id": job_id})
+                self.db.add_event(job_id, "requeued",
+                                  "Задание числилось выполняющимся, но его никто не "
+                                  "считал (сбой записи исхода) — возвращено в очередь "
+                                  "без траты попытки")
+        if возвращено:
+            self._wake.set()
+        return возвращено
+
+    def _поднять_умерших(self) -> int:
+        """Поднимает заново поток воркера, умерший не по команде.
+
+        Потоки воркеров не перезапускались: `BaseException` из задания
+        (например, `SystemExit` из библиотеки движка) убивал поток, и сервер
+        жил с меньшим числом воркеров до перезапуска, показывая в состоянии
+        полное число.
+        """
+        if self._stop.is_set() or not self._started:
+            return 0
+        поднято = 0
+        with self._lock:
+            for index, поток in list(self._потоки.items()):
+                if поток.is_alive() or index >= self._worker_count \
+                        or index in self._retiring or index not in self._states:
+                    continue
+                log.error("Воркер %d завершился непредвиденно — поднимаю заново", index)
+                self._states[index] = WorkerState(index=index)
+                self._поднять_воркера(index)
+                поднято += 1
+            self._workers = [t for t in self._workers if t.is_alive()]
+        return поднято
+
+    def _подмести_временные(self, *, при_запуске: bool = False) -> dict[str, int]:
+        """Убирает брошенное в каталоге временных файлов сервера.
+
+        * рабочие каталоги заданий этого сервера, которые сейчас никто не
+          считает, — при запуске сразу (прежний процесс этого экземпляра
+          умер), дальше — старше `ВОЗРАСТ_ВРЕМЕННЫХ_С`;
+        * рабочие каталоги чужих экземпляров и прочие файлы (выгрузки
+          DOCX, черновики приёма записей, поток диктовки) — только старше
+          `ВОЗРАСТ_ВРЕМЕННЫХ_С`: каталог бывает общим у нескольких серверов.
+
+        Рабочие каталоги идущих заданий не трогаются никогда. И только своё
+        — по именам, которые даёт сам сервер (`СВОИ_ВРЕМЕННЫЕ`): `temp_dir`
+        может указывать на общий системный каталог, и чужие файлы в нём
+        уборке не принадлежат.
+        """
+        корни = {self._каталог_временных()}
+        запасной = getattr(getattr(self.settings, "paths", None), "tmp", None)
+        if запасной:
+            корни.add(Path(запасной))
+        with self._lock:
+            идут = set(self._идут) | set(self._running)
+        try:
+            чужие_идут = {str(с["id"]) for с in self.db.query(
+                "SELECT id FROM jobs WHERE status=?", (STATUS_RUNNING,))}
+        except Exception:                                   # noqa: BLE001
+            чужие_идут = set()
+        from .phone_compat import safe_path_key  # noqa: PLC0415
+
+        машина = safe_path_key(HOSTNAME) + "_"
+
+        def мёртвого_процесса(имя: str) -> bool:
+            # Рабочий каталог процесса этой машины, которого больше нет:
+            # «<задание>.<машина>_<pid>». Его прежний хозяин не вернётся.
+            хвост = имя.split(".", 1)[1] if "." in имя else ""
+            номер_процесса = хвост[len(машина):] if хвост.startswith(машина) else ""
+            return (номер_процесса.isdigit()
+                    and not process_alive(f"{HOSTNAME}:{номер_процесса}"))
+
+        граница = time.time() - ВОЗРАСТ_ВРЕМЕННЫХ_С
+        итог = {"dirs": 0, "files": 0}
+        for корень in корни:
+            if not корень.is_dir():
+                continue
+            for путь in корень.iterdir():
+                имя = путь.name
+                if not имя.startswith(СВОИ_ВРЕМЕННЫЕ):
+                    continue
+                номер = имя.split(".", 1)[0]
+                if номер in идут or номер in чужие_идут:
+                    continue
+                try:
+                    старый = путь.stat().st_mtime < граница
+                except OSError:
+                    continue
+                if not (старый or (при_запуске and мёртвого_процесса(имя))):
+                    continue
+                try:
+                    if путь.is_dir() and not путь.is_symlink():
+                        shutil.rmtree(путь, ignore_errors=True)
+                        итог["dirs"] += 1
+                    else:
+                        путь.unlink(missing_ok=True)
+                        итог["files"] += 1
+                except OSError as exc:
+                    log.debug("Временный файл %s не убран: %s", путь, exc)
+        if итог["dirs"] or итог["files"]:
+            log.info("Убрано брошенных временных файлов: каталогов %d, файлов %d",
+                     итог["dirs"], итог["files"])
+        return итог
 
     def _insights(self) -> Any:
         """Свод по содержанию для сводки по расписанию.

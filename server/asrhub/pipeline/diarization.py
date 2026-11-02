@@ -288,13 +288,14 @@ def разделить_по_словам(segments: list[Segment]) -> list[Segmen
                 segment.speaker = части[0][0]
             итог.append(segment)
             continue
-        for говорящий, свои in части:
+        тексты = _тексты_частей(str(segment.text or ""), части)
+        for (говорящий, свои), текст in zip(части, тексты, strict=True):
             уверенность = [float(с["confidence"]) for с in свои
                            if isinstance(с.get("confidence"), (int, float))]
             итог.append(Segment(
                 start=float(свои[0].get("start", segment.start)),
                 end=float(свои[-1].get("end", segment.end)),
-                text=" ".join(str(с.get("word") or "").strip() for с in свои).strip(),
+                text=текст,
                 speaker=говорящий,
                 confidence=(round(sum(уверенность) / len(уверенность), 4)
                             if уверенность else segment.confidence),
@@ -304,6 +305,49 @@ def разделить_по_словам(segments: list[Segment]) -> list[Segmen
                 language=segment.language,
                 words=свои))
     return итог
+
+
+def _тексты_частей(текст: str, части: list[tuple[str, list[dict[str, Any]]]]) -> list[str]:
+    """Текст каждой части — кусками ИСХОДНОГО текста реплики, а не склейкой слов.
+
+    Слова — это то, чему выравниватель или движок дал время, а не весь
+    текст: цифры и «%» у wav2vec2 границ не получают, знаки препинания в
+    словах не стоят вовсе. Склейка слов теряла и то и другое: «выросла на 5%
+    и это хорошо» превращалось в «выросла на и», а хвост без слов исчезал из
+    расшифровки целиком. Здесь куски текста раздаются по частям: кусок,
+    совпавший со словом, — его части, остальные — части предыдущего
+    совпавшего (в начале — первой). Не сошлось ничего — как раньше, словами.
+    """
+    import difflib  # noqa: PLC0415
+    import re  # noqa: PLC0415
+
+    def ключ(слово: str) -> str:
+        return "".join(с for с in слово.lower() if с.isalnum())
+
+    куски = re.findall(r"\S+", текст)
+    чья: list[int] = []
+    слова: list[str] = []
+    for номер, (_, свои) in enumerate(части):
+        for слово in свои:
+            чья.append(номер)
+            слова.append(ключ(str(слово.get("word") or "")))
+    сличение = difflib.SequenceMatcher(a=слова, b=[ключ(к) for к in куски], autojunk=False)
+    часть_куска: list[int | None] = [None] * len(куски)
+    for i, j, n in сличение.get_matching_blocks():
+        for k in range(n):
+            if слова[i + k]:
+                часть_куска[j + k] = чья[i + k]
+    if not any(ч is not None for ч in часть_куска):
+        return [" ".join(str(с.get("word") or "").strip() for с in свои).strip()
+                for _, свои in части]
+    текущая = next(ч for ч in часть_куска if ч is not None)
+    по_частям: list[list[str]] = [[] for _ in части]
+    for кусок, часть in zip(куски, часть_куска, strict=True):
+        if часть is not None:
+            # Части идут по времени; кусок не уводит назад, к уже закрытой.
+            текущая = max(текущая, часть)
+        по_частям[текущая].append(кусок)
+    return [" ".join(свои).strip() for свои in по_частям]
 
 
 def _пробеги(слова: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:

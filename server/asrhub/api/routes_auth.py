@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
@@ -14,6 +15,7 @@ from .. import audit
 from ..accounts import (
     DEFAULT_PASSWORD,
     DEFAULT_USERNAME,
+    НЕВЕРНЫЙ_ВХОД,
     AccountError,
     AccountNotFound,
     поле_да_нет,
@@ -26,6 +28,7 @@ from .deps import (
     authenticate,
     get_state,
     require_admin,
+    закрыть_сокеты,
 )
 
 log = get_logger("api.auth")
@@ -39,6 +42,20 @@ def _accounts(request: Request):
         raise AuthError("Вход по логину и паролю недоступен.",
                         hint="Учётные записи появляются после обновления базы.")
     return state.accounts
+
+
+def _закрыть_сокеты_записи(state: Any, user_id: str, причина: str, *,
+                           кроме_сессии: str = "") -> None:
+    """Закрывает веб-сокеты учётной записи (кроме сессии `кроме_сессии`)."""
+    hub = getattr(state, "events", None)
+    if hub is None:
+        return
+    try:
+        hub.close_where(lambda п: п.user_id == user_id
+                        and (not кроме_сессии or п.session != кроме_сессии),
+                        reason=причина)
+    except Exception as exc:                                    # noqa: BLE001
+        log.debug("Сокеты учётной записи не закрыты: %s", exc)
 
 
 def _set_cookie(request: Request, response: Response, token: str, expires: float) -> None:
@@ -59,7 +76,9 @@ def _set_cookie(request: Request, response: Response, token: str, expires: float
         # честно истекала — но браузер хранил мёртвый токен десятилетиями
         # и слал его при каждом запросе.
         max_age=int(max(0, expires - time.time())) or None,
-        expires=int(expires),
+        # Срок — моментом времени, а не числом: целое Starlette понимает как
+        # «секунд от сейчас», и метка эпохи давала куке Expires 2083 года.
+        expires=datetime.fromtimestamp(expires, tz=timezone.utc),
         httponly=True,          # javascript до куки не дотянется
         samesite="lax",         # чужая страница не отправит её POST-запросом
         secure=https,
@@ -88,8 +107,11 @@ def login(request: Request, response: Response,
     # пароля запирал вход каждому (см. `trusted_proxies`).
     адрес = (audit.адрес(request.headers, request.client,
                          state.settings.get("trusted_proxies")) or "неизвестно")
-    state.check_rate(f"login:{адрес}",
-                     int(state.settings.get("login_rate_limit") or 0))
+    # Обычно попытку уже посчитала прослойка — до чтения тела (иначе предел
+    # не спасал от тела в сотни мегабайт); здесь — когда её не было.
+    if not getattr(request.state, "login_rate_checked", False):
+        state.check_rate(f"login:{адрес}",
+                         int(state.settings.get("login_rate_limit") or 0))
     accounts = _accounts(request)
     username = str(payload.get("username") or "").strip()
     password = str(payload.get("password") or "")
@@ -138,7 +160,7 @@ def _войти(state, accounts, username: str, password: str):
     Ответ при отказе один и тот же во всех трёх случаях — иначе по разнице в
     сообщениях собирается список тех, кто в каталоге есть.
     """
-    from ..ldap_auth import Настройки, войти  # noqa: PLC0415
+    from ..ldap_auth import БезРоли, Настройки, войти  # noqa: PLC0415
 
     каталог = Настройки.из_настроек(state.settings)
     запись = accounts.by_username(username)
@@ -157,16 +179,30 @@ def _войти(state, accounts, username: str, password: str):
                      "этому человеку обычную учётную запись.")
         return accounts.authenticate(username, password)
 
-    человек = войти(каталог, username, password)
+    try:
+        человек = войти(каталог, username, password)
+    except БезРоли:
+        # Пара верна, но человека сняли со всех сопоставленных групп. Его
+        # запись уже на сервере — значит, и открытые сессии надо закрыть:
+        # снятие с группы обязано отнимать доступ, а не ждать срока куки.
+        if запись is not None and запись.from_directory:
+            accounts.drop_sessions(запись.id)
+            _закрыть_сокеты_записи(state, запись.id, "Доступ через каталог снят")
+        raise AuthError(НЕВЕРНЫЙ_ВХОД) from None
     if человек is None:
         if запись is not None and запись.from_directory:
-            raise AuthError("Неверный логин или пароль.")
+            raise AuthError(НЕВЕРНЫЙ_ВХОД)
         # Логина нет ни здесь, ни в каталоге — обычная проверка даст тот же
         # отказ и тем же текстом, заодно посчитав неудачу.
         return accounts.authenticate(username, password)
 
     учётная = accounts.ensure_directory(
         человек.username, role=человек.role, display_name=человек.display_name)
+    if запись is not None and запись.role != учётная.role:
+        # Роль сменилась в каталоге — открытые сокеты переподключатся уже с
+        # новой: лента событий администратора не должна доставаться тому,
+        # кого из администраторов сняли.
+        _закрыть_сокеты_записи(state, учётная.id, "Роль изменена каталогом")
     if not учётная.enabled:
         raise ForbiddenError("Учётная запись отключена на сервере.")
     accounts.note_login(учётная.id)
@@ -182,6 +218,10 @@ def logout(request: Request, response: Response) -> dict[str, Any]:
     if ушедший is not None:
         request.state.audit_actor = ушедший.username
     accounts.close_session(токен)
+    if токен:
+        # Выход закрывает и веб-сокеты этой сессии: лента событий иначе
+        # шла дальше, пока открыта вкладка.
+        закрыть_сокеты(request, lambda п: п.session == токен, reason="Выход")
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"status": "ok"}
 
@@ -242,8 +282,10 @@ def change_password(request: Request,
         raise AccountError("Новый пароль совпадает со старым.")
     if new == DEFAULT_PASSWORD:
         raise AccountError("Это пароль по умолчанию — придумайте другой.")
-    accounts.set_password(account.id, new,
-                          keep_sessions=request.cookies.get(SESSION_COOKIE, ""))
+    своя = request.cookies.get(SESSION_COOKIE, "")
+    accounts.set_password(account.id, new, keep_sessions=своя)
+    _закрыть_сокеты_записи(get_state(request), account.id, "Пароль изменён",
+                           кроме_сессии=своя)
     log.info("Пароль изменён: %s", account.username)
     return {"status": "ok"}
 
@@ -318,6 +360,12 @@ def update_user(user_id: str, request: Request, payload: dict[str, Any] = Body(.
                                                       payload.get("must_change_password", True)))
         log.info("Пароль сброшен администратором: %s", updated.username)
         updated = accounts.get(user_id) or updated
+    # Отключение, сброс пароля, смена роли или группы — открытые сокеты этой
+    # записи закрываются: права у сокета проверялись при рукопожатии, и
+    # отключённая запись продолжала получать ленту событий.
+    if (not updated.enabled or payload.get("password")
+            or updated.role != account.role or updated.group != account.group):
+        _закрыть_сокеты_записи(get_state(request), user_id, "Учётная запись изменена")
     return updated.to_dict()
 
 
@@ -331,10 +379,15 @@ def delete_user(user_id: str, request: Request,
         raise AccountNotFound(f"Учётная запись {user_id} не найдена.")
     if account.id == principal.user_id:
         raise ForbiddenError("Нельзя удалить учётную запись, под которой вы вошли.")
-    if account.role == "admin" and accounts.admin_count() <= 1:
+    # Последним считается последний ДЕЙСТВУЮЩИЙ администратор: отключённый в
+    # их число не входит, и раньше его нельзя было удалить, пока действующий
+    # один, — при том что управлять сервером он не может и так.
+    if (account.role == "admin" and account.enabled
+            and accounts.admin_count() <= 1):
         raise ForbiddenError("Это последний администратор.",
                              hint="Сначала заведите второго администратора.")
     accounts.delete(user_id)
+    _закрыть_сокеты_записи(get_state(request), user_id, "Учётная запись удалена")
     log.info("Удалена учётная запись «%s»", account.username)
     return {"status": "ok", "username": account.username}
 
@@ -360,6 +413,11 @@ def read_audit(request: Request,
     """
     require_admin(principal)
     state = get_state(request)
+    # Журнал пишется фоновым потоком (`audit.Писатель`): дождёмся, пока он
+    # допишет поставленное, — иначе только что сделанное в журнале не видно.
+    писатель = getattr(state, "audit_writer", None)
+    if писатель is not None:
+        писатель.flush(timeout=5.0)
     итог = state.db.audit_list(limit=limit, offset=offset, since=since,
                                until=until, actor=actor, query=query,
                                failed_only=failed_only)

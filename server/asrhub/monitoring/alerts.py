@@ -11,12 +11,15 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .catalog import METRICS_BY_NAME, порог, порог_нарушен, слово_порога
@@ -124,14 +127,22 @@ class Rule:
         метки = data.get("labels") or {}
         if not isinstance(метки, dict):
             raise TypeError("labels — объект «метка: значение»")
+        выдержка = float(data.get("for_seconds", 300))
+        # 1e999 в JSON — это бесконечность, и `int()` от неё бросал
+        # OverflowError мимо всех перехватов: ответ 500 вместо «неверное
+        # правило».
+        if not math.isfinite(выдержка):
+            raise ValueError("for_seconds должен быть конечным числом")
+        включено = _да_нет(data.get("enabled"))
         return cls(
             metric=str(data["metric"]),
             direction=направление,
             threshold=порог,
             severity=важность,
-            for_seconds=max(0, int(float(data.get("for_seconds", 300)))),
+            for_seconds=max(0, int(выдержка)),
             labels={str(k): str(v) for k, v in метки.items()},
-            enabled=bool(data.get("enabled", True)),
+            # Строка «false» — это «выключено»: `bool("false")` включал правило.
+            enabled=True if включено is None else включено,
             summary=str(data.get("summary", "")),
             # Не названо — решает __post_init__ (прежнее поведение движка).
             inclusive=_да_нет(data.get("inclusive")),
@@ -224,18 +235,16 @@ def default_rules(settings: Any = None) -> list[Rule]:
         threshold = порог(spec, settings)
         if not threshold or spec.name == "asrhub_up":
             continue
-        # Метрики, для которых порог задан в процентах или в приросте, здесь
-        # не проверяются: их выражения требуют функций Prometheus.
-        if spec.name in {"asrhub_jobs_total", "asrhub_http_requests_total",
-                         "asrhub_ram_used_bytes", "asrhub_gpu_memory_used_bytes",
-                         "asrhub_no_speech_total", "asrhub_auth_failures_total",
-                         "asrhub_webhooks_total", "asrhub_uptime_seconds"}:
+        # Метрики, для которых порог задан не к самому значению (доля,
+        # процент, прирост — см. `Threshold.kind`), здесь не проверяются:
+        # их выражения требуют функций Prometheus.
+        if getattr(threshold, "kind", "value") != "value":
             continue
-        labels = {}
-        if spec.name in {"asrhub_rtf", "asrhub_queue_wait_seconds"}:
-            labels = {"stat": "p95"}
-        elif spec.name == "asrhub_confidence":
-            labels = {"stat": "avg"}
+        # Порог среза — только к своему срезу. Перечень был свой и без
+        # asrhub_stream_first_text_seconds: порог для p95 сравнивался со
+        # всеми срезами, и тревога поднималась по p99.
+        stat = getattr(threshold, "stat", "")
+        labels = {"stat": stat} if stat else {}
         уже: set[float] = set()
         for severity, value in (("critical", threshold.critical),
                                 ("warning", threshold.warning)):
@@ -255,6 +264,26 @@ def default_rules(settings: Any = None) -> list[Rule]:
                         f"{_для_людей(float(value), spec.unit)}",
             ))
     return rules
+
+
+def ключ_наложения(правило: Rule) -> tuple[Any, ...]:
+    """Чем своё правило заменяет правило каталога: метрика, важность, метки."""
+    return (правило.metric, правило.severity, tuple(sorted(правило.labels.items())))
+
+
+def наложить(каталог: list[Rule], свои: list[Rule]) -> list[Rule]:
+    """Свои правила поверх правил каталога, а не вместо них.
+
+    Непустая настройка `monitoring_rules` раньше заменяла набор целиком:
+    администратор поднимал порог очереди по примеру из справочника — одно
+    правило — и пропадали все шестьдесят четыре тревоги каталога: о диске,
+    движках, температуре. Теперь своё правило заменяет правило каталога с
+    той же метрикой, важностью и метками, а остальные остаются. Выключить
+    правило каталога — то же правило с `"enabled": false`.
+    """
+    заменены = {ключ_наложения(п) for п in свои}
+    # Свои — первыми: в списке правил их ищут прежде всего.
+    return [*свои, *(п for п in каталог if ключ_наложения(п) not in заменены)]
 
 
 def _для_людей(значение: float, единица: str) -> str:
@@ -278,13 +307,71 @@ class AlertEngine:
     """Хранит правила, считает состояния и зовёт обработчик при смене."""
 
     def __init__(self, rules: list[Rule] | None = None,
-                 on_change: Callable[[AlertState, str], None] | None = None) -> None:
+                 on_change: Callable[[AlertState, str], None] | None = None,
+                 store: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._rules: list[Rule] = []
         self._states: dict[str, AlertState] = {}
         self._history: list[dict[str, Any]] = []
         self.on_change = on_change
+        #: Где хранится состояние тревог между запусками (см. `_восстановить`).
+        self._хранилище: Path | None = None
+        self._сохранённые: dict[str, dict[str, Any]] = {}
         self.set_rules(rules if rules is not None else default_rules())
+        if store is not None:
+            self.хранить_в(store)
+
+    # -- состояние между запусками -------------------------------------------
+
+    def хранить_в(self, путь: Path) -> None:
+        """Состояние тревог — в файл, чтобы пережить перезапуск.
+
+        Состояние жило в памяти: после перезапуска выдержка отсчитывалась с
+        нуля, и правило с выдержкой в час не срабатывало при перезапусках
+        чаще раза в час, а событие «тревога» оставалось без пары «снята».
+        Теперь ждущие и горящие тревоги восстанавливаются с прежним «с
+        какого момента» — по имени правила, на первом же снимке с метрикой.
+        """
+        self._хранилище = Path(путь)
+        try:
+            данные = json.loads(self._хранилище.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            данные = {}
+        if isinstance(данные, dict):
+            with self._lock:
+                self._сохранённые = {str(к): з for к, з in данные.items()
+                                     if isinstance(з, dict)
+                                     and з.get("state") in (STATE_PENDING, STATE_FIRING)}
+
+    def _сохранить(self) -> None:
+        if self._хранилище is None:
+            return
+        with self._lock:
+            данные = {к: {"state": с.state, "since": с.since, "fired_at": с.fired_at,
+                          "value": с.value}
+                      for к, с in self._states.items()
+                      if с.state in (STATE_PENDING, STATE_FIRING)}
+            # Ещё не встреченные в снимке восстановленные — тоже хранятся,
+            # иначе первый же снимок без их метрики стёр бы их навсегда.
+            for к, з in self._сохранённые.items():
+                данные.setdefault(к, з)
+        try:
+            self._хранилище.parent.mkdir(parents=True, exist_ok=True)
+            временный = self._хранилище.with_suffix(".tmp")
+            временный.write_text(json.dumps(данные, ensure_ascii=False), encoding="utf-8")
+            os.replace(временный, self._хранилище)
+        except OSError as exc:
+            log.debug("Состояние тревог не сохранено: %s", exc)
+
+    def _восстановить(self, state: AlertState) -> None:
+        """Новое состояние правила — с тем, что было до перезапуска."""
+        прежнее = self._сохранённые.pop(state.rule.id, None)
+        if not прежнее:
+            return
+        state.state = str(прежнее.get("state") or STATE_OK)
+        state.since = float(прежнее.get("since") or 0.0)
+        state.fired_at = float(прежнее.get("fired_at") or 0.0)
+        state.value = float(прежнее.get("value") or 0.0)
 
     # -- правила -------------------------------------------------------------
 
@@ -314,10 +401,30 @@ class AlertEngine:
             if занято[основа] > 1:
                 правило.ordinal = занято[основа]
             свои.append(правило)
-        имена = {п.id for п in свои}
+        имена = {п.id for п in свои if п.enabled}
         with self._lock:
             self._rules = свои
+            # Состояние правила, которое убрали или выключили, снимается
+            # обычным путём — с записью в историю и событием «снята». Прежде
+            # выключенное правило evaluate пропускал, а его состояние
+            # «firing» переносилось как было: тревога горела в счётчике
+            # меню, в /alerts и в /health до перезапуска, а события снятия не
+            # было вовсе — выключить правило, чтобы заглушить, было нельзя.
+            ушли = [v for k, v in self._states.items()
+                    if k not in имена and v.state != STATE_OK]
             self._states = {k: v for k, v in self._states.items() if k in имена}
+        сейчас = time.time()
+        for состояние in ушли:
+            прежнее = состояние.state
+            состояние.state = STATE_OK
+            состояние.resolved_at = сейчас
+            состояние.since = 0.0
+            состояние.clear_since = 0.0
+            if прежнее == STATE_FIRING:
+                self._record(состояние.to_dict(), прежнее)
+                self._сообщить(состояние, прежнее)
+        if ушли:
+            self._сохранить()
 
     def reset_rules(self, settings: Any = None) -> None:
         self.set_rules(default_rules(settings))
@@ -404,12 +511,14 @@ class AlertEngine:
         # звали: сработавшая тревога молча исчезала из раздела, а в журнале
         # событий так и оставалась «сработавшей» навсегда.
         self._сообщить(state, previous)
+        self._сохранить()
 
     def _advance(self, rule: Rule, value: float, now: float) -> None:
         with self._lock:
             state = self._states.get(rule.id)
             if state is None:
                 state = self._states[rule.id] = AlertState(rule=rule)
+                self._восстановить(state)
             previous = state.state
             state.value = value
             state.rule = rule
@@ -444,6 +553,7 @@ class AlertEngine:
         if changed and snapshot is not None:
             self._record(snapshot, previous)
             self._сообщить(state, previous)
+            self._сохранить()
 
     def _сообщить(self, state: AlertState, previous: str) -> None:
         """Зовёт обработчик смены состояния; его сбой — не повод падать."""

@@ -66,7 +66,7 @@ if (-not $Only -or $Only -eq 'hardware') {
                 'Для расчётов встроенная графика не годится: сервер работает на процессоре.'
         } elseif ($gpuBus.DriverIsGeneric) {
             Test-Item 'Видеокарта' 'warn' "$($gpuBus.Name) — драйвера нет" `
-                'Windows показывает стандартный адаптер. Поставить драйвер: powershell -File scripts\install.ps1'
+                'Windows показывает стандартный адаптер. Поставить драйвер: powershell -ExecutionPolicy Bypass -File scripts\install.ps1'
         } else {
             Test-Item 'Видеокарта' 'warn' "$($gpuBus.Name) — драйвер есть, расчёты недоступны" `
                 'Установлен видеодрайвер без поддержки вычислений либо карта отключена в панели управления.'
@@ -81,7 +81,10 @@ if (-not $Only -or $Only -eq 'hardware') {
             Test-Item 'PyTorch видит видеокарту' $(if ($torchCuda -eq 'True') { 'ok' } else { 'fail' }) `
                 "$torchCuda" "Переустановите PyTorch: `"$Prefix\venv\Scripts\pip.exe`" install --force-reinstall --index-url $(Get-TorchIndexUrl -Accelerator cuda -CudaVersion $hw.CudaVersion) torch torchaudio"
         }
-    } else {
+    } elseif (-not $gpuBus.Vendor) {
+        # Только когда карты нет и на шине: найденная, но нерабочая карта уже
+        # описана выше, и вторая строка «Видеокарта: не обнаружена» ей
+        # противоречила.
         Test-Item 'Видеокарта' 'warn' 'не обнаружена' `
             'Работа только на процессоре. Включите int8 и берите модели полегче.'
     }
@@ -113,13 +116,13 @@ if (-not $Only) {
             $script:Passed, $script:Warned, $script:Failed)
         Write-Host ''
         Write-Host '  ASR Hub на этой машине не найден.' -ForegroundColor Red
-        Write-Host '  Установка: powershell -File scripts\install.ps1' -ForegroundColor DarkGray
+        Write-Host '  Установка: powershell -ExecutionPolicy Bypass -File scripts\install.ps1' -ForegroundColor DarkGray
         Write-Host ''
         exit 1
     }
     Test-Item 'Каталог программы' $(if ($Prefix -and (Test-Path $Prefix)) { 'ok' } else { 'fail' }) `
         $(if ($Prefix) { $Prefix } else { 'не найден' }) `
-        'Запустите установку: powershell -File scripts\install.ps1'
+        'Запустите установку: powershell -ExecutionPolicy Bypass -File scripts\install.ps1'
     Test-Item 'Каталог данных' $(if ($DataDir -and (Test-Path $DataDir)) { 'ok' } else { 'fail' }) `
         $(if ($DataDir) { $DataDir } else { 'не найден' })
     foreach ($sub in @('uploads', 'results', 'models', 'logs', 'tmp')) {
@@ -205,10 +208,10 @@ if (-not $Only -or $Only -eq 'network') {
         Test-Item 'Сервер' 'ok' "отвечает на порту $port, версия $version"
     } elseif ($probe.Status -gt 0) {
         Test-Item 'Сервер' 'warn' "отвечает на порту $port, но сообщает о неисправности (код $($probe.Status))" `
-            "Журнал: powershell -File `"$PSScriptRoot\service.ps1`" -Action logs -Lines 100"
+            "Журнал: powershell -ExecutionPolicy Bypass -File `"$PSScriptRoot\service.ps1`" -Action logs -Lines 100"
     } else {
         Test-Item "Порт $port" 'warn' 'сервер не отвечает' `
-            "Запустить: powershell -File `"$PSScriptRoot\service.ps1`" -Action start"
+            "Запустить: powershell -ExecutionPolicy Bypass -File `"$PSScriptRoot\service.ps1`" -Action start"
     }
     # Правило брандмауэра нужно только серверу, открытому в сеть. Раньше
     # предупреждение звучало всегда — и у сервера на 127.0.0.1, которому
@@ -235,7 +238,7 @@ Write-Host ("  ✓ пройдено: {0}   ! предупреждений: {1}  
 Write-Host ''
 if ($script:Failed -gt 0) {
     Write-Host '  Есть критические проблемы — сервер может не работать.' -ForegroundColor Red
-    Write-Host '  Попробуйте: powershell -File scripts\doctor.ps1 -Fix' -ForegroundColor DarkGray
+    Write-Host '  Попробуйте: powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Fix' -ForegroundColor DarkGray
     exit 1
 } elseif ($script:Warned -gt 0) {
     Write-Host '  Сервер работоспособен, часть возможностей ограничена.' -ForegroundColor Yellow

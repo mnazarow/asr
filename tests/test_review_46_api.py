@@ -343,6 +343,10 @@ def test_тревога_несёт_знак_и_метки(data_dir, monkeypatch)
             {"metric": "asrhub_collector_source_up", "direction": "below", "threshold": 1,
              "severity": "critical", "inclusive": True, "labels": {"source": "queue"}}])
         тревоги = c.get("/api/monitoring/alerts").json()["alerts"]
+    # Заход 54: своё правило ложится поверх правил каталога, а не вместо них —
+    # в списке и тревоги каталога; своё — то, что с метками.
+    тревоги = [т for т in тревоги if т["metric"] == "asrhub_collector_source_up"
+               and т["labels"] == {"source": "queue"}]
     assert len(тревоги) == 1, тревоги
     assert тревоги[0]["inclusive"] is True
     assert тревоги[0]["labels"] == {"source": "queue"}

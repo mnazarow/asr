@@ -41,6 +41,7 @@ class DemoEngine(Engine):
     supports_batching = True
     supports_streaming = True
     outputs_punctuation = True
+    режет_сам = True
 
     @classmethod
     def check_available(cls) -> tuple[bool, str]:

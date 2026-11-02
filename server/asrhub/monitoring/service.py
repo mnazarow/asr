@@ -9,11 +9,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from .. import settings_access as S
 from . import exporters, probes
-from .alerts import AlertEngine, Rule, default_rules
+from .alerts import AlertEngine, Rule, default_rules, наложить
 from .collector import RUNTIME, Collector, Sample
 from .pushers import PushManager, Target
 
@@ -26,8 +27,14 @@ log = logging.getLogger("asrhub.monitoring")
 #: событий о кончающемся диске молчала.
 ОЦЕНКА_ТРЕВОГ_С = 60.0
 
-#: Сколько ждать чужой сбор снимка, прежде чем собрать самому.
+#: Сколько ждать чужой сбор снимка. Дольше — отдаётся прежний снимок с
+#: пометкой, что он устарел: прежде после тайм-аута ожидание начиналось
+#: заново, и при зависшем сборе висели все /metrics, /health, /alerts и
+#: /info, каждый со своим потоком пула.
 ЖДАТЬ_СБОР_С = 120.0
+
+#: Файл, в котором тревоги переживают перезапуск (см. `AlertEngine.хранить_в`).
+ФАЙЛ_ТРЕВОГ = "monitoring-alerts.json"
 
 #: Ключи настроек, от которых зависит мониторинг.
 КЛЮЧИ_НАСТРОЕК = frozenset({"monitoring_targets", "monitoring_rules",
@@ -43,6 +50,9 @@ class MonitoringService:
         self.runtime = RUNTIME
         self.collector = Collector(state, RUNTIME)
         self.alerts = AlertEngine(on_change=self._on_alert_change)
+        данные = getattr(getattr(getattr(state, "settings", None), "paths", None), "data", None)
+        if данные:
+            self.alerts.хранить_в(Path(str(данные)) / ФАЙЛ_ТРЕВОГ)
         self.push = PushManager(self._collect_for_push)
         self.cache_ttl_s = cache_ttl_s
 
@@ -79,6 +89,14 @@ class MonitoringService:
                 self._собран.wait(timeout=ЖДАТЬ_СБОР_С)
                 if self._cache_at >= запрошено:
                     return list(self._cache), list(self._cache_errors)
+                if self._сбор_идёт and time.time() - запрошено >= ЖДАТЬ_СБОР_С \
+                        and self._cache_at:
+                    # Чужой сбор висит дольше срока — отдаём прежний снимок
+                    # и говорим, что он устарел, а не ждём снова.
+                    return list(self._cache), [
+                        *self._cache_errors,
+                        f"снимок устарел: сбор идёт дольше {ЖДАТЬ_СБОР_С:g} с, отдан "
+                        f"собранный {time.time() - self._cache_at:.0f} с назад"]
         try:
             collected, errors = self.collector.collect()
             collected.extend(self.push.healthy_samples())
@@ -136,12 +154,25 @@ class MonitoringService:
 
     # -- состояние -----------------------------------------------------------
 
+    def последний(self) -> tuple[list[Sample], list[str]]:
+        """Последний собранный снимок — без нового сбора, если он уже был.
+
+        Тревоги считает фоновый поток раз в минуту и каждый сбор метрик, а
+        интерфейс спрашивает их каждые четыре секунды с любой страницы.
+        Сбор по каждому такому вопросу — это обход базы за сутки на каждый
+        опрос меню; ответ по последнему расчёту ничем не хуже.
+        """
+        with self._собран:
+            if self._cache_at:
+                return list(self._cache), list(self._cache_errors)
+        return self.samples()
+
     def health(self) -> dict[str, Any]:
-        self.samples()                      # заодно пересчитываем оповещения
+        self.последний()                    # тревоги — по последнему расчёту
         return probes.overall(self.state, self.alerts.summary())
 
     def info(self) -> dict[str, Any]:
-        samples, errors = self.samples()
+        samples, errors = self.последний()
         return {
             "scrapes": self._scrapes,
             "samples": len(samples),
@@ -170,11 +201,25 @@ class MonitoringService:
                         type(raw_targets).__name__)
             raw_targets = []
         targets: list[Target] = []
+        занятые: set[str] = set()
         for item in raw_targets:
             try:
-                targets.append(Target.from_dict(item))
+                приёмник = Target.from_dict(item)
             except Exception as exc:                         # noqa: BLE001
                 log.warning("Приёмник метрик пропущен: %s", exc)
+                continue
+            # Имя — ключ приёмника, а по умолчанию это его вид: два influxdb
+            # без name схлопывались в один, и работал только последний. Как у
+            # POST /targets — занятое имя получает номер.
+            if приёмник.name in занятые:
+                основа, номер = приёмник.name, 2
+                while f"{основа}-{номер}" in занятые:
+                    номер += 1
+                log.warning("Два приёмника метрик с именем «%s»: второй назван «%s-%d»",
+                            основа, основа, номер)
+                приёмник.name = f"{основа}-{номер}"
+            занятые.add(приёмник.name)
+            targets.append(приёмник)
         self.push.set_targets(targets)
 
         raw_rules = settings.get("monitoring_rules") or []
@@ -188,11 +233,10 @@ class MonitoringService:
                 rules.append(Rule.from_dict(item))
             except Exception as exc:                         # noqa: BLE001
                 log.warning("Правило оповещения пропущено: %s", exc)
-        # Пустой список — пороги каталога, сдвинутые по настройкам сервера
-        # (место на диске — от disk_min_free_gb). Раньше пустой список
-        # оставлял прежние правила как есть: убранные из настроек свои
-        # пороги продолжали действовать до перезапуска.
-        self.alerts.set_rules(rules or default_rules(settings))
+        # Свои правила — поверх порогов каталога, сдвинутых по настройкам
+        # сервера (место на диске — от disk_min_free_gb), а не вместо них
+        # (см. `alerts.наложить`). Пустой список — одни пороги каталога.
+        self.alerts.set_rules(наложить(default_rules(settings), rules))
         self._переоценить()
 
         # Ноль — «кеш выключен», а не «по умолчанию»: `or 5.0` превращал
@@ -206,7 +250,11 @@ class MonitoringService:
     def start(self) -> None:
         self.apply_settings(self.state.settings)
         self.collector.начать_замер()
-        if self._оценка is None:
+        if self._оценка is not None and self._оценка.is_alive():
+            # Недождавшийся при остановке поток продолжит работу — второй
+            # такой же считал бы тревоги дважды (см. `PushManager.start`).
+            self._стоп.clear()
+        else:
             self._стоп.clear()
             self._оценка = threading.Thread(target=self._оценивать, name="asrhub-alerts",
                                              daemon=True)
@@ -216,7 +264,8 @@ class MonitoringService:
         self._стоп.set()
         if self._оценка is not None:
             self._оценка.join(timeout=5.0)
-            self._оценка = None
+            if not self._оценка.is_alive():
+                self._оценка = None
         self.push.stop()
 
     def _оценивать(self) -> None:
@@ -256,15 +305,18 @@ class MonitoringService:
 
     def save_rules(self, rules: list[Rule] | None) -> dict[str, Any]:
         """Ставит правила (None — пороги каталога) и записывает в настройки."""
-        if rules is None:
+        if not rules:
+            # Пустой список — те же пороги каталога, что «Вернуть пороги»:
+            # прежде PUT [] оставлял ноль правил до перезапуска.
             self.alerts.reset_rules(self.state.settings)
             self._переоценить()
             return self._сохранить("monitoring_rules", [])
-        self.alerts.set_rules(rules)
+        # Свои правила — поверх каталога; в настройку уходят только свои.
+        self.alerts.set_rules(наложить(default_rules(self.state.settings), rules))
         self._переоценить()
         return self._сохранить("monitoring_rules",
                                [{к: з for к, з in r.to_dict().items() if к != "id"}
-                                for r in self.alerts.rules])
+                                for r in rules])
 
     def _сохранить(self, ключ: str, значение: Any) -> dict[str, Any]:
         """Значение — в настройки сервера и в файл конфигурации.
@@ -281,7 +333,7 @@ class MonitoringService:
     # -- оповещения ----------------------------------------------------------
 
     def _on_alert_change(self, alert: Any, previous: str) -> None:
-        """Пишет смену состояния в ленту событий сервера."""
+        """Пишет смену состояния в ленту событий сервера и шлёт на `alert_url`."""
         try:
             payload = alert.to_dict()
             kind = ("alert_firing" if payload["state"] == "firing"
@@ -291,3 +343,35 @@ class MonitoringService:
             self.state.db.add_event(None, kind, payload["summary"], payload)
         except Exception as exc:                            # noqa: BLE001
             log.debug("Не удалось записать событие оповещения: %s", exc)
+            return
+        self._уведомить(kind, payload)
+
+    def _уведомить(self, kind: str, payload: dict[str, Any]) -> None:
+        """Тревога и её снятие — на `alert_url`, если он задан.
+
+        Уведомлений о встроенных тревогах не было вовсе: смена состояния
+        уходила только в ленту событий, а её смотрят, когда уже знают, что
+        искать. Теперь — POST с JSON на адрес чата или дежурной системы, тем
+        же путём и с той же проверкой адреса, что у трекеров и сводки.
+        Отправка — отдельным потоком: тревоги считает сбор метрик, и ждать в
+        нём чужой сервер нельзя.
+        """
+        settings = getattr(self.state, "settings", None)
+        адрес = str((settings.get("alert_url") if settings else "") or "").strip()
+        if not адрес:
+            return
+        from ..job_queue import check_outbound_url  # noqa: PLC0415
+
+        try:
+            check_outbound_url(адрес, bool(settings.get("webhook_allow_internal")))
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Адрес уведомлений о тревогах отвергнут: %s", exc)
+            return
+        тело = {"event": kind, "text": (("Тревога: " if kind == "alert_firing"
+                                         else "Тревога снята: ") + str(payload.get("summary"))),
+                **payload}
+        from ..maintenance import send_json  # noqa: PLC0415
+
+        threading.Thread(target=send_json, args=(тело, адрес),
+                         kwargs={"what": "тревога"}, name="asrhub-alert-notify",
+                         daemon=True).start()

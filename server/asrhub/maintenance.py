@@ -163,20 +163,28 @@ def make_backup(db: Any, settings: Any) -> Path | None:
     метка = time.strftime("%Y%m%d-%H%M%S")
     цель = каталог / f"asrhub-{метка}-{_кто()}.db"
     начало = time.time()
+    from . import backup as резерв  # noqa: PLC0415
+    from .errors import StorageError  # noqa: PLC0415
+
     try:
         # Копия базы — вся база разговоров: 0600, как и архивы копий.
         цель.touch(mode=0o600, exist_ok=True)
         os.chmod(цель, 0o600)
-        приёмник = sqlite3.connect(str(цель))
-        try:
-            with приёмник:
-                db.conn.backup(приёмник)
-        finally:
-            приёмник.close()
-    except (sqlite3.Error, OSError) as exc:
+        # Тем же путём, что копия из раздела «Копии»: снимок по режиму журнала
+        # (в режиме отката одним шагом он запирал запись всем, см.
+        # `Database.snapshot`) и проверка целостности. Без неё копия
+        # испорченной базы ложилась в каталог как исправная, и узнавали об
+        # этом в день восстановления.
+        резерв._снять_базу(db, цель)
+        резерв._проверить_снимок(цель)
+    except (sqlite3.Error, OSError, StorageError) as exc:
         log.warning("Резервная копия не удалась: %s", exc)
         цель.unlink(missing_ok=True)
+        for хвост in резерв.СПУТНИКИ_БАЗЫ:
+            Path(str(цель) + хвост).unlink(missing_ok=True)
         return None
+    if предел > 0:
+        _подчистить(каталог, предел)
 
     как_у_каталога(Path(settings.paths.data), цель)
     размер = цель.stat().st_size
@@ -198,11 +206,14 @@ def _подчистить(каталог: Path, держать: int, *,
 
     `место_под_ещё_одну` вычитает единицу: перед снятием новой копии в
     каталоге должно остаться `держать - 1` штук, иначе после успешного
-    захода их станет на одну больше заявленного.
+    захода их станет на одну больше заявленного. Но не меньше одной: при
+    `backup_keep: 1` единственная прежняя копия удалялась ДО попытки снять
+    новую, и неудавшаяся копия (полный диск, порча базы) оставляла каталог
+    пустым. Лишняя, если новая удалась, уходит подчисткой после неё.
     """
     предел = max(1, держать)
     if место_под_ещё_одну:
-        предел = max(0, предел - 1)
+        предел = max(1, предел - 1)
     try:
         копии = sorted(каталог.glob("asrhub-*.db"),
                        key=lambda p: p.stat().st_mtime, reverse=True)
@@ -619,11 +630,18 @@ def _справочник(db: Any, settings: Any) -> dict[str, Any] | None:
         db.add_event(None, "employees_sync_failed",
                      f"Справочник не обновлён: {exc}", {"url": адрес})
         return {"error": str(exc), "url": адрес}
+    заблокировано = int(итог.get("deactivation_blocked") or 0)
     db.add_event(None, "employees_synced",
                  f"Справочник обновлён: +{итог.get('added')} новых, "
-                 f"{итог.get('updated')} изменено, {итог.get('deactivated')} уволено",
+                 f"{итог.get('updated')} изменено, {итог.get('deactivated')} уволено"
+                 + (f"; {заблокировано} не отмечены уволенными — выгрузка похожа на "
+                    "неполную, проверьте и повторите импорт с force=true"
+                    if заблокировано else ""),
                  {"url": адрес, "rows": итог.get("rows"),
-                  "skipped": итог.get("skipped")})
+                  "skipped": итог.get("skipped"), "deactivation_blocked": заблокировано})
+    if заблокировано:
+        log.warning("Справочник: %d карточек не отмечены уволенными — выгрузка "
+                    "похожа на неполную", заблокировано)
     return итог
 
 
@@ -695,11 +713,16 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
         держатель = db.lease_take(АРЕНДА_КОПИИ, INSTANCE_ID, СРОК_АРЕНДЫ_КОПИИ_С)
         if держатель is None:
             try:
-                копия = резерв.создать(db, settings,
-                                       kind=str(settings.get("backup_kind") or "full"),
-                                       comment="по расписанию")
-                db.set_kv(KV_BACKUP, time.time())
-                сделано["backup"] = копия.get("name")
+                # «Пора» проверялось только до аренды, и в узком окне два
+                # сервера на общей базе оба видели «пора»: первый снимал
+                # копию и отпускал аренду, второй брал её следом — и снимал
+                # вторую. Под арендой отметка перечитывается ещё раз.
+                if резерв.пора(db, settings, ключ=KV_BACKUP):
+                    копия = резерв.создать(db, settings,
+                                           kind=str(settings.get("backup_kind") or "full"),
+                                           comment="по расписанию")
+                    db.set_kv(KV_BACKUP, time.time())
+                    сделано["backup"] = копия.get("name")
             except Exception as exc:                         # noqa: BLE001
                 # Сбой копии не должен ронять служебный заход: следом идут
                 # уборка и сводка, и они к копии отношения не имеют.
@@ -915,3 +938,20 @@ def _срок(settings: Any, ключ: str, default: int = 30) -> int:
 
 def retention_days(settings: Any, default: int = 30) -> int:
     return _срок(settings, "result_retention_days", default)
+
+
+def calls_file_days(settings: Any) -> int:
+    """Самая большая глубина просмотра каталога записей среди станций, дней.
+
+    Ниже неё строку звонка, заведённую обходом каталога, забывать нельзя:
+    импорт узнаёт уже распознанный файл только по ней, и при глубине больше
+    срока хранения (60 дней при 30) каждая запись распознавалась бы заново.
+    """
+    try:
+        from .telephony import stations  # noqa: PLC0415
+
+        return max((int(с.lookback_days or 0) for с in stations.список(settings)),
+                   default=0)
+    except Exception as exc:                                 # noqa: BLE001
+        log.debug("Глубина просмотра станций не узнана: %s", exc)
+        return 0

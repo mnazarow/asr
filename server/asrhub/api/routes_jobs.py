@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import math
 import mimetypes
+import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -31,6 +34,7 @@ from ..errors import (
     ASRHubError,
     ConfigError,
     FileTooLarge,
+    ForbiddenError,
     JobNotFound,
     ModelNotFound,
     QuotaExceeded,
@@ -136,7 +140,7 @@ def _parse_settings(raw: str | None) -> dict[str, Any]:
 #: то есть задание с номерами абонентов не создавалось бы вовсе.
 _RESERVED_FORM_FIELDS = frozenset({
     "file", "files", "settings", "priority", "group_id", "tags",
-    "reference_text", "webhook_url", *ПОЛЯ_ЗВОНКА,
+    "reference_text", "webhook_url", "deadline", *ПОЛЯ_ЗВОНКА,
 })
 
 
@@ -190,7 +194,7 @@ async def _form_overrides(request: Request) -> dict[str, Any]:
             f"Неизвестные поля формы: {known}.",
             hint="Список допустимых параметров: GET /api/params. "
                  "Служебные поля: file, settings, priority, group_id, tags, "
-                 "reference_text, webhook_url. Данные звонка: "
+                 "reference_text, webhook_url, deadline. Данные звонка: "
                  + ", ".join(ПОЛЯ_ЗВОНКА) + "."))
     return values
 
@@ -215,8 +219,141 @@ def check_quota(request: Request, principal: Principal, *,
         raise error_response(exc) from exc
 
 
+#: Окно суточной квоты.
+СУТКИ_С = 86400.0
+
+#: Ключ журнала расхода вне таблицы заданий (см. `учесть_расход`).
+_РАСХОД = "квота:расход:"
+
+#: Предел записей журнала расхода на одного владельца: сутки удалений по
+#: записи в секунду — больше, чем бывает, и всё ещё килобайты.
+_РАСХОД_ПРЕДЕЛ = 20000
+
+
+def учесть_расход(state: Any, owner: str, *, jobs: int = 0, audio_s: float = 0.0,
+                  size: int = 0) -> None:
+    """Записывает расход, которого больше не видно по таблице заданий.
+
+    Суточный расход считался по существующим строкам `jobs`: удалил задание
+    — расход вернулся. Ключ с квотой «одно задание в сутки» грузил запись,
+    забирал расшифровку, удалял её и грузил следующую сколько угодно раз.
+    То же с повтором: перераспознавание — это та же работа сервера, а новой
+    строки оно не создаёт. И с потоком: диктовка вовсе не оставляет строки.
+
+    Поэтому такой расход ведётся отдельным журналом — строкой `kv` на
+    владельца со списком «когда, сколько». Запись идёт одной транзакцией
+    базы (чтение и запись под её замком), так что два удаления разом,
+    даже с разных серверов, не теряют друг друга. Старше суток — вычищается
+    при следующей записи.
+    """
+    if not owner or not (jobs or audio_s or size):
+        return
+    ключ = _РАСХОД + owner
+    мгновение = time.time()
+    try:
+        with state.db.write() as conn:
+            строка = conn.execute("SELECT value FROM kv WHERE key=?", (ключ,)).fetchone()
+            try:
+                было = json.loads(строка["value"]) if строка is not None else []
+            except (TypeError, ValueError):
+                было = []
+            записи = [з for з in (было if isinstance(было, list) else [])
+                      if isinstance(з, list) and len(з) == 4
+                      and float(з[0] or 0) >= мгновение - СУТКИ_С]
+            записи.append([round(мгновение, 3), int(jobs), round(float(audio_s), 3),
+                           int(size)])
+            conn.execute("INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?,?,?)",
+                         (ключ, json.dumps(записи[-_РАСХОД_ПРЕДЕЛ:]), мгновение))
+    except Exception as exc:                                    # noqa: BLE001
+        # Расход — учёт, а не условие работы: удаление и повтор уже
+        # выполнены, и отменять их из-за сбоя записи учёта нельзя.
+        log.warning("Расход владельца «%s» не записан: %s", owner, exc)
+
+
+def расход(state: Any, scope: str | list[str], since: float) -> dict[str, float]:
+    """Расход владельца или подразделения: задания в таблице плюс журнал расхода."""
+    used = dict(state.db.owner_usage(scope, since))
+    владельцы = [scope] if isinstance(scope, str) else list(scope)
+    добавка = {"jobs": 0, "audio_s": 0.0, "bytes": 0}
+    for владелец in владельцы:
+        try:
+            записи = state.db.get_kv(_РАСХОД + str(владелец), []) or []
+        except Exception:                                       # noqa: BLE001
+            записи = []
+        for з in записи if isinstance(записи, list) else []:
+            if not isinstance(з, list) or len(з) != 4:
+                continue
+            try:
+                if float(з[0]) < since:
+                    continue
+                добавка["jobs"] += int(з[1])
+                добавка["audio_s"] += float(з[2])
+                добавка["bytes"] += int(з[3])
+            except (TypeError, ValueError):
+                continue
+    used["jobs"] = int(used.get("jobs") or 0) + добавка["jobs"]
+    used["audio_hours"] = round(float(used.get("audio_hours") or 0)
+                                + добавка["audio_s"] / 3600, 4)
+    used["storage_gb"] = round(float(used.get("storage_gb") or 0)
+                               + добавка["bytes"] / 1024 ** 3, 4)
+    return used
+
+
+#: Замки квоты по владельцу: проверка и постановка одного владельца идут по
+#: одной (см. `под_квотой`).
+_ЗАМКИ_КВОТЫ: dict[str, threading.Lock] = {}
+_ЗАМОК_ЗАМКОВ = threading.Lock()
+
+
+def _замок_квоты(principal: Principal) -> threading.Lock:
+    scope = scope_owner(principal) or principal.name
+    ключ = ",".join(scope) if isinstance(scope, list) else str(scope)
+    with _ЗАМОК_ЗАМКОВ:
+        return _ЗАМКИ_КВОТЫ.setdefault(ключ, threading.Lock())
+
+
+def под_квотой(state: Any, principal: Principal, действие: Any, *,
+               incoming_bytes: int = 0, incoming_audio_s: float = 0.0,
+               incoming_jobs: int = 1) -> Any:
+    """Проверяет квоту и выполняет постановку под одним замком владельца.
+
+    Проверка читала расход, а задание появлялось позже — после приёма файла
+    и ffprobe, — и между ними не было ничего общего: десять одновременных
+    загрузок ключа с квотой «три в сутки» видели по два задания и проходили
+    все десять. Теперь последняя проверка и сама постановка одного
+    владельца идут по одной. Замок — в процессе: два сервера над одной
+    базой по-прежнему могут пропустить по лишнему заданию каждый.
+    """
+    if principal.is_admin or not (principal.quota_jobs_per_day
+                                  or principal.quota_audio_hours_per_day
+                                  or principal.quota_storage_gb):
+        return действие()
+    with _замок_квоты(principal):
+        проверить_квоту(state, principal, incoming_bytes=incoming_bytes,
+                        incoming_audio_s=incoming_audio_s, incoming_jobs=incoming_jobs)
+        return действие()
+
+
+def _под_квотой_или_отказ(state: Any, principal: Principal, действие: Any,
+                         **пределы: Any) -> Any:
+    """`под_квотой` с отказом в виде ответа API."""
+    try:
+        return под_квотой(state, principal, действие, **пределы)
+    except QuotaExceeded as exc:
+        raise error_response(exc) from exc
+
+
+def _свои_выражения(state: Any, overrides: dict[str, Any]) -> None:
+    """Регулярные выражения словаря замен — только от администратора сервера."""
+    try:
+        state.settings.выражения_задания(overrides)
+    except ConfigError as exc:
+        raise error_response(exc) from exc
+
+
 def проверить_квоту(state: Any, principal: Principal, *,
-                    incoming_bytes: int = 0, incoming_audio_s: float = 0.0) -> None:
+                    incoming_bytes: int = 0, incoming_audio_s: float = 0.0,
+                    incoming_jobs: int = 1) -> None:
     """Проверяет суточные квоты ключа перед приёмом задания.
 
     Три роли давали ответ на вопрос «что можно делать», но не на вопрос
@@ -226,6 +363,9 @@ def проверить_квоту(state: Any, principal: Principal, *,
     Квота считается за скользящие сутки и восстанавливается сама.
     Администратор не ограничен: иначе обслуживание сервера упиралось бы в
     ту же стену, что и злоупотребление.
+
+    `incoming_jobs` — сколько заданий добавит действие: ноль у повтора и
+    потока (они расходуют часы звука, а не задания).
     """
     if principal.is_admin:
         return
@@ -238,16 +378,23 @@ def проверить_квоту(state: Any, principal: Principal, *,
         return
 
     scope = scope_owner(principal) or principal.name
-    used = state.db.owner_usage(scope, time.time() - 86400)
+    used = расход(state, scope, time.time() - СУТКИ_С)
     # Учитываем и то, что принимаем прямо сейчас: иначе одна загрузка на
     # сто часов проходила бы поверх любой квоты.
     pending = {
-        "jobs": used["jobs"] + 1,
+        "jobs": used["jobs"] + incoming_jobs,
         "audio_hours": used["audio_hours"] + incoming_audio_s / 3600,
         "storage_gb": used["storage_gb"] + incoming_bytes / 1024 ** 3,
     }
     for kind, limit in limits.items():
-        if limit and pending[kind] > limit:
+        if not limit:
+            continue
+        # Действие, которое этого вида не добавляет (повтор — заданий),
+        # не упирается в него: сравнивать надо только то, что растёт.
+        if kind == "jobs" and not incoming_jobs:
+            continue
+        if pending[kind] > limit or (kind == "audio_hours" and incoming_jobs == 0
+                                     and used[kind] >= limit):
             raise QuotaExceeded(kind, round(pending[kind], 3), limit)
 
 
@@ -310,6 +457,11 @@ def проверить_квоту(state: Any, principal: Principal, *,
 #: за секунды, ноль или мусор.
 НЕ_РАНЬШЕ = 946684800.0
 
+#: Насколько время начала звонка может быть в будущем: часы станции и
+#: сервера расходятся, а время без пояса читается в поясе сервера, — но не
+#: больше чем на двое суток. Дальше — ошибка ввода.
+НЕ_ПОЗЖЕ_С = 2 * 86400.0
+
 
 def _разобрать_время(значение: str) -> tuple[float, str]:
     """Время начала звонка: секунды эпохи или ISO-8601. Возвращает (время, беда).
@@ -331,11 +483,19 @@ def _разобрать_время(значение: str) -> tuple[float, str]:
     except ValueError:
         число = None
     if число is not None:
+        # «inf», «nan» и «1e30» float() принимает: звонок ложился в архив с
+        # inf, NULL или 1e27 и навсегда становился «самым свежим» либо не
+        # попадал ни в один период.
+        if not math.isfinite(число):
+            return 0.0, f"время начала звонка «{текст}» — не число — не записано"
         if число >= 1e11:                       # похоже на миллисекунды
             число /= 1000.0
         if число < НЕ_РАНЬШЕ:
             return 0.0, (f"время начала звонка «{текст}» не похоже на дату "
                          f"(раньше 2000 года) — не записано")
+        if число > time.time() + НЕ_ПОЗЖЕ_С:
+            return 0.0, (f"время начала звонка «{текст}» — в будущем больше чем на "
+                         f"двое суток — не записано")
         return число, ""
     # ISO-8601. `fromisoformat` до Python 3.11 не понимает «Z» на конце —
     # а именно так время пишет половина систем, включая браузеры.
@@ -352,6 +512,9 @@ def _разобрать_время(значение: str) -> tuple[float, str]:
         отметка = когда.timestamp()
         if отметка < НЕ_РАНЬШЕ:
             return 0.0, f"время начала звонка «{текст}» раньше 2000 года — не записано"
+        if отметка > time.time() + НЕ_ПОЗЖЕ_С:
+            return 0.0, (f"время начала звонка «{текст}» — в будущем больше чем на "
+                         f"двое суток — не записано")
         return отметка, ""
     return 0.0, (f"время начала звонка «{текст}» не разобрано — ожидаются секунды "
                  f"эпохи (1757500001) или ISO-8601 (2026-09-10T14:03:11) — не записано")
@@ -543,6 +706,27 @@ def _число(значение: Any, умолчание: float) -> float:
 """
 
 
+ОПИСАНИЕ_СРОКА = ("Срок выполнения — для политики «По сроку» (scheduling_policy: "
+                  "deadline): секунды эпохи, время ISO-8601 или «через сколько» — "
+                  "+30 (минут), 30m, 2h, 1d")
+
+
+def _срок_из_формы(значение: str) -> float | None:
+    """Срок выполнения из поля формы — или 400 с объяснением.
+
+    Политике «По сроку выполнения» неоткуда было взять срок: поле формы
+    `deadline` отвергалось как «неизвестное», а `deadline` внутри
+    `settings` принималось и молча пропадало. Политика всегда была «по
+    приоритету», хотя её включали ради договорных сроков.
+    """
+    from ..job_queue import разобрать_срок  # noqa: PLC0415
+
+    try:
+        return разобрать_срок(значение)
+    except ConfigError as exc:
+        raise error_response(exc) from exc
+
+
 @router.post("", summary="Поставить файл в очередь",
              description="Принимает аудио- или видеофайл и ставит его в очередь "
                          "распознавания. Параметры задания — полем `settings` "
@@ -557,6 +741,7 @@ async def create_job(
     tags: str = Form(default=""),
     reference_text: str = Form(default=""),
     webhook_url: str = Form(default=""),
+    deadline: str = Form(default="", description=ОПИСАНИЕ_СРОКА),
     caller: str = Form(default="", description="Номер звонящего"),
     callee: str = Form(default="", description="Номер вызываемого"),
     call_id: str = Form(default="", description="Идентификатор звонка на стороне АТС"),
@@ -579,8 +764,9 @@ async def create_job(
         raise error_response(UnsupportedFormat(filename, suffix))
 
     # Квоту на число заданий проверяем до приёма файла: смысла принимать
-    # сотню мегабайт, чтобы затем отказать, нет.
-    check_quota(request, principal)
+    # сотню мегабайт, чтобы затем отказать, нет. В потоке — это запрос к
+    # базе, а обработчик асинхронный.
+    await asyncio.to_thread(check_quota, request, principal)
 
     limit_mb = int(state.settings.get("max_upload_mb") or 2048)
     target = state.settings.paths.uploads / f"{new_id('up')}{suffix or '.bin'}"
@@ -615,19 +801,24 @@ async def create_job(
         # здесь `async`: прямой вызов останавливал бы весь сервер на время
         # разбора. В поток уходит и постановка в очередь — она делает тот
         # же разбор второй раз и пишет в базу.
-        check_quota(request, principal, incoming_bytes=size,
-                    incoming_audio_s=await asyncio.to_thread(_probe_duration, target))
+        длительность = await asyncio.to_thread(_probe_duration, target)
         # Значения из settings перекрывают одноимённые поля формы: явный JSON
         # выражает намерение точнее, чем разрозненные поля.
         overrides = {**await _form_overrides(request), **_parse_settings(settings)}
         _известные_модель_и_движок(overrides)
+        _свои_выражения(state, overrides)
         merged = state.settings.merged(overrides)
-        job = await asyncio.to_thread(functools.partial(
-            state.queue.submit,
-            file_path=target, filename=filename, settings=merged,
-            owner=principal.name, api_key_name=principal.name,
-            priority=priority, group_id=group_id, source="web",
-            tags=tags, reference_text=reference_text, webhook_url=webhook_url))
+        # Последняя проверка квоты и постановка — под одним замком владельца
+        # (см. `под_квотой`): иначе одновременные загрузки обходили квоту.
+        job = await asyncio.to_thread(
+            _под_квотой_или_отказ, state, principal, functools.partial(
+                state.queue.submit,
+                file_path=target, filename=filename, settings=merged,
+                owner=principal.name, api_key_name=principal.name,
+                priority=priority, group_id=group_id, source="web",
+                tags=tags, reference_text=reference_text, webhook_url=webhook_url,
+                deadline=_срок_из_формы(deadline)),
+            incoming_bytes=size, incoming_audio_s=длительность)
     except Exception:
         # Ловим всё: ASRHubError, HTTPException от разбора полей и любую
         # неожиданную ошибку — файл не должен пережить неудачный запрос.
@@ -664,6 +855,7 @@ async def create_batch(
     files: list[UploadFile] = File(...),
     settings: str | None = Form(default=None),
     priority: int | None = Form(default=None),
+    deadline: str = Form(default="", description=ОПИСАНИЕ_СРОКА),
     caller: str = Form(default="", description="Номер звонящего"),
     callee: str = Form(default="", description="Номер вызываемого"),
     call_id: str = Form(default="", description="Идентификатор звонка на стороне АТС"),
@@ -690,8 +882,10 @@ async def create_batch(
     group = new_id("grp")
     created: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    срок = _срок_из_формы(deadline)
     overrides = {**await _form_overrides(request), **_parse_settings(settings)}
     _известные_модель_и_движок(overrides)
+    _свои_выражения(state, overrides)
     merged = state.settings.merged(overrides)
     # Данные звонка разбираются один раз на весь пакет: поля общие, и
     # повторять разбор (а с ним и предупреждения) на каждый файл незачем.
@@ -723,14 +917,17 @@ async def create_batch(
                         raise FileTooLarge(size / 1024 / 1024, limit_mb)
                     out.write(chunk)
             # Квота проверяется на каждый файл пакета: иначе один запрос из
-            # двухсот файлов обходил бы её целиком.
-            check_quota(request, principal, incoming_bytes=size,
-                        incoming_audio_s=await asyncio.to_thread(_probe_duration, target))
-            job = await asyncio.to_thread(functools.partial(
-                state.queue.submit,
-                file_path=target, filename=filename, settings=merged,
-                owner=principal.name, api_key_name=principal.name,
-                priority=priority, group_id=group, source="web-batch"))
+            # двухсот файлов обходил бы её целиком. Проверка и постановка —
+            # под замком владельца, как у одиночной загрузки.
+            длительность = await asyncio.to_thread(_probe_duration, target)
+            job = await asyncio.to_thread(
+                _под_квотой_или_отказ, state, principal, functools.partial(
+                    state.queue.submit,
+                    file_path=target, filename=filename, settings=merged,
+                    owner=principal.name, api_key_name=principal.name,
+                    priority=priority, group_id=group, source="web-batch",
+                    deadline=срок),
+                incoming_bytes=size, incoming_audio_s=длительность)
             if данные_звонка:
                 # Ключ архива — по заданию: иначе второй файл пакета
                 # перезаписал бы строку первого, и в архиве осталась бы
@@ -790,6 +987,14 @@ def list_jobs(
     group_id: str | None = None,
     search: str | None = None,
     since_hours: float | None = None,
+    since: float | None = Query(
+        default=None,
+        description="Не раньше этого времени постановки (секунды эпохи) — окно "
+                    "отчёта, из которого пришли за списком"),
+    until: float | None = Query(
+        default=None,
+        description="Раньше этого времени постановки (секунды эпохи); окно "
+                    "полуоткрытое, как у списков раскрытия (/api/drill)"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     order: str = "created_at DESC",
@@ -816,7 +1021,10 @@ def list_jobs(
         statuses = list(EMPTY_STATUSES)
     elif status and "," in status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
-    since = time.time() - since_hours * 3600 if since_hours else None
+    # Обе нижние границы — берётся поздняя: «за последние сутки» внутри
+    # окна отчёта — это пересечение, а не что-то одно из двух.
+    if since_hours:
+        since = max(since or 0.0, time.time() - since_hours * 3600)
     # Выборка сужается до собственных заданий для всех, кроме администратора.
     # Карточка задания давно закрыта require_owner, а список — нет: чужие
     # имена файлов, пути на диске и расшифровки уходили любому ключу.
@@ -833,7 +1041,7 @@ def list_jobs(
                  + ", ".join(f"{п}<значение>" for п in state.db.PREFIX_FILTERS)))
     jobs = state.db.list_jobs(status=statuses, owner=scope, model=model, group_id=group_id,
                               search=search, since=since, limit=limit, offset=offset,
-                              order=order, light=light, content=content)
+                              order=order, light=light, content=content, until=until)
     if not light:
         jobs = [_без_раскладки(j, principal) for j in jobs]
     # При поиске к каждой строке добавляется сама найденная фраза с
@@ -842,6 +1050,8 @@ def list_jobs(
     # глазами — при том что сервер уже знал и фразу, и секунду.
     if search:
         находки = state.db.best_snippets(search, [str(j["id"]) for j in jobs])
+        from ..content import masking  # noqa: PLC0415
+
         for job in jobs:
             найдено = находки.get(str(job["id"]))
             if найдено:
@@ -850,13 +1060,19 @@ def list_jobs(
                     "start_s": найдено.get("start_s"),
                     "speaker": найдено.get("speaker"),
                 }
+                if masking.нужно(principal):
+                    # Ключу с обезличиванием — вместе с целой репликой:
+                    # выдержка обрезана по краям, и хвост номера на краю
+                    # узнаётся только по реплике (см. `masking.mask_snippet`).
+                    # Сама реплика уходит закрытой той же прослойкой.
+                    job["match"]["text"] = найдено.get("text") or ""
     return {
         "items": jobs,
         # Счётчик получает те же условия, что и список: иначе «показано 30,
         # всего 4000» и листалка, ведущая на пустые страницы.
         "total": state.db.count_jobs(status=statuses, owner=scope, model=model,
                                      search=search, group_id=group_id,
-                                     since=since, content=content),
+                                     since=since, content=content, until=until),
         # Поиск по расшифровкам берёт не больше `SEARCH_LIMIT` совпадений,
         # и об этом надо сказать. Молчаливая обрезка читается как «старых
         # разговоров на эту тему нет», а это разные утверждения.
@@ -1155,6 +1371,20 @@ def get_audio(request: Request, job_id: str,
     """
     job = _owned_job(request, job_id, principal)
     real = _source_audio(request, job)
+    if getattr(principal, "mask_pii", False):
+        # Ключ с обезличиванием получал исходный звук целиком: имя файла
+        # маскировалось, а голос клиента, продиктовавшего номер карты, —
+        # нет. Ему отдаётся только заглушённая копия (POST …/redact), а
+        # если её нет — отказ с объяснением, как её сделать.
+        копия = _отредактированный_путь(real)
+        if not копия.is_file():
+            raise error_response(ForbiddenError(
+                "Ключу с обезличиванием исходная запись не выдаётся: в ней звучат "
+                "персональные данные.",
+                hint="Сделайте копию с заглушёнными данными — POST "
+                     f"/api/jobs/{job_id}/redact — она будет отдаваться здесь и по "
+                     f"/api/jobs/{job_id}/redacted."))
+        real = копия
     media = _AUDIO_TYPES.get(real.suffix.lower())
     if media is None:
         media, _ = mimetypes.guess_type(real.name)
@@ -1271,9 +1501,7 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
         имя_файла = masking.mask_text(str(имя_файла))
     name = Path(имя_файла).stem
     if fmt == "docx":
-        out = state.settings.paths.tmp / f"{job_id}.docx"
-        export_mod.to_docx(payload, merged, out)
-        return FileResponse(str(out), filename=f"{name}.docx")
+        return _документ(state, job_id, payload, merged, name)
     body = {
         "txt": export_mod.to_txt, "json": export_mod.to_json, "srt": export_mod.to_srt,
         "vtt": export_mod.to_vtt, "ass": export_mod.to_ass, "md": export_mod.to_markdown,
@@ -1286,6 +1514,51 @@ def download(request: Request, job_id: str, fmt: str = Query(default="txt"),
              "vtt": "text/vtt", "csv": "text/csv"}.get(fmt, "text/plain")
     return PlainTextResponse(text, media_type=f"{media}; charset=utf-8", headers={
         "Content-Disposition": content_disposition(f"{name}.{fmt}")})
+
+
+def _документ(state: Any, job_id: str, payload: dict[str, Any], merged: dict[str, Any],
+              name: str) -> FileResponse:
+    """Документ Word «на лету» — своим временным файлом на каждую выгрузку.
+
+    Раньше документ писался в общий `tmp/<id>.docx`, а FileResponse читал
+    его уже после возврата из обработчика. Обезличенная и обычная выгрузка
+    одного задания писали в один и тот же файл, и ключ с mask_pii при
+    одновременной выгрузке получал полный текст или битый файл. Файл к тому
+    же не убирал никто: расшифровка с номером клиента лежала в tmp и после
+    удаления записи по требованию. Теперь у выгрузки свой файл, и он
+    удаляется, как только ответ отдан.
+
+    Без python-docx `to_docx` пишет Markdown и возвращает его путь — его и
+    отдаём, с честным расширением, а не несуществующий .docx (это было 500).
+    """
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from starlette.background import BackgroundTask  # noqa: PLC0415
+
+    каталог = Path(state.settings.paths.tmp)
+    каталог.mkdir(parents=True, exist_ok=True)
+    дескриптор, путь = tempfile.mkstemp(prefix=f"{job_id}.", suffix=".docx",
+                                        dir=str(каталог))
+    os.close(дескриптор)
+    заготовка = Path(путь)
+    try:
+        готовый = Path(export_mod.to_docx(payload, merged, заготовка))
+    except BaseException:
+        заготовка.unlink(missing_ok=True)
+        raise
+    if готовый != заготовка:
+        заготовка.unlink(missing_ok=True)
+
+    def убрать() -> None:
+        готовый.unlink(missing_ok=True)
+
+    if готовый.suffix.lower() == ".docx":
+        return FileResponse(str(готовый), filename=f"{name}.docx",
+                            background=BackgroundTask(убрать))
+    return FileResponse(str(готовый), filename=f"{name}{готовый.suffix}",
+                        media_type="text/markdown; charset=utf-8",
+                        background=BackgroundTask(убрать))
 
 
 def _owned_job(request: Request, job_id: str, principal: Principal) -> dict[str, Any]:
@@ -1351,9 +1624,64 @@ def retry(request: Request, job_id: str,
           overrides: dict[str, Any] | None = Body(default=None),
           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
+    job = _owned_job(request, job_id, principal)
+    require_write(principal)
+    свои = _проверенные_переопределения(overrides)
+    _свои_выражения(state, свои)
+    return _повторить(state, principal, job, свои or None)
+
+
+def _повторить(state: Any, principal: Principal, job: dict[str, Any],
+               overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Повтор задания с учётом суточной квоты.
+
+    /retry, /rescan и пакетный повтор квоту не проверяли вовсе: повтор не
+    заводит новой строки, а расход считался по строкам. Между тем повтор —
+    это то же распознавание тех же часов звука. Теперь он проверяется по
+    часам звука и записывается в журнал расхода владельца.
+
+    Исключение — неудавшееся или отменённое задание этих суток: снова попав
+    в очередь, оно и так считается в расходе своей строкой, и записать его
+    второй раз значило бы взять плату дважды за одно распознавание.
+    Повторы администратора не ограничены и не записываются на владельца:
+    это обслуживание, а не расход ключа.
+    """
+    job_id = str(job["id"])
+    if principal.is_admin:
+        return state.queue.retry(job_id, overrides)
+    длительность = float(job.get("media_duration_s") or 0.0)
+    снова_в_счёте = (str(job.get("status") or "") in ("failed", "cancelled")
+                     and float(job.get("created_at") or 0) >= time.time() - СУТКИ_С
+                     and str(job.get("source") or "") != "control")
+
+    def действие() -> dict[str, Any]:
+        итог = state.queue.retry(job_id, overrides)
+        if not снова_в_счёте:
+            учесть_расход(state, str(job.get("owner") or principal.name),
+                          audio_s=длительность)
+        return итог
+
+    try:
+        return под_квотой(state, principal, действие,
+                          incoming_jobs=1 if снова_в_счёте else 0,
+                          incoming_audio_s=длительность)
+    except QuotaExceeded as exc:
+        raise error_response(exc) from exc
+
+
+@router.post("/{job_id}/deadline", summary="Задать срок выполнения")
+def set_deadline(request: Request, job_id: str,
+                 deadline: str | float | None = Body(default=None, embed=True,
+                                                     description=ОПИСАНИЕ_СРОКА),
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Срок у ждущего задания — для политики «По сроку»; пусто — снять срок."""
+    state = get_state(request)
     _owned_job(request, job_id, principal)
     require_write(principal)
-    return state.queue.retry(job_id, _проверенные_переопределения(overrides) or None)
+    try:
+        return state.queue.set_deadline(job_id, deadline)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
 
 
 @router.post("/{job_id}/priority", summary="Изменить приоритет")
@@ -1427,7 +1755,8 @@ BULK_LIMIT = 500
 #: параметры задания.
 ПОЛЯ_ПЕРЕРАСПОЗНАВАНИЯ = (
     "engine", "model", "language", "task", "beam_size", "temperature",
-    "vad_enabled", "diarization_enabled", "punctuation", "compute_type",
+    "vad_enabled", "diarization_enabled", "punctuation", "punctuation_enabled",
+    "compute_type",
     "device", "initial_prompt", "num_speakers", "align_words",
 )
 
@@ -1464,10 +1793,26 @@ def rescan(request: Request, данные: dict[str, Any] = Body(default={}),
     переопределения = _проверенные_переопределения(
         данные.get("overrides") or {}, разрешённые=ПОЛЯ_ПЕРЕРАСПОЗНАВАНИЯ, строго=False)
 
-    ids = [str(и) for и in (данные.get("ids") or []) if str(и).strip()]
+    сырые_ids = данные.get("ids") or []
+    if not isinstance(сырые_ids, list):
+        raise error_response(ConfigError(
+            "Поле ids — список идентификаторов заданий.",
+            hint='Например: {"ids": ["job_…", "job_…"]}.'))
+    ids = [str(и) for и in сырые_ids if str(и).strip()]
     предел = max(1, min(int(_число(данные.get("limit"), 500.0)), 5000))
+    # Предел у явного списка тот же, что у отбора: без него десятки тысяч
+    # идентификаторов одной командой держали замок записи минутами.
+    if len(ids) > 5000:
+        raise error_response(ConfigError(
+            f"За один раз можно распознать заново не больше 5000 записей, "
+            f"а указано {len(ids)}.",
+            hint="Разбейте список на части."))
     if not ids:
-        отбор = dict(данные.get("filter") or {})
+        отбор = данные.get("filter") or {}
+        if not isinstance(отбор, dict):
+            raise error_response(ConfigError(
+                "Поле filter — объект с условиями отбора.",
+                hint='Например: {"filter": {"status": "completed", "model": "…"}}.'))
         задания = state.db.list_jobs(
             status=отбор.get("status") or ["completed", "failed"],
             model=отбор.get("model") or None,
@@ -1482,19 +1827,39 @@ def rescan(request: Request, данные: dict[str, Any] = Body(default={}),
             "По этому отбору нечего распознавать заново.",
             hint="Проверьте период и состояние записей."))
 
+    # Всё, что можно проверить до цикла, проверяется до него: важность
+    # разбиралась ПОСЛЕ постановки, и «priority: срочно» ставило задание в
+    # очередь, а в ответе стоял отказ — «queued: 0», хотя запись уже
+    # распознавалась.
     важность = данные.get("priority")
+    if важность is not None:
+        try:
+            важность = max(0, min(100, int(важность)))
+        except (TypeError, ValueError):
+            raise error_response(ConfigError(
+                f"Важность «{важность}» — не число.",
+                hint="Важность — целое от 0 до 100.")) from None
     поставлено, отказы = [], []
     for job_id in dict.fromkeys(ids):
         try:
-            _owned_job(request, job_id, principal)
-            задание = state.queue.retry(job_id, переопределения or None)
+            job = _owned_job(request, job_id, principal)
+            задание = _повторить(state, principal, job, переопределения or None)
             if важность is not None:
-                state.queue.set_priority(job_id, int(важность))
+                state.queue.set_priority(job_id, важность)
             поставлено.append(задание.get("id") or job_id)
+        except HTTPException as exc:
+            # Отказ из `_owned_job` и квоты приходит ответом API: человеку
+            # нужна строка причины, а не «403: {'code': …}» (как в bulk).
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            отказы.append({"id": job_id,
+                           "error": str(detail.get("message") or exc.detail)})
         except ASRHubError as exc:
             отказы.append({"id": job_id, "error": exc.message})
         except Exception as exc:                             # noqa: BLE001
-            отказы.append({"id": job_id, "error": str(exc)})
+            log.warning("Повторное распознавание не удалось на %s: %s", job_id, exc,
+                        extra={"job_id": job_id})
+            отказы.append({"id": job_id,
+                           "error": f"Внутренняя ошибка сервера: {type(exc).__name__}"})
     state.db.add_event(None, "rescan",
                        f"Повторное распознавание: поставлено {len(поставлено)}"
                        + (f", отказов {len(отказы)}" if отказы else ""))
@@ -1545,7 +1910,7 @@ def bulk(request: Request,
         try:
             job = _owned_job(request, job_id, principal)
             if action == "retry":
-                state.queue.retry(job_id, None)
+                _повторить(state, principal, job, None)
             elif action == "cancel":
                 state.queue.cancel(job_id, by=principal.name)
             elif action == "delete":
@@ -1603,6 +1968,16 @@ def _inside(base: Path, target: str) -> Path | None:
 def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
     """Удаление одного задания вместе с его файлами."""
     job_id = str(job["id"])
+    # Расход удалённого задания этих суток остаётся в квоте владельца:
+    # иначе «загрузил, забрал расшифровку, удалил» обходило суточную квоту
+    # сколько угодно раз (см. `учесть_расход`). Считается то, что сервер
+    # успел сделать: незаконченное и отменённое в расход и не входило.
+    if (str(job.get("status") or "") not in (*ACTIVE_STATUSES, "failed", "cancelled")
+            and float(job.get("created_at") or 0) >= time.time() - СУТКИ_С
+            and str(job.get("source") or "") != "control"):
+        учесть_расход(state, str(job.get("owner") or ""), jobs=1,
+                      audio_s=float(job.get("media_duration_s") or 0.0),
+                      size=int(job.get("file_size") or 0))
     if job["status"] in ACTIVE_STATUSES:
         state.queue.cancel(job_id, by=principal.name)
     каталог = _inside(Path(state.settings.paths.results),
@@ -1620,7 +1995,38 @@ def _delete_one(state: Any, job: dict[str, Any], principal: Principal) -> None:
         файл.unlink(missing_ok=True)
         # И копию с заглушёнными данными: это тот же голос клиента.
         _отредактированный_путь(файл).unlink(missing_ok=True)
+    # Выгрузки, оставшиеся во временном каталоге (документ Word прежних
+    # версий писался в tmp/<id>.docx и не убирался никогда): расшифровка с
+    # номером клиента не должна пережить удаление записи по требованию.
+    # Рабочий каталог tmp/<id>/ — только у незапущенного: идущее задание
+    # отменено, но ещё может дописывать в него, и уберёт его само.
+    _убрать_временные(state, job_id,
+                      с_каталогом=job["status"] not in ACTIVE_STATUSES)
     state.db.delete_job(job_id)
+
+
+def _убрать_временные(state: Any, job_id: str, *, с_каталогом: bool = True) -> None:
+    """Файлы задания во временном каталоге сервера: tmp/<id>.* и tmp/<id>/."""
+    if not job_id or "/" in job_id or "\\" in job_id or job_id.startswith("."):
+        return
+    каталог = Path(state.settings.paths.tmp)
+    try:
+        следы = list(каталог.glob(f"{job_id}.*"))
+    except OSError:
+        return
+    if с_каталогом:
+        следы.append(каталог / job_id)
+    for след in следы:
+        путь = _inside(каталог, str(след))
+        if путь is None:
+            continue
+        try:
+            if путь.is_dir():
+                shutil.rmtree(путь, ignore_errors=True)
+            else:
+                путь.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Временный файл задания %s не удалён: %s", job_id, exc)
 
 
 @router.post("/{job_id}/reference", summary="Задать эталонный текст и пересчитать WER")
@@ -1671,13 +2077,19 @@ def create_text_job(request: Request, данные: dict[str, Any] = Body(...),
         разобрано = textchat.задание(данные)
     except ASRHubError as exc:
         raise error_response(exc) from exc
+    # Номер сделки уходит в путь запроса к CRM с токеном интеграции: только
+    # число, иначе «../contacts/5» писало примечание в чужую сущность.
+    if данные.get("crm_entity_id") not in (None, "") and not re.fullmatch(
+            r"[0-9]{1,20}", str(данные.get("crm_entity_id")).strip()):
+        raise error_response(ConfigError(
+            "crm_entity_id — номер сделки (контакта, компании) в CRM, только цифры.",
+            hint="Например: \"crm_entity_id\": \"123456\"."))
     # Переписка — такое же задание, как и разговор, и в суточную квоту
     # входит так же: без проверки ключ с квотой в одно задание в сутки
-    # создавал их сколько угодно, лишь бы текстом.
-    check_quota(request, principal,
-                incoming_bytes=len(str(разобрано["text"] or "").encode("utf-8")))
-
-    job_id = состояние.db.create_job({
+    # создавал их сколько угодно, лишь бы текстом. Проверка и создание —
+    # под одним замком (`под_квотой`): иначе десять запросов разом читали
+    # один и тот же расход и проходили все.
+    job_id = _под_квотой_или_отказ(состояние, principal, lambda: состояние.db.create_job({
         "filename": разобрано["filename"],
         "status": "completed",
         "source": "text",
@@ -1692,9 +2104,9 @@ def create_text_job(request: Request, данные: dict[str, Any] = Body(...),
                    # Кто здесь оператор — чтобы пересчёт и проверка скрипта
                    # взяли ту же сторону, что и разбор при приёме.
                    **({"agent": разобрано["agent"]} if разобрано["agent"] else {}),
-                   **({"crm_entity_id": str(данные["crm_entity_id"])}
+                   **({"crm_entity_id": str(данные["crm_entity_id"]).strip()}
                       if данные.get("crm_entity_id") else {})},
-    })
+    }), incoming_bytes=len(str(разобрано["text"] or "").encode("utf-8")))
     состояние.db.save_segments(job_id, разобрано["segments"])
     разбор = None
     if состояние.content is not None:

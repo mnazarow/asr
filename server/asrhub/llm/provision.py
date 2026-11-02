@@ -37,6 +37,7 @@ import tarfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
@@ -45,6 +46,7 @@ from typing import Any
 from ..errors import ASRHubError, ConfigError
 from ..hardware import HardwareInfo, detect
 from ..logging_setup import get_logger
+from .client import мимо_прокси, открыть
 
 log = get_logger("llm")
 
@@ -288,9 +290,106 @@ def _запрос(method: str, url: str, body: dict[str, Any] | None = None, *,
                  **(headers or {})}
     данные = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     запрос = urllib.request.Request(url, data=данные, method=method, headers=заголовки)  # noqa: S310
-    with urllib.request.urlopen(запрос, timeout=timeout) as ответ:  # noqa: S310
+    # К своей службе — мимо прокси из окружения (см. `client.мимо_прокси`):
+    # «служба не отвечает» при живой Ollama за корпоративным прокси.
+    with открыть(запрос, timeout) as ответ:
         сырое = ответ.read()
     return json.loads(сырое.decode("utf-8")) if сырое else {}
+
+
+#: Сколько гигабайт занимает распакованная Ollama — к месту под веса, когда
+#: она ставится в каталог данных.
+РАЗМЕР_OLLAMA_ГБ = 2.0
+
+
+def свой_каталог(settings: Any) -> Path:
+    """Каталог данных сервера, куда Ollama ставится без root."""
+    return Path(str(settings.paths.data if getattr(settings, "paths", None)
+                    else ".")) / "ollama"
+
+
+def своя_ollama(settings: Any) -> Path | None:
+    """Исполняемый файл Ollama, поставленной в каталог данных, — или None."""
+    корень = свой_каталог(settings)
+    двоичный = корень / "bin" / "ollama"
+    if двоичный.is_file():
+        return двоичный
+    if корень.is_dir():
+        return next((п for п in корень.rglob("ollama") if п.is_file()), None)
+    return None
+
+
+def окружение_своей(двоичный: Path, корень: Path) -> None:
+    """PATH и OLLAMA_MODELS этого процесса — под Ollama из каталога данных.
+
+    Без `OLLAMA_MODELS` служба, поднятая заново, смотрит в домашний каталог
+    и не видит скачанных весов: «модель не скачана» при двадцати гигабайтах
+    на диске.
+    """
+    каталог_бин = str(двоичный.parent)
+    путь = os.environ.get("PATH", "")
+    if каталог_бин not in путь.split(os.pathsep):
+        os.environ["PATH"] = f"{каталог_бин}{os.pathsep}{путь}"
+    os.environ.setdefault("OLLAMA_MODELS", str(корень / "models"))
+
+
+def _своя_служба(двоичный: Path | str, адрес: str, журнал_в: Path) -> None:
+    """Запускает `ollama serve` отдельным процессом с журналом в файле.
+
+    Журнал закрывается у себя сразу после запуска: у дочернего процесса своя
+    копия дескриптора, а наша оставалась открытой до остановки сервера.
+    Адрес службы — из `llm_url`: на нестандартном порту `ollama serve`
+    без `OLLAMA_HOST` слушал бы 11434, а сервер ждал бы ответа на своём.
+    """
+    окружение = dict(os.environ)
+    try:
+        части = urllib.parse.urlsplit(адрес)
+        if части.hostname and части.port:
+            окружение["OLLAMA_HOST"] = f"{части.hostname}:{части.port}"
+    except ValueError:
+        pass
+    журнал = журнал_в.open("ab")
+    try:
+        subprocess.Popen([str(двоичный), "serve"], stdout=журнал,  # noqa: S603
+                         stderr=журнал, start_new_session=True, env=окружение)
+    finally:
+        журнал.close()
+
+
+def поднять_свою(settings: Any, адрес: str | None = None) -> bool:
+    """После перезапуска сервера — поднять Ollama, поставленную без root.
+
+    Такая Ollama — дочерний процесс сервера: PATH и `OLLAMA_MODELS` были
+    выставлены только в его окружении, и перезапуск службы (её группа
+    процессов гасит и Ollama) или контейнера с «no new privileges» оставлял
+    смысловой слой без модели — до тех пор, пока кто-нибудь не догадается
+    запустить её руками, да ещё и с `OLLAMA_MODELS`. Теперь сервер при
+    старте сам находит её в каталоге данных и, если служба по `llm_url` не
+    отвечает, поднимает. Только для адреса на этой машине: чужой сервер
+    модели запускать не нам.
+    """
+    двоичный = своя_ollama(settings)
+    if двоичный is None:
+        return False
+    окружение_своей(двоичный, свой_каталог(settings))
+    адрес = (адрес or str(settings.get("llm_url") or АДРЕС)).rstrip("/")
+    if not мимо_прокси(адрес):
+        return False
+    try:
+        узел = urllib.parse.urlsplit(адрес).hostname or ""
+    except ValueError:
+        return False
+    if узел not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+        return False
+    if служба(адрес)["running"]:
+        return False
+    try:
+        _своя_служба(двоичный, адрес, свой_каталог(settings).parent / "ollama.log")
+    except OSError as exc:
+        log.warning("Ollama из каталога данных не запустилась: %s", exc)
+        return False
+    log.info("Запущена Ollama из каталога данных: %s", двоичный)
+    return True
 
 
 def служба(url: str = АДРЕС, *, timeout: float = 3.0) -> dict[str, Any]:
@@ -572,7 +671,7 @@ class Установщик:
 
     def _работа(self, модели: list[str], включить: str, ставить: bool, адрес: str) -> None:
         try:
-            размеры = self._проверка(модели)
+            размеры = self._проверка(модели, адрес)
             if self._отменено():
                 return
             self._установка(ставить)
@@ -629,13 +728,28 @@ class Установщик:
 
     # --- шаги -----------------------------------------------------------
 
-    def _проверка(self, модели: list[str]) -> dict[str, float]:
-        """Место на диске и существование тегов — до всякой установки."""
+    def _проверка(self, модели: list[str], адрес: str = "") -> dict[str, float]:
+        """Место на диске и существование тегов — до всякой установки.
+
+        Уже скачанные модели в «нужно» не идут: повторный запуск с той же
+        моделью при малом остатке места падал на «нужно 22,7 ГБ», хотя
+        качать было нечего. А место меряется там, куда веса правда лягут: у
+        установки без root это каталог данных сервера, а не домашний каталог
+        — и к весам прибавляется сама Ollama.
+        """
         self._шаг("проверка", "идёт")
         info = self._hardware() if callable(self._hardware) else detect()
+        try:
+            уже = {м["name"] for м in установленные(адрес)} if адрес else set()
+        except Exception:                                    # noqa: BLE001
+            уже = set()
         размеры: dict[str, float] = {}
         всего = 0.0
         for имя in модели:
+            if имя in уже or f"{имя}:latest" in уже:
+                размеры[имя] = 0.0
+                self._записать(f"{имя}: уже скачана — место под неё не нужно.")
+                continue
             размер, ошибка = размер_в_реестре(имя)
             if размер is None:
                 # Реестр недоступен — не повод отказываться: скачивание
@@ -650,8 +764,24 @@ class Установщик:
                 self._записать(f"{имя}: {размер:g} ГБ по реестру.")
             размеры[имя] = размер
             всего += размер
-        нужно = round(всего * 1.15 + 2, 1)
-        свободно, куда = свободно_под_веса()
+        без_root = not shutil.which("ollama") and not sudo_работает()[0] \
+            and not os.environ.get("OLLAMA_MODELS")
+        if без_root:
+            # Ollama ляжет в каталог данных, а вместе с ней и веса
+            # (`_в_свой_каталог` ставит OLLAMA_MODELS туда же).
+            корень = свой_каталог(self.settings)
+            существующий = корень
+            while not существующий.exists() and существующий.parent != существующий:
+                существующий = существующий.parent
+            try:
+                свободно = round(shutil.disk_usage(существующий).free / 1024 ** 3, 1)
+            except OSError:
+                свободно = 0.0
+            куда = str(корень / "models")
+            всего += 0 if своя_ollama(self.settings) else РАЗМЕР_OLLAMA_ГБ
+        else:
+            свободно, куда = свободно_под_веса()
+        нужно = round(всего * 1.15 + 2, 1) if всего else 0.0
         if not свободно:
             свободно = float(info.disk_free_gb or 0)
         if свободно and свободно < нужно:
@@ -675,6 +805,13 @@ class Установщик:
     def _установка(self, ставить: bool) -> None:
         """Ставит Ollama, если её нет. Уже стоит — шаг пропускается."""
         путь = shutil.which("ollama")
+        if not путь:
+            # Поставленная раньше без root — в каталоге данных: повторная
+            # установка заново качала архив в сотни мегабайт.
+            своя = своя_ollama(self.settings)
+            if своя is not None:
+                окружение_своей(своя, свой_каталог(self.settings))
+                путь = str(своя)
         if путь:
             self._шаг("установка", "пропущен", f"уже установлена: {путь}")
             self._записать(f"Ollama уже установлена: {путь}")
@@ -827,21 +964,18 @@ class Установщик:
 
         # PATH этого процесса — чтобы `shutil.which("ollama")` и все
         # последующие шаги (запуск, скачивание весов, прогрев) нашли её без
-        # особых случаев в каждом месте.
-        каталог_бин = str(двоичный.parent)
-        путь = os.environ.get("PATH", "")
-        if каталог_бин not in путь.split(os.pathsep):
-            os.environ["PATH"] = f"{каталог_бин}{os.pathsep}{путь}"
-        # Веса тоже кладём в каталог данных: домашний каталог службы может
-        # быть недоступен на запись, а места под модели нужно десятки ГБ.
-        os.environ.setdefault("OLLAMA_MODELS", str(корень / "models"))
+        # особых случаев в каждом месте. Веса тоже кладём в каталог данных:
+        # домашний каталог службы может быть недоступен на запись, а места
+        # под модели нужно десятки ГБ.
+        окружение_своей(двоичный, корень)
 
         подробность = f"без root, в {корень}"
         if причина:
             подробность += f" (штатный установщик: {причина})"
-        self._записать("Готово. Служба поднимется отдельным процессом; "
-                       "после перезагрузки машины запустите её заново или "
-                       "заведите службу от root.")
+        self._записать("Готово. Служба поднимется отдельным процессом; после "
+                       "перезапуска сервера он поднимет её сам, а после "
+                       "перезагрузки машины — вместе с собой. Чтобы она жила "
+                       "отдельно от сервера, заведите службу от root.")
         self._шаг("установка", "готово", подробность)
 
     def _запуск(self, адрес: str) -> None:
@@ -870,16 +1004,11 @@ class Установщик:
             # Ни системы инициализации, ни прав — запускаем сами и
             # переживём перезагрузку разве что до неё.
             self._записать("Запускаем ollama serve отдельным процессом.")
-            журнал = None
             try:
                 каталог_данных = Path(str(self.settings.paths.data)) if getattr(
                     self.settings, "paths", None) else Path(".")
-                журнал = (каталог_данных / "ollama.log").open("ab")
-                subprocess.Popen(["ollama", "serve"], stdout=журнал,  # noqa: S603, S607
-                                 stderr=журнал, start_new_session=True)
+                _своя_служба("ollama", адрес, каталог_данных / "ollama.log")
             except (OSError, subprocess.SubprocessError) as exc:
-                if журнал is not None:
-                    журнал.close()
                 raise ConfigError(f"Не удалось запустить ollama serve: {exc}") from exc
         крайний = time.time() + 60
         while time.time() < крайний:

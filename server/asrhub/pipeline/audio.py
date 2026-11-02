@@ -182,6 +182,14 @@ def probe(path: Path) -> AudioInfo:
                 f"В файле «{path.name}» нет звуковой дорожки.",
                 hint="Проверьте файл: возможно, это видео без звука или повреждённый контейнер.")
         duration = float(audio.get("duration") or fmt.get("duration") or 0.0)
+        if duration <= 0.0:
+            # Запись, сделанная потоком, длительности в заголовке не несёт:
+            # MediaRecorder в браузере, OBS, запись разговора в канал пишут
+            # webm/mkv, не возвращаясь к началу файла, — некуда. ffprobe
+            # отдаёт пустое поле, и исправная шестисекундная запись
+            # отвергалась как «длительность близка к нулю». Единственный
+            # честный способ узнать длину такой записи — пройти её декодером.
+            duration = _длительность_декодером(path)
         return AudioInfo(
             path=str(path),
             duration_s=duration,
@@ -216,12 +224,52 @@ def probe(path: Path) -> AudioInfo:
         raise AudioError(f"Не удалось прочитать WAV: {exc}") from exc
 
 
+def _время_прохода(вывод: str) -> float | None:
+    """Последняя отметка «time=ЧЧ:ММ:СС.сс» из вывода ffmpeg — длина пройденного.
+
+    ffmpeg печатает ход через «\\r», и последняя отметка — итог прохода:
+    сколько звука декодер выдал на самом деле.
+    """
+    итог: float | None = None
+    for кусок in (вывод or "").replace("\r", "\n").split("time=")[1:]:
+        отметка = кусок.split(" ", 1)[0].strip()
+        try:
+            часы, минуты, секунды = отметка.split(":")
+            итог = int(часы) * 3600 + int(минуты) * 60 + float(секунды)
+        except ValueError:
+            continue
+    return итог
+
+
+def _длительность_декодером(path: Path) -> float:
+    """Длина записи по проходу декодера — для файлов без длины в заголовке.
+
+    Видео не декодируется (`-vn`): нужна длина звука, а кадры только
+    тратили бы время. Не вышло — ноль, и решает вызывающий: такая запись
+    дальше отвергается как пустая, что и было до проверки.
+    """
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        return 0.0
+    try:
+        res = subprocess.run(
+            [exe, "-hide_banner", "-nostdin", "-i", str(path),
+             "-vn", "-sn", "-dn", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    return max(0.0, _время_прохода(res.stderr or "") or 0.0)
+
+
 def analyze_levels(path: Path, max_seconds: float = 600.0) -> dict[str, float]:
     """Измеряет уровни громкости и долю тишины — используется в аналитике качества."""
     exe = shutil.which("ffmpeg")
     if not exe:
         return {}
-    cmd = [exe, "-hide_banner", "-nostats", "-t", str(max_seconds), "-i", str(path),
+    # -vn: замер касается звука, а видеодорожку совещания в 720p декодер
+    # иначе разбирал целиком — впятеро дольше самого замера.
+    cmd = [exe, "-hide_banner", "-nostats", "-nostdin", "-t", str(max_seconds),
+           "-i", str(path), "-vn", "-sn", "-dn",
            "-af", "volumedetect,silencedetect=noise=-35dB:d=0.5", "-f", "null", "-"]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
@@ -268,15 +316,21 @@ def silence_bounds(src: Path, settings: dict[str, Any],
     """
     if not settings.get("audio_trim_silence"):
         return 0.0, None
+    if not has_ffmpeg():
+        # Без ffmpeg мерить тишину нечем — запись идёт необрезанной (об этом
+        # говорит `prepare`), а не падает: WAV без ffmpeg читается.
+        return 0.0, None
     exe = _ffmpeg()
-    cmd = [exe, "-hide_banner", "-nostdin", "-i", str(src),
+    # -vn: видеодорожку декодировать незачем, а на записи совещания в mp4
+    # проход с ней шёл в шесть раз дольше и упирался в тайм-аут — после
+    # него обрезка тишины молча не выполнялась.
+    cmd = [exe, "-hide_banner", "-nostdin", "-i", str(src), "-vn", "-sn", "-dn",
            "-af", "silencedetect=noise=-45dB:d=0.1", "-f", "null", "-"]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     except (OSError, subprocess.SubprocessError):
         return 0.0, None
     отрезки: list[list[float | None]] = []
-    длительность = duration_s
     for line in (res.stderr or "").splitlines():
         try:
             if "silence_start:" in line:
@@ -284,12 +338,15 @@ def silence_bounds(src: Path, settings: dict[str, Any],
                     [float(line.split("silence_start:")[1].strip().split(" ")[0]), None])
             elif "silence_end:" in line and отрезки:
                 отрезки[-1][1] = float(line.split("silence_end:")[1].strip().split(" ")[0])
-            elif длительность is None and "time=" in line:
-                # Итог прохода: «… time=00:02:05.12 …» — длина, если её не дали.
-                часы, минуты, секунды = line.split("time=")[1].split(" ")[0].split(":")
-                длительность = int(часы) * 3600 + int(минуты) * 60 + float(секунды)
         except (ValueError, IndexError):
             continue
+    # Конец записи — по итогу самого прохода, а не по заголовку. У MP3
+    # ffprobe называет длину на 0,07–0,15 с больше, чем декодер выдаёт на
+    # самом деле (задержка кодера и выравнивание кадров), и тишина в конце
+    # записи не доходила до «конца» с допуском в 0,05 с: обрезка конца
+    # молча не делалась у каждой телефонной записи в MP3. Итог прохода
+    # (последняя отметка «time=») — ровно то, до чего дошёл silencedetect.
+    длительность = _время_прохода(res.stderr or "") or duration_s
     начало = 0.0
     if отрезки and (отрезки[0][0] or 0.0) <= 0.05:
         # Интересует только тишина, с которой запись начинается.
@@ -328,7 +385,7 @@ def deepfilter_путь() -> str | None:
 
 
 def очистить_deepfilter(src: Path, workdir: Path,
-                        settings: dict[str, Any]) -> tuple[Path, str]:
+                        settings: dict[str, Any], *, каналов: int = 1) -> tuple[Path, str]:
     """Прогоняет запись через DeepFilterNet. Возвращает (файл, замечание).
 
     Это единственное шумоподавление в наборе, у которого есть ЗАМЕРЕННАЯ
@@ -343,6 +400,13 @@ def очистить_deepfilter(src: Path, workdir: Path,
     На телефонных 8 кГц это означает пустую верхнюю половину спектра —
     случай, в котором модель видит не то, на чём обучалась. Для 8 кГц
     очистку стоит включать только после собственного замера.
+
+    `каналов` — сколько каналов должно остаться у очищенной записи. Прежде
+    вход для модели всегда сводился в моно, а дальше подготовка разделяла
+    каналы ЭТОГО файла: «Канал 1» получал смесь обоих собеседников, «Канал
+    2» — тишину, и вся речь клиента уходила оператору; при «взять правый
+    канал» задание падало. Теперь, когда каналы дальше нужны порознь, каждый
+    чистится отдельно, и результат собирается обратно в ту же раскладку.
     """
     бинарь = deepfilter_путь()
     if бинарь is None:
@@ -350,37 +414,71 @@ def очистить_deepfilter(src: Path, workdir: Path,
                      "шумоподавление пропущено")
     exe = _ffmpeg()
     workdir.mkdir(parents=True, exist_ok=True)
-    на_вход = workdir / f"{src.stem}.dfn-in.wav"
     каталог = workdir / f"{src.stem}.dfn-out"
     каталог.mkdir(parents=True, exist_ok=True)
+    каналов = max(1, int(каналов))
+    if каналов == 1:
+        входы = [(workdir / f"{src.stem}.dfn-in.wav", ["-ac", "1"])]
+    else:
+        входы = [(workdir / f"{src.stem}.dfn-in.c{номер}.wav",
+                  ["-af", f"pan=mono|c0=c{номер}"]) for номер in range(каналов)]
     try:
-        subprocess.run(
-            [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-             "-i", str(src), "-vn", "-sn", "-dn", "-ac", "1",
-             "-ar", str(DEEPFILTER_ЧАСТОТА), "-acodec", "pcm_s16le",
-             str(на_вход)], capture_output=True, text=True, timeout=1800, check=True)
-        subprocess.run([бинарь, "-o", str(каталог), str(на_вход)],
+        for путь, выбор in входы:
+            subprocess.run(
+                [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                 "-i", str(src), "-vn", "-sn", "-dn", *выбор,
+                 "-ar", str(DEEPFILTER_ЧАСТОТА), "-acodec", "pcm_s16le",
+                 str(путь)], capture_output=True, text=True, timeout=1800, check=True)
+        # Один запуск на все каналы: модель грузится один раз.
+        subprocess.run([бинарь, "-o", str(каталог), *(str(путь) for путь, _ in входы)],
                        capture_output=True, text=True, timeout=3600, check=True)
     except (OSError, subprocess.SubprocessError) as сбой:
         log.warning("DeepFilterNet не отработал: %s", сбой)
         return src, f"DeepFilterNet не отработал ({сбой}) — шумоподавление пропущено"
-    очищенный = каталог / на_вход.name
-    if not очищенный.is_file() or очищенный.stat().st_size < ПУСТОЙ_WAV:
+    очищенные = [каталог / путь.name for путь, _ in входы]
+    if any(not ф.is_file() or ф.stat().st_size < ПУСТОЙ_WAV for ф in очищенные):
         # Пустой выход — это отказ, а не тишина: подавать его дальше значит
         # заменить разговор на ничто и назвать это обработкой.
         return src, "DeepFilterNet вернул пустой файл — взята исходная запись"
-    return очищенный, ""
+    if каналов == 1:
+        return очищенные[0], ""
+    собранный = workdir / f"{src.stem}.dfn.wav"
+    try:
+        входы_ffmpeg: list[str] = []
+        for ф in очищенные:
+            входы_ffmpeg += ["-i", str(ф)]
+        метки = "".join(f"[{номер}:a]" for номер in range(каналов))
+        subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *входы_ffmpeg,
+             "-filter_complex", f"{метки}amerge=inputs={каналов}[o]", "-map", "[o]",
+             "-ac", str(каналов), "-acodec", "pcm_s16le", str(собранный)],
+            capture_output=True, text=True, timeout=1800, check=True)
+    except (OSError, subprocess.SubprocessError) as сбой:
+        log.warning("Каналы после DeepFilterNet не собрались: %s", сбой)
+        return src, (f"Каналы после DeepFilterNet не собрались ({сбой}) — "
+                     "шумоподавление пропущено")
+    if not собранный.is_file() or собранный.stat().st_size < ПУСТОЙ_WAV:
+        return src, "DeepFilterNet вернул пустой файл — взята исходная запись"
+    return собранный, ""
 
 
-def оценить_snr(src: Path, секунд: float = ЗАМЕР_СЕКУНД) -> float | None:
+def оценить_snr(src: Path, секунд: float = ЗАМЕР_СЕКУНД, *,
+                workdir: Path | None = None) -> float | None:
     """Отношение сигнал/шум исходной записи, дБ. None — померить не вышло.
 
     Меряется по началу записи и без единого фильтра: решение «чистить или
     не чистить» принимается по тому, что пришло, а не по тому, что уже
     обработали.
+
+    Временный файл — в рабочем каталоге задания: рядом с исходником он
+    ложился в каталог загрузок («up_….snr.wav»), который уборка задания не
+    чистит, а при обрыве процесса там и оставался.
     """
     exe = _ffmpeg()
-    временный = src.with_suffix(".snr.wav")
+    временный = ((workdir / f"{src.stem}.snr.wav") if workdir is not None
+                 else src.with_suffix(".snr.wav"))
+    if workdir is not None:
+        workdir.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
             [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
@@ -400,7 +498,8 @@ def оценить_snr(src: Path, секунд: float = ЗАМЕР_СЕКУНД)
         временный.unlink(missing_ok=True)
 
 
-def нужна_очистка(src: Path, settings: dict[str, Any]) -> tuple[bool, str]:
+def нужна_очистка(src: Path, settings: dict[str, Any], *,
+                  workdir: Path | None = None) -> tuple[bool, str]:
     """Стоит ли вообще чистить ЭТУ запись. Возвращает (да/нет, замечание).
 
     Безусловная очистка всего потока — приём, который измерения последних
@@ -417,7 +516,7 @@ def нужна_очистка(src: Path, settings: dict[str, Any]) -> tuple[bool
     порог = S.num(settings, "audio_denoise_below_snr_db", 0.0)
     if порог <= 0:
         return True, ""                      # порог не задан — как раньше
-    snr = оценить_snr(src)
+    snr = оценить_snr(src, workdir=workdir)
     if snr is None:
         return True, ""                      # не померили — не отменяем
     if snr >= порог:
@@ -430,6 +529,21 @@ def модель_arnndn() -> str | None:
     """Файл модели RNNoise для `audio_denoise: arnndn`, если он задан и есть."""
     model = os.environ.get("ASRHUB_ARNNDN_MODEL", "").strip()
     return model if model and Path(model).is_file() else None
+
+
+def _значение_фильтра(значение: str) -> str:
+    """Значение параметра фильтра, экранированное для цепочки ffmpeg.
+
+    Экранирование двухуровневое (раздел «Notes on filtergraph escaping»
+    документации ffmpeg). Первый уровень — значение параметра: «:» разделяет
+    параметры фильтра, «'» и «\\» служебные. Второй — вся цепочка: «,» и «;»
+    разделяют фильтры, «[» и «]» — метки, и «\\» и «'» снова служебные.
+    Путь к модели RNNoise вставлялся как есть: «C:\\asrhub\\models\\std.rnnn»
+    на Windows или каталог с запятой ломали разбор, ffmpeg отказывал, и
+    задание падало вместе с ним.
+    """
+    первый = значение.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return "".join("\\" + знак if знак in "\\'[],;" else знак for знак in первый)
 
 
 def build_filter_chain(settings: dict[str, Any]) -> str:
@@ -446,7 +560,7 @@ def build_filter_chain(settings: dict[str, Any]) -> str:
     elif denoise == "arnndn":
         model = модель_arnndn()
         if model:
-            filters.append(f"arnndn=m={model}")
+            filters.append(f"arnndn=m={_значение_фильтра(model)}")
         else:
             # В задание это пишет `prepare`: журнал сервера человек, выбравший
             # шумоподавление, не читает.
@@ -487,12 +601,16 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     channel: None — по настройке audio_channels; «left»/«right» — конкретный
     канал; «c<N>» — канал с номером N от нуля (многоканальная запись).
     """
-    exe = _ffmpeg()
     rate = int(settings.get("audio_sample_rate") or 16000)
     mode = channel or str(settings.get("audio_channels") or "mono")
     номер_канала = {"left": 0, "right": 1}.get(mode)
     if номер_канала is None and mode[:1] == "c" and mode[1:].isdigit():
         номер_канала = int(mode[1:])
+    if not has_ffmpeg() and src.suffix.lower() == ".wav":
+        # Обещание шапки модуля: без ffmpeg несжатый WAV всё равно
+        # читается. Прежде `prepare` бросал BinaryMissing и на нём.
+        return _convert_wav(src, dst, rate, номер_канала, start_s, duration_s)
+    exe = _ffmpeg()
 
     cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if start_s is not None:
@@ -534,7 +652,7 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     # исправный файл. Отличаются они кодом возврата: при успехе ffmpeg
     # молчит, и в сообщении не оказывалось даже его слов.
     if res.returncode == 0 and размер < ПУСТОЙ_WAV:
-        отказ = _пустой_результат(src, settings, start_s)
+        отказ = _пустой_результат(src, settings, start_s, channel=номер_канала)
         отказ.details.update(источник)
         raise отказ
     # Обрезка тишины раньше шла фильтром ПОСЛЕ остальных, и запись, из
@@ -546,7 +664,7 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     # 16 кГц — быстрый проход без памяти под всю запись.
     if res.returncode == 0 and settings.get("audio_trim_silence") \
             and peak_db(dst) <= ТИШИНА_ДБ:
-        отказ = _пустой_результат(src, settings, start_s)
+        отказ = _пустой_результат(src, settings, start_s, channel=номер_канала)
         отказ.details.update(источник)
         raise отказ
     if res.returncode != 0 or размер < ПУСТОЙ_WAV:
@@ -564,6 +682,63 @@ def convert(src: Path, dst: Path, settings: dict[str, Any], *,
     return dst
 
 
+def _convert_wav(src: Path, dst: Path, rate: int, канал: int | None,
+                 start_s: float | None, duration_s: float | None) -> Path:
+    """WAV 16 бит → моно WAV 16 бит нужной частоты средствами Python, без ffmpeg.
+
+    Только выбор канала, отрезок и передискретизация (линейная — для
+    распознавания её хватает); фильтры цепочки без ffmpeg не применяются,
+    и `prepare` говорит об этом заданию.
+    """
+    try:
+        with wave.open(str(src), "rb") as wf:
+            if wf.getsampwidth() != 2:
+                raise AudioError("Без ffmpeg читается только WAV 16 бит.",
+                                 hint="Установите ffmpeg или пришлите WAV PCM 16 бит.")
+            исходная = wf.getframerate()
+            каналов = wf.getnchannels()
+            начало = int(max(0.0, start_s or 0.0) * исходная)
+            wf.setpos(min(начало, wf.getnframes()))
+            кадров = wf.getnframes() - начало
+            if duration_s is not None:
+                кадров = min(кадров, int(duration_s * исходная))
+            сырые = wf.readframes(max(0, кадров))
+    except wave.Error as exc:
+        raise AudioError(f"Не удалось прочитать WAV: {exc}") from exc
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        np = None  # type: ignore
+    if np is not None:
+        данные = np.frombuffer(сырые, dtype="<i2").astype(np.float32) / 32768.0
+        if каналов > 1:
+            данные = данные.reshape(-1, каналов)
+            данные = (данные[:, канал] if канал is not None and канал < каналов
+                      else данные.mean(axis=1))
+        if исходная != rate and len(данные):
+            длина = int(round(len(данные) * rate / исходная))
+            данные = np.interp(np.arange(длина) / rate,
+                               np.arange(len(данные)) / исходная, данные).astype(np.float32)
+    else:
+        if исходная != rate:
+            raise AudioError(
+                f"Без ffmpeg и numpy частоту {исходная} Гц не привести к {rate} Гц.",
+                hint="Установите ffmpeg или numpy.")
+        счёт = len(сырые) // 2
+        значения = struct.unpack(f"<{счёт}h", сырые[:счёт * 2])
+        if каналов > 1:
+            значения = tuple(
+                значения[i + канал] if канал is not None and канал < каналов
+                else sum(значения[i:i + каналов]) / каналов
+                for i in range(0, len(значения) - каналов + 1, каналов))
+        данные = [v / 32768.0 for v in значения]
+    if len(данные) < 8:
+        raise NoSpeechDetected(f"В записи «{src.name}» не осталось звука.",
+                               details={"empty_output": True})
+    write_wav(dst, данные, rate)
+    return dst
+
+
 def _отпечаток(src: Path) -> dict[str, Any]:
     """Размер и время правки файла — в том виде, в каком они были при отказе."""
     try:
@@ -574,17 +749,23 @@ def _отпечаток(src: Path) -> dict[str, Any]:
             "source_mtime": round(сведения.st_mtime, 3)}
 
 
-def peak_db(src: Path) -> float:
+def peak_db(src: Path, channel: int | None = None) -> float:
     """Пиковая громкость записи в дБ. -inf (как -120) — ни одного отсчёта.
 
     Нужна там, где иначе пришлось бы гадать: «на выходе пусто» бывает и от
     тишины в записи, и от фильтров, которые эту запись выхолостили. Это
     разные починки — на станции и в настройках, — и отличить их можно только
     померив исходник.
+
+    `channel` — мерить один канал (номер от нуля), тот же, что выбирает
+    `convert`. Пик по всем каналам здесь врал: при «взять правый канал» и
+    молчащем клиенте громкий оператор слева давал «запись звучит», и
+    задание падало с советом проверить фильтры вместо честного «речи нет».
     """
     exe = _ffmpeg()
-    cmd = [exe, "-hide_banner", "-nostdin", "-i", str(src),
-           "-af", "volumedetect", "-f", "null", "-"]
+    фильтр = "volumedetect" if channel is None else f"pan=mono|c0=c{channel},volumedetect"
+    cmd = [exe, "-hide_banner", "-nostdin", "-i", str(src), "-vn", "-sn", "-dn",
+           "-af", фильтр, "-f", "null", "-"]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     except (OSError, subprocess.SubprocessError):
@@ -599,18 +780,22 @@ def peak_db(src: Path) -> float:
 
 
 def _пустой_результат(src: Path, settings: dict[str, Any],
-                      start_s: float | None) -> ASRHubError:
+                      start_s: float | None, *, channel: int | None = None) -> ASRHubError:
     """Называет причину, по которой после ffmpeg не осталось звука.
 
     Причин три, и лечатся они в трёх разных местах: тишина в записи — на
     станции, пустой файл — там же, но иначе, а отрезок мимо записи — в
     настройках задания. Общий ответ «проверьте целостность файла» не годится
     ни для одной: файл при этом целый.
+
+    `channel` — канал, который брала конвертация: громкость меряется у него,
+    а не у всей записи (см. `peak_db`).
     """
     try:
-        длительность = probe(src).duration_s
+        сведения: AudioInfo | None = probe(src)
     except ASRHubError:
-        длительность = 0.0
+        сведения = None
+    длительность = сведения.duration_s if сведения is not None else 0.0
 
     if длительность <= 0.05:
         return AudioError(
@@ -623,7 +808,8 @@ def _пустой_результат(src: Path, settings: dict[str, Any],
     # Дальше догадка была бы дешёвой и неверной: «включена обрезка тишины —
     # значит, тишина». Обрезка убирает и то, что выхолостили фильтры, и
     # громкая запись выглядит тогда молчаливой. Поэтому исходник меряется.
-    пик = peak_db(src)
+    каналов = сведения.channels if сведения is not None else 1
+    пик = peak_db(src, channel if channel is not None and каналов > channel else None)
     # Пометка «на выходе пусто» отличает этот отказ от настоящего сбоя
     # ffmpeg. Разница важна для стереозаписи: пустой канал — это факт о
     # записи, и терять из-за него второго собеседника нельзя, а вот битый
@@ -644,11 +830,7 @@ def _пустой_результат(src: Path, settings: dict[str, Any],
     # которая заведомо в порядке.
     цепочка = build_filter_chain(settings)
     подробности["filters"] = цепочка
-    частота = 0
-    try:
-        частота = probe(src).sample_rate
-    except ASRHubError:
-        pass
+    частота = сведения.sample_rate if сведения is not None else 0
     подробности["sample_rate"] = частота
     return AudioError(
         f"Запись «{src.name}» звучит ({пик:.0f} дБ), но после обработки "
@@ -767,17 +949,37 @@ def prepare(src: Path, workdir: Path, settings: dict[str, Any]) -> Prepared:
     # коду настройки идут уже поправленными: `audio_denoise` в них может
     # оказаться выключенным, и это осознанно.
     настройки = dict(settings)
-    if str(настройки.get("audio_denoise") or "none") != "none":
-        чистить, почему = нужна_очистка(src, настройки)
+    if str(настройки.get("audio_denoise") or "none") != "none" and has_ffmpeg():
+        чистить, почему = нужна_очистка(src, настройки, workdir=workdir)
         if not чистить:
             настройки["audio_denoise"] = "none"
             замечания.append(почему)
         elif str(настройки.get("audio_denoise")) == "deepfilternet":
-            src, беда = очистить_deepfilter(src, workdir, настройки)
+            # Каналы нужны порознь — чистим порознь (см. `очистить_deepfilter`):
+            # раскладка после очистки обязана совпасть с той, по которой
+            # дальше выбирается канал.
+            режим = str(настройки.get("audio_channels") or "mono")
+            порознь = info.channels >= 2 and (
+                режим != "mono" or (
+                    bool(настройки.get("diarization_enabled"))
+                    and str(настройки.get("diarization_backend") or "") == "channels"))
+            src, беда = очистить_deepfilter(src, workdir, настройки,
+                                            каналов=info.channels if порознь else 1)
             настройки["audio_denoise"] = "none"
             if беда:
                 замечания.append(беда)
     settings = настройки
+    if not has_ffmpeg():
+        без = [название for ключ, название in (
+            ("audio_trim_silence", "обрезка тишины"), ("audio_normalize", "нормализация"),
+            ("audio_highpass_hz", "фильтр"), ("audio_denoise", "шумоподавление"))
+            if settings.get(ключ) and str(settings.get(ключ)) != "none"]
+        if abs(float(settings.get("audio_speed") or 1.0) - 1.0) > 1e-3:
+            без.append("смена темпа")
+        if без:
+            замечания.append("ffmpeg не найден: запись WAV подготовлена без обработки ("
+                             + ", ".join(без) + ").")
+            settings = {**settings, "audio_speed": 1.0}
     if str(settings.get("audio_denoise") or "none") == "arnndn" and модель_arnndn() is None:
         # Раньше об этом знал только журнал сервера: запись уходила без
         # шумоподавления, а в задании стояло «arnndn» — как будто оно было.
@@ -914,6 +1116,46 @@ def load_samples(path: Path, max_seconds: float | None = None):
     if channels > 1:
         data = data.reshape(-1, channels).mean(axis=1)
     return data, rate
+
+
+def wav_блоками(path: Path, кадров: int):
+    """Отсчёты WAV блоками по `кадров` кадров: (номер первого кадра, отсчёты моно).
+
+    Для замеров, которым запись целиком не нужна: полосе громкости и
+    энергетическому поиску речи. Они читали её в память разом — час
+    телефонного звука это 115 МБ байтов, вдвое больше во float32 и ещё
+    массив на каждого говорящего: 600–700 МБ на задание, а на пределе
+    длительности по умолчанию (четыре часа) — под три гигабайта. Здесь в
+    памяти один блок. Отсчёты — numpy float32, если numpy есть, иначе
+    список float.
+    """
+    кадров = max(1, int(кадров))
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        np = None  # type: ignore
+    with wave.open(str(path), "rb") as wf:
+        if wf.getsampwidth() != 2:
+            raise AudioError("Ожидается 16-битный WAV.")
+        каналов = wf.getnchannels()
+        начало = 0
+        while True:
+            сырые = wf.readframes(кадров)
+            if not сырые:
+                return
+            if np is not None:
+                данные = np.frombuffer(сырые, dtype="<i2").astype(np.float32) / 32768.0
+                if каналов > 1:
+                    данные = данные.reshape(-1, каналов).mean(axis=1)
+            else:
+                счёт = len(сырые) // 2
+                значения = struct.unpack(f"<{счёт}h", сырые[:счёт * 2])
+                if каналов > 1:
+                    значения = tuple(sum(значения[i:i + каналов]) / каналов
+                                     for i in range(0, len(значения), каналов))
+                данные = [v / 32768.0 for v in значения]
+            yield начало, данные
+            начало += len(данные)
 
 
 def write_wav(path: Path, samples, sample_rate: int = 16000) -> Path:

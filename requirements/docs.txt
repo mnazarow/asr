@@ -1,0 +1,13 @@
+# Сборка документации (bash docs/build.sh). Раньше эти зависимости нигде не
+# были названы, и сборка на другой машине падала на первом же импорте.
+#
+# Кроме пакетов Python нужны программы:
+#   pandoc                    — Markdown → Word (apt install pandoc);
+#   LibreOffice с python3-uno — оглавление и PDF (apt install libreoffice-writer python3-uno);
+#   схема OOXML wml.xsd       — путь в ASRHUB_WML_XSD; без неё fix_docx.py
+#                               пропускает перестановку элементов.
+lxml>=4.9
+# SVG → PNG для схем; без него в Word попадают только SVG.
+cairosvg>=2.7
+# Примеры ответов в справочнике API мониторинга — с работающего сервера.
+requests>=2.31

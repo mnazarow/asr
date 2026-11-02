@@ -48,6 +48,9 @@ LABELS = {
     "job.retry": "повтор",
     "job.cancelled": "отменено",
     "job.cached": "из кеша",
+    # Итоги без расшифровки (3.1.24): не ошибки, а свои состояния.
+    "job.no_speech": "без речи",
+    "job.short": "короткая запись",
     "queue.paused": "очередь на паузе",
     "queue.resumed": "очередь запущена",
 }
@@ -83,6 +86,8 @@ async def main() -> int:
             elif kind == "job.failed":
                 error = message.get("error") or {}
                 extra = f" — {error.get('message', '')}"
+            elif kind in ("job.no_speech", "job.short"):
+                extra = f" — {message.get('message', '')}"
             print(f"\r  {label}: {message.get('id', '')}{extra}{' ' * 20}")
     return 0
 

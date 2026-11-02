@@ -43,6 +43,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from .db import Database
 from .errors import ConfigError
 
 МАСШТАБЫ = ("day", "month", "quarter", "year")
@@ -189,14 +190,27 @@ def базы(масштаб: str, первый: dt.date) -> list[Окно]:
     return итог
 
 
-def разобрать_дату(значение: str | None) -> dt.date:
+#: Годы, за которые отчёт можно спросить. Шире незачем: у года 1 нет
+#: прошлого года для сравнения, у 9999 — следующего дня, и такая дата
+#: роняла отчёт ошибкой сервера вместо понятного ответа.
+ГОДЫ = (1972, 2999)
+
+
+def разобрать_дату(значение: str | None, сейчас: float | None = None) -> dt.date:
+    """День из параметра `date`; пусто — день момента `сейчас` (или сегодня)."""
     if not значение:
-        return dt.date.today()
-    try:
-        return dt.date.fromisoformat(str(значение)[:10])
-    except ValueError:
-        raise ConfigError(f"Дата «{значение}» не разобрана.",
-                          hint="Ожидается ГГГГ-ММ-ДД, например 2026-10-26.") from None
+        день = dt.date.today() if сейчас is None else dt.date.fromtimestamp(сейчас)
+        значение = день.isoformat()
+    else:
+        try:
+            день = dt.date.fromisoformat(str(значение)[:10])
+        except ValueError:
+            raise ConfigError(f"Дата «{значение}» не разобрана.",
+                              hint="Ожидается ГГГГ-ММ-ДД, например 2026-10-26.") from None
+    if not ГОДЫ[0] <= день.year <= ГОДЫ[1]:
+        raise ConfigError(f"Дата «{значение}» вне допустимых лет.",
+                          hint=f"Год — от {ГОДЫ[0]} до {ГОДЫ[1]}.")
+    return день
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +328,10 @@ def корзины(масштаб: str, первый: dt.date) -> Корзины
 # ---------------------------------------------------------------------------
 
 #: Разговор отдела — добавочный из журнала звонков, отдел — из справочника
-#: сотрудников по этому номеру. Тот же отбор есть у списков раскрытия
+#: сотрудников по этому номеру, по его главной карточке (той, чьим именем
+#: номер подписан в отчёте). Тот же отбор есть у списков раскрытия
 #: (`department:` в `drill`), и список под числом сходится с числом.
-ОТДЕЛ_ЗАДАНИЯ = ("EXISTS (SELECT 1 FROM calls cl JOIN employees e ON e.phone_ext = cl.agent "
-                 "WHERE cl.job_id = j.id AND COALESCE(cl.agent,'') <> '' AND e.department = ?)")
+ОТДЕЛ_ЗАДАНИЯ = Database.ОТДЕЛ_ЗАДАНИЯ
 ДОБАВОЧНЫЙ_ЗАДАНИЯ = "EXISTS (SELECT 1 FROM calls cl WHERE cl.job_id = j.id AND cl.agent = ?)"
 ДОБАВОЧНЫЙ_ВЫРАЖЕНИЕ = ("COALESCE((SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id "
                         "AND COALESCE(cl.agent,'') <> '' LIMIT 1), '')")
@@ -363,8 +377,7 @@ class Отбор:
             условия.append("cl.agent = ?")
             аргументы.append(self.agent)
         if self.department:
-            условия.append("EXISTS (SELECT 1 FROM employees e WHERE e.phone_ext = cl.agent "
-                           "AND e.department = ?)")
+            условия.append(Database.ОТДЕЛ_ЗВОНКА)
             аргументы.append(self.department)
         return " AND ".join(условия), аргументы
 
@@ -431,6 +444,10 @@ class Отчёт:
                 база.until = min(база.end, база.since + прошло)
                 база.to_date = True
         self.корзины = корзины(масштаб, первый)
+        #: Все строки сотрудников периода и добавочные главной базы — после
+        #: `посчитать` (см. там же).
+        self.сотрудники: list[dict[str, Any]] = []
+        self.сотрудники_базы: list[dict[str, Any]] = []
 
     # --- навигация ---------------------------------------------------------
 
@@ -453,8 +470,23 @@ class Отчёт:
         корз = self._корзины_окна(о)
         return [dict(r) for r in self.db.query(
             f"SELECT {корз.выражение('j.created_at')} AS k, j.status AS s, COUNT(*) AS n, "
-            "       SUM(COALESCE(j.media_duration_s, 0)) AS dur "
+            "       SUM(COALESCE(j.media_duration_s, 0)) AS dur, "
+            "       SUM(CASE WHEN j.media_duration_s > 0 THEN 1 ELSE 0 END) AS dn "
             f"FROM jobs j WHERE {где} GROUP BY k, s", арг)]
+
+    @staticmethod
+    def _известных_длительностей(группы: list[dict[str, Any]]) -> int:
+        """Сколько готовых записей окна с известной длительностью.
+
+        Переписка из текстовых каналов (`POST /api/jobs/text`) — готовая
+        запись без длительности: в колонке у неё ноль. Медиана, 90-й
+        процентиль и средняя длина разговора считаются по записям, у
+        которых длина есть, — и номер строки медианы, и делитель средней.
+        От всех готовых каждый чат шёл разговором в ноль секунд: на месяце
+        с сотней звонков и сотней чатов медиана падала до самого короткого
+        звонка, а средняя — вдвое.
+        """
+        return sum(int(г.get("dn") or 0) for г in группы if г["s"] == "completed")
 
     @staticmethod
     def _итог_заданий(группы: list[dict[str, Any]]) -> dict[str, Any]:
@@ -470,12 +502,12 @@ class Отчёт:
                 в_работе += n
             if г["s"] == "completed":
                 длит += float(г["dur"] or 0)
-        готово = по["completed"]
+        с_длиной = Отчёт._известных_длительностей(группы)
         return {
             "jobs": int(всего), **по, "active": в_работе,
             "empty": по["no_speech"] + по["short"],
             "talk_hours": round(длит / 3600, 2),
-            "avg_duration_s": round(длит / готово, 1) if готово else None,
+            "avg_duration_s": round(длит / с_длиной, 1) if с_длиной else None,
             "empty_share": _доля(по["no_speech"] + по["short"], всего),
             "failed_share": _доля(по["failed"], всего),
         }
@@ -504,7 +536,12 @@ class Отчёт:
         return ряд
 
     def _медиана(self, о: Окно, готово: int) -> dict[str, Any]:
-        """Медиана и 90-й процентиль длительности разговора — без выборки в память."""
+        """Медиана и 90-й процентиль длительности разговора — без выборки в память.
+
+        `готово` — сколько готовых записей окна с известной длительностью:
+        ровно столько строк отбирает запрос ниже, и номер строки медианы
+        считается от них (см. `_известных_длительностей`).
+        """
         if not готово:
             return {"median_duration_s": None, "p90_duration_s": None}
         где, арг = self.отбор.где(self.db, о.since, о.until, готовые=True)
@@ -512,7 +549,7 @@ class Отчёт:
         for имя, доля in (("median_duration_s", 0.5), ("p90_duration_s", 0.9)):
             строка = self.db.query_one(
                 f"SELECT j.media_duration_s AS v FROM jobs j WHERE {где} "
-                "AND j.media_duration_s IS NOT NULL ORDER BY j.media_duration_s "
+                "AND j.media_duration_s > 0 ORDER BY j.media_duration_s "
                 "LIMIT 1 OFFSET ?", [*арг, max(0, min(готово - 1, int(готово * доля)))])
             итог[имя] = round(float(строка["v"]), 1) if строка and строка["v"] is not None else None
         return итог
@@ -692,7 +729,16 @@ class Отчёт:
                 f"SELECT {корз.выражение('j.created_at')} AS k, "
                 f"j.status AS s, COUNT(*) AS n FROM jobs j WHERE {где} GROUP BY k, s", арг):
             дата = time.strftime("%Y-%m-%d", time.localtime(корз.момент(г["k"])))
-            день = дни.setdefault(дата, {"date": дата, "completed": 0, "jobs": 0})
+            if дата not in дни:
+                # Границы дня — по часам сервера и в ответ: список под клеткой
+                # календаря открывается ими, а не полуночью браузера — у того
+                # бывает другой часовой пояс. Сегодняшний день кончается
+                # концом окна отчёта, а не завтрашней полуночью.
+                сутки = dt.date.fromisoformat(дата)
+                дни[дата] = {"date": дата, "completed": 0, "jobs": 0,
+                             "since": _секунды(сутки),
+                             "until": min(_секунды(сутки + dt.timedelta(days=1)), о.until)}
+            день = дни[дата]
             день["jobs"] += int(г["n"] or 0)
             if г["s"] == "completed":
                 день["completed"] += int(г["n"] or 0)
@@ -864,7 +910,8 @@ class Отчёт:
 
         задания = {о.id: ж_задания[о.id].result() for о in окна}
         итоги = {о.id: self._итог_заданий(задания[о.id]) for о in окна}
-        ж_медианы = {о.id: пул.submit(self._медиана, о, итоги[о.id]["completed"])
+        ж_медианы = {о.id: пул.submit(self._медиана, о,
+                                      self._известных_длительностей(задания[о.id]))
                      for о in окна[:2]}
         содержание = {о.id: ж_содержание[о.id].result() for о in окна}
         ответы = {о.id: self._итог_ответов(ж_ответы[о.id].result()) for о in окна}
@@ -894,10 +941,19 @@ class Отчёт:
 
         люди = ж_люди.result()
         люди_было = ж_люди_было.result() if ж_люди_было is not None else {}
-        сотрудники = sorted(
+        # Все добавочные периода и главной базы остаются при отчёте: свод по
+        # отделам складывается из них, а не из показанных трёхсот. Иначе на
+        # большом колл-центре отдел недосчитывал разговоров тех, кто не
+        # попал в рейтинг, а «к базе» сравнивалось только с теми, кто
+        # работал в обоих периодах, — и число в таблице отделов расходилось
+        # со списком под ним.
+        self.сотрудники = sorted(
             (self._строка_сотрудника(ч, люди_было.get(номер))
              for номер, ч in люди.items() if номер),
-            key=lambda с: (-с["completed"], -с["jobs"], с["agent"]))[:ДОБАВОЧНЫХ]
+            key=lambda с: (-с["completed"], -с["jobs"], с["agent"]))
+        self.сотрудники_базы = [{"agent": номер, "completed": int(ч.get("completed") or 0)}
+                                for номер, ч in люди_было.items() if номер]
+        сотрудники = self.сотрудники[:ДОБАВОЧНЫХ]
         без_добавочного = люди.get("", {})
 
         ответ = {
@@ -1006,33 +1062,39 @@ def списки(db: Any, отчёт: Отчёт) -> dict[str, Any]:
             if isinstance(действия, list) and действия:
                 обязательств += len(действия)
                 с_обязательствами += 1
-            свои_трекеры: set[str] = set()
+            # Запись считается один раз на трекер и на ответ пункта — как в
+            # «Голосовой аналитике» и как отбирает список под числом: трекер
+            # сработал, если сработал любой из его повторов (два трекера с
+            # одним id в настройке), пункт «не выполнен», если так ответил
+            # любой. Прежде решал первый повтор, и при «не сработал,
+            # сработал» число говорило ноль, а список показывал запись.
+            свои_трекеры: dict[str, bool] = {}
             for т in разобрать(r["trackers"]) or []:
                 if not isinstance(т, dict):
                     continue
                 ключ = str(т.get("id") or т.get("label") or "")
                 if not ключ:
                     continue
-                запись = трекеры.setdefault(ключ, {"id": ключ, "label": т.get("label") or ключ,
-                                                    "checked": 0, "fired": 0})
-                if ключ in свои_трекеры:
-                    continue
-                свои_трекеры.add(ключ)
-                запись["checked"] += 1
-                if т.get("fired"):
-                    запись["fired"] += 1
-            свои_пункты: set[str] = set()
+                трекеры.setdefault(ключ, {"id": ключ, "label": т.get("label") or ключ,
+                                          "checked": 0, "fired": 0})
+                свои_трекеры[ключ] = свои_трекеры.get(ключ, False) or bool(т.get("fired"))
+            for ключ, сработал in свои_трекеры.items():
+                трекеры[ключ]["checked"] += 1
+                if сработал:
+                    трекеры[ключ]["fired"] += 1
+            свои_ответы: set[tuple[str, str]] = set()
             for п in разобрать(r["scorecard"]) or []:
                 if not isinstance(п, dict):
                     continue
                 ключ = str(п.get("id") or п.get("question") or "")
-                if not ключ or ключ in свои_пункты:
+                if not ключ:
                     continue
-                свои_пункты.add(ключ)
-                запись = пункты.setdefault(ключ, {"id": ключ, "question": п.get("question") or ключ,
-                                                   "yes": 0, "no": 0, "na": 0})
+                пункты.setdefault(ключ, {"id": ключ, "question": п.get("question") or ключ,
+                                         "yes": 0, "no": 0, "na": 0})
                 ответ = п.get("answer")
-                запись["yes" if ответ == "да" else "no" if ответ == "нет" else "na"] += 1
+                свои_ответы.add((ключ, "yes" if ответ == "да" else "no" if ответ == "нет" else "na"))
+            for ключ, вид in свои_ответы:
+                пункты[ключ][вид] += 1
         return {"records": записей, "actions": обязательств,
                 "records_with_actions": с_обязательствами,
                 "trackers": трекеры, "scorecard": пункты}

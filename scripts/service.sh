@@ -46,7 +46,9 @@ while [[ $# -gt 0 ]]; do
     --from)   RESTORE_FROM="${2:?}"; shift 2 ;;
     --quiet|-q) ASRHUB_QUIET=1; shift ;;
     --dry-run) ASRHUB_DRY_RUN=1; shift ;;
-    *) shift ;;
+    # Незнакомый ключ — ошибка, а не пропуск: опечатка в `--prot 8081`
+    # молча ставила службу на прежний порт.
+    *) error "Неизвестный параметр: $1"; hint "Справка: bash scripts/service.sh help"; exit 2 ;;
   esac
 done
 
@@ -114,7 +116,48 @@ PLIST="$(plist_path_for "${SERVICE_NAME}")"
 UNIT="${ASRHUB_SYSTEMD_DIR:-/etc/systemd/system}/${SERVICE_NAME}.service"
 USER_UNIT="${ASRHUB_SYSTEMD_USER_DIR:-${HOME}/.config/systemd/user}/${SERVICE_NAME}.service"
 
-use_user_systemd() { [[ ! -w /etc/systemd/system ]] && ! is_root; }
+# Системный или пользовательский systemd — по тому, где лежит юнит этой
+# службы, а не по тому, кто запустил сценарий. Служба, поставленная через
+# sudo, — системная; команды из документации (`service.sh status|restart|logs`
+# без sudo) шли в `systemctl --user` и отвечали «Unit could not be found»,
+# а `uninstall` рапортовал «Служба удалена», оставляя юнит на месте.
+# Юнита ещё нет (установка) — решают права на каталог системных юнитов.
+use_user_systemd() {
+  [[ -f "${UNIT}" ]] && return 1
+  [[ -f "${USER_UNIT}" ]] && return 0
+  [[ ! -w "$(dirname "${UNIT}")" ]] && ! is_root
+}
+
+# Журнал системной службы без прав читает только группа systemd-journal
+# (или adm, wheel): иначе journalctl честно отвечает «-- No entries --».
+journal_needs_root() {
+  is_root && return 1
+  id -nG 2>/dev/null | tr ' ' '\n' | grep -qxE 'systemd-journal|adm|wheel' && return 1
+  return 0
+}
+
+# systemctl есть, а systemd не запущен (WSL без systemd, контейнер): вместо
+# сырого «System has not been booted with systemd» — объяснение и выход.
+systemd_running() {
+  [[ -d /run/systemd/system ]] && return 0
+  # Каталога-признака нет — спрашиваем сам systemctl: без systemd он
+  # отвечает «System has not been booted with systemd».
+  [[ "$(set +o pipefail; systemctl show -p Version 2>&1 \
+         | grep -c "has not been booted with systemd" || true)" -eq 0 ]]
+}
+
+# Журналы launchd (service.log, service-error.log) сам launchd не
+# ротирует: на долго работающем Mac они росли месяцами. Перед запуском
+# службы файл больше 32 МБ уходит в .1.
+rotate_launchd_logs() {
+  local file size
+  for file in "${DATA_DIR}/logs/service.log" "${DATA_DIR}/logs/service-error.log"; do
+    [[ -f "${file}" ]] || continue
+    size="$(stat -f '%z' "${file}" 2>/dev/null || stat -c '%s' "${file}" 2>/dev/null || echo 0)"
+    [[ "${size}" =~ ^[0-9]+$ ]] && (( size > 33554432 )) || continue
+    mv -f "${file}" "${file}.1" 2>/dev/null || true
+  done
+}
 
 # Перечитывает определения юнитов, если файл на диске разошёлся с тем, что
 # systemd держит в памяти.
@@ -159,7 +202,6 @@ install_systemd() {
   local user_mode=0
   if use_user_systemd; then
     unit_path="${USER_UNIT}"; user_mode=1
-    mkdir -p "$(dirname "${USER_UNIT}")"
     info "Права на /etc/systemd отсутствуют — служба ставится для текущего пользователя."
   fi
   local run_user="${SERVICE_USER}"
@@ -178,6 +220,16 @@ install_systemd() {
     run_user="root"
     warn "Пользователь службы не задан — юнит будет работать от root."
     warn "Так делать не стоит: укажите --user ИМЯ (обычно asrhub)."
+  fi
+
+  # Порт ниже 1024 пользователю службы не открыть без права на привязку:
+  # сервер падал при старте, а разбор причины звал права на каталог данных.
+  local caps_block=""
+  if [[ "${PORT}" =~ ^[0-9]+$ ]] && (( 10#${PORT} < 1024 )) \
+     && [[ "${user_mode}" -eq 0 && -n "${run_user}" && "${run_user}" != "root" ]]; then
+    caps_block="# Порт ${PORT} ниже 1024: право привязки без root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+"
   fi
 
   local content
@@ -225,7 +277,11 @@ Environment="XDG_CACHE_HOME=${DATA_DIR}/cache"
 Environment="NUMBA_CACHE_DIR=${DATA_DIR}/cache/numba"
 EnvironmentFile=-${DATA_DIR}/env.sh
 ExecStart=${EXEC_Q} -m asrhub --host ${HOST} --port ${PORT}
-ExecReload=/bin/kill -HUP \$MAINPID
+# ExecReload нет намеренно: SIGHUP сервер не обрабатывает, и
+# «systemctl reload» убивал его, а смерть от SIGHUP systemd считает чистым
+# выходом — Restart=on-failure не срабатывал, сервер так и стоял. Без
+# ExecReload systemctl reload честно отвечает отказом; новая конфигурация
+# — через restart.
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=45
@@ -235,6 +291,7 @@ KillMode=mixed
 LimitNOFILE=65535
 MemoryHigh=90%
 
+${caps_block}
 # Изоляция
 NoNewPrivileges=true
 PrivateTmp=true
@@ -272,6 +329,9 @@ UNITEOF
   # новыми файлами, а новый порт или адрес из юнита вступали в силу только
   # при случайном перезапуске — вопреки обещанию «служба будет перезапущена».
   if [[ "${user_mode}" -eq 1 ]]; then
+    # Каталог — после проверки пробного запуска: `install.sh --dry-run` не
+    # от root создавал ~/.config/systemd/user и писал «изменений не вносилось».
+    mkdir -p "$(dirname "${USER_UNIT}")"
     printf '%s\n' "${content}" > "${unit_path}"
     run systemctl --user daemon-reload
     run systemctl --user enable "${SERVICE_NAME}.service"
@@ -327,12 +387,22 @@ PLISTEOF
   # вносилось».
   mkdir -p "$(dirname "${PLIST}")" "${DATA_DIR}/logs"
   printf '%s\n' "${content}" > "${PLIST}"
+  rotate_launchd_logs
   run launchctl unload "${PLIST}" 2>/dev/null || true
   run launchctl load -w "${PLIST}"
   ok "Служба launchd создана: ${PLIST}"
 }
 
 # ---------------------------------------------------------------------------
+
+# Пробному запуску systemd не нужен: он только показывает юнит.
+if [[ "${OS}" != "macos" && "${ASRHUB_DRY_RUN}" != "1" ]] && have systemctl && ! systemd_running \
+   && [[ "${ACTION}" =~ ^(install|uninstall|start|stop|restart|status|logs)$ ]]; then
+  error "systemctl есть, но systemd на этой машине не запущен (WSL без systemd, контейнер)."
+  hint "Запускайте сервер вручную: cd '${PREFIX}/server' && ASRHUB_DATA_DIR='${DATA_DIR}' '${PREFIX}/venv/bin/python' -m asrhub --port ${PORT}"
+  hint "В WSL systemd включается строкой systemd=true в /etc/wsl.conf (раздел [boot])."
+  exit 1
+fi
 
 case "${ACTION}" in
   install)
@@ -379,9 +449,10 @@ case "${ACTION}" in
     reload_units_if_needed
     if [[ "${OS}" == "macos" ]]; then
       case "${ACTION}" in
-        start)   run launchctl load -w "${PLIST}" ;;
+        start)   rotate_launchd_logs; run launchctl load -w "${PLIST}" ;;
         stop)    run launchctl unload "${PLIST}" ;;
-        restart) launchctl unload "${PLIST}" 2>/dev/null || true; run launchctl load -w "${PLIST}" ;;
+        restart) launchctl unload "${PLIST}" 2>/dev/null || true; rotate_launchd_logs
+                 run launchctl load -w "${PLIST}" ;;
       esac
     elif have systemctl; then
       if use_user_systemd; then run systemctl --user "${ACTION}" "${SERVICE_NAME}.service"
@@ -417,14 +488,22 @@ case "${ACTION}" in
       # объявлялась незапущенной. Отсюда же тянулось: update.sh определял
       # WAS_RUNNING этим же вызовом и не поднимал сервер после обновления,
       # оставляя его на старом коде.
-      if [[ "$(set +o pipefail; launchctl list 2>/dev/null \
-               | grep -cF -- "${PLIST_LABEL}" || true)" -gt 0 ]]; then
+      # «Запущена» — когда у агента есть процесс. В `launchctl list`
+      # остаются и упавшие агенты (с «-» вместо номера процесса), и сервер,
+      # падавший при запуске, объявлялся работающим.
+      if [[ "$(service_state "${SERVICE_NAME}" || true)" == "running" ]]; then
         ok "Служба запущена"
         launchctl list "${PLIST_LABEL}" 2>/dev/null | head -12
       else
-        warn "Служба не запущена"; exit 1
+        warn "Служба не запущена"
+        LAST_EXIT="$(launchctl list "${PLIST_LABEL}" 2>/dev/null \
+                     | sed -n 's/.*"LastExitStatus" = \([0-9-]*\);.*/\1/p' | head -1 || true)"
+        [[ -n "${LAST_EXIT}" && "${LAST_EXIT}" != "0" ]] && \
+          hint "Последний выход с кодом ${LAST_EXIT}. Причина: bash '${SCRIPT_DIR}/service.sh' logs"
+        exit 1
       fi
     elif have systemctl; then
+      # Состояние системной службы systemctl отдаёт и без прав.
       if use_user_systemd; then systemctl --user status "${SERVICE_NAME}.service" --no-pager -l || exit 1
       else systemctl status "${SERVICE_NAME}.service" --no-pager -l || exit 1; fi
     else
@@ -433,10 +512,17 @@ case "${ACTION}" in
 
   logs)
     if [[ "${OS}" == "macos" ]]; then
-      if [[ "${FOLLOW}" -eq 1 ]]; then tail -f "${DATA_DIR}/logs/service.log"
-      else tail -n "${LINES}" "${DATA_DIR}/logs/service.log" 2>/dev/null || warn "Журнал пуст."; fi
+      # Журнал приложения идёт в stderr — в service-error.log; service.log —
+      # только строки доступа. Раньше показывался второй, и трассировка
+      # упавшего при запуске сервера оставалась в соседнем файле.
+      MAC_LOG="${DATA_DIR}/logs/service-error.log"
+      [[ -s "${MAC_LOG}" ]] || MAC_LOG="${DATA_DIR}/logs/service.log"
+      if [[ "${FOLLOW}" -eq 1 ]]; then tail -f "${MAC_LOG}"
+      else tail -n "${LINES}" "${MAC_LOG}" 2>/dev/null || warn "Журнал пуст."; fi
     elif have journalctl; then
       if use_user_systemd; then journalctl --user -u "${SERVICE_NAME}.service" -n "${LINES}" $( [[ "${FOLLOW}" -eq 1 ]] && echo -f ) --no-pager
+      elif journal_needs_root; then
+        as_root journalctl -u "${SERVICE_NAME}.service" -n "${LINES}" $( [[ "${FOLLOW}" -eq 1 ]] && echo -f ) --no-pager
       else journalctl -u "${SERVICE_NAME}.service" -n "${LINES}" $( [[ "${FOLLOW}" -eq 1 ]] && echo -f ) --no-pager; fi
     else
       tail -n "${LINES}" "${DATA_DIR}/logs/asrhub.log" 2>/dev/null || warn "Журнал не найден."
@@ -511,8 +597,7 @@ PYCODE
     fi
     # На macOS проверка та же — агент launchd по своей метке.
     if [[ "${OS}" == "macos" ]] && have launchctl \
-       && [[ "$(set +o pipefail; launchctl list 2>/dev/null \
-                | grep -cF -- "${PLIST_LABEL}" || true)" -gt 0 ]]; then
+       && [[ "$(service_state "${SERVICE_NAME}" || true)" == "running" ]]; then
       error "Служба ${PLIST_LABEL} не остановилась — восстановление отменено."
       hint "Остановите её вручную: launchctl unload '${PLIST}' — и повторите."
       exit 1

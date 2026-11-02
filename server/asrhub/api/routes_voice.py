@@ -35,8 +35,16 @@ router = APIRouter(prefix="/api/voice", tags=["Аналитика"])
 ДОБАВОЧНЫХ_В_ОТБОРЕ = 500
 
 
-def _отделы(сотрудники: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Свод по отделам — из строк сотрудников, отдел которых знает справочник."""
+def _отделы(сотрудники: list[dict[str, Any]],
+            база: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Свод по отделам — из строк сотрудников, отдел которых знает справочник.
+
+    `сотрудники` — все добавочные периода, а не показанные в рейтинге:
+    отдел — сумма всех своих номеров. `база` — добавочные главной базы
+    сравнения с отделом (`agent_department`) и числом разговоров: «к базе»
+    у отдела — его разговоры тогда, в том числе тех, кто с тех пор ушёл.
+    Без неё прошлое берётся из строк сотрудников (`prev_completed`).
+    """
     отделы: dict[str, dict[str, Any]] = {}
     for с in сотрудники:
         имя = str(с.get("agent_department") or "")
@@ -54,6 +62,13 @@ def _отделы(сотрудники: list[dict[str, Any]]) -> list[dict[str, 
         о["known"] += int(с.get("resolved_known") or 0)
         о["yes"] += int(с.get("resolved_yes") or 0)
         о["score_sum"] += float(с.get("score_sum") or 0)
+    if база is not None:
+        for о in отделы.values():
+            о["prev_completed"] = 0
+        for с in база:
+            о = отделы.get(str(с.get("agent_department") or ""))
+            if о is not None:
+                о["prev_completed"] += int(с.get("completed") or 0)
     строки = []
     for о in отделы.values():
         строки.append({
@@ -97,6 +112,9 @@ def voice_period(
                             description="Только отдел (по справочнику сотрудников)"),
     part: str = Query(default="", pattern="^(|fast|heavy)$",
                       description="fast — без трекеров и скоркарты, heavy — только они"),
+    now: float | None = Query(default=None, ge=0,
+                              description="Момент, на который считать идущий период "
+                                          "(`generated_at` первой части); пусто — сейчас"),
     principal: Principal = Depends(authenticate),
 ) -> dict[str, Any]:
     """Сводный отчёт за календарный период со сравнением.
@@ -115,22 +133,33 @@ def voice_period(
 
     Без речи и короткие входят в объём, но не в доли: тональность, решённые,
     причины и исходы считаются по разговорам с речью.
+
+    `now` — момент, на который считается идущий период. Вторую часть
+    спрашивают позже первой, и без него она считалась бы по другому окну:
+    конец идущего периода — «сейчас», а базы обрезаны тем же отрезком.
+    Интерфейс передаёт `generated_at` первой части; позже «сейчас» момент
+    не ставится.
     """
     state = get_state(request)
     владелец = scope_owner(principal)
     имена = bool(state.settings.get("employees_match_ext", True))
+    сейчас = _момент(now)
     try:
         отчёт = период.Отчёт(
-            state.db, scale, период.разобрать_дату(date),
-            период.Отбор(owner=владелец, agent=agent.strip(), department=department.strip()))
+            state.db, scale, период.разобрать_дату(date, сейчас),
+            период.Отбор(owner=владелец, agent=agent.strip(), department=department.strip()),
+            сейчас=сейчас)
     except ASRHubError as exc:
         raise error_response(exc) from exc
     if part == "heavy":
         return {**отчёт._шапка(), "part": "heavy", "lists": период.списки(state.db, отчёт)}
     ответ = отчёт.посчитать()
     if not ответ.get("future"):
-        справочник.подписать_добавочные(state.db, ответ["agents"], имена=имена)
-        ответ["departments"] = _отделы(ответ["agents"])
+        # Подписываются все добавочные периода (показанные в рейтинге — среди
+        # них): отделы складываются из всех, а не из первых трёхсот.
+        справочник.подписать_добавочные(state.db, отчёт.сотрудники, имена=имена)
+        справочник.подписать_добавочные(state.db, отчёт.сотрудники_базы, имена=имена)
+        ответ["departments"] = _отделы(отчёт.сотрудники, отчёт.сотрудники_базы)
         ответ["summary"] = период.коротко(ответ)
     ответ["options"] = _варианты(state, отчёт, владелец, имена)
     if part == "fast":
@@ -155,6 +184,11 @@ def voice_period(
     "all": ("всё время", ""),
 }
 
+def _момент(now: float | None) -> float | None:
+    """Момент отчёта из параметра `now`: не позже, чем сейчас."""
+    return None if now is None else min(float(now), time.time())
+
+
 def _п(имя: str) -> Any:
     """Описание параметра окна — свежим объектом на каждую ручку.
 
@@ -176,12 +210,15 @@ def _п(имя: str) -> Any:
                                description="конец скользящего окна, секунды эпохи"),
         "agent": lambda: Query(default="", max_length=64, description="только этот добавочный"),
         "department": lambda: Query(default="", max_length=200, description="только отдел"),
+        "now": lambda: Query(default=None, ge=0,
+                             description="момент, на который считать идущий календарный "
+                                         "период (`generated_at` отчёта за период)"),
     }[имя]()
 
 
 def _окна_проблем(db: Any, отбор: период.Отбор, *, scale: str, date: str | None,
-                  period: str, since: float | None, until: float | None
-                  ) -> tuple[проблемы.Окна, str]:
+                  period: str, since: float | None, until: float | None,
+                  now: float | None = None) -> tuple[проблемы.Окна, str]:
     """Окно сводки и база сравнения — календарные или скользящие.
 
     Календарный период — те же границы и та же база, что у отчёта за период
@@ -190,7 +227,12 @@ def _окна_проблем(db: Any, отбор: период.Отбор, *, sc
     база — такое же окно перед ним.
     """
     if scale:
-        отчёт = период.Отчёт(db, scale, период.разобрать_дату(date), отбор)
+        # `now` — тот же момент, что у отчёта за период, рядом с которым
+        # сводка стоит: идущий период и базы режутся одинаково, и трекеры
+        # из второй части отчёта раскрываются окном этой сводки.
+        сейчас = _момент(now)
+        отчёт = период.Отчёт(db, scale, период.разобрать_дату(date, сейчас), отбор,
+                             сейчас=сейчас)
         б = отчёт.базы[0] if отчёт.базы else None
         окна = проблемы.Окна(
             since=отчёт.окно.since, until=отчёт.окно.until, label=отчёт.окно.label,
@@ -218,13 +260,39 @@ def _сохранённая(state: Any, ключ: str, сводка: dict[str, A
     return {**запись, "stale": устарела}
 
 
+def _обезличить(запись: dict[str, Any] | None, principal: Principal) -> dict[str, Any] | None:
+    """Сводка моделью для ключа с `mask_pii` — с пометками вместо номеров.
+
+    Модель пишет сводку по пересказам разговоров и пересказы же цитирует
+    примерами — с телефонами, картами и почтой, если они были в разговоре.
+    Посредник обезличивания знает текстовые поля по именам (`summary`,
+    `quote`…), а у сводки свои — `overview`, `details`, `examples`, — и
+    ключ без права на персональные данные получал их как есть. Хранится
+    сводка полной (её же видят ключи с правом), а обезличивается при выдаче.
+    """
+    if not запись or not principal.mask_pii:
+        return запись
+    from ..content import masking  # noqa: PLC0415
+
+    def текст(значение: Any) -> Any:
+        if isinstance(значение, str):
+            return masking.mask_text(значение)
+        if isinstance(значение, list):
+            return [текст(з) for з in значение]
+        if isinstance(значение, dict):
+            return {к: текст(з) for к, з in значение.items()}
+        return значение
+
+    return {**запись, "result": текст(запись.get("result") or {})}
+
+
 @router.get("/problems", summary="Проблемы и сложности разговоров за период")
 def voice_problems(
     request: Request,
     scale: str = _п("scale"), date: str | None = _п("date"),
     period: str = _п("period"), since: float | None = _п("since"),
     until: float | None = _п("until"), agent: str = _п("agent"),
-    department: str = _п("department"),
+    department: str = _п("department"), now: float | None = _п("now"),
     principal: Principal = Depends(authenticate),
 ) -> dict[str, Any]:
     """Сводка по всем разговорам периода: какие проблемы и сколько.
@@ -244,7 +312,7 @@ def voice_problems(
     отбор = период.Отбор(owner=владелец, agent=agent.strip(), department=department.strip())
     try:
         окна, ид = _окна_проблем(state.db, отбор, scale=scale, date=date, period=period,
-                                 since=since, until=until)
+                                 since=since, until=until, now=now)
     except ASRHubError as exc:
         raise error_response(exc) from exc
     сводка = проблемы.посчитать(state.db, окна, отбор,
@@ -252,7 +320,8 @@ def voice_problems(
     клиент = getattr(state, "llm", None)
     сводка["period_id"] = ид
     сводка["llm_enabled"] = bool(клиент is not None and клиент.enabled)
-    сводка["digest"] = _сохранённая(state, проблемы.ключ_сводки(ид, отбор), сводка)
+    сводка["digest"] = _обезличить(
+        _сохранённая(state, проблемы.ключ_сводки(ид, отбор), сводка), principal)
     return сводка
 
 
@@ -262,7 +331,7 @@ def voice_problems_digest(
     scale: str = _п("scale"), date: str | None = _п("date"),
     period: str = _п("period"), since: float | None = _п("since"),
     until: float | None = _п("until"), agent: str = _п("agent"),
-    department: str = _п("department"),
+    department: str = _п("department"), now: float | None = _п("now"),
     principal: Principal = Depends(authenticate),
 ) -> dict[str, Any]:
     """Связный текст о проблемах периода: главное, проблемы с примерами,
@@ -289,7 +358,7 @@ def voice_problems_digest(
     отбор = период.Отбор(owner=владелец, agent=agent.strip(), department=department.strip())
     try:
         окна, ид = _окна_проблем(state.db, отбор, scale=scale, date=date, period=period,
-                                 since=since, until=until)
+                                 since=since, until=until, now=now)
     except ASRHubError as exc:
         raise error_response(exc) from exc
     имена = bool(state.settings.get("employees_match_ext", True))
@@ -321,7 +390,7 @@ def voice_problems_digest(
     state.db.add_event(None, "voice_digest",
                        f"Сводка проблем моделью: {окна.label or ид}",
                        {"period": ид, "conversations": сводка["conversations"]})
-    return {**запись, "stale": False}
+    return {**(_обезличить(запись, principal) or запись), "stale": False}
 
 
 __all__ = ["router"]

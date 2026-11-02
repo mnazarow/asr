@@ -14,11 +14,19 @@ services:
       args:
         PROFILE: ${ASRHUB_PROFILE:-full}
         ACCEL: cuda
-        TORCH_INDEX: https://download.pytorch.org/whl/cu124
+        # Индекс PyTorch под драйвер хоста; установщик пишет его в .env по
+        # версии CUDA (как и для обычной установки). Был зашит cu124 — на
+        # нём последний torch не знает RTX 50xx (sm_120): карта видна, а
+        # вычисления падают с «no kernel image is available».
+        TORCH_INDEX: ${ASRHUB_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}
     image: asrhub:${ASRHUB_TAG:-cuda}
     environment:
-      ASRHUB_DEVICE: cuda
-      ASRHUB_COMPUTE_TYPE: float16
+      # Устройство и точность — без значений: передаются, только если
+      # заданы в .env. Сервер и так возьмёт карту при device: auto, а
+      # заданные здесь cuda и float16 перекрывали сохранённое в интерфейсе
+      # после каждого перезапуска.
+      ASRHUB_DEVICE:
+      ASRHUB_COMPUTE_TYPE:
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
     deploy:
       resources:

@@ -1,15 +1,39 @@
+# Сборка пакета. Раздел [project] был декоративным: без [build-system],
+# зависимостей и точки входа «pip install .» в клоне падал на «Multiple
+# top-level packages discovered in a flat-layout: agent, server, docker».
+# Пакет — только каталог server/asrhub; зависимости — те же, что ставит
+# установщик (requirements/base.txt), движки — отдельно, как и прежде.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "asrhub"
-version = "3.1.25"
+version = "3.1.26"
 description = "Сервер распознавания речи на свободных моделях: GigaAM, Whisper и другие"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "ASR Hub" }]
 keywords = ["asr", "speech-recognition", "whisper", "gigaam", "распознавание речи"]
+dynamic = ["dependencies"]
 
-[project.urls]
-Documentation = "docs/README.md"
+# Ссылка на документацию была путём «docs/README.md» — такого файла нет, а
+# адрес без схемы pip отвергал предупреждением; ссылки убраны.
+
+[project.scripts]
+asrhub = "asrhub.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["server"]
+include = ["asrhub*"]
+
+[tool.setuptools.package-data]
+# Веб-интерфейс — не модули Python, без этой строки в пакет он не попадал.
+asrhub = ["web/*"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements/base.txt"] }
 
 [tool.ruff]
 line-length = 100

@@ -8,7 +8,9 @@
 
 ```bash
 # проверить, что всё работает, без загрузки моделей
-cd server && python3 -m pip install fastapi uvicorn python-multipart
+# (uvicorn[standard] — с библиотекой WebSocket: без неё нет живого
+# обновления очереди и диктовки, /ws отвечает 404)
+cd server && python3 -m pip install fastapi "uvicorn[standard]" python-multipart
 python3 -m asrhub --host 127.0.0.1 --port 8080
 ```
 

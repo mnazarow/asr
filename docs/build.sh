@@ -15,6 +15,9 @@
 #   5. pandoc собирает .docx по этому шаблону.
 #   6. fix_docx.py приводит файл к схеме OOXML и оформляет таблицы.
 #   7. update_toc.py заполняет оглавление и сохраняет PDF.
+#
+# Зависимости: pip install -r requirements/docs.txt, pandoc и LibreOffice
+# (подробности — в шапке requirements/docs.txt).
 
 set -o errexit
 set -o nounset

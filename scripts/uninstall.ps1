@@ -25,6 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:RemovalFailed = $false
 Import-Module (Join-Path $PSScriptRoot 'lib\Common.psm1') -Force
 Set-AssumeYes $Yes.IsPresent
 Set-DryRun $DryRun.IsPresent
@@ -51,6 +52,38 @@ if (-not $Prefix -and -not $DataDir) {
     Write-Warn 'Установка ASR Hub не найдена.'
     Write-Hint 'Укажите пути явно: -Prefix и -DataDir'
     exit 0
+}
+
+# Каталог программы, заданный ключом, — только если это установка: раньше
+# «-Prefix <не тот каталог>» удалял его целиком, ничем не проверив.
+if ($Prefix -and (Test-Path -LiteralPath $Prefix) -and -not (Test-AsrInstallation -Path $Prefix)) {
+    Write-Err "$Prefix не похож на установку ASR Hub (нет VERSION, server и метки установки)."
+    Write-Hint 'Удаление снесло бы его целиком. Проверьте путь: -Prefix <каталог установки>'
+    exit 2
+}
+# И не системный каталог: корень диска, Windows, Program Files целиком, профиль.
+foreach ($path in @($Prefix, $(if ($Purge) { $DataDir } else { '' }))) {
+    if (-not $path) { continue }
+    $full = ConvertTo-AsrFullPath $path
+    $forbidden = @([System.IO.Path]::GetPathRoot($full), $env:SystemRoot, $env:ProgramFiles,
+                   ${env:ProgramFiles(x86)}, $env:ProgramData, $env:USERPROFILE, $env:LOCALAPPDATA,
+                   $env:APPDATA, [Environment]::GetFolderPath('MyDocuments')) | Where-Object { $_ }
+    if (@($forbidden | Where-Object { Test-AsrSamePath $_ $full }).Count -gt 0) {
+        Write-Err "Каталог $full — системный или домашний; удалять его нельзя."
+        exit 2
+    }
+}
+
+# Права: удаление службы, каталога в Program Files или закрытого каталога
+# данных без повышенной консоли раньше «проходило» — ошибки глушились
+# SilentlyContinue, а итог говорил «ASR Hub удалён», хотя служба работала, а
+# с -Purge из-под неё удалялись данные, доступные установившему по личному SID.
+$needsAdmin = (@($ownAutostart | Where-Object { $_.Kind -eq 'service' }).Count -gt 0) -or
+    ($Prefix -and $env:ProgramFiles -and (Test-AsrPathInside -Path $Prefix -Parent $env:ProgramFiles))
+if ($needsAdmin -and -not (Test-Administrator) -and -not (Get-DryRun)) {
+    Write-Err 'Для удаления этой установки нужна консоль от имени администратора.'
+    Write-Hint 'Её служба и каталог программы без прав администратора не удаляются.'
+    exit 13
 }
 
 function Get-FolderSize {
@@ -253,31 +286,47 @@ if ($Purge -and $KeepModels -and $DataDir) {
 # писал «Данные сохранены».
 $dataInsidePrefix = $false
 if ($Prefix -and $DataDir) {
-    $dataInsidePrefix = Test-AsrPathInside -Path $DataDir -Parent $Prefix
+    # Совпадение — тоже «внутри»: иначе обычное удаление без -Purge сносило
+    # каталог целиком вместе с базой и моделями и печатало «Данные сохраняются».
+    $dataInsidePrefix = (Test-AsrPathInside -Path $DataDir -Parent $Prefix) -or (Test-AsrSamePath $DataDir $Prefix)
 }
 
 if ($Prefix -and (Test-Path -LiteralPath $Prefix)) {
     if (-not $Purge -and $dataInsidePrefix) {
         Write-Info 'Каталог данных находится внутри каталога программы — удаляем выборочно.'
-        foreach ($sub in @('server', 'scripts', 'config', 'requirements', 'docker', 'examples',
-                           'venv', 'VERSION', 'README.md', '.asrhub-install')) {
+        foreach ($sub in @((Get-AsrInstallItems) + @('venv', 'venv.before-force', '.asrhub-install'))) {
             $target = Join-Path $Prefix $sub
             if (-not (Test-Path -LiteralPath $target)) { continue }
             if (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $target" -ForegroundColor Yellow }
             else { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue }
         }
-        if (-not (Get-DryRun)) { Write-Ok "Программа удалена, данные оставлены: $DataDir" }
+        if (-not (Get-DryRun)) {
+            if (Test-Path -LiteralPath (Join-Path $Prefix 'server')) {
+                Write-Warn "Программа удалена не целиком: $(Join-Path $Prefix 'server') на месте (занят процессом? нет прав?)."
+                $script:RemovalFailed = $true
+            } else { Write-Ok "Программа удалена, данные оставлены: $DataDir" }
+        }
     }
     elseif (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $Prefix" -ForegroundColor Yellow }
     else {
         Remove-Item -LiteralPath $Prefix -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Ok "Удалено: $Prefix"
+        # Итог — по факту, а не по команде: SilentlyContinue прятал отказ.
+        if (Test-Path -LiteralPath $Prefix) {
+            Write-Warn "Удалено не всё: $Prefix на месте (занят процессом? нет прав?)."
+            $script:RemovalFailed = $true
+        } else { Write-Ok "Удалено: $Prefix" }
     }
 }
 
 if ($Purge -and $DataDir -and (Test-Path -LiteralPath $DataDir)) {
     if (Get-DryRun) { Write-Host "  [пробный запуск] Remove-Item $DataDir" -ForegroundColor Yellow }
-    else { Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue; Write-Ok "Удалено: $DataDir" }
+    else {
+        Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $DataDir) {
+            Write-Warn "Удалено не всё: $DataDir на месте."
+            $script:RemovalFailed = $true
+        } else { Write-Ok "Удалено: $DataDir" }
+    }
     if ($keptModels) { Write-Info "Модели: $keptModels" }
 } elseif ($Purge) {
     if ($keptModels) { Write-Info "Модели: $keptModels" }
@@ -336,6 +385,12 @@ if (Get-DryRun) {
     Write-Host 'Пробный запуск завершён — ничего не удалено.' -ForegroundColor Green
     Write-Host ''
     exit 0
+}
+if ($script:RemovalFailed) {
+    Write-Host 'ASR Hub удалён не полностью — остатки перечислены выше.' -ForegroundColor Yellow
+    if (Test-Path -LiteralPath $backupDir) { Write-Host "  Резервная копия: $backupDir" }
+    Write-Host ''
+    exit 1
 }
 Write-Host 'ASR Hub удалён' -ForegroundColor Green
 if (Test-Path -LiteralPath $backupDir) { Write-Host "  Резервная копия: $backupDir" }

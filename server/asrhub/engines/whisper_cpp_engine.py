@@ -307,10 +307,50 @@ def разобрать_вывод(data: dict[str, Any], *, пословно: boo
     return реплики
 
 
+def _ядер() -> int:
+    """Сколько ядер доступно процессу — с учётом квоты контейнера и привязки.
+
+    `os.cpu_count()` отдаёт ядра машины: в контейнере с квотой на два ядра
+    из шестнадцати whisper.cpp запускал шестнадцать потоков и толкался сам с
+    собой.
+    """
+    try:
+        from ..hardware import _постоянное  # noqa: PLC0415
+
+        # Постоянная часть сведений об оборудовании — из кеша процесса:
+        # ядра и квота между заданиями не меняются.
+        return max(1, int(_постоянное(".").cpu_cores_available()))
+    except Exception:                                       # noqa: BLE001
+        try:
+            return max(1, len(os.sched_getaffinity(0)))     # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            return os.cpu_count() or 4
+
+
 class WhisperCppEngine(Engine):
     id = "whisper_cpp"
     supports_word_timestamps = True
     outputs_punctuation = True
+    режет_сам = True                 # свой поиск речи (--vad)
+
+    def resolve_device(self, settings: dict[str, Any]) -> str:
+        """Устройство как задано: whisper.cpp — сборка без torch.
+
+        «auto» решалось по torch, и сервер без torch (или с torch без CUDA)
+        передавал `-ng` сборке whisper.cpp, которая карту видит: модель шла
+        на процессор. «auto» остаётся «auto» — сборка сама выберет карту, если
+        она есть.
+        """
+        устройство = str(settings.get("device") or "auto").strip().lower()
+        for имя in ("rocm", "hip"):
+            if устройство == имя or устройство.startswith(имя + ":"):
+                return "cuda" + устройство[len(имя):]
+        return устройство or "auto"
+
+    def проверить_устройство(self, устройство: str) -> tuple[bool, str]:
+        # Карту проверяет сама сборка whisper.cpp: torch ей не нужен, и его
+        # «CUDA не видит ни одной карты» о ней ничего не говорит.
+        return True, ""
 
     @classmethod
     def _find_binary(cls) -> str | None:
@@ -371,7 +411,7 @@ class WhisperCppEngine(Engine):
                 # и уверенность у whisper.cpp были пустыми всегда.
                 binary, "-m", model_file, "-f", str(audio_path),
                 "-ojf", "-of", str(out_base),
-                "-t", str(S.integer(settings, "cpu_threads", 0) or os.cpu_count() or 4),
+                "-t", str(S.integer(settings, "cpu_threads", 0) or _ядер()),
                 "-bs", str(int(settings.get("beam_size") or 5)),
                 "-bo", str(int(settings.get("best_of") or 5)),
                 "-tp", str(S.num(settings, "temperature", 0.0)),
@@ -396,8 +436,15 @@ class WhisperCppEngine(Engine):
             # разбор не читает: границы слов берутся из токенов.
             if not settings.get("flash_attention", True):
                 cmd.append("-nfa")
-            if self.resolve_device(settings) == "cpu":
+            устройство = self.resolve_device(settings)
+            if устройство == "cpu":
                 cmd.append("-ng")
+            elif устройство.startswith("cuda:"):
+                # Номер карты — ключом -dev: прежде он не передавался, и
+                # «cuda:1» садился на карту 0.
+                номер = устройство.split(":", 1)[1].strip()
+                if номер.isdigit():
+                    cmd += ["-dev", номер]
             prompt = str(settings.get("initial_prompt") or "").strip()
             if prompt:
                 cmd += ["--prompt", prompt]

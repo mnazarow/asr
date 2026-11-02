@@ -78,6 +78,17 @@ _WRITE_CHUNK = 1 << 15
 ТИШИНА = 330
 РЕЧЬ = 1000
 
+#: Сколько отказов распознавания подряд (не «модель занята», а настоящих:
+#: веса не скачаны, нехватка памяти) выдерживает сессия, прежде чем
+#: закрыться с объяснением. Прежде она не закрывалась никогда: хвост рос без
+#: предела, каждое окно заново писало его на диск, клиент получал `error` за
+#: `error`, а итог так и не приходил.
+ОТКАЗОВ_ДО_ЗАКРЫТИЯ = 5
+
+#: Жёсткий предел хвоста при отказах, секунд. `MAX_TAIL_S` действует только
+#: при удачном закреплении; при отказах звук «сохраняется» — но не без конца.
+ПРЕДЕЛ_ХВОСТА_С = 2 * MAX_TAIL_S
+
 
 @dataclass(slots=True)
 class StreamEvent:
@@ -248,7 +259,9 @@ class StreamSession:
         self._native_bytes = 0
         self._since_flush = 0            # байт с прошлой гипотезы
         self._committed_s = 0.0          # длительность закреплённого звука
-        self._started = time.time()
+        # Длительности сессии — по монотонным часам: перевод системных часов
+        # вперёд обрывал сессию ложным «длиннее часа», назад — продлевал.
+        self._started = time.monotonic()
         self._closed = False
         self._native: Any = None         # состояние движка, если он умеет поток
         self._final_text = ""
@@ -334,11 +347,17 @@ class StreamSession:
         """Принимает кусок звука и, если пора, отдаёт уточнённую гипотезу."""
         if self._closed:
             return [StreamEvent("error", extra={"message": "Сессия уже завершена."})]
-        if time.time() - self._started > MAX_SESSION_S:
-            self._closed = True
+        # Предел — и по времени сессии, и по количеству звука: звук можно
+        # слать быстрее реального времени, и час сессии не был часом звука.
+        if (time.monotonic() - self._started > MAX_SESSION_S
+                or self.duration_s > MAX_SESSION_S):
+            # Не просто закрыть: прежде на 61-й минуте `_closed` ставился
+            # здесь, а `finish()` после этого отдавал пустой список — остаток
+            # не распознавался, и события `done` не было вовсе.
             return [StreamEvent("error", extra={
                 "message": f"Сессия длиннее {MAX_SESSION_S / 60:.0f} минут прервана.",
-                "hint": "Для длинных записей ставьте обычное задание: POST /api/jobs."})]
+                "hint": "Для длинных записей ставьте обычное задание: POST /api/jobs."}),
+                *self.finish()]
 
         pcm = self.decoder.feed(chunk)
         if not pcm:
@@ -355,11 +374,22 @@ class StreamSession:
 
         self._pcm.extend(pcm)
         self._since_flush += len(pcm)
+        предел = int(ПРЕДЕЛ_ХВОСТА_С * SAMPLE_RATE * 2)
+        if len(self._pcm) > предел:
+            # Отказы подряд копили хвост без предела — до 115 МБ к концу часа.
+            лишнее = len(self._pcm) - предел
+            лишнее -= лишнее % 2
+            del self._pcm[:лишнее]
+            self._committed_s += лишнее / (SAMPLE_RATE * 2)
+            log.warning("Хвост потока перерос %.0f с при отказах распознавания — "
+                        "старый звук выброшен", ПРЕДЕЛ_ХВОСТА_С)
 
         # Пауза после речи — конец фразы: закрепляем сразу, не дожидаясь
-        # ни окна, ни тридцатисекундного хвоста.
+        # ни окна, ни тридцатисекундного хвоста. После неудачного
+        # закрепления — не на каждом следующем куске тишины, а не чаще окна:
+        # иначе десять секунд тишины давали три десятка попыток и ошибок.
         пауза_с = getattr(self, "endpoint_s", 0.0)
-        if пауза_с > 0:
+        if пауза_с > 0 and time.monotonic() >= getattr(self, "_закреплять_не_раньше", 0.0):
             if not self._речь and any(у > РЕЧЬ for у in _уровни(pcm)):
                 self._речь = True
             пауза = int(пауза_с * SAMPLE_RATE) * 2
@@ -394,10 +424,11 @@ class StreamSession:
         except ASRHubError as exc:
             # Промежуточный результат — вещь необязательная: не посчитался,
             # и ладно, следующее окно посчитает. Ронять из-за него сессию
-            # незачем, но и молчать не будем.
+            # незачем, но и молчать не будем — а отказы подряд считаем.
             log.info("Промежуточное распознавание пропущено: %s", exc.message)
-            return []
+            return self._отказ(exc)
 
+        self._отказов_подряд = 0
         события = self._освободилась()
         if text and text != self._last_partial:
             self._last_partial = text
@@ -405,6 +436,29 @@ class StreamSession:
             события.append(StreamEvent("partial", text=text,
                                        start=self._committed_s, end=self.duration_s))
         return события
+
+    def _отказ(self, exc: ASRHubError) -> list[StreamEvent]:
+        """Отказ распознавания: после `ОТКАЗОВ_ДО_ЗАКРЫТИЯ` подряд — закрыть сессию.
+
+        Закрывается честно: `error` с причиной и `done` с тем, что успели
+        закрепить. Распознавать остаток незачем — им и не удаётся.
+        """
+        self._отказов_подряд = getattr(self, "_отказов_подряд", 0) + 1
+        if self._отказов_подряд < ОТКАЗОВ_ДО_ЗАКРЫТИЯ:
+            return []
+        self._closed = True
+        хвост_с = len(self._pcm) / (SAMPLE_RATE * 2)
+        log.warning("Поток закрыт: распознавание отказало %d раз подряд (%s)",
+                    self._отказов_подряд, exc.message)
+        return [StreamEvent("error", extra={
+            "message": (f"Распознавание отказало {self._отказов_подряд} раз подряд — "
+                        f"сессия закрыта; последние {хвост_с:.0f} с не распознаны: "
+                        f"{exc.message}"),
+            "hint": exc.hint}),
+            StreamEvent("done", extra={
+                "duration_s": round(self.duration_s, 3), "text": self._final_text,
+                "first_text_s": self.first_text_s,
+                "session_s": round(time.monotonic() - self._started, 3)})]
 
     def _занята(self, exc: EngineBusy) -> list[StreamEvent]:
         """Модель занята файлом: говорим клиенту один раз, звук копим."""
@@ -452,7 +506,7 @@ class StreamSession:
 
     def _note_first_text(self) -> None:
         if self._first_text_at is None:
-            self._first_text_at = time.time()
+            self._first_text_at = time.monotonic()
 
     @property
     def first_text_s(self) -> float | None:
@@ -497,7 +551,10 @@ class StreamSession:
             # штатным `done`. Человек видел в `partial` текст, которого в
             # итоговой расшифровке не оказалось.
             log.warning("Закрепление не удалось, звук сохранён: %s", exc.message)
-            return [StreamEvent("error", extra={"message": exc.message})]
+            self._закреплять_не_раньше = time.monotonic() + float(
+                getattr(self, "window_s", DEFAULT_WINDOW_S))
+            return [StreamEvent("error", extra={"message": exc.message}), *self._отказ(exc)]
+        self._отказов_подряд = 0
         start, end = self._committed_s, self._committed_s + cut / (SAMPLE_RATE * 2)
         del self._pcm[:cut]
         self._committed_s = end
@@ -517,13 +574,22 @@ class StreamSession:
             return []
         self._closed = True
         tail = self.decoder.close()
+        events: list[StreamEvent] = []
         if tail:
             if self._native is not None:
+                # Хвост декодера — тоже звук сессии, и движку он нужен: ffmpeg
+                # отдаёт звук с задержкой, и в хвосте всегда последние
+                # секунды. Прежде он только прибавлялся к длительности, а в
+                # движок не шёл — последние слова диктовки не распознавались,
+                # короткая фраза пропадала целиком.
                 self._native_bytes += len(tail)
+                events.extend(self._feed_native(tail))
+                if self._native is None:
+                    # Поток движка отказал на хвосте — хвост распознаём окном.
+                    self._pcm.extend(tail)
             else:
                 self._pcm.extend(tail)
 
-        events: list[StreamEvent] = []
         if self._native is not None:
             events.extend(self._finish_native())
         else:
@@ -542,6 +608,14 @@ class StreamSession:
                                 f"{хвост_с:.0f} с речи не распознаны."),
                     "hint": exc.hint}))
                 text = ""
+            except ASRHubError as exc:
+                # Отказ на итоге — тоже итог: `done` клиенту нужен в любом
+                # случае, иначе он ждёт его до своего тайм-аута.
+                log.warning("Итог потока не распознан: %s", exc.message)
+                events.append(StreamEvent("error", extra={
+                    "message": f"Последние {len(self._pcm) / (SAMPLE_RATE * 2):.0f} с "
+                               f"речи не распознаны: {exc.message}", "hint": exc.hint}))
+                text = ""
             else:
                 events.extend(self._освободилась())
             if text:
@@ -554,7 +628,7 @@ class StreamSession:
             "duration_s": round(self.duration_s, 3),
             "text": self._final_text,
             "first_text_s": self.first_text_s,
-            "session_s": round(time.time() - self._started, 3),
+            "session_s": round(time.monotonic() - self._started, 3),
         }))
         return events
 

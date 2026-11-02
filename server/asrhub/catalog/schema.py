@@ -88,8 +88,19 @@ class ModelSpec:
     gated: bool = False               # требуется принятие лицензии и HF-токен
     maturity: Maturity = Maturity.STABLE
     released: str = ""
+    #: Значения параметров, с которыми модель хорошо работает, — справочно,
+    #: для карточки модели. Автоматически они не подставляются: настройки
+    #: задания складываются из умолчаний каталога, сервера и самого задания,
+    #: а предел длины прохода движок соблюдает сам. Ключи — только из
+    #: каталога параметров (проверка — tests/test_review_54_params.py).
     default_params: dict[str, Any] = field(default_factory=dict)
     aliases: list[str] = field(default_factory=list)
+    #: Что модель в ASR Hub: «asr» — распознаёт речь и берётся в задание;
+    #: «auxiliary» — вспомогательная (эмоции, диаризация), её выход не
+    #: расшифровка; «unsupported» — адаптер её не исполняет. Последние две в
+    #: задание не берутся (см. `role_note` — почему).
+    role: str = "asr"
+    role_note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -98,6 +109,11 @@ class ModelSpec:
         data["maturity"] = self.maturity.value
         data["benchmarks"] = [b.to_dict() for b in self.benchmarks]
         return data
+
+    @property
+    def runnable(self) -> bool:
+        """Можно ли поставить задание на эту модель."""
+        return self.role == "asr"
 
     @property
     def best_ru_wer(self) -> float | None:
@@ -169,6 +185,11 @@ class ParamSpec:
     requires: dict[str, Any] = field(default_factory=dict)  # условия отображения
     aliases: dict[str, str] = field(default_factory=dict)   # engine -> имя параметра в его API
     see_also: list[str] = field(default_factory=list)
+    #: Решает только сервер: задание этот ключ не переопределяет (см.
+    #: `config.Settings.ТОЛЬКО_СЕРВЕРУ`). Так помечены имена моделей,
+    #: которые уходят в загрузчик весов: имя из задания означало бы, что
+    #: сервер качает и грузит то, что скажет запрос.
+    server_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

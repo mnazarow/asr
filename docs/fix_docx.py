@@ -12,6 +12,7 @@ element-only узлов).
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -22,8 +23,13 @@ from lxml import etree
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 XS = "{http://www.w3.org/2001/XMLSchema}"
-SCHEMA = Path("/mnt/skills/public/docx/scripts/office/schemas/"
-              "ISO-IEC29500-4_2016/wml.xsd")
+# Схема OOXML (wml.xsd из ISO/IEC 29500-4). Путь по умолчанию — с машины,
+# где собиралась документация; на любой другой его нет, и сборка обрывалась
+# на шаге 7 из 8. Свой путь — переменной ASRHUB_WML_XSD; без схемы файл
+# остаётся как его собрал pandoc (Word открывает и такой).
+SCHEMA = Path(os.environ.get("ASRHUB_WML_XSD")
+              or "/mnt/skills/public/docx/scripts/office/schemas/"
+                 "ISO-IEC29500-4_2016/wml.xsd")
 
 # Тег -> имя типа в схеме. Дополнения после списка схемы — элементы,
 # объявленные в наследнике типа (например, CT_PPr расширяет CT_PPrBase).
@@ -354,7 +360,7 @@ def fix_tree(root: etree._Element, orders: dict[str, list[str]]) -> int:
             continue
         for node in root.iter(W + tag):
             fixed += reorder(node, order)
-    if root.tag == W + "settings":
+    if root.tag == W + "settings" and "settings" in orders:
         fixed += reorder(root, orders["settings"])
 
     for container in list(root.iter(W + "rPr")) + list(root.iter(W + "pPr")):
@@ -398,12 +404,16 @@ def main(argv: list[str]) -> int:
     if not path.exists():
         print(f"Файл не найден: {path}")
         return 1
-    if not SCHEMA.exists():
-        print(f"Не найдена схема {SCHEMA} — проверка невозможна.")
-        return 1
-
-    orders = schema_orders()
-    schema = etree.XMLSchema(etree.parse(str(SCHEMA)))
+    # Без схемы — только то, что от неё не зависит (таблицы, типы
+    # вложений): порядок элементов и проверка по схеме пропускаются.
+    orders: dict[str, list[str]] = {}
+    schema = None
+    if SCHEMA.exists():
+        orders = schema_orders()
+        schema = etree.XMLSchema(etree.parse(str(SCHEMA)))
+    else:
+        print(f"! Не найдена схема {SCHEMA}: порядок элементов не выправлен и не "
+              "проверен. Путь к wml.xsd — переменная ASRHUB_WML_XSD.")
     total = 0
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -453,6 +463,8 @@ def main(argv: list[str]) -> int:
         shutil.move(str(out), str(path))
 
     print(f"Исправлено блоков: {total}")
+    if schema is None:
+        return 0
 
     problems = 0
     with zipfile.ZipFile(path) as archive:

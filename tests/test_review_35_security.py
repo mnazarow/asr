@@ -68,13 +68,17 @@ def test_пароль_станции_не_уходит_в_настройках(�
             assert ответ.status_code == 200, ответ.text
             текст = ответ.text
             assert "пароль-АТС-9137" not in текст, f"пароль станции виден ключу {ключ}"
-            станции = ответ.json()["values"]["telephony_stations"]
+            станции = ответ.json()["values"].get("telephony_stations")
+            if ключ != "ah_admin":
+                # С захода 54 параметры самого сервера (станции в их числе)
+                # неадминистратору не отдаются вовсе — ни адреса, ни имена.
+                assert станции is None, станции
+                continue
             assert станции[0]["secret"] == "***"
             assert станции[0]["name"] == "Головной офис", "имя станции должно остаться"
         # Адреса и пути станции — только администратору, как в /telephony/stations.
         чтение = клиент.get("/api/settings", headers={"X-API-Key": "ah_ro"}).json()
-        станция = чтение["values"]["telephony_stations"][0]
-        assert "host" not in станция and "recordings_dir" not in станция
+        assert "telephony_stations" not in чтение["values"]
         админ = клиент.get("/api/settings", headers={"X-API-Key": "ah_admin"}).json()
         assert админ["values"]["telephony_stations"][0]["host"] == "10.0.0.5"
 

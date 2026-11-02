@@ -144,12 +144,25 @@ class LLMWorker:
         return bool(self.settings.get("llm_queue_paused", False))
 
     def analyze_job(self, job_id: str, *, force: bool = False,
-                    из_очереди: bool = False) -> dict[str, Any]:
-        """Разбор одной записи сейчас, в вызывающем потоке; ответ — в базу."""
+                    из_очереди: bool = False, fresh: bool = False) -> dict[str, Any]:
+        """Разбор одной записи сейчас, в вызывающем потоке; ответ — в базу.
+
+        `fresh` — спросить модель заново, мимо кеша ответов: «Разобрать
+        заново» без него всегда отдавало прежний ответ, не потратив ни одного
+        вызова, — и после смены модели на ту же подсказку, и после правки,
+        которая ответ и должна была изменить.
+        """
         if not force:
             готовое = self.db.llm_get(job_id)
             if готовое and готовое.get("version") == tasks.VERSION and not готовое.get("error"):
-                self.db.llmq_finish(job_id, latency_ms=готовое.get("latency_ms"))
+                # Закрывается только ждущая строка очереди: её разбор уже
+                # есть. Идущую — нет: её прямо сейчас разбирает фоновый поток,
+                # и «готово» поверх неё показывало бы конец разбора, которого
+                # ещё не было.
+                self.db.execute(
+                    "UPDATE llm_queue SET state=?, finished_at=?, error='' "
+                    "WHERE job_id=? AND state=?",
+                    (self.db.LLMQ_ГОТОВО, time.time(), str(job_id), self.db.LLMQ_ЖДЁТ))
                 self._после_модели(job_id)
                 return готовое
         job = self.db.get_job(job_id)
@@ -172,18 +185,43 @@ class LLMWorker:
                 f"Запись «{job_id}» уже разбирается прямо сейчас. Дождитесь "
                 "окончания — ход виден в разделе очереди разбора, ответ "
                 "появится в карточке записи сам.")
-        сегменты = self.db.get_segments(job_id)
-        скрипт = list(self.settings.get("content_script") or [])
-        оператор = str(self.settings.get("content_agent_speaker") or "")
         try:
-            with _для_записи(self.client, job_id):
-                итог = tasks.analyze(self.client, text=str(job.get("text") or ""),
-                                     segments=сегменты, settings=self.settings,
-                                     agent_speaker=оператор, script=скрипт)
+            return self._разобрать(job_id, job, fresh=fresh)
         except LLMError as exc:
             self._отметить_сбой(job_id, str(exc))
             self.db.llmq_finish(job_id, error=str(exc))
             raise
+        except Exception as exc:                             # noqa: BLE001
+            # Не сбой модели, а что угодно другое: сбой базы на чтении
+            # сегментов или на записи ответа, ошибка в разборе. Строка «идёт»
+            # закрывалась только веткой LLMError, а отметка жизни освежала
+            # все свои идущие строки — и брошенная не устаревала никогда:
+            # «Запись уже разбирается прямо сейчас» до перезапуска сервера.
+            # Фоновому циклу закрытие тоже нужно, он его и делает сам — с
+            # возвратом в очередь и счётом попыток (см. `_loop`).
+            if из_очереди:
+                raise
+            текст = f"{type(exc).__name__}: {exc}"
+            log.warning("Смысловой разбор %s дал сбой: %s", job_id, текст)
+            try:
+                self._отметить_сбой(job_id, текст)
+                self.db.llmq_finish(job_id, error=текст)
+            except Exception as второй:                     # noqa: BLE001
+                log.debug("Строка очереди %s не закрыта: %s", job_id, второй)
+            raise LLMError(f"Разбор записи не удался: {текст}") from exc
+
+    def _разобрать(self, job_id: str, job: dict[str, Any], *,
+                   fresh: bool = False) -> dict[str, Any]:
+        """Сам разбор: вызовы модели и запись ответа в базу."""
+        сегменты = self.db.get_segments(job_id)
+        скрипт = list(self.settings.get("content_script") or [])
+        оператор = str(self.settings.get("content_agent_speaker") or "")
+        мимо = getattr(self.client, "мимо_кеша", None)
+        with _для_записи(self.client, job_id), \
+                (мимо() if fresh and callable(мимо) else contextlib.nullcontext()):
+            итог = tasks.analyze(self.client, text=str(job.get("text") or ""),
+                                 segments=сегменты, settings=self.settings,
+                                 agent_speaker=оператор, script=скрипт)
         замечания = [str(з) for з in (итог.get("warnings") or []) if str(з).strip()]
         # Пустой разбор — тот, в котором нет ответа ни на одну заказанную
         # задачу. Раньше пустым считался любой без резюме и исхода: сервер,
@@ -195,6 +233,8 @@ class LLMWorker:
         пусто = not (итог.get("summary") or итог.get("outcome") or итог.get("reason")
                      or any(итог.get(п) is not None
                             for п in ("actions", "trackers", "scorecard")))
+        # Сбой записи ответа (база занята, диск полон) закрывает строку «идёт»
+        # там же, где любой другой сбой разбора (см. `analyze_job`).
         self.db.llm_save(
             job_id, tasks.VERSION, model=self.client.model,
             summary=итог.get("summary"), reason=итог.get("reason"),
@@ -290,12 +330,26 @@ class LLMWorker:
                 log.info("Возвращено в очередь разбора после перезапуска: %d", вернулось)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Очередь разбора не приведена в порядок: %s", exc)
+        # Ollama, поставленная без root в каталог данных, не переживает
+        # перезапуск сервера: она была его дочерним процессом. Поднимаем её
+        # здесь — фоном, чтобы старт сервера не ждал службу модели.
+        if str(self.settings.get("llm_backend") or "") == "ollama":
+            threading.Thread(target=self._своя_ollama, name="asrhub-llm-ollama",
+                             daemon=True).start()
         self._thread = threading.Thread(target=self._loop, name="asrhub-llm", daemon=True)
         self._thread.start()
         if self._служба is None or not self._служба.is_alive():
             self._служба = threading.Thread(target=self._служебный, name="asrhub-llm-svc",
                                             daemon=True)
             self._служба.start()
+
+    def _своя_ollama(self) -> None:
+        from . import provision  # noqa: PLC0415
+
+        try:
+            provision.поднять_свою(self.settings)
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Ollama из каталога данных не поднята: %s", exc)
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -386,7 +440,19 @@ class LLMWorker:
             if not self.client.enabled or self.paused or self._queue_busy():
                 пауза = простой
                 continue
-            job_id = self._next()
+            # Взятие строки — под защитой, как и сам разбор. Оно ходит в базу
+            # (llmq_take, llm_pending, llmq_put), и одно «database is locked»
+            # дольше busy_timeout или переполненный диск выходили из цикла:
+            # поток asrhub-llm умирал, перезапуска не было, и очередь разбора
+            # стояла до перезапуска сервера, а состояние показывало «не идёт»
+            # без единой ошибки. Теперь — запись в состояние и пауза.
+            try:
+                job_id = self._next()
+            except Exception as exc:                         # noqa: BLE001
+                self.last_error = f"очередь разбора недоступна: {exc}"
+                log.warning("Очередь смыслового разбора недоступна: %s", exc)
+                пауза = max(простой, 5.0)
+                continue
             if job_id is None:
                 пауза = простой
                 continue

@@ -5,11 +5,11 @@
     Установка — та же, что у остальных сценариев: заданная ключом -Prefix,
     та, из которой запущен сценарий, или единственная известная на машине.
 .EXAMPLE
-    powershell -File scripts\models.ps1 -Action list
-    powershell -File scripts\models.ps1 -Action list -Language ru
-    powershell -File scripts\models.ps1 -Action info -Model gigaam-v3-rnnt
-    powershell -File scripts\models.ps1 -Action download -Model gigaam-v3-e2e-rnnt
-    powershell -File scripts\models.ps1 -Action install-engine -Engine faster_whisper
+    powershell -ExecutionPolicy Bypass -File scripts\models.ps1 -Action list
+    powershell -ExecutionPolicy Bypass -File scripts\models.ps1 -Action list -Language ru
+    powershell -ExecutionPolicy Bypass -File scripts\models.ps1 -Action info -Model gigaam-v3-rnnt
+    powershell -ExecutionPolicy Bypass -File scripts\models.ps1 -Action download -Model gigaam-v3-e2e-rnnt
+    powershell -ExecutionPolicy Bypass -File scripts\models.ps1 -Action install-engine -Engine faster_whisper
 #>
 [CmdletBinding()]
 param(
@@ -86,7 +86,12 @@ function Invoke-CatalogScript {
 switch ($Action) {
 
 'list' {
-    Invoke-CatalogScript -Arguments @($(if ($Installed) { '1' } else { '0' }), $Language, $modelsDir) -Code @'
+    # Язык — заменителем «-», когда он не задан: Windows PowerShell 5.1 (и 7.0–
+    # 7.2) пустую строку внешней программе не передаёт вовсе, Python получал
+    # два аргумента вместо трёх и падал с IndexError — на действии по
+    # умолчанию и команде из «Что дальше» установщика.
+    $languageArg = if ($Language) { $Language } else { '-' }
+    Invoke-CatalogScript -Arguments @($(if ($Installed) { '1' } else { '0' }), $languageArg, $modelsDir) -Code @'
 import sys
 from pathlib import Path
 sys.path.insert(0, ".")
@@ -97,8 +102,17 @@ from asrhub.catalog import MODELS, mean_ru_wer
 from asrhub import model_files
 
 only_installed = sys.argv[1] == "1"
-language = sys.argv[2]
+language = "" if sys.argv[2] == "-" else sys.argv[2]
 models_dir = Path(sys.argv[3])
+
+
+def local_path(spec):
+    # openai-whisper кладёт веса одним файлом «<имя>.pt», а короткое имя у
+    # него то же, что у faster-whisper: общий поиск находил чужой каталог.
+    if spec.engine == "whisper":
+        candidate = models_dir / f"{spec.source}.pt"
+        return candidate if candidate.exists() else None
+    return model_files.find_local(models_dir, spec.source, spec.revision or "")
 
 quality = {"excellent": "отличное", "good": "хорошее", "fair": "среднее",
            "poor": "слабое", "none": "—"}
@@ -107,7 +121,7 @@ for spec in MODELS:
     if language and language not in spec.languages and not any(
             x.startswith("multi") for x in spec.languages):
         continue
-    path = model_files.find_local(models_dir, spec.source, spec.revision or "")
+    path = local_path(spec)
     if only_installed and path is None:
         continue
     families.setdefault(spec.family, []).append((spec, path))
@@ -222,7 +236,7 @@ if spec.engine == "gigaam":
         target = download_weights(spec.source, spec.revision or "", models_dir)
     except DependencyMissing:
         print("Движок gigaam не установлен.")
-        print("Установите: powershell -File scripts\\models.ps1 -Action install-engine -Engine gigaam")
+        print("Установите: powershell -ExecutionPolicy Bypass -File scripts\\models.ps1 -Action install-engine -Engine gigaam")
         raise SystemExit(1)
     except Exception as exc:
         print(f"\nОшибка загрузки: {exc}"); raise SystemExit(1)
@@ -254,6 +268,29 @@ if spec.source.startswith("http"):
     with zipfile.ZipFile(archive) as zf:
         zf.extractall(target)
     archive.unlink(missing_ok=True)
+    print(f"Готово: {target}"); raise SystemExit(0)
+
+# openai-whisper: один файл «<имя>.pt» с адреса самой библиотеки. Общая
+# дорога ниже клала веса faster-whisper (CTranslate2), которые openai-whisper
+# не откроет.
+if spec.engine == "whisper":
+    target = models_dir / f"{spec.source}.pt"
+    if target.exists() and not force:
+        print(f"Уже загружено: {target}"); raise SystemExit(0)
+    try:
+        import whisper
+    except ModuleNotFoundError:
+        print("Движок whisper (openai-whisper) не установлен: models.ps1 -Action install-engine -Engine whisper")
+        raise SystemExit(1)
+    url = getattr(whisper, "_MODELS", {}).get(spec.source)
+    if not url:
+        print(f"openai-whisper не знает модели «{spec.source}»."); raise SystemExit(1)
+    if force:
+        target.unlink(missing_ok=True)
+    try:
+        whisper._download(url, str(models_dir), False)
+    except Exception as exc:
+        print(f"\nОшибка загрузки: {exc}"); raise SystemExit(1)
     print(f"Готово: {target}"); raise SystemExit(0)
 
 try:
@@ -306,11 +343,16 @@ spec = get_model(sys.argv[1]); models_dir = Path(sys.argv[2])
 if spec is None:
     print("Модель не найдена."); raise SystemExit(1)
 candidates = []
-found = model_files.find_local(models_dir, spec.source, spec.revision or "")
+if spec.engine == "whisper":
+    # Только «<имя>.pt»: каталог Systran/faster-whisper-<имя> — чужая модель.
+    found = models_dir / f"{spec.source}.pt"
+    found = found if found.exists() else None
+else:
+    found = model_files.find_local(models_dir, spec.source, spec.revision or "")
 if found is not None:
     candidates.append(found)
 # Прямые ссылки распаковываются в несколько каталогов сразу — берём их все.
-if spec.source.startswith("http") and models_dir.exists():
+if spec.engine != "whisper" and spec.source.startswith("http") and models_dir.exists():
     name = spec.source.rsplit("/", 1)[-1].replace(".zip", "")
     candidates += [p for p in models_dir.rglob(f"*{name}*") if p not in candidates]
 removed = 0
@@ -342,7 +384,11 @@ from asrhub import model_files
 spec = get_model(sys.argv[1]); models_dir = Path(sys.argv[2])
 if spec is None:
     print("Модель не найдена."); raise SystemExit(1)
-path = model_files.find_local(models_dir, spec.source, spec.revision or "")
+if spec.engine == "whisper":
+    path = models_dir / f"{spec.source}.pt"
+    path = path if path.exists() else None
+else:
+    path = model_files.find_local(models_dir, spec.source, spec.revision or "")
 print(f"Веса на диске:   {'да, ' + str(path) if path else 'нет'}")
 if path:
     files = [path] if path.is_file() else [f for f in path.rglob("*") if f.is_file()]
@@ -378,6 +424,26 @@ print()
 
 'install-engine' {
     if (-not $Engine) { Write-Err 'Укажите движок: -Engine <имя>'; exit 2 }
+    # Имя — к одному виду, как у сервера: подсказка «Доступные» печатает
+    # имена файлов через дефис.
+    $Engine = $Engine -replace '-', '_'
+    # whisper.cpp — не пакет Python, а программа, MFA — окружение conda: в
+    # их файлах требований нет ничего, и pip «ставил» их, ничего не
+    # поставив, а сценарий отвечал «установлен». В models.sh это
+    # исправлено в заходе 48 — здесь честный отказ с объяснением.
+    if ($Engine -eq 'whisper_cpp') {
+        Write-Err 'whisper.cpp на Windows этим сценарием не собирается.'
+        Write-Hint 'Варианты: WSL (bash scripts/models.sh install-engine whisper_cpp), режим -Mode docker'
+        Write-Hint 'или готовый whisper-cli.exe с github.com/ggml-org/whisper.cpp/releases —'
+        Write-Hint 'путь к нему задайте переменной ASRHUB_WHISPER_CPP.'
+        exit 1
+    }
+    if ($Engine -eq 'mfa') {
+        Write-Err 'Montreal Forced Aligner ставится через conda, а не pip — этот сценарий его не ставит.'
+        Write-Hint 'conda create -n mfa -c conda-forge montreal-forced-aligner, затем каталог mfa — в PATH службы.'
+        Write-Hint 'Проще — выравнивание WhisperX: models.ps1 -Action install-engine -Engine whisperx'
+        exit 1
+    }
     $req = Join-Path $Prefix ("requirements\engines\" + ($Engine -replace '_', '-') + '.txt')
     if (-not (Test-Path $req)) {
         Write-Err "Нет файла зависимостей для «$Engine»."
@@ -390,10 +456,16 @@ print()
     if (-not (Test-Path $venvPip)) { Write-Err "Не найдено окружение: $venvPip"; exit 1 }
 
     $hw = Get-HardwareInfo
+    $engineFlags = @('--disable-pip-version-check')
+    $constraints = ''
     if ($Engine -eq 'faster_whisper' -and $hw.Accelerator -eq 'cuda') {
-        $pin = Get-CTranslate2Pin -Accelerator $hw.Accelerator -CudaVersion $hw.CudaVersion
-        Write-Info "Совместимая версия CTranslate2: $pin"
-        Invoke-Checked -Command $venvPip -Arguments @('install', '--disable-pip-version-check', $pin) -IgnoreExitCode | Out-Null
+        # Ограничением в той же команде: отдельная установка ctranslate2 тут
+        # же отменялась файлом требований движка.
+        $pin = @(Get-CTranslate2Pin -Accelerator $hw.Accelerator -CudaVersion $hw.CudaVersion)
+        Write-Info "Совместимая версия CTranslate2: $($pin -join ' ')"
+        $constraints = Join-Path ([System.IO.Path]::GetTempPath()) "asrhub-ct2-$([guid]::NewGuid().ToString('N')).txt"
+        [System.IO.File]::WriteAllLines($constraints, [string[]]$pin, [System.Text.UTF8Encoding]::new($false))
+        $engineFlags += @('-c', $constraints)
     }
     if ($Engine -eq 'tone') {
         Write-Warn 'T-one требует KenLM, который не собирается нативно под Windows.'
@@ -406,14 +478,17 @@ print()
     }
 
     Write-Info "Установка движка «$Engine»…"
-    Invoke-WithRetry -Attempts 2 -Description $Engine -Action {
-        # Та же функция, что у установщика: голый «pip install -r» не знал
-        # про спутники no-deps и optional, и «models.ps1 install-engine
-        # gigaam» печатал «установлен», не поставив сам gigaam — его пакет
-        # только в no-deps\gigaam.txt.
-        Install-EngineRequirements -Pip $venvPip -Requirements $req `
-            -PipFlags @('--disable-pip-version-check')
-    } | Out-Null
+    try {
+        Invoke-WithRetry -Attempts 2 -Description $Engine -Action {
+            # Та же функция, что у установщика: голый «pip install -r» не знал
+            # про спутники no-deps и optional, и «models.ps1 install-engine
+            # gigaam» печатал «установлен», не поставив сам gigaam — его пакет
+            # только в no-deps\gigaam.txt.
+            Install-EngineRequirements -Pip $venvPip -Requirements $req -PipFlags $engineFlags
+        } | Out-Null
+    } finally {
+        if ($constraints) { Remove-Item -LiteralPath $constraints -Force -ErrorAction SilentlyContinue }
+    }
     # Движок мог утащить общий пакет под свой пин — возвращаем заданное нами.
     $requirementsDir = Join-Path $Prefix 'requirements'
     Install-Overrides -Pip $venvPip -RequirementsDir $requirementsDir

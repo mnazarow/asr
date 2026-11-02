@@ -659,12 +659,14 @@ def test_docker_uid_is_not_root_under_sudo(repo_root: Path):
     контейнер снова шёл от root с примонтированным каталогом хоста.
     """
     text = (repo_root / "scripts" / "install.sh").read_text(encoding="utf-8")
-    assert 'docker_uid="${SUDO_UID:-$(id -u)}"' in text
-    assert 'docker_gid="${SUDO_GID:-$(id -g)}"' in text
+    # Заход 54: владелец нужен раньше сборки (config.yaml пишется до «up»),
+    # поэтому переменные стали глобальными, а .env собирается одним текстом.
+    assert 'DOCKER_UID="${SUDO_UID:-$(id -u)}"' in text
+    assert 'DOCKER_GID="${SUDO_GID:-$(id -g)}"' in text
     # Ноль не должен доехать до .env ни одним путём.
-    assert '[[ "${docker_uid}" == "0" ]] && docker_uid=1000' in text
-    assert '[[ "${docker_gid}" == "0" ]] && docker_gid=1000' in text
-    assert 'echo "ASRHUB_UID=${docker_uid}"' in text
+    assert '[[ "${DOCKER_UID}" == "0" ]] && DOCKER_UID=1000' in text
+    assert '[[ "${DOCKER_GID}" == "0" ]] && DOCKER_GID=1000' in text
+    assert 'ASRHUB_UID=${DOCKER_UID}' in text
 
 
 def test_service_user_is_created(repo_root: Path):
@@ -693,7 +695,9 @@ def test_web_interface_regressions(repo_root: Path):
     # Событие не перерисовывает раздел целиком, стирая фильтры
     assert "function refreshLiveViews" in app_js
     # Файлы, добавленные во время отправки, больше не пропадают
-    assert "const batch = state.files.slice()" in app_js
+    # (снимок списка на момент нажатия; с заходом 54 — без файлов сверх
+    # предела max_upload_mb, они остаются в списке с причиной)
+    assert "const batch = state.files.filter(" in app_js
     # Отзыв ключа шлёт то, что сервер принимает
     assert "k.key_id" in app_js
     # У кнопок-иконок есть доступное имя
@@ -1223,7 +1227,10 @@ def test_all_sections_of_one_report_cover_the_same_window(rich_db, monkeypatch):
     import asrhub.analytics as модуль
 
     границы: list[float] = []
-    исходный = rich_db.db.list_jobs
+    # С захода 54 разрезы читают базу не через `list_jobs`, а своими
+    # запросами (группировка и узкие выборки); окно у них у всех строит
+    # `_условие` — его и слушаем.
+    исходный = rich_db._условие
 
     def учёт(**kw):
         if kw.get("since") is not None:
@@ -1239,11 +1246,11 @@ def test_all_sections_of_one_report_cover_the_same_window(rich_db, monkeypatch):
                                     if not имя.startswith("_")})
     часы.time = lambda: настоящее + next(тик)
     monkeypatch.setattr(модуль, "time", часы)
-    rich_db.db.list_jobs = учёт
+    rich_db._условие = учёт
     try:
         rich_db.full_report("month")
     finally:
-        rich_db.db.list_jobs = исходный
+        del rich_db._условие
 
     assert границы, "ни один разрез не ограничил окно"
     окна = sorted(set(границы))
