@@ -688,6 +688,34 @@ GET    /api/telephony/dialplan/asrhub-dialplan  сценарий отправк�
 
 `GET /api/telephony/dialplan/config?driver=pjsip&mode=upload&station=main` собирает файлы настройки Asterisk (`files`), таблицу различий chan_sip и chan_pjsip (`differences`) и рекомендации (`tips`); `driver` — `pjsip` или `sip`, `mode` — `upload` или `path`.
 
+
+### Контроль качества
+
+```text
+GET    /api/qc/status                 состояние: телефон, голос, очередь, часы обзвона
+GET    /api/qc/groups                 группы: добавочные и тексты опроса
+PUT    /api/qc/groups                 заменить список групп
+POST   /api/qc/tts                    фраза голосом опроса (WAV)
+POST   /api/qc/check                  регистрация телефона на станции сейчас
+POST   /api/qc/test-call              пробный звонок с опросом
+GET    /api/qc/surveys                журнал опросов
+POST   /api/qc/surveys/{id}/cancel    отменить ждущий опрос
+GET    /api/qc/summary                оценки за период
+GET    /api/qc/stoplist               список «не звонить»
+POST   /api/qc/stoplist               внести номер
+DELETE /api/qc/stoplist/{number}      убрать номер
+GET    /api/qc/audio                  записи диктора
+POST   /api/qc/audio                  загрузить запись (форма, поле file)
+GET    /api/qc/audio/{name}           скачать запись
+DELETE /api/qc/audio/{name}           удалить запись
+GET    /api/qc/voice-sample           образец голоса для синтезатора
+POST   /api/qc/voice-sample           загрузить образец (форма, поле file)
+GET    /api/qc/voice-sample/audio     прослушать образец
+DELETE /api/qc/voice-sample           убрать образец
+```
+
+Все маршруты — только администратору. Сервер перезванивает клиенту после разговора с добавочным из группы контроля, проговаривает вопросы и записывает нажатые кнопки; устройство, настройка станции и примеры — в [32. Контроль качества](32-quality-control.md).
+
 ## Аналитика по сотрудникам
 
 ```

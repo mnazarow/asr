@@ -513,11 +513,12 @@ class Settings:
     #: рода, что адрес сводки.
     SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token",
                    "llm_api_key", "telephony_secret", "tracker_url",
-                   "crm_url", "crm_token", "employees_url", "alert_url")
+                   "crm_url", "crm_token", "employees_url", "alert_url",
+                   "qc_sip_password")
 
     #: Секреты, которые не отдаются и администратору (см. `to_dict`).
     СЕКРЕТЫ_ВСЕГДА = ("webhook_secret", "hf_token", "llm_api_key", "telephony_secret",
-                      "crm_token", "crm_url")
+                      "crm_token", "crm_url", "qc_sip_password")
 
     #: Что не уносится в параметры задания. Параметры задания — снимок
     #: настроек на момент постановки, и отдаются они владельцу задания:
@@ -1078,7 +1079,7 @@ def _целое(значение: Any, умолчание: int) -> int:
 #: на диске, наблюдение, языковая модель, телефония, CRM, справочник
 #: сотрудников, контроль качества. Задание в них ничего не решает.
 ГРУППЫ_СЕРВЕРА = frozenset({"server", "access", "runtime", "monitoring", "llm",
-                            "llm_queue", "telephony", "crm", "employees", "health",
+                            "llm_queue", "telephony", "crm", "employees", "health", "qc",
                             # Разбор содержания читает только настройки
                             # сервера (content_index): `content_script` или
                             # `content_pause_s` из задания принимались,

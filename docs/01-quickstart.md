@@ -8,7 +8,7 @@
 
 ```bash
 cd asr-hub/server
-python3 -m pip install fastapi uvicorn python-multipart
+python3 -m pip install fastapi "uvicorn[standard]" python-multipart
 python3 -m asrhub --host 127.0.0.1 --port 8080
 ```
 

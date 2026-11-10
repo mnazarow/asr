@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -968,6 +968,55 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_agents_seen ON agents(last_seen DESC)",
+    # --- версия 34: контроль качества — обратный звонок с опросом ----------
+    #
+    # Строка — один опрос: клиент, которому надо перезвонить после разговора
+    # с добавочным из группы контроля. Она же и очередь обзвона (`status`,
+    # `due_at`), и итог (`answers`, `score`). `call_key` — ключ исходного
+    # звонка в `calls`: уникален, поэтому один разговор не даст двух
+    # опросов, сколько бы раз его ни сохранили; у пробного звонка он пуст.
+    """
+    CREATE TABLE IF NOT EXISTS qc_surveys (
+        id           TEXT PRIMARY KEY,
+        call_key     TEXT,
+        kind         TEXT DEFAULT 'опрос',
+        group_name   TEXT DEFAULT '',
+        ext          TEXT DEFAULT '',
+        number       TEXT DEFAULT '',
+        station      TEXT DEFAULT '',
+        owner        TEXT DEFAULT '',
+        job_id       TEXT,
+        direction    TEXT DEFAULT '',
+        call_at      REAL,
+        created_at   REAL,
+        due_at       REAL,
+        started_at   REAL,
+        answered_at  REAL,
+        finished_at  REAL,
+        status       TEXT DEFAULT 'ждёт',
+        attempts     INTEGER DEFAULT 0,
+        sip_code     INTEGER DEFAULT 0,
+        error        TEXT DEFAULT '',
+        answers      TEXT DEFAULT '',
+        score        REAL,
+        score_pct    REAL,
+        talk_s       REAL DEFAULT 0
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_qc_call ON qc_surveys(call_key)",
+    "CREATE INDEX IF NOT EXISTS idx_qc_due ON qc_surveys(status, due_at)",
+    "CREATE INDEX IF NOT EXISTS idx_qc_number ON qc_surveys(number, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_qc_created ON qc_surveys(created_at DESC)",
+    # Номера, на которые больше не звонить: клиент нажал кнопку отказа или
+    # номер внёс администратор.
+    """
+    CREATE TABLE IF NOT EXISTS qc_stoplist (
+        number     TEXT PRIMARY KEY,
+        added_at   REAL,
+        reason     TEXT DEFAULT '',
+        survey_id  TEXT DEFAULT ''
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS llm_queue (
         job_id       TEXT PRIMARY KEY,
@@ -3469,6 +3518,22 @@ class Database:
         return self.execute(
             f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE {условие} "
             "AND (job_id IS NULL OR job_id NOT IN (SELECT id FROM jobs))", args)
+
+    def erase_qc(self, запрос: str) -> int:
+        """Опросы контроля качества по номеру клиента — по требованию субъекта.
+
+        Опрос хранит номер и нажатые им оценки; из списка «не звонить» номер
+        не убирается намеренно: это воля самого субъекта, и забыть её
+        значило бы позвонить ему снова.
+        """
+        цифры = self._цифры_номера(запрос)
+        if not цифры or len(цифры) < 5:
+            return 0
+        return self.execute(
+            "DELETE FROM qc_surveys WHERE instr(number, ?) > 0 AND status NOT IN ('ждёт','звонит')",
+            (цифры,)) + self.execute(
+            "UPDATE qc_surveys SET status='отменён', finished_at=? "
+            "WHERE instr(number, ?) > 0 AND status='ждёт'", (now(), цифры))
 
     def llm_outcome_filter(self, kind: str, value: str) -> tuple[str, list[Any]]:
         """Условие отбора заданий по исходу или причине из ответа модели."""

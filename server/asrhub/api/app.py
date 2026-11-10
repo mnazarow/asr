@@ -33,6 +33,7 @@ from ..job_queue import JobQueue
 from ..llm import LLMClient, LLMSetup, LLMWorker
 from ..logging_setup import get_logger, setup
 from ..monitoring import RUNTIME, MonitoringService
+from ..qc import КонтрольКачества
 from ..streaming import StreamSession
 from ..telephony import Телефония
 from ..trends import Trends
@@ -60,6 +61,7 @@ from .routes_llm import router as llm_router
 from .routes_llm_proxy import router as llm_proxy_router
 from .routes_monitoring import router as monitoring_router
 from .routes_phone import router as phone_router
+from .routes_qc import router as qc_router
 from .routes_review import router as review_router
 from .routes_system import health_router
 from .routes_system import router as system_router
@@ -659,6 +661,9 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # а работает только при включённой настройке: раздел должен показывать
     # журнал уже импортированного и тогда, когда забор выключен.
     state.telephony = Телефония(db, settings, queue)
+    # Контроль качества: обратный звонок клиенту с опросом. Собирается
+    # всегда, звонит только при включённой настройке (см. qc/survey.py).
+    state.qc = КонтрольКачества(db, settings)
 
     def _закрыть_пул_диктовки() -> None:
         пул = (getattr(state, "stream_pool", None) or {}).get("пул")
@@ -674,6 +679,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         state.content.start()
         state.llm_worker.start()
         state.telephony.start()
+        state.qc.start()
         log.info("ASR Hub запущен: %s:%s, каталог данных %s",
                  settings.get("server_host"), settings.get("server_port"),
                  settings.paths.data)
@@ -692,6 +698,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                               ("разбор содержания", state.content.stop),
                               ("языковая модель", state.llm_worker.stop),
                               ("телефония", state.telephony.stop),
+                              ("контроль качества", state.qc.stop),
                               ("журнал доступа", писатель.stop),
                               ("пул диктовки", _закрыть_пул_диктовки),
                               ("модели", lambda: registry.unload_all(кроме_занятых=False))):
@@ -1163,6 +1170,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(agent_router)
     app.include_router(agent_admin_router)
     app.include_router(dialplan_router)
+    app.include_router(qc_router)
     app.include_router(backup_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.

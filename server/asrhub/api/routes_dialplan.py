@@ -48,6 +48,10 @@ from .deps import (
 
 log = get_logger("telephony")
 
+#: Пометки звонка без задания, к которому станция вправе дослать запись.
+ДОСЛАТЬ_МОЖНО = ("нет записи", "сервер не принял запись", "запись не читается",
+                 "не дождались записи")
+
 router = APIRouter(prefix="/api/telephony/dialplan", tags=["Телефония"])
 
 #: Сценарий отправки лежит рядом с агентом и раздаётся так же: установка на
@@ -205,6 +209,13 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
         прежняя = _строка(state, ключ)
         отложен = bool(прежняя) and str(прежняя.get("skipped") or "").startswith(
             state.db.ОТЛОЖЕН)
+        # Запись можно дослать к звонку, который лёг без неё: сценарий на 413
+        # и 415 шлёт звонок без файла, и без этого правила запись потом не
+        # принималась уже ничем — звонок навсегда оставался «нет записи».
+        if (прежняя and not отложен and not прежняя.get("job_id")
+                and (загрузка is not None or поля.get("recording"))
+                and str(прежняя.get("skipped") or "").startswith(ДОСЛАТЬ_МОЖНО)):
+            отложен = True
         if прежняя and not отложен and проба:
             тело.update({"result": "dry_run", "dry_run": True, "would": "skip",
                          "reason": "уже импортирован", "job_id": прежняя.get("job_id")})

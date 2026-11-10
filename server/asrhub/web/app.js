@@ -1083,6 +1083,7 @@ const VIEWS = {
   employees:  { title: 'Аналитика по сотрудникам', subtitle: 'Все показатели по каждому: речь, клиенты, скрипт, звонки и что разобрать' },
   content:    { title: 'Аналитика записей', subtitle: 'О чём и как говорили: тональность, речь, темы, обязательства, скрипт' },
   pbx:        { title: 'АТС', subtitle: 'Все подключённые станции: состояние, нагрузка, очереди и операторы, забор записей' },
+  qc:         { title: 'Контроль качества', subtitle: 'Обратный звонок клиенту после разговора: сервер звонит как SIP-телефон станции, проговаривает вопросы группы и принимает оценки кнопками' },
   dialplan:   { title: 'Asterisk: диалплан', subtitle: 'Приём звонков прямо из диалплана: как устроено, готовая настройка для chan_pjsip и chan_sip, проба и журнал обращений' },
   telephony:  { title: 'Телефония', subtitle: 'Журнал звонков: кто, кому, когда, чем закончилось и что распознано' },
   models:     { title: 'Модели', subtitle: 'Каталог моделей, лицензии, требования, загрузка весов' },
@@ -1346,7 +1347,8 @@ document.addEventListener('DOMContentLoaded', () => {
 const HOTKEY_VIEWS = ['dashboard', 'transcribe', 'dictation', 'queue', 'results',
                       'rescan', 'analytics', 'trends', 'content', 'voice',
                       'voice_day', 'voice_month', 'voice_quarter', 'voice_year',
-                      'llmqueue', 'employees', 'pbx', 'dialplan', 'telephony', 'models',
+                      'llmqueue', 'employees', 'pbx', 'dialplan', 'qc', 'telephony',
+                      'models',
                       'compare', 'staff', 'settings', 'system', 'monitoring'];
 
 const HOTKEY_HELP = [
@@ -10417,7 +10419,7 @@ RENDERERS.dialplan = {
     место.innerHTML = `${беды.join('')}
       <div class="grid cols-6" style="margin-bottom:16px">
         ${kpi('Станций приёма', num(станции.length, 0),
-          станции.map((с) => с.name).join(', ') || 'не заведено')}
+          esc(станции.map((с) => с.name).join(', ')) || 'не заведено')}
         ${kpi('Обращений', num(свод.requests || 0, 0), 'с запуска сервера')}
         ${kpi('Поставлено', num(свод.queued || 0, 0), 'в очередь распознавания')}
         ${kpi('Пропущено', num((свод.skipped || 0) + (свод.duplicate || 0), 0),
@@ -10787,6 +10789,781 @@ function ПАТС_ИЗ_СТАНЦИИ(с) {
       : (с.owner_map || ''),
   };
 }
+
+// --------------------------------------------------------------------------
+// Контроль качества: обратный звонок клиенту с опросом по кнопкам телефона
+// --------------------------------------------------------------------------
+
+const QC_СОСТОЯНИЯ = {
+  'ждёт': ['ждёт', ''], 'звонит': ['звонит', 'info'], 'пройден': ['пройден', 'ok'],
+  'частично': ['частично', 'ok'], 'без ответа': ['снял трубку, не ответил', 'warn'],
+  'отказ': ['отказался от опросов', 'warn'], 'не дозвонились': ['не дозвонились', 'warn'],
+  'ошибка': ['ошибка', 'err'], 'устарел': ['устарел', ''], 'отменён': ['отменён', ''],
+};
+
+const QC_ПОЛЯ_ТЕЛЕФОНА = [
+  ['qc_sip_host', 'Адрес станции', 'pbx.example.local', 'text'],
+  ['qc_sip_port', 'Порт SIP', '5060', 'number'],
+  ['qc_sip_user', 'Номер телефона (логин)', '900', 'text'],
+  ['qc_sip_password', 'Пароль', '', 'password'],
+  ['qc_dial_prefix', 'Префикс набора', 'пусто или 9', 'text'],
+  ['qc_hours', 'Часы обзвона', '09:00-20:00', 'text'],
+  ['qc_delay_s', 'Пауза перед звонком, с', '300', 'number'],
+  ['qc_cooldown_days', 'Не чаще раза в, дней', '30', 'number'],
+];
+
+function qcНоваяГруппа(умолчания) {
+  return { name: '', enabled: true, extensions: '', direction: 'in', min_talk_s: 20,
+           sample_percent: 100, greeting: (умолчания || {}).greeting || '',
+           questions: [{ text: 'Оцените, пожалуйста, работу оператора от одного до пяти, '
+                               + 'где пять — отлично.', min: 1, max: 5 }],
+           goodbye: (умолчания || {}).goodbye || '', optout_digit: '', repeats: 1 };
+}
+
+RENDERERS.qc = {
+  async render(root) {
+    if ((state.me || {}).role !== 'admin') {
+      root.innerHTML = `<div class="empty">Контроль качества настраивает и смотрит администратор:
+        здесь учётные данные телефона и номера клиентов.</div>`;
+      return;
+    }
+    if (!state.qcDays) state.qcDays = 30;
+    root.innerHTML = `
+      <div class="settings-toolbar">
+        <span class="small dim">Период отчёта:</span>
+        <div class="group-nav" id="qc-days">
+          ${[[7, 'неделя'], [30, 'месяц'], [90, 'квартал'], [365, 'год']].map(([д, имя]) =>
+            `<button data-days="${д}" class="${state.qcDays === д ? 'active' : ''}">${имя}</button>`).join('')}
+        </div>
+        <span class="spacer"></span>
+        <button class="ghost sm" id="qc-refresh" title="Обновить состояние, отчёт и журнал">Обновить</button>
+      </div>
+      <div id="qc-state"></div>
+      ${this.intro()}
+      <div class="grid cols-2" style="margin-bottom:16px">
+        <div id="qc-phone"></div>
+        <div id="qc-test"></div>
+      </div>
+      <div class="grid cols-2" style="margin-bottom:16px">
+        <div id="qc-voice"></div>
+        <div id="qc-audio"></div>
+      </div>
+      <div id="qc-groups"><div class="empty">Читаю группы…</div></div>
+      <div id="qc-summary"></div>
+      <div id="qc-journal"></div>
+      <div id="qc-stoplist"></div>`;
+    qsa('#qc-days button').forEach((к) => к.addEventListener('click', () => {
+      state.qcDays = Number(к.dataset.days);
+      qsa('#qc-days button').forEach((x) => x.classList.toggle('active', x === к));
+      this.loadReport();
+    }));
+    qs('#qc-refresh').onclick = () => this.load();
+    await this.load();
+  },
+
+  intro() {
+    const шаги = [
+      ['Разговор', 'клиент поговорил с добавочным из группы контроля; звонок лёг в архив'],
+      ['Пауза', 'сервер ждёт заданное время и часы обзвона; одному номеру — не чаще заданного'],
+      ['Обратный звонок', 'сервер набирает клиента через Asterisk как обычный SIP-телефон'],
+      ['Опрос', 'голос проговаривает текст группы, клиент нажимает кнопки на телефоне'],
+      ['Оценка', 'ответы ложатся в отчёт: по группам, добавочным и вопросам'],
+    ];
+    return card('Как это работает',
+      'серверу нужен внутренний номер на станции — как любому телефону; AMI и правка диалплана не нужны',
+      `<div class="row" style="gap:6px;flex-wrap:wrap;align-items:stretch">
+        ${шаги.map(([имя, что], н) => `${н ? '<div class="dim" style="align-self:center">→</div>' : ''}
+          <div class="kpi" style="flex:1 1 150px;min-width:150px;padding:10px 12px">
+            <div class="kpi-label">${н + 1}. ${esc(имя)}</div>
+            <div class="small" style="margin-top:4px">${esc(что)}</div></div>`).join('')}
+      </div>
+       <details style="margin-top:12px"><summary class="small">Как завести номер на станции
+         (chan_pjsip и chan_sip)</summary>
+         <div class="grid cols-2" style="margin-top:8px">
+           <div><div class="small dim" style="margin-bottom:4px">pjsip.conf</div>
+<pre class="mono small" style="background:var(--bg);padding:10px;border-radius:6px;overflow-x:auto;margin:0">[900]
+type=endpoint
+context=asrhub-qc
+disallow=all
+allow=alaw,ulaw
+dtmf_mode=rfc4733
+direct_media=no
+auth=900
+aors=900
+callerid="Контроль качества" &lt;900&gt;
+
+[900]
+type=auth
+auth_type=userpass
+username=900
+password=ДЛИННЫЙ_ПАРОЛЬ
+
+[900]
+type=aor
+max_contacts=1</pre></div>
+           <div><div class="small dim" style="margin-bottom:4px">sip.conf и extensions.conf</div>
+<pre class="mono small" style="background:var(--bg);padding:10px;border-radius:6px;overflow-x:auto;margin:0">[900]
+type=friend
+host=dynamic
+secret=ДЛИННЫЙ_ПАРОЛЬ
+context=asrhub-qc
+disallow=all
+allow=alaw,ulaw
+dtmfmode=rfc2833
+directmedia=no
+callerid="Контроль качества" &lt;900&gt;
+
+; extensions.conf: номеру можно только наружу
+[asrhub-qc]
+exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
+ same =&gt; n,Dial(PJSIP/\${EXTEN}@trunk,40)
+ same =&gt; n,Hangup()</pre></div>
+         </div>
+         <div class="small dim" style="margin-top:8px">Строку Dial() возьмите из своего исходящего
+           маршрута. Подробно, с FreePBX и установкой голоса, — в главе «Контроль качества»
+           документации.</div></details>`);
+  },
+
+  async load() {
+    try {
+      const [состояние, группы, настройки, записи, образец] = await Promise.all([
+        API.get('/api/qc/status'), API.get('/api/qc/groups'), API.get('/api/settings'),
+        API.get('/api/qc/audio'), API.get('/api/qc/voice-sample')]);
+      state.qcAudio = записи;
+      state.qcVoice = образец;
+      state.qcStatus = состояние;
+      state.qcGroups = группы;
+      state.qcValues = (настройки || {}).values || {};
+      if (!state.qcDraft) state.qcDraft = JSON.parse(JSON.stringify(группы.items || []));
+      this.drawState();
+      this.drawPhone();
+      this.drawTest();
+      this.drawVoice();
+      this.drawAudio();
+      this.drawGroups();
+      await this.loadReport();
+    } catch (err) {
+      if (err && err.silent) return;
+      qs('#qc-state').innerHTML = `<div class="banner err"><b>Раздел не загрузился:</b>
+        ${esc(err.message || 'ошибка')}</div>`;
+    }
+  },
+
+  async loadReport() {
+    try {
+      const [свод, журнал, стоп] = await Promise.all([
+        API.get(`/api/qc/summary?since_days=${state.qcDays}`),
+        API.get(`/api/qc/surveys?since_days=${state.qcDays}&limit=100`),
+        API.get('/api/qc/stoplist')]);
+      state.qcSummary = свод;
+      state.qcJournal = журнал;
+      state.qcStop = стоп;
+      this.drawSummary();
+      this.drawJournal();
+      this.drawStoplist();
+      // Пока есть идущие звонки, журнал обновляется сам.
+      clearTimeout(this._таймер);
+      if ((журнал.items || []).some((з) => з.status === 'звонит') && state.view === 'qc') {
+        this._таймер = setTimeout(() => { if (state.view === 'qc') this.loadReport(); }, 3000);
+      }
+    } catch (err) {
+      if (err && err.silent) return;
+      qs('#qc-summary').innerHTML = `<div class="banner err">${esc(err.message || 'Отчёт не получен')}</div>`;
+    }
+  },
+
+  drawState() {
+    const с = state.qcStatus || {};
+    const рег = с.registration || {};
+    const голос = с.tts || {};
+    const часы = с.hours || {};
+    const время = (м) => `${String(Math.floor(м / 60)).padStart(2, '0')}:${String(м % 60).padStart(2, '0')}`;
+    const беды = [];
+    if (!с.configured) беды.push(`Телефон не настроен: ${с.missing}.`);
+    if (!голос.available) беды.push(`Голос: ${голос.reason}.`);
+    else if (голос.warning) беды.push(`Голос: ${голос.warning}.`);
+    if (с.groups_error) беды.push(`Группы: ${с.groups_error}.`);
+    if (часы.error) беды.push(`Часы обзвона: ${часы.error}.`);
+    if (рег.state === 'отказ') беды.push(`Станция: ${рег.error}`);
+    if (!с.groups_active && !с.groups_error) беды.push('Нет ни одной включённой группы с вопросами.');
+    const вид = !с.enabled ? '' : беды.length ? 'warn' : 'ok';
+    qs('#qc-state').innerHTML = `
+      <div class="banner ${вид}" style="margin-bottom:12px">
+        <div class="row" style="gap:12px;flex-wrap:wrap;align-items:center">
+          <b>${с.enabled ? 'Обзвон включён' : 'Обзвон выключен'}</b>
+          <span class="small">${с.enabled
+            ? (часы.open ? 'сейчас в часах обзвона' : `сейчас вне часов обзвона (${esc(часы.now || '')})`)
+            : 'новые опросы не заводятся, очередь не обзванивается'}</span>
+          <span class="spacer"></span>
+          <button class="${с.enabled ? 'ghost' : 'primary'} sm" id="qc-toggle">${
+            с.enabled ? 'Выключить' : 'Включить'}</button>
+        </div>
+        ${беды.length ? `<div class="small" style="margin-top:6px">${беды.map(esc).join(' ')}</div>` : ''}
+        ${с.last_error ? `<div class="small dim" style="margin-top:4px">Последняя ошибка: ${esc(с.last_error)}</div>` : ''}
+      </div>
+      <div class="grid cols-6" style="margin-bottom:16px">
+        ${kpi('Телефон', esc(рег.state || '—'), рег.state === 'зарегистрирован'
+          ? 'станция приняла регистрацию' : esc(рег.error || 'регистрируется при первом звонке'))}
+        ${kpi('Голос', голос.available ? esc(голос.name) : 'нет', голос.available
+          ? (голос.clone ? 'по загруженному образцу голоса' : `голос ${esc(голос.voice || 'по умолчанию')}`)
+          : 'синтезатор не найден')}
+        ${kpi('Часы обзвона', часы.from === 0 && часы.to === 1440 ? 'круглые сутки'
+          : `${время(часы.from || 0)}–${время(часы.to || 0)}`, `на часах обзвона ${esc(часы.now || '')}`)}
+        ${kpi('Ждут звонка', num(с.waiting || 0, 0), с.next_due
+          ? `ближайший ${fmtTime(с.next_due)}` : 'очередь пуста')}
+        ${kpi('Групп', num(с.groups_active || 0, 0), `из ${num(с.groups || 0, 0)} включены и с вопросами`)}
+        ${kpi('Не звонить', num(с.stoplist || 0, 0), 'номеров в списке')}
+      </div>`;
+    qs('#qc-toggle').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      кнопка.disabled = true;
+      try {
+        await API.put('/api/settings?persist=true', { qc_enabled: !с.enabled });
+        toast(с.enabled ? 'Обзвон выключен' : 'Обзвон включён', 'ok',
+          с.enabled ? '' : 'Опросы заводятся по разговорам, пришедшим с этой минуты.');
+        await this.load();
+      } catch (err) { fail(err); кнопка.disabled = false; }
+    };
+  },
+
+  drawPhone() {
+    const з = state.qcValues || {};
+    qs('#qc-phone').innerHTML = card('Телефон и правила обзвона',
+      'остальное — в «Настройках», группа «Контроль качества»',
+      `<div class="form-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        ${QC_ПОЛЯ_ТЕЛЕФОНА.map(([ключ, подпись, пример, вид]) => `<label class="small">${esc(подпись)}
+          <input type="${вид}" data-qc="${ключ}" value="${esc(з[ключ] === undefined || з[ключ] === null ? '' : з[ключ])}"
+            placeholder="${esc(пример)}" autocomplete="off"></label>`).join('')}
+      </div>
+      <label class="row small" style="gap:8px;margin-top:12px;cursor:pointer"
+        title="Опрашиваются собеседники с внутренним номером, в том числе по внутренним звонкам; городские и мобильные номера сервер не набирает">
+        <input type="checkbox" data-qc="qc_short_numbers_only" style="width:auto"
+          ${з.qc_short_numbers_only ? 'checked' : ''}>
+        Перезванивать только на номера из 3 и 4 знаков</label>
+      <div class="row" style="margin-top:12px;gap:10px;flex-wrap:wrap">
+        <button class="primary sm" id="qc-phone-save">Сохранить</button>
+        <button class="ghost sm" id="qc-phone-check"
+          title="Регистрация на станции прямо сейчас">Проверить телефон</button>
+        <button class="ghost sm" id="qc-phone-more">Все параметры</button>
+      </div>
+      <div id="qc-phone-out" style="margin-top:10px"></div>`);
+    // Уходит только изменённое: пароль сервер показывает заглушкой, и
+    // вернуть её назад значило бы записать звёздочки вместо пароля.
+    const собрать = () => {
+      const тело = {};
+      qsa('[data-qc]').forEach((вход) => {
+        const ключ = вход.dataset.qc;
+        if (вход.type === 'checkbox') {
+          if (вход.checked !== Boolean(з[ключ])) тело[ключ] = вход.checked;
+          return;
+        }
+        const было = з[ключ] === undefined || з[ключ] === null ? '' : String(з[ключ]);
+        const стало = вход.value.trim();
+        if (стало === было || стало === '***') return;
+        if (вход.type === 'number') { if (стало !== '') тело[ключ] = Number(стало); } else тело[ключ] = стало;
+      });
+      return тело;
+    };
+    const сохранить = async () => {
+      const тело = собрать();
+      if (Object.keys(тело).length) await API.put('/api/settings?persist=true', тело);
+      return Object.keys(тело).length;
+    };
+    qs('#qc-phone-save').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      кнопка.disabled = true;
+      try {
+        toast(await сохранить() ? 'Сохранено' : 'Изменений нет', 'ok');
+        await this.load();
+      } catch (err) { fail(err); } finally { кнопка.disabled = false; }
+    };
+    qs('#qc-phone-check').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      const вывод = qs('#qc-phone-out');
+      кнопка.disabled = true;
+      вывод.innerHTML = '<div class="small dim">Регистрируюсь на станции…</div>';
+      try {
+        // Проверяется сохранённое: сначала сохраняем то, что в полях.
+        if (await сохранить()) state.qcValues = ((await API.get('/api/settings')) || {}).values || {};
+        const о = await API.post('/api/qc/check');
+        вывод.innerHTML = о.ok
+          ? `<div class="banner ok"><b>Станция ответила: ${esc(о.state)}</b>
+              <div class="small" style="margin-top:4px">сервер ${esc(о.local)} → станция ${esc(о.server)}</div></div>`
+          : `<div class="banner err"><b>${esc(о.error || 'Отказ')}</b></div>`;
+        state.qcStatus = await API.get('/api/qc/status');
+        this.drawState();
+      } catch (err) {
+        вывод.innerHTML = `<div class="banner err"><b>${esc(err.message || 'Отказ')}</b></div>`;
+      } finally { кнопка.disabled = false; }
+    };
+    qs('#qc-phone-more').onclick = () => { state.paramGroup = 'qc'; go('settings'); };
+  },
+
+  drawTest() {
+    const группы = (state.qcGroups || {}).items || [];
+    qs('#qc-test').innerHTML = card('Пробный звонок',
+      'весь путь на своём телефоне: регистрация, голос, кнопки',
+      `<div class="small dim" style="margin-bottom:10px">Сервер позвонит на номер сейчас — мимо часов
+        обзвона и списка «не звонить» — и проведёт опрос сохранённой группы. В отчёт проба не идёт,
+        ход виден в журнале ниже.</div>
+      <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <label class="small" style="flex:1;min-width:140px">Номер
+          <input type="text" id="qc-test-number" placeholder="внутренний или городской" inputmode="tel"
+            value="${esc(state.qcTestNumber || '')}"></label>
+        <label class="small" style="flex:1;min-width:140px">Группа
+          <select id="qc-test-group">${группы.map((г) =>
+            `<option value="${esc(г.name)}">${esc(г.name)}</option>`).join('')
+            || '<option value="">нет сохранённых групп</option>'}</select></label>
+        <button class="primary sm" id="qc-test-go" ${группы.length ? '' : 'disabled'}>Позвонить</button>
+      </div>
+      <div id="qc-test-out" style="margin-top:10px"></div>`);
+    qs('#qc-test-go').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      const вывод = qs('#qc-test-out');
+      state.qcTestNumber = qs('#qc-test-number').value.trim();
+      кнопка.disabled = true;
+      try {
+        const о = await API.post('/api/qc/test-call',
+          { number: state.qcTestNumber, group: qs('#qc-test-group').value });
+        вывод.innerHTML = `<div class="banner ok"><b>Звоню на ${esc(о.number)}</b>
+          <div class="small" style="margin-top:4px">Снимите трубку и ответьте кнопками. Итог появится
+            в журнале опросов строкой с пометкой «проба».</div></div>`;
+        setTimeout(() => this.loadReport(), 1500);
+      } catch (err) {
+        вывод.innerHTML = `<div class="banner err"><b>${esc(err.message || 'Отказ')}</b>
+          ${err.hint ? `<div class="small" style="margin-top:4px">${esc(err.hint)}</div>` : ''}</div>`;
+      } finally { кнопка.disabled = false; }
+    };
+  },
+
+  /** Образец голоса: запись, голосом которой синтезатор проговаривает тексты. */
+  drawVoice() {
+    const о = state.qcVoice || {};
+    const д = о.engine || {};
+    const состояние = !о.exists ? ''
+      : д.clone && д.available
+        ? `<div class="banner ok" style="margin-bottom:10px"><b>Тексты проговариваются этим голосом</b>
+            <div class="small" style="margin-top:4px">синтезатор: ${esc(д.name)}</div></div>`
+        : `<div class="banner warn" style="margin-bottom:10px"><b>Образец загружен, но не используется</b>
+            <div class="small" style="margin-top:4px">${esc(д.warning || д.reason || '')}</div></div>`;
+    qs('#qc-voice').innerHTML = card('Образец голоса',
+      'запись, голосом которой синтезатор проговаривает тексты опросов',
+      `<div class="small dim" style="margin-bottom:10px">Загрузите 10–30 секунд ровной речи одного
+        человека — без музыки, шума и других голосов. Нужен синтезатор, умеющий говорить по образцу:
+        Coqui XTTS (<span class="mono">pip install coqui-tts</span>) сервер находит сам, другой
+        подключается своей командой с <span class="mono">{sample}</span>. Берите голос только с
+        согласия его владельца.</div>
+      ${состояние}
+      ${о.exists ? `<div class="row small" style="gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          <span class="mono">${esc(о.name || '')}</span>
+          <span class="dim">${fmtDur(о.seconds || 0)}, загружен ${fmtTime(о.uploaded_at)}</span>
+          <span class="spacer"></span>
+          <a href="#" id="qc-voice-play">прослушать образец</a>
+          <a href="#" id="qc-voice-try" title="Проговорить пробную фразу голосом из образца">проверить синтез</a>
+          <a href="#" id="qc-voice-del">убрать</a></div>` : ''}
+      <div class="row" style="gap:10px;flex-wrap:wrap">
+        <input type="file" id="qc-voice-file" accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a"
+          style="flex:1;min-width:200px">
+        <button class="primary sm" id="qc-voice-upload">${о.exists ? 'Заменить' : 'Загрузить'}</button></div>
+      <div id="qc-voice-out" style="margin-top:10px"></div>`);
+    const обновить = async () => {
+      state.qcVoice = await API.get('/api/qc/voice-sample');
+      this.drawVoice();
+      state.qcStatus = await API.get('/api/qc/status');
+      this.drawState();
+    };
+    qs('#qc-voice-upload').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      const вывод = qs('#qc-voice-out');
+      const файл = (qs('#qc-voice-file').files || [])[0];
+      if (!файл) { toast('Выберите файл', 'warn'); return; }
+      кнопка.disabled = true;
+      try {
+        const форма = new FormData();
+        форма.append('file', файл);
+        await API.call('/api/qc/voice-sample', { method: 'POST', body: форма });
+        toast('Образец голоса загружен', 'ok');
+        await обновить();
+      } catch (err) {
+        вывод.innerHTML = `<div class="banner err"><b>${esc(err.message || 'Образец не принят')}</b>
+          ${err.hint ? `<div class="small" style="margin-top:4px">${esc(err.hint)}</div>` : ''}</div>`;
+        кнопка.disabled = false;
+      }
+    };
+    if (!о.exists) return;
+    qs('#qc-voice-play').onclick = async (ев) => {
+      ев.preventDefault();
+      try {
+        const ключ = localStorage.getItem('asrhub_key');
+        const ответ = await fetch('/api/qc/voice-sample/audio', {
+          credentials: 'same-origin', headers: ключ ? { 'X-API-Key': ключ } : {} });
+        if (!ответ.ok) throw причинаОтказа(await ответ.json().catch(() => ({})), ответ.status);
+        const адрес = URL.createObjectURL(await ответ.blob());
+        const звук = new Audio(адрес);
+        звук.onended = () => URL.revokeObjectURL(адрес);
+        await звук.play();
+      } catch (err) { toast(err.message || 'Образец не проигрывается', 'err', err.hint); }
+    };
+    qs('#qc-voice-try').onclick = (ев) => {
+      ев.preventDefault();
+      toast('Готовлю фразу голосом из образца', 'ok', 'Первый синтез нейросетью занимает до нескольких минут.');
+      this.listen('Здравствуйте! Это проверка голоса для опросов качества.', ев.currentTarget);
+    };
+    qs('#qc-voice-del').onclick = async (ев) => {
+      ев.preventDefault();
+      if (!window.confirm('Убрать образец голоса? Тексты будет проговаривать обычный голос синтезатора.')) return;
+      try {
+        await API.del('/api/qc/voice-sample');
+        toast('Образец убран', 'ok');
+        await обновить();
+      } catch (err) { fail(err); }
+    };
+  },
+
+  drawAudio() {
+    const д = state.qcAudio || {};
+    const записи = д.items || [];
+    qs('#qc-audio').innerHTML = card('Записи диктора',
+      'готовая фраза вместо синтеза',
+      `<div class="small dim" style="margin-bottom:10px">Любую фразу опроса можно заменить готовой
+        записью: загрузите файл и впишите вместо текста
+        <span class="mono">audio:имя файла</span>. Файл до ${num(д.max_mb || 50, 0)} МБ и
+        ${num((д.max_seconds || 900) / 60, 0)} минут: WAV, MP3, OGG, FLAC, M4A.</div>
+      <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <input type="file" id="qc-audio-file" accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a,.gsm"
+          style="flex:1;min-width:220px">
+        <button class="primary sm" id="qc-audio-upload">Загрузить</button></div>
+      <div id="qc-audio-out"></div>
+      ${записи.length ? `<div class="table-wrap"><table class="table" id="qc-audio-table"><thead><tr>
+        <th>Запись</th><th class="num">Длительность</th><th class="num">Размер</th>
+        <th style="width:150px">Загружена</th><th>В группах</th><th></th></tr></thead>
+        <tbody>${записи.map((з) => `<tr><td class="mono">${esc(з.name)}</td>
+          <td class="num">${з.seconds ? fmtDur(з.seconds) : '<span class="chip err">не читается</span>'}</td>
+          <td class="num">${fmtBytes(з.bytes)}</td><td class="small">${fmtTime(з.uploaded_at)}</td>
+          <td>${(з.groups || []).map(esc).join(', ') || '<span class="faint">не используется</span>'}</td>
+          <td class="small"><a href="#" data-qc-audio-play="${esc(з.name)}">прослушать</a>
+            <a href="#" data-qc-audio-del="${esc(з.name)}">удалить</a></td></tr>`).join('')}
+        </tbody></table></div>`
+        : '<div class="empty small">Записей пока нет.</div>'}`);
+    const обновить = async () => {
+      state.qcAudio = await API.get('/api/qc/audio');
+      this.drawAudio();
+    };
+    qs('#qc-audio-upload').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      const вывод = qs('#qc-audio-out');
+      const файл = (qs('#qc-audio-file').files || [])[0];
+      if (!файл) { toast('Выберите файл', 'warn'); return; }
+      кнопка.disabled = true;
+      вывод.innerHTML = '<div class="small dim" style="margin-bottom:10px">Загружаю и готовлю к телефону…</div>';
+      try {
+        const форма = new FormData();
+        форма.append('file', файл);
+        const о = await API.call('/api/qc/audio', { method: 'POST', body: форма });
+        toast(`Запись загружена: ${о.name}`, 'ok', `длительность ${fmtDur(о.seconds)}`);
+        await обновить();
+      } catch (err) {
+        вывод.innerHTML = `<div class="banner err"><b>${esc(err.message || 'Запись не принята')}</b>
+          ${err.hint ? `<div class="small" style="margin-top:4px">${esc(err.hint)}</div>` : ''}</div>`;
+        кнопка.disabled = false;
+      }
+    };
+    qsa('[data-qc-audio-play]').forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
+      ев.preventDefault();
+      this.listen(`audio:${ссылка.dataset.qcAudioPlay}`, ссылка);
+    }));
+    qsa('[data-qc-audio-del]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
+      ев.preventDefault();
+      const имя = ссылка.dataset.qcAudioDel;
+      if (!window.confirm(`Удалить запись «${имя}»?`)) return;
+      try {
+        await API.del(`/api/qc/audio/${encodeURIComponent(имя)}`);
+        toast('Запись удалена', 'ok');
+        await обновить();
+      } catch (err) { fail(err); }
+    }));
+  },
+
+  /** Читает черновик групп из полей формы — перед любым действием с ним. */
+  readDraft() {
+    qsa('#qc-groups [data-group]').forEach((блок) => {
+      const г = state.qcDraft[Number(блок.dataset.group)];
+      if (!г) return;
+      qsa('[data-поле]', блок).forEach((вход) => {
+        const поле = вход.dataset.поле;
+        if (вход.type === 'checkbox') г[поле] = вход.checked;
+        else if (вход.type === 'number') г[поле] = вход.value === '' ? '' : Number(вход.value);
+        else г[поле] = вход.value;
+      });
+      г.questions = qsa('[data-вопрос]', блок).map((строка) => ({
+        text: qs('[data-в="text"]', строка).value,
+        min: Number(qs('[data-в="min"]', строка).value),
+        max: Number(qs('[data-в="max"]', строка).value),
+      }));
+    });
+  },
+
+  drawGroups() {
+    const место = qs('#qc-groups');
+    const данные = state.qcGroups || {};
+    const группы = state.qcDraft || [];
+    const фраза = (подпись, поле, значение, подсказка) => `<label class="small" style="display:block;margin-top:10px">
+        ${esc(подпись)} <span class="faint">${esc(подсказка || '')}</span>
+        <div class="row" style="gap:8px;align-items:flex-start">
+          <textarea data-поле="${поле}" rows="2" style="flex:1;font-family:inherit">${esc(значение || '')}</textarea>
+          <button class="ghost sm" data-слушать title="Прослушать голосом опроса">▶</button></div></label>`;
+    место.innerHTML = card('Группы и тексты опроса',
+      'у каждой группы свои добавочные и свой текст; текст проговаривает синтезатор речи',
+      `${данные.error ? `<div class="banner err" style="margin-bottom:10px"><b>Сохранённые группы не читаются:</b>
+          ${esc(данные.error)}</div>` : ''}
+      ${группы.length ? '' : `<div class="empty small">Групп пока нет. Добавьте группу: имя, добавочные
+        номера и вопросы, на которые клиент ответит кнопками.</div>`}
+      ${группы.map((г, н) => `<div class="card" data-group="${н}" style="margin:0 0 12px;background:var(--bg)">
+        <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <label class="small" style="flex:2;min-width:160px">Имя группы
+            <input type="text" data-поле="name" value="${esc(г.name)}" placeholder="Отдел продаж"></label>
+          <label class="small" style="flex:3;min-width:200px">Добавочные
+            <input type="text" data-поле="extensions" value="${esc(г.extensions)}" placeholder="101, 102, 110-119"></label>
+          <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" data-поле="enabled"
+            ${г.enabled ? 'checked' : ''} style="width:auto"> включена</label>
+          <button class="ghost sm" data-удалить-группу title="Удалить группу">Удалить</button>
+        </div>
+        <div class="row" style="gap:10px;flex-wrap:wrap;margin-top:10px;align-items:flex-end">
+          <label class="small" style="min-width:170px">После каких звонков
+            <select data-поле="direction">${[['in', 'входящих'], ['out', 'исходящих'], ['any', 'любых']]
+              .map(([к, имя]) => `<option value="${к}" ${г.direction === к ? 'selected' : ''}>${имя}</option>`).join('')}
+            </select></label>
+          <label class="small" style="width:150px">Разговор не короче, с
+            <input type="number" min="0" max="3600" data-поле="min_talk_s" value="${esc(г.min_talk_s)}"></label>
+          <label class="small" style="width:150px">Опрашивать, % звонков
+            <input type="number" min="1" max="100" data-поле="sample_percent" value="${esc(г.sample_percent)}"></label>
+          <label class="small" style="width:150px">Кнопка «не звонить»
+            <input type="text" data-поле="optout_digit" maxlength="1" value="${esc(г.optout_digit || '')}" placeholder="нет"></label>
+          <label class="small" style="width:150px">Повторов вопроса
+            <input type="number" min="0" max="3" data-поле="repeats" value="${esc(г.repeats)}"></label>
+        </div>
+        ${фраза('Приветствие', 'greeting', г.greeting, 'кто звонит и зачем; назовите кнопку отказа, если она задана')}
+        <div class="small" style="margin-top:12px"><b>Вопросы</b>
+          <span class="faint">— называйте кнопки вслух; шкала отбирает принятые нажатия</span></div>
+        ${(г.questions || []).map((в, к) => `<div class="row" data-вопрос="${к}"
+            style="gap:8px;margin-top:6px;align-items:flex-start">
+          <textarea data-в="text" rows="2" style="flex:1;font-family:inherit" placeholder="Текст вопроса">${esc(в.text)}</textarea>
+          <label class="small" style="width:64px">от<input type="number" min="0" max="9" data-в="min" value="${esc(в.min)}"></label>
+          <label class="small" style="width:64px">до<input type="number" min="0" max="9" data-в="max" value="${esc(в.max)}"></label>
+          <button class="ghost sm" data-слушать title="Прослушать голосом опроса">▶</button>
+          <button class="ghost sm" data-удалить-вопрос title="Убрать вопрос">✕</button></div>`).join('')}
+        <button class="ghost sm" data-добавить-вопрос style="margin-top:8px">Добавить вопрос</button>
+        ${фраза('Прощание', 'goodbye', г.goodbye, '')}
+      </div>`).join('')}
+      <div class="row" style="gap:10px;flex-wrap:wrap">
+        <button class="ghost sm" id="qc-group-add">Добавить группу</button>
+        <span class="spacer"></span>
+        <button class="ghost sm" id="qc-groups-reset" title="Вернуть сохранённое">Отменить правки</button>
+        <button class="primary sm" id="qc-groups-save">Сохранить группы</button>
+      </div>
+      <div id="qc-groups-out" style="margin-top:10px"></div>`);
+    qs('#qc-group-add').onclick = () => {
+      this.readDraft();
+      state.qcDraft.push(qcНоваяГруппа(данные.defaults));
+      this.drawGroups();
+    };
+    qs('#qc-groups-reset').onclick = () => {
+      state.qcDraft = JSON.parse(JSON.stringify(данные.items || []));
+      this.drawGroups();
+    };
+    qsa('[data-group]', место).forEach((блок) => {
+      const н = Number(блок.dataset.group);
+      qs('[data-удалить-группу]', блок).onclick = () => {
+        this.readDraft();
+        const имя = state.qcDraft[н].name || 'без имени';
+        if (!window.confirm(`Удалить группу «${имя}»? Собранные оценки останутся в отчёте.`)) return;
+        state.qcDraft.splice(н, 1);
+        this.drawGroups();
+      };
+      qs('[data-добавить-вопрос]', блок).onclick = () => {
+        this.readDraft();
+        state.qcDraft[н].questions.push({ text: '', min: 1, max: 5 });
+        this.drawGroups();
+      };
+      qsa('[data-удалить-вопрос]', блок).forEach((кнопка, к) => { кнопка.onclick = () => {
+        this.readDraft();
+        state.qcDraft[н].questions.splice(к, 1);
+        this.drawGroups();
+      }; });
+      qsa('[data-слушать]', блок).forEach((кнопка) => { кнопка.onclick = () => {
+        const поле = кнопка.parentElement.querySelector('textarea');
+        this.listen((поле || {}).value || '', кнопка);
+      }; });
+    });
+    qs('#qc-groups-save').onclick = async (ев) => {
+      const кнопка = ев.currentTarget;
+      const вывод = qs('#qc-groups-out');
+      this.readDraft();
+      кнопка.disabled = true;
+      try {
+        const о = await API.put('/api/qc/groups', { groups: state.qcDraft });
+        state.qcGroups = { ...данные, items: о.items, error: '' };
+        state.qcDraft = JSON.parse(JSON.stringify(о.items));
+        toast('Группы сохранены', (о.warnings || []).length ? 'warn' : 'ok',
+          (о.warnings || []).join('; '));
+        this.drawGroups();
+        this.drawTest();
+        state.qcStatus = await API.get('/api/qc/status');
+        this.drawState();
+        state.qcAudio = await API.get('/api/qc/audio');
+        this.drawAudio();
+      } catch (err) {
+        вывод.innerHTML = `<div class="banner err"><b>${esc(err.message || 'Не сохранено')}</b>
+          ${err.hint ? `<div class="small" style="margin-top:4px">${esc(err.hint)}</div>` : ''}</div>`;
+        кнопка.disabled = false;
+      }
+    };
+  },
+
+  /** Проигрывает фразу тем голосом, который услышит клиент. */
+  async listen(текст, кнопка) {
+    if (!String(текст).trim()) { toast('Пустая фраза', 'warn'); return; }
+    кнопка.disabled = true;
+    try {
+      const ключ = localStorage.getItem('asrhub_key');
+      const ответ = await fetch('/api/qc/tts', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', ...(ключ ? { 'X-API-Key': ключ } : {}) },
+        body: JSON.stringify({ text: текст }) });
+      if (!ответ.ok) {
+        const о = await ответ.json().catch(() => ({}));
+        throw причинаОтказа(о, ответ.status);
+      }
+      const адрес = URL.createObjectURL(await ответ.blob());
+      const звук = new Audio(адрес);
+      звук.onended = () => URL.revokeObjectURL(адрес);
+      await звук.play();
+    } catch (err) {
+      toast(err.message || 'Фраза не проигрывается', 'err', err.hint);
+    } finally { кнопка.disabled = false; }
+  },
+
+  drawSummary() {
+    const с = state.qcSummary || {};
+    const в = с.total || {};
+    const оценка = (з) => (з.score === null || з.score === undefined ? '—' : num(з.score, 2));
+    const доля = (з) => (з === null || з === undefined ? '—' : `${num(з, 0)}%`);
+    const полоска = (в_) => {
+      const всего = Object.values(в_.distribution || {}).reduce((а, б) => а + б, 0);
+      if (!всего) return '<span class="faint">ответов нет</span>';
+      const части = [];
+      for (let ц = Number(в_.min); ц <= Number(в_.max); ц += 1) {
+        const число = (в_.distribution || {})[String(ц)] || 0;
+        части.push(`<span title="кнопка ${ц}: ${число}" style="display:inline-block;min-width:34px;
+          margin-right:4px"><b>${ц}</b> <span class="dim">${num(100 * число / всего, 0)}%</span></span>`);
+      }
+      return части.join('');
+    };
+    qs('#qc-summary').innerHTML = `
+      <div class="grid cols-5" style="margin-bottom:16px">
+        ${kpi('Опросов', num(в.surveys || 0, 0), `из них ждут звонка ${num(в.waiting || 0, 0)}`)}
+        ${kpi('Дозвон', доля(в.answer_rate), `сняли трубку ${num(в.answered || 0, 0)} из ${num(в.finished || 0, 0)}`)}
+        ${kpi('Ответили', доля(в.response_rate), `оценили ${num(в.rated || 0, 0)}`)}
+        ${kpi('Средняя оценка', оценка(в), в.score_pct === null || в.score_pct === undefined
+          ? 'оценок пока нет' : `${num(в.score_pct, 0)}% шкалы`)}
+        ${kpi('Отказались', num(в.optout || 0, 0), 'нажали «не звонить»')}
+      </div>
+      ${card('Оценки по добавочным', 'кого оценивали клиенты: чем больше ответов, тем надёжнее средняя',
+        (с.extensions || []).length ? `<div class="table-wrap"><table class="table" id="qc-ext-table">
+          <thead><tr><th>Добавочный</th><th>Сотрудник</th><th>Группа</th><th class="num">Опросов</th>
+            <th class="num">Дозвон</th><th class="num">Оценили</th><th class="num">Средняя</th></tr></thead>
+          <tbody>${с.extensions.map((з) => `<tr><td class="mono">${esc(з.ext || '—')}</td>
+            <td>${esc(з.name || '')} <span class="faint">${esc(з.department || '')}</span></td>
+            <td>${esc(з.group)}</td><td class="num">${num(з.surveys, 0)}</td>
+            <td class="num">${доля(з.answer_rate)}</td><td class="num">${num(з.rated, 0)}</td>
+            <td class="num"><b>${оценка(з)}</b></td></tr>`).join('')}</tbody></table></div>`
+          : '<div class="empty small">За период опросов не было.</div>')}
+      ${(с.questions || []).length ? card('Ответы по вопросам', 'какие кнопки нажимали',
+        `<div class="table-wrap"><table class="table"><thead><tr><th>Группа</th><th>Вопрос</th>
+          <th class="num">Задан</th><th class="num">Ответили</th><th class="num">Средняя</th><th>Нажатия</th></tr></thead>
+          <tbody>${с.questions.map((з) => `<tr><td>${esc(з.group)}</td><td>${esc(з.text)}</td>
+            <td class="num">${num(з.asked, 0)}</td><td class="num">${num(з.answered, 0)}</td>
+            <td class="num"><b>${оценка(з)}</b></td><td>${полоска(з)}</td></tr>`).join('')}</tbody></table></div>`) : ''}`;
+  },
+
+  drawJournal() {
+    const ж = state.qcJournal || {};
+    const записи = ж.items || [];
+    const ответы = (з) => (з.answers || []).length
+      ? з.answers.map((о) => `<span title="${esc(о.text)}" class="mono">${о.digit === null || о.digit === undefined ? '–' : esc(о.digit)}</span>`).join(' ')
+      : '<span class="faint">—</span>';
+    qs('#qc-journal').innerHTML = card('Журнал опросов',
+      `кому звонили и что ответили; показано ${записи.length} из ${num(ж.total || 0, 0)}`,
+      записи.length ? `<div class="table-wrap"><table class="table" id="qc-journal-table">
+        <thead><tr><th style="width:140px">Заведён</th><th>Клиент</th><th>Добавочный</th><th>Группа</th>
+          <th>Состояние</th><th>Ответы</th><th class="num">Оценка</th><th class="num">Попыток</th><th></th></tr></thead>
+        <tbody>${записи.map((з) => {
+          const [подпись, вид] = QC_СОСТОЯНИЯ[з.status] || [з.status, ''];
+          return `<tr><td class="small">${fmtTime(з.created_at)}</td>
+            <td class="mono">${esc(з.number)}${з.kind === 'проба' ? ' <span class="chip">проба</span>' : ''}</td>
+            <td class="mono">${esc(з.ext || '—')} <span class="faint">${esc(з.ext_name || '')}</span></td>
+            <td>${esc(з.group_name)}</td>
+            <td><span class="chip ${вид}">${esc(подпись)}</span>
+              ${з.status === 'ждёт' && з.due_at ? `<span class="small faint">с ${fmtTime(з.due_at)}</span>` : ''}
+              ${з.error && з.status !== 'пройден' ? `<div class="small faint">${esc(з.error)}</div>` : ''}</td>
+            <td>${ответы(з)}</td>
+            <td class="num">${з.score === null || з.score === undefined ? '—' : `<b>${num(з.score, 2)}</b>`}</td>
+            <td class="num">${num(з.attempts || 0, 0)}</td>
+            <td class="small">${з.job_id ? `<a href="#" data-qc-job="${esc(з.job_id)}">разговор</a>` : ''}
+              ${з.status === 'ждёт' ? `<a href="#" data-qc-cancel="${esc(з.id)}">отменить</a>` : ''}</td></tr>`;
+        }).join('')}</tbody></table></div>`
+        : '<div class="empty small">За период опросов не было. Сделайте пробный звонок — он появится здесь.</div>');
+    qsa('[data-qc-job]').forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
+      ев.preventDefault();
+      state.resultsSearch = ссылка.dataset.qcJob;
+      go('results');
+    }));
+    qsa('[data-qc-cancel]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
+      ев.preventDefault();
+      try {
+        await API.post(`/api/qc/surveys/${encodeURIComponent(ссылка.dataset.qcCancel)}/cancel`);
+        toast('Опрос отменён', 'ok');
+        this.loadReport();
+      } catch (err) { fail(err); }
+    }));
+  },
+
+  drawStoplist() {
+    const записи = (state.qcStop || {}).items || [];
+    qs('#qc-stoplist').innerHTML = card('Список «не звонить»',
+      'номера клиентов, нажавших кнопку отказа, и внесённые вручную; опросы им не заводятся',
+      `<div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+        <label class="small" style="min-width:200px">Номер
+          <input type="text" id="qc-stop-number" placeholder="79991234567" inputmode="tel"></label>
+        <label class="small" style="flex:1;min-width:200px">Причина
+          <input type="text" id="qc-stop-reason" placeholder="просил не звонить"></label>
+        <button class="ghost sm" id="qc-stop-add">Внести</button></div>
+      ${записи.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Номер</th>
+        <th style="width:150px">Когда</th><th>Причина</th><th></th></tr></thead>
+        <tbody>${записи.map((з) => `<tr><td class="mono">${esc(з.number)}</td>
+          <td class="small">${fmtTime(з.added_at)}</td><td>${esc(з.reason || '')}</td>
+          <td class="small"><a href="#" data-qc-unstop="${esc(з.number)}">убрать</a></td></tr>`).join('')}
+        </tbody></table></div>` : '<div class="empty small">Список пуст.</div>'}`);
+    qs('#qc-stop-add').onclick = async () => {
+      try {
+        await API.post('/api/qc/stoplist', { number: qs('#qc-stop-number').value,
+                                             reason: qs('#qc-stop-reason').value });
+        toast('Номер внесён', 'ok');
+        this.loadReport();
+        state.qcStatus = await API.get('/api/qc/status');
+        this.drawState();
+      } catch (err) { fail(err); }
+    };
+    qsa('[data-qc-unstop]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
+      ев.preventDefault();
+      if (!window.confirm(`Убрать ${ссылка.dataset.qcUnstop} из списка? Этому номеру снова смогут звонить с опросом.`)) return;
+      try {
+        await API.del(`/api/qc/stoplist/${encodeURIComponent(ссылка.dataset.qcUnstop)}`);
+        this.loadReport();
+      } catch (err) { fail(err); }
+    }));
+  },
+};
 
 RENDERERS.content = {
   async render(root) {

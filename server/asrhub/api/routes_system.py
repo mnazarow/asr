@@ -983,6 +983,8 @@ def erase(request: Request,
     # следующий запрос.
     state.db.erase_calls(запрос)
     обезличено = звонков - state.db.erase_calls_count(запрос)
+    # Опросы контроля качества: номер клиента и его оценки.
+    опросов = state.db.erase_qc(запрос)
     # Ответы модели, положенные в кеш до того, как он узнал свои записи.
     из_кеша = state.db.llm_cache_forget_matching(запрос)
     # Следы в указателе поиска и словаре форм — сразу, а не суточной
@@ -995,7 +997,7 @@ def erase(request: Request,
                        f"({principal.name})",
                        {"count": len(номера), "calls": обезличено, "by": principal.name})
     return {"dry_run": False, "deleted": len(номера), "ids": номера,
-            "calls": обезличено, "llm_cache": из_кеша,
+            "calls": обезличено, "qc_surveys": опросов, "llm_cache": из_кеша,
             "index_purged": bool(уборка.get("fts")), "limit": BULK_LIMIT,
             "more": ещё}
 
