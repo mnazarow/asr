@@ -1032,6 +1032,8 @@ def test_запрос_mysql_отбирает_период_и_не_пускает
     запросы = []
 
     def запомнить(запрос):
+        if запрос.startswith("SHOW COLUMNS"):         # проверка колонок linkedid
+            return ""
         запросы.append(запрос)
         return ""
 

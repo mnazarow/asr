@@ -17,6 +17,8 @@ export ASRHUB_KEY="$(cat /var/lib/asrhub/api-key.txt)"
 | `live_events.py` | Подписка на события WebSocket вместо опроса |
 | `monitoring_pull.py` | Снятие метрик и разбор порогов из справочника |
 | `stream_microphone.py` | Распознавание на лету: звук кусками, текст по ходу речи |
+| `telephony_push_call.py` | Передать звонок с записью из своей интеграции, как диалплан: повторы, 409/429/503, проба |
+| `telephony_export_calls.py` | Выгрузить журнал звонков с АТС в CSV для сверки со своей статистикой |
 
 Зависимости: `requests`, `websockets` для `live_events.py` и
 `websocket-client` для `stream_microphone.py` (в режиме микрофона — ещё

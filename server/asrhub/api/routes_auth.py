@@ -137,10 +137,24 @@ def login(request: Request, response: Response,
     }
     if account.must_change_password:
         # Почему смена обязательна — так форма скажет правду (см. /me).
+        первый = _пароль_первого_запуска(request)
         ответ["password_reason"] = (
-            "default" if account.username.lower() == DEFAULT_USERNAME
-            and password == DEFAULT_PASSWORD else "assigned")
+            "assigned" if account.username.lower() != DEFAULT_USERNAME
+            else "default" if password == DEFAULT_PASSWORD
+            else "first" if первый and password == первый else "assigned")
     return ответ
+
+
+def _каталог_данных(request: Request):
+    settings = getattr(get_state(request), "settings", None)
+    пути = getattr(settings, "paths", None)
+    return getattr(пути, "data", None)
+
+
+def _пароль_первого_запуска(request: Request) -> str:
+    from ..accounts import Accounts  # noqa: PLC0415
+
+    return Accounts.пароль_из_файла(_каталог_данных(request))
 
 
 def _войти(state, accounts, username: str, password: str):
@@ -245,10 +259,11 @@ def me(request: Request,
         # запуске, известен всем» и тому, кому администратор выдал
         # временный пароль лично, — а это неправда и пугает зря.
         учётка = state.accounts.get(principal.user_id) if principal.user_id else None
+        админ = учётка is not None and учётка.username.lower() == DEFAULT_USERNAME
         data["password_reason"] = (
-            "default" if учётка is not None
-            and учётка.username.lower() == DEFAULT_USERNAME
-            and state.accounts.uses_default_password() else "assigned")
+            "default" if админ and state.accounts.uses_default_password()
+            else "first" if админ and _пароль_первого_запуска(request)
+            else "assigned")
     if principal.is_admin and state.accounts is not None and вход_включён:
         # Предупреждение про пароль по умолчанию видит только администратор:
         # остальным оно ничего не даёт, а подсказывает лишнее. И только
@@ -284,6 +299,9 @@ def change_password(request: Request,
         raise AccountError("Это пароль по умолчанию — придумайте другой.")
     своя = request.cookies.get(SESSION_COOKIE, "")
     accounts.set_password(account.id, new, keep_sessions=своя)
+    if account.username.lower() == DEFAULT_USERNAME:
+        # Пароль первого запуска больше не действует — и файл с ним не нужен.
+        accounts.забыть_пароль_первого_запуска(_каталог_данных(request))
     _закрыть_сокеты_записи(get_state(request), account.id, "Пароль изменён",
                            кроме_сессии=своя)
     log.info("Пароль изменён: %s", account.username)

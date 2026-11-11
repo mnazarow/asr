@@ -47,6 +47,7 @@ from fastapi import (
     UploadFile,
 )
 
+from .. import resources as ресурсы
 from ..db import new_id
 from ..errors import (
     ASRHubError,
@@ -123,7 +124,7 @@ class АгентВыключен(ConfigError):
 ПОЛЯ_ЗВОНКА = (
     "src", "dst", "clid", "channel", "dstchannel", "context", "disposition",
     "direction", "queue", "agent", "duration", "billsec", "answered",
-    "started_at", "userfield", "accountcode",
+    "started_at", "userfield", "accountcode", "linkedid", "sequence",
 )
 
 
@@ -501,6 +502,11 @@ async def _принять(request: Request, state: Any, principal: Principal,
     звонок["duration"] = int(_число(звонок.get("duration")))
     звонок["billsec"] = int(_число(звонок.get("billsec")))
     звонок["started_at"] = _число(звонок.get("started_at"))
+    if "linkedid" in звонок:
+        связь = str(звонок.get("linkedid") or "").strip()[:128]
+        звонок["linkedid"] = связь if re.fullmatch(r"[\w.\-]*\d+\.\d+", связь) else ""
+    if "sequence" in звонок:
+        звонок["sequence"] = int(_число(звонок.get("sequence")))
     звонок["answered"] = 1 if звонок.get("answered") else 0
     звонок["pbx_uid"] = uniqueid
     есть_файл = file is not None and bool((file.filename or "").strip())
@@ -641,13 +647,18 @@ async def _принять(request: Request, state: Any, principal: Principal,
 # ---------------------------------------------------------------------------
 
 def _файл_агента(имя: str) -> str:
+    # Сначала — дерево программы (клон, установщик, образ), потом —
+    # share/asrhub/agent, куда агента кладёт колесо (см. `asrhub.resources`).
     путь = КОРЕНЬ_АГЕНТА / имя
+    if not путь.is_file():
+        путь = ресурсы.файл("agent", имя, переменная="ASRHUB_AGENT_DIR") or путь
     try:
         return путь.read_text(encoding="utf-8")
     except OSError as exc:
         raise error_response(ASRHubError(
             f"Файл агента «{имя}» не найден в установке сервера.",
-            hint="Похоже, сервер обновляли частично: каталог agent/ отсутствует.")) from exc
+            hint="Похоже, сервер обновляли частично: каталог agent/ отсутствует. "
+                 "Укажите его переменной ASRHUB_AGENT_DIR.")) from exc
 
 
 @router.get("/asrhub-agent.py", summary="Исходный текст агента")

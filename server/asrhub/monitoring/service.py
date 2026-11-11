@@ -81,7 +81,13 @@ class MonitoringService:
         запрошено = time.time()
         with self._собран:
             while True:
-                if not fresh and time.time() - self._cache_at < self.cache_ttl_s:
+                # Срок кеша — не меньше длительности последнего сбора: на
+                # большом архиве сбор идёт секунды, и при кеше короче сбора
+                # каждый опрос запускал новый сразу после предыдущего —
+                # база не отдыхала вовсе. Ноль в настройке — кеш выключен.
+                срок = (max(self.cache_ttl_s, getattr(self, "_длился_с", 0.0))
+                        if self.cache_ttl_s > 0 else 0.0)
+                if not fresh and time.time() - self._cache_at < срок:
                     return list(self._cache), list(self._cache_errors)
                 if not self._сбор_идёт:
                     self._сбор_идёт = True
@@ -98,7 +104,9 @@ class MonitoringService:
                         f"снимок устарел: сбор идёт дольше {ЖДАТЬ_СБОР_С:g} с, отдан "
                         f"собранный {time.time() - self._cache_at:.0f} с назад"]
         try:
+            начало = time.monotonic()
             collected, errors = self.collector.collect()
+            self._длился_с = time.monotonic() - начало
             collected.extend(self.push.healthy_samples())
             self.alerts.evaluate(collected)
             with self._собран:
@@ -373,5 +381,7 @@ class MonitoringService:
         from ..maintenance import send_json  # noqa: PLC0415
 
         threading.Thread(target=send_json, args=(тело, адрес),
-                         kwargs={"what": "тревога"}, name="asrhub-alert-notify",
+                         kwargs={"what": "тревога", "попыток": 4,
+                                 "allow_internal": bool(settings.get("webhook_allow_internal"))},
+                         name="asrhub-alert-notify",
                          daemon=True).start()

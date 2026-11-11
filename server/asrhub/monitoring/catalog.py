@@ -154,6 +154,12 @@ GROUPS: list[dict[str, str]] = [
     {"id": "content", "title": "Содержание записей",
      "description": "О чём и как шли разговоры: тональность, тревожные "
                     "упоминания, обещания, скрипт, состояние разбора."},
+    {"id": "telephony", "title": "Телефония",
+     "description": "Забор звонков со станций: жива ли станция, сколько звонков "
+                    "за сутки, отложенные, пульс сценария отправки диалплана."},
+    {"id": "qc", "title": "Контроль качества",
+     "description": "Обратные звонки с опросом: очередь, регистрация телефона, "
+                    "дозвон и средняя оценка за сутки."},
 ]
 
 GROUPS_BY_ID = {g["id"]: g for g in GROUPS}
@@ -337,6 +343,31 @@ _m(MetricSpec(
     threshold=Threshold("above", warning=1800, critical=7200, for_seconds=300),
     troubleshooting="Проверьте политику планирования: при priority_fifo длинная "
                     "запись может ждать за многочасовым архивом",
+))
+
+_m(MetricSpec(
+    name="asrhub_deadline_overdue", type="gauge", group="queue",
+    label="Просрочено в очереди",
+    description=(
+        "Заданий в очереди, чей срок выполнения (deadline) уже прошёл: результат "
+        "опоздает, даже если взять их прямо сейчас."
+    ),
+    recommendation="Срок обещан клиенту — значит, о его срыве надо узнать раньше клиента.",
+    normal="0",
+    threshold=Threshold("above", warning=0, for_seconds=300),
+    troubleshooting=(
+        "Политика планирования «deadline» берёт задания по сроку; при "
+        "«priority_fifo» срок не учитывается вовсе. Добавьте воркеров или "
+        "снимите лишнее из очереди."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_deadline_missed_day", type="gauge", group="queue",
+    label="Сроков сорвано за сутки",
+    description="Заданий со сроком, завершённых за последние сутки позже срока.",
+    normal="0",
+    threshold=Threshold("above", warning=0, for_seconds=0),
 ))
 
 _m(MetricSpec(
@@ -1804,6 +1835,169 @@ _m(MetricSpec(
         "asrhub_content_analyzed / (asrhub_content_analyzed + asrhub_content_pending)."
     ),
     normal="равно числу завершённых записей с расшифровкой",
+))
+
+
+# ---------------------------------------------------------------------------
+# Телефония
+# ---------------------------------------------------------------------------
+
+_m(MetricSpec(
+    name="asrhub_telephony_station_up", type="gauge", group="telephony",
+    label="Станция на связи", labels=("station", "source"),
+    description=(
+        "1 — последний заход к станции прошёл без ошибки (журнал CDR, AMI, "
+        "каталог записей). У станции «вызов из диалплана» — сценарий отправки "
+        "присылал пульс в последние полчаса (или пульса не было никогда: "
+        "сценарий старой версии или без cron)."
+    ),
+    recommendation=(
+        "Главная тревога телефонии: остановка забора иначе видна только "
+        "глазами в разделе «АТС», а звонки за это время не распознаются."
+    ),
+    normal="1 у каждой включённой станции",
+    threshold=Threshold("below", warning=1, for_seconds=900),
+    troubleshooting=(
+        "Раздел «АТС» → «Проверить связь» и «Почему не приходят звонки»: там "
+        "видно, что именно не так — адрес, пароль, файл журнала, права. Для "
+        "диалплана — asrhub-dialplan --status на станции."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_telephony_calls_day", type="gauge", group="telephony",
+    label="Звонков за сутки", labels=("station", "result"),
+    description=(
+        "Звонков станции за последние сутки по итогу: queued — поставлен в "
+        "распознавание, skipped — пропущен порогами (короткий, без ответа, нет "
+        "записи), deferred — отложен (запись ещё пишется, очередь отказала)."
+    ),
+    recommendation=(
+        "Свой порог по рабочему времени: «queued меньше N за сутки в будний "
+        "день» ловит тихую остановку, которую станция не считает ошибкой."
+    ),
+    normal="повторяет суточный ритм станции",
+))
+
+_m(MetricSpec(
+    name="asrhub_telephony_deferred", type="gauge", group="telephony",
+    label="Отложенных звонков", labels=("station",),
+    description=(
+        "Звонков станции в отложенных сейчас: ждут записи или места в очереди. "
+        "Отложенный разбирается каждым заходом и через сутки отмечается "
+        "пропущенным."
+    ),
+    normal="единицы — записи дописываются",
+    threshold=Threshold("above", warning=200, for_seconds=3600),
+    troubleshooting=(
+        "Причины — в разделе «АТС», колонка «Пропущено»: «нет записи» — не тот "
+        "каталог или маска файла; «очередь отказала» — переполнена очередь."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_telephony_last_import_age_seconds", type="gauge", group="telephony",
+    label="С последнего звонка", unit="с", labels=("station",),
+    description="Сколько секунд прошло с последнего звонка станции, попавшего в архив.",
+    recommendation=(
+        "Порог задайте сами по графику работы: ночью и в выходные тишина "
+        "нормальна, в рабочий день час без звонков — повод посмотреть."
+    ),
+))
+
+_m(MetricSpec(
+    name="asrhub_dialplan_spool_pending", type="gauge", group="telephony",
+    label="Очередь повтора сценария", labels=("station",),
+    description=(
+        "Сколько звонков ждёт в очереди повтора сценария asrhub-dialplan на "
+        "станции — по его пульсу. Не ноль полчаса подряд — сервер для станции "
+        "недоступен (сеть, сертификат, ключ) или отвечает 5xx."
+    ),
+    normal="0",
+    threshold=Threshold("above", warning=0, for_seconds=1800),
+    troubleshooting="На станции: asrhub-dialplan --status и журнал /var/log/asterisk/asrhub-dialplan.log.",
+))
+
+_m(MetricSpec(
+    name="asrhub_dialplan_pulse_age_seconds", type="gauge", group="telephony",
+    label="Пульс сценария отправки", unit="с", labels=("station",),
+    description=(
+        "Сколько секунд назад сценарий отправки прислал пульс (cron, раз в "
+        "пять минут). Ряда нет, пока пульса не было ни разу."
+    ),
+    normal="до 300",
+    threshold=Threshold("above", warning=1800, for_seconds=0),
+    troubleshooting="Досылка не запускается: asrhub-dialplan --install заводит /etc/cron.d/asrhub-dialplan.",
+))
+
+_m(MetricSpec(
+    name="asrhub_dialplan_rejected_day", type="gauge", group="telephony",
+    label="Отказов приёма за сутки", labels=("station",),
+    description=(
+        "Обращений из диалплана, отвергнутых сервером сегодня: ключ, станция, "
+        "негодный звонок. Отказы до выбора станции считаются под станцией «»."
+    ),
+    normal="0",
+    threshold=Threshold("above", warning=10, for_seconds=0),
+    troubleshooting="Причины — в журнале обращений раздела «Asterisk: диалплан».",
+))
+
+# ---------------------------------------------------------------------------
+# Контроль качества
+# ---------------------------------------------------------------------------
+
+_m(MetricSpec(
+    name="asrhub_qc_registered", type="gauge", group="qc",
+    label="Телефон опросов зарегистрирован",
+    description=(
+        "1 — телефон контроля качества зарегистрирован на станции (или "
+        "работает без регистрации), 0 — станция отвергла регистрацию. Ряда "
+        "нет, пока контроль качества выключен."
+    ),
+    normal="1",
+    threshold=Threshold("below", warning=1, for_seconds=600),
+    troubleshooting="Раздел «Контроль качества» → «Проверить связь»: код ответа станции и подсказка.",
+))
+
+_m(MetricSpec(
+    name="asrhub_qc_waiting", type="gauge", group="qc",
+    label="Опросов ждёт звонка",
+    description="Опросов в очереди обзвона: ждут своего часа или повтора.",
+    normal="растёт днём, к вечеру уходит в ноль",
+    threshold=Threshold("above", warning=500, for_seconds=3600),
+    troubleshooting="Обзвон не успевает: часы обзвона, qc_parallel, отказы станции.",
+))
+
+_m(MetricSpec(
+    name="asrhub_qc_surveys_day", type="gauge", group="qc",
+    label="Опросов за сутки", labels=("status",),
+    description="Опросов, завершённых за последние сутки, по итогу: пройден, частично, не дозвонились, отказ…",
+))
+
+_m(MetricSpec(
+    name="asrhub_qc_score_pct_day", type="gauge", group="qc",
+    label="Средняя оценка за сутки", unit="%",
+    description=(
+        "Средняя оценка клиентов за последние сутки в процентах шкалы (0 — "
+        "худшая, 100 — лучшая). Ряд появляется, когда оценок за сутки не "
+        "меньше трёх: по одной-двум средняя ничего не говорит."
+    ),
+    recommendation="Порог подберите по своей обычной оценке: тревога — о резком падении.",
+    normal="стабильна изо дня в день",
+    threshold=Threshold("below", warning=60, for_seconds=0),
+    troubleshooting="Отчёт раздела «Контроль качества»: оценки по группам и добавочным.",
+))
+
+_m(MetricSpec(
+    name="asrhub_qc_unreached_share_day", type="gauge", group="qc",
+    label="Доля недозвонов за сутки",
+    description=(
+        "Доля опросов «не дозвонились» среди завершённых за сутки (0…1). Ряд "
+        "появляется от пяти завершённых опросов."
+    ),
+    normal="до 0,4",
+    threshold=Threshold("above", warning=0.6, for_seconds=0),
+    troubleshooting="Поздние часы обзвона, отказы станции (код SIP в журнале опросов), номера без выхода в город.",
 ))
 
 

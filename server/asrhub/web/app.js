@@ -169,11 +169,28 @@ const API = {
     delete opts.background;
     const noLogin = opts.noLogin === true;
     delete opts.noLogin;
+    // Предел ожидания чтения: повисший отчёт оставлял «Загрузка…» навсегда.
+    // Только для GET — загрузка файла и долгие действия идут без предела.
+    const предел = opts.timeout !== undefined ? Number(opts.timeout) || 0
+      : (method === 'GET' ? 60000 : 0);
+    delete opts.timeout;
     let own = null;
     if (!opts.signal && method === 'GET' && !background) {
       own = new AbortController();
       opts.signal = own.signal;
       this._pending.add(own);
+    }
+    let поСроку = false;
+    let таймер = null;
+    if (предел > 0) {
+      const свой = new AbortController();
+      const чужой = opts.signal;
+      if (чужой) {
+        if (чужой.aborted) свой.abort();
+        else чужой.addEventListener('abort', () => свой.abort(), { once: true });
+      }
+      opts.signal = свой.signal;
+      таймер = setTimeout(() => { поСроку = true; свой.abort(); }, предел);
     }
     let response;
     let text;
@@ -186,6 +203,10 @@ const API = {
       // консоли при обычном переключении вкладок.
       text = await response.text();
     } catch (err) {
+      if (err && err.name === 'AbortError' && поСроку) {
+        throw { code: 'timeout', message: `Сервер не ответил за ${Math.round(предел / 1000)} с`,
+                hint: 'Отчёт за большой период может считаться долго: повторите или сузьте период.' };
+      }
       if (err && err.name === 'AbortError') {
         // Запрос отменён более свежим — это не сбой, а штатный ход.
         throw { code: 'aborted', message: 'Запрос отменён', silent: true };
@@ -194,6 +215,7 @@ const API = {
               hint: 'Проверьте, что служба asrhub запущена и доступна по сети.' };
     } finally {
       if (own) this._pending.delete(own);
+      if (таймер) clearTimeout(таймер);
     }
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
@@ -726,6 +748,10 @@ function promptPasswordChange(optional, причина) {
   const объяснение = причина === 'default'
     ? `Сейчас действует пароль, заданный при первом запуске. Он известен всем,
        у кого есть эта программа, поэтому работать с сервером до смены нельзя.`
+    : причина === 'first'
+      ? `Сейчас действует пароль первого запуска из файла admin-password.txt в каталоге
+         данных сервера: его мог прочитать любой, у кого есть доступ к серверу. Придумайте
+         свой — после смены файл удалится и откроется интерфейс.`
     : `Пароль выдан администратором и действует до первого входа: придумайте
        свой — его будете знать только вы. После смены откроется интерфейс.`;
   const card = h(`<div class="card" style="max-width:460px;margin:60px auto">
@@ -1094,6 +1120,7 @@ const VIEWS = {
   backup:     { title: 'Резервные копии', subtitle: 'Копии настроек и данных, восстановление, расписание и срок хранения' },
   logs:       { title: 'Журнал', subtitle: 'События сервера и заданий' },
   help:       { title: 'Справка', subtitle: 'Как пользоваться, программный интерфейс, устранение неполадок' },
+  manual:     { title: 'Документация', subtitle: 'Руководство этой версии: установка, разделы, API, телефония, эксплуатация — с поиском' },
 };
 
 function go(view) {
@@ -1114,6 +1141,9 @@ function go(view) {
   const meta = VIEWS[view] || { title: view, subtitle: '' };
   qs('#view-title').textContent = meta.title;
   qs('#view-subtitle').textContent = meta.subtitle;
+  // Раздел — и в заголовке вкладки: в истории и среди вкладок разделы
+  // были неразличимы («ASR Hub — сервер распознавания речи» везде).
+  document.title = `${meta.title} — ASR Hub`;
   // Смена hash сама по себе вызовет render(); флаг гасит повторную отрисовку,
   // иначе каждый переход слал все запросы раздела дважды.
   if (location.hash.replace('#', '') !== view) {
@@ -1133,6 +1163,19 @@ function render() {
   if (запись) {
     go('results');
     window.__asrhub.openJob(запись[1]);
+    return;
+  }
+  // Глава руководства: #manual/05-web-interface/якорь — ссылку можно
+  // переслать коллеге, и она откроет нужное место.
+  const глава = /^manual\/([\w.-]+)(?:\/(.+))?$/.exec(hash);
+  if (глава) {
+    state.manualChapter = глава[1];
+    state.manualAnchor = глава[2] ? decodeURIComponent(глава[2]) : '';
+    if (state.view === 'manual' && RENDERERS.manual.open) {
+      RENDERERS.manual.open(глава[1], state.manualAnchor);
+      return;
+    }
+    go('manual');
     return;
   }
   go(VIEWS[hash] ? hash : 'transcribe');
@@ -1316,7 +1359,21 @@ document.addEventListener('DOMContentLoaded', () => {
     localStorage.removeItem('asrhub_key');
     location.reload();
   });
-  if (localStorage.getItem('asrhub_theme') === 'light') document.body.classList.add('light');
+  // Тема: выбранная кнопкой — запоминается; не выбранная — как в системе,
+  // и следует за ней, когда система переключается (вечером на тёмную).
+  const системная = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null;
+  const своя = localStorage.getItem('asrhub_theme');
+  if (своя === 'light' || (!своя && системная && системная.matches)) {
+    document.body.classList.add('light');
+  }
+  if (системная && системная.addEventListener) {
+    системная.addEventListener('change', (e) => {
+      if (localStorage.getItem('asrhub_theme')) return;      // выбрана кнопкой
+      document.body.classList.toggle('light', e.matches);
+      renderView();
+      document.body.dispatchEvent(new CustomEvent('asrhub:theme'));
+    });
+  }
   qs('#theme-toggle').addEventListener('click', () => {
     document.body.classList.toggle('light');
     localStorage.setItem('asrhub_theme',
@@ -1353,6 +1410,7 @@ const HOTKEY_VIEWS = ['dashboard', 'transcribe', 'dictation', 'queue', 'results'
 
 const HOTKEY_HELP = [
   ['1 … 0', 'переход к разделу по номеру: первые десять разделов в порядке меню'],
+  ['Ctrl+K', 'переход в любой раздел по названию'],
   ['/', 'поиск в текущем разделе'],
   ['u', 'выбрать файлы для загрузки'],
   ['r', 'обновить данные раздела'],
@@ -1372,7 +1430,11 @@ function inEditable(target) {
 function closeTopModal() {
   const modals = qsa('.modal-backdrop');
   if (!modals.length) return false;
-  closeModal(modals[modals.length - 1]);
+  const верхнее = modals[modals.length - 1];
+  // Окно, которое закрывается только своей кнопкой (новый ключ): Esc его не
+  // трогает, иначе ключ, показанный один раз, терялся случайным нажатием.
+  if (верхнее.__sticky) return true;
+  closeModal(верхнее);
   return true;
 }
 
@@ -1431,7 +1493,10 @@ function mountModal(backdrop, options) {
     }
   };
   backdrop.addEventListener('keydown', backdrop.__trap);
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(backdrop); });
+  backdrop.__sticky = !!opts.sticky;
+  backdrop.addEventListener('click', (e) => {
+    if (e.target === backdrop && !backdrop.__sticky) closeModal(backdrop);
+  });
 
   const initial = qsa(FOCUSABLE, dialog).filter((el) => el.offsetParent !== null)[0];
   (initial || dialog).focus();
@@ -1453,6 +1518,137 @@ function closeModal(backdrop) {
     if (app) app.removeAttribute('aria-hidden');
   }
   if (back && typeof back.focus === 'function' && document.contains(back)) back.focus();
+}
+
+/**
+ * Окно с одним полем: замена `prompt()`.
+ *
+ * Системный диалог браузер может подавить («не показывать окна с этой
+ * страницы»), он не принимает пароль скрытым полем и не даёт подсказок.
+ * Ответ — введённое значение или null, если окно закрыли.
+ */
+function askValue({ title, label, value = '', type = 'text', hint = '', ok = 'Готово',
+                    list = [], required = false, check = null }) {
+  return new Promise((resolve) => {
+    const ид = `ask-${Math.random().toString(36).slice(2, 8)}`;
+    const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:460px">
+      <div class="modal-head"><b>${esc(title)}</b><span class="spacer"></span>
+        <button class="ghost icon" data-ask-close aria-label="Закрыть" title="Закрыть">✕</button></div>
+      <div class="modal-body">
+        <label class="small" for="${ид}">${esc(label)}</label>
+        <input id="${ид}" type="${esc(type)}" value="${esc(value)}" autocomplete="off"
+          ${list.length ? `list="${ид}-list"` : ''} style="width:100%;margin-top:4px">
+        ${list.length ? `<datalist id="${ид}-list">${list.map((з) =>
+          `<option value="${esc(з)}"></option>`).join('')}</datalist>` : ''}
+        ${hint ? `<div class="small dim" style="margin-top:6px">${esc(hint)}</div>` : ''}
+        <div class="small err" data-ask-err style="margin-top:6px"></div></div>
+      <div class="modal-foot"><button class="ghost" data-ask-close>Отмена</button>
+        <button class="primary" data-ask-ok>${esc(ok)}</button></div></div></div>`);
+    let ответ = null;
+    backdrop.addEventListener('asrhub:closed', () => resolve(ответ));
+    mountModal(backdrop, { label: title });
+    const поле = qs(`#${ид}`, backdrop);
+    поле.focus();
+    const готово = () => {
+      const значение = поле.value;
+      const беда = (required && !значение.trim()) ? 'Поле не заполнено.'
+        : (check ? check(значение) : '');
+      if (беда) { qs('[data-ask-err]', backdrop).textContent = беда; поле.focus(); return; }
+      ответ = значение;
+      closeModal(backdrop);
+    };
+    qs('[data-ask-ok]', backdrop).onclick = готово;
+    поле.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); готово(); } });
+    qsa('[data-ask-close]', backdrop).forEach((к) => { к.onclick = () => closeModal(backdrop); });
+  });
+}
+
+/**
+ * Подтверждение в своём окне вместо системного `confirm()`: тот блокирует
+ * всю страницу (и опрос сервера), не читается программами экранного
+ * доступа как часть интерфейса, а браузер после пары подряд предлагает
+ * «запретить этой странице диалоги» — и дальше каждое удаление молча
+ * отменялось. Первая строка текста — заголовок, остальное — пояснение.
+ * Опасное действие (удалить, забыть, отозвать) — красная кнопка.
+ */
+function подтвердить(текст, { ok = '', опасно = null } = {}) {
+  // Ответ за человека — для браузерных проверок (см. tests/drill_seed.py,
+  // `отвечать`): вопрос записывается, окно не показывается.
+  const авто = window.__asrhubConfirm;
+  if (авто === true || авто === false) {
+    (window.__asrhubConfirms = window.__asrhubConfirms || []).push(String(текст || ''));
+    return Promise.resolve(авто);
+  }
+  return new Promise((resolve) => {
+    const [заголовок, ...остальное] = String(текст || '').split('\n');
+    const пояснение = остальное.join('\n').trim();
+    const красная = опасно !== null ? опасно
+      : /удал|забыть|отозв|убрать|отключ|выключ|отмен|сброс|отброс|безвозвратн/i.test(заголовок);
+    const кнопка = ok || (красная ? 'Да, выполнить' : 'Продолжить');
+    const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:480px"
+        role="alertdialog" aria-modal="true">
+      <div class="modal-head"><b>${esc(заголовок)}</b></div>
+      ${пояснение ? `<div class="modal-body"><p class="small" style="white-space:pre-line;margin:0">${
+        esc(пояснение)}</p></div>` : ''}
+      <div class="modal-foot"><button class="ghost" data-confirm-no>Отмена</button>
+        <button class="${красная ? 'danger' : 'primary'}" data-confirm-yes>${esc(кнопка)}</button></div>
+    </div></div>`);
+    let ответ = false;
+    backdrop.addEventListener('asrhub:closed', () => resolve(ответ));
+    mountModal(backdrop, { label: заголовок });
+    const да = qs('[data-confirm-yes]', backdrop);
+    да.onclick = () => { ответ = true; closeModal(backdrop); };
+    qs('[data-confirm-no]', backdrop).onclick = () => closeModal(backdrop);
+    // Фокус — на «Отмене» у опасного действия: случайный Enter не удаляет.
+    (красная ? qs('[data-confirm-no]', backdrop) : да).focus();
+  });
+}
+
+/**
+ * Новый ключ доступа: показывается один раз, поэтому — окно с полем,
+ * «Скопировать» и «Скачать», которое закрывается только своей кнопкой.
+ * Раньше это был `prompt()`: подавленный браузером диалог или случайный Esc —
+ * и ключ потерян, заводи новый.
+ */
+function showSecretOnce(title, secret, note = '') {
+  return new Promise((resolve) => {
+    const backdrop = h(`<div class="modal-backdrop"><div class="modal" style="max-width:560px">
+      <div class="modal-head"><b>${esc(title)}</b></div>
+      <div class="modal-body">
+        <div class="banner warn" style="margin-bottom:10px">Ключ показывается один раз:
+          сохраните его сейчас. Потом его не увидит никто, включая администратора.</div>
+        <input type="text" readonly class="mono" data-secret value="${esc(secret)}"
+          aria-label="Ключ доступа" style="width:100%">
+        ${note ? `<div class="small dim" style="margin-top:8px">${esc(note)}</div>` : ''}</div>
+      <div class="modal-foot">
+        <button class="ghost" data-secret-copy>Скопировать</button>
+        <button class="ghost" data-secret-save>Скачать</button>
+        <span class="spacer"></span>
+        <button class="primary" data-secret-done>Я сохранил ключ</button></div></div></div>`);
+    backdrop.addEventListener('asrhub:closed', () => resolve());
+    mountModal(backdrop, { label: title, sticky: true });
+    const поле = qs('[data-secret]', backdrop);
+    поле.focus();
+    поле.select();
+    qs('[data-secret-copy]', backdrop).onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(secret);
+        toast('Ключ скопирован', 'ok');
+      } catch (err) {
+        поле.select();
+        toast('Скопируйте ключ вручную: Ctrl+C', 'warn');
+      }
+    };
+    qs('[data-secret-save]', backdrop).onclick = () => {
+      const ссылка = document.createElement('a');
+      ссылка.href = URL.createObjectURL(new Blob([`${secret}\n`], { type: 'text/plain' }));
+      ссылка.download = 'asrhub-key.txt';
+      document.body.appendChild(ссылка);
+      ссылка.click();
+      setTimeout(() => { URL.revokeObjectURL(ссылка.href); ссылка.remove(); }, 1000);
+    };
+    qs('[data-secret-done]', backdrop).onclick = () => closeModal(backdrop);
+  });
 }
 
 function focusSearch() {
@@ -1482,8 +1678,66 @@ function showHotkeys() {
   qs('#hk-close', backdrop).onclick = () => closeModal(backdrop);
 }
 
+/**
+ * Подписи полей для программ экранного доступа. Во многих разделах поле
+ * подписано только подсказкой внутри (placeholder): она исчезает при вводе и
+ * не читается как имя поля. Поле без имени получает aria-label из подсказки,
+ * всплывающего title или текста соседней подписи — один проход после каждой
+ * перерисовки, а не правка сотни шаблонов.
+ */
+function подписатьПоля(корень = document) {
+  qsa('input:not([type=hidden]):not([aria-label]):not([aria-labelledby]), select:not([aria-label]):not([aria-labelledby]), textarea:not([aria-label]):not([aria-labelledby])', корень)
+    .forEach((поле) => {
+      if (поле.id && корень.querySelector && document.querySelector(`label[for="${CSS.escape(поле.id)}"]`)) return;
+      if (поле.closest('label')) return;
+      const рядом = поле.previousElementSibling;
+      const имя = поле.getAttribute('placeholder') || поле.getAttribute('title')
+        || (рядом && /^(LABEL|SPAN|B)$/.test(рядом.tagName) ? рядом.textContent.trim() : '')
+        || (поле.type === 'checkbox' ? 'выбрать' : '');
+      if (имя) поле.setAttribute('aria-label', имя.slice(0, 120));
+    });
+}
+(() => {
+  let ждёт = false;
+  const наблюдатель = new MutationObserver(() => {
+    if (ждёт) return;
+    ждёт = true;
+    requestAnimationFrame(() => { ждёт = false; подписатьПоля(); });
+  });
+  const начать = () => наблюдатель.observe(document.body, { childList: true, subtree: true });
+  if (document.body) начать(); else document.addEventListener('DOMContentLoaded', начать);
+})();
+
+/** Окно «перейти в раздел»: название раздела с подсказкой по первым буквам. */
+async function быстрыйПереход() {
+  if (qsa('.modal-backdrop').length) return;
+  const разделы = qsa('.nav-item[data-view]').map((к) => ({
+    view: к.dataset.view, title: (VIEWS[к.dataset.view] || {}).title || к.textContent.trim(),
+  }));
+  const ответ = await askValue({
+    title: 'Перейти в раздел', label: 'Раздел', list: разделы.map((р) => р.title),
+    hint: 'Начните вводить название, Enter — перейти. Ctrl+K — это окно из любого места.',
+    ok: 'Перейти',
+    check: (з) => (разделы.some((р) => р.title.toLowerCase().startsWith(з.trim().toLowerCase())
+      && з.trim()) ? '' : 'Такого раздела нет.'),
+  });
+  if (ответ === null || ответ === undefined) return;
+  const искомое = String(ответ).trim().toLowerCase();
+  const найден = разделы.find((р) => р.title.toLowerCase() === искомое)
+    || разделы.find((р) => р.title.toLowerCase().startsWith(искомое));
+  if (найден) go(найден.view);
+}
+
 function installHotkeys() {
   document.addEventListener('keydown', (e) => {
+    // Ctrl+K (⌘K) — переход в любой раздел по первым буквам: цифрами
+    // достаются только первые десять разделов из тридцати.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K'
+        || e.key === 'л' || e.key === 'Л')) {
+      e.preventDefault();
+      быстрыйПереход();
+      return;
+    }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
     if (e.key === 'Escape') {
@@ -3764,7 +4018,7 @@ RENDERERS.queue = {
       } catch (err) { fail(err); }
     };
     qs('#q-clear').onclick = async () => {
-      if (!confirm('Отменить все ожидающие задания?')) return;
+      if (!await подтвердить('Отменить все ожидающие задания?')) return;
       try {
         const r = await API.post('/api/queue/clear');
         toast(`Отменено: ${r.cancelled}`, 'warn');
@@ -4075,7 +4329,7 @@ window.__asrhub.download = async (id, fmt) => {
 
 window.__asrhub.jobAction = async (id, action) => {
   try {
-    if (action === 'cancel' && !confirm('Отменить задание?')) return;
+    if (action === 'cancel' && !await подтвердить('Отменить задание?')) return;
     await API.post(`/api/jobs/${id}/${action}`);
     toast('Выполнено', 'ok');
     await refreshQueue();
@@ -4153,16 +4407,17 @@ const Bulk = {
     if (action === 'llm') return this.llm(ids);
     const тело = { action, ids };
     if (action === 'tag') {
-      const метка = prompt(
-        `Метка для ${ids.length} ${plural(ids.length, 'задания', 'заданий', 'заданий')}` +
-        ' (пустая строка снимет метку):', '');
+      const метка = await askValue({
+        title: `Метка для ${ids.length} ${plural(ids.length, 'задания', 'заданий', 'заданий')}`,
+        label: 'Метка', ok: 'Поставить', list: [...new Set(state.knownTags || [])],
+        hint: 'Пустое поле снимет метку. Несколько меток — через запятую.' });
       if (метка === null) return;
       тело.tags = метка.trim();
     }
-    if (action === 'delete' && !confirm(
+    if (action === 'delete' && !await подтвердить(
         `Удалить ${ids.length} ${plural(ids.length, 'задание', 'задания', 'заданий')} ` +
         'вместе с записями и результатами? Это не отменить.')) return;
-    if (action === 'retry' && !confirm(
+    if (action === 'retry' && !await подтвердить(
         `Поставить ${ids.length} ${plural(ids.length, 'задание', 'задания', 'заданий')} ` +
         'в очередь заново?')) return;
     try {
@@ -4400,6 +4655,9 @@ RENDERERS.results = {
              ${num(data.search_limit || 0)} самых свежих совпадений — их больше.
              Уточните запрос или сузьте период, чтобы увидеть остальные.</div>`
         : '';
+      // Метки на странице — подсказки для окна «Метка» массового действия.
+      state.knownTags = [...new Set([...(state.knownTags || []), ...data.items.flatMap((j) =>
+        String(j.tags || '').split(',').map((т) => т.trim()).filter(Boolean))])].slice(-200);
       host.innerHTML = data.items.length ? обрезано + `<table>
         <thead><tr><th class="pick"><input type="checkbox" id="r-pick-all"
             title="Выбрать все на странице"></th>
@@ -4409,7 +4667,7 @@ RENDERERS.results = {
           <th style="width:230px">Выгрузка</th></tr></thead><tbody>
         ${data.items.map((job) => `<tr data-id="${job.id}">
           <td class="pick"><input type="checkbox" class="pick-one" value="${job.id}"
-            ${Bulk.has(job.id) ? 'checked' : ''}></td>
+            aria-label="Выбрать ${esc(job.filename)}" ${Bulk.has(job.id) ? 'checked' : ''}></td>
           <td><div class="truncate" style="max-width:260px">${esc(job.filename)}</div>
             ${job.match && job.match.snippet
               ? `<div class="found small truncate" style="max-width:260px" tabindex="0" role="button"
@@ -4428,7 +4686,7 @@ RENDERERS.results = {
           <td class="num">${job.avg_confidence ? pct(job.avg_confidence, 0) : '—'}</td>
           <td class="num">${job.speakers_count || '—'}</td>
           <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
-          <td><div class="row" style="gap:3px">
+          <td class="exports"><div class="row" style="gap:3px;flex-wrap:nowrap">
             <button class="ghost sm" onclick="__asrhub.playRecording(${jsArg(job.id)})"
               title="Прослушать запись">▶</button>
             ${['txt', 'srt', 'json', 'docx'].map((f) =>
@@ -4735,6 +4993,13 @@ const Player = {
   },
 };
 window.__asrhub.playRecording = (id) => window.__asrhub.openJob(id, { play: true });
+// «Запись» у другой ноги разговора в карточке звонка (см. call.legs).
+document.addEventListener('click', (ев) => {
+  const ссылка = ев.target.closest && ев.target.closest('[data-leg-job]');
+  if (!ссылка) return;
+  ев.preventDefault();
+  window.__asrhub.openJob(ссылка.dataset.legJob);
+});
 /**
  * Выгрузка отчёта в таблицу.
  *
@@ -4821,6 +5086,8 @@ function showJobModal(job, opts) {
       <b>${esc(job.filename)}</b>
       ${statusChip(job.status)}
       <span class="spacer"></span>
+      <button class="ghost icon" id="modal-link" aria-label="Ссылка на запись"
+        title="Скопировать ссылку на эту запись">🔗</button>
       <button class="ghost icon" id="modal-close" aria-label="Закрыть" title="Закрыть">✕</button>
     </div>
     <div class="modal-body">
@@ -4838,6 +5105,9 @@ function showJobModal(job, opts) {
         ${job.loudness_lufs !== null && job.loudness_lufs !== undefined ? ` · громкость ${num(job.loudness_lufs, 0)} LUFS` : ''}
         ${job.silence_share !== null && job.silence_share !== undefined ? ` · тишины ${pct(job.silence_share, 0)}` : ''}</div>` : ''}
 
+      ${job.deadline ? `<div class="small dim" style="margin:-6px 0 12px" id="job-deadline">
+        <b class="small">Срок</b>: ${esc(fmtTime(job.deadline))}${job.deadline_missed
+          ? ' <span class="chip warn">сорван</span>' : ''}</div>` : ''}
       ${job.call ? `<div class="card tight" style="margin-bottom:12px">
         <b class="small">${job.source === 'asterisk' ? 'Звонок с АТС' : 'Звонок'}</b>
         <div class="small dim" style="margin-top:4px">
@@ -4854,7 +5124,29 @@ function showJobModal(job, opts) {
           из ${fmtDur(job.call.duration || 0)} ·
           ${job.call.answered ? 'ответили' : esc((job.call.disposition || '').toLowerCase() || 'без ответа')}
           · идентификатор <span class="mono">${esc(job.call.pbx_uid || job.call.uniqueid || '')}</span>
+          ${job.call.linkedid && job.call.linkedid !== job.call.pbx_uid
+            ? ` · разговор <span class="mono">${esc(job.call.linkedid)}</span>` : ''}
         </div>
+        ${job.qc_survey ? `<div class="small" style="margin-top:6px" id="call-qc">
+          <b class="small">Оценка клиента</b> ·
+          ${job.qc_survey.score === null || job.qc_survey.score === undefined
+            ? esc(job.qc_survey.status || '') : `<b>${num(job.qc_survey.score, 2)}</b>${
+              job.qc_survey.score_pct !== null && job.qc_survey.score_pct !== undefined
+                ? ` <span class="dim">(${num(job.qc_survey.score_pct, 0)}% шкалы)</span>` : ''}`}
+          · ${esc(job.qc_survey.group_name || '')} · ${esc(fmtTime(job.qc_survey.finished_at))}
+          ${(job.qc_survey.answers || []).map((о) => `<div class="small dim">${esc(о.text || '')}: <b class="mono">${
+            о.digit === null || о.digit === undefined ? '—' : esc(о.digit)}</b></div>`).join('')}
+        </div>` : ''}
+        ${(job.call.legs || []).length ? `<div class="small" style="margin-top:6px" id="call-legs">
+          <b class="small">Другие ноги разговора</b>
+          ${job.call.legs.map((н) => `<div class="small dim">
+            ${esc(fmtTime(н.started_at))} · ${esc(н.src || '—')} → ${esc(н.dst || '—')}
+            ${н.agent ? ` · добавочный <span class="mono">${esc(н.agent)}</span>` : ''}
+            ${н.queue ? ` · очередь ${esc(н.queue)}` : ''}
+            · ${esc((н.disposition || '').toLowerCase() || '—')}, разговор ${fmtDur(н.billsec || 0)}
+            ${н.job_id ? ` · <a href="#" data-leg-job="${esc(н.job_id)}">запись</a>`
+              : н.skipped ? ` · <span class="dim">${esc(н.skipped)}</span>` : ''}</div>`).join('')}
+        </div>` : ''}
       </div>` : ''}
 
       ${job.error_message && EMPTY_STATUSES.includes(job.status)
@@ -4932,6 +5224,22 @@ function showJobModal(job, opts) {
 
   backdrop.dataset.jobId = String(job.id);
   mountModal(backdrop);
+  // Ссылка на карточку: адрес раздела в строке браузера не меняется (он
+  // остаётся адресом раздела), а ссылка на саму запись — по кнопке. Она
+  // открывает эту же карточку у коллеги (#jobs/<id>, см. render).
+  const ссылка = qs('#modal-link', backdrop);
+  if (ссылка) {
+    ссылка.onclick = async () => {
+      const адрес = `${location.origin}${location.pathname}#jobs/${encodeURIComponent(job.id)}`;
+      try {
+        await navigator.clipboard.writeText(адрес);
+        toast('Ссылка на запись скопирована', 'ok');
+      } catch (e) {
+        await askValue({ title: 'Ссылка на запись', label: 'Скопируйте адрес', value: адрес,
+                         ok: 'Закрыть' });
+      }
+    };
+  }
   const close = () => closeModal(backdrop);
   qs('#modal-close', backdrop).onclick = close;
   // Пробел — пуск и пауза, как и обещает подсказка на «▶». Обработчика не
@@ -9064,9 +9372,12 @@ RENDERERS.pbx = {
   async collect(режим, кнопка) {
     let тело = { station: state.pbxStation || '', mode: режим };
     if (режим === 'period') {
-      const с = window.prompt('Начало периода (ГГГГ-ММ-ДД):', '');
+      const с = await askValue({ title: 'Собрать архив за период', label: 'Начало периода',
+        type: 'date', ok: 'Дальше', required: true });
       if (!с) return;
-      const по = window.prompt('Конец периода (ГГГГ-ММ-ДД):', '');
+      const по = await askValue({ title: 'Собрать архив за период', label: 'Конец периода',
+        type: 'date', value: с, ok: 'Собрать', required: true,
+        check: (з) => (з < с ? 'Конец раньше начала.' : '') });
       if (!по) return;
       const начало = Date.parse(`${с}T00:00:00`) / 1000;
       const конец = Date.parse(`${по}T23:59:59`) / 1000;
@@ -9075,7 +9386,7 @@ RENDERERS.pbx = {
         return;
       }
       тело = { ...тело, since: начало, until: конец };
-    } else if (!window.confirm(
+    } else if (!await подтвердить(
       'Пройти журнал станции с начала и поднять весь архив?\n\n'
       + 'Звонки не задваиваются: уже импортированные пропускаются. '
       + 'На большом архиве это часы — ход виден здесь же.')) {
@@ -9147,7 +9458,7 @@ RENDERERS.pbx = {
       toast('Выберите станцию', 'warn', 'Позиция чтения своя у каждой станции.');
       return;
     }
-    if (!window.confirm('Забыть позицию чтения журнала?\n\n'
+    if (!await подтвердить('Забыть позицию чтения журнала?\n\n'
       + 'Следующий заход пойдёт с начала файла. Звонки не задваиваются.')) return;
     try {
       const итог = await API.post(
@@ -9295,7 +9606,7 @@ RENDERERS.pbx = {
     qsa('[data-enable]', тело).forEach((к) => {
       к.onclick = (е) => занятьКнопку(е.currentTarget, async () => {
         const включить = к.dataset.enable === '1';
-        if (!включить && !window.confirm('Выключить агента?\n\nСервер перестанет принимать '
+        if (!включить && !await подтвердить('Выключить агента?\n\nСервер перестанет принимать '
           + 'от него звонки, пока агента не включат снова.')) return;
         try {
           await API.post(`/api/telephony/agents/${encodeURIComponent(к.dataset.agent)}/enabled`,
@@ -9307,7 +9618,7 @@ RENDERERS.pbx = {
     });
     qsa('[data-drop]', тело).forEach((к) => {
       к.onclick = async () => {
-        if (!window.confirm('Забыть агента?\n\nПрисланные им звонки останутся в архиве.')) return;
+        if (!await подтвердить('Забыть агента?\n\nПрисланные им звонки останутся в архиве.')) return;
         try {
           await API.del(`/api/telephony/agents/${encodeURIComponent(к.dataset.drop)}`);
           this.drawAgents(тело);
@@ -9993,7 +10304,7 @@ RENDERERS.pbx = {
     const архив = (станция.calls || {}).total || 0;
     // Подтверждение спрашиваем, но не пугаем: звонки остаются, и человеку
     // важно это знать до нажатия, а не после.
-    const ответ = confirm(`Убрать станцию «${станция.name}»?\n\n`
+    const ответ = await подтвердить(`Убрать станцию «${станция.name}»?\n\n`
       + `Её ${num(архив, 0)} ${plural(архив, 'звонок', 'звонка', 'звонков')} останутся в архиве `
       + 'и в отчётах: убирается только подключение. Чтобы убрать и записи, '
       + 'пользуйтесь сроком хранения в разделе «Сервер».');
@@ -10420,7 +10731,7 @@ RENDERERS.dialplan = {
       <div class="grid cols-6" style="margin-bottom:16px">
         ${kpi('Станций приёма', num(станции.length, 0),
           esc(станции.map((с) => с.name).join(', ')) || 'не заведено')}
-        ${kpi('Обращений', num(свод.requests || 0, 0), 'с запуска сервера')}
+        ${kpi('Обращений', num(свод.requests || 0, 0), 'всего; счёт хранится в базе')}
         ${kpi('Поставлено', num(свод.queued || 0, 0), 'в очередь распознавания')}
         ${kpi('Пропущено', num((свод.skipped || 0) + (свод.duplicate || 0), 0),
           `порогами ${num(свод.skipped || 0, 0)}, повторов ${num(свод.duplicate || 0, 0)}`)}
@@ -10439,11 +10750,16 @@ RENDERERS.dialplan = {
               ${с.enabled ? '' : '<span class="chip warn">выключена</span>'}</td>
             <td class="small">короче ${num(с.min_duration_s || 0, 0)} с — мимо;
               ${с.skip_unanswered ? 'без ответа — мимо' : 'без ответа — тоже'}</td>
-            <td class="small">${esc(с.owner || '—')} · ${num(с.priority || 0, 0)}</td>
+            <td class="small">${esc(с.owner || '—')} · ${num(с.priority || 0, 0)}
+              <div class="small dim">${с.intake_key
+                ? `ключ «${esc(с.intake_key)}» · <a href="#" data-dp-unbind="${esc(с.id)}"
+                    title="Станция примет звонки от следующего ключа, который их пришлёт">отвязать</a>`
+                : 'ключ: закрепится за первым, кто пришлёт звонок'}</div></td>
             <td class="small mono">${esc(с.recordings_dir || '— только файлом')}</td>
             <td class="small">${п.last_at ? esc(fmtAgo(п.last_at)) : '<span class="dim">не было</span>'}
               ${п.last_error ? `<div class="small err" title="${esc(п.last_error)}">${
-                esc(String(п.last_error).slice(0, 80))}</div>` : ''}</td>
+                esc(String(п.last_error).slice(0, 80))}</div>` : ''}
+              ${пульсСценария(с.pulse)}</td>
             <td class="small">${num(з.total || 0, 0)} звонков, ${num(з.queued || 0, 0)} с записью</td>
             <td><button class="ghost sm" data-dp-edit="${esc(с.id)}">Изменить</button></td></tr>`;
         }).join('')}</tbody></table></div>` : ''}`;
@@ -10457,6 +10773,16 @@ RENDERERS.dialplan = {
     };
     const добавить = qs('#dp-add2');
     if (добавить) добавить.onclick = () => this.addStation();
+    qsa('[data-dp-unbind]', место).forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
+      ев.preventDefault();
+      if (!await подтвердить('Отвязать станцию от ключа? Она примет звонки от следующего ключа, '
+        + 'который их пришлёт.')) return;
+      try {
+        await API.del(`/api/telephony/dialplan/key/${encodeURIComponent(ссылка.dataset.dpUnbind)}`);
+        toast('Станция отвязана от ключа', 'ok');
+        await this.load();
+      } catch (err) { fail(err); }
+    }));
     qsa('[data-dp-edit]', место).forEach((к) => {
       к.onclick = () => RENDERERS.pbx.edit(к.dataset.dpEdit, {
         station: станции.find((с) => с.id === к.dataset.dpEdit) });
@@ -10693,9 +11019,18 @@ RENDERERS.dialplan = {
     const д = state.dpStatus;
     if (!место || !д) return;
     const записи = д.recent || [];
+    const дни = д.days || [];
+    const поДням = дни.length ? `<div class="table-wrap" style="margin-bottom:12px">
+      <table class="table" id="dp-days"><thead><tr><th>Сутки</th><th>Обращений</th><th>Поставлено</th>
+        <th>Пропущено</th><th>Отложено</th><th>Отказов</th></tr></thead><tbody>${дни.map((д_) => `<tr>
+        <td class="mono small">${esc(д_.day)}</td><td>${num(д_.requests || 0, 0)}</td>
+        <td>${num(д_.queued || 0, 0)}</td><td>${num((д_.skipped || 0) + (д_.duplicate || 0), 0)}</td>
+        <td>${num(д_.deferred || 0, 0)}</td>
+        <td${д_.rejected ? ' class="err"' : ''}>${num(д_.rejected || 0, 0)}</td></tr>`).join('')}
+      </tbody></table></div>` : '';
     место.innerHTML = card('Журнал обращений',
-      'последние обращения станции и ответы сервера — с отказами ключа; хранится в памяти до перезапуска',
-      записи.length ? `<div class="table-wrap"><table class="table" id="dp-log-table">
+      'последние обращения станции и ответы сервера — с отказами ключа; счёт по суткам за месяц и последние 200 обращений хранятся в базе',
+      поДням + (записи.length ? `<div class="table-wrap"><table class="table" id="dp-log-table">
         <thead><tr><th style="width:140px">Когда</th><th>Откуда</th><th>Станция</th>
           <th>Звонок</th><th>Номера</th><th>Добавочный</th><th>Запись</th><th>Итог</th><th>Задание</th></tr></thead>
         <tbody>${записи.map((з) => {
@@ -10715,7 +11050,7 @@ RENDERERS.dialplan = {
               ${з.code ? `<div class="small dim mono">${esc(з.code)}${з.status ? ` · ${з.status}` : ''}</div>` : ''}</td>
             <td>${з.job_id ? `<button class="ghost sm" data-dp-job="${esc(з.job_id)}">Открыть</button>` : ''}</td></tr>`;
         }).join('')}</tbody></table></div>`
-        : '<div class="empty">Обращений пока не было. Отправьте пробу или позвоните на станцию.</div>',
+        : '<div class="empty">Обращений пока не было. Отправьте пробу или позвоните на станцию.</div>'),
       `<button class="ghost sm" id="dp-log-refresh">Обновить</button>
        <button class="ghost sm" id="dp-log-clear">Очистить</button>`);
     qsa('[data-dp-job]', место).forEach((к) => { к.onclick = () => window.__asrhub.openJob(к.dataset.dpJob); });
@@ -10728,6 +11063,22 @@ RENDERERS.dialplan = {
     };
   },
 };
+
+/** Пульс сценария отправки на станции (cron, раз в пять минут): жив ли,
+ * сколько ждёт в очереди повтора и сколько отвергнуто сервером. */
+function пульсСценария(пульс) {
+  if (!пульс || !пульс.at) {
+    return '<div class="small dim" title="Сценарий присылает пульс при каждой досылке из cron '
+      + '(asrhub-dialplan --install настраивает её)">пульса сценария не было</div>';
+  }
+  const давно = Date.now() / 1000 - пульс.at > 20 * 60;
+  const очередь = Number(пульс.pending || 0), отвергнуто = Number(пульс.failed || 0);
+  return `<div class="small ${давно || очередь ? 'warn' : 'dim'}" data-dp-pulse
+    title="версия сценария ${esc(пульс.version || '?')}, ${esc(пульс.ip || '')}">
+    сценарий: пульс ${esc(fmtAgo(пульс.at))}${давно ? ' — cron молчит' : ''}${очередь
+      ? ` · в очереди повтора ${num(очередь, 0)}, старейший ${fmtDur(пульс.oldest_s || 0)}` : ''}${отвергнуто
+      ? ` · отвергнуто ${num(отвергнуто, 0)}` : ''}</div>`;
+}
 
 /** Запись тишины в wav (8 кГц, 16 бит, моно) — для пробы приёма. */
 function пустаяЗапись(секунд) {
@@ -11039,7 +11390,10 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
         title="Опрашиваются собеседники с внутренним номером, в том числе по внутренним звонкам; городские и мобильные номера сервер не набирает">
         <input type="checkbox" data-qc="qc_short_numbers_only" style="width:auto"
           ${з.qc_short_numbers_only ? 'checked' : ''}>
-        Перезванивать только на номера из 3 и 4 знаков</label>
+        Перезванивать только на короткие номера, знаков:</label>
+      <input type="text" data-qc="qc_short_lengths" style="width:120px;margin-top:4px"
+        value="${esc(з.qc_short_lengths === undefined || з.qc_short_lengths === null ? '3,4' : з.qc_short_lengths)}"
+        placeholder="3,4" aria-label="Длины коротких номеров" title="Через запятую или диапазоном: 3,4 или 2-5">
       <div class="row" style="margin-top:12px;gap:10px;flex-wrap:wrap">
         <button class="primary sm" id="qc-phone-save">Сохранить</button>
         <button class="ghost sm" id="qc-phone-check"
@@ -11211,7 +11565,7 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
     };
     qs('#qc-voice-del').onclick = async (ев) => {
       ев.preventDefault();
-      if (!window.confirm('Убрать образец голоса? Тексты будет проговаривать обычный голос синтезатора.')) return;
+      if (!await подтвердить('Убрать образец голоса? Тексты будет проговаривать обычный голос синтезатора.')) return;
       try {
         await API.del('/api/qc/voice-sample');
         toast('Образец убран', 'ok');
@@ -11275,7 +11629,7 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
     qsa('[data-qc-audio-del]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
       ев.preventDefault();
       const имя = ссылка.dataset.qcAudioDel;
-      if (!window.confirm(`Удалить запись «${имя}»?`)) return;
+      if (!await подтвердить(`Удалить запись «${имя}»?`)) return;
       try {
         await API.del(`/api/qc/audio/${encodeURIComponent(имя)}`);
         toast('Запись удалена', 'ok');
@@ -11324,6 +11678,10 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
             <input type="text" data-поле="name" value="${esc(г.name)}" placeholder="Отдел продаж"></label>
           <label class="small" style="flex:3;min-width:200px">Добавочные
             <input type="text" data-поле="extensions" value="${esc(г.extensions)}" placeholder="101, 102, 110-119"></label>
+          <label class="small" style="flex:2;min-width:180px"
+            title="Сотрудники этих отделов из справочника входят в группу без перечисления номеров">Отделы справочника
+            <input type="text" data-поле="departments" value="${esc(Array.isArray(г.departments) ? г.departments.join(', ') : (г.departments || ''))}"
+              placeholder="Продажи, Поддержка"></label>
           <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" data-поле="enabled"
             ${г.enabled ? 'checked' : ''} style="width:auto"> включена</label>
           <button class="ghost sm" data-удалить-группу title="Удалить группу">Удалить</button>
@@ -11373,10 +11731,10 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
     };
     qsa('[data-group]', место).forEach((блок) => {
       const н = Number(блок.dataset.group);
-      qs('[data-удалить-группу]', блок).onclick = () => {
+      qs('[data-удалить-группу]', блок).onclick = async () => {
         this.readDraft();
         const имя = state.qcDraft[н].name || 'без имени';
-        if (!window.confirm(`Удалить группу «${имя}»? Собранные оценки останутся в отчёте.`)) return;
+        if (!await подтвердить(`Удалить группу «${имя}»? Собранные оценки останутся в отчёте.`)) return;
         state.qcDraft.splice(н, 1);
         this.drawGroups();
       };
@@ -11512,7 +11870,11 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
             <td class="small">${з.job_id ? `<a href="#" data-qc-job="${esc(з.job_id)}">разговор</a>` : ''}
               ${з.status === 'ждёт' ? `<a href="#" data-qc-cancel="${esc(з.id)}">отменить</a>` : ''}</td></tr>`;
         }).join('')}</tbody></table></div>`
-        : '<div class="empty small">За период опросов не было. Сделайте пробный звонок — он появится здесь.</div>');
+        : '<div class="empty small">За период опросов не было. Сделайте пробный звонок — он появится здесь.</div>',
+      записи.length ? '<button class="ghost sm" id="qc-export">Выгрузить CSV</button>' : '');
+    const выгрузка = qs('#qc-export');
+    if (выгрузка) выгрузка.onclick = () => скачатьФайл(
+      `/api/qc/surveys/export?since_days=${encodeURIComponent(state.qcDays || 30)}`, 'qc-surveys.csv');
     qsa('[data-qc-job]').forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
       ев.preventDefault();
       state.resultsSearch = ссылка.dataset.qcJob;
@@ -11556,12 +11918,202 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
     };
     qsa('[data-qc-unstop]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
       ев.preventDefault();
-      if (!window.confirm(`Убрать ${ссылка.dataset.qcUnstop} из списка? Этому номеру снова смогут звонить с опросом.`)) return;
+      if (!await подтвердить(`Убрать ${ссылка.dataset.qcUnstop} из списка? Этому номеру снова смогут звонить с опросом.`)) return;
       try {
         await API.del(`/api/qc/stoplist/${encodeURIComponent(ссылка.dataset.qcUnstop)}`);
         this.loadReport();
       } catch (err) { fail(err); }
     }));
+  },
+};
+
+// --------------------------------------------------------------------------
+// Документация: главы руководства этой версии, оглавление и поиск
+// --------------------------------------------------------------------------
+
+RENDERERS.manual = {
+  async render(root) {
+    // Глава рисуется заново при каждом входе в раздел: разметка прошлого
+    // входа уже снята вместе с разделом.
+    this._html = false;
+    root.innerHTML = `
+      <div class="manual-layout">
+        <aside class="manual-nav card" aria-label="Оглавление руководства">
+          <input type="search" id="man-q" placeholder="Поиск по руководству"
+            aria-label="Поиск по руководству" value="${esc(state.manualQuery || '')}">
+          <div id="man-found" class="manual-found"></div>
+          <nav id="man-toc" class="manual-toc"><div class="empty small">Читаю оглавление…</div></nav>
+        </aside>
+        <article class="manual-main card" id="man-main" aria-live="polite">
+          <div class="empty">Открываю главу…</div></article>
+      </div>`;
+    let таймер = null;
+    qs('#man-q').addEventListener('input', (ev) => {
+      clearTimeout(таймер);
+      state.manualQuery = ev.target.value;
+      таймер = setTimeout(() => this.search(ev.target.value), 300);
+    });
+    qs('#man-q').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { clearTimeout(таймер); this.search(ev.target.value); }
+    });
+    // Ссылки внутри главы: на другую главу, на место в этой, на картинку.
+    qs('#man-main').addEventListener('click', (ев) => {
+      const ссылка = ев.target.closest('a');
+      if (ссылка && ссылка.dataset.doc) {
+        ев.preventDefault();
+        this.open(ссылка.dataset.doc, ссылка.dataset.anchor || '');
+      } else if (ссылка && ссылка.dataset.anchor !== undefined && !ссылка.dataset.doc) {
+        ев.preventDefault();
+        this.scrollTo(ссылка.dataset.anchor);
+        this.remember(state.manualChapter, ссылка.dataset.anchor);
+      } else if (ссылка && ссылка.dataset.nav) {
+        ев.preventDefault();
+        this.open(ссылка.dataset.nav, '');
+      } else if (ев.target.tagName === 'IMG' && ев.target.closest('.manual-body')) {
+        window.open(ев.target.src, '_blank', 'noopener');
+      }
+    });
+    try {
+      const оглавление = await API.get('/api/manual');
+      if (!qs('#man-toc')) return;
+      state.manualToc = оглавление;
+      if (!оглавление.available || !(оглавление.chapters || []).length) {
+        qs('#man-toc').innerHTML = '';
+        qs('#man-main').innerHTML = `<div class="banner warn"><b>Документации на сервере нет.</b>
+          <div class="small" style="margin-top:4px">Каталог <span class="mono">docs</span> не
+          установлен рядом с программой. Обновите установку (install.sh или update.sh кладут
+          его сами) или задайте путь переменной <span class="mono">ASRHUB_DOCS_DIR</span>.</div></div>`;
+        return;
+      }
+      this.drawToc();
+      if (state.manualQuery) this.search(state.manualQuery);
+      await this.open(state.manualChapter || '00-README', state.manualAnchor || '');
+    } catch (err) {
+      if (err && err.silent) return;
+      const место = qs('#man-main');
+      if (место) место.innerHTML = `<div class="banner err">${esc(err.message || 'Оглавление не получено')}</div>`;
+    }
+  },
+
+  drawToc() {
+    const главы = (state.manualToc || {}).chapters || [];
+    const пункт = (г) => `<a href="#manual/${esc(г.slug)}" data-toc="${esc(г.slug)}"
+        class="${г.slug === state.manualChapter ? 'active' : ''}"
+        ${г.slug === state.manualChapter ? 'aria-current="page"' : ''}>
+        ${г.number === null || г.number === undefined ? '' : `<span class="num">${г.number}</span>`}
+        <span>${esc(г.title)}</span></a>`;
+    const основные = главы.filter((г) => г.number !== null && г.number !== undefined);
+    const прочие = главы.filter((г) => г.number === null || г.number === undefined);
+    qs('#man-toc').innerHTML = основные.map(пункт).join('')
+      + (прочие.length ? `<div class="manual-toc-group">Дополнения</div>${прочие.map(пункт).join('')}` : '');
+    qsa('#man-toc [data-toc]').forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
+      ев.preventDefault();
+      this.open(ссылка.dataset.toc, '');
+    }));
+  },
+
+  /** Адрес страницы — на эту главу и место: ссылку можно переслать. */
+  remember(slug, anchor) {
+    const хвост = anchor ? `/${encodeURIComponent(anchor)}` : '';
+    try { history.replaceState(null, '', `#manual/${slug}${хвост}`); } catch (e) { /* без истории */ }
+  },
+
+  scrollTo(anchor) {
+    if (!anchor) {
+      // Начало главы — начало страницы, а не край карточки: иначе шапка
+      // главы уезжала под верхнюю панель.
+      window.scrollTo(0, 0);
+      const поле = qs('#content');
+      if (поле) поле.scrollTop = 0;
+      const главное = qs('.main');
+      if (главное) главное.scrollTop = 0;
+      return;
+    }
+    const место = document.getElementById(anchor);
+    if (!место) return;
+    место.scrollIntoView({ block: 'start' });
+    if (anchor) {
+      место.classList.add('manual-target');
+      setTimeout(() => место.classList.remove('manual-target'), 1600);
+    }
+  },
+
+  async open(slug, anchor) {
+    const место = qs('#man-main');
+    if (!место) return;
+    if (state.manualChapter !== slug || !this._html) {
+      место.setAttribute('aria-busy', 'true');
+      try {
+        const г = await API.latest('manual-chapter', `/api/manual/chapter/${encodeURIComponent(slug)}`);
+        if (!qs('#man-main')) return;
+        this._html = true;
+        state.manualChapter = slug;
+        const сосед = (с, вперёд) => (с ? `<a href="#manual/${esc(с.slug)}" data-nav="${esc(с.slug)}"
+            class="manual-pager-${вперёд ? 'next' : 'prev'}">${вперёд ? '' : '← '}${
+            с.number === null || с.number === undefined ? '' : `${с.number}. `}${esc(с.title)}${вперёд ? ' →' : ''}</a>` : '<span></span>');
+        место.innerHTML = `
+          <div class="manual-head">
+            <div class="small dim">${г.number === null || г.number === undefined ? 'Дополнение'
+              : `Глава ${г.number}`} · ${num(г.words || 0, 0)} слов · версия ${esc((state.manualToc || {}).version || '')}</div>
+            <span class="spacer"></span>
+            <a class="btn sm" href="/api/manual/raw/${encodeURIComponent(г.slug)}" data-raw
+              title="Текст главы в Markdown">Markdown</a>
+            <button class="ghost sm" id="man-print" title="Напечатать или сохранить в PDF">Печать</button>
+          </div>
+          ${(г.headings || []).length > 3 ? `<details class="manual-outline" ${
+            (г.headings || []).length < 25 ? 'open' : ''}><summary class="small">В этой главе</summary>
+            <ul>${г.headings.filter((з) => з.level === 2).map((з) =>
+              `<li><a href="#manual/${esc(г.slug)}/${esc(з.id)}" data-anchor="${esc(з.id)}">${esc(з.text)}</a></li>`).join('')}</ul>
+          </details>` : ''}
+          <div class="manual-body">${г.html}</div>
+          <div class="manual-pager">${сосед(г.prev, false)}${сосед(г.next, true)}</div>`;
+        qs('#man-print').onclick = () => window.print();
+        // Markdown главы — тем же запросом с ключом: ссылка в новой вкладке
+        // ключ не передаёт.
+        qs('[data-raw]', место).addEventListener('click', (ев) => {
+          ев.preventDefault();
+          открытьВкладкой(`/api/manual/raw/${encodeURIComponent(г.slug)}`);
+        });
+        this.drawToc();
+        const активный = qs('#man-toc a.active');
+        if (активный) активный.scrollIntoView({ block: 'nearest' });
+      } catch (err) {
+        if (err && err.silent) return;
+        место.innerHTML = `<div class="banner err"><b>${esc(err.message || 'Глава не открылась')}</b>
+          ${err.hint ? `<div class="small" style="margin-top:4px">${esc(err.hint)}</div>` : ''}</div>`;
+        return;
+      } finally {
+        место.removeAttribute('aria-busy');
+      }
+    }
+    this.remember(slug, anchor);
+    this.scrollTo(anchor);
+  },
+
+  async search(запрос) {
+    const место = qs('#man-found');
+    if (!место) return;
+    const текст = String(запрос || '').trim();
+    if (текст.length < 2) { место.innerHTML = ''; return; }
+    try {
+      const ответ = await API.latest('manual-search',
+        `/api/manual/search?q=${encodeURIComponent(текст)}&limit=40`);
+      const найдено = ответ.items || [];
+      место.innerHTML = найдено.length
+        ? `<div class="small dim" style="margin:6px 0">Найдено: ${найдено.length}${найдено.length >= 40 ? '+' : ''}</div>
+           ${найдено.map((н) => `<a href="#manual/${esc(н.slug)}/${esc(н.anchor)}" class="manual-hit"
+               data-hit="${esc(н.slug)}" data-hit-anchor="${esc(н.anchor)}">
+             <b>${н.number === null || н.number === undefined ? '' : `${н.number}. `}${esc(н.heading)}</b>
+             <span class="small dim">${esc(н.snippet)}</span></a>`).join('')}`
+        : '<div class="small dim" style="margin:6px 0">Ничего не нашлось.</div>';
+      qsa('[data-hit]', место).forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
+        ев.preventDefault();
+        this.open(ссылка.dataset.hit, ссылка.dataset.hitAnchor);
+      }));
+    } catch (err) {
+      if (err && err.silent) return;
+      место.innerHTML = `<div class="small err">${esc(err.message || 'Поиск не удался')}</div>`;
+    }
   },
 };
 
@@ -11665,7 +12217,7 @@ RENDERERS.content = {
   },
 
   async recompute() {
-    if (!confirm('Пересчитать разбор всего архива?\n\nСчитается в фоне порциями; ' +
+    if (!await подтвердить('Пересчитать разбор всего архива?\n\nСчитается в фоне порциями; ' +
                  'на большом архиве это часы. Нужно после смены словарей, ' +
                  'скрипта разговора или обновления сервера.')) return;
     try {
@@ -13751,8 +14303,8 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
   const вернуть = qs('#cat-default');
   // Сброс — после подтверждения: свой набор уходил одним щелчком, а
   // вопрос появлялся уже после записи и спрашивал про пересчёт архива.
-  if (вернуть) вернуть.addEventListener('click', (e) => {
-    if (!confirm(`Вернуть готовый набор категорий?\n\nВаш набор (${набор.length} `
+  if (вернуть) вернуть.addEventListener('click', async (e) => {
+    if (!await подтвердить(`Вернуть готовый набор категорий?\n\nВаш набор (${набор.length} `
       + `${plural(набор.length, 'категория', 'категории', 'категорий')}) будет заменён `
       + 'готовым, и разметка записей пойдёт по нему. Вернуть свои правила можно будет '
       + 'только из резервной копии настроек.')) return;
@@ -13760,8 +14312,8 @@ RENDERERS.content.drawCategories = function (host, свод, драйверы) {
   });
   qs('#cat-save').addEventListener('click', (e) => занятьКнопку(e.currentTarget,
     () => this.saveCategories(набор)));
-  qs('#cat-discard').addEventListener('click', () => {
-    if (!confirm('Отбросить несохранённые правки набора категорий?')) return;
+  qs('#cat-discard').addEventListener('click', async () => {
+    if (!await подтвердить('Отбросить несохранённые правки набора категорий?')) return;
     state.contentCategories = null;
     state.contentCategoriesDirty = false;
     this.showTab();
@@ -13857,7 +14409,7 @@ RENDERERS.content.saveCategories = async function (набор, сброс) {
   } catch (err) { fail(err); return; }
   toast(набор.length ? сохраненоИли(итог, 'Набор категорий сохранён', 'Набор категорий применён')
     : 'Возвращён готовый набор', persistedKind(итог), persistedHint(итог));
-  if (confirm('Набор категорий изменился — пересчитать разбор архива?\n\n' +
+  if (await подтвердить('Набор категорий изменился — пересчитать разбор архива?\n\n' +
               'Без пересчёта старые записи останутся размечены прежним набором, ' +
               'и счёт по категориям будет смешивать два набора.')) {
     try { await API.post('/api/content/recompute', {}); } catch (err) { fail(err); }
@@ -14070,8 +14622,8 @@ RENDERERS.content.drawScript = function (host) {
                check: 'customer_name', where: 'any' });
   });
   const вернуть = qs('#script-default');
-  if (вернуть) вернуть.addEventListener('click', (e) => {
-    if (!confirm(`Вернуть набор пунктов по умолчанию?\n\nВаш скрипт (${пункты.length} `
+  if (вернуть) вернуть.addEventListener('click', async (e) => {
+    if (!await подтвердить(`Вернуть набор пунктов по умолчанию?\n\nВаш скрипт (${пункты.length} `
       + `${plural(пункты.length, 'пункт', 'пункта', 'пунктов')}) будет удалён, и сервер `
       + 'станет проверять набор по умолчанию. Вернуть свои пункты можно будет только из '
       + 'резервной копии настроек.')) return;
@@ -14079,8 +14631,8 @@ RENDERERS.content.drawScript = function (host) {
   });
   qs('#script-save').addEventListener('click', (e) => занятьКнопку(e.currentTarget,
     () => this.saveScript(state.contentScript || [])));
-  qs('#script-discard').addEventListener('click', () => {
-    if (!confirm('Отбросить несохранённые правки скрипта?')) return;
+  qs('#script-discard').addEventListener('click', async () => {
+    if (!await подтвердить('Отбросить несохранённые правки скрипта?')) return;
     state.contentScript = null;
     state.contentScriptDirty = false;
     this.showTab();
@@ -14145,7 +14697,7 @@ RENDERERS.content.saveScript = async function (пункты, сброс) {
   } catch (err) { fail(err); return; }
   toast(пункты.length ? сохраненоИли(итог, 'Скрипт сохранён', 'Скрипт применён')
     : 'Возвращён набор по умолчанию', persistedKind(итог), persistedHint(итог));
-  if (confirm('Скрипт изменился — пересчитать разбор архива?\n\n' +
+  if (await подтвердить('Скрипт изменился — пересчитать разбор архива?\n\n' +
               'Без пересчёта соблюдение скрипта в отчётах останется посчитанным ' +
               'по прежним пунктам, и сравнивать эти числа с новыми нельзя.')) {
     try { await API.post('/api/content/recompute', {}); } catch (err) { fail(err); }
@@ -14179,7 +14731,7 @@ async function неЧужиеПравки(ключ, база, что) {
   if (база === undefined) return true;
   const сейчас = await базаНабора(ключ);
   if (сейчас === undefined || сейчас === база) return true;
-  return confirm(`${что} изменили, пока шла ваша правка — в другом окне или другой `
+  return await подтвердить(`${что} изменили, пока шла ваша правка — в другом окне или другой `
     + 'администратор.\n\nСохранить ваш вариант поверх? Чужие правки пропадут.\n'
     + '«Отмена» — оставить черновик несохранённым и сначала посмотреть, что изменилось.');
 }
@@ -14732,7 +15284,7 @@ async function renderAccessSection(host) {
       try {
         const created = await API.post('/api/keys',
           { name, role: qs('#access-new-role').value, ...квотыКлюча('access-new') });
-        prompt('Сохраните ключ — он показывается один раз:', created.key);
+        await showSecretOnce(`Ключ «${name}»`, created.key);
         сообщитьОКлюче(created);
         qs('#access-new-name').value = '';
         loadAccessKeys();
@@ -14915,7 +15467,7 @@ async function loadHfToken(isAdmin) {
   };
   const clear = qs('#hf-clear');
   if (clear) clear.onclick = async () => {
-    if (!confirm('Убрать токен Hugging Face?')) return;
+    if (!await подтвердить('Убрать токен Hugging Face?')) return;
     try {
       await API.put('/api/settings/hf-token', { token: '' });
       toast('Токен убран', 'warn');
@@ -15025,7 +15577,7 @@ async function drawLlmSetup(host) {
     qsa('input[data-model]', host).forEach((кн) => привязать_флажок(кн));
     qsa('button[data-drop]', host).forEach((кн) => {
       кн.onclick = async () => {
-        if (!confirm(`Удалить веса модели ${кн.dataset.drop} с диска сервера?`)) return;
+        if (!await подтвердить(`Удалить веса модели ${кн.dataset.drop} с диска сервера?`)) return;
         кн.disabled = true;
         try {
           await API.post('/api/llm/models/delete', { model: кн.dataset.drop });
@@ -15129,7 +15681,7 @@ async function drawLlmSetup(host) {
   const запустить = async () => {
     if (!выбраны.size) { toast('Отметьте хотя бы одну модель', 'warn'); return; }
     const тяжёлые = (д.models || []).filter((м) => выбраны.has(м.name) && м.state === 'нет');
-    if (тяжёлые.length && !confirm(
+    if (тяжёлые.length && !await подтвердить(
       `${тяжёлые.map((м) => м.title).join(', ')} не помещается в память этого сервера — ` +
       'модель пойдёт частично на процессоре и будет отвечать минутами. Всё равно ставить?')) return;
     // Двойной щелчок запускал вторую установку поверх первой.
@@ -15250,7 +15802,7 @@ RENDERERS.settings = {
      * сбрасывается открытая группа (или найденное поиском), человек видит
      * список до сброса, а на сервер он уходит обычным «Применить». Наборы
      * со своими редакторами, вход и каталоги здесь не трогаются. */
-    qs('#p-reset').onclick = () => {
+    qs('#p-reset').onclick = async () => {
       const меняются = this.видимые().filter((p) => сбрасываемый(p)
         && JSON.stringify(state.settings[p.key] ?? null) !== JSON.stringify(p.default ?? null));
       if (!меняются.length) {
@@ -15258,7 +15810,7 @@ RENDERERS.settings = {
               'Сбрасываются параметры открытой группы или найденные поиском');
         return;
       }
-      if (!confirm(`Вернуть к значениям по умолчанию параметров: ${меняются.length}?\n\n`
+      if (!await подтвердить(`Вернуть к значениям по умолчанию параметров: ${меняются.length}?\n\n`
         + меняются.slice(0, 15).map((p) => `• ${p.label}`).join('\n')
         + (меняются.length > 15 ? `\n…и ещё ${меняются.length - 15}` : '')
         + '\n\nНа сервере они изменятся, когда вы нажмёте «Применить на сервере» '
@@ -15311,7 +15863,7 @@ RENDERERS.settings = {
       return было !== undefined && сейчас !== было && сейчас !== JSON.stringify(тело[k] ?? null);
     });
     if (!чужие.length) return true;
-    return confirm(`Пока вы правили, на сервере изменили: ${чужие.map((k) =>
+    return await подтвердить(`Пока вы правили, на сервере изменили: ${чужие.map((k) =>
       (paramByKey(k) || {}).label || k).join(', ')}.\n\nЗаписать ваши значения поверх?`);
   },
 
@@ -15738,7 +16290,7 @@ RENDERERS.backup = {
         + '«asrhub.db.before-restore-…», и вернуть её можно.\n\n'
         + 'Подмена базы происходит при перезапуске сервера: до него сервер '
         + 'работает с прежними данными.';
-    if (!confirm(вопрос)) return;
+    if (!await подтвердить(вопрос)) return;
     const прежний = кнопка.textContent;
     кнопка.disabled = true;
     кнопка.textContent = 'Восстанавливаю…';
@@ -15773,7 +16325,7 @@ RENDERERS.backup = {
   },
 
   async remove(имя) {
-    if (!confirm(`Убрать копию «${имя}»?\n\nВосстановить её после удаления будет неоткуда.`)) return;
+    if (!await подтвердить(`Убрать копию «${имя}»?\n\nВосстановить её после удаления будет неоткуда.`)) return;
     try {
       const итог = await API.del(`/api/backup/${encodeURIComponent(имя)}`);
       toast('Копия убрана', 'warn', `Освободилось ${fmtBytes(итог.freed || 0)}`);
@@ -16610,7 +17162,7 @@ RENDERERS.system = {
         const r = await API.post('/api/keys',
           { name, role: qs('#key-role').value, ...квотыКлюча('key-new'),
             mask_pii: !!(qs('#key-mask') && qs('#key-mask').checked) });
-        prompt('Сохраните ключ — он показывается один раз:', r.key);
+        await showSecretOnce(`Ключ «${name}»`, r.key);
         сообщитьОКлюче(r);
         this.loadKeys();
       } catch (err) { fail(err); }
@@ -16680,7 +17232,7 @@ RENDERERS.system = {
     });
     удалить.onclick = (e) => занятьКнопку(e.currentTarget, async () => {
       if (!найдено || найдено.запрос !== поле.value.trim()) return;
-      if (!confirm(`Удалить безвозвратно записей: ${найдено.записей}, обезличить звонков: ${
+      if (!await подтвердить(`Удалить безвозвратно записей: ${найдено.записей}, обезличить звонков: ${
         найдено.звонков}?\n\nЗапрос: «${найдено.запрос}». Отменить это нельзя.`)) return;
       try {
         const итог = await API.post('/api/maintenance/erase', { query: найдено.запрос, dry_run: false });
@@ -16775,7 +17327,11 @@ RENDERERS.system = {
 };
 
 window.__asrhub.resetPassword = async (id, username) => {
-  const password = prompt(`Новый пароль для «${username}»:`);
+  const password = await askValue({
+    title: `Новый пароль для «${username}»`, label: 'Временный пароль', type: 'password',
+    ok: 'Сбросить пароль', required: true,
+    hint: 'Пользователь сменит его при первом входе. Не короче 8 знаков.',
+    check: (з) => (з.length < 8 ? 'Пароль короче 8 знаков.' : '') });
   if (!password) return;
   try {
     await API.patch(`/api/users/${id}`, { password, must_change_password: true });
@@ -16785,13 +17341,13 @@ window.__asrhub.resetPassword = async (id, username) => {
 };
 
 window.__asrhub.deleteUser = async (id, username) => {
-  if (!confirm(`Удалить учётную запись «${username}»?`)) return;
+  if (!await подтвердить(`Удалить учётную запись «${username}»?`)) return;
   try { await API.del(`/api/users/${id}`); toast('Учётная запись удалена', 'warn'); renderView(); }
   catch (err) { fail(err); }
 };
 
 window.__asrhub.revokeKey = async (preview) => {
-  if (!confirm('Отозвать ключ?')) return;
+  if (!await подтвердить('Отозвать ключ?')) return;
   try { await API.del(`/api/keys/${preview}`); toast('Ключ отозван', 'warn'); renderView(); }
   catch (err) { fail(err); }
 };
@@ -16939,7 +17495,7 @@ RENDERERS.monitoring = {
     qs('#mon-reset-rules').onclick = async () => {
       // Сброс заменяет все правила, в том числе свои, — после подтверждения:
       // раньше он выполнялся одним щелчком, с записью в конфигурацию.
-      if (!confirm(`Вернуть пороги тревог к значениям каталога?\n\nВсе правила (${
+      if (!await подтвердить(`Вернуть пороги тревог к значениям каталога?\n\nВсе правила (${
         num(summary.rules || 0)}) заменятся правилами каталога метрик; свои пороги `
         + 'и выключенные правила пропадут, в том числе из файла конфигурации.')) return;
       try {
@@ -16973,7 +17529,7 @@ RENDERERS.monitoring = {
     qsa('[data-drop-target]').forEach((кнопка) => {
       кнопка.onclick = async () => {
         const имя = кнопка.dataset.dropTarget;
-        if (!confirm(`Убрать приёмник «${имя}»? Метрики туда больше не пойдут.`)) return;
+        if (!await подтвердить(`Убрать приёмник «${имя}»? Метрики туда больше не пойдут.`)) return;
         try {
           const итог = await API.del(`/api/monitoring/targets/${encodeURIComponent(имя)}`);
           toast(`Приёмник «${имя}» убран`, итог.persisted === false ? 'warn' : 'ok',
@@ -17699,6 +18255,12 @@ RENDERERS.help = {
     const сохранённый = localStorage.getItem('asrhub_key') || '';
     const key = '$ASRHUB_KEY';
     root.innerHTML = `
+      <div class="banner ok" style="margin-bottom:16px">
+        <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
+          <span><b>Полное руководство</b> — в разделе «Документация»: все главы этой версии,
+            оглавление и поиск по тексту.</span><span class="spacer"></span>
+          <button class="primary sm" onclick="__asrhub.go('manual')">Открыть документацию</button>
+        </div></div>
       <div class="grid cols-2">
         ${card('С чего начать', '', `<div class="small dim" style="line-height:1.75">
           <p><b>1. Проверьте установку.</b> Раздел «Сервер» показывает, какие движки
@@ -18236,7 +18798,7 @@ RENDERERS.llmqueue = {
   },
 
   async clear() {
-    if (!window.confirm('Убрать из очереди всё, что ещё не разобрано?\n\n'
+    if (!await подтвердить('Убрать из очереди всё, что ещё не разобрано?\n\n'
       + 'Идущий разбор не прерывается, разобранное остаётся на месте.')) return;
     try {
       const итог = await API.post('/api/llm/queue/clear', { state: '' });
@@ -18551,7 +19113,7 @@ RENDERERS.rescan = {
     const всего = Number(д.total || (д.jobs || []).length);
     const правки = Object.entries(this.переопределения)
       .map(([к, з]) => `${(paramByKey(к) || {}).label || к}: ${з}`).join(', ');
-    if (!window.confirm(
+    if (!await подтвердить(
       `Распознать заново все записи под отбором (${всего})?\n\n`
       + (правки ? `Новые параметры — ${правки}.\n\n` : 'Параметры остаются прежними.\n\n')
       + 'Прежние расшифровки будут заменены новыми, когда очередь дойдёт до записи. '
@@ -21105,7 +21667,7 @@ RENDERERS.staff = {
   async remove(id) {
     const ч = (state.staff.items || []).find((к) => к.id === id) || {};
     const имя = [ч.last_name, ч.first_name].filter(Boolean).join(' ') || id;
-    if (!window.confirm(`Удалить карточку «${имя}»?\n\n`
+    if (!await подтвердить(`Удалить карточку «${имя}»?\n\n`
       + 'Звонки этого номера останутся в архиве: они привязаны к номеру, а не к карточке.')) return;
     try {
       await API.del(`/api/employees/${encodeURIComponent(id)}`);
@@ -21135,12 +21697,12 @@ RENDERERS.staff = {
       const задержано = Number((проба || {}).deactivation_blocked || 0);
       let силой = false;
       if (задержано) {
-        силой = window.confirm(`Выгрузка по адресу: строк ${num(проба.rows || 0)}. В ней нет `
+        силой = await подтвердить(`Выгрузка по адресу: строк ${num(проба.rows || 0)}. В ней нет `
           + `${num(задержано)} работающих сотрудников — это больше трети справочника, `
           + 'так обычно выглядит оборванная или неполная выгрузка.\n\n'
           + '«ОК» — всё равно отметить их уволенными (штат и правда сократился).\n'
           + '«Отмена» — импортировать остальное, никого не увольняя.');
-      } else if (уволит && !window.confirm(`Выгрузка по адресу: строк ${num(проба.rows || 0)}, `
+      } else if (уволит && !await подтвердить(`Выгрузка по адресу: строк ${num(проба.rows || 0)}, `
         + `добавится ${num(проба.added || 0)}, обновится ${num(проба.updated || 0)}.\n\n`
         + `Будут отмечены уволенными: ${num(уволит)} — их нет в выгрузке.\n\n`
         + 'Если выгрузка неполная (оборвана, только один отдел), нажмите «Отмена» и '

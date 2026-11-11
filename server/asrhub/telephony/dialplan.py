@@ -30,6 +30,7 @@ MixMonitor — и присылает запись файлом либо путь
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -75,7 +76,7 @@ from .stations import список as станции_из_настроек
     "recording": "recording", "path": "recording", "file": "recording",
     "ready": "ready",
     "dry_run": "dry_run", "test": "dry_run",
-    "linkedid": "linkedid",
+    "linkedid": "linkedid", "sequence": "sequence",
 }
 
 #: Предел длины одного поля. Номера и имена каналов короче в разы; длинное
@@ -247,6 +248,13 @@ def собрать_звонок(поля: dict[str, str], станция: Ста
     if not звонок.clid and звонок.src:
         # Поиск по номеру в разделе «Телефония» смотрит и в определитель.
         звонок.clid = звонок.src
+    # ${CDR(linkedid)} и ${CDR(sequence)} — общий идентификатор ног
+    # разговора; негодное значение не ломает звонок, а просто не пишется.
+    связь = str(поля.get("linkedid", "") or "").strip()[:128]
+    звонок.linkedid = связь if re.fullmatch(r"[\w.\-]*\d+\.\d+", связь) else ""
+    последовательность = str(поля.get("sequence", "") or "").strip()
+    if последовательность.isdigit():
+        звонок.sequence = int(последовательность[:18])
     звонок.duration = _целое(поля.get("duration", ""), беды, "duration")
     звонок.billsec = _целое(поля.get("billsec", ""), беды, "billsec")
     if звонок.duration and звонок.billsec > звонок.duration:
@@ -413,16 +421,81 @@ class ЖурналПриёма:
     Здесь — ровно то, что нужно разделу «Asterisk: диалплан»: время, адрес,
     станция, идентификатор, итог и причина, в том числе для 401 и 403.
 
-    Хранится в памяти: это инструмент наладки, а не архив. Сами звонки — в
-    таблице `calls`, и там они остаются.
+    Сами звонки — в таблице `calls`; журнал — инструмент наладки, но
+    переживает перезапуск: счётчики, счёт по суткам за месяц и последние
+    обращения сохраняются в базу (`привязать`) не реже раза в
+    `СОХРАНЯТЬ_С` и при остановке. Раньше после перезапуска раздел
+    показывал нули, и «а дошло ли вчера» было не узнать.
     """
 
     РАЗМЕР = 200
+    #: Ключ в таблице kv и как часто туда писать.
+    КЛЮЧ = "dialplan_intake_journal"
+    СОХРАНЯТЬ_С = 15.0
+    #: Сколько суток счёта по дням хранить.
+    СУТОК = 31
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._записи: deque[dict[str, Any]] = deque(maxlen=self.РАЗМЕР)
         self._счёт: dict[str, dict[str, Any]] = {}
+        #: станция → сутки «ГГГГ-ММ-ДД» → итог → число.
+        self._по_дням: dict[str, dict[str, dict[str, int]]] = {}
+        self._db: Any = None
+        self._сохранён = 0.0
+        self._изменён = False
+
+    def привязать(self, db: Any) -> None:
+        """Хранить журнал в этой базе и поднять сохранённый."""
+        данные: dict[str, Any] = {}
+        try:
+            данные = db.get_kv(self.КЛЮЧ, {}) or {}
+        except Exception:  # noqa: BLE001 — журнал наладки не держит запуск
+            данные = {}
+        with self._lock:
+            self._db = db
+            self._записи = deque((dict(з) for з in данные.get("recent") or []
+                                  if isinstance(з, dict)), maxlen=self.РАЗМЕР)
+            self._счёт = {str(к): dict(в) for к, в in (данные.get("counts") or {}).items()
+                          if isinstance(в, dict)}
+            self._по_дням = {str(к): {str(д): dict(ч) for д, ч in (в or {}).items()}
+                             for к, в in (данные.get("days") or {}).items()
+                             if isinstance(в, dict)}
+            self._сохранён, self._изменён = time.time(), False
+
+    def сохранить(self, *, сразу: bool = True) -> None:
+        """Записать в базу; без `сразу` — только если пора."""
+        with self._lock:
+            if self._db is None or not self._изменён:
+                return
+            if not сразу and time.time() - self._сохранён < self.СОХРАНЯТЬ_С:
+                return
+            порог = time.strftime("%Y-%m-%d", time.localtime(time.time() - self.СУТОК * 86400))
+            for дни in self._по_дням.values():
+                for день in [д for д in дни if д < порог]:
+                    дни.pop(день, None)
+            снимок = {"recent": list(self._записи), "counts": self._счёт,
+                      "days": self._по_дням}
+            снимок = json.loads(json.dumps(снимок, default=str))
+            db = self._db
+            self._сохранён, self._изменён = time.time(), False
+        try:
+            db.set_kv(self.КЛЮЧ, снимок)
+        except Exception:  # noqa: BLE001 — не записали сейчас, запишем следующим
+            with self._lock:
+                self._изменён = True
+
+    def по_дням(self, station: str = "", *, дней: int = 7) -> list[dict[str, Any]]:
+        """Счёт по суткам, свежие первыми: [{"day", "requests", "queued", …}]."""
+        with self._lock:
+            станции = [station] if station else list(self._по_дням)
+            итог: dict[str, dict[str, int]] = {}
+            for ид in станции:
+                for день, счёт in (self._по_дням.get(ид) or {}).items():
+                    свод = итог.setdefault(день, {})
+                    for ключ, число in счёт.items():
+                        свод[ключ] = свод.get(ключ, 0) + int(число or 0)
+        return [{"day": день, **итог[день]} for день in sorted(итог, reverse=True)[:max(1, дней)]]
 
     def отметить(self, **запись: Any) -> dict[str, Any]:
         запись.setdefault("at", time.time())
@@ -437,6 +510,11 @@ class ЖурналПриёма:
                 "last_error_at": None})
             счёт["requests"] += 1
             счёт[итог] = int(счёт.get(итог) or 0) + 1
+            день = self._по_дням.setdefault(ид, {}).setdefault(
+                time.strftime("%Y-%m-%d", time.localtime(запись["at"])), {})
+            день["requests"] = день.get("requests", 0) + 1
+            день[итог] = день.get(итог, 0) + 1
+            self._изменён = True
             счёт["bytes"] += int(запись.get("bytes") or 0)
             счёт["last_at"] = запись["at"]
             if итог == "rejected":
@@ -444,6 +522,7 @@ class ЖурналПриёма:
                 счёт["last_error_at"] = запись["at"]
             elif итог != "dry_run":
                 счёт["last_ok_at"] = запись["at"]
+        self.сохранить(сразу=False)
         return запись
 
     def последние(self, *, station: str = "", limit: int = 50) -> list[dict[str, Any]]:
@@ -476,6 +555,9 @@ class ЖурналПриёма:
         with self._lock:
             self._записи.clear()
             self._счёт.clear()
+            self._по_дням.clear()
+            self._изменён = True
+        self.сохранить()
 
 
 #: Один журнал на процесс: поток станции, проверка связи и раздел «АТС»

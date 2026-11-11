@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys as _sys
 import time
 from pathlib import Path
 
@@ -22,6 +23,9 @@ import pytest
 from test_review_46_web import _без_исключений, _вкладка, _Окружение, _открыть, _поднять
 from test_review_46_web import _проверить_среду as _среда46
 from test_web_ui import _браузер, _наполнить
+
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from drill_seed import заданные, отвечать  # noqa: E402
 
 ПАРОЛЬ = "Проверка-54-пароль"
 КЛЮЧ_АДМИНА = "ah_" + "a" * 30
@@ -499,7 +503,7 @@ def test_администратор_видит_управление_очеред
 
 
 def _вкладка_диктовки(браузер, адрес):
-    контекст = браузер.new_context(viewport={"width": 1600, "height": 1000},
+    контекст = браузер.new_context(viewport={"width": 1600, "height": 1000}, color_scheme="dark",
                                    permissions=["microphone"])
     контекст.add_init_script(ПОДСТАВНОЙ_СОКЕТ)
     вкладка = контекст.new_page()
@@ -850,11 +854,11 @@ def test_сброс_набора_к_готовому_спрашивает_до_�
         вкладка = _вкладка(браузер, стенд["адрес"])
         _открыть(вкладка, "content")
         _вкладка_разбора(вкладка, "categories")
-        вопросы: list[str] = []
-        вкладка.on("dialog", lambda д: (вопросы.append(д.message), д.dismiss()))
+        отвечать(вкладка, False)
         пойманные = _перехват(вкладка, "**/api/settings?persist=true", {}, метод="PUT")
         вкладка.click("#cat-default")
         вкладка.wait_for_timeout(600)
+        вопросы = заданные(вкладка)
         assert вопросы and "Вернуть готовый набор" in вопросы[0], вопросы
         assert "2 категории" in вопросы[0], вопросы[0]
         assert not пойманные, "набор записан до ответа на вопрос"
@@ -873,10 +877,10 @@ def test_чужое_сохранение_набора_не_стирается_м
     чужой = [{"id": "dostavka", "label": "Доставка (Б)", "rule": "доставка", "kind": "topic"}]
     состояние.settings.set("content_categories", чужой)          # «Б» сохранил своё
     try:
-        вопросы: list[str] = []
-        вкладка.on("dialog", lambda д: (вопросы.append(д.message), д.dismiss()))
+        отвечать(вкладка, False)
         вкладка.click("#cat-save")
         вкладка.wait_for_timeout(1500)
+        вопросы = заданные(вкладка)
         assert вопросы and "изменили, пока шла ваша правка" in вопросы[0], вопросы
         assert состояние.settings.get("content_categories") == чужой
         assert not вкладка.is_disabled("#cat-save"), "черновик А должен остаться"
@@ -901,11 +905,11 @@ def test_сбросить_не_включает_вход_и_не_трогает_
     _открыть(вкладка, "settings")
     _группа(вкладка, "server")
     сброс = _перехват(вкладка, "**/api/settings/reset", {})
-    вопросы: list[str] = []
-    вкладка.on("dialog", lambda д: (вопросы.append(д.message), д.accept()))
+    отвечать(вкладка, True)
     вкладка.evaluate("() => { window.__asrhub.state.settings.rate_limit_per_minute = 999; }")
     вкладка.click("#p-reset")
     вкладка.wait_for_timeout(500)
+    вопросы = заданные(вкладка)
     assert not сброс, "звался общий сброс сервера"
     состояние = стенд["состояние"]
     assert состояние.settings.get("auth_enabled") is False
@@ -943,10 +947,10 @@ def test_применить_предупреждает_о_чужой_правк�
     вкладка.dispatch_event(".param[data-key='max_queue_size'] input[type=number]", "change")
     состояние.settings.set("max_queue_size", 555)                # правка второго администратора
     try:
-        вопросы: list[str] = []
-        вкладка.on("dialog", lambda д: (вопросы.append(д.message), д.dismiss()))
+        отвечать(вкладка, False)
         вкладка.click("#p-apply")
         вкладка.wait_for_timeout(1000)
+        вопросы = заданные(вкладка)
         assert вопросы and "изменили" in вопросы[0], вопросы
         assert состояние.settings.get("max_queue_size") == 555
     finally:
@@ -1095,7 +1099,8 @@ def test_карта_по_часам_подписывает_пояс_сервер
     """Сервер по UTC, браузер в Москве — пик в 06–15 без единого слова."""
     смещение = time.localtime().tm_gmtoff
     пояс = "Asia/Vladivostok" if смещение != 36000 else "Europe/Moscow"
-    контекст = браузер.new_context(viewport={"width": 1600, "height": 1000}, timezone_id=пояс)
+    контекст = браузер.new_context(viewport={"width": 1600, "height": 1000}, timezone_id=пояс,
+                                   color_scheme="dark")
     вкладка = контекст.new_page()
     вкладка.адрес = стенд["адрес"]
     _открыть(вкладка, "analytics", 3000)
@@ -1119,7 +1124,7 @@ def test_ключ_создаётся_с_подразделением_и_квот
     вкладка.fill("#key-new-group", "склад")
     вкладка.fill("#key-new-qjobs", "25")
     вкладка.fill("#key-new-qhours", "1.5")
-    вкладка.on("dialog", lambda д: д.accept())
+    отвечать(вкладка, True)
     вкладка.click("#key-create")
     вкладка.wait_for_timeout(1500)
     ключи = стенд_со_входом["состояние"].settings.api_keys
@@ -1165,7 +1170,7 @@ def test_удаление_по_требованию_сначала_ищет_по
     вкладка.wait_for_timeout(600)
     assert json.loads(вызовы[0]["body"]) == {"query": "+79001110000", "dry_run": True}
     assert "3" in вкладка.inner_text("#erase-out")
-    вкладка.on("dialog", lambda д: д.dismiss())
+    отвечать(вкладка, False)
     вкладка.click("#erase-go")
     вкладка.wait_for_timeout(400)
     assert len(вызовы) == 1, "удаление без подтверждения"
@@ -1233,10 +1238,10 @@ def test_импорт_по_адресу_спрашивает_про_увольн
         _открыть(вкладка, "staff", 2000)
         вызовы = _перехват(вкладка, "**/api/employees/import",
                            {"rows": 1, "added": 0, "updated": 1, "deactivated": 2})
-        вопросы: list[str] = []
-        вкладка.on("dialog", lambda д: (вопросы.append(д.message), д.dismiss()))
+        отвечать(вкладка, False)
         вкладка.click("#st-import")
         вкладка.wait_for_timeout(800)
+        вопросы = заданные(вкладка)
         assert json.loads(вызовы[0]["body"]).get("dry_run") is True
         assert len(вызовы) == 1, "импорт ушёл без подтверждения"
         assert вопросы and "уволенными: 2" in вопросы[0], вопросы

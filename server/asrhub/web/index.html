@@ -127,6 +127,7 @@
         Сервер
       </button>
       <button class="nav-item" data-view="monitoring">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>
         Мониторинг <span class="nav-badge" id="badge-alerts">0</span>
       </button>
       <button class="nav-item" data-view="backup">
@@ -141,12 +142,16 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg>
         Справка
       </button>
+      <button class="nav-item" data-view="manual" title="Руководство: все главы документации этой версии">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/><path d="M8 7h8M8 11h6"/></svg>
+        Документация
+      </button>
     </nav>
 
     <div class="sidebar-foot">
       <div id="conn-status" role="status" aria-live="polite"><span class="status-dot warn"></span>подключение…</div>
       <div class="row">
-        <span id="version-label">v3.1.27</span>
+        <span id="version-label">v3.1.29</span>
         <span class="spacer"></span>
         <button class="ghost sm" id="theme-toggle" title="Сменить тему">◐</button>
       </div>

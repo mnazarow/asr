@@ -107,7 +107,7 @@ from urllib import request as запросы_url
 #: взят: по ней в разделе «АТС» видно, что станцию забыли обновить. Долго
 #: стояла «3.0.1» при сервере 3.1.x — и раздел не мог сказать ничего;
 #: теперь она поднимается вместе с сервером, а проверка следит за этим.
-ВЕРСИЯ = "3.1.27"
+ВЕРСИЯ = "3.1.29"
 
 #: Минимальный Python. Названной величиной, а не литералом в сравнении:
 #: сравнение с литералом статические проверки считают устаревшим и
@@ -709,13 +709,15 @@ class Звонок:
     __slots__ = ("uniqueid", "src", "dst", "clid", "channel", "dstchannel",
                  "context", "disposition", "duration", "billsec", "started_at",
                  "answered", "userfield", "accountcode", "direction", "queue",
-                 "agent", "recording", "lastapp", "lastdata", "последний_шанс")
+                 "agent", "recording", "lastapp", "lastdata", "последний_шанс",
+                 "linkedid", "sequence")
 
     def __init__(self, uniqueid="", src="", dst="", clid="", channel="",
                  dstchannel="", context="", disposition="", duration=0,
                  billsec=0, started_at=0.0, answered=False, userfield="",
                  accountcode="", direction="", queue="", agent="",
-                 recording="", lastapp="", lastdata="", последний_шанс=""):
+                 recording="", lastapp="", lastdata="", последний_шанс="",
+                 linkedid="", sequence=0):
         self.uniqueid = uniqueid
         self.src = src
         self.dst = dst
@@ -740,6 +742,10 @@ class Звонок:
         #: едет последний раз — с записью, если она готова, а нет — без
         #: неё, с пометкой «не дождались записи: <причина>».
         self.последний_шанс = последний_шанс
+        #: Общий идентификатор ног разговора и порядок строки CDR (Asterisk
+        #: 12+); пустые, если журнал их не пишет.
+        self.linkedid = linkedid
+        self.sequence = sequence
 
     def поля_для_сервера(self, agent_id, пропущено=""):
         """Поле ``meta`` запроса /call — ровно те имена, что ждёт сервер.
@@ -768,6 +774,9 @@ class Звонок:
             "userfield": self.userfield,
             "accountcode": self.accountcode,
         }
+        if self.linkedid:
+            поля["linkedid"] = self.linkedid
+            поля["sequence"] = int(self.sequence or 0)
         if пропущено:
             поля["skipped"] = пропущено
         # Имена файлов и поля из журнала бывают с байтами не из UTF-8 —
@@ -799,6 +808,8 @@ def звонок_из_полей(поля):
         accountcode=str(поля.get("accountcode") or "").strip(),
         lastapp=str(поля.get("lastapp") or "").strip(),
         lastdata=str(поля.get("lastdata") or "").strip(),
+        linkedid=str(поля.get("linkedid") or "").strip()[:128],
+        sequence=целое(поля.get("sequence")),
     )
     return звонок
 
@@ -847,7 +858,15 @@ def поля_по_раскладке(значения):
     for раскладка in РАСКЛАДКИ:
         место = раскладка.index("uniqueid")
         if место < len(значения) and ПОХОЖ_НА_ID.match(значения[место].strip()):
-            return собрать_поля(раскладка, значения)
+            поля = собрать_поля(раскладка, значения)
+            # newcdrcolumns=yes в cdr.conf (Asterisk 12+): после userfield —
+            # peeraccount, linkedid, sequence. По linkedid сервер собирает
+            # ноги одного разговора.
+            хвост = значения[len(раскладка):]
+            if len(хвост) >= 3 and хвост[2].strip().isdigit():
+                поля["linkedid"] = хвост[1].strip()
+                поля["sequence"] = хвост[2].strip()
+            return поля
     # Раскладка не совпала — ищем сдвиг по единственному полю, похожему на
     # идентификатор: часть сборок добавляет в Master.csv свои колонки.
     места = [i for i, з in enumerate(значения) if ПОХОЖ_НА_ID.match(з.strip())]
@@ -2087,6 +2106,20 @@ class ИсточникCSV:
                       путь, прочитано, смещение)
 
 
+
+def _значение_mycnf(значение):
+    """Значение для файла настроек клиента MySQL — в кавычках.
+
+    Без кавычек «#» в пароле начинает комментарий, и клиент молча
+    получает обрезанный пароль («Access denied» при верном пароле), а
+    пробелы по краям теряются. В кавычках клиент понимает экранирование
+    обратной чертой: «\\» и «\"». Перевода строки в значении быть не может —
+    он разорвал бы файл.
+    """
+    значение = значение.replace("\r", "").replace("\n", "")
+    return '"' + значение.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 class ИсточникMySQL:
     """Журнал звонков в MySQL/MariaDB через внешнюю программу ``mysql``.
 
@@ -2181,9 +2214,11 @@ class ИсточникMySQL:
         for ключ, поле in (("host", "hostname"), ("user", "user"),
                            ("password", "password"), ("port", "port"),
                            ("socket", "sock")):
-            значение = str(self.настройки.get(поле) or "").strip()
+            значение = str(self.настройки.get(поле) or "")
+            if ключ != "password":
+                значение = значение.strip()
             if значение:
-                строки.append(f"{ключ}={значение}")
+                строки.append(f"{ключ}={_значение_mycnf(значение)}")
         дескриптор = os.open(путь, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(дескриптор, "w", encoding="utf-8") as файл:
             файл.write("\n".join(строки) + "\n")
@@ -2251,6 +2286,23 @@ class ИсточникMySQL:
     ПОЛЯ_ЗАПРОСА = ("accountcode", "src", "dst", "dcontext", "clid", "channel",
                     "dstchannel", "lastapp", "lastdata", "start", "duration",
                     "billsec", "disposition", "uniqueid", "userfield")
+    #: Таблица Asterisk 12+ (и FreePBX) хранит ещё linkedid и sequence — по
+    #: ним сервер собирает ноги одного разговора. На старой схеме колонок
+    #: нет, и запрос с ними упал бы: наличие проверяется один раз.
+    ПОЛЯ_СВЯЗИ = ("linkedid", "sequence")
+
+    def _поля_выборки(self, таблица):
+        if getattr(self, "_связь_есть", None) is None:
+            try:
+                вывод = self._выполнить(f"SHOW COLUMNS FROM `{таблица}` LIKE 'linkedid'")
+                self._связь_есть = "linkedid" in вывод
+                if self._связь_есть:
+                    вывод = self._выполнить(f"SHOW COLUMNS FROM `{таблица}` LIKE 'sequence'")
+                    self._связь_есть = "sequence" in вывод
+            except Exception as exc:  # noqa: BLE001 — без связи ног, но с журналом
+                log.debug("Колонки linkedid не проверены: %s", exc)
+                self._связь_есть = False
+        return self.ПОЛЯ_ЗАПРОСА + (self.ПОЛЯ_СВЯЗИ if self._связь_есть else ())
 
     #: Насколько назад от последнего прочитанного начала звонка смотреть.
     #: calldate — время НАЧАЛА, а строку Asterisk пишет по ОКОНЧАНИИ звонка:
@@ -2267,6 +2319,7 @@ class ИсточникMySQL:
     def звонки(self, весь_архив=False, предел=0, двигать_позицию=True,
                начало=None, конец=None):
         таблица = re.sub(r"[^A-Za-z0-9_]", "", str(self.настройки.get("table") or "cdr"))
+        поля_выборки = self._поля_выборки(таблица)
         условия = []
         позиция = self.состояние.позиция_mysql()
         последний = str(позиция.get("последний") or "")
@@ -2304,8 +2357,9 @@ class ИсточникMySQL:
                 "channel, dstchannel, lastapp, "
                 "REPLACE(REPLACE(lastdata, '\\t', ' '), '\\n', ' ') AS lastdata, "
                 "calldate AS start, duration, billsec, disposition, uniqueid, "
-                "userfield "
-                f"FROM `{таблица}`{где} ORDER BY calldate ASC, uniqueid ASC "
+                "userfield"
+                + (", linkedid, sequence " if поля_выборки != self.ПОЛЯ_ЗАПРОСА else " ")
+                + f"FROM `{таблица}`{где} ORDER BY calldate ASC, uniqueid ASC "
                 f"LIMIT {self.СТРАНИЦА}")
             вывод = self._выполнить(запрос)
             строк = 0
@@ -2315,12 +2369,12 @@ class ИсточникMySQL:
                     continue
                 строк += 1
                 значения = строка.split("\t")
-                if len(значения) != len(self.ПОЛЯ_ЗАПРОСА):
+                if len(значения) != len(поля_выборки):
                     log.warning("Строка выборки MySQL с %d полями вместо %d — "
                                 "пропускаю: похоже, в поле попал разделитель.",
-                                len(значения), len(self.ПОЛЯ_ЗАПРОСА))
+                                len(значения), len(поля_выборки))
                     continue
-                поля = собрать_поля(self.ПОЛЯ_ЗАПРОСА, значения)
+                поля = собрать_поля(поля_выборки, значения)
                 звонок = звонок_из_полей(поля)
                 if not звонок.uniqueid:
                     continue

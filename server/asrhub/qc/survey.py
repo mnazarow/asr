@@ -49,6 +49,9 @@ log = get_logger("qc")
 СРОК_ДАВНОСТИ_Ч = 24
 #: Строка «звонит» старше этого — след упавшего сервера.
 ЗАВИСШИЙ_ВЫЗОВ_С = 900
+#: Коды SIP, которыми станция отказывает именно этому номеру: его нет (404,
+#: 410, 484, 485, 604) или на него нельзя звонить (403). Повтор не поможет.
+ОТКАЗ_НОМЕРУ = frozenset({403, 404, 410, 484, 485, 604})
 #: Длины номера в режиме «только номера из 3 и 4 знаков».
 КОРОТКИЙ_НОМЕР = (3, 4)
 ПРЕДЕЛ_ГРУПП = 50
@@ -86,14 +89,20 @@ class Группа:
     goodbye: str = ПРОЩАНИЕ
     optout_digit: str = ""
     repeats: int = 1
+    #: Отделы справочника сотрудников: добавочный сотрудника из такого отдела
+    #: входит в группу и без перечисления номеров (см. `содержит`).
+    departments: tuple[str, ...] = ()
     _номера: frozenset[str] = frozenset()
     _отрезки: tuple[tuple[int, int, int], ...] = ()
 
-    def содержит(self, добавочный: str) -> bool:
+    def содержит(self, добавочный: str, отдел: str = "") -> bool:
         добавочный = str(добавочный or "").strip()
         if not добавочный:
             return False
         if добавочный in self._номера:
+            return True
+        if отдел and self.departments and \
+                " ".join(отдел.split()).lower() in self.departments:
             return True
         if добавочный.isdigit():
             число = int(добавочный)
@@ -107,7 +116,7 @@ class Группа:
                 "sample_percent": self.sample_percent, "greeting": self.greeting,
                 "questions": [в.to_dict() for в in self.questions],
                 "goodbye": self.goodbye, "optout_digit": self.optout_digit,
-                "repeats": self.repeats}
+                "repeats": self.repeats, "departments": list(self.departments)}
 
     def фразы(self) -> list[str]:
         """Все тексты, которые понадобятся в разговоре, — для подготовки звука."""
@@ -128,6 +137,14 @@ def _целое(значение: Any, запасное: int, низ: int, ве�
     if not низ <= число <= верх:
         raise ValueError(f"{что}: от {низ} до {верх}, получено {число}")
     return число
+
+
+def _отделы(значение: Any) -> tuple[str, ...]:
+    """Отделы группы: список или строка через запятую; без регистра."""
+    куски = (значение if isinstance(значение, (list, tuple))
+             else str(значение or "").split(","))
+    return tuple(sorted({" ".join(str(к).split()).lower() for к in куски
+                         if str(к).strip()}))[:50]
 
 
 def разобрать_добавочные(текст: Any) -> tuple[frozenset[str], tuple[tuple[int, int, int], ...]]:
@@ -229,6 +246,7 @@ def разобрать_группы(значение: Any) -> list[Группа]
             goodbye=" ".join(str(запись.get("goodbye") or ПРОЩАНИЕ).split()),
             optout_digit=отказ,
             repeats=_целое(запись.get("repeats"), 1, 0, 3, f"{где}, repeats"),
+            departments=_отделы(запись.get("departments")),
         )
         for что, текст in (("приветствие", группа.greeting), ("прощание", группа.goodbye)):
             if len(текст) > tts.ДЛИНА_ФРАЗЫ and not текст.startswith(("file:", tts.ЗАГРУЖЕННАЯ)):
@@ -248,8 +266,9 @@ def проверить_группы(значение: Any) -> list[str]:
     for группа in группы:
         if группа.enabled and not группа.questions:
             замечания.append(f"группа «{группа.name}»: нет ни одного вопроса")
-        if группа.enabled and not (группа._номера or группа._отрезки):
-            замечания.append(f"группа «{группа.name}»: не заданы добавочные номера")
+        if группа.enabled and not (группа._номера or группа._отрезки or группа.departments):
+            замечания.append(f"группа «{группа.name}»: не заданы ни добавочные номера, "
+                             "ни отделы справочника")
     return замечания
 
 
@@ -289,8 +308,59 @@ def _доля(ключ: str) -> int:
     return int(hashlib.sha256(ключ.encode("utf-8")).hexdigest()[:8], 16) % 100
 
 
+def дни_обзвона(значение: Any) -> set[int]:
+    """Дни недели обзвона (1 — понедельник … 7 — воскресенье); пусто — все."""
+    дни: set[int] = set()
+    куски = (значение if isinstance(значение, (list, tuple, set))
+             else re.split(r"[,;\s]+", str(значение or "").strip()))
+    for кусок in куски:
+        от, _, до = str(кусок).partition("-")
+        try:
+            а, б = int(от), int(до or от)
+        except ValueError:
+            continue
+        дни.update(д for д in range(min(а, б), max(а, б) + 1) if 1 <= д <= 7)
+    return дни
+
+
+def праздники(значение: Any) -> set[str]:
+    """Даты без обзвона, «ГГГГ-ММ-ДД»; годовые «ММ-ДД» — на текущий год."""
+    куски = (значение if isinstance(значение, (list, tuple, set))
+             else re.split(r"[,;\s]+", str(значение or "").strip()))
+    год = time.strftime("%Y")
+    даты: set[str] = set()
+    for кусок in куски:
+        кусок = str(кусок).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", кусок):
+            даты.add(кусок)
+        elif re.fullmatch(r"\d{2}-\d{2}", кусок):
+            даты.add(f"{год}-{кусок}")
+    return даты
+
+
+def длины_коротких(значение: Any) -> tuple[int, ...]:
+    """Длины «коротких» номеров из настройки: «3,4», «2-5», [3, 4]."""
+    if isinstance(значение, (list, tuple, set)):
+        куски = [str(з) for з in значение]
+    else:
+        куски = re.split(r"[,;\s]+", str(значение or "").strip())
+    длины: set[int] = set()
+    for кусок in куски:
+        if not кусок:
+            continue
+        от, _, до = кусок.partition("-")
+        try:
+            а, б = int(от), int(до or от)
+        except ValueError:
+            continue
+        длины.update(range(max(1, min(а, б)), min(max(а, б), 15) + 1))
+    return tuple(sorted(длины)) or КОРОТКИЙ_НОМЕР
+
+
 def отобрать(звонок: dict[str, Any], группы: list[Группа], *,
-             короткие: bool = False) -> tuple[Группа, str, str] | str:
+             короткие: bool = False,
+             длины: tuple[int, ...] = КОРОТКИЙ_НОМЕР,
+             отделы: dict[str, str] | None = None) -> tuple[Группа, str, str] | str:
     """Нужен ли опрос по звонку: (группа, добавочный, номер клиента) или причина отказа.
 
     `короткие` — режим «перезванивать только на номера из 3 и 4 знаков»:
@@ -315,14 +385,16 @@ def отобрать(звонок: dict[str, Any], группы: list[Групп
         # Внутренний звонок: собеседник — тот из двоих, кто не сотрудник группы.
         клиент = куда if откуда == добавочный else откуда
     if короткие:
-        if len(клиент) not in КОРОТКИЙ_НОМЕР:
-            return "номер не из 3–4 знаков"
+        if len(клиент) not in длины:
+            return ("номер не из 3–4 знаков" if длины == КОРОТКИЙ_НОМЕР
+                    else f"номер не из {', '.join(map(str, длины))} знаков")
         if клиент == добавочный:
             return "нет номера клиента"
     elif len(клиент) < 5:
         return "нет номера клиента"
     for группа in группы:
-        if not (группа.enabled and группа.questions and группа.содержит(добавочный)):
+        отдел = (отделы or {}).get(добавочный, "")
+        if not (группа.enabled and группа.questions and группа.содержит(добавочный, отдел)):
             continue
         нужное = НАПРАВЛЕНИЯ[группа.direction]
         if нужное and внешний and нужное != направление:
@@ -568,8 +640,28 @@ class КонтрольКачества:
                 self.регистрация = {"state": "выключено", "error": "", "at": time.time()}
             return
         self._вернуть_зависшие()
+        self._держать_регистрацию()
         self.найти_новые()
         self.обзвон()
+
+    def _держать_регистрацию(self) -> None:
+        """Регистрация обновляется и между звонками.
+
+        Раньше её продлевал только очередной вызов: в тихие часы она
+        истекала, станция показывала номер недоступным, а раздел — всё ещё
+        «зарегистрирован».
+        """
+        if not bool(self.settings.get("qc_sip_register")) or self.настроен():
+            return
+        if time.time() < self._сбой_телефона_до:
+            return
+        try:
+            self.телефон()
+        except ОшибкаSIP as exc:
+            # Неверный пароль или станция недоступна: не долбить её каждые
+            # пять секунд.
+            self._сбой_телефона_до = time.time() + 120
+            log.info("Контроль качества: регистрация не обновлена: %s", exc)
 
     # -- поиск новых звонков -----------------------------------------------
 
@@ -590,13 +682,20 @@ class КонтрольКачества:
         if not строки:
             return 0
         короткие = bool(self.settings.get("qc_short_numbers_only"))
+        длины = длины_коротких(self.settings.get("qc_short_lengths") or "3,4")
         задержка = self._число("qc_delay_s", 300)
         пауза_дней = self._число("qc_cooldown_days", 30)
         сейчас = time.time()
         заведено = 0
+        отделы: dict[str, str] = {}
+        if any(г.departments for г in группы):
+            # Отдел сотрудника — из справочника, одним запросом на порцию.
+            люди = self.db.employees_by_ext([str(с["agent"] or "") for с in строки
+                                             if с["agent"]])
+            отделы = {доб: str(ч.get("department") or "") for доб, ч in люди.items()}
         for строка in строки:
             звонок = dict(строка)
-            итог = отобрать(звонок, группы, короткие=короткие)
+            итог = отобрать(звонок, группы, короткие=короткие, длины=длины, отделы=отделы)
             if isinstance(итог, str):
                 continue
             группа, добавочный, клиент = итог
@@ -658,7 +757,15 @@ class КонтрольКачества:
         return datetime.now(пояс) if пояс else datetime.now()
 
     def можно_звонить(self) -> bool:
-        return в_часах(self._часы(), self._сейчас_местное())
+        сейчас = self._сейчас_местное()
+        if not в_часах(self._часы(), сейчас):
+            return False
+        # Дни недели и праздники: «с 9 до 20» в субботу и первого января —
+        # звонок клиенту, которого никто не просил.
+        дни = дни_обзвона(self.settings.get("qc_weekdays"))
+        if дни and сейчас.isoweekday() not in дни:
+            return False
+        return сейчас.strftime("%Y-%m-%d") not in праздники(self.settings.get("qc_holidays"))
 
     def обзвон(self) -> int:
         """Берёт из очереди готовые опросы и звонит; ответ — сколько взято."""
@@ -704,6 +811,41 @@ class КонтрольКачества:
         self.db.execute(
             f"UPDATE qc_surveys SET {', '.join(f'{к}=?' for к in поля)} WHERE id=?",  # noqa: S608
             (*поля.values(), номер))
+        if статус in ИТОГОВЫЕ and статус != ОТМЕНЁН:
+            self._сообщить(номер)
+
+    def _сообщить(self, номер: str) -> None:
+        """Завершённый опрос — POST на qc_webhook_url (CRM, табло, чат).
+
+        Отдельным потоком и с повторами: обзвон не ждёт чужой сервер, а
+        оценка, которую приёмник не взял с первого раза, не теряется.
+        Пробные звонки не уходят — это наладка, а не клиент.
+        """
+        адрес = str(self.settings.get("qc_webhook_url") or "").strip()
+        if not адрес:
+            return
+        строка = self.db.query_one("SELECT * FROM qc_surveys WHERE id=?", (номер,))
+        if строка is None or строка["kind"] != "опрос":
+            return
+        from ..job_queue import check_outbound_url  # noqa: PLC0415
+        from ..maintenance import send_json  # noqa: PLC0415
+
+        try:
+            check_outbound_url(адрес, bool(self.settings.get("webhook_allow_internal")))
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Адрес уведомлений об опросах отвергнут: %s", exc)
+            return
+        опрос = опрос_наружу(строка)
+        тело = {"event": "qc_survey_finished", "survey": опрос,
+                "text": (f"Опрос {опрос.get('group_name') or ''}, добавочный "
+                         f"{опрос.get('ext') or '—'}: {опрос.get('status')}"
+                         + (f", оценка {опрос['score']:g}" if опрос.get("score") is not None
+                            else ""))}
+        threading.Thread(target=send_json, args=(тело, адрес),
+                         kwargs={"what": "опрос", "попыток": 3,
+                                 "allow_internal": bool(
+                                     self.settings.get("webhook_allow_internal"))},
+                         name="asrhub-qc-notify", daemon=True).start()
 
     def _вызов(self, опрос: dict[str, Any]) -> None:
         """Один звонок клиенту от набора до итога в базе."""
@@ -714,6 +856,12 @@ class КонтрольКачества:
             группа = next((г for г in self.группы() if г.name == опрос.get("group_name")), None)
             if группа is None or not группа.questions:
                 self._закрыть(номер, ОШИБКА, error="группа удалена или в ней нет вопросов")
+                return
+            # Список «не звонить» — ещё раз перед набором: номер мог попасть в
+            # него после того, как опрос встал в очередь (клиент отказался в
+            # другом опросе, номер внесли руками в другом написании).
+            if not проба and self.в_стоп_листе(опрос["number"]):
+                self._закрыть(номер, ОТМЕНЁН, error="номер в списке «не звонить»")
                 return
             # Звук готовится до набора: синтез занимает секунды, а в трубке
             # они были бы тишиной.
@@ -734,13 +882,19 @@ class КонтрольКачества:
                 self._закрыть(номер, НЕ_ДОЗВОНИЛИСЬ, sip_code=exc.код, error=str(exc))
             return
         except ОшибкаSIP as exc:
-            # Отказ станции — не вина клиента: попытку не тратим, обзвон
-            # придерживаем, чтобы не засыпать станцию отказами.
             self.последняя_ошибка = str(exc)
             log.warning("Контроль качества: вызов %s не удался: %s", номер, exc)
-            if проба or попытка >= 5:
+            if проба or exc.код in ОТКАЗ_НОМЕРУ:
+                # Отказ именно этому номеру (его нет, звонить на него нельзя)
+                # — опрос закрывается. Раньше такой отказ считался сбоем
+                # станции: опрос с неверным номером повторялся сутки и каждый
+                # раз придерживал обзвон всех остальных на две минуты.
                 self._закрыть(номер, ОШИБКА, sip_code=exc.код, error=str(exc))
             else:
+                # Отказ станции (молчит, не принимает пароль, перегружена) —
+                # не вина клиента: попытку не тратим, обзвон придерживаем,
+                # чтобы не засыпать станцию отказами. Срок давности (сутки)
+                # закроет опрос, если станция так и не ответит.
                 self._сбой_телефона_до = time.time() + 120
                 self.db.execute(
                     "UPDATE qc_surveys SET status=?, attempts=MAX(attempts-1,0), sip_code=?, "
@@ -748,8 +902,18 @@ class КонтрольКачества:
                     (ЖДЁТ, exc.код, str(exc), time.time() + 120, номер))
             return
         except ConfigError as exc:
+            # Не готовится голос (нет синтезатора, сломан ffmpeg) — это
+            # настройка сервера, а не клиент: опросы ждут, пока её исправят,
+            # а не сгорают все разом «ошибкой». Срок давности (сутки) их
+            # всё равно закроет.
             self.последняя_ошибка = exc.message
-            self._закрыть(номер, ОШИБКА, error=exc.message)
+            if проба:
+                self._закрыть(номер, ОШИБКА, error=exc.message)
+            else:
+                self._сбой_телефона_до = time.time() + 120
+                self.db.execute(
+                    "UPDATE qc_surveys SET status=?, attempts=MAX(attempts-1,0), error=?, "
+                    "due_at=? WHERE id=?", (ЖДЁТ, exc.message, time.time() + 300, номер))
             return
         except Exception as exc:                            # noqa: BLE001
             self.последняя_ошибка = f"{type(exc).__name__}: {exc}"
@@ -825,10 +989,12 @@ class КонтрольКачества:
         self.db.execute(
             "INSERT OR REPLACE INTO qc_stoplist (number, added_at, reason, survey_id) "
             "VALUES (?,?,?,?)", (клиент, time.time(), причина[:200], опрос))
-        # Ждущие опросы этого номера снимаются сразу.
+        # Ждущие опросы этого номера снимаются сразу — в любом написании
+        # («8…», «7…», «+7…»): сравнение, как и везде, по последним десяти.
         self.db.execute(
             "UPDATE qc_surveys SET status=?, finished_at=?, error='номер в списке «не звонить»' "
-            "WHERE number=? AND status=?", (ОТМЕНЁН, time.time(), клиент, ЖДЁТ))
+            "WHERE (number=? OR (length(number)>=10 AND substr(number, -10)=?)) AND status=?",
+            (ОТМЕНЁН, time.time(), клиент, клиент[-10:], ЖДЁТ))
         return True
 
     def из_стоп_листа(self, номер: str) -> bool:

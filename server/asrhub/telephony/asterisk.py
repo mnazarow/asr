@@ -62,7 +62,14 @@ log = get_logger("telephony")
     "EndTime": "end", "Duration": "duration", "BillableSeconds": "billsec",
     "Disposition": "disposition", "AMAFlags": "amaflags", "UniqueID": "uniqueid",
     "UserField": "userfield",
+    # Asterisk 12+ с полями linkedid и sequence в [mappings] cdr_manager.conf
+    # (по умолчанию их в событии нет — тогда остаются пустыми).
+    "LinkedID": "linkedid", "Sequence": "sequence",
 }
+
+#: Хвост строки `Master.csv` при `newcdrcolumns=yes` в cdr.conf (Asterisk 12+):
+#: после userfield — peeraccount, linkedid, sequence.
+ПОЛЯ_CSV_НОВЫЕ = ("peeraccount", "linkedid", "sequence")
 
 
 class AMIError(ASRHubError):
@@ -95,6 +102,10 @@ class Звонок:
     direction: str = ""
     queue: str = ""
     agent: str = ""
+    #: Общий идентификатор всех ног разговора (Asterisk 12+) и порядок
+    #: строки CDR — пустые, если источник их не знает.
+    linkedid: str = ""
+    sequence: int = 0
     raw: dict[str, str] = field(default_factory=dict)
     #: Смещение конца строки журнала CDR, из которой взят звонок (−1 — не из
     #: журнала). По нему позиция чтения двигается за каждым обработанным
@@ -115,6 +126,7 @@ class Звонок:
             "userfield": self.userfield, "accountcode": self.accountcode,
             "recording": self.recording, "direction": self.direction,
             "queue": self.queue, "agent": self.agent,
+            "linkedid": self.linkedid, "sequence": self.sequence,
         }
         return данные
 
@@ -137,6 +149,8 @@ class Звонок:
         звонок.billsec = int(строка.get("billsec") or 0)
         звонок.started_at = float(строка.get("started_at") or 0.0)
         звонок.answered = bool(строка.get("answered"))
+        звонок.linkedid = str(строка.get("linkedid") or "")
+        звонок.sequence = int(строка.get("sequence") or 0)
         # Идентификатор — тот, что дала станция, а не ключ архива: по нему
         # ищется файл записи, и «golovnoy:1789.5» в имени файла не встретится
         # никогда. Ключ архива собирается заново тем, кто будет сохранять.
@@ -221,6 +235,10 @@ def свести(ноги: list[Звонок]) -> Звонок:
             итог.queue = next((н.queue for н in ноги if н.queue), "")
     if not итог.recording:
         итог.recording = next((н.recording for н in ноги if н.recording), "")
+    if not итог.linkedid:
+        итог.linkedid = next((н.linkedid for н in ноги if н.linkedid), "")
+    последовательности = [н.sequence for н in ноги if н.sequence]
+    итог.sequence = min(последовательности) if последовательности else итог.sequence
     позиции = [н.конец_строки for н in ноги if н.конец_строки >= 0]
     итог.конец_строки = min(позиции) if позиции else -1
     return итог
@@ -305,8 +323,16 @@ def звонок_из_полей(поля: dict[str, str], *, пояс: tzinfo |
         answered=расположение == "ANSWERED",
         userfield=str(поля.get("userfield") or "").strip(),
         accountcode=str(поля.get("accountcode") or "").strip(),
+        linkedid=_связь(поля.get("linkedid")),
+        sequence=_целое(поля.get("sequence")),
         raw={к: str(з) for к, з in поля.items()},
     )
+
+
+def _связь(значение: Any) -> str:
+    """linkedid, если он похож на идентификатор Asterisk, иначе пусто."""
+    значение = str(значение or "").strip()[:128]
+    return значение if _ПОХОЖ_НА_ID.match(значение) else ""
 
 
 def разобрать_cdr_строку(строка: str, *, пояс: tzinfo | None = None) -> Звонок | None:
@@ -324,6 +350,9 @@ def разобрать_cdr_строку(строка: str, *, пояс: tzinfo |
     if значения is None:
         return None
     поля = dict(zip(ПОЛЯ_CSV, значения, strict=False))
+    хвост = значения[len(ПОЛЯ_CSV):]
+    if len(хвост) >= len(ПОЛЯ_CSV_НОВЫЕ) and хвост[2].strip().isdigit():
+        поля.update(zip(ПОЛЯ_CSV_НОВЫЕ, хвост, strict=False))
     звонок = звонок_из_полей(поля, пояс=пояс)
     return звонок if звонок.uniqueid else None
 

@@ -212,6 +212,20 @@ function fmtNum(value, digits) {
 
   // ---- каркас графика ---------------------------------------------------
 
+  /** Имя графика для экранного диктора, если его не передали явно.
+
+      Почти ни один вызов не передаёт `title`, и диктор читал «график,
+      график, график». Имя берётся из подписи места (`data-title`,
+      `aria-label`) или из заголовка карточки, в которой график стоит. */
+  function имяГрафика(host) {
+    const своё = host.getAttribute('data-title') || host.getAttribute('aria-label');
+    if (своё) return своё;
+    const карточка = host.closest('.card, section, .modal');
+    const заголовок = карточка && карточка.querySelector('h3, h2, .card-head, .modal-head');
+    const текст = заголовок ? заголовок.textContent.replace(/\s+/g, ' ').trim() : '';
+    return текст ? `график: ${текст}` : 'график';
+  }
+
   function frame(host, opts) {
     host.innerHTML = '';
     const width = opts.width || host.clientWidth || 640;
@@ -220,7 +234,7 @@ function fmtNum(value, digits) {
     const svg = el('svg', {
       class: 'chart', viewBox: `0 0 ${width} ${height}`,
       width: '100%', height: height, role: 'img',
-      'aria-label': opts.title || 'график',
+      'aria-label': opts.title || имяГрафика(host),
     }, host);
     return { svg, width, height, pad,
              iw: width - pad.left - pad.right, ih: height - pad.top - pad.bottom };

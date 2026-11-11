@@ -212,10 +212,12 @@ ADMIN_ROUTES = {
     ("/api/qc/status", "get"), ("/api/qc/groups", "get"), ("/api/qc/groups", "put"),
     ("/api/qc/tts", "post"), ("/api/qc/check", "post"), ("/api/qc/test-call", "post"),
     ("/api/qc/surveys", "get"), ("/api/qc/surveys/{survey_id}/cancel", "post"),
+    ("/api/qc/surveys/export", "get"),
     ("/api/qc/summary", "get"), ("/api/qc/stoplist", "get"), ("/api/qc/stoplist", "post"),
     ("/api/qc/stoplist/{number}", "delete"),
     ("/api/qc/audio", "get"), ("/api/qc/audio", "post"),
     ("/api/qc/audio/{name}", "get"), ("/api/qc/audio/{name}", "delete"),
+    ("/api/telephony/dialplan/key/{station_id}", "delete"),
     ("/api/qc/voice-sample", "get"), ("/api/qc/voice-sample", "post"),
     ("/api/qc/voice-sample/audio", "get"), ("/api/qc/voice-sample", "delete"),
     # Отложенное восстановление копии и передача агента другому ключу.

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,10 @@ ENV_PREFIX = "ASRHUB_"
     # Сценарий отправки звонков из диалплана (agent/asrhub-dialplan): его
     # настройки живут в /etc/asrhub/dialplan.conf станции, а не у сервера.
     "send_mode", "send_timeout_s",
+    # Каталог руководства для раздела «Документация» (заход 56).
+    "docs_dir",
+    # Проверки: без браузера — ошибка, а не пропуск (tests/conftest.py).
+    "require_browser",
 })
 
 
@@ -347,6 +352,44 @@ def _станции_с_паролями(новые: list[Any], прежние: A
     return итог
 
 
+def хеш_ключа(ключ: str) -> str:
+    """Под каким именем ключ доступа хранится в config.yaml: sha256 от ключа."""
+    return "sha256:" + hashlib.sha256(str(ключ).encode("utf-8")).hexdigest()
+
+
+class КлючиДоступа(dict):
+    """Ключи доступа: ищутся и по самому ключу, и по его хешу.
+
+    Ключи, выпущенные сервером, хранятся в файле настроек хешем
+    («sha256:…») с превью для списка: файл конфигурации уезжает в копии,
+    в снимки и в заявки поддержки, и ключ открытым текстом из него
+    становился чужим пропуском. Прежние ключи открытым текстом продолжают
+    действовать как были.
+    """
+
+    def _найти(self, ключ: Any) -> Any:
+        if not isinstance(ключ, str) or not ключ:
+            return None
+        запись = dict.get(self, ключ)
+        if запись is None and not ключ.startswith("sha256:"):
+            запись = dict.get(self, хеш_ключа(ключ))
+        return запись
+
+    def get(self, ключ: Any, default: Any = None) -> Any:  # noqa: A003
+        запись = self._найти(ключ)
+        return default if запись is None else запись
+
+    def __contains__(self, ключ: Any) -> bool:
+        return self._найти(ключ) is not None
+
+    def имя_в_словаре(self, ключ: str) -> str | None:
+        """Под каким именем ключ лежит в словаре (сам ключ или его хеш)."""
+        if dict.__contains__(self, ключ):
+            return ключ
+        хеш = хеш_ключа(ключ)
+        return хеш if dict.__contains__(self, хеш) else None
+
+
 @dataclass
 class Settings:
     """Итоговая конфигурация сервера."""
@@ -371,6 +414,10 @@ class Settings:
     #: ключ, отозванный здесь, от ключа, который в тот же файл дописал
     #: соседний сервер (см. `persist_keys`).
     api_keys_file: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.api_keys, КлючиДоступа):
+            self.api_keys = КлючиДоступа(self.api_keys or {})
 
     # --- доступ ---------------------------------------------------------
 
@@ -514,7 +561,7 @@ class Settings:
     SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token",
                    "llm_api_key", "telephony_secret", "tracker_url",
                    "crm_url", "crm_token", "employees_url", "alert_url",
-                   "qc_sip_password")
+                   "qc_sip_password", "qc_webhook_url")
 
     #: Секреты, которые не отдаются и администратору (см. `to_dict`).
     СЕКРЕТЫ_ВСЕГДА = ("webhook_secret", "hf_token", "llm_api_key", "telephony_secret",

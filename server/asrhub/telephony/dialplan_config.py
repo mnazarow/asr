@@ -211,11 +211,14 @@ def _отбой_файлом(п: Параметры) -> str:
 ; Всё, что приходит снаружи, — только через FILTER(): значения попадают в
 ; командную строку, и без фильтра номер звонящего «1;rm -rf /» выполнился бы
 ; на станции. Фильтр оставляет цифры, латиницу и «+._» — пробела, кавычек,
-; «;», «&», «$» и «`» в аргументах не бывает.
+; «;», «&», «$» и «`» в аргументах не бывает. В идентификаторе звонка — ещё
+; «-»: с systemname в asterisk.conf ${{UNIQUEID}} выглядит как
+; «pbx-1-1700000000.12». «--.» в начале фильтра — диапазон от «-» до «.»:
+; одиночный дефис FILTER() читает как знак диапазона.
 ; ---------------------------------------------------------------------------
 [asrhub-hangup]
 exten => s,1,NoOp(ASR Hub: отправка ${{ASRHUB_UID}})
-{_агент(п)} same => n,System(${{ASRHUB_SEND}} uniqueid=${{FILTER(0-9A-Za-z.,${{ASRHUB_UID}})}} direction=${{FILTER(a-z,${{ASRHUB_DIRECTION}})}} src=${{FILTER(0-9+,${{CALLERID(num)}})}} dst=${{FILTER(0-9+,${{ASRHUB_DST}})}} agent=${{FILTER(0-9A-Za-z_.,${{ASRHUB_AGENT}})}} queue=${{FILTER(0-9A-Za-z_.,${{ASRHUB_QUEUE}})}} userfield=${{FILTER(0-9A-Za-z_.,${{ASRHUB_TAG}})}} started_at=${{FILTER(0-9,${{ASRHUB_STARTED}})}} duration=${{FILTER(0-9,${{CDR(duration)}})}} billsec=${{FILTER(0-9,${{CDR(billsec)}})}} disposition=${{FILTER(A-Z,${{CDR(disposition)}})}} file=${{ASRHUB_BASE}}/${{ASRHUB_REL}})
+{_агент(п)} same => n,System(${{ASRHUB_SEND}} uniqueid=${{FILTER(--.0-9A-Za-z_,${{ASRHUB_UID}})}} linkedid=${{FILTER(--.0-9A-Za-z_,${{CDR(linkedid)}})}} sequence=${{FILTER(0-9,${{CDR(sequence)}})}} direction=${{FILTER(a-z,${{ASRHUB_DIRECTION}})}} src=${{FILTER(0-9+,${{CALLERID(num)}})}} dst=${{FILTER(0-9+,${{ASRHUB_DST}})}} agent=${{FILTER(0-9A-Za-z_.,${{ASRHUB_AGENT}})}} queue=${{FILTER(0-9A-Za-z_.,${{ASRHUB_QUEUE}})}} userfield=${{FILTER(0-9A-Za-z_.,${{ASRHUB_TAG}})}} started_at=${{FILTER(0-9,${{ASRHUB_STARTED}})}} duration=${{FILTER(0-9,${{CDR(duration)}})}} billsec=${{FILTER(0-9,${{CDR(billsec)}})}} disposition=${{FILTER(A-Z,${{CDR(disposition)}})}} file=${{ASRHUB_BASE}}/${{ASRHUB_REL}})
  same => n,Return()
 """
 
@@ -372,9 +375,9 @@ def установка(п: Параметры) -> str:
     станция = f"?station={п.station}" if п.station else ""
     return f"""\
 # На станции, от root. Ключ — тот, что заведён для станции в разделе «Доступ».
-curl -fsS -H 'X-API-Key: ah_ВАШ_КЛЮЧ' \\
-     -o /tmp/asrhub-dialplan '{п.url}/api/telephony/dialplan/asrhub-dialplan{станция}'
-sh /tmp/asrhub-dialplan --install       # /usr/local/bin, /etc/asrhub, очередь повтора
+t=$(mktemp) && curl -fsS -H 'X-API-Key: ah_ВАШ_КЛЮЧ' -o "$t" \\
+     '{п.url}/api/telephony/dialplan/asrhub-dialplan{станция}' &&
+  sh "$t" --install; rm -f "$t"         # /usr/local/bin, /etc/asrhub, очередь повтора
 editor /etc/asrhub/dialplan.conf         # вписать ключ
 asrhub-dialplan --test                   # адрес, ключ и станция — без записи в архив
 

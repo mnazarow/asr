@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import math
 import mimetypes
@@ -758,6 +759,16 @@ async def create_job(
     state = get_state(request)
     require_write(principal)
 
+    # Ключ идемпотентности: повтор той же загрузки (клиент не дождался
+    # ответа — обрыв, тайм-аут прокси) возвращает уже заведённое задание, а
+    # не ставит второе. Действует сутки в пределах владельца.
+    ключ_повтора = _ключ_идемпотентности(request)
+    if ключ_повтора:
+        прежнее = await asyncio.to_thread(_по_ключу_повтора, state, principal, ключ_повтора)
+        if прежнее is not None:
+            await file.close()
+            return прежнее
+
     filename = Path(file.filename or "upload.wav").name
     suffix = Path(filename).suffix.lower()
     if suffix and suffix not in SUPPORTED_EXTENSIONS:
@@ -838,7 +849,53 @@ async def create_job(
     if данные_звонка:
         job["call"] = await asyncio.to_thread(
             _сохранить_звонок, state, job, principal, данные_звонка, беды)
+    if ключ_повтора:
+        await asyncio.to_thread(_запомнить_ключ_повтора, state, principal, ключ_повтора,
+                                str(job.get("id") or ""))
     return job
+
+
+#: Сколько помнится ключ идемпотентности, с.
+СРОК_КЛЮЧА_ПОВТОРА = 86400.0
+_ГОДНЫЙ_КЛЮЧ_ПОВТОРА = re.compile(r"^[\x21-\x7e]{1,128}$")
+
+
+def _ключ_идемпотентности(request: Request) -> str:
+    """Заголовок Idempotency-Key: печатные ASCII без пробелов, до 128 знаков."""
+    ключ = (request.headers.get("Idempotency-Key") or "").strip()
+    if not ключ:
+        return ""
+    if not _ГОДНЫЙ_КЛЮЧ_ПОВТОРА.match(ключ):
+        raise error_response(ConfigError(
+            "Заголовок Idempotency-Key: от 1 до 128 печатных знаков ASCII без пробелов.",
+            hint="Удобно — UUID, сгенерированный клиентом на каждую загрузку."))
+    return ключ
+
+
+def _имя_ключа_повтора(principal: Principal, ключ: str) -> str:
+    отпечаток = hashlib.sha256(f"{principal.name}\n{ключ}".encode()).hexdigest()[:32]
+    return f"idempotency:{отпечаток}"
+
+
+def _по_ключу_повтора(state: Any, principal: Principal, ключ: str) -> dict[str, Any] | None:
+    запись = state.db.get_kv(_имя_ключа_повтора(principal, ключ)) or {}
+    if not isinstance(запись, dict) or not запись.get("job_id"):
+        return None
+    if time.time() - float(запись.get("at") or 0) > СРОК_КЛЮЧА_ПОВТОРА:
+        return None
+    try:
+        job = state.queue.get(str(запись["job_id"]))
+    except JobNotFound:
+        return None
+    job = dict(job)
+    job["idempotent_replay"] = True
+    return job
+
+
+def _запомнить_ключ_повтора(state: Any, principal: Principal, ключ: str, job_id: str) -> None:
+    if job_id:
+        state.db.set_kv(_имя_ключа_повтора(principal, ключ),
+                        {"job_id": job_id, "at": time.time()})
 
 
 @router.post("/batch", summary="Поставить несколько файлов одной группой",
@@ -1147,6 +1204,11 @@ def get_job(request: Request, job_id: str,
     else:
         job.pop("waveform", None)
     job["events"] = state.db.get_events(job_id, limit=100)
+    # Срок выполнения сорван (или уже не будет соблюдён): признак для карточки
+    # и для внешних систем, чтобы не сравнивать время самим.
+    if job.get("deadline"):
+        конец = float(job.get("finished_at") or time.time())
+        job["deadline_missed"] = конец > float(job["deadline"])
     # Если задание — звонок, поля звонка. Без них карточка показывает
     # «1757500001.1.wav» и больше ничего: ни кто звонил, ни куда попал, ни
     # сколько ждал. Звонком бывает не только запись с АТС: номера присылают
@@ -1160,6 +1222,14 @@ def get_job(request: Request, job_id: str,
         # под то же правило, что и раскладка хранилища.
         if not principal.is_admin:
             звонок.pop("recording", None)
+        # Другие ноги разговора (перевод, очередь) — по linkedid. Чужие
+        # ноги обычному ключу не видны: владелец у ноги свой.
+        from .deps import same_scope  # noqa: PLC0415
+
+        ноги = [н for н in state.db.call_legs(звонок)
+                if principal.is_admin or same_scope(principal, str(н.get("owner") or ""))]
+        if ноги:
+            звонок["legs"] = ноги
         # Добавочный — это стол, а читающему нужен человек. Справочник
         # сотрудников открыт любому ключу (это внутренний телефонный
         # список), поэтому имя приходит прямо в карточку.
@@ -1185,6 +1255,18 @@ def get_job(request: Request, job_id: str,
                 if isinstance(звонок.get(поле), str):
                     звонок[поле] = masking.mask_text(звонок[поле])
         job["call"] = звонок
+        # Оценка клиента из обратного звонка с опросом (контроль качества):
+        # последний завершённый опрос по этому разговору.
+        опрос = state.db.query_one(
+            "SELECT group_name, status, score, score_pct, answers, finished_at FROM qc_surveys "
+            "WHERE call_key=? AND kind='опрос' AND finished_at IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT 1", (str(звонок.get("uniqueid") or ""),))
+        if опрос is not None:
+            from ..qc.survey import опрос_наружу  # noqa: PLC0415
+
+            оценка = опрос_наружу(опрос)
+            job["qc_survey"] = {к: оценка.get(к) for к in (
+                "group_name", "status", "score", "score_pct", "answers", "finished_at")}
     # Проверка качества по записи — чтобы оценить работу оператора прямо в
     # карточке, куда ведёт очередь «Контроль качества».
     проверка = state.db.qa_for_job(job_id)

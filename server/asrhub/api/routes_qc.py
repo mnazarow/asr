@@ -360,16 +360,8 @@ async def test_call(request: Request, number: str = Body(..., embed=True),
         raise error_response(exc) from exc
 
 
-@router.get("/surveys", summary="Журнал опросов")
-async def surveys(request: Request, principal: Principal = Depends(authenticate),
-                  status: str = Query("", description="Состояние: ждёт, пройден, частично…"),
-                  group: str = Query("", description="Имя группы"),
-                  ext: str = Query("", description="Добавочный номер"),
-                  search: str = Query("", description="Часть номера клиента"),
-                  since_days: int = Query(30, ge=1, le=3650),
-                  limit: int = Query(100, ge=1, le=500),
-                  offset: int = Query(0, ge=0)) -> dict[str, Any]:
-    state, _ = _служба(request, principal)
+def _отбор_опросов(status: str, group: str, ext: str, search: str,
+                   since_days: int) -> tuple[str, list[Any]]:
     условия = ["s.created_at>=?"]
     параметры: list[Any] = [time.time() - since_days * 86400]
     for поле, значение in (("s.status", status), ("s.group_name", group), ("s.ext", ext)):
@@ -380,7 +372,20 @@ async def surveys(request: Request, principal: Principal = Depends(authenticate)
     if цифры:
         условия.append("instr(s.number, ?) > 0")
         параметры.append(цифры)
-    где = " AND ".join(условия)
+    return " AND ".join(условия), параметры
+
+
+@router.get("/surveys", summary="Журнал опросов")
+async def surveys(request: Request, principal: Principal = Depends(authenticate),
+                  status: str = Query("", description="Состояние: ждёт, пройден, частично…"),
+                  group: str = Query("", description="Имя группы"),
+                  ext: str = Query("", description="Добавочный номер"),
+                  search: str = Query("", description="Часть номера клиента"),
+                  since_days: int = Query(30, ge=1, le=3650),
+                  limit: int = Query(100, ge=1, le=500),
+                  offset: int = Query(0, ge=0)) -> dict[str, Any]:
+    state, _ = _служба(request, principal)
+    где, параметры = _отбор_опросов(status, group, ext, search, since_days)
 
     def прочитать() -> dict[str, Any]:
         всего = state.db.query_one(
@@ -403,6 +408,72 @@ async def surveys(request: Request, principal: Principal = Depends(authenticate)
                 "limit": limit, "offset": offset}
 
     return await asyncio.to_thread(прочитать)
+
+
+#: Колонки выгрузки опросов: (заголовок, поле).
+_КОЛОНКИ_ВЫГРУЗКИ = (("Создан", "created_at"), ("Разговор", "call_at"),
+                     ("Завершён", "finished_at"), ("Группа", "group_name"),
+                     ("Добавочный", "ext"), ("Сотрудник", "ext_name"),
+                     ("Номер клиента", "number"), ("Итог", "status"),
+                     ("Попыток", "attempts"), ("Оценка", "score"), ("Оценка, %", "score_pct"),
+                     ("Код SIP", "sip_code"), ("Ошибка", "error"),
+                     ("Задание разговора", "job_id"))
+
+
+@router.get("/surveys/export", summary="Выгрузка опросов в CSV")
+async def surveys_export(request: Request, principal: Principal = Depends(authenticate),
+                         status: str = Query("", description="Состояние"),
+                         group: str = Query("", description="Имя группы"),
+                         ext: str = Query("", description="Добавочный номер"),
+                         search: str = Query("", description="Часть номера клиента"),
+                         since_days: int = Query(30, ge=1, le=3650)) -> Response:
+    """Тот же отбор, что у журнала, — все строки, по колонке на каждый
+    вопрос группы. CSV для Excel: разделитель «;», UTF-8 с BOM."""
+    state, _ = _служба(request, principal)
+    где, параметры = _отбор_опросов(status, group, ext, search, since_days)
+
+    def собрать() -> str:
+        import csv  # noqa: PLC0415
+        import io  # noqa: PLC0415
+
+        строки = state.db.query(
+            f"SELECT s.*, COALESCE(c.job_id, s.job_id) AS call_job_id "  # noqa: S608
+            f"FROM qc_surveys s LEFT JOIN calls c ON c.uniqueid = s.call_key "
+            f"WHERE {где} ORDER BY s.created_at DESC LIMIT 100000", параметры)
+        записи = [опросы.опрос_наружу(с) for с in строки]
+        люди = state.db.employees_by_ext([з["ext"] for з in записи if з.get("ext")])
+        вопросов = max((len(з.get("answers") or []) for з in записи), default=0)
+        буфер = io.StringIO()
+        письмо = csv.writer(буфер, delimiter=";")
+        письмо.writerow([з for з, _ in _КОЛОНКИ_ВЫГРУЗКИ]
+                        + [f"Вопрос {н + 1}" for н in range(вопросов)])
+        for з in записи:
+            человек = люди.get(з.get("ext") or "") or {}
+            з["ext_name"] = " ".join(ч for ч in (человек.get("last_name"),
+                                                 человек.get("first_name")) if ч)
+            з["job_id"] = з.pop("call_job_id", None) or ""
+            for поле in ("created_at", "call_at", "finished_at"):
+                з[поле] = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(з[поле])))
+                           if з.get(поле) else "")
+            ответы = [("" if о.get("digit") is None else о.get("digit"))
+                      for о in (з.get("answers") or [])]
+            письмо.writerow([_ячейка(з.get(поле)) for _, поле in _КОЛОНКИ_ВЫГРУЗКИ]
+                            + ответы + [""] * (вопросов - len(ответы)))
+        return "\ufeff" + буфер.getvalue()
+
+    текст = await asyncio.to_thread(собрать)
+    имя = time.strftime("qc-surveys-%Y%m%d.csv")
+    return Response(текст, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{имя}"'})
+
+
+def _ячейка(значение: Any) -> Any:
+    """Значение для CSV: текст, начинающийся с «=+-@», Excel не исполняет."""
+    if значение is None:
+        return ""
+    if isinstance(значение, str) and значение[:1] in ("=", "+", "-", "@"):
+        return "'" + значение
+    return значение
 
 
 @router.post("/surveys/{survey_id}/cancel", summary="Отменить ждущий опрос")

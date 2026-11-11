@@ -29,8 +29,18 @@
     config.yaml.bak.*; пропадут ключи интеграций, токен Hugging Face и все
     настройки.
 
+.PARAMETER Offline
+    Не обращаться к индексу пакетов: pip берёт пакеты только из каталога
+    -Wheels. Без -Wheels установка остановится с подсказкой.
+
+.PARAMETER Wheels
+    Каталог с заранее скачанными колёсами (pip download -d КАТАЛОГ …).
+    С -Offline — единственный источник пакетов, без него — дополнительный.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Offline -Wheels D:\wheels
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Profile standard -Port 9000
 .EXAMPLE
@@ -55,6 +65,7 @@ param(
     [switch]$Interactive,
     [switch]$NoInteractive,
     [switch]$Offline,
+    [string]$Wheels = '',
     [switch]$Force,
     [switch]$ResetConfig,
     [switch]$DryRun,
@@ -476,7 +487,28 @@ if (-not $Offline -and $Mode -eq 'native') {
     if (Test-Internet) { Write-Ok 'Доступ в интернет есть' }
     else {
         Write-Warn 'pypi.org не ответил на проверку — pip попробует сам (и зеркало из pip.ini, если оно задано).'
-        Write-Hint 'Машина без сети — колёса заранее (pip download) и -Offline.'
+        Write-Hint 'Машина без сети — колёса заранее (pip download -d КАТАЛОГ), затем -Offline -Wheels КАТАЛОГ.'
+    }
+}
+if ($Offline -and $Mode -eq 'native') {
+    if (-not $Wheels) {
+        Write-Err 'Ключ -Offline без -Wheels: pip ставит только из каталога колёс, а он не задан.'
+        Write-Hint 'Скачайте пакеты на машине с сетью: pip download -d D:\wheels -r requirements\base.txt'
+        Write-Hint 'и повторите: install.ps1 -Offline -Wheels D:\wheels'
+        exit 1
+    }
+    if (-not (Test-Path -LiteralPath $Wheels -PathType Container)) {
+        Write-Err "Каталога колёс нет: $Wheels"
+        exit 1
+    }
+    $Wheels = (Resolve-Path -LiteralPath $Wheels).Path
+    Write-Ok "Пакеты — только из каталога $Wheels"
+} elseif ($Wheels) {
+    if (Test-Path -LiteralPath $Wheels -PathType Container) {
+        $Wheels = (Resolve-Path -LiteralPath $Wheels).Path
+    } else {
+        Write-Warn "Каталога колёс нет: $Wheels — ставлю из индекса."
+        $Wheels = ''
     }
 }
 
@@ -875,6 +907,10 @@ if ($Mode -eq 'docker') {
 
     $pipFlags = @('--disable-pip-version-check', '--no-input')
     if ($Offline) { $pipFlags += '--no-index' }
+    # Каталог колёс. Раньше -Offline давал только --no-index, без источника
+    # пакетов: pip не находил ни одного и установка падала на первом же
+    # «No matching distribution found».
+    if ($Wheels) { $pipFlags += @('--find-links', $Wheels) }
 
     Invoke-Checked -Command $venvPython -Arguments (@('-m', 'pip', 'install') + $pipFlags +
         @('--upgrade', 'pip', 'setuptools', 'wheel')) -IgnoreExitCode | Out-Null
@@ -1158,6 +1194,13 @@ Write-Host ''
 Write-Host "  Веб-интерфейс     http://${probeHost}:$Port"
 Write-Host "  Справочник API    http://${probeHost}:$Port/api/reference"
 if ($apiKey) { Write-Host "  Ключ доступа      $apiKey" -ForegroundColor White }
+# Пароль первого запуска — случайный: сервер кладёт его в каталог данных при
+# первом старте и удаляет после смены.
+$adminPasswordFile = Join-Path $DataDir 'admin-password.txt'
+if (Test-Path $adminPasswordFile) {
+    $adminPassword = (Get-Content $adminPasswordFile -Raw).Trim()
+    Write-Host "  Вход              admin / $adminPassword (сменить при первом входе)" -ForegroundColor White
+}
 Write-Host "  Каталог программы $Prefix"
 Write-Host "  Каталог данных    $DataDir"
 Write-Host "  Журнал установки  $logFile"

@@ -1,6 +1,7 @@
 """Журналирование ASR Hub: файлы с ротацией, консоль и кольцевой буфер для интерфейса."""
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import logging.handlers
@@ -32,6 +33,24 @@ def _mask(value: Any) -> Any:
     return f"{text[:4]}…{text[-2:]}"
 
 
+#: Номер текущего запроса API (см. прослойку `_НомерЗапроса` в api/app.py):
+#: каждая строка журнала, написанная по ходу запроса, несёт его в поле
+#: request_id — по номеру из ответа (X-Request-ID) строки находятся разом.
+НОМЕР_ЗАПРОСА: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "asrhub_request_id", default="")
+
+
+class _ФильтрНомера(logging.Filter):
+    """Ставит record.request_id из контекста запроса, если он есть."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "request_id", None) is None:
+            номер = НОМЕР_ЗАПРОСА.get()
+            if номер:
+                record.request_id = номер
+        return True
+
+
 class RingHandler(logging.Handler):
     """Держит последние записи в памяти — интерфейс показывает их без чтения файла."""
 
@@ -44,7 +63,8 @@ class RingHandler(logging.Handler):
                 "logger": record.name,
                 "message": record.getMessage(),
             }
-            for key in ("job_id", "model", "engine", "duration", "error_code"):
+            for key in ("job_id", "model", "engine", "duration", "error_code",
+                        "request_id"):
                 val = getattr(record, key, None)
                 if val is not None:
                     entry[key] = val
@@ -93,7 +113,7 @@ class HumanFormatter(logging.Formatter):
         if self.color:
             prefix = f"{stamp} {_LEVEL_COLORS.get(level, '')}{level:<8}{_RESET}"
         extras = []
-        for key in ("job_id", "model", "engine"):
+        for key in ("job_id", "model", "engine", "request_id"):
             val = getattr(record, key, None)
             if val:
                 extras.append(f"{key}={val}")
@@ -138,6 +158,9 @@ def setup(level: str = "INFO", log_dir: Path | None = None,
             root.warning("Не удалось открыть файл журнала в %s: %s", log_dir, exc)
 
     root.addHandler(RingHandler())
+    фильтр = _ФильтрНомера()
+    for обработчик in root.handlers:
+        обработчик.addFilter(фильтр)
 
     for noisy in ("urllib3", "httpx", "asyncio", "filelock", "huggingface_hub", "numba"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

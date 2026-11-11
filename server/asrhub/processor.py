@@ -459,14 +459,21 @@ def process_job(source: Path, settings: dict[str, Any], registry: EngineRegistry
         # lease() держит модель занятой: пока идёт распознавание, её не
         # выгрузит ни сборщик простоя, ни вытеснение из кеша.
         ждём_модель = time.monotonic()
+        # Движок один на модель и под своим замком: второй воркер на той же
+        # модели стоит здесь, пока первый не закончит. Это видно в задании
+        # стадией, а время ожидания идёт в ожидание очереди, не в обработку.
+        report(0.18 + 0.64 * channel_index / max(1, len(channels)), "ожидание модели")
         with registry.lease(settings) as engine:
+            ожидание = time.monotonic() - ждём_модель
+            outcome.stats["engine_wait_s"] = round(
+                float(outcome.stats.get("engine_wait_s") or 0.0) + ожидание, 3)
             # Срок задания — на работу, а не на очередь к модели: lease()
             # ждёт замок движка без предела, и второй воркер на той же
             # модели, простояв за длинной записью соседа дольше срока,
             # получал JobTimeout на первом же докладе — не начав
             # распознавание и без повтора.
             if deadline is not None:
-                deadline += time.monotonic() - ждём_модель
+                deadline += ожидание
             timer.start("inference")
             куски = _куски_по_речи(engine, spec, settings, spans,
                                    _длина_wav(prepared) or info.duration_s)

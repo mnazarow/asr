@@ -170,7 +170,7 @@ ARG ACCEL=cpu
 # Версия образа. Значение по умолчанию обязано совпадать с файлом VERSION —
 # это проверяется тестом: раньше оно было вписано числом и тихо отставало от
 # файла на каждом выпуске, а docker inspect показывал прошлогоднюю версию.
-ARG VERSION=3.1.27
+ARG VERSION=3.1.29
 
 LABEL org.opencontainers.image.title="ASR Hub" \
       org.opencontainers.image.description="Сервер распознавания речи на свободных моделях" \
@@ -208,6 +208,8 @@ COPY requirements/ ./requirements/
 # (/api/telephony/agent/install.sh). Без этой строки адрес из главы про
 # агента отвечал в контейнере ошибкой 500.
 COPY agent/ ./agent/
+# Руководство — для раздела «Документация» (главы и картинки).
+COPY docs/ ./docs/
 COPY VERSION ./
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh && \

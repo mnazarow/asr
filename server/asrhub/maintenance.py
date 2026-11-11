@@ -22,6 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .errors import ASRHubError
 from .instance import INSTANCE_ID
 from .logging_setup import get_logger
 
@@ -556,30 +557,68 @@ def digest_text(сводка: dict[str, Any], ошибки: dict[str, Any],
     return "\n".join(строки)
 
 
-def send_json(payload: dict[str, Any], url: str, *, what: str = "сводка") -> bool:
-    """Отправляет JSON на заданный адрес; сбой — в журнал, не наружу."""
+def _адрес_в_журнал(url: str) -> str:
+    """От адреса — схема и узел: токен чата лежит в пути и в параметрах."""
+    from .monitoring.pushers import адрес_для_всех  # noqa: PLC0415
+
+    return адрес_для_всех(url) or "***"
+
+
+def send_json(payload: dict[str, Any], url: str, *, what: str = "сводка",
+              попыток: int = 1, паузы: tuple[float, ...] = (5.0, 30.0, 120.0),
+              allow_internal: bool = False) -> bool:
+    """Отправляет JSON на заданный адрес; сбой — в журнал, не наружу.
+
+    `попыток` больше одного — повторы с паузами `паузы` (для тревог: приёмник,
+    недоступный в эту секунду, не должен терять «диск кончается»). В журнал
+    адрес попадает без токена: `alert_url`, `digest_url` и `tracker_url` —
+    секреты, токен чата у них в самом адресе, а журнал отдаётся по
+    `/api/logs` и уезжает в сборщики.
+    """
     тело = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    try:
-        # Сборка запроса — тоже внутри: негодный адрес в настройках
-        # («без схемы», опечатка) роняет уже конструктор, и без этого
-        # служебный цикл писал бы в журнал ошибку каждые двадцать секунд.
-        запрос = urllib.request.Request(                 # noqa: S310
-            url, data=тело, method="POST",
-            headers={"Content-Type": "application/json; charset=utf-8",
-                     "User-Agent": "ASR Hub"})
-        with urllib.request.urlopen(запрос, timeout=DIGEST_TIMEOUT) as ответ:  # noqa: S310
-            log.info("%s: отправлено на %s, код %s", what.capitalize(), url, ответ.status)
-            return True
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        # Сбой отправки никогда не влияет на работу сервера: сводка и
-        # трекеры — удобство, а не часть обработки заданий.
-        log.warning("%s: отправить не удалось (%s): %s", what.capitalize(), url, exc)
-        return False
+    куда = _адрес_в_журнал(url)
+    for попытка in range(max(1, попыток)):
+        try:
+            # Сборка запроса — тоже внутри: негодный адрес в настройках
+            # («без схемы», опечатка) роняет уже конструктор, и без этого
+            # служебный цикл писал бы в журнал ошибку каждые двадцать секунд.
+            запрос = urllib.request.Request(                 # noqa: S310
+                url, data=тело, method="POST",
+                headers={"Content-Type": "application/json; charset=utf-8",
+                         "User-Agent": "ASR Hub"})
+            # Тот же открыватель, что у уведомлений о заданиях: адрес
+            # проверяется и на каждом перенаправлении. Обычный urlopen шёл по
+            # «302 → http://169.254.169.254/…» куда скажут — проверка адреса
+            # приёмника в настройках этого не ловила.
+            from .job_queue import открыватель_наружу  # noqa: PLC0415
+
+            открыватель = открыватель_наружу(bool(allow_internal))
+            with открыватель.open(запрос, timeout=DIGEST_TIMEOUT) as ответ:
+                log.info("%s: отправлено на %s, код %s", what.capitalize(), куда, ответ.status)
+                return True
+        except ASRHubError as exc:
+            # Адрес (или перенаправление) ведёт во внутреннюю сеть, а она
+            # закрыта настройкой webhook_allow_internal: повторять незачем.
+            log.warning("%s: адрес %s отвергнут: %s", what.capitalize(), куда,
+                        str(exc.message).replace(url, куда) if url else exc.message)
+            return False
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # Сбой отправки никогда не влияет на работу сервера: сводка и
+            # трекеры — удобство, а не часть обработки заданий. Текст ошибки
+            # urllib может содержать адрес целиком — его тоже чистим.
+            причина = str(exc).replace(url, куда) if url else str(exc)
+            последняя = попытка + 1 >= max(1, попыток)
+            log.warning("%s: отправить не удалось (%s, попытка %d из %d): %s",
+                        what.capitalize(), куда, попытка + 1, max(1, попыток), причина)
+            if последняя:
+                return False
+            time.sleep(паузы[min(попытка, len(паузы) - 1)])
+    return False
 
 
-def send_digest(digest: dict[str, Any], url: str) -> bool:
+def send_digest(digest: dict[str, Any], url: str, *, allow_internal: bool = False) -> bool:
     """Отправляет сводку на заданный адрес."""
-    return send_json(digest, url, what="сводка")
+    return send_json(digest, url, what="сводка", allow_internal=allow_internal)
 
 
 #: Отметки суточных заходов здоровья распознавания.
@@ -748,14 +787,21 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
             log.warning("Уборка файлов без задания не прошла: %s", exc)
 
     адрес = str(settings.get("digest_url") or "").strip()
-    if адрес and _пора(db, KV_DIGEST, float(settings.get("digest_interval_hours") or 0)):
+    интервал = float(settings.get("digest_interval_hours") or 0)
+    if адрес and _пора(db, KV_DIGEST, интервал):
         db.set_kv(KV_DIGEST, time.time())
         try:
             сводка = build_digest(analytics, settings, insights=insights)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Сводку собрать не удалось: %s", exc)
         else:
-            сделано["digest"] = send_digest(сводка, адрес)
+            сделано["digest"] = send_digest(
+                сводка, адрес, allow_internal=bool(settings.get("webhook_allow_internal")))
+            if not сделано["digest"] and интервал > 1:
+                # Приёмник был недоступен: следующая попытка — через час, а
+                # не через полный срок. Раньше отметка «отправлено» ставилась
+                # до отправки, и недельная сводка при сбое терялась на неделю.
+                db.set_kv(KV_DIGEST, time.time() - (интервал - 1.0) * 3600)
     return сделано
 
 
@@ -775,7 +821,6 @@ def restore(path: Path, target: Path, settings: Any = None) -> str:
     `service.sh restore`. Возвращает имя сохранённой прежней базы.
     """
     from . import backup as резерв  # noqa: PLC0415
-    from .errors import ASRHubError  # noqa: PLC0415
 
     if not Path(path).exists():
         raise FileNotFoundError(f"Копия не найдена: {path}")

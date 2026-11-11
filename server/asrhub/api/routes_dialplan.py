@@ -20,8 +20,10 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -32,8 +34,9 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from .. import resources as ресурсы
 from ..db import new_id
-from ..errors import ASRHubError, ConfigError, FileTooLarge, StorageError
+from ..errors import ASRHubError, ConfigError, FileTooLarge, ForbiddenError, StorageError
 from ..logging_setup import get_logger
 from ..telephony import dialplan as Д
 from ..telephony import dialplan_config as К
@@ -53,6 +56,96 @@ log = get_logger("telephony")
                  "не дождались записи")
 
 router = APIRouter(prefix="/api/telephony/dialplan", tags=["Телефония"])
+
+#: Звонки, которые принимаются прямо сейчас («станция:идентификатор»).
+#: Повтор сценария, пока первый запрос ещё идёт, получает 409 и повторит
+#: позже, а не ставит второе задание. Замок всей станции на каждый приём
+#: больше не берётся: под ним шли сохранение файла, ffprobe и замеры роста
+#: записи, и массовый отбой (конец смены) выстраивал все обращения станции
+#: в одну очередь в общем пуле потоков сервера.
+_ПРИНИМАЮТСЯ: set[str] = set()
+_ЗАМОК_ПРИЁМА = threading.Lock()
+#: Чей ключ принимает звонки станции: kv «dialplan:key:<станция>».
+КЛЮЧ_СТАНЦИИ = "dialplan:key:"
+
+
+class ПриёмНедоступен(ASRHubError):
+    """Забор или станция выключены — временно: повторить позже.
+
+    Был 400, и сценарий отправки складывал звонки за время обслуживания в
+    `failed/`, откуда их дошлёт только ручной `--resend-failed`. С 503 и
+    `Retry-After` они остаются в `pending/` и дошлются сами.
+    """
+
+    code = "intake_disabled"
+    http_status = 503
+    retryable = True
+
+
+def _недоступен(сообщение: str, подсказка: str) -> ПриёмНедоступен:
+    ошибка = ПриёмНедоступен(сообщение, hint=подсказка)
+    ошибка.details = {**(ошибка.details or {}), "retry_after_s": 300}
+    return ошибка
+
+
+def _проверить_квоту_станции(state: Any, principal: Principal, станция: Any) -> None:
+    """Суточная квота ключа — по звонкам его станции.
+
+    Задания звонков записываются не на ключ, а на владельца из карты
+    станции (отдел, сотрудник), поэтому обычный расход ключа их не видит.
+    Станция же закреплена за ключом (см. `_проверить_ключ`): её звонки за
+    сутки и есть расход ключа. Раньше квота здесь не проверялась вовсе.
+    """
+    if principal.is_admin:
+        return
+    заданий = float(principal.quota_jobs_per_day or 0)
+    часов = float(principal.quota_audio_hours_per_day or 0)
+    if not (заданий or часов):
+        return
+    from ..errors import QuotaExceeded  # noqa: PLC0415
+
+    расход = state.db.query_one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(j.media_duration_s), 0) AS s "
+        "FROM calls c JOIN jobs j ON j.id = c.job_id "
+        "WHERE c.station=? AND j.created_at>=? AND j.status NOT IN ('cancelled', 'failed')",
+        (станция.id, time.time() - 86400))
+    n, s = int(расход["n"] or 0), float(расход["s"] or 0)
+    if заданий and n + 1 > заданий:
+        raise QuotaExceeded("jobs", n + 1, заданий)
+    if часов and s / 3600 >= часов:
+        raise QuotaExceeded("audio_hours", round(s / 3600, 3), часов)
+
+
+def _проверить_ключ(state: Any, principal: Principal, станция: Any) -> None:
+    """Звонки станции принимаются от одного ключа (и от администратора).
+
+    Раньше станция выбиралась полем запроса, и любой ключ с правом записи
+    заводил звонки — и задания — от имени чужого подразделения. Теперь
+    станция закрепляется за ключом, который первым прислал ей звонок; ключи
+    той же группы считаются своими. Ключ отозвали — станция переходит к
+    пришедшему. Отвязать станцию может администратор в разделе «Asterisk:
+    диалплан».
+    """
+    if principal.is_admin:
+        return
+    ключ = КЛЮЧ_СТАНЦИИ + станция.id
+    владелец = str(state.db.get_kv(ключ) or "")
+    if not владелец:
+        state.db.set_kv(ключ, principal.name)
+        return
+    if владелец == principal.name or владелец in (principal.peers or ()):
+        return
+    from .routes_agent import _владелец_жив  # noqa: PLC0415
+
+    if not _владелец_жив(state, владелец):
+        log.warning("Диалплан «%s»: ключ «%s» отозван, станция переходит к «%s»",
+                    станция.name, владелец, principal.name)
+        state.db.set_kv(ключ, principal.name)
+        return
+    raise ForbiddenError(
+        f"Станция «{станция.name}» принимает звонки от другого ключа доступа.",
+        hint="Каждая станция шлёт звонки своим ключом. Отвязать станцию от ключа "
+             "может администратор в разделе «Asterisk: диалплан».")
 
 #: Сценарий отправки лежит рядом с агентом и раздаётся так же: установка на
 #: станции — одна команда, без git и без копирования руками.
@@ -172,17 +265,21 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
         "mode": ("upload" if загрузка is not None else
                  "path" if поля.get("recording") else "none")}
     сохранённый: Path | None = None
+    занят_ключ = ""
     try:
         станция = Д.выбрать_станцию(state.settings, поля.get("station", ""))
         отметка["station"] = станция.id
         if not state.settings.get("telephony_enabled", False):
-            raise ConfigError(
+            raise _недоступен(
                 "Забор записей с АТС выключен.",
-                hint="Включите параметр «Забирать записи с АТС» (telephony_enabled) "
-                     "в разделе «Настройки» или кнопкой в разделе «Asterisk: диалплан».")
+                "Включите параметр «Забирать записи с АТС» (telephony_enabled) "
+                "в разделе «Настройки» или кнопкой в разделе «Asterisk: диалплан». "
+                "Сценарий отправки держит звонки у себя и дошлёт их сам.")
         if not станция.enabled:
-            raise ConfigError(f"Станция «{станция.name}» выключена.",
-                              hint="Включите её в разделе «АТС».")
+            raise _недоступен(f"Станция «{станция.name}» выключена.",
+                              "Включите её в разделе «АТС». Сценарий отправки держит "
+                              "звонки у себя и дошлёт их сам.")
+        _проверить_ключ(state, principal, станция)
         uid = поля.get("uniqueid", "")
         if not uid:
             raise ConfigError("У звонка нет идентификатора (uniqueid).",
@@ -206,6 +303,15 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
             "direction": звонок.direction, "agent": звонок.agent, "owner": владелец,
             "warnings": беды, "ignored": лишние}
 
+        from .routes_agent import ЗвонокПринимается  # noqa: PLC0415
+
+        with _ЗАМОК_ПРИЁМА:
+            if ключ in _ПРИНИМАЮТСЯ:
+                raise ЗвонокПринимается(
+                    f"Звонок {звонок.uniqueid} уже принимается другим запросом.",
+                    hint="Сценарий отправки повторит его позже сам.")
+            _ПРИНИМАЮТСЯ.add(ключ)
+            занят_ключ = ключ
         прежняя = _строка(state, ключ)
         отложен = bool(прежняя) and str(прежняя.get("skipped") or "").startswith(
             state.db.ОТЛОЖЕН)
@@ -253,13 +359,17 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
                          **Д.решение_пробы(звонок, станция,
                                            есть_запись=путь is not None or есть_файл,
                                            владелец=владелец)})
-            if путь is not None:
+            # Есть ли файл в каталоге записей — только администратору: иначе
+            # проба с путём превращалась в способ узнавать, какие файлы лежат
+            # на общем диске.
+            if путь is not None and principal.is_admin:
                 тело["recording_exists"] = путь.is_file()
             Д.журнал.отметить(**отметка, result="dry_run",
                               reason=(f"был бы пропущен: {тело['reason']}" if тело.get("reason")
                                       else "был бы поставлен"))
             return 200, тело
 
+        _проверить_квоту_станции(state, principal, станция)
         if путь is not None:
             звонок.recording = str(путь)
             if готов and not (звонок.billsec or звонок.duration) and путь.is_file():
@@ -275,11 +385,16 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
             # один период раздела «Телефония».
             звонок.started_at = time.time() - float(звонок.duration or звонок.billsec or 0)
 
-        # Под замком станции: её поток прямо сейчас может дозабирать этот же
-        # отложенный звонок, и без замка одна запись ушла бы двумя заданиями.
+        # Замок станции — только когда он нужен: поток станции может прямо
+        # сейчас дозабирать этот же отложенный звонок, а у станции с журналом
+        # или AMI — импортировать тот же звонок из своего источника. Без
+        # замка одна запись ушла бы двумя заданиями. Новый звонок станции
+        # «вызов из диалплана» её поток не видит, пока тот не отложен, и от
+        # повтора того же звонка хватает занятого ключа.
         from ..telephony.importer import ОчередьОтказала  # noqa: PLC0415
 
-        with импортёр._заход:
+        нужен_замок = отложен or станция.source != Д.ИСТОЧНИК
+        with импортёр._заход if нужен_замок else contextlib.nullcontext():
             try:
                 почему = импортёр._взять(звонок, отложенный=отложен, готов=готов,
                                          разметка=False)
@@ -322,6 +437,10 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
         Д.журнал.отметить(**отметка, result="rejected", reason=f"сбой сервера: {exc}",
                           code="internal_error", status=500)
         raise
+    finally:
+        if занят_ключ:
+            with _ЗАМОК_ПРИЁМА:
+                _ПРИНИМАЮТСЯ.discard(занят_ключ)
 
 
 #: Тело запроса для описания API: поля читаются из запроса вручную (форма,
@@ -403,6 +522,52 @@ async def call(request: Request,
     return JSONResponse(тело, status_code=код)
 
 
+#: Ключ пульса сценария отправки в таблице kv.
+КЛЮЧ_ПУЛЬСА = "dialplan:pulse:"
+
+
+@router.post("/pulse", summary="Пульс сценария отправки: жив, сколько ждёт в очереди")
+async def pulse(request: Request,
+                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Сценарий asrhub-dialplan присылает его при каждой досылке (cron, раз
+    в пять минут): сколько звонков ждёт в очереди повтора, сколько отвергнуто,
+    возраст самого старого. По нему раздел и тревоги отличают «станция
+    молчит» от «звонков нет»."""
+    require_write(principal)
+    state = get_state(request)
+    поля, _файл, форма = await _прочитать(request)
+    try:
+        станция = Д.выбрать_станцию(state.settings, str(поля.get("station") or ""))
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+    finally:
+        if форма is not None:
+            await форма.close()
+    try:
+        await run_in_threadpool(_проверить_ключ, state, principal, станция)
+    except ASRHubError as exc:
+        raise error_response(exc) from exc
+
+    def число(имя: str) -> int:
+        try:
+            return max(0, min(int(float(str(поля.get(имя) or 0))), 10**9))
+        except ValueError:
+            return 0
+
+    запись = {"at": time.time(), "pending": число("pending"), "failed": число("failed"),
+              "oldest_s": число("oldest_s"), "sent": число("sent"),
+              "version": re.sub(r"[^0-9A-Za-z.+-]", "", str(поля.get("version") or ""))[:32],
+              "ip": _адрес_клиента(request), "key": principal.name}
+    await run_in_threadpool(state.db.set_kv, КЛЮЧ_ПУЛЬСА + станция.id, запись)
+    return {"ok": True, "station": станция.id}
+
+
+def пульс(state: Any, станция_id: str) -> dict[str, Any]:
+    """Последний пульс сценария станции; {} — не было ни одного."""
+    данные = state.db.get_kv(КЛЮЧ_ПУЛЬСА + станция_id) or {}
+    return dict(данные) if isinstance(данные, dict) else {}
+
+
 # ---------------------------------------------------------------------------
 # Раздел «Asterisk: диалплан»
 # ---------------------------------------------------------------------------
@@ -429,7 +594,11 @@ def status(request: Request,
     for с in свои:
         данные = с.to_dict(for_admin=True)
         данные["intake"] = Д.журнал.свод(с.id)
+        данные["intake_days"] = Д.журнал.по_дням(с.id, дней=7)
+        данные["pulse"] = пульс(state, с.id)
         данные["calls"] = state.db.call_counts(station=с.id)
+        # Ключ, за которым закреплена станция (см. `_проверить_ключ`).
+        данные["intake_key"] = str(state.db.get_kv(КЛЮЧ_СТАНЦИИ + с.id) or "")
         станции.append(данные)
     return {
         "enabled": bool(state.settings.get("telephony_enabled", False)),
@@ -439,10 +608,25 @@ def status(request: Request,
         "other_stations": [{"id": с.id, "name": с.name, "source": с.source}
                            for с in С.список(state.settings) if с.source != Д.ИСТОЧНИК],
         "summary": Д.журнал.свод(station) if station else Д.журнал.свод(),
+        "days": Д.журнал.по_дням(station, дней=14),
         "recent": Д.журнал.последние(station=station, limit=limit),
         "rate_limit_per_minute": int(state.settings.get("rate_limit_per_minute") or 0),
         "version": str(state.version),
     }
+
+
+@router.delete("/key/{station_id}", summary="Отвязать станцию от ключа доступа")
+def unbind_key(station_id: str, request: Request,
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Станция примет звонки от следующего ключа, который их пришлёт."""
+    require_admin(principal)
+    state = get_state(request)
+    было = str(state.db.get_kv(КЛЮЧ_СТАНЦИИ + station_id) or "")
+    state.db.set_kv(КЛЮЧ_СТАНЦИИ + station_id, "")
+    if было:
+        state.db.add_event(None, "settings_changed",
+                           f"Диалплан: станция {station_id} отвязана от ключа «{было}»")
+    return {"ok": True, "station": station_id, "was": было}
 
 
 @router.delete("/log", summary="Очистить журнал обращений из диалплана")
@@ -487,8 +671,10 @@ def script(request: Request,
     state = get_state(request)
     if station and not К._СТАНЦИЯ.match(station):
         raise error_response(ConfigError("Недопустимый идентификатор станции."))
+    путь = СЦЕНАРИЙ if СЦЕНАРИЙ.is_file() else (
+        ресурсы.файл("agent", СЦЕНАРИЙ.name, переменная="ASRHUB_AGENT_DIR") or СЦЕНАРИЙ)
     try:
-        текст = СЦЕНАРИЙ.read_text(encoding="utf-8")
+        текст = путь.read_text(encoding="utf-8")
     except OSError as exc:
         raise error_response(ASRHubError(
             "Сценарий отправки не найден в установке сервера.",

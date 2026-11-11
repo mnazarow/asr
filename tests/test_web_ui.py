@@ -22,11 +22,15 @@ from __future__ import annotations
 import os
 import re
 import socket
+import sys as _sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
+
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from drill_seed import отвечать  # noqa: E402
 
 #: Где искать браузер. Первый существующий и берётся.
 БРАУЗЕРЫ = (
@@ -150,7 +154,8 @@ def страница(сервер):
 
     with sync_playwright() as playwright:
         браузер = playwright.chromium.launch(executable_path=_браузер())
-        вкладка = браузер.new_page(viewport={"width": 1600, "height": 1000})
+        вкладка = браузер.new_page(viewport={"width": 1600, "height": 1000},
+                                   color_scheme="dark")
         ошибки: list[str] = []
         вкладка.on("console", lambda m: ошибки.append(f"консоль: {m.text}")
                    if m.type == "error" else None)
@@ -1118,7 +1123,7 @@ def test_приёмник_метрик_добавляется_и_убирает�
         assert приёмники["zabbix"]["host"] == "asr-01"
 
         страница.wait_for_selector('[data-drop-target="zabbix"]', timeout=15000)
-        страница.once("dialog", lambda окно: окно.accept())
+        отвечать(страница, True)
         страница.click('[data-drop-target="zabbix"]')
         страница.wait_for_selector('#toasts .toast:has-text("убран")', timeout=15000)
         assert [п["name"] for п in запрос("GET", "/api/monitoring/targets")["targets"]] == [

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from drill_seed import Архив, Вкладка, браузер, поднять
+from drill_seed import Архив, Вкладка, браузер, отвечать, поднять
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qc_pbx import МиниАТС  # noqa: E402
@@ -157,7 +157,7 @@ def test_короткие_номера_образец_голоса_и_запис
     текст = с.inner_text("#qc-voice")
     assert "Урок.wav" in текст and "не используется" in текст
     assert (сервер[1].app.state.hub.qc.каталог_звука().parent / "voice" / "sample.wav").is_file()
-    с.once("dialog", lambda окно: окно.accept())
+    отвечать(с, True)
     с.click("#qc-voice-del")
     с.wait_for_function("() => !document.querySelector('#qc-voice-del')")
     вкладка.чисто()

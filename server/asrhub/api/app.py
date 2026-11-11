@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,7 @@ from .routes_employees import router as employees_router
 from .routes_jobs import router as jobs_router
 from .routes_llm import router as llm_router
 from .routes_llm_proxy import router as llm_proxy_router
+from .routes_manual import router as manual_router
 from .routes_monitoring import router as monitoring_router
 from .routes_phone import router as phone_router
 from .routes_qc import router as qc_router
@@ -632,7 +634,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # не стартовал из-за заведения учётной записи, отнимает и распознавание,
     # и единственный способ увидеть, что пошло не так.
     try:
-        state.accounts.ensure_default_admin()
+        state.accounts.ensure_default_admin(settings.paths.data if settings.paths else None)
     except Exception as exc:                                   # noqa: BLE001
         log.error("Не удалось завести учётную запись по умолчанию: %s", exc)
         log.error("Вход по логину и паролю недоступен; ключи доступа работают. "
@@ -1099,6 +1101,13 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         # выставить свои; заданное приложением он увидит и не задвоит.
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        # Адрес страницы (в нём бывают номер задания и поиск по тексту) не
+        # уходит на чужие сайты, а микрофон нужен только диктовке на своей
+        # странице.
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), geolocation=(), payment=(), usb=(), "
+                                  "microphone=(self)")
         return response
 
     @app.exception_handler(StarletteHTTPException)
@@ -1171,6 +1180,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(agent_admin_router)
     app.include_router(dialplan_router)
     app.include_router(qc_router)
+    app.include_router(manual_router)
     app.include_router(backup_router)
     # Совместимость с phone_asr: маршруты в корне, как у него, и те же под
     # /api — чтобы новые клиенты не выглядели исключением среди прочих.
@@ -1619,7 +1629,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             # Страница отдаётся с запретом на кеш и со ссылками, в которых
             # стоит отпечаток содержимого. Почему так — см. `_asset_version`.
             return HTMLResponse(_index_html(web_dir),
-                                headers={"Cache-Control": "no-cache"})
+                                headers={"Cache-Control": "no-cache",
+                                         "Content-Security-Policy": _ПОЛИТИКА_СТРАНИЦЫ})
 
         @app.get("/favicon.ico", include_in_schema=False)
         async def favicon():
@@ -1632,5 +1643,105 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # нет, схлопывается в «unknown» и не плодит временные ряды.
     # Заполняем в самом конце, когда подключены все маршрутизаторы.
     register_routes(app)
+    app.add_middleware(_НомерЗапроса)
+    # Сжатие — самым внешним слоем, после всех прочих прослоек.
+    app.add_middleware(_Сжатие)
 
     return app
+
+
+#: Политика содержимого главной страницы. Встроенные обработчики (onclick)
+#: пока требуют 'unsafe-inline', но запросы, картинки и звук — только к
+#: самому серверу: внедрённая строка не уведёт ключ из localStorage
+#: на чужой адрес ни fetch, ни картинкой.
+_ПОЛИТИКА_СТРАНИЦЫ = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+    "media-src 'self' blob:; connect-src 'self' ws: wss:; font-src 'self' data:; "
+    "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'")
+
+
+class _НомерЗапроса:
+    """Сквозной номер запроса: в ответе (X-Request-ID) и в каждой строке журнала.
+
+    Номер берётся из заголовка X-Request-ID запроса (его ставят прокси и
+    балансировщики — тогда номер один на всём пути), если он похож на номер:
+    латиница, цифры, «.-_:», до 64 знаков. Иначе — свой. Жалоба «загрузка
+    упала в 14:03» превращается в поиск по номеру из ответа, а не в чтение
+    всего журнала за минуту.
+    """
+
+    _ГОДЕН = re.compile(r"^[A-Za-z0-9._:\-]{8,64}$")
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        from ..logging_setup import НОМЕР_ЗАПРОСА  # noqa: PLC0415
+
+        присланный = ""
+        for ключ, значение in scope.get("headers") or []:
+            if ключ.lower() == b"x-request-id":
+                присланный = значение.decode("latin-1", "replace").strip()
+                break
+        номер = присланный if self._ГОДЕН.match(присланный) else uuid.uuid4().hex[:16]
+        метка = НОМЕР_ЗАПРОСА.set(номер)
+        scope.setdefault("state", {})["request_id"] = номер
+
+        async def отправить(сообщение: Any) -> None:
+            if сообщение.get("type") == "http.response.start":
+                заголовки = [(к, з) for к, з in сообщение.get("headers") or []
+                             if к.lower() != b"x-request-id"]
+                заголовки.append((b"x-request-id", номер.encode("ascii")))
+                сообщение = {**сообщение, "headers": заголовки}
+            await send(сообщение)
+
+        try:
+            await self.app(scope, receive, отправить)
+        finally:
+            НОМЕР_ЗАПРОСА.reset(метка)
+
+
+class _Сжатие:
+    """gzip для статики и ответов API.
+
+    `app.js` — 1,35 МБ, сжатый — 340 КБ, а сценарий «с удалённого
+    компьютера» через VPN — главный. Мимо сжатия идут: запросы с Range
+    (перемотка записи — частичные ответы), веб-сокеты и всё, что не текст:
+    звук, архивы, выгрузки XLSX и DOCX (они уже сжаты внутри).
+    """
+
+    def __init__(self, app: Any) -> None:
+        from starlette.middleware.gzip import GZipMiddleware  # noqa: PLC0415
+
+        self.app = app
+        исключить = ("audio/*", "video/*", "image/png", "image/jpeg", "image/webp",
+                     "application/zip", "application/gzip", "application/octet-stream",
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     "text/event-stream")
+        try:
+            self.сжать = GZipMiddleware(app, minimum_size=1024, compresslevel=6,
+                                        exclude_content_types=исключить)
+        except TypeError:
+            # Starlette до 0.47 не знает exclude_content_types: сжимает всё
+            # по minimum_size, а звук отсекается проверкой пути ниже.
+            self.сжать = GZipMiddleware(app, minimum_size=1024, compresslevel=6)
+            self._старый = True
+        else:
+            self._старый = False
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        заголовки = {к.lower(): з for к, з in scope.get("headers") or []}
+        путь = str(scope.get("path") or "")
+        if b"range" in заголовки or (self._старый and any(
+                ч in путь for ч in ("/audio", "/download", "/export", "/backup", "/redacted"))):
+            await self.app(scope, receive, send)
+            return
+        await self.сжать(scope, receive, send)

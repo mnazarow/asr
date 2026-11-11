@@ -315,10 +315,14 @@ def test_выключенная_телефония_и_станция(data_dir, m
     app = приложение(data_dir, monkeypatch, [станция()], включено=False)
     with TestClient(app) as c:
         ответ = прислать(c, файл=None)
-        assert ответ.status_code == 400 and "выключен" in ответ.json()["message"]
+        # Временно, а не навсегда: 503 и Retry-After — сценарий держит звонок
+        # в pending/ и дошлёт его сам, а не складывает в failed/.
+        assert ответ.status_code == 503 and "выключен" in ответ.json()["message"]
+        assert ответ.headers.get("Retry-After") == "300"
     app = приложение(data_dir, monkeypatch, [станция(enabled=False)])
     with TestClient(app) as c:
-        assert "выключена" in прислать(c, файл=None).json()["message"]
+        ответ = прислать(c, файл=None)
+        assert ответ.status_code == 503 and "выключена" in ответ.json()["message"]
 
 
 def test_проба_ничего_не_пишет(клиент):

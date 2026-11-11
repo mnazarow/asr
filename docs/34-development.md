@@ -1,0 +1,90 @@
+# 34. Разработка: как устроен репозиторий, проверки и выпуск
+
+Глава для того, кто правит код ASR Hub: где что лежит, как запустить сервер из клона, как гонять проверки и собирать руководство, что проверяют согласованность кода и документации и что делать при выпуске версии.
+
+## Что где лежит
+
+| Каталог | Что в нём |
+|---|---|
+| `server/asrhub/` | сервер: FastAPI (`api/`), очередь (`job_queue.py`), база SQLite (`db.py`), движки (`engines/`), конвейер (`pipeline/`), телефония (`telephony/`), контроль качества (`qc/`), мониторинг (`monitoring/`), каталог параметров (`catalog/params.py`) |
+| `server/asrhub/web/` | интерфейс: одна страница без сборщика — `index.html`, `app.js`, `charts.js`, `styles.css` |
+| `agent/` | агент станции (`asrhub-agent.py`, Python 3.6+ без зависимостей), его установщик и сценарий отправки диалплана `asrhub-dialplan` (POSIX sh + curl) |
+| `scripts/` | установка, обновление, служба, проверка окружения — bash и PowerShell парами |
+| `docker/` | образ и compose |
+| `docs/` | руководство (главы `NN-имя.md`), генераторы и сборка в Word/PDF |
+| `examples/` | короткие клиенты: каждый запускается сам и проверяется |
+| `tests/` | проверки (pytest), в том числе браузерные (Playwright) |
+
+## Сервер из клона
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements/dev.txt
+ASRHUB_DATA_DIR=/tmp/asrhub-dev ASRHUB_MODEL=demo-simulator ASRHUB_ENGINE=demo \
+  PYTHONPATH=server python -m asrhub --port 8080
+```
+
+Модель `demo-simulator` проходит весь путь задания без весов и видеокарты. Пароль первого запуска — в `/tmp/asrhub-dev/admin-password.txt` (или задайте `ASRHUB_ADMIN_PASSWORD`).
+
+## Проверки
+
+```bash
+python -m pytest tests -q -p no:cacheprovider -rf                     # всё (больше часа)
+python -m pytest tests -q -m "not web and not scripts and not drill and not slow"   # быстрый ярус
+python -m pytest tests/test_dialplan.py -q -k "сценарий"              # по имени
+```
+
+Метки ставит `tests/conftest.py` по имени файла: `web` — браузерные (`*_web.py`, `test_web_ui.py`, `test_manual.py`), `scripts` — установщики, служебные сценарии и образ, `drill` — сквозные прогоны разделов на наполненном архиве (`test_drill_*`), `slow` — полный цикл через очередь.
+
+- **Браузер.** Браузерные проверки ищут Chromium (`PLAYWRIGHT_CHROMIUM` или `python -m playwright install chromium`); без него они пропускаются. `ASRHUB_REQUIRE_BROWSER=1` делает отсутствие браузера ошибкой — так в сборочном конвейере.
+- **Подтверждения в интерфейсе** — окна, а не `confirm()`: в браузерной проверке ответ за человека даёт `отвечать(страница, True)` из `tests/drill_seed.py`, заданные вопросы — `заданные(страница)`.
+- **Тема.** Интерфейс по умолчанию следует теме системы; браузерные проверки открывают страницы с `color_scheme="dark"`, чтобы снимки и контраст не зависели от машины.
+- **Пароль администратора.** `conftest.py` ставит `ASRHUB_ADMIN_PASSWORD=admin123`: сотни проверок входят этой парой. Проверка случайного пароля сама снимает переменную.
+- **Наполненный архив.** `tests/drill_seed.py` — `Архив` (база с заданиями, звонками, разбором), `поднять` (сервер в потоке на свободном порту), `Вкладка` (страница с проверкой, что в консоли нет ошибок).
+
+## Линтеры
+
+```bash
+ruff check server tests agent/asrhub-agent.py examples
+for f in server/asrhub/web/*.js; do node --check "$f"; done
+shellcheck -S warning -s sh agent/asrhub-dialplan
+shellcheck -S warning agent/install.sh
+shellcheck -S error scripts/*.sh scripts/lib/*.sh
+```
+
+## Сборочный конвейер
+
+`.github/workflows/ci.yml`: на каждый push и запрос на слияние — линтеры и быстрый ярус на Python 3.10 и 3.12; раз в сутки и по кнопке — полный набор с браузером (`ASRHUB_REQUIRE_BROWSER=1`) и сборка колеса с проверкой, что в него попали агент и руководство.
+
+## Согласованность кода и документации
+
+Часть проверок следит не за поведением, а за тем, чтобы код и руководство не разошлись:
+
+- **Маршруты.** Каждый маршрут API должен быть в справочнике (`docs/api-reference.md`, его собирает `docs/generate_api_full.py` с работающего сервера), а маршрут для администратора — в списке `ADMIN_ROUTES` генератора. Пути и параметры, упомянутые в главах, должны существовать.
+- **Коды ошибок** из `errors.py` — в таблице главы 8.
+- **Параметры** — только из каталога `catalog/params.py`: у каждого описание, рекомендация, примеры. Глава 4 и таблицы параметров собираются `docs/generate.py`.
+- **Метрики** — из `monitoring/catalog.py` с описанием и порогом; глава 16 собирается тем же генератором, встроенные тревоги и правила Prometheus берутся из порогов.
+- **Готовые файлы Asterisk** в главе 31 — те же, что отдаёт сервер: блоки `<!-- dialplan … -->` пересобирает `docs/generate.py`.
+- **Ссылки и якоря** между главами разрешаются (якоря — как у GitHub).
+
+После правки параметров, метрик, файлов диалплана или маршрутов:
+
+```bash
+PYTHONPATH=server python3 docs/generate.py
+PYTHONPATH=server python -m asrhub --port 8099 &      # для справочника API
+python3 docs/generate_api_full.py http://127.0.0.1:8099
+```
+
+## Руководство
+
+- Главы — `docs/NN-имя.md`, номер главы берётся из имени файла. Новая глава — строка в `docs/00-README.md` и в списке `docs/assemble.py`.
+- Раздел «Документация» интерфейса показывает те же файлы (`manual.py`); картинки — из `docs/images`.
+- Обзорные снимки разделов пересъёмка: `PYTHONPATH=server python3 docs/make_screenshots.py` (на демонстрационном архиве).
+- Word и PDF: `bash docs/build.sh` (нужен pandoc).
+
+## Выпуск версии
+
+1. Номер — в `VERSION`, `pyproject.toml`, `server/asrhub/__init__.py`, `agent/asrhub-agent.py`, `docker/Dockerfile`, `scripts/lib/common.sh`, `scripts/lib/Common.psm1`, `scripts/client/asrctl`, `scripts/client/asrctl.ps1`, `server/asrhub/web/index.html`.
+2. Запись в главе 18 «Ревизия кода»: что сделано и почему, с новыми проверками.
+3. Глава 33: сделанное убрать, найденное — добавить.
+4. Полный набор проверок, генераторы документации.

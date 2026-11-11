@@ -149,7 +149,11 @@ def test_ключ_доступа_пишет_в_файл_только_ключи(
         ответ = c.post("/api/keys", json={"name": "интеграция", "role": "user"}).json()
         assert ответ["persisted"] is True
     файл = _файл(data_dir)
-    assert ответ["key"] in файл["api_keys"]
+    from asrhub.config import хеш_ключа
+
+    # Ключ уходит в файл хешем (заход 57), сам ключ — только в ответе.
+    assert хеш_ключа(ответ["key"]) in файл["api_keys"]
+    assert ответ["key"] not in str(файл)
     плоско = _плоско(файл)
     assert "model_cache_size" not in плоско, "пробное значение ушло в файл вместе с ключом"
     # Подобранное под оборудование тоже не записывается: на другой машине

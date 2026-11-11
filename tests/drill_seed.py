@@ -245,7 +245,8 @@ class Вкладка:
 
         self._игра = sync_playwright().start()
         self._браузер = self._игра.chromium.launch(executable_path=браузер())
-        self.страница = self._браузер.new_page(viewport={"width": ширина, "height": высота})
+        self.страница = self._браузер.new_page(viewport={"width": ширина, "height": высота},
+                                                  color_scheme="dark")
         self.ошибки: list[str] = []
         self.запросы: list[str] = []
         self.адрес = адрес
@@ -267,9 +268,31 @@ class Вкладка:
         return sum(1 for адрес in self.запросы if "/api/drill?" in адрес)
 
     def чисто(self) -> None:
-        настоящие = [о for о in self.ошибки if "audio" not in о and "400" not in о]
+        # Отказ 400 — ожидаемый ответ на проверку ввода, звук — на записи без
+        # файла. Раньше отбрасывалась любая строка с «400» (и «1400» в
+        # тексте исключения), теперь — только сами эти отказы.
+        настоящие = [о for о in self.ошибки
+                     if "/audio" not in о and "status of 400" not in о]
         assert not настоящие, "\n".join(настоящие)
 
     def закрыть(self) -> None:
         self._браузер.close()
         self._игра.stop()
+
+
+def отвечать(страница, да: bool) -> None:
+    """Отвечать на подтверждения интерфейса («Удалить?») за человека.
+
+    Подтверждения — окна интерфейса (`подтвердить` в app.js), а не системный
+    confirm(): события «dialog» у Playwright больше нет. Ответ действует и
+    после перехода по страницам; заданные вопросы — `заданные(страница)`.
+    """
+    код = (f"window.__asrhubConfirm = {'true' if да else 'false'}; "
+           "window.__asrhubConfirms = window.__asrhubConfirms || [];")
+    страница.add_init_script(код)
+    страница.evaluate(f"() => {{ {код} }}")
+
+
+def заданные(страница) -> list[str]:
+    """Вопросы, на которые интерфейс просил подтверждения (см. `отвечать`)."""
+    return list(страница.evaluate("() => window.__asrhubConfirms || []"))

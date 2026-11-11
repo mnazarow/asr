@@ -49,7 +49,7 @@ if [[ -r "${BASH_SOURCE[0]%/*}/../../VERSION" ]]; then
   read -r ASRHUB_VERSION < "${BASH_SOURCE[0]%/*}/../../VERSION" || ASRHUB_VERSION=""
 fi
 ASRHUB_VERSION="${ASRHUB_VERSION//[$'\t\r\n ']/}"
-[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.27"
+[[ -n "${ASRHUB_VERSION}" ]] || ASRHUB_VERSION="3.1.29"
 # Каталог самой библиотеки — рядом с ней лежат её данные (список снятых
 # пакетов). Абсолютный путь считаем сразу: вызывающий скрипт может потом
 # сменить каталог, и относительный путь указывал бы в никуда. Те же
@@ -2624,7 +2624,7 @@ ASRHUB_INSTALL_MARKER=".asrhub-install"
 # сценарии: agent/ в нём не было, и сервер установки отдавал на команду из
 # главы про агента (`curl …/api/telephony/agent/install.sh | bash`) ответ 500 —
 # агент лежит в <каталог программы>/agent, а туда его не клал никто.
-ASRHUB_INSTALL_ITEMS="server scripts config requirements docker examples agent VERSION README.md"
+ASRHUB_INSTALL_ITEMS="server scripts config requirements docker examples agent docs VERSION README.md"
 
 # Скопированное от root — владельцу каталога программы. `cp -a` сохраняет
 # владельца источника, и после `sudo bash ~/asr-hub/scripts/update.sh` код

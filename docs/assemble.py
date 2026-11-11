@@ -50,6 +50,7 @@ CHAPTERS: list[tuple[str, str]] = [
     ("31-asterisk-dialplan.md", "Приём звонков из диалплана Asterisk"),
     ("32-quality-control.md", "Контроль качества: обратный звонок с опросом"),
     ("33-roadmap.md", "Что доделать и улучшить"),
+    ("34-development.md", "Разработка: репозиторий, проверки и выпуск"),
     ("18-review.md", "Ревизия кода"),
     ("appendix-phone-asr.md", "Приложение. Разбор проектов phone_asr"),
 ]
@@ -74,7 +75,7 @@ def main() -> int:
     BUILD.mkdir(exist_ok=True)
     parts: list[str] = []
 
-    for number, (name, title) in enumerate(CHAPTERS, start=1):
+    for name, title in CHAPTERS:
         path = DOCS / name
         if not path.exists():
             print(f"  пропущено (нет файла): {name}")
@@ -91,7 +92,13 @@ def main() -> int:
         # Пути к картинкам считаются от корня проекта.
         body = body.replace("](images/", "](docs/images/")
 
-        parts.append(f"# {number}. {title}\n\n{body}")
+        # Номер главы — из имени файла («05-…» → 5), как в ссылках внутри
+        # текста («5. Веб-интерфейс»). Раньше главы считались по порядку с
+        # единицы: оглавление Word расходилось со ссылками на единицу, а
+        # главы вне ряда (ревизия, приложение) получали чужие номера.
+        совпало = re.match(r"(\d+)-", name)
+        заголовок = f"{int(совпало.group(1))}. {title}" if совпало else title
+        parts.append(f"# {заголовок}\n\n{body}")
 
     combined = "\n\n\\newpage\n\n".join(parts)
     target = BUILD / "asr-hub-полная-документация.md"

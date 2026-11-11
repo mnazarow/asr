@@ -1973,6 +1973,14 @@ unset _SHOWN_HOST
 printf '  Локально          http://127.0.0.1:%s\n' "${PORT}"
 printf '  Справочник API    http://127.0.0.1:%s/api/reference\n' "${PORT}"
 [[ -n "${API_KEY}" ]] && printf '  Ключ доступа      %s%s%s\n' "${C_BOLD}" "${API_KEY}" "${C_RESET}"
+# Пароль первого запуска — случайный, сервер кладёт его в каталог данных
+# при первом старте и удаляет после смены (см. accounts.ensure_default_admin).
+ADMIN_PASSWORD="$(cat "${DATA_DIR}/admin-password.txt" 2>/dev/null || echo '')"
+if [[ -n "${ADMIN_PASSWORD}" ]]; then
+  printf '  Вход              %sadmin / %s%s (сменить при первом входе)\n' \
+    "${C_BOLD}" "${ADMIN_PASSWORD}" "${C_RESET}"
+fi
+unset ADMIN_PASSWORD
 printf '  Каталог программы %s\n' "${PREFIX}"
 printf '  Каталог данных    %s\n' "${DATA_DIR}"
 printf '  Конфигурация      %s\n' "${CONFIG_FILE}"

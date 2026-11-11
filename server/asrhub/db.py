@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -908,7 +908,14 @@ _SCHEMA = [
         -- считался от `imported_at`, а его обновляет каждое повторное
         -- откладывание — и безнадёжный звонок (запись нулевой длины, не
         -- задан каталог) крутился в отложенных вечно.
-        deferred_at  REAL
+        deferred_at  REAL,
+        -- Версия 35: разговор целиком. Asterisk 12+ даёт каждой ноге свой
+        -- uniqueid, а общий для всех ног разговора — linkedid (у первой ноги
+        -- он равен её uniqueid); sequence — порядок строки CDR. По ним в
+        -- карточке звонка видны остальные ноги: перевод, очередь, второй
+        -- оператор. Источники, которые их не знают, оставляют пустыми.
+        linkedid     TEXT DEFAULT '',
+        sequence     INTEGER DEFAULT 0
     )
     """,
     # --- версия 23: сотрудники, агенты на АТС, очередь к языковой модели ---
@@ -1046,6 +1053,7 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_station ON calls(station, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_linked ON calls(station, linkedid)",
     # Версия 33: добавочный по заданию без чтения строки звонка — им
     # подписываются таблицы «Голосовой аналитики» и разрез по добавочным.
     "CREATE INDEX IF NOT EXISTS idx_calls_job_agent ON calls(job_id, agent)",
@@ -4752,7 +4760,7 @@ class Database:
         "src", "dst", "clid", "channel", "dstchannel", "context",
         "disposition", "direction", "queue", "agent", "duration", "billsec",
         "answered", "started_at", "recording", "userfield", "accountcode",
-        "station", "pbx_uid",
+        "station", "pbx_uid", "linkedid", "sequence",
     )
 
     def save_call(self, uniqueid: str, *, job_id: str | None = None,
@@ -4786,7 +4794,7 @@ class Database:
             значение = поля[имя]
             if имя == "answered":
                 значение = 1 if значение else 0
-            elif имя in ("duration", "billsec"):
+            elif имя in ("duration", "billsec", "sequence"):
                 значение = int(значение or 0)
             elif имя == "started_at":
                 значение = float(значение or 0.0)
@@ -5222,6 +5230,25 @@ class Database:
         звонок = dict(строка)
         звонок["answered"] = bool(звонок.get("answered"))
         return звонок
+
+    def call_legs(self, звонок: dict[str, Any], *, предел: int = 20) -> list[dict[str, Any]]:
+        """Другие ноги того же разговора: та же станция и тот же linkedid.
+
+        Перевод с оператора на оператора, очередь, второй участник — у
+        Asterisk 12+ это отдельные строки CDR со своими uniqueid и общим
+        linkedid. Порядок — по sequence, затем по началу.
+        """
+        связь = str(звонок.get("linkedid") or "")
+        if not связь:
+            return []
+        строки = self.query(
+            "SELECT uniqueid, pbx_uid, job_id, src, dst, agent, queue, direction, "
+            "disposition, billsec, duration, started_at, sequence, skipped, owner FROM calls "
+            "WHERE station=? AND linkedid=? AND uniqueid<>? "
+            "ORDER BY sequence, started_at LIMIT ?",
+            (str(звонок.get("station") or ""), связь, str(звонок.get("uniqueid") or ""),
+             max(1, int(предел))))
+        return [dict(с) for с in строки]
 
     def call_dimensions(self, *, owner: str | list[str] | None = None,
                         station: str = "") -> dict[str, list[str]]:

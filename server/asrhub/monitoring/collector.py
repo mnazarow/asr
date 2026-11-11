@@ -224,7 +224,8 @@ class Collector:
     #: `asrhub_collector_source_up`) и метод.
     ИСТОЧНИКИ: tuple[str, ...] = (
         "service", "queue", "jobs", "performance", "quality", "models",
-        "resources", "storage", "api", "errors", "content", "runtime")
+        "resources", "storage", "api", "errors", "content", "telephony", "qc",
+        "runtime")
 
     def __init__(self, state: Any, runtime: Runtime | None = None,
                  expensive_interval_s: float = 300.0) -> None:
@@ -407,6 +408,16 @@ class Collector:
         out.append(Sample("asrhub_queue_eta_seconds", float(status.get("eta_s", 0))))
         out.append(Sample("asrhub_queue_capacity",
                           float(status.get("max_queue_size", 0) or 0)))
+
+        сейчас = time.time()
+        просрочено = self.state.db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','retry','paused') "
+            "AND deadline IS NOT NULL AND deadline > 0 AND deadline < ?", (сейчас,))
+        out.append(Sample("asrhub_deadline_overdue", float((просрочено or {"n": 0})["n"] or 0)))
+        сорвано = self.state.db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE finished_at >= ? AND deadline IS NOT NULL "
+            "AND deadline > 0 AND finished_at > deadline", (сейчас - 86400,))
+        out.append(Sample("asrhub_deadline_missed_day", float((сорвано or {"n": 0})["n"] or 0)))
 
         oldest = self.state.db.query_one(
             "SELECT MIN(queued_at) t FROM jobs WHERE status IN ('queued','retry')")
@@ -896,6 +907,86 @@ class Collector:
         for т in категории.get("trackers") or []:
             out.append(Sample("asrhub_content_tracker_hits", float(т.get("hits") or 0),
                               {"category": str(т["category"])}))
+
+    # -- телефония и контроль качества ------------------------------------------
+
+    def _telephony(self, out: list[Sample]) -> None:
+        телефония = getattr(self.state, "telephony", None)
+        if телефония is None or not getattr(телефония, "enabled", False):
+            return
+        from ..telephony import dialplan as Д  # noqa: PLC0415
+
+        сейчас = time.time()
+        with телефония._lock:
+            импортёры = list(телефония._станции.values())
+        for имп in импортёры:
+            if not имп.enabled:
+                continue
+            ид, источник = имп.id, имп.source
+            живая = not имп.last_error
+            if источник == Д.ИСТОЧНИК:
+                пульс = self.state.db.get_kv(f"dialplan:pulse:{ид}") or {}
+                if isinstance(пульс, dict) and пульс.get("at"):
+                    возраст = max(0.0, сейчас - float(пульс["at"]))
+                    живая = возраст < 1800
+                    out.append(Sample("asrhub_dialplan_pulse_age_seconds", round(возраст, 1),
+                                      {"station": ид}))
+                    out.append(Sample("asrhub_dialplan_spool_pending",
+                                      float(пульс.get("pending") or 0), {"station": ид}))
+                сегодня = Д.журнал.по_дням(ид, дней=1)
+                отказов = (сегодня[0].get("rejected", 0)
+                           if сегодня and сегодня[0]["day"] == time.strftime("%Y-%m-%d") else 0)
+                out.append(Sample("asrhub_dialplan_rejected_day", float(отказов),
+                                  {"station": ид}))
+            out.append(Sample("asrhub_telephony_station_up", 1.0 if живая else 0.0,
+                              {"station": ид, "source": источник}))
+        строки = self.state.db.query(
+            "SELECT station, "
+            "SUM(CASE WHEN job_id IS NOT NULL THEN 1 ELSE 0 END) AS queued, "
+            "SUM(CASE WHEN COALESCE(skipped,'')<>'' AND skipped NOT LIKE 'отложен: %' "
+            "    THEN 1 ELSE 0 END) AS skipped, "
+            "SUM(CASE WHEN skipped LIKE 'отложен: %' THEN 1 ELSE 0 END) AS deferred "
+            "FROM calls WHERE imported_at>=? GROUP BY station", (сейчас - 86400,))
+        for с in строки:
+            for итог in ("queued", "skipped", "deferred"):
+                out.append(Sample("asrhub_telephony_calls_day", float(с[итог] or 0),
+                                  {"station": str(с["station"] or ""), "result": итог}))
+        for с in self.state.db.query(
+                "SELECT station, MAX(imported_at) AS last, "
+                "SUM(CASE WHEN skipped LIKE 'отложен: %' THEN 1 ELSE 0 END) AS deferred "
+                "FROM calls GROUP BY station"):
+            метки = {"station": str(с["station"] or "")}
+            out.append(Sample("asrhub_telephony_deferred", float(с["deferred"] or 0), метки))
+            if с["last"]:
+                out.append(Sample("asrhub_telephony_last_import_age_seconds",
+                                  round(max(0.0, сейчас - float(с["last"])), 1), метки))
+
+    def _qc(self, out: list[Sample]) -> None:
+        служба = getattr(self.state, "qc", None)
+        if служба is None or not getattr(служба, "включён", False):
+            return
+        регистрация = str((служба.регистрация or {}).get("state") or "")
+        if регистрация in ("зарегистрирован", "без регистрации", "отказ"):
+            out.append(Sample("asrhub_qc_registered",
+                              0.0 if регистрация == "отказ" else 1.0))
+        db = self.state.db
+        ждёт = db.query_one("SELECT COUNT(*) AS n FROM qc_surveys WHERE status='ждёт'")
+        out.append(Sample("asrhub_qc_waiting", float((ждёт or {"n": 0})["n"] or 0)))
+        с_суток = time.time() - 86400
+        итоги = {str(с["status"]): int(с["n"]) for с in db.query(
+            "SELECT status, COUNT(*) AS n FROM qc_surveys WHERE kind='опрос' "
+            "AND finished_at>=? GROUP BY status", (с_суток,))}
+        for итог, число in итоги.items():
+            out.append(Sample("asrhub_qc_surveys_day", float(число), {"status": итог}))
+        оценки = db.query_one(
+            "SELECT COUNT(*) AS n, AVG(score_pct) AS avg FROM qc_surveys WHERE kind='опрос' "
+            "AND finished_at>=? AND score_pct IS NOT NULL", (с_суток,))
+        if оценки and int(оценки["n"] or 0) >= 3 and оценки["avg"] is not None:
+            out.append(Sample("asrhub_qc_score_pct_day", round(float(оценки["avg"]), 1)))
+        завершено = sum(число for итог, число in итоги.items() if итог not in ("отменён", "устарел"))
+        if завершено >= 5:
+            out.append(Sample("asrhub_qc_unreached_share_day",
+                              round(итоги.get("не дозвонились", 0) / завершено, 3)))
 
     def _runtime_series(self, out: list[Sample]) -> None:
         """Переносит в снимок счётчики и гистограммы, накопленные в памяти."""

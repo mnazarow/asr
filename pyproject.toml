@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asrhub"
-version = "3.1.27"
+version = "3.1.29"
 description = "Сервер распознавания речи на свободных моделях: GigaAM, Whisper и другие"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,15 @@ include = ["asrhub*"]
 [tool.setuptools.package-data]
 # Веб-интерфейс — не модули Python, без этой строки в пакет он не попадал.
 asrhub = ["web/*"]
+
+# Агент станции, сценарий отправки и руководство — не часть пакета Python,
+# но сервер их раздаёт (скачать агента, раздел «Документация»). Колесо
+# кладёт их в <prefix>/share/asrhub/, сервер ищет их там после дерева
+# программы (см. asrhub/resources.py).
+[tool.setuptools.data-files]
+"share/asrhub/agent" = ["agent/asrhub-agent.py", "agent/asrhub-dialplan", "agent/install.sh"]
+"share/asrhub/docs" = ["docs/*.md"]
+"share/asrhub/docs/images" = ["docs/images/*"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements/base.txt"] }
@@ -74,5 +83,13 @@ pythonpath = ["server"]
 addopts = "-q --tb=short"
 # Медленные проверки — те, что гоняют полный цикл задания через очередь.
 # Отдельная метка нужна, чтобы их можно было пропустить: `-m "not slow"`.
-markers = ["slow: полный цикл через очередь, десятки секунд"]
+# Ярусы для сборочного конвейера (.github/workflows/ci.yml): метки ставит
+# conftest.py по имени файла. Быстрый ярус — `-m "not web and not scripts
+# and not drill and not slow"`.
+markers = [
+    "slow: полный цикл через очередь, десятки секунд",
+    "web: проверки в браузере (Playwright и Chromium)",
+    "scripts: установщики и служебные сценарии bash и PowerShell, образ Docker",
+    "drill: сквозные проверки разделов на наполненном архиве",
+]
 filterwarnings = ["ignore::DeprecationWarning"]

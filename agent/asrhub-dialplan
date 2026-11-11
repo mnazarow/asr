@@ -21,7 +21,10 @@
 #   asrhub-dialplan --resend-failed   дослать и то, что сервер отверг (после
 #                                     исправления настройки)
 #   asrhub-dialplan --install         поставить себя в /usr/local/bin, завести
-#                                     /etc/asrhub/dialplan.conf и каталоги
+#                                     /etc/asrhub/dialplan.conf, каталоги,
+#                                     досылку в cron и ротацию журнала
+#   asrhub-dialplan --status          очередь повтора, отвергнутые, последние
+#                                     строки журнала
 #   asrhub-dialplan --version
 #
 # Безопасность. Значения приходят из командной строки, которую собрал
@@ -52,6 +55,8 @@ ASRHUB_SPOOL="/var/spool/asrhub-dialplan"
 ASRHUB_LOG="/var/log/asterisk/asrhub-dialplan.log"
 ASRHUB_CACERT=""
 ASRHUB_INSECURE="no"
+# Сколько суток хранить отвергнутые сервером звонки (failed/); 0 — вечно.
+ASRHUB_FAILED_DAYS=30
 
 if [ -r "$CONF" ]; then
     # shellcheck disable=SC1090
@@ -99,7 +104,7 @@ safe_value() {
     return 0
 }
 
-KNOWN_FIELDS=" uniqueid linkedid src dst clid agent direction queue context channel dstchannel disposition dialstatus answered duration billsec started_at userfield accountcode station ready "
+KNOWN_FIELDS=" uniqueid linkedid sequence src dst clid agent direction queue context channel dstchannel disposition dialstatus answered duration billsec started_at userfield accountcode station ready "
 
 # --- очередь повтора ---------------------------------------------------------
 #
@@ -111,18 +116,44 @@ KNOWN_FIELDS=" uniqueid linkedid src dst clid agent direction queue context chan
 spool_dirs() {
     for d in sending pending failed; do
         mkdir -p "$ASRHUB_SPOOL/$d" 2>/dev/null || return 1
+        [ -w "$ASRHUB_SPOOL/$d" ] || return 1
     done
     return 0
 }
 
+# Запасной каталог очереди, когда основной недоступен на запись: в домашнем
+# каталоге пользователя станции (у asterisk — /var/lib/asterisk), а если и
+# там нельзя — новый каталог со случайным именем. Раньше это был
+# /tmp/asrhub-dialplan.<uid>: имя предсказуемо, и другой пользователь станции
+# мог создать его заранее и подложить ссылку. Выбор делается ДО записи
+# звонка: write_call работает в $(…), и подмена каталога внутри неё до
+# отправки не доходила — файл оставался в sending/, куда --resend не смотрит.
+FALLBACK_SPOOL="${HOME:+$HOME/.asrhub-dialplan}"
+
+choose_spool() {
+    umask 077
+    spool_dirs && return 0
+    main=$ASRHUB_SPOOL
+    if [ -n "$FALLBACK_SPOOL" ]; then
+        ASRHUB_SPOOL=$FALLBACK_SPOOL
+        if spool_dirs; then
+            log "каталог очереди $main недоступен на запись — звонки копятся в $ASRHUB_SPOOL"
+            return 0
+        fi
+    fi
+    ASRHUB_SPOOL=$(mktemp -d "${TMPDIR:-/tmp}/asrhub-dialplan.XXXXXXXX" 2>/dev/null) || return 1
+    spool_dirs || return 1
+    log "каталог очереди $main недоступен — звонок во временном каталоге $ASRHUB_SPOOL;" \
+        "дошлите: ASRHUB_SPOOL=$ASRHUB_SPOOL asrhub-dialplan --resend"
+    command -v logger >/dev/null 2>&1 &&
+        logger -t asrhub-dialplan "очередь $main недоступна, звонок в $ASRHUB_SPOOL"
+    return 0
+}
+
 # Записать звонок из аргументов в файл; печатает путь к файлу.
+# Каталог очереди выбран заранее (choose_spool).
 write_call() {
     umask 077
-    if ! spool_dirs; then
-        log "каталог очереди $ASRHUB_SPOOL недоступен на запись — звонок во временном файле"
-        ASRHUB_SPOOL="${TMPDIR:-/tmp}/asrhub-dialplan.$(id -u)"
-        spool_dirs || return 1
-    fi
     uid=""
     tmp="$ASRHUB_SPOOL/sending/.new.$$"
     : >"$tmp" || return 1
@@ -168,10 +199,11 @@ direction_from_name() {
 # Подождать, пока MixMonitor закроет файл: размер перестал меняться.
 wait_file() {
     f=$1
+    limit=${2:-$ASRHUB_WAIT_S}
     waited=0
     last=-1
     stable=0
-    while [ "$waited" -lt "$ASRHUB_WAIT_S" ]; do
+    while [ "$waited" -lt "$limit" ]; do
         if [ -f "$f" ]; then
             size=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
             if [ "$size" = "$last" ] && [ "${size:-0}" -gt 0 ]; then
@@ -198,6 +230,7 @@ post_once() {
     set --
     file=""
     ready=0
+    talked=""
     while IFS= read -r line; do
         key=${line%%=*}
         value=${line#*=}
@@ -205,6 +238,13 @@ post_once() {
             file) file=$value ;;
             ready) ready=1 ;;
             *) set -- "$@" --form-string "$key=$value" ;;
+        esac
+        # Был ли разговор: у несоединённого звонка MixMonitor с опцией b
+        # файла не создаёт, и ждать его все ASRHUB_WAIT_S незачем.
+        case "$key=$value" in
+            disposition=ANSWERED|dialstatus=ANSWER|answered=1) talked=yes ;;
+            disposition=*|dialstatus=*|answered=0) [ -z "$talked" ] && talked=no ;;
+            billsec=0) [ -z "$talked" ] && talked=no ;;
         esac
     done <"$callfile"
     if [ -n "$ASRHUB_STATION" ] && ! grep -q '^station=' "$callfile"; then
@@ -225,7 +265,10 @@ post_once() {
     fi
     if [ -n "$file" ] && [ "$with_file" = 1 ]; then
         if [ "$ready" != 1 ] && [ "$dry" != 1 ]; then
-            wait_file "$file" || log "$(basename "$callfile"): записи $file нет — звонок уйдёт без неё"
+            limit=$ASRHUB_WAIT_S
+            [ "$talked" = no ] && limit=5
+            wait_file "$file" "$limit" ||
+                log "$(basename "$callfile"): записи $file нет — звонок уйдёт без неё"
         fi
         if [ -f "$file" ]; then
             if [ "$ASRHUB_SEND_MODE" = "path" ]; then
@@ -254,6 +297,19 @@ summary() {
     return 0
 }
 
+# Пауза после попытки $1, с: по списку PAUSES, дальше — по последней. Раньше
+# попыток было не больше, чем пауз в списке: ASRHUB_RETRIES=10 молча
+# означал пять.
+pause_for() {
+    n=$1
+    p=5
+    for p in $PAUSES; do
+        n=$((n - 1))
+        [ "$n" -le 0 ] && break
+    done
+    printf '%s' "$p"
+}
+
 # Отправить звонок с повторами. $1 — файл звонка в sending/, $2 — сколько попыток.
 deliver() {
     callfile=$1
@@ -261,19 +317,29 @@ deliver() {
     name=$(basename "$callfile" .call)
     attempt=1
     with_file=1
-    for pause in $PAUSES; do
+    while :; do
+        # Свежее время изменения — знак, что файл в работе: --resend забирает
+        # из sending/ только брошенные (старше часа).
+        touch "$callfile" 2>/dev/null
         code=$(post_once "$callfile" "$with_file" 0)
+        last_code=$code
         case "$code" in
             200|202)
                 log "$name: принят, ответ $code: $(summary "$callfile.answer")"
                 rm -f "$callfile" "$callfile.answer"
                 return 0 ;;
             413|415)
-                # Запись не принята (велика или не тот формат) — звонок
-                # всё равно нужен в журнале: шлём его ещё раз без записи.
-                log "$name: запись отвергнута ($code: $(summary "$callfile.answer")) — шлём без неё"
-                with_file=0
-                continue ;;
+                if [ "$with_file" = 1 ]; then
+                    # Запись не принята (велика или не тот формат) — звонок
+                    # всё равно нужен в журнале: шлём его ещё раз без записи.
+                    log "$name: запись отвергнута ($code: $(summary "$callfile.answer")) — шлём без неё"
+                    with_file=0
+                    continue
+                fi
+                log "$name: сервер отверг звонок (код $code): $(summary "$callfile.answer")"
+                mv "$callfile" "$ASRHUB_SPOOL/failed/" 2>/dev/null
+                mv "$callfile.answer" "$ASRHUB_SPOOL/failed/" 2>/dev/null
+                return 1 ;;
             000|408|409|423|425|429|5*)
                 log "$name: попытка $attempt — сервер недоступен или занят (код $code)" ;;
             *)
@@ -283,8 +349,8 @@ deliver() {
                 return 1 ;;
         esac
         [ "$attempt" -ge "$tries" ] && break
+        sleep "$(pause_for "$attempt")"
         attempt=$((attempt + 1))
-        sleep "$pause"
     done
     log "$name: не отправлен за $attempt попыток — в очереди повтора"
     rm -f "$callfile.answer"
@@ -296,6 +362,7 @@ deliver() {
 
 send_mode() {
     configured
+    choose_spool || { log "нет каталога для очереди — звонок не записан"; exit 0; }
     callfile=$(write_call "$@") || exit 0
     if [ "${ASRHUB_FOREGROUND:-0}" = 1 ]; then
         deliver "$callfile" "$ASRHUB_RETRIES"
@@ -312,13 +379,107 @@ send_mode() {
 
 resend_mode() {
     configured
-    spool_dirs || die "каталог очереди $ASRHUB_SPOOL недоступен"
     from=pending
     [ "$1" = failed ] && from=failed
-    # Брошенные отправки (процесс убит посреди повторов) — старше часа.
-    find "$ASRHUB_SPOOL/sending" -name '*.call' -mmin +60 -exec mv {} "$ASRHUB_SPOOL/pending/" \; 2>/dev/null
     sent=0
     left=0
+    # Основная очередь и запасная (см. choose_spool), если там что-то есть.
+    for spool in "$ASRHUB_SPOOL" "$FALLBACK_SPOOL"; do
+        [ -n "$spool" ] && [ -d "$spool" ] || continue
+        ASRHUB_SPOOL=$spool
+        spool_dirs || { log "каталог очереди $spool недоступен"; continue; }
+        resend_spool "$from" || break
+    done
+    # Отвергнутые сервером звонки копятся вечно, если их никто не смотрит:
+    # старше ASRHUB_FAILED_DAYS — удаляются (запись остаётся в каталоге
+    # MixMonitor, удаляется только файл звонка).
+    if [ "${ASRHUB_FAILED_DAYS:-0}" -gt 0 ] 2>/dev/null; then
+        for spool in "$ASRHUB_SPOOL" "$FALLBACK_SPOOL"; do
+            [ -n "$spool" ] && [ -d "$spool/failed" ] || continue
+            find "$spool/failed" -type f \( -name '*.call' -o -name '*.call.answer' \) \
+                -mtime +"$ASRHUB_FAILED_DAYS" -exec rm -f {} + 2>/dev/null
+        done
+    fi
+    pulse
+    say "дослано $sent, осталось $left"
+}
+
+# Пульс: при каждой досылке (cron, раз в пять минут) — короткое сообщение
+# серверу, что сценарий жив, сколько ждёт в очереди и сколько отвергнуто.
+# Без него «станция молчит» и «звонков просто нет» неотличимы, а очередь
+# повтора, растущая неделями, видна только на самой станции.
+pulse() {
+    pending=0
+    failed=0
+    oldest=0
+    now=$(date +%s)
+    for spool in "$ASRHUB_SPOOL" "$FALLBACK_SPOOL"; do
+        [ -n "$spool" ] && [ -d "$spool" ] || continue
+        for f in "$spool/pending"/*.call "$spool/sending"/*.call; do
+            [ -f "$f" ] || continue
+            pending=$((pending + 1))
+            m=$(date -r "$f" +%s 2>/dev/null || echo "$now")
+            [ $((now - m)) -gt "$oldest" ] && oldest=$((now - m))
+        done
+        for f in "$spool/failed"/*.call; do
+            [ -f "$f" ] && failed=$((failed + 1))
+        done
+    done
+    set -- --form-string "pending=$pending" --form-string "failed=$failed" \
+        --form-string "oldest_s=$oldest" --form-string "sent=${sent:-0}" \
+        --form-string "version=$VERSION" --connect-timeout 10 --max-time 30
+    [ -n "$ASRHUB_STATION" ] && set -- "$@" --form-string "station=$ASRHUB_STATION"
+    [ -n "$ASRHUB_CACERT" ] && set -- "$@" --cacert "$ASRHUB_CACERT"
+    [ "$ASRHUB_INSECURE" = "yes" ] && set -- "$@" --insecure
+    printf 'header = "X-API-Key: %s"\n' "$ASRHUB_KEY" |
+        curl -sS --config - -o /dev/null "$@" \
+            "${ASRHUB_URL%/}/api/telephony/dialplan/pulse" 2>>"$ASRHUB_LOG" || true
+}
+
+status_mode() {
+    configured
+    printf 'Сервер: %s\nСтанция: %s\n' "$ASRHUB_URL" "${ASRHUB_STATION:-(единственная)}"
+    for spool in "$ASRHUB_SPOOL" "$FALLBACK_SPOOL"; do
+        [ -n "$spool" ] && [ -d "$spool" ] || continue
+        printf '\nОчередь %s:\n' "$spool"
+        for d in sending pending failed; do
+            n=$(find "$spool/$d" -name '*.call' 2>/dev/null | wc -l | tr -d ' ')
+            oldest=$(find "$spool/$d" -name '*.call' 2>/dev/null | head -1)
+            [ -n "$oldest" ] && oldest=$(date -r "$oldest" '+%Y-%m-%d %H:%M' 2>/dev/null)
+            printf '  %-8s %s\n' "$d" "$n${oldest:+ (например, от $oldest)}"
+        done
+    done
+    if crontab -l 2>/dev/null | grep -q 'asrhub-dialplan --resend' \
+            || grep -qs 'asrhub-dialplan --resend' /etc/cron.d/* /etc/crontab; then
+        printf '\nДосылка в cron: есть\n'
+    else
+        printf '\nДосылка в cron: НЕТ — очередь повтора сама не уйдёт (asrhub-dialplan --install)\n'
+    fi
+    if [ -r "$ASRHUB_LOG" ]; then
+        printf '\nПоследние строки %s:\n' "$ASRHUB_LOG"
+        tail -n 10 "$ASRHUB_LOG"
+    fi
+}
+
+# Дослать из одной очереди. Ответ 1 — сервер недоступен, дальше идти незачем.
+resend_spool() {
+    from=$1
+    # Замок: cron запускает --resend раз в пять минут, а проход по сотне
+    # звонков при лежащем сервере длится дольше. Два прохода брали бы одни и
+    # те же брошенные файлы и заливали записи дважды. Замок старше двух часов
+    # считается брошенным (процесс убит).
+    lock="$ASRHUB_SPOOL/.resend.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
+            rmdir "$lock" 2>/dev/null && mkdir "$lock" 2>/dev/null || return 0
+        else
+            log "--resend уже идёт ($ASRHUB_SPOOL) — этот запуск пропущен"
+            return 0
+        fi
+    fi
+    trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+    # Брошенные отправки (процесс убит посреди повторов) — старше часа.
+    find "$ASRHUB_SPOOL/sending" -name '*.call' -mmin +60 -exec mv {} "$ASRHUB_SPOOL/pending/" \; 2>/dev/null
     for f in "$ASRHUB_SPOOL/$from"/*.call; do
         [ -f "$f" ] || continue
         target="$ASRHUB_SPOOL/sending/$(basename "$f")"
@@ -326,19 +487,31 @@ resend_mode() {
         # уже не возьмёт.
         mv "$f" "$target" 2>/dev/null || continue
         rm -f "$f.answer"
+        last_code=""
         if deliver "$target" 1; then
             sent=$((sent + 1))
         else
             left=$((left + 1))
+            if [ "$last_code" = 000 ]; then
+                # Сервер не отвечает: остальные звонки ждали бы по
+                # connect-timeout каждый. Дошлются следующим запуском.
+                # Неотправленный вернулся в $from и уже посчитан выше.
+                left=$((left - 1 + $(find "$ASRHUB_SPOOL/$from" -name '*.call' | wc -l)))
+                log "сервер не отвечает — досылка прервана, остальное в следующий раз"
+                rmdir "$lock" 2>/dev/null
+                trap - EXIT INT TERM
+                return 1
+            fi
         fi
     done
-    say "дослано $sent, осталось $left"
+    rmdir "$lock" 2>/dev/null
+    trap - EXIT INT TERM
+    return 0
 }
 
 test_mode() {
     configured
-    spool_dirs || ASRHUB_SPOOL="${TMPDIR:-/tmp}/asrhub-dialplan.$(id -u)"
-    spool_dirs || die "нет каталога для временного файла"
+    choose_spool || die "нет каталога для временного файла"
     callfile=$(write_call "uniqueid=test.$(date +%s)" "src=79161234567" "dst=101" \
         "direction=in" "billsec=42" "duration=50" "disposition=ANSWERED") ||
         die "не удалось подготовить пробный звонок"
@@ -399,6 +572,27 @@ EOF
     chmod 750 "$ASRHUB_SPOOL"
     touch "$ASRHUB_LOG" 2>/dev/null && chown "$owner:$group" "$ASRHUB_LOG" 2>/dev/null
     say "очередь повтора: $ASRHUB_SPOOL, журнал: $ASRHUB_LOG"
+    # Досылка очереди повтора и пульс — раз в пять минут, от того же
+    # пользователя, что и Asterisk (ему принадлежит очередь).
+    if [ -d /etc/cron.d ]; then
+        if [ ! -f /etc/cron.d/asrhub-dialplan ]; then
+            printf '%s\n' "# ASR Hub: досылка звонков, не дошедших с первого раза, и пульс" \
+                "*/5 * * * * $owner $target --resend >/dev/null 2>&1" >/etc/cron.d/asrhub-dialplan
+            chmod 644 /etc/cron.d/asrhub-dialplan
+            say "досылка: /etc/cron.d/asrhub-dialplan (раз в пять минут)"
+        else
+            say "досылка уже настроена: /etc/cron.d/asrhub-dialplan — не тронута"
+        fi
+    else
+        say "нет /etc/cron.d — добавьте в crontab пользователя $owner:"
+        say "  */5 * * * * $target --resend >/dev/null 2>&1"
+    fi
+    if [ -d /etc/logrotate.d ] && [ ! -f /etc/logrotate.d/asrhub-dialplan ]; then
+        printf '%s\n' "$ASRHUB_LOG {" "    weekly" "    rotate 8" "    compress" \
+            "    missingok" "    notifempty" "    create 0640 $owner $group" "}" \
+            >/etc/logrotate.d/asrhub-dialplan
+        say "ротация журнала: /etc/logrotate.d/asrhub-dialplan"
+    fi
     say "дальше: впишите ключ в $CONF и выполните: asrhub-dialplan --test"
 }
 
@@ -408,7 +602,8 @@ case "${1:-}" in
     --resend) resend_mode pending ;;
     --resend-failed) resend_mode failed ;;
     --install) install_mode ;;
-    --help|-h|"") sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
+    --status) status_mode ;;
+    --help|-h|"") sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' ;;
     -*) die "неизвестный ключ $1 (--help — справка)" ;;
     *) send_mode "$@" ;;
 esac

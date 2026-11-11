@@ -16,6 +16,7 @@ from fastapi.responses import (
 
 from .. import catalog, selfcheck
 from .. import settings_access as S
+from ..config import хеш_ключа
 from ..errors import ASRHubError, ConfigError, KeyNotFound
 from ..hardware import detect, recommended_settings
 from ..logging_setup import counts as log_counts
@@ -168,6 +169,16 @@ def queue_status(request: Request,
     status["items"] = state.db.list_jobs(
         status=["queued", "running", "retry", "paused"], limit=200,
         order="priority DESC", owner=scope_owner(principal), light=True)
+    if not principal.is_admin:
+        # Устройство сервера — не дело обычного ключа: имена узлов и
+        # процессов (instance, instances) ему ни к чему, а номер задания у
+        # воркера — это номер чужого задания. Число воркеров и занятость
+        # остаются: по ним видно, скоро ли дойдёт очередь.
+        свои = {з["id"] for з in status["items"]}
+        status.pop("instances", None)
+        status.pop("instance", None)
+        status["workers"] = [{**в, "job_id": в.get("job_id") if в.get("job_id") in свои else None}
+                             for в in status.get("workers") or []]
     return status
 
 
@@ -405,8 +416,13 @@ def reset_settings(request: Request,
     return {"reset": True, "changed": изменено}
 
 
+#: Периоды аналитики. Прочее раньше молча считалось за сутки: опечатка
+#: «mounth» давала суточные числа под подписью «за месяц».
+_ПЕРИОД = "^(hour|day|week|month|quarter|year|all)$"
+
+
 @router.get("/analytics", summary="Сводная аналитика")
-def analytics(request: Request, period: str = Query(default="week"),
+def analytics(request: Request, period: str = Query(default="week", pattern=_ПЕРИОД),
               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     state = get_state(request)
     # Ключу без прав администратора аналитика считается только по его
@@ -417,7 +433,7 @@ def analytics(request: Request, period: str = Query(default="week"),
 
 
 @router.get("/analytics/export", summary="Выгрузка аналитики в таблицу")
-def analytics_export(request: Request, period: str = Query(default="month"),
+def analytics_export(request: Request, period: str = Query(default="month", pattern=_ПЕРИОД),
                      fmt: str = Query(default="xlsx", pattern="^(xlsx|csv)$"),
                      principal: Principal = Depends(authenticate)) -> Any:
     """Тот же отчёт, что на экране, — книгой Excel или архивом CSV.
@@ -463,7 +479,8 @@ def analytics_export(request: Request, period: str = Query(default="month"),
 
 
 @router.get("/analytics/{section}", summary="Отдельный раздел аналитики")
-def analytics_section(request: Request, section: str, period: str = "week",
+def analytics_section(request: Request, section: str,
+                      period: str = Query(default="week", pattern=_ПЕРИОД),
                       principal: Principal = Depends(authenticate)) -> Any:
     """Один разрез сводного отчёта — когда весь отчёт не нужен.
 
@@ -602,13 +619,16 @@ def list_keys(request: Request,
     require_admin(principal)
     items = []
     for key, info in state.settings.api_keys.items():
+        хеш = key.startswith("sha256:")
         items.append({
             # Отдельно от превью: отзыв требует не меньше двенадцати символов,
             # а из «ah_8AD…anCu» столько не выкроить. Интерфейс раньше слал
             # первые шесть символов превью и получал 400 на любом ключе —
             # отозвать ключ через интерфейс было невозможно в принципе.
             "key_id": key[:16] if len(key) > 16 else key,
-            "key_preview": f"{key[:6]}…{key[-4:]}" if len(key) > 12 else "***",
+            "key_preview": (str(info.get("preview") or "***") if хеш
+                            else f"{key[:6]}…{key[-4:]}" if len(key) > 12 else "***"),
+            "hashed": хеш,
             "name": info.get("name"),
             "role": info.get("role", "user"),
             "enabled": info.get("enabled", True),
@@ -663,7 +683,13 @@ def create_key(request: Request, name: str = Body(embed=True),
     key = "ah_" + secrets.token_urlsafe(24)
     # group объединяет ключи в подразделение: они видят задания друг друга.
     # Квоты нулевые означают «без ограничения» и считаются за скользящие сутки.
-    state.settings.api_keys[key] = {
+    # В файл настроек ключ уходит хешем: сам ключ показывается один раз, в
+    # этом ответе, и больше нигде не хранится (см. `config.КлючиДоступа`).
+    state.settings.api_keys[хеш_ключа(key)] = {
+        "preview": f"{key[:6]}…{key[-4:]}",
+        # Начало ключа — для отзыва по нему (DELETE /api/keys/{первые знаки}):
+        # 16 знаков из 35, остальные 19 — всё ещё больше 110 бит.
+        "prefix": key[:16],
         "name": name, "role": role, "rate_limit": rate_limit, "enabled": True,
         "group": group,
         "quota_jobs_per_day": max(0, quota_jobs_per_day),
@@ -709,7 +735,12 @@ def revoke_key(request: Request, preview: str,
             hint="Передайте не менее двенадцати первых символов ключа — "
                  "иначе под совпадение попадёт чужой ключ."))
 
-    matches = [key for key in state.settings.api_keys if key.startswith(preview)]
+    # Ключ-хеш ищется и по началу самого ключа: в записи хранится его
+    # префикс (16 знаков — по ним отзывали всегда), а целиком — по хешу.
+    matches = [key for key, info in state.settings.api_keys.items()
+               if key.startswith(preview) or key == хеш_ключа(preview)
+               or (key.startswith("sha256:") and len(preview) >= 12
+                   and str(info.get("prefix") or "").startswith(preview))]
     if not matches:
         raise error_response(KeyNotFound(preview))
     if len(matches) > 1:
@@ -731,13 +762,15 @@ def revoke_key(request: Request, preview: str,
     # Открытые веб-сокеты этого ключа закрываются сразу: права у сокета
     # проверялись при рукопожатии, и лента событий продолжала идти ключу,
     # которому REST уже отвечал 401.
-    закрыть_сокеты(request, lambda п: п.key == ключ, reason="Ключ доступа отозван")
+    закрыть_сокеты(request, lambda п: bool(п.key) and (п.key == ключ or хеш_ключа(п.key) == ключ),
+                   reason="Ключ доступа отозван")
     state.db.add_event(None, "key_revoked", f"Отозван ключ доступа «{name}»")
     ответ: dict[str, Any] = {"revoked": True, "name": name,
                              "persisted": saved or из_файла}
     import os  # noqa: PLC0415
 
-    if os.environ.get("ASRHUB_API_KEY", "").strip() == ключ:
+    из_окружения = os.environ.get("ASRHUB_API_KEY", "").strip()
+    if из_окружения and ключ in (из_окружения, хеш_ключа(из_окружения)):
         ответ["persisted"] = False
         ответ["warning"] = ("Ключ задан переменной окружения ASRHUB_API_KEY и вернётся "
                             "после перезапуска — уберите переменную из окружения службы.")
@@ -754,7 +787,10 @@ def _убрать_файл_ключа(state: Any, ключ: str) -> bool:
         return False
     файл = paths.data / "api-key.txt"
     try:
-        if not файл.is_file() or файл.read_text(encoding="utf-8").strip() != ключ:
+        if not файл.is_file():
+            return False
+        в_файле = файл.read_text(encoding="utf-8").strip()
+        if в_файле != ключ and хеш_ключа(в_файле) != ключ:
             return False
         файл.unlink()
     except OSError as exc:

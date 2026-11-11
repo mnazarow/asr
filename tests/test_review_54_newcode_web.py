@@ -102,7 +102,7 @@ def test_день_календаря_раскрывается_сутками_с�
     игра = sync_playwright().start()
     try:
         обозреватель = игра.chromium.launch(executable_path=браузер())
-        с = обозреватель.new_page(viewport={"width": 1600, "height": 1000},
+        с = обозреватель.new_page(viewport={"width": 1600, "height": 1000}, color_scheme="dark",
                                   timezone_id="Asia/Tokyo")
         запросы: list[str] = []
         с.on("request", lambda r: запросы.append(r.url))

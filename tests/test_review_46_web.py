@@ -19,12 +19,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys as _sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
 from test_web_ui import _браузер, _наполнить, _свободный_порт
+
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from drill_seed import отвечать  # noqa: E402
 
 #: Пароль администратора на стенде со входом — не по умолчанию.
 ПАРОЛЬ = "Проверка-46-пароль"
@@ -173,7 +177,7 @@ def браузер():
 def _вкладка(браузер, адрес: str, *, ключ: str = "", ширина: int = 1600,
              скрипт: str = ""):
     """Новая вкладка в своём контексте — со счётчиком ошибок консоли и запросов."""
-    контекст = браузер.new_context(viewport={"width": ширина, "height": 1000},
+    контекст = браузер.new_context(viewport={"width": ширина, "height": 1000}, color_scheme="dark",
                                    accept_downloads=True)
     if ключ:
         контекст.add_init_script(f"localStorage.setItem('asrhub_key', {json.dumps(ключ)});")
@@ -990,14 +994,16 @@ def test_справочник_сотрудников_отбирает_работ
 def test_новый_ключ_с_занятым_именем_предупреждает(стенд, браузер):
     """Ответ сервера о совпадении имён терялся — было только окно с ключом."""
     вкладка = _вкладка(браузер, стенд["адрес"])
-    вкладка.on("dialog", lambda окно: окно.accept())
     _открыть(вкладка, "settings")
+    отвечать(вкладка, True)
     вкладка.evaluate("() => { window.__asrhub.state.paramGroup = '_access';"
                      " window.__asrhub.renderView(); }")
     вкладка.wait_for_selector("#access-new-name", timeout=10000)
     for _ in range(2):
         вкладка.fill("#access-new-name", "проба-имени")
         вкладка.click("#access-new")
+        # Заход 56: ключ — в окне, которое закрывается только своей кнопкой.
+        вкладка.click("[data-secret-done]", timeout=10000)
         вкладка.wait_for_timeout(800)
     assert "Общая видимость заданий" in вкладка.inner_text("#toasts")
 
@@ -1088,8 +1094,8 @@ def test_сбой_журнала_не_выдаётся_за_нехватку_п�
 
 def test_сбор_без_включённых_станций_не_выдаётся_за_запуск(стенд, браузер):
     вкладка = _вкладка(браузер, стенд["адрес"])
-    вкладка.on("dialog", lambda окно: окно.accept())
     _открыть(вкладка, "pbx", 2000)
+    отвечать(вкладка, True)
     вкладка.evaluate("() => window.__asrhub.RENDERERS.pbx.collect('all', null)")
     вкладка.wait_for_timeout(1500)
     сообщения = вкладка.inner_text("#toasts")

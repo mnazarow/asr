@@ -36,7 +36,7 @@ try {
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.27'
+    $script:AsrHubVersion = '3.1.29'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }
@@ -2152,7 +2152,7 @@ function Set-AsrPrivateAcl {
 # сценарии. agent в нём не было, и сервер установки отдавал на команду из
 # главы про агента ответ 500: агент лежит в <каталог программы>\agent.
 $script:AsrInstallItems = @('server', 'scripts', 'config', 'requirements', 'docker',
-                            'examples', 'agent', 'VERSION', 'README.md')
+                            'examples', 'agent', 'docs', 'VERSION', 'README.md')
 function Get-AsrInstallItems { return $script:AsrInstallItems }
 
 # Местные файлы каталога docker: .env (порт, адрес, каталог данных, токен),

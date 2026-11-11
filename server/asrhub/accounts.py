@@ -23,11 +23,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .db import Database
@@ -38,7 +40,26 @@ log = get_logger("accounts")
 
 #: Учётная запись, которая создаётся при первом запуске.
 DEFAULT_USERNAME = "admin"
+#: Прежний пароль первого запуска. Сервер его больше не выдаёт (см.
+#: `ensure_default_admin`), но базы, заведённые раньше, могут его хранить:
+#: по нему узнаётся «пароль известен всем» и запрещается поставить его снова.
 DEFAULT_PASSWORD = "admin123"
+#: Файл в каталоге данных, куда записывается случайный пароль первого запуска.
+ФАЙЛ_ПАРОЛЯ = "admin-password.txt"
+
+
+def пароль_первого_запуска() -> str:
+    """Пароль для учётной записи первого запуска.
+
+    `ASRHUB_ADMIN_PASSWORD` — свой (установка без участия человека, образ
+    с заранее заданным паролем, проверки); иначе — случайный. Прежде это
+    всегда был admin123 — его знает всякий, кто читал руководство, и сервер,
+    открытый в сеть до первой смены пароля, был открыт всем.
+    """
+    свой = os.environ.get("ASRHUB_ADMIN_PASSWORD", "")
+    if свой.strip():
+        return свой
+    return secrets.token_urlsafe(12)
 
 #: Параметры scrypt. n=2^15 при r=8 требует около 32 МБ на проверку — это
 #: заметно для перебора и незаметно для входа раз в несколько часов.
@@ -689,23 +710,65 @@ class Accounts:
 
     # --- первый запуск --------------------------------------------------
 
-    def ensure_default_admin(self) -> Account | None:
-        """Заводит admin/admin123, если учётных записей нет ни одной.
+    def ensure_default_admin(self, каталог: Path | str | None = None) -> Account | None:
+        """Заводит admin, если учётных записей нет ни одной.
 
-        Возвращает созданную запись или None, если записи уже были. Пароль
-        помечен как обязательный к смене: интерфейс не даст работать, пока
-        его не поменяют, а в журнале это предупреждение.
+        Пароль — случайный (или `ASRHUB_ADMIN_PASSWORD`), записывается в
+        `<каталог данных>/admin-password.txt` с правами 0600: его читает
+        установщик и показывает человеку. В журнал пароль не попадает — журнал
+        отдаётся по /api/logs и уезжает в сборщики, — только путь к файлу.
+        Пароль помечен как обязательный к смене; после смены файл удаляется.
+
+        Возвращает созданную запись или None, если записи уже были.
         """
         if self.count() > 0:
             return None
-        account = self.create(DEFAULT_USERNAME, DEFAULT_PASSWORD, role="admin",
+        пароль = пароль_первого_запуска()
+        account = self.create(DEFAULT_USERNAME, пароль, role="admin",
                               display_name="Администратор",
                               must_change_password=True)
-        log.warning("Создана учётная запись по умолчанию: %s / %s",
-                    DEFAULT_USERNAME, DEFAULT_PASSWORD)
-        log.warning("Смените пароль при первом входе — до этого сервер доступен всем, "
-                    "кто знает эту пару.")
+        свой = bool(os.environ.get("ASRHUB_ADMIN_PASSWORD", "").strip())
+        файл = Path(каталог) / ФАЙЛ_ПАРОЛЯ if каталог else None
+        if файл is not None and not свой:
+            try:
+                файл.parent.mkdir(parents=True, exist_ok=True)
+                дескриптор = os.open(str(файл), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(дескриптор, "w", encoding="utf-8") as поток:
+                    поток.write(пароль + "\n")
+            except OSError as exc:
+                log.error("Пароль первого запуска не записан в %s: %s — задайте "
+                          "ASRHUB_ADMIN_PASSWORD и удалите базу учётных записей, или "
+                          "задайте пароль командой «python -m asrhub --set-password admin»", файл, exc)
+                файл = None
+        if свой:
+            log.warning("Создана учётная запись «%s» с паролем из ASRHUB_ADMIN_PASSWORD",
+                        DEFAULT_USERNAME)
+        elif файл is not None:
+            log.warning("Создана учётная запись «%s»; пароль первого запуска — в файле %s",
+                        DEFAULT_USERNAME, файл)
+        log.warning("Смените пароль при первом входе: до этого сервер ничего, кроме "
+                    "смены пароля, не делает.")
         return account
+
+    @staticmethod
+    def забыть_пароль_первого_запуска(каталог: Path | str | None) -> None:
+        """Пароль сменён — файл с паролем первого запуска больше не нужен."""
+        if not каталог:
+            return
+        try:
+            (Path(каталог) / ФАЙЛ_ПАРОЛЯ).unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Файл пароля первого запуска не удалён: %s", exc)
+
+    @staticmethod
+    def пароль_из_файла(каталог: Path | str | None) -> str:
+        """Пароль первого запуска из файла; пусто — файла нет."""
+        if not каталог:
+            return ""
+        try:
+            return (Path(каталог) / ФАЙЛ_ПАРОЛЯ).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
     def uses_default_password(self) -> bool:
         """Стоит ли где-то ещё пароль по умолчанию — для предупреждения в интерфейсе."""

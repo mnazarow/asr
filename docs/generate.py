@@ -99,7 +99,10 @@ def generate_parameters() -> str:
     ]
     for group in catalog.GROUPS:
         params = catalog.params_for_group(group["id"])
-        anchor = group["title"].lower().replace(" ", "-").replace(",", "").replace("(", "").replace(")", "")
+        # Якорь — как его строит GitHub (и раздел «Документация»): всё, кроме
+        # букв, цифр, пробела, «-» и «_», выбрасывается. Двоеточие в имени
+        # группы «Контроль качества: …» давало ссылку в никуда.
+        anchor = re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", group["title"].lower()))
         out.append(f"- [{group['title']}](#{anchor}) — {len(params)} парам.: {group['description']}")
     out.append("")
 
@@ -995,7 +998,10 @@ Prometheus и без открытой вкладки «Мониторинг» н
 JSON при срабатывании и при снятии (`event` — `alert_firing` или
 `alert_resolved`, `text` — готовая строка для чата, дальше сама тревога). Адрес
 проверяется так же, как адрес сводки и трекеров: внутренняя сеть запрещена, пока
-не разрешена `webhook_allow_internal`.
+не разрешена `webhook_allow_internal`. Недоступный приёмник не теряет тревогу:
+отправка повторяется ещё трижды — через 5, 30 и 120 секунд. В журнал сервера
+адрес попадает без токена — только схема и узел: у входящих адресов чатов
+токен стоит в самом пути.
 
 ```bash
 curl -H "X-API-Key: ключ" http://сервер:8080/api/monitoring/alerts

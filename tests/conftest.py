@@ -11,6 +11,96 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "server"))
 
+# Пароль первого запуска в проверках — прежний, известный: сотни проверок
+# входят как admin/admin123. Сам сервер без этой переменной заводит
+# случайный пароль (см. accounts.ensure_default_admin и test_review_57).
+import os  # noqa: E402
+
+os.environ.setdefault("ASRHUB_ADMIN_PASSWORD", "admin123")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """С ASRHUB_REQUIRE_BROWSER=1 нет браузера — ошибка, а не пропуск.
+
+    Браузерных проверок — сотни, и без Playwright или Chromium они молча
+    пропускаются: прогон «зелёный», а интерфейс не проверен вовсе. В
+    сборочном конвейере эту переменную надо ставить.
+    """
+    import os
+
+    if os.environ.get("ASRHUB_REQUIRE_BROWSER", "") not in ("1", "true", "yes"):
+        return
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError:
+        pytest.exit("ASRHUB_REQUIRE_BROWSER=1, а пакета playwright нет: "
+                    "pip install -r requirements/dev.txt", returncode=4)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from drill_seed import браузер
+
+    if браузер() is None:
+        pytest.exit("ASRHUB_REQUIRE_BROWSER=1, а Chromium не найден: python -m playwright "
+                    "install chromium или PLAYWRIGHT_CHROMIUM=<путь>", returncode=4)
+
+
+#: Метки по имени файла проверок (см. markers в pyproject.toml).
+_МЕТКИ_ФАЙЛОВ = (
+    ("web", ("_web.py", "test_web_ui.py", "test_manual.py")),
+    ("scripts", ("_scripts.py", "test_install_scripts.py", "test_docker.py",
+                 "test_gpu_detect.py", "test_review_47_windows.py", "_install.py",
+                 "_install_ops.py", "_install_packaging.py", "_install_ps.py")),
+    ("drill", ("test_drill_",)),
+)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Ярус каждой проверки — по файлу: быстрый ярус не ждёт браузера и сценариев."""
+    for item in items:
+        имя = Path(str(item.fspath)).name
+        for метка, признаки in _МЕТКИ_ФАЙЛОВ:
+            if any(имя.endswith(п) or имя.startswith(п) or имя == п for п in признаки):
+                item.add_marker(getattr(pytest.mark, метка))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _подтверждения_как_диалоги_playwright():
+    """Подтверждения интерфейса — «Отмена», пока проверка не ответила сама.
+
+    До 3.1.29 подтверждения были системным confirm(), и Playwright без
+    обработчика отвечал на них «Отмена». Теперь это окна интерфейса
+    (`подтвердить` в app.js): без ответа окно ждало бы человека, а проверка,
+    не знающая о нём, — своего срока. Каждая новая страница получает тот же
+    ответ по умолчанию; «Да» — `drill_seed.отвечать(страница, True)`.
+    """
+    try:
+        from playwright.sync_api import Browser
+    except ImportError:
+        yield
+        return
+    скрипт = "if (window.__asrhubConfirm === undefined) { window.__asrhubConfirm = false; }"
+    контекст_был, страница_была = Browser.new_context, Browser.new_page
+
+    # Политика содержимого страницы (3.1.28) запрещает eval, а им пользуется
+    # wait_for_function с выражением строкой: проверкам она не нужна —
+    # заголовок и его содержимое проверяются отдельно (test_review_56).
+    def new_context(self, *args, **kwargs):
+        kwargs.setdefault("bypass_csp", True)
+        контекст = контекст_был(self, *args, **kwargs)
+        контекст.add_init_script(скрипт)
+        return контекст
+
+    def new_page(self, *args, **kwargs):
+        kwargs.setdefault("bypass_csp", True)
+        страница = страница_была(self, *args, **kwargs)
+        страница.add_init_script(скрипт)
+        return страница
+
+    Browser.new_context, Browser.new_page = new_context, new_page
+    try:
+        yield
+    finally:
+        Browser.new_context, Browser.new_page = контекст_был, страница_была
+
 
 @pytest.fixture(scope="session")
 def repo_root() -> Path:

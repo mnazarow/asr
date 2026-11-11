@@ -505,6 +505,8 @@ class JobQueue:
         self.on_event = on_event
 
         self._lock = threading.RLock()
+        #: Проверка предела очереди и заведение задания — одним шагом (см. `submit`).
+        self._замок_приёма = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._paused = False
@@ -853,6 +855,22 @@ class JobQueue:
                                             deadline=deadline)
                 RUNTIME.inc("asrhub_cached_jobs_total")
                 self._emit("job.cached", {"id": job_id, "source": cached["id"]})
+                # Клон — такая же завершённая запись, как обычная: разбор
+                # содержания (и с ним CRM, трекеры) и смысловой разбор — сразу,
+                # а не когда фоновый поиск «неразобранного» до него дойдёт.
+                # Реплики — от исходного задания: у клона своих строк нет.
+                if self.content_index is not None:
+                    try:
+                        self.content_index.on_job_completed(
+                            job_id, self.db.get_job(job_id) or {},
+                            self.db.get_segments(str(cached["id"])))
+                    except Exception as exc:                 # noqa: BLE001
+                        log.debug("Клон %s не разобран сразу: %s", job_id, exc)
+                if self.llm_worker is not None:
+                    try:
+                        self.llm_worker.enqueue(job_id)
+                    except Exception as exc:                 # noqa: BLE001
+                        log.debug("Клон %s не поставлен на смысловой разбор: %s", job_id, exc)
                 # Задание завершено мгновенно, но для отправителя оно
                 # завершено — значит уведомление обязано уйти. Раньше на
                 # этом пути его не отправляли вовсе, и внешняя система
@@ -872,7 +890,31 @@ class JobQueue:
         payload = Settings.для_задания(settings)
         payload["_hash"] = params_digest
 
-        job_id = self.db.create_job({
+        # Глубина проверялась в начале, а задание заводилось после разбора
+        # файла (хеш, длительность — секунды на большой записи): сто
+        # одновременных загрузок при пустой очереди проходили проверку все
+        # и вставали поверх max_queue_size. Повторная проверка и запись —
+        # под одним замком.
+        with self._замок_приёма:
+            depth = self.db.count_jobs(status=[STATUS_QUEUED, STATUS_RETRY])
+            if depth >= self._max_queue:
+                raise QueueFull(f"В очереди уже {depth} заданий (предел {self._max_queue}).")
+            job_id = self._завести(payload, path=path, filename=filename, digest=digest,
+                                   duration=duration, settings=settings, group_id=group_id,
+                                   priority=priority, owner=owner,
+                                   api_key_name=api_key_name, source=source, tags=tags,
+                                   deadline=deadline, reference_text=reference_text,
+                                   webhook_url=webhook_url)
+        self._emit("job.queued", {"id": job_id, "filename": filename})
+        self._wake.set()
+        return self.get(job_id)
+
+    def _завести(self, payload: dict[str, Any], *, path: Path, filename: str, digest: str,
+                 duration: float, settings: dict[str, Any], group_id: str | None,
+                 priority: int | None, owner: str, api_key_name: str, source: str,
+                 tags: str, deadline: float | None, reference_text: str,
+                 webhook_url: str) -> str:
+        return self.db.create_job({
             "id": new_id(),
             "group_id": group_id,
             "filename": filename,
@@ -896,9 +938,6 @@ class JobQueue:
             "reference_text": reference_text or None,
             "webhook_url": webhook_url or None,
         })
-        self._emit("job.queued", {"id": job_id, "filename": filename})
-        self._wake.set()
-        return self.get(job_id)
 
     def _отпечаток_весов(self, spec: Any) -> str:
         """Отпечаток файлов модели для ключа кеша (см. `model_files.fingerprint`).
@@ -1132,16 +1171,35 @@ class JobQueue:
         return self.get(job_id)
 
     def cancel_group(self, group_id: str) -> int:
-        jobs = self.db.list_jobs(group_id=group_id, status=list(ACTIVE_STATUSES), limit=10000)
-        for job in jobs:
-            self.cancel(job["id"], by="group")
-        return len(jobs)
+        return self._отменить_всё({"group_id": group_id, "status": list(ACTIVE_STATUSES)},
+                                  "group")
 
     def cancel_all(self) -> int:
-        jobs = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY, STATUS_PAUSED], limit=10000)
-        for job in jobs:
-            self.cancel(job["id"], by="all")
-        return len(jobs)
+        return self._отменить_всё(
+            {"status": [STATUS_QUEUED, STATUS_RETRY, STATUS_PAUSED]}, "all")
+
+    def _отменить_всё(self, отбор: dict[str, Any], кто: str) -> int:
+        """Отменить всё по отбору — проходами, пока выборка не опустеет.
+
+        Раньше брались первые десять тысяч, и очередь архива в сорок тысяч
+        отменялась на четверть, а в ответ уходило число выбранных, а не
+        отменённых (задание, успевшее завершиться, тоже считалось).
+        Предел проходов — от бесконечного цикла, если отмена где-то не
+        удаётся и задание остаётся в выборке.
+        """
+        отменено = 0
+        виденные: set[str] = set()
+        for _ in range(1000):
+            порция = [з for з in self.db.list_jobs(**отбор, limit=5000)
+                      if з["id"] not in виденные]
+            if not порция:
+                break
+            for job in порция:
+                виденные.add(job["id"])
+                итог = self.cancel(job["id"], by=кто)
+                if итог.get("status") == STATUS_CANCELLED:
+                    отменено += 1
+        return отменено
 
     def retry(self, job_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         """Ставит задание в очередь заново — после сбоя или ради новой модели.
@@ -1453,6 +1511,14 @@ class JobQueue:
                 candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
                                                limit=window, order=preselect, light=True,
                                                ready_before=now())
+                if policy == "priority_fifo" and self._старение_с() > 0:
+                    # Состарившееся задание с низким приоритетом может не
+                    # попасть в окно «по приоритету» — добираем старейшие.
+                    есть = {c["id"] for c in candidates}
+                    candidates += [c for c in self.db.list_jobs(
+                        status=[STATUS_QUEUED, STATUS_RETRY], limit=min(window, 100),
+                        order="created_at ASC", light=True, ready_before=now())
+                        if c["id"] not in есть]
             candidates = [c for c in candidates if c["id"] not in self._running]
             if per_model_limit > 0:
                 candidates = [c for c in candidates
@@ -1612,8 +1678,25 @@ class JobQueue:
                                       -int(c.get("priority") or 0),
                                       float(c.get("created_at") or 0)))
         # priority_fifo
-        return max(candidates, key=lambda c: (int(c.get("priority") or 0),
+        шаг = self._старение_с()
+        сейчас = now()
+
+        def приоритет(c: dict[str, Any]) -> float:
+            свой = int(c.get("priority") or 0)
+            if шаг <= 0:
+                return свой
+            ждёт = max(0.0, сейчас - float(c.get("queued_at") or c.get("created_at") or сейчас))
+            return свой + int(ждёт // шаг)
+
+        return max(candidates, key=lambda c: (приоритет(c),
                                               -float(c.get("created_at") or 0)))
+
+    def _старение_с(self) -> float:
+        """Шаг старения приоритета в секундах; 0 — выключено."""
+        try:
+            return max(0.0, float(self.settings.get("priority_aging_minutes") or 0) * 60.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     # --- рабочий цикл -----------------------------------------------------
 
@@ -1837,6 +1920,13 @@ class JobQueue:
             cleanup_workdir(workdir)
 
         elapsed = time.time() - started
+        # Ожидание занятой модели — это ожидание, а не обработка: при двух
+        # воркерах на одной модели второй стоит за замком движка. Раньше оно
+        # входило в `processing_time_s` и завышало «самые медленные» и
+        # длительность заданий, а «задержка очереди» выходила меньше.
+        ждали_модель = max(0.0, min(elapsed, float(outcome.stats.get("engine_wait_s") or 0.0)))
+        elapsed -= ждали_модель
+        job["queue_time_s"] = float(job.get("queue_time_s") or 0.0) + ждали_модель
         accuracy = outcome.stats.get("accuracy") or {}
         # Реплики и отметка «готово» — одной транзакцией и одним условием
         # (см. `Database.finish_job`). Прежде реплики писались первыми, а при
@@ -1878,6 +1968,7 @@ class JobQueue:
             avg_confidence=outcome.stats.get("avg_confidence"),
             rtf=outcome.rtf,
             processing_time_s=round(elapsed, 3),
+            queue_time_s=round(float(job.get("queue_time_s") or 0.0), 3),
             audio_prep_s=outcome.timings.get("audio_prep"),
             model_load_s=outcome.timings.get("model_load"),
             inference_s=outcome.timings.get("inference"),
@@ -2669,11 +2760,22 @@ class JobQueue:
         import hashlib
         import hmac
         import urllib.error
+        import urllib.parse
         import urllib.request
 
         secret = str(self.settings.get("webhook_secret") or "").encode("utf-8")
         headers = {"Content-Type": "application/json; charset=utf-8",
-                   "User-Agent": "ASRHub/3.0"}
+                   "User-Agent": "ASRHub/3.0",
+                   # Сопоставить уведомление и отбросить повтор: номер
+                   # доставки один на все попытки одного исхода задания и
+                   # новый — у исхода после повтора задания. Раньше приёмнику
+                   # оставалось сравнивать тела.
+                   # Номер задания бывает не латиницей («phone-звонок_1» у
+                   # разговоров phone_asr), а заголовок HTTP — только latin-1:
+                   # кодируем как в адресе.
+                   "X-ASRHub-Delivery": (f"{urllib.parse.quote(str(job['id']), safe='-_.')}."
+                                         f"{int(float(job.get('finished_at') or 0) * 1000)}"),
+                   "X-ASRHub-Event": f"job.{job.get('status') or 'finished'}"}
         if secret:
             headers["X-ASRHub-Signature"] = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
@@ -2708,6 +2810,16 @@ class JobQueue:
                 self._отложить_уведомление(job, "остановка", без_попытки=True)
                 return
             try:
+                # Подпись со временем отправки: старая подпись (только тело)
+                # годилась навсегда, и перехваченное уведомление можно было
+                # прислать приёмнику снова через месяц. Приёмник сверяет
+                # HMAC от «время.тело» и отбрасывает старше пяти минут.
+                момент = str(int(time.time()))
+                headers["X-ASRHub-Timestamp"] = момент
+                headers["X-ASRHub-Attempt"] = str(attempt + 1)
+                if secret:
+                    headers["X-ASRHub-Signature-256"] = "sha256=" + hmac.new(
+                        secret, момент.encode() + b"." + payload, hashlib.sha256).hexdigest()
                 request = urllib.request.Request(target, data=payload,
                                                  headers=headers, method="POST")
                 with opener.open(request, timeout=15) as response:
@@ -3266,14 +3378,22 @@ class JobQueue:
                   for status in (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY,
                                  STATUS_PAUSED, STATUS_COMPLETED, STATUS_FAILED,
                                  STATUS_CANCELLED, *EMPTY_STATUSES)}
-        queued = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY], limit=500,
-                                   light=True)
-        pending_audio = sum(float(j.get("media_duration_s") or 0) for j in queued)
+        # Звук в очереди и ожидание — по всей очереди одним запросом, с
+        # разбивкой по моделям. Раньше суммировались первые 500 заданий, и
+        # при очереди в 3000 оценка занижалась вшестеро: «очередь большая,
+        # а ждать недолго». Скорость берётся у модели самого задания; у
+        # модели без истории — средняя по остальным.
+        по_моделям = self.db.query(
+            "SELECT model, SUM(COALESCE(media_duration_s, 0)) AS audio FROM jobs "
+            "WHERE status IN (?, ?) GROUP BY model", (STATUS_QUEUED, STATUS_RETRY))
         stats = self.db.model_stats()
-        rtf_values = [s["rtf_avg"] for s in stats if s.get("rtf_avg")]
-        avg_rtf = sum(rtf_values) / len(rtf_values) if rtf_values else 0.25
+        скорость = {s["model"]: s["rtf_avg"] for s in stats if s.get("rtf_avg")}
+        avg_rtf = (sum(скорость.values()) / len(скорость)) if скорость else 0.25
+        pending_audio = sum(float(r["audio"] or 0) for r in по_моделям)
+        работа = sum(float(r["audio"] or 0) * скорость.get(r["model"], avg_rtf)
+                     for r in по_моделям)
         workers = int(self.settings.get("max_concurrent_jobs") or 2)
-        eta = (pending_audio * avg_rtf / max(1, workers)) if pending_audio else 0.0
+        eta = (работа / max(1, workers)) if pending_audio else 0.0
         # Какие экземпляры сейчас держат задания. На одном сервере это всегда
         # он сам; на нескольких — видно, кто чем занят, и сразу заметно, если
         # один перестал отвечать и его задания вот-вот вернутся в очередь.
@@ -3295,7 +3415,10 @@ class JobQueue:
             log.debug("Список экземпляров не собран: %s", exc)
 
         return {
-            "paused": self._paused,
+            # Флаг паузы общий для всех серверов над базой: берётся из неё,
+            # а не из памяти — на узле без воркеров память не обновлялась, и
+            # остановленная соседом очередь показывалась идущей.
+            "paused": self.is_paused,
             "instance": INSTANCE_ID,
             "instances": instances,
             "workers": [s.to_dict() for _, s in sorted(self._states.items())],

@@ -39,8 +39,11 @@ def test_dockerignore_lives_in_build_context_root():
         "копия в docker/ не действует и вводит в заблуждение"
 
     text = (ROOT / ".dockerignore").read_text(encoding="utf-8")
-    for heavy in ("docs/", ".git/", "*.whl"):
+    for heavy in (".git/", "*.whl"):
         assert heavy in text, f"{heavy} не исключён из контекста сборки"
+    # Заход 56: из docs в образ идут только главы и картинки — для раздела
+    # «Документация»; сборочные сценарии руководства — нет.
+    assert "docs/*" in text and "!docs/*.md" in text and "!docs/images" in text
 
 
 def test_dockerignore_keeps_what_image_needs():

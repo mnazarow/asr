@@ -473,6 +473,8 @@ def test_выборка_mysql_идёт_страницами(tmp_path: Path, monk
                           "ANSWERED", f"1757500001.{н}", ""])
 
     def выполнить(запрос):
+        if запрос.startswith("SHOW COLUMNS"):         # проверка колонок linkedid
+            return ""
         запросы.append(запрос)
         if len(запросы) == 1:
             return строка(1) + "\n" + строка(2) + "\n"

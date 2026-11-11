@@ -26,7 +26,8 @@ class МиниАТС:
     def __init__(self, *, пароль: str = "secret", способ: str = "rfc2833",
                  кнопки: list[str] | None = None, ответ: str = "answer",
                  положить_после: int | None = None, qop: bool = True,
-                 без_пароля: bool = False, кодек: str = "PCMA") -> None:
+                 без_пароля: bool = False, кодек: str = "PCMA",
+                 глотать_отмену: int = 0) -> None:
         self.пароль = пароль
         self.способ = способ                # rfc2833 | info | inband
         self.кнопки = list(кнопки or [])
@@ -35,6 +36,7 @@ class МиниАТС:
         self.qop = qop
         self.без_пароля = без_пароля
         self.кодек = кодек
+        self.глотать_отмену = глотать_отмену   # сколько первых CANCEL «потерять»
         self.сокет = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.сокет.bind(("127.0.0.1", 0))
         self.порт = self.сокет.getsockname()[1]
@@ -157,6 +159,9 @@ class МиниАТС:
                     self._разговор["поток"] = поток
                     поток.start()
             elif метод == "CANCEL":
+                if self.глотать_отмену > 0:
+                    self.глотать_отмену -= 1           # «потерялся» в сети
+                    continue
                 self.отменён.set()
                 self._ответить(сообщение, откуда, 200, "OK", метка="abc")
                 if self._разговор:

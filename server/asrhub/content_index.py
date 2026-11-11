@@ -213,6 +213,7 @@ class ContentIndex:
         свод, основы = content.features(разбор)
         if save:
             self.db.save_content(job_id, свод, основы)
+            self._кеш_состояния = {}             # счётчики состояния устарели
             # Пересчёт записи пересчитывает и здоровье распознавания: после
             # смены ожидаемого числа говорящих иначе пришлось бы ждать
             # фонового разбора, который эту запись уже прошёл.
@@ -310,15 +311,18 @@ class ContentIndex:
             except Exception as exc:                         # noqa: BLE001
                 log.warning("Адрес трекеров отвергнут: %s", exc)
                 return
-            threading.Thread(target=self._отправить, args=(адрес, события),
+            внутренние = bool(self.settings.get("webhook_allow_internal"))
+            threading.Thread(target=self._отправить, args=(адрес, события, внутренние),
                              name="asrhub-tracker", daemon=True).start()
 
     @staticmethod
-    def _отправить(адрес: str, события: list[dict[str, Any]]) -> None:
+    def _отправить(адрес: str, события: list[dict[str, Any]],
+                   внутренние: bool = False) -> None:
         from .maintenance import send_json  # noqa: PLC0415
 
         for событие in события:
-            send_json({"event": "tracker", **событие}, адрес, what="трекер")
+            send_json({"event": "tracker", **событие}, адрес, what="трекер",
+                      allow_internal=внутренние)
 
     def _оценить_качество(self, job_id: str, реплики: list[dict[str, Any]],
                           задание: dict[str, Any] | None = None) -> None:
@@ -408,6 +412,8 @@ class ContentIndex:
                 except Exception:                            # noqa: BLE001
                     log.debug("Не удалось пометить запись %s", job_id)
         self.backfilled += сделано
+        if сделано:
+            self._кеш_состояния = {}
         return сделано
 
     def recompute(self, job_ids: list[str] | None = None) -> dict[str, Any]:
@@ -442,7 +448,23 @@ class ContentIndex:
         пятнадцать секунд — он не попадал в кеш ни разу, и каждый опрос
         делал полную группировку по таблице основ под общей блокировкой.
         """
-        сведения = self.db.content_stats(content.VERSION, owner=owner)
+        # Счётчики — полный проход по заданиям архива: на сотнях тысяч это
+        # секунды на каждый опрос раздела (раз в пятнадцать секунд). Держим
+        # их полминуты на владельца: число «разобрано» отстаёт не больше
+        # чем на одну порцию фонового разбора.
+        ключ = repr(sorted(owner) if isinstance(owner, list) else owner)
+        кеш = getattr(self, "_кеш_состояния", None)
+        if кеш is None:
+            кеш = self._кеш_состояния = {}
+        сейчас = time.monotonic()
+        запись = кеш.get(ключ)
+        if запись is None or сейчас - запись[0] > 30.0:
+            запись = (сейчас, self.db.content_stats(content.VERSION, owner=owner),
+                      self.db.vocabulary_size(), self.db.content_window_size(owner=owner))
+            if len(кеш) > 256:
+                кеш.clear()
+            кеш[ключ] = запись
+        _, сведения, словарь, корпус = запись
         набор = self.categories()
         return {
             **сведения,
@@ -453,8 +475,8 @@ class ContentIndex:
             "backfill": bool(self.settings.get("content_backfill", True))
             if self.settings else True,
             "running": bool(self._thread and self._thread.is_alive()),
-            "vocabulary": self.db.vocabulary_size(),
-            "corpus": self.db.content_window_size(owner=owner),
+            "vocabulary": словарь,
+            "corpus": корпус,
             "backfilled": self.backfilled,
             "last_error": self.last_error,
         }
