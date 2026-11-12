@@ -12,6 +12,8 @@
 #   bash scripts/models.sh install-engine nemo   установить движок
 #   bash scripts/models.sh install-engine mfa    выравнивание (conda + модели)
 #   bash scripts/models.sh disk                  сколько занято на диске
+#   bash scripts/models.sh voice ru_RU-irina-medium  голос Piper для опросов
+#                                                (ставит piper-tts и качает голос)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
@@ -100,6 +102,40 @@ run_python() {
 # ---------------------------------------------------------------------------
 
 case "${ACTION}" in
+
+voice)
+  # Голос для контроля качества: Piper (piper-tts) в окружение сервера и
+  # файл голоса — в <данные>/qc/piper. Русские голоса: ru_RU-irina-medium,
+  # ru_RU-denis-medium, ru_RU-dmitri-medium, ru_RU-ruslan-medium.
+  VOICE="${ARGS[0]:-ru_RU-irina-medium}"
+  VPIP="${PREFIX}/venv/bin/pip"
+  if [[ -x "${VPIP}" && ! -x "${PREFIX}/venv/bin/piper" ]]; then
+    info "Установка Piper (piper-tts) в окружение сервера…"
+    if [[ "${ASRHUB_DRY_RUN}" != "1" ]]; then
+      "${VPIP}" install --disable-pip-version-check -q piper-tts \
+        || { error "piper-tts не установился"; hint "Без сети: pip download piper-tts на другой машине."; exit 1; }
+    fi
+  fi
+  VOICE_DIR="${DATA_DIR}/qc/piper"
+  VOICE_MODEL="$(run_python "${VOICE}" "${VOICE_DIR}" <<'PYEOF'
+import sys
+from pathlib import Path
+sys.path.insert(0, ".")
+from asrhub.errors import ASRHubError
+from asrhub.qc import tts
+try:
+    print(tts.скачать_голос_piper(sys.argv[1], Path(sys.argv[2])))
+except ASRHubError as exc:
+    sys.stderr.write(f"{exc.message} {exc.hint or ''}\n")
+    sys.exit(2)
+PYEOF
+)" || { error "Голос ${VOICE} не скачался"; exit 1; }
+  ok "Голос ${VOICE}: ${VOICE_MODEL}"
+  PIPER_BIN="${PREFIX}/venv/bin/piper"
+  [[ -x "${PIPER_BIN}" ]] || PIPER_BIN="piper"
+  hint "В «Настройки» → «Контроль качества» (или config.yaml):"
+  printf '  qc_tts_voice: %s\n  qc_tts_command: %s -m {voice} -f {out}\n' "${VOICE_MODEL}" "${PIPER_BIN}"
+  ;;
 
 list)
   run_python "${FILTER_INSTALLED}" "${FILTER_LANGUAGE}" "${MODELS_DIR}" <<'PYEOF'

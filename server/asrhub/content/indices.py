@@ -465,7 +465,7 @@ def усталость(сегменты: list[dict[str, Any]], оператор:
     таких измерений в разрезе по сотруднику.
     """
     свои = _речь_оператора(сегменты, оператор) or []
-    пусто = {"index": None, "level": None, "signals": [],
+    пусто: dict[str, Any] = {"index": None, "level": None, "signals": [],
              "wpm_start": None, "wpm_end": None}
     if len(свои) < 6:
         # На пяти репликах «первая треть» — это одна реплика, и разницу с
@@ -539,7 +539,7 @@ def понятность(сегменты: list[dict[str, Any]], речь: dict[
     его работа.
     """
     свои = _речь_оператора(сегменты, оператор)
-    пусто = {"index": None, "grade": None, "wpm": None, "sentence_words": None,
+    пусто: dict[str, Any] = {"index": None, "grade": None, "wpm": None, "sentence_words": None,
              "long_sentences": 0, "hard_words": 0, "filler_rate": None, "signals": []}
     if свои is None:
         return пусто
@@ -616,7 +616,7 @@ def точность(сегменты: list[dict[str, Any]], оператор: s
     плохо расслышанной записи судить о конкретности нельзя.
     """
     свои = _речь_оператора(сегменты, оператор)
-    пусто = {"index": None, "vague": [], "specific_hits": 0, "confidence": confidence}
+    пусто: dict[str, Any] = {"index": None, "vague": [], "specific_hits": 0, "confidence": confidence}
     if свои is None:
         return пусто
     текст = _текст(свои)
@@ -732,7 +732,7 @@ def ритмичность(сегменты: list[dict[str, Any]], речь: dic
     более рваным просто потому, что у него больше числа.
     """
     свои = _речь_оператора(сегменты, оператор)
-    пусто = {"index": None, "wpm_spread": None, "pause_spread": None,
+    пусто: dict[str, Any] = {"index": None, "wpm_spread": None, "pause_spread": None,
              "wpm": None, "level": None}
     if свои is None:
         return пусто
@@ -747,9 +747,8 @@ def ритмичность(сегменты: list[dict[str, Any]], речь: dic
     # оператора» мерил, как быстро отвечает клиент. Реплика собеседника
     # обрывает череду: пауза перед ответом — другой показатель. Поддакивание
     # собеседника («угу» внутри речи оператора) череду не обрывает.
-    поддакивание = float(речь.get("backchannel_threshold_s")
-                         if речь.get("backchannel_threshold_s") is not None
-                         else ПОРОГ_ПОДДАКИВАНИЯ)
+    порог_речи = речь.get("backchannel_threshold_s")
+    поддакивание = float(порог_речи if порог_речи is not None else ПОРОГ_ПОДДАКИВАНИЯ)
     паузы = []
     свой_конец: float | None = None
     for с in sorted(сегменты, key=lambda с: float(с.get("start") or 0)):
@@ -788,7 +787,7 @@ def паразиты(сегменты: list[dict[str, Any]], оператор: s
     разными разговорами с сотрудником, а в общей доле они неразличимы.
     """
     свои = _речь_оператора(сегменты, оператор)
-    если_нет = {"rate": None, "count": 0, "top": [], "sounds": 0}
+    если_нет: dict[str, Any] = {"rate": None, "count": 0, "top": [], "sounds": 0}
     if свои is None:
         return если_нет
     # По репликам, а не по склеенному тексту: оборот не должен собираться из
@@ -825,7 +824,7 @@ def уменьшительные(сегменты: list[dict[str, Any]],
     «заявку» — и показатель превращается в счётчик обычных слов.
     """
     свои = _речь_оператора(сегменты, оператор)
-    если_нет = {"count": None, "rate": None, "top": [], "familiar": []}
+    если_нет: dict[str, Any] = {"count": None, "rate": None, "top": [], "familiar": []}
     if свои is None:
         return если_нет
     слова_ = words(_текст(свои))

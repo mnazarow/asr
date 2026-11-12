@@ -1234,6 +1234,57 @@ def search_in_job(request: Request, job_id: str,
     }
 
 
+def _по_участникам(state: Any, principal: Any, звонок: dict[str, Any],
+                   ноги: list[dict[str, Any]], job: dict[str, Any]) -> dict[str, Any] | None:
+    """Отрезки записи по участникам разговора с переводами (см. `telephony.segments`)."""
+    from ..telephony import segments as отрезки_мод  # noqa: PLC0415
+    from .deps import same_scope  # noqa: PLC0415
+
+    свои = []
+    for нога in ноги:
+        if principal.is_admin or same_scope(principal, str(нога.get("owner") or "")):
+            свои.append(нога)
+        else:
+            # Время чужой ноги нужно, чтобы знать, где кончился свой
+            # отрезок; кто это был — нет.
+            свои.append({**нога, "agent": "другой участник", "uniqueid": ""})
+    if len({str(н.get("agent") or "") for н in [звонок, *свои] if н.get("agent")}) < 2:
+        return None
+    try:
+        итог = отрезки_мод.по_участникам(
+            звонок, свои, state.db.get_segments(str(job.get("id") or "")),
+            длительность=float(job.get("media_duration_s") or 0))
+    except Exception as exc:                                # noqa: BLE001
+        log.debug("Отрезки по участникам не посчитаны: %s", exc)
+        return None
+    if итог and state.settings.get("employees_match_ext", True):
+        for участник in итог["agents"]:
+            сотрудник = state.db.employee_by_ext(участник["agent"])
+            if сотрудник:
+                участник["agent_name"] = " ".join(
+                    str(сотрудник.get(п) or "").strip()
+                    for п in ("last_name", "first_name", "middle_name")).strip()
+    return итог
+
+
+@router.get("/{job_id}/agents", summary="Кто говорил на каком отрезке записи")
+def job_agents(request: Request, job_id: str,
+               principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Отрезки записи по участникам разговора с переводами и оценка каждого.
+
+    Пусто (`by_agent: null`) — у записи один участник или она не звонок.
+    """
+    state = get_state(request)
+    job = state.db.get_job(job_id)
+    if job is None:
+        raise error_response(JobNotFound(job_id))
+    require_owner(principal, job)
+    звонок = state.db.call_for_job(job_id)
+    итог = (_по_участникам(state, principal, звонок, state.db.call_legs(звонок), job)
+            if звонок else None)
+    return {"job_id": job_id, "by_agent": итог}
+
+
 @router.get("/{job_id}", summary="Карточка задания")
 def get_job(request: Request, job_id: str,
             with_segments: bool = False,
@@ -1285,10 +1336,15 @@ def get_job(request: Request, job_id: str,
         # ноги обычному ключу не видны: владелец у ноги свой.
         from .deps import same_scope  # noqa: PLC0415
 
-        ноги = [н for н in state.db.call_legs(звонок)
+        все_ноги = state.db.call_legs(звонок)
+        ноги = [н for н in все_ноги
                 if principal.is_admin or same_scope(principal, str(н.get("owner") or ""))]
         if ноги:
             звонок["legs"] = ноги
+        if все_ноги:
+            # Кто говорил на каком отрезке записи: разговор с переводом — по
+            # участникам. Чужие ноги участвуют во времени, но без имени.
+            звонок["by_agent"] = _по_участникам(state, principal, звонок, все_ноги, job)
         # Добавочный — это стол, а читающему нужен человек. Справочник
         # сотрудников открыт любому ключу (это внутренний телефонный
         # список), поэтому имя приходит прямо в карточку.
@@ -1991,7 +2047,7 @@ def rescan(request: Request, данные: dict[str, Any] = Body(default={}),
         except HTTPException as exc:
             # Отказ из `_owned_job` и квоты приходит ответом API: человеку
             # нужна строка причины, а не «403: {'code': …}» (как в bulk).
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
             отказы.append({"id": job_id,
                            "error": str(detail.get("message") or exc.detail)})
         except ASRHubError as exc:
@@ -2064,7 +2120,7 @@ def bulk(request: Request,
         except HTTPException as exc:
             # `error_response` кладёт разбор ошибки в detail; человеку нужна
             # одна строка причины, а не весь словарь в кавычках.
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
             отказы.append({"id": job_id,
                            "error": str(detail.get("message") or exc.detail)})
         except ASRHubError as exc:

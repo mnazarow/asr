@@ -2935,7 +2935,9 @@ class JobQueue:
         except Exception as exc:                            # noqa: BLE001
             log.debug("Ждущие уведомления не перечислены: %s", exc)
             return 0
-        пул = self._webhook_pool() if номера else None
+        if not номера:
+            return 0
+        пул = self._webhook_pool()
         for job_id in номера:
             пул.submit(self._доставить, job_id)
         return len(номера)
@@ -3005,8 +3007,8 @@ class JobQueue:
         # который кладёт маршрут /process-call.
         call = (job.get("params") or {}).get("_phone")
         if call:
-            body = self._phone_callback_body(job, call)
-            payload = json_mod.dumps(body, ensure_ascii=False).encode("utf-8")
+            payload = json_mod.dumps(self._phone_callback_body(job, call),
+                                     ensure_ascii=False).encode("utf-8")
             self._deliver_webhook(job, payload)
             return
 

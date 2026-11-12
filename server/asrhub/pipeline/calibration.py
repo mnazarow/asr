@@ -118,17 +118,18 @@ def aggregate(записи: list[dict[str, Any] | str | None]) -> dict[str, Any]
     for i, (n, s, h) in enumerate(итог):
         conf = (s / n) if n else None
         acc = (h / n) if n else None
-        if n:
+        if conf is not None and acc is not None:
             ece += (n / всего) * abs(acc - conf)
         строки.append({"from": round(i / КОРЗИН, 1), "to": round((i + 1) / КОРЗИН, 1),
                        "words": n,
                        "confidence": round(conf, 4) if conf is not None else None,
                        "accuracy": round(acc, 4) if acc is not None else None,
-                       "gap": round(conf - acc, 4) if conf is not None else None})
+                       "gap": round(conf - acc, 4)
+                       if conf is not None and acc is not None else None})
     auc = None
     if верных and неверных:
         # Неверные ниже текущей корзины — уже пройденные.
-        ниже = 0
+        ниже = 0.0
         сумма = 0.0
         for n, _, h in итог:
             w = n - h
@@ -145,7 +146,8 @@ def aggregate(записи: list[dict[str, Any] | str | None]) -> dict[str, Any]
         "auc": round(auc, 4) if auc is not None else None,
         "confidence": round(conf_all, 4) if conf_all is not None else None,
         "accuracy": round(acc_all, 4) if acc_all is not None else None,
-        "overconfidence": round(conf_all - acc_all, 4) if всего else None,
+        "overconfidence": (round(conf_all - acc_all, 4)
+                           if conf_all is not None and acc_all is not None else None),
         "bins": строки,
         "sources": источники,
     }

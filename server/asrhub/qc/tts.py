@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -42,7 +43,9 @@ log = get_logger("qc")
 #: `{voice}` — голос. Текст подаётся ещё и на стандартный ввод.
 ДВИЖКИ: tuple[tuple[str, str, str, str], ...] = (
     ("RHVoice", "RHVoice-test", "RHVoice-test -p {voice} -o {out}", "anna"),
-    ("Piper", "piper", "piper --model {voice} --output_file {out}", ""),
+    # -m и -f понимают все Piper: и прежний на C++, и пакет piper-tts
+    # (у него длинное имя — --output-file, у прежнего — --output_file).
+    ("Piper", "piper", "piper -m {voice} -f {out}", ""),
     ("eSpeak NG", "espeak-ng", "espeak-ng -v {voice} -s 145 -w {out} -f {text}", "ru"),
     ("eSpeak", "espeak", "espeak -v {voice} -s 145 -w {out} -f {text}", "ru"),
 )
@@ -249,6 +252,37 @@ def питон_программы(программа: str) -> str:
     if Path(части[0]).name == "env" and len(части) > 1:
         return shutil.which(части[1]) or ""
     return части[0] if "python" in Path(части[0]).name and Path(части[0]).is_file() else ""
+
+
+#: Голоса Piper: хранилище и закреплённая версия (каталог «язык/язык_РЕГИОН/имя/качество»).
+ГОЛОСА_PIPER = "rhasspy/piper-voices"
+ВЕРСИЯ_ГОЛОСОВ_PIPER = "v1.0.0"
+ИМЯ_ГОЛОСА_PIPER = re.compile(r"^([a-z]{2,3})_([A-Z]{2})-([a-z0-9_]+)-(x_low|low|medium|high)$")
+
+
+def скачать_голос_piper(имя: str, каталог: Path, *, загрузить: Any = None) -> Path:
+    """Голос Piper (`ru_RU-irina-medium`) — файл модели .onnx и его .onnx.json.
+
+    Берётся из хранилища rhasspy/piper-voices закреплённой версии через
+    huggingface_hub (уже стоит у сервера). Ответ — путь к .onnx: его
+    вписывают в «Голос синтеза» (qc_tts_voice).
+    """
+    совпало = ИМЯ_ГОЛОСА_PIPER.match(str(имя or "").strip())
+    if not совпало:
+        raise ConfigError(f"«{имя}» — не имя голоса Piper.",
+                          hint="Имя вида ru_RU-irina-medium: язык_РЕГИОН-голос-качество.")
+    язык, регион, голос, качество = совпало.groups()
+    if загрузить is None:
+        from huggingface_hub import hf_hub_download as загрузить  # noqa: PLC0415
+    каталог.mkdir(parents=True, exist_ok=True)
+    основа = f"{язык}/{язык}_{регион}/{голос}/{качество}/{имя}"
+    for хвост in (".onnx.json", ".onnx"):
+        путь = Path(загрузить(repo_id=ГОЛОСА_PIPER, revision=ВЕРСИЯ_ГОЛОСОВ_PIPER,
+                              filename=основа + хвост, local_dir=str(каталог)))
+        if not путь.is_file() or путь.stat().st_size < 64:
+            raise ConfigError(f"Голос {имя}: файл {хвост} не скачался.")
+    модель = каталог / f"{основа}.onnx"
+    return модель
 
 
 def каталог_образца(кеш: Path) -> Path:

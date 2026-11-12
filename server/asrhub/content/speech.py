@@ -183,8 +183,8 @@ def analyze(segments: list[dict[str, Any]], duration_s: float,
     паузы: list[float] = []
     длинных_пауз = 0
     перебивания: list[dict[str, Any]] = []
-    монолог = {"speaker": None, "seconds": 0.0, "start_s": 0.0}
-    текущий = {"speaker": None, "seconds": 0.0, "start_s": 0.0}
+    монолог: dict[str, Any] = {"speaker": None, "seconds": 0.0, "start_s": 0.0}
+    текущий: dict[str, Any] = {"speaker": None, "seconds": 0.0, "start_s": 0.0}
     ответы: dict[str, list[float]] = {}
     # Смены говорящего и наложение речи — то, что Gong называет
     # интерактивностью, а Genesys считает в секундах: сколько раз речь

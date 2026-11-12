@@ -47,7 +47,7 @@ _РЕПЛИКА = """Сценарий клиента:
 def сценарии(db: Any, *, owner: Any = None, limit: int = 20) -> list[dict[str, Any]]:
     """Разговоры архива, годные в сценарий: разобраны моделью, причина известна."""
     строки = db.llm_window_rows(time.time() - 90 * 86400.0, owner=owner, limit=limit * 5)
-    итог = []
+    итог: list[dict[str, Any]] = []
     причины: set[str] = set()
     for р in строки:
         if not р.get("summary") or not р.get("reason"):
@@ -114,7 +114,7 @@ def начать(db: Any, client: LLMClient, *, job_id: str = "", reason: str = 
         сценарий = f"Причина обращения: {reason}. Подробности придумай сам, правдоподобно."
     else:
         raise LLMError("Нужен сценарий: запись архива (job_id) или причина обращения.")
-    сессия = {"id": secrets.token_hex(8), "owner": owner, "by": by,
+    сессия: dict[str, Any] = {"id": secrets.token_hex(8), "owner": owner, "by": by,
               "job_id": job_id or None, "reason": reason or None,
               "scenario": сценарий, "history": [], "done": False,
               "started_at": time.time(), "result": None}

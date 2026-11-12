@@ -1818,7 +1818,8 @@ class Analytics:
             "waited_over_10_minutes": sum(1 for v in все if v > 600),
         }
 
-    def full_report(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+    def full_report(self, period: str = "week",
+                    owner: str | list[str] | None = None) -> dict[str, Any]:
         """Все разрезы сразу — по одной выборке заданий на каждый запрос.
 
         Отдельные разрезы забирают по своим адресам и читают базу сами;

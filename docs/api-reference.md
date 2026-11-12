@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **249**, операций: **278**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **250**, операций: **279**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -200,6 +200,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/jobs/text` | Разобрать переписку (чат, почта) без звука | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/jobs/{job_id}` | Карточка задания | любой действующий ключ |
 | `DELETE` | `/api/jobs/{job_id}` | Удалить задание и результаты | ключ с правом записи (**admin** или **user**) |
+| `GET` | `/api/jobs/{job_id}/agents` | Кто говорил на каком отрезке записи | любой действующий ключ |
 | `GET` | `/api/jobs/{job_id}/audio` | Исходная запись задания | любой действующий ключ |
 | `POST` | `/api/jobs/{job_id}/bottom` | Опустить в конец очереди | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/jobs/{job_id}/cancel` | Отменить задание | ключ с правом записи (**admin** или **user**) |
@@ -684,6 +685,21 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/jobs/j_a1b2c3
 |---|---|---|---|---|
 | `job_id` | в пути | string | обязателен | — |
 
+### `GET /api/jobs/{job_id}/agents`
+
+Кто говорил на каком отрезке записи.
+
+Отрезки записи по участникам разговора с переводами и оценка каждого.
+
+Пусто (`by_agent: null`) — у записи один участник или она не звонок.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `job_id` | в пути | string | обязателен | — |
+
 ### `GET /api/jobs/{job_id}/audio`
 
 Исходная запись задания.
@@ -967,7 +983,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:12852-c2319c",
+  "instance": "vm:1452-0751e7",
   "instances": [],
   "workers": [
     {
@@ -1567,7 +1583,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794471972.6977706,
+    "generated_at": 1794476073.5883167,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1734,8 +1750,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.36",
-  "uptime_s": 1.7,
+  "version": "3.1.37",
+  "uptime_s": 1.6,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1815,8 +1831,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.36",
-  "uptime_s": 1.7,
+  "version": "3.1.37",
+  "uptime_s": 1.6,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1825,8 +1841,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
-    "disk_free_gb": 21.8,
+    "ram_available_gb": 7.2,
+    "disk_free_gb": 22.8,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2575,8 +2591,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793867172.76746,
-    "until": 1794471972.76746
+    "since": 1793871273.6601794,
+    "until": 1794476073.6601794
   }
 }
 ```
@@ -2968,7 +2984,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 7.1,
+    "free_gb": 7.2,
     "reserve_gb": 4.0,
     "budget_gb": 3.0,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
@@ -5103,7 +5119,7 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 1.8,
+  "uptime_s": 1.7,
   "liveness": {
     "status": "ok",
     "checks": [
@@ -5145,7 +5161,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 21.8 ГБ",
+        "detail": "свободно 22.8 ГБ",
         "hint": ""
 …
 ```

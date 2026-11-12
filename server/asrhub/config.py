@@ -423,7 +423,11 @@ class Settings:
     """Итоговая конфигурация сервера."""
 
     values: dict[str, Any] = field(default_factory=dict)
-    paths: Paths | None = None
+    #: Каталоги установки. `load()` задаёт их всегда; None — только у
+    #: настроек, собранных руками (проверки), где каталоги не нужны.
+    #: Для проверки типов — Paths: иначе каждое обращение в обработчиках
+    #: требовало бы проверки, которой на деле нужны только эти настройки.
+    paths: Paths = None  # type: ignore[assignment]
     config_file: Path | None = None
     api_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     hf_token: str = ""

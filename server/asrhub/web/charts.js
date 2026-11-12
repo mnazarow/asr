@@ -537,8 +537,11 @@ function fmtNum(value, digits) {
         }
       }
       if (config.showValues !== false && values.length <= 14 && v > 0) {
+        // Подпись числа лежит поверх колонки выбора: без pointer-events
+        // щелчок по самому числу не раскрывал список, а только по краю.
         el('text', { x: x + barWidth / 2, y: y - 5, 'text-anchor': 'middle',
-                     fill: ink(), 'font-size': 10.5 }, ctx.svg).textContent = fmtNum(v);
+                     fill: ink(), 'font-size': 10.5, 'pointer-events': 'none' },
+           ctx.svg).textContent = fmtNum(v);
       }
       if (config.labels) {
         // Шаг подписей — по ширине, а не по числу столбцов. По числу было

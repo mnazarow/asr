@@ -20,15 +20,21 @@ API его сохранял, отпечаток настроек менялся,
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 
-def _raw(settings: dict[str, Any], key: str) -> Any:
+class _СЧтением(Protocol):
+    """Что угодно с `get` — словарь настроек или сами `Settings`."""
+
+    def get(self, key: str, default: Any = None) -> Any: ...
+
+
+def _raw(settings: _СЧтением, key: str) -> Any:
     value = settings.get(key)
     return None if value is None or value == "" else value
 
 
-def num(settings: dict[str, Any], key: str, default: float) -> float:
+def num(settings: _СЧтением, key: str, default: float) -> float:
     """Дробное значение параметра; ноль остаётся нулём."""
     value = _raw(settings, key)
     if value is None:
@@ -39,7 +45,7 @@ def num(settings: dict[str, Any], key: str, default: float) -> float:
         return float(default)
 
 
-def integer(settings: dict[str, Any], key: str, default: int) -> int:
+def integer(settings: _СЧтением, key: str, default: int) -> int:
     """Целое значение параметра; ноль остаётся нулём."""
     value = _raw(settings, key)
     if value is None:

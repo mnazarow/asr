@@ -5328,6 +5328,42 @@ const Player = {
   },
 };
 window.__asrhub.playRecording = (id) => window.__asrhub.openJob(id, { play: true });
+/**
+ * Кто говорил на каком отрезке записи (разговор с переводами): полоса
+ * отрезков по времени и оценка каждого участника. Щелчок по отрезку —
+ * перейти к нему в записи.
+ */
+function участникиРазговора(разбор) {
+  const длина = Math.max(1, ...разбор.segments.map((о) => о.to_s));
+  const цвета = ['var(--accent)', 'var(--ok)', 'var(--warn)', 'var(--err)', 'var(--text-dim)'];
+  const номер = new Map(разбор.agents.map((у, н) => [у.agent, н % цвета.length]));
+  const имя = (у) => (у.agent_name ? `${у.agent} — ${у.agent_name}` : у.agent);
+  const тон = (т) => html`<span class="chip ${т.label === 'отрицательная' ? 'err'
+    : т.label === 'положительная' ? 'ok' : ''}">${т.label}</span>`;
+  return html`<div class="small" style="margin-top:8px" id="call-by-agent">
+    <b class="small">Кто говорил когда</b>
+    <span class="dim"> · ${разбор.note}</span>
+    <div class="agent-strip" style="display:flex;height:14px;margin:6px 0;border-radius:4px;overflow:hidden"
+      role="img" aria-label="Отрезки записи по участникам">
+      ${разбор.segments.map((о) => html`<span data-seek="${о.from_s}" tabindex="0" role="button"
+        data-enter-click title="${о.agent}: ${fmtDur(о.from_s)}–${fmtDur(о.to_s)}"
+        style="cursor:pointer;flex:${Math.max(0.5, о.to_s - о.from_s) / длина};background:${
+          raw(цвета[номер.get(о.agent) || 0])}"></span>`)}
+    </div>
+    <table class="table small" data-nosort><thead><tr><th>Участник</th><th class="num">Звучал</th>
+      <th class="num">Доля</th><th class="num">Слов</th><th>Тональность</th></tr></thead><tbody>
+      ${разбор.agents.map((у) => html`<tr>
+        <td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${
+          raw(цвета[номер.get(у.agent) || 0])}"></span> <span class="mono">${имя(у)}</span></td>
+        <td class="num">${fmtDur(у.talk_s)}</td><td class="num">${pct(у.share, 0)}</td>
+        <td class="num">${num(у.words, 0)}</td><td>${тон(у.sentiment)}</td></tr>`)}
+    </tbody></table>
+    ${разбор.segments.map((о) => html`<div class="dim" style="margin-top:2px">
+      <a href="#" data-seek="${о.from_s}">${fmtDur(о.from_s)}–${fmtDur(о.to_s)}</a>
+      · <span class="mono">${о.agent}</span> · ${о.preview}</div>`)}
+  </div>`;
+}
+
 // «Запись» у другой ноги разговора в карточке звонка (см. call.legs).
 document.addEventListener('click', (ев) => {
   const ссылка = ев.target.closest && ев.target.closest('[data-leg-job]');
@@ -5482,6 +5518,7 @@ function showJobModal(job, opts) {
             ${н.job_id ? ` · <a href="#" data-leg-job="${esc(н.job_id)}">запись</a>`
               : н.skipped ? ` · <span class="dim">${esc(н.skipped)}</span>` : ''}</div>`).join('')}
         </div>` : ''}
+        ${job.call.by_agent ? raw(участникиРазговора(job.call.by_agent)) : ''}
       </div>` : ''}
 
       ${job.error_message && EMPTY_STATUSES.includes(job.status)
@@ -5591,49 +5628,51 @@ function showJobModal(job, opts) {
   });
 
   const body = qs('#job-tab-body', backdrop);
+  // Вкладки с текстом распознавания — шаблоном html`…`: реплики, говорящие и
+  // параметры приходят из записи и экранируются сами (см. `html`).
   const tabs = {
-    text: () => (EMPTY_STATUSES.includes(job.status) && !job.text
-      ? `<div class="empty">${job.status === 'short' ? 'Короткая запись не распознаётся'
+    text: () => String(EMPTY_STATUSES.includes(job.status) && !job.text
+      ? html`<div class="empty">${job.status === 'short' ? 'Короткая запись не распознаётся'
         : 'В записи нет речи'} — расшифровки нет.</div>`
-      : `<div class="transcript" style="white-space:pre-wrap;line-height:1.7">${
-        esc(job.text || '—')}</div>`),
-    segments: () => segments.length ? `
+      : html`<div class="transcript" style="white-space:pre-wrap;line-height:1.7">${
+        job.text || '—'}</div>`),
+    segments: () => String(segments.length ? html`
       <div class="job-find">
         <input type="search" id="job-find-input" placeholder="Найти в разговоре"
                autocomplete="off">
         <span class="count" id="job-find-count"></span>
       </div>
       <div class="find-hits" id="job-find-hits"></div>
-      <div class="transcript">${segments.map((s, i) => `
+      <div class="transcript">${segments.map((s, i) => html`
       <div class="segment" data-index="${i}" data-start="${s.start}" data-end="${s.end}">
         <div class="ts">${fmtDur(s.start)}<br><span style="opacity:.6">${
           fmtDur(s.end)}</span></div>
         <div class="${(s.confidence !== null && s.confidence < 0.7) ? 'conf-low' : ''}">
-          ${s.speaker ? `<div class="speaker">${esc(s.speaker)}</div>` : ''}
-          ${esc(s.text)}
+          ${s.speaker ? html`<div class="speaker">${s.speaker}</div>` : ''}
+          ${s.text}
           ${s.confidence !== null && s.confidence !== undefined
-            ? `<span class="chip ${s.confidence < 0.7 ? 'warn' : ''}"
+            ? html`<span class="chip ${s.confidence < 0.7 ? 'warn' : ''}"
                  style="margin-left:8px">${pct(s.confidence, 0)}</span>` : ''}
-        </div></div>`).join('')}</div>` : '<div class="empty">Сегменты недоступны</div>',
-    params: () => `<div class="table-wrap"><table>
+        </div></div>`)}</div>` : html`<div class="empty">Сегменты недоступны</div>`),
+    params: () => String(html`<div class="table-wrap"><table>
       <thead><tr><th>Параметр</th><th>Значение</th><th>По умолчанию</th></tr></thead><tbody>
       ${changed.map(([k, v]) => {
         const spec = paramByKey(k);
-        return `<tr><td>${esc(spec.label)}<div class="small faint mono">${esc(k)}</div></td>
-          <td class="mono" style="color:var(--accent)">${esc(JSON.stringify(v))}</td>
-          <td class="mono faint">${esc(JSON.stringify(spec.default))}</td></tr>`;
-      }).join('')}</tbody></table></div>
-      ${changed.length === 0 ? '<div class="empty small">Использованы значения по умолчанию</div>' : ''}`,
+        return html`<tr><td>${spec.label}<div class="small faint mono">${k}</div></td>
+          <td class="mono" style="color:var(--accent)">${JSON.stringify(v)}</td>
+          <td class="mono faint">${JSON.stringify(spec.default)}</td></tr>`;
+      })}</tbody></table></div>
+      ${changed.length === 0 ? html`<div class="empty small">Использованы значения по умолчанию</div>` : ''}`),
     analysis: () => `<div id="job-analysis"><div class="empty">Разбираем запись…</div></div>`,
     reference: () => referenceTab(job, segments),
     qa: () => qaTab(job),
-    events: () => `<div class="table-wrap"><table>
+    events: () => String(html`<div class="table-wrap"><table>
       <thead><tr><th>Время</th><th>Событие</th><th>Сообщение</th></tr></thead><tbody>
-      ${(job.events || []).map((e) => `<tr>
+      ${(job.events || []).map((e) => html`<tr>
         <td class="small faint nowrap">${fmtTime(e.ts)}</td>
-        <td><span class="chip">${esc(e.kind)}</span></td>
-        <td class="small">${esc(e.message || '')}</td></tr>`).join('')}
-      </tbody></table></div>`,
+        <td><span class="chip">${e.kind}</span></td>
+        <td class="small">${e.message || ''}</td></tr>`)}
+      </tbody></table></div>`),
   };
   const show = (name) => {
     body.innerHTML = tabs[name]();
@@ -6536,6 +6575,13 @@ function setupJobPlayer(backdrop, job, segments, show, options) {
       // И реплики, и строки разбора: у обеих есть секунда, и обе для того
       // и показаны — чтобы попасть в это место записи. Разбор без перехода
       // остаётся справкой; с переходом становится оглавлением разговора.
+      // Отрезок участника разговора («Кто говорил когда») — тоже место записи.
+      const отрезок = event.target.closest('[data-seek]');
+      if (отрезок) {
+        event.preventDefault();
+        player.seek(Number(отрезок.dataset.seek), true);
+        return;
+      }
       const node = event.target.closest('.segment[data-start], .analysis-line[data-start]');
       if (!node) return;
       player.seek(Number(node.dataset.start), true);

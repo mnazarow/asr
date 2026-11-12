@@ -350,6 +350,14 @@ GET /api/jobs/{id}/waveform?fmt=phone_asr
 GET /api/jobs/{id}/segments
 ```
 
+### Кто говорил на каком отрезке
+
+```
+GET /api/jobs/{id}/agents
+```
+
+Разговор с переводами: запись разложена по участникам — ногам с одним `linkedid` (глава 21, «Разговор из нескольких ног»). `by_agent.windows` — окна участников на времени записи (`agent`, `from_s`, `to_s`), `by_agent.segments` — подряд идущие отрезки одного участника с оценкой (`replicas`, `words`, `talk_s`, `sentiment`, `preview`), `by_agent.agents` — итог по участнику (`talk_s`, `share`, `words`, `sentiment`, `agent_name` из справочника). `null` — участник один. То же поле — `call.by_agent` в карточке задания.
+
 ### Скачать результат
 
 ```
