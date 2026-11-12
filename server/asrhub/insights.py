@@ -1039,7 +1039,7 @@ class Insights:
         отсекает опечатки распознавания.
         """
         начало, прошлое = self.window(period)
-        if начало is None:
+        if начало is None or прошлое is None:
             # «За всё время» сравнивать не с чем: предыдущего окна нет.
             return []
         n_сейчас = self.db.content_window_size(since=начало, owner=owner)
@@ -1061,7 +1061,8 @@ class Insights:
             out.append({"stem": т["stem"], "word": т["word"],
                         "now": т["now"], "before": т["before"],
                         "share_now": доля, "share_before": доля_было,
-                        "delta": round(доля - доля_было, 1)})
+                        "delta": (round(доля - доля_было, 1)
+                                  if доля is not None and доля_было is not None else None)})
         return out
 
     def new_topics(self, period: str = "week",
@@ -1666,7 +1667,7 @@ class Insights:
     # --- связи ------------------------------------------------------------
 
     def correlations(self, period: str = "week",
-                     owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+                     owner: str | list[str] | None = None) -> dict[str, Any]:
         """Связи между признаками — с порогами и без причинности."""
         нужные = sorted({к for пара in ПАРЫ for к in пара[:2]})
         выборка = self.db.content_sample(

@@ -456,6 +456,28 @@ exten => _8XXXXXXXXXX,1,Gosub(asrhub-record,s,1(out,${{EXTEN}}))
 """
 
 
+def журнал_cel(п: Параметры) -> str:
+    """cel.conf и cel_custom.conf: события перевода для сервера."""
+    from .transfers import ОТОБРАЖЕНИЕ_CEL  # noqa: PLC0415
+
+    return f"""\
+; Граница перевода в разговоре с переводом — для станции без AMI: Asterisk
+; пишет события перевода в журнал CEL, сервер читает его (поле станции
+; «Журнал CEL»). Со станцией по AMI не нужно: события придут оттуда.
+;
+; /etc/asterisk/cel.conf — если CEL уже ведётся, добавьте два события к своим:
+;   [general]
+;   enable = yes
+;   events = BLINDTRANSFER,ATTENDEDTRANSFER
+;
+; /etc/asterisk/cel_custom.conf — журнал для ASR Hub. Файл ляжет в
+; /var/log/asterisk/cel-custom/asrhub-cel.csv. После правки:
+;   asterisk -rx "module reload cel_custom.so"
+[mappings]
+{ОТОБРАЖЕНИЕ_CEL}
+"""
+
+
 def очереди(п: Параметры) -> str:
     t = "PJSIP" if п.driver == "pjsip" else "SIP"
     return f"""\
@@ -556,6 +578,8 @@ def собрать(п: Параметры, *, версия: str = "") -> dict[st
          "text": контексты(п)},
         {"id": "queues", "title": "Очереди: кто ответил",
          "path": "/etc/asterisk/queues.conf", "lang": "asterisk", "text": очереди(п)},
+        {"id": "cel", "title": "Переводы: журнал CEL (без AMI)",
+         "path": "/etc/asterisk/cel_custom.conf", "lang": "asterisk", "text": журнал_cel(п)},
     ]
     if п.live:
         файлы.append({"id": "live", "title": "Живой разговор двух людей (не проверено)",

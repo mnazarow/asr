@@ -258,16 +258,17 @@ def посчитать(db: Any, окна: Окна, отбор: Отбор, *, �
     from . import employees as справочник  # noqa: PLC0415
 
     пул = _пул()
-    есть_база = окна.base_since is not None and окна.base_until is not None
+    база_с, база_по = окна.base_since, окна.base_until
+    есть_база = база_с is not None and база_по is not None
     ж_группы = пул.submit(_группы, db, отбор, окна.since, окна.until)
-    ж_база = (пул.submit(_итоги, db, отбор, окна.base_since, окна.base_until)
-              if есть_база else None)
+    ж_база = (пул.submit(_итоги, db, отбор, база_с, база_по)
+              if база_с is not None and база_по is not None else None)
     ж_состояния = пул.submit(_состояния, db, отбор, окна.since, окна.until)
-    ж_состояния_было = (пул.submit(_состояния, db, отбор, окна.base_since, окна.base_until)
-                        if есть_база else None)
+    ж_состояния_было = (пул.submit(_состояния, db, отбор, база_с, база_по)
+                        if база_с is not None and база_по is not None else None)
     ж_звонки = пул.submit(_звонки, db, отбор, окна.since, окна.until)
-    ж_звонки_было = (пул.submit(_звонки, db, отбор, окна.base_since, окна.base_until)
-                     if есть_база else None)
+    ж_звонки_было = (пул.submit(_звонки, db, отбор, база_с, база_по)
+                     if база_с is not None and база_по is not None else None)
 
     группы = ж_группы.result()
     база = ж_база.result() if ж_база is not None else {}
@@ -356,12 +357,17 @@ def посчитать(db: Any, окна: Окна, отбор: Отбор, *, �
             })
 
     проблем = sum(итог[f"p_{п.id}"] for п in ПРОБЛЕМЫ if п.группа in ГРУППЫ_РАЗГОВОРА)
-    люди = []
+
+    def главная_у(с: dict[str, Any]) -> Проблема:
+        """Самая частая проблема разговора; при равенстве — раньше в перечне."""
+        return max((п for п in ПРОБЛЕМЫ if п.группа in ГРУППЫ_РАЗГОВОРА),
+                   key=lambda п: (с[f"p_{п.id}"], -ПРОБЛЕМЫ.index(п)))
+
+    люди: list[dict[str, Any]] = []
     for номер, с in по_людям.items():
         if not номер or с["n"] < МИНИМУМ_У_СОТРУДНИКА:
             continue
-        главная = max((п for п in ПРОБЛЕМЫ if п.группа in ГРУППЫ_РАЗГОВОРА),
-                      key=lambda п, с=с: (с[f"p_{п.id}"], -ПРОБЛЕМЫ.index(п)))
+        главная = главная_у(с)
         люди.append({"agent": номер, "conversations": с["n"], "with_problems": с["any_problem"],
                      "share": _доля(с["any_problem"], с["n"]),
                      "unresolved": с["p_unresolved"], "unresolved_base": с["b_unresolved"],
@@ -373,12 +379,11 @@ def посчитать(db: Any, окна: Окна, отбор: Отбор, *, �
     люди = люди[:СОТРУДНИКОВ]
     справочник.подписать_добавочные(db, люди, имена=имена)
 
-    причины = []
+    причины: list[dict[str, Any]] = []
     for причина, с in по_причинам.items():
         if not причина:
             continue
-        главная = max((п for п in ПРОБЛЕМЫ if п.группа in ГРУППЫ_РАЗГОВОРА),
-                      key=lambda п, с=с: (с[f"p_{п.id}"], -ПРОБЛЕМЫ.index(п)))
+        главная = главная_у(с)
         причины.append({"reason": причина, "conversations": с["n"],
                         "with_problems": с["any_problem"],
                         "share": _доля(с["any_problem"], с["n"]),

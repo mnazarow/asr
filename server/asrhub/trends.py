@@ -1270,7 +1270,7 @@ class Trends:
         except Exception as exc:                             # noqa: BLE001
             log.debug("Разложение по часам не посчитано: %s", exc)
             rows = []
-        сетка = [[None] * 24 for _ in range(7)]
+        сетка: list[list[float | None]] = [[None] * 24 for _ in range(7)]
         раскрытие = РАСКРЫТИЯ.get(п.id)
         # Записей за клеткой — за весь период, без деления на недели: в
         # списке под клеткой окажутся все понедельники, а не «средний».

@@ -552,17 +552,37 @@ def _по_добавочным(state: Any, since: float, owner: str | list[str] 
             if г[поле]:
                 з[куда][г[поле]] = з[куда].get(г[поле], 0) + n
 
+    # Разговоры с переводом — по отрезкам участников (`agent_segments`):
+    # второй оператор участвовал в записи, которая числится за первым.
+    условие, аргументы = state.db._окно_ответов(since, owner, until=until)
+    переводы = {str(г["agent"]): г for г in state.db.agent_segments_by_agent(условие, аргументы)}
+    for номер in переводы:
+        люди.setdefault(номер, {"agent": номер, "records": 0, "analyzed": 0, "errors": 0,
+                                "known": 0, "yes": 0, "reasons": {}, "outcomes": {}})
+
     def частые(счёт: dict[str, int]) -> list[dict[str, Any]]:
         return [{"key": к, "records": n} for к, n in
                 sorted(счёт.items(), key=lambda пара: (-пара[1], пара[0]))[:3]]
+
+    def участие(номер: str) -> dict[str, Any]:
+        г = переводы.get(номер)
+        if not г:
+            return {"split_records": 0, "split_received": 0, "split_talk_hours": 0.0,
+                    "split_negative_share": None}
+        return {"split_records": int(г["records"] or 0),
+                "split_received": int(г["received"] or 0),
+                "split_talk_hours": round(float(г["talk_s"] or 0) / 3600, 2),
+                "split_negative_share": (round(int(г["negative"] or 0) / int(г["scored"]), 4)
+                                         if г["scored"] else None)}
 
     строки = [{
         "agent": з["agent"], "records": з["records"], "analyzed": з["analyzed"],
         "errors": з["errors"],
         "resolved_share": round(100.0 * з["yes"] / з["known"], 1) if з["known"] else None,
         "reasons": частые(з["reasons"]), "outcomes": частые(з["outcomes"]),
+        **участие(з["agent"]),
     } for з in люди.values() if з["agent"]]
-    строки.sort(key=lambda с: (-с["records"], с["agent"]))
+    строки.sort(key=lambda с: (-с["records"], -с["split_records"], с["agent"]))
     видны = строки[:ДОБАВОЧНЫХ_В_СВОДЕ]
     справочник.подписать_добавочные(state.db, видны, имена=_имена_включены(state))
     return {"agents": видны, "agents_total": len(строки),

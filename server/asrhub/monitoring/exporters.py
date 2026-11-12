@@ -308,7 +308,7 @@ def zabbix_discovery(samples: list[Sample]) -> dict[str, list[dict[str, str]]]:
     видели: set[tuple[str, tuple[str, ...]]] = set()
     for sample in samples:
         spec = METRICS_BY_NAME.get(sample.name)
-        if not _zabbix_sendable(spec, sample) or not spec.labels \
+        if spec is None or not _zabbix_sendable(spec, sample) or not spec.labels \
                 or spec.name in _KNOWN_LABEL_VALUES:
             continue
         значения = _zabbix_values(sample, spec)
@@ -816,7 +816,7 @@ def _stable_uuid(seed: str) -> str:
 #: Метрики, у которых набор значений меток известен заранее. Для них можно
 #: объявить обычные элементы; всё остальное уходит в правило обнаружения.
 #: Срезы совпадают с тем, что отдаёт сборщик (collector._quantiles).
-_STATS = [("avg",), ("p50",), ("p90",), ("p95",), ("p99",)]
+_STATS: list[tuple[str, ...]] = [("avg",), ("p50",), ("p90",), ("p95",), ("p99",)]
 
 _KNOWN_LABEL_VALUES: dict[str, list[tuple[str, ...]]] = {
     "asrhub_jobs_by_status": [("queued",), ("running",), ("completed",),
@@ -930,16 +930,18 @@ def _zabbix_triggers(spec: MetricSpec, key: str, label: str,
         if шаблон is None:
             return []
         if "{op}" in шаблон:
-            for уровень, значение in _zabbix_levels(spec, threshold):
+            # Без порога в каталоге сравнивать не с чем — триггера нет.
+            if threshold is not None:
                 знак = оператор_порога(threshold.direction, bool(threshold.inclusive))
-                выражения.append((уровень, шаблон.format(op=знак, value=f"{значение:.15g}"),
-                                  f"{label}: {слово_порога(threshold.direction, bool(threshold.inclusive))} "
-                                  f"{_человеку(значение, spec.unit)}"))
+                слово = слово_порога(threshold.direction, bool(threshold.inclusive))
+                for уровень, значение in _zabbix_levels(spec, threshold):
+                    выражения.append((уровень, шаблон.format(op=знак, value=f"{значение:.15g}"),
+                                      f"{label}: {слово} {_человеку(значение, spec.unit)}"))
         else:
             уровень = "critical" if (threshold is None or threshold.critical is not None) \
                 else "warning"
             выражения.append((уровень, шаблон, f"{label}: {spec.label.lower()}"))
-    else:
+    elif threshold is not None:
         for уровень, значение in _zabbix_levels(spec, threshold):
             знак = оператор_порога(threshold.direction, bool(threshold.inclusive))
             выражения.append((

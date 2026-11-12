@@ -1,4 +1,4 @@
-"""Заход 63: докачка записей агентом частями и храповик проверки типов.
+"""Заход 63: докачка записей агентом частями и проверка типов (с 3.1.38 — целиком).
 
 Большая запись от агента раньше шла одним запросом: обрыв на гигабайтной
 записи означал отправку с нуля, а прокси с `client_max_body_size` меньше
@@ -246,24 +246,21 @@ def test_with_hint_обычный_метод_и_цепочка_работает(
     assert ошибка.to_dict()["hint"] == "поставьте пакет"
 
 
-def test_модули_без_замечаний_mypy_такими_и_остаются():
-    """Храповик: модули из tests/mypy-clean.txt проходят mypy без замечаний.
+def test_сервер_и_агент_проходят_mypy_целиком():
+    """Проверка типов без замечаний — весь сервер и агент.
 
-    Весь проект пока нет (около 280 замечаний), но чистое не должно
-    пачкаться снова. Новый чистый модуль — строкой в список.
+    С 3.1.35 по 3.1.37 чистые модули держались храповиком (список
+    `tests/mypy-clean.txt`); в 3.1.38 замечаний не осталось нигде, и
+    проверяется всё: новое замечание — упавшая проверка.
     """
     if shutil.which("mypy") is None and subprocess.run(
             [sys.executable, "-m", "mypy", "--version"], capture_output=True).returncode:
         pytest.skip("mypy не установлен")
-    список = [с.strip() for с in (КОРЕНЬ / "tests" / "mypy-clean.txt").read_text(
-        encoding="utf-8").splitlines() if с.strip() and not с.startswith("#")]
-    assert len(список) >= 80
-    for путь in список:
-        assert (КОРЕНЬ / путь).is_file(), путь
     итог = subprocess.run(
         [sys.executable, "-m", "mypy", "--ignore-missing-imports",
-         "--follow-imports=silent", "--no-error-summary", *список],
-        cwd=КОРЕНЬ, capture_output=True, text=True, timeout=600)
+         "--follow-imports=silent", "--no-error-summary", "server/asrhub",
+         "agent/asrhub-agent.py"],
+        cwd=КОРЕНЬ, capture_output=True, text=True, timeout=900)
     assert итог.returncode == 0, итог.stdout[-4000:]
 
 

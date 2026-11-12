@@ -86,7 +86,8 @@ def разобрать_пояс(имя: str) -> tzinfo | None:
 #: Поля станции, которые нельзя показывать не администратору: по ним
 #: строится вход в телефонию организации, а не понимание своей работы.
 ЗАКРЫТЫЕ = ("host", "port", "username", "secret", "cdr_file",
-            "recordings_dir", "filename", "tls", "ca_file", "auth", "queue_log")
+            "recordings_dir", "filename", "tls", "ca_file", "auth", "queue_log",
+            "transfers", "cel_file")
 
 #: Поля-секреты: не показываются никому и в ответах заменяются пометкой.
 СЕКРЕТНЫЕ = ("secret",)
@@ -145,6 +146,12 @@ class Станция:
     #: Журнал очередей Asterisk (`/var/log/asterisk/queue_log`), если сервер
     #: его видит: ожидание, брошенные в очереди, пропуски операторов.
     queue_log: str = ""
+    #: События перевода из AMI (`BlindTransfer`, `AttendedTransfer`, класс
+    #: `call`): точная граница отрезков участников в разговоре с переводом.
+    transfers: bool = True
+    #: Журнал CEL с событиями перевода (`cel_custom.conf`, отображение
+    #: `transfers.ОТОБРАЖЕНИЕ_CEL`) — для станций без AMI.
+    cel_file: str = ""
 
     # Файлы
     cdr_file: str = ""
@@ -219,7 +226,8 @@ class Станция:
                 "host": self.host, "port": self.port, "username": self.username,
                 "secret": "***" if self.secret else "",
                 "tls": self.tls, "ca_file": self.ca_file, "auth": self.auth,
-                "queue_log": self.queue_log,
+                "queue_log": self.queue_log, "transfers": self.transfers,
+                "cel_file": self.cel_file,
                 "cdr_file": self.cdr_file, "recordings_dir": self.recordings_dir,
                 "filename": self.filename, "owner_map": dict(self.owner_map),
             })
@@ -310,6 +318,8 @@ def _станция_из(данные: dict[str, Any], номер: int) -> Ст�
         ca_file=str(данные.get("ca_file") or "").strip(),
         auth="md5" if str(данные.get("auth") or "").strip().lower() == "md5" else "plain",
         queue_log=str(данные.get("queue_log") or "").strip(),
+        transfers=_признак(данные.get("transfers"), True),
+        cel_file=str(данные.get("cel_file") or "").strip(),
         cdr_file=str(данные.get("cdr_file") or "").strip(),
         recordings_dir=str(данные.get("recordings_dir") or "").strip(),
         filename=str(данные.get("filename") or "").strip(),

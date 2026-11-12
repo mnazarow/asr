@@ -1241,19 +1241,30 @@ def _по_участникам(state: Any, principal: Any, звонок: dict[st
     from .deps import same_scope  # noqa: PLC0415
 
     свои = []
+    чужие: set[str] = set()
     for нога in ноги:
         if principal.is_admin or same_scope(principal, str(нога.get("owner") or "")):
             свои.append(нога)
         else:
             # Время чужой ноги нужно, чтобы знать, где кончился свой
             # отрезок; кто это был — нет.
+            чужие.add(str(нога.get("agent") or ""))
             свои.append({**нога, "agent": "другой участник", "uniqueid": ""})
     if len({str(н.get("agent") or "") for н in [звонок, *свои] if н.get("agent")}) < 2:
         return None
+    видимые = {str(звонок.get("agent") or ""), *(str(н.get("agent") or "") for н in свои)}
+
+    def скрыть(номер: Any) -> str:
+        номер = str(номер or "")
+        return "другой участник" if номер in чужие and номер not in видимые else номер
+
     try:
+        переводы = [{**п, "from_agent": скрыть(п.get("from_agent")),
+                     "to_agent": скрыть(п.get("to_agent"))}
+                    for п in state.db.call_transfers(звонок)]
         итог = отрезки_мод.по_участникам(
             звонок, свои, state.db.get_segments(str(job.get("id") or "")),
-            длительность=float(job.get("media_duration_s") or 0))
+            длительность=float(job.get("media_duration_s") or 0), переводы=переводы)
     except Exception as exc:                                # noqa: BLE001
         log.debug("Отрезки по участникам не посчитаны: %s", exc)
         return None

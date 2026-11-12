@@ -311,7 +311,8 @@ def _приёмники_с_заголовками(новые: list[Any], пре�
     for приёмник in новые:
         if isinstance(приёмник, dict) and isinstance(приёмник.get("headers"), dict):
             было = по_ключу.get(ключ(приёмник), {})
-            заголовки_были = было.get("headers") if isinstance(было.get("headers"), dict) else {}
+            прежние = было.get("headers")
+            заголовки_были: dict[str, Any] = прежние if isinstance(прежние, dict) else {}
             заголовки = {}
             for заголовок, значение in приёмник["headers"].items():
                 if значение != Settings.ЗАГЛУШКА:
@@ -823,7 +824,8 @@ class Settings:
             raise ConfigError("Не задан путь к файлу конфигурации.")
         ключи = [ключ for ключ in self.values
                  if ключ in catalog.PARAMS_BY_KEY and self._своё(ключ)]
-        return self.persist_keys([*ключи, *self.ОСОБЫЕ_ЗАПИСИ], target=Path(target))
+        записано = self.persist_keys([*ключи, *self.ОСОБЫЕ_ЗАПИСИ], target=Path(target))
+        return записано if записано is not None else Path(target)
 
     def _своё(self, ключ: str) -> bool:
         """Задано ли значение людьми (файл, интерфейс, API, пресет), а не взято само."""
@@ -883,7 +885,9 @@ class Settings:
                         # которых не было при нашей загрузке, — дописаны
                         # соседом, и они остаются; бывшие при загрузке, но
                         # пропавшие у нас — отозваны здесь.
-                        в_файле = raw.get("api_keys") if isinstance(raw.get("api_keys"), dict) else {}
+                        в_файле_сырое = raw.get("api_keys")
+                        в_файле: dict[str, Any] = (в_файле_сырое
+                                                   if isinstance(в_файле_сырое, dict) else {})
                         значение: Any = {к: з for к, з in в_файле.items()
                                          if к not in self.api_keys_file and к not in self.api_keys
                                          and к not in self.api_keys_env}
@@ -910,10 +914,11 @@ class Settings:
                 if ключ not in self.values:
                     continue
                 if по_группам:
-                    группа = raw.setdefault(spec.group, {})
-                    if not isinstance(группа, dict):
-                        raw[spec.group] = группа = {}
-                    группа[ключ] = self.values[ключ]
+                    раздел = raw.setdefault(spec.group, {})
+                    if not isinstance(раздел, dict):
+                        раздел = {}
+                        raw[spec.group] = раздел
+                    раздел[ключ] = self.values[ключ]
                 else:
                     raw[ключ] = self.values[ключ]
             return self._write_locked(target, raw)

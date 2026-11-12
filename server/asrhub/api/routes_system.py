@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request
@@ -307,6 +308,7 @@ def применить_на_ходу(state: Any, изменено: dict[str, Any
     новые значения. `изменено` None — «поменяться могло всё».
     """
     все = изменено is None
+    изменено = изменено or {}
     # Сервер «только интерфейс» (`--no-queue`) очередь не обрабатывает, и
     # правка числа воркеров не должна поднимать в нём рабочие потоки.
     if (все or "max_concurrent_jobs" in изменено) and getattr(state, "queue_enabled", True):
@@ -498,7 +500,7 @@ def analytics_section(request: Request, section: str,
     отвечает 400 с перечнем доступных.
     """
     state = get_state(request)
-    handlers = {
+    handlers: dict[str, Callable[..., Any]] = {
         "overview": state.analytics.overview,
         "timeseries": state.analytics.timeseries,
         "models": state.analytics.by_model,
@@ -674,8 +676,9 @@ def create_key(request: Request, name: str = Body(embed=True),
     тёзки = [info for info in state.settings.api_keys.values()
              if str(info.get("name") or "ключ") == name]
     учётка = None
+    учётные = getattr(state, "accounts", None)
     try:
-        учётка = state.accounts.by_username(name) if getattr(state, "accounts", None) else None
+        учётка = учётные.by_username(name) if учётные is not None else None
     except Exception:                                    # noqa: BLE001
         учётка = None
     key = "ah_" + secrets.token_urlsafe(24)
@@ -1243,7 +1246,8 @@ def system_problems(request: Request,
             job_id = событие.get("job_id")
             if not principal.is_admin and (not job_id or job_id not in свои):
                 continue
-            данные = событие.get("data") if isinstance(событие.get("data"), dict) else {}
+            сырые = событие.get("data")
+            данные: dict[str, Any] = сырые if isinstance(сырые, dict) else {}
             записи.append(_problem_row(
                 событие.get("ts"), уровень,
                 f"событие · {событие.get('kind')}",

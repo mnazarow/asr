@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import Header, HTTPException, Request
+from starlette.requests import HTTPConnection
 
 from .. import __version__
 from ..accounts import Accounts
@@ -110,6 +111,11 @@ class AppState:
     drill: Any = None
     trends: Any = None
     llm_setup: Any = None
+    #: Телефония (забор со станций), контроль качества (опросы) и приём
+    #: живого звука по AudioSocket — заводит `create_app`.
+    telephony: Any = None
+    qc: Any = None
+    audiosocket: Any = None
     _rate: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     #: Замок к окнам частоты. Проверка ключа — обычная (не async)
     #: зависимость, а такие FastAPI выполняет в пуле потоков: два запроса
@@ -324,7 +330,7 @@ def token_from(x_api_key: str | None, authorization: str | None,
     return token
 
 
-def token_of(request: Request) -> str:
+def token_of(request: HTTPConnection) -> str:
     """То же самое для запроса или веб-сокета, у которого нет Depends."""
     query = getattr(request, "query_params", None)
     return token_from(request.headers.get("x-api-key"),

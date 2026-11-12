@@ -1511,8 +1511,17 @@ function renderView(soft) {
   const tip = qs('#chart-tip');
   if (tip) tip.style.display = 'none';
   content.innerHTML = '';
+  // Признак «раздел отрисован» (`data-ready` = имя раздела): по нему
+  // проверки в браузере ждут раздел, а не полторы секунды наугад.
+  content.dataset.ready = '';
+  const отрисован = () => { if (state.view === view) content.dataset.ready = view; };
   try {
     const result = renderer.render(content);
+    if (result && typeof result.then === 'function') {
+      result.then(отрисован, отрисован);
+    } else {
+      отрисован();
+    }
     if (result && typeof result.catch === 'function') {
       result.catch((err) => {
         // Отменённый запрос и раздел, который успели сменить, — не ошибка:
@@ -2086,6 +2095,23 @@ function card(title, hint, body, actions) {
  * справочник; полное имя и отдел — в подсказке, чтобы столбец не
  * раздувался. Номера нет — прочерк.
  */
+/**
+ * Участие добавочного в разговорах с переводом — ячейка разрезов по
+ * сотрудникам: сколько таких разговоров (в скольких принял перевод — в
+ * скобках), сколько звучал его собственный отрезок и доля отрицательных
+ * отрезков. Считается фоном по времени ног CDR (`agent_segments`).
+ */
+function участиеВПереводах(с) {
+  const всего = Number((с && с.split_records) || 0);
+  if (!всего) return '<span class="faint">—</span>';
+  const принял = Number(с.split_received || 0);
+  const негатив = с.split_negative_share;
+  return `<span title="Разговоров с переводом: ${num(всего)}, принял перевод: ${num(принял)}">`
+    + `${num(всего)}${принял ? ` <span class="faint">(${num(принял)})</span>` : ''}</span>`
+    + ` · ${num(Number(с.split_talk_hours || 0), 1)} ч`
+    + (негатив === null || негатив === undefined ? '' : ` · <span title="Доля отрицательных своих отрезков">${pct(негатив, 0)}</span>`);
+}
+
 function добавочный(с, пусто = '—') {
   const номер = String((с && с.agent) || '');
   if (!номер) return `<span class="faint">${esc(пусто)}</span>`;
@@ -5358,6 +5384,10 @@ function участникиРазговора(разбор) {
         <td class="num">${fmtDur(у.talk_s)}</td><td class="num">${pct(у.share, 0)}</td>
         <td class="num">${num(у.words, 0)}</td><td>${тон(у.sentiment)}</td></tr>`)}
     </tbody></table>
+    ${(разбор.transfers || []).map((п) => html`<div class="dim" style="margin-top:2px">
+      <a href="#" data-seek="${Math.max(0, п.at_s)}">${fmtDur(Math.max(0, п.at_s))}</a>
+      · перевод ${п.kind === 'attended' ? 'с предупреждением' : 'без предупреждения'}:
+      <span class="mono">${п.from_agent || '—'}</span> → <span class="mono">${п.to_agent || 'внешний номер'}</span></div>`)}
     ${разбор.segments.map((о) => html`<div class="dim" style="margin-top:2px">
       <a href="#" data-seek="${о.from_s}">${fmtDur(о.from_s)}–${fmtDur(о.to_s)}</a>
       · <span class="mono">${о.agent}</span> · ${о.preview}</div>`)}
@@ -9330,6 +9360,19 @@ const ПАТС_ПОЛЯ = [
     desc: 'Файл сертификата центра, которым подписан сертификат станции. Пусто — системные.',
     rec: 'Для самоподписанного сертификата станции укажите сам этот сертификат.',
     examples: ['/etc/asrhub/pbx-ca.pem'] },
+  { key: 'transfers', label: 'События перевода', type: 'bool', only: 'ami',
+    desc: 'Просить у AMI события BlindTransfer и AttendedTransfer (класс call): момент '
+        + 'перевода — точная граница отрезков участников в разговоре с переводом. '
+        + 'Остальные события класса call сервер отбрасывает при чтении.',
+    rec: 'Учётной записи AMI нужно read = call,cdr. Выключайте, если станция не даёт '
+       + 'класс call: тогда граница — по времени ног CDR.',
+    examples: ['включено — граница перевода по событию', 'выключено — по времени ног CDR'] },
+  { key: 'cel_file', label: 'Журнал CEL', type: 'text',
+    desc: 'Путь к журналу CEL с событиями перевода, если сервер его видит: граница перевода '
+        + 'в разговоре с переводом — для станций без AMI. Станция пишет его по отображению '
+        + 'из раздела «Asterisk: диалплан» (файл cel_custom.conf).',
+    rec: 'Обычно /var/log/asterisk/cel-custom/asrhub-cel.csv. Читается с запомненной позиции.',
+    examples: ['/var/log/asterisk/cel-custom/asrhub-cel.csv'] },
   { key: 'cdr_file', label: 'Журнал звонков', type: 'text', only: 'cdr_csv',
     desc: 'Путь к файлу Master.csv, который Asterisk пишет после каждого звонка.',
     rec: 'Обычно /var/log/asterisk/cdr-csv/Master.csv. Нужен доступ на чтение '
@@ -11704,7 +11747,7 @@ function ПАТС_ПО_УМОЛЧАНИЮ() {
     internal_digits: '3, 4', contexts: 'from-trunk=входящий, from-internal=исходящий',
     min_duration_s: 10, skip_unanswered: true, settle_s: 30, lookback_days: 7,
     match_window: 120, poll_s: 60, owner: 'telephony', owner_map: '', priority: 40,
-    tags: '', timezone: '',
+    tags: '', timezone: '', transfers: true, cel_file: '',
   };
 }
 
@@ -20552,39 +20595,42 @@ RENDERERS.voice = {
     const наибольшее = Math.max(1, ...люди.map((ч) => Number(ч.records || 0)));
     const окно = д.window;
     const частое = (список) => (список && список.length
-      ? `${esc(список[0].key)} <span class="faint">${num(список[0].records)}</span>` : '<span class="faint">—</span>');
-    место.innerHTML = `<div class="table-wrap"><table class="vo-agents" data-drill-host>
-      <thead><tr><th>Добавочный</th><th>Отдел</th><th class="num">Разговоров</th><th></th>
-        <th class="num">Разобрано</th><th class="num">Решено</th>
-        <th>Частая причина</th><th>Частый исход</th></tr></thead>
-      <tbody>${люди.map((ч) => {
-        const n = Number(ч.records || 0);
-        const свой = [...this.ЗАПИСИ, `agent:${ч.agent}`];
-        const подпись = `${ч.agent}${ч.agent_name ? ` — ${ч.agent_name}` : ''}`;
-        return `<tr class="${ч.agent === this.добавочный ? 'selected' : ''}">
-          <td class="nowrap"><a href="#" data-agent="${esc(ч.agent)}"
-            title="Показать раздел только по этому добавочному">${добавочный(ч)}</a></td>
-          <td class="small dim">${esc(ч.agent_department || '')}</td>
-          <td class="num">${n ? Drill.num(num(n), окно, { base: 'jobs', f: свой,
+      ? html`${список[0].key} <span class="faint">${num(список[0].records)}</span>` : html`<span class="faint">—</span>`);
+    const строка = (ч) => {
+      const n = Number(ч.records || 0);
+      const свой = [...this.ЗАПИСИ, `agent:${ч.agent}`];
+      const подпись = `${ч.agent}${ч.agent_name ? ` — ${ч.agent_name}` : ''}`;
+      return html`<tr class="${ч.agent === this.добавочный ? 'selected' : ''}">
+          <td class="nowrap"><a href="#" data-agent="${ч.agent}"
+            title="Показать раздел только по этому добавочному">${raw(добавочный(ч))}</a></td>
+          <td class="small dim">${ч.agent_department || ''}</td>
+          <td class="num">${n ? raw(Drill.num(num(n), окно, { base: 'jobs', f: свой,
             // «Разговоров» — все готовые записи добавочного, и разобранные
             // моделью, и ещё нет: список — по заданиям, а не по ответам
             // модели, иначе десять разговоров раскрывались в шесть.
             title: `Разговоры: добавочный ${подпись}`,
-            cols: ['when', 'record', 'duration'] }) : num(n)}</td>
+            cols: ['when', 'record', 'duration'] })) : num(n)}</td>
           <td style="width:120px"><div class="drill-bar"><span style="width:${
             (100 * n / наибольшее).toFixed(1)}%"></span></div></td>
           <td class="num">${num(ч.analyzed || 0)}${ч.errors
-            ? ` <span class="chip err" title="Разбор сорвался">${num(ч.errors)}</span>` : ''}</td>
+            ? html` <span class="chip err" title="Разбор сорвался">${num(ч.errors)}</span>` : ''}</td>
           <td class="num">${ч.resolved_share === null || ч.resolved_share === undefined ? '—'
             : pct(Number(ч.resolved_share) / 100, 0)}</td>
           <td class="small">${частое(ч.reasons)}</td>
-          <td class="small">${частое(ч.outcomes)}</td></tr>`;
-      }).join('')}</tbody></table></div>
+          <td class="small">${частое(ч.outcomes)}</td>
+          <td class="num small">${raw(участиеВПереводах(ч))}</td></tr>`;
+    };
+    место.innerHTML = html`<div class="table-wrap"><table class="vo-agents" data-drill-host>
+      <thead><tr><th>Добавочный</th><th>Отдел</th><th class="num">Разговоров</th><th></th>
+        <th class="num">Разобрано</th><th class="num">Решено</th>
+        <th>Частая причина</th><th>Частый исход</th>
+        <th class="num" title="Разговоры с переводом, где добавочный участвовал (принял перевод — в скобках); часы и негатив — по его собственным отрезкам записи">С переводом</th></tr></thead>
+      <tbody>${люди.map(строка)}</tbody></table></div>
       <div class="small faint" style="margin-top:6px">${Number(д.agents_total || 0) > люди.length
         ? `Показаны ${num(люди.length)} из ${num(д.agents_total)} самых занятых. ` : ''}${
         д.without_agent ? `Разговоров без добавочного: ${num(д.without_agent)} — у них нет строки
           в журнале звонков.` : ''}${this.добавочный
-        ? ` <a href="#" data-agent="">Снять отбор по добавочному</a>` : ''}</div>`;
+        ? html` <a href="#" data-agent="">Снять отбор по добавочному</a>` : ''}</div>`;
     qsa('[data-agent]', место).forEach((к) => {
       к.onclick = (е) => {
         е.preventDefault();
@@ -21865,36 +21911,42 @@ function периодГолоса(масштаб) {
 
     сотрудники(люди, д) {
       if (!люди.length) {
-        return `<div class="empty small">Добавочных за период нет.
+        return html`<div class="empty small">Добавочных за период нет.
           <div class="small dim" style="margin-top:6px">Добавочный приходит из журнала звонков: с АТС,
           полем <span class="mono">internalPhone</span> в <span class="mono">/process-call</span> или полями звонка
           при загрузке.</div></div>`;
       }
       const наибольшее = Math.max(1, ...люди.map((ч) => ч.completed || 0));
       const база = (д.baselines || [])[0];
-      return `<div class="table-wrap"><table class="vp-agents">
+      const доля = (значение) => (значение === null || значение === undefined ? '—' : pct(значение, 0));
+      const нет = html`<span class="faint">—</span>`;
+      const строка = (ч, номер) => html`<tr class="${ч.agent === this.добавочный ? 'selected' : ''}">
+          <td class="faint">${номер + 1}</td>
+          <td class="nowrap"><a href="#" data-agent="${ч.agent}" title="Отчёт только по этому добавочному">${raw(добавочный(ч))}</a></td>
+          <td class="small dim">${ч.agent_department || ''}</td>
+          <td class="num">${ч.completed ? raw(this.число(num(ч.completed), { f: ['status:completed', `agent:${ч.agent}`],
+            title: `Разговоры: добавочный ${ч.agent}` })) : '0'}</td>
+          <td style="width:90px"><div class="drill-bar"><span style="width:${(100 * (ч.completed || 0) / наибольшее).toFixed(1)}%"></span></div></td>
+          <td class="num">${база && ч.prev_completed ? raw(сдвигКБазе(ч.completed, ч.prev_completed))
+            : (база && ч.completed ? html`<span class="chip">новый</span>` : '')}</td>
+          <td class="num">${num(ч.talk_hours, 1)}</td>
+          <td class="num">${ч.avg_duration_s ? fmtDur(ч.avg_duration_s) : '—'}</td>
+          <td class="num">${доля(ч.resolved_share)}</td>
+          <td class="num">${доля(ч.negative_share)}</td>
+          <td class="num">${ч.agent_score === null ? '—' : num(ч.agent_score, 0)}</td>
+          <td class="num">${доля(ч.compliance)}</td>
+          <td class="small">${ч.top_reason ? html`${ч.top_reason} <span class="faint">${num(ч.top_reason_n)}</span>` : нет}</td>
+          <td class="num">${ч.empty ? raw(this.число(num(ч.empty), { f: ['status:no_speech,short', `agent:${ч.agent}`],
+            title: `Без речи и короткие: добавочный ${ч.agent}` })) : html`<span class="faint">0</span>`}</td>
+          <td class="num small">${raw(участиеВПереводах(ч))}</td>
+        </tr>`;
+      return html`<div class="table-wrap"><table class="vp-agents">
         <thead><tr><th>#</th><th>Добавочный</th><th>Отдел</th><th class="num">Разговоров</th><th></th>
           <th class="num">${база ? 'К базе' : ''}</th><th class="num">Часов</th><th class="num">Средний</th>
           <th class="num">Решено</th><th class="num">Негатив</th><th class="num">Балл</th>
-          <th class="num">Скрипт</th><th>Частая причина</th><th class="num">Без речи и кор.</th></tr></thead>
-        <tbody>${люди.map((ч, номер) => `<tr class="${ч.agent === this.добавочный ? 'selected' : ''}">
-          <td class="faint">${номер + 1}</td>
-          <td class="nowrap"><a href="#" data-agent="${esc(ч.agent)}" title="Отчёт только по этому добавочному">${добавочный(ч)}</a></td>
-          <td class="small dim">${esc(ч.agent_department || '')}</td>
-          <td class="num">${ч.completed ? this.число(num(ч.completed), { f: ['status:completed', `agent:${ч.agent}`],
-            title: `Разговоры: добавочный ${ч.agent}` }) : '0'}</td>
-          <td style="width:90px"><div class="drill-bar"><span style="width:${(100 * (ч.completed || 0) / наибольшее).toFixed(1)}%"></span></div></td>
-          <td class="num">${база && ч.prev_completed ? сдвигКБазе(ч.completed, ч.prev_completed) : (база && ч.completed ? '<span class="chip">новый</span>' : '')}</td>
-          <td class="num">${num(ч.talk_hours, 1)}</td>
-          <td class="num">${ч.avg_duration_s ? fmtDur(ч.avg_duration_s) : '—'}</td>
-          <td class="num">${ч.resolved_share === null ? '—' : pct(ч.resolved_share, 0)}</td>
-          <td class="num">${ч.negative_share === null ? '—' : pct(ч.negative_share, 0)}</td>
-          <td class="num">${ч.agent_score === null ? '—' : num(ч.agent_score, 0)}</td>
-          <td class="num">${ч.compliance === null ? '—' : pct(ч.compliance, 0)}</td>
-          <td class="small">${ч.top_reason ? `${esc(ч.top_reason)} <span class="faint">${num(ч.top_reason_n)}</span>` : '<span class="faint">—</span>'}</td>
-          <td class="num">${ч.empty ? this.число(num(ч.empty), { f: ['status:no_speech,short', `agent:${ч.agent}`],
-            title: `Без речи и короткие: добавочный ${ч.agent}` }) : '<span class="faint">0</span>'}</td>
-        </tr>`).join('')}</tbody></table></div>
+          <th class="num">Скрипт</th><th>Частая причина</th><th class="num">Без речи и кор.</th>
+          <th class="num" title="Разговоры с переводом, где сотрудник участвовал (принял перевод — в скобках); часы и негатив — по его собственным отрезкам записи">С переводом</th></tr></thead>
+        <tbody>${люди.map(строка)}</tbody></table></div>
         <div class="small faint" style="margin-top:6px">${Number(д.agents_total || 0) > люди.length
           ? `Показаны ${num(люди.length)} из ${num(д.agents_total)}. ` : ''}${(д.without_agent || {}).completed
           ? `Разговоров без добавочного: ${num(д.without_agent.completed)}. ` : ''}Доли у сотрудника с парой

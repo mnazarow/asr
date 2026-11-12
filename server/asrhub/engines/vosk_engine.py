@@ -131,7 +131,7 @@ class VoskEngine(Engine):
             text = str(item.get("text", "")).strip()
             if not text:
                 continue
-            words = [{
+            words: list[dict[str, Any]] = [{
                 "word": str(w.get("word", "")),
                 "start": round(float(w.get("start", 0.0)), 3),
                 "end": round(float(w.get("end", 0.0)), 3),

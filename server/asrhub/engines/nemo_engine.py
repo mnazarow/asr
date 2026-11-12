@@ -200,7 +200,7 @@ def _convert(out: Any, offset: float, language: str, *,
     seg_items = timestamp.get("segment") if isinstance(timestamp, dict) else None
     word_items = timestamp.get("word") if isinstance(timestamp, dict) else None
 
-    words = [{
+    words: list[dict[str, Any]] = [{
         "word": str(w.get("word", w.get("segment", ""))).strip(),
         "start": round(float(w.get("start", 0.0)) + offset, 3),
         "end": round(float(w.get("end", 0.0)) + offset, 3),

@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -1156,6 +1156,41 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_queue_events_ts ON queue_events(station, ts)",
+    # Версия 39: запись разговора с переводами — по участникам (см.
+    # `telephony.segments`): сколько звучал каждый, его слова и тональность
+    # своих отрезков. Разрезы по сотрудникам берут отсюда участие в
+    # переводах, а не отдают всю запись добавочному записанной ноги.
+    """
+    CREATE TABLE IF NOT EXISTS agent_segments (
+        job_id      TEXT NOT NULL,
+        agent       TEXT NOT NULL,
+        talk_s      REAL DEFAULT 0,
+        words       INTEGER DEFAULT 0,
+        replicas    INTEGER DEFAULT 0,
+        sentiment   REAL,
+        share       REAL,
+        recorded    INTEGER DEFAULT 0,
+        legs        INTEGER DEFAULT 0,
+        transfers   INTEGER DEFAULT 0,
+        computed_at REAL,
+        PRIMARY KEY (job_id, agent)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_agent_segments_agent ON agent_segments(agent)",
+    # События перевода из AMI (`telephony.transfers`): точная граница
+    # отрезков участников. Номер вне станции не хранится.
+    """
+    CREATE TABLE IF NOT EXISTS call_transfers (
+        station    TEXT NOT NULL,
+        linkedid   TEXT NOT NULL,
+        ts         REAL NOT NULL,
+        kind       TEXT NOT NULL,
+        from_agent TEXT NOT NULL DEFAULT '',
+        to_agent   TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (station, linkedid, ts, kind)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_call_transfers_ts ON call_transfers(ts)",
     # Версия 33: добавочный по заданию без чтения строки звонка — им
     # подписываются таблицы «Голосовой аналитики» и разрез по добавочным.
     "CREATE INDEX IF NOT EXISTS idx_calls_job_agent ON calls(job_id, agent)",
@@ -1549,6 +1584,17 @@ class Database:
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
         rows = self.query(sql, params)
         return rows[0] if rows else None
+
+    def query_scalar(self, sql: str, params: Sequence[Any] = (), default: Any = 0) -> Any:
+        """Первое значение первой строки; нет строки или там NULL — `default`.
+
+        `query_one(...)["n"]` падал бы на пустом ответе и не проходит
+        проверку типов: строки может не быть.
+        """
+        строка = self.query_one(sql, params)
+        if строка is None or строка[0] is None:
+            return default
+        return строка[0]
 
     def has_index(self, name: str) -> bool:
         """Есть ли в базе указатель с таким именем.
@@ -2265,7 +2311,8 @@ class Database:
                    "owner": "q.owner"}.get(by)
         if колонка is None:
             return {}
-        условия, аргументы = ["q.score_pct IS NOT NULL"], []
+        условия: list[str] = ["q.score_pct IS NOT NULL"]
+        аргументы: list[Any] = []
         if since:
             условия.append("q.created_at >= ?")
             аргументы.append(float(since))
@@ -2801,10 +2848,10 @@ class Database:
         # части архива» — при том что его часть разобрана целиком.
         условие, свои = self._owner_clause(owner, "j")
         где = f" AND {условие}" if условие else ""
-        всего = int(self.query_one(
+        всего = int(self.query_scalar(
             "SELECT COUNT(*) n FROM jobs j WHERE j.status='completed' "
             "AND j.text IS NOT NULL AND j.text != '' "
-            f"AND COALESCE(j.source,'') <> 'control'{где}", свои)["n"])
+            f"AND COALESCE(j.source,'') <> 'control'{где}", свои))
         # Тем же проходом — сколько из «разобранных» на деле заглушки: разбор
         # записи не удался несколько раз подряд, и в строке лежит только
         # ошибка (тональности у неё нет, а у настоящего разбора она есть
@@ -2819,10 +2866,10 @@ class Database:
             "WHERE c.version >= ? AND j.status='completed' "
             "AND j.text IS NOT NULL AND j.text != '' "
             f"AND COALESCE(j.source,'') <> 'control'{где}", (version, *свои))
-        разобрано = int(строка["n"])
+        разобрано = int(строка["n"] or 0) if строка else 0
         return {"total": всего, "analyzed": разобрано,
                 "pending": max(0, всего - разобрано),
-                "failed": int(строка["f"] or 0)}
+                "failed": int(строка["f"] or 0) if строка else 0}
 
     def document_frequency(self, limit: int = 40000,
                            min_df: int = 2) -> tuple[dict[str, int], int]:
@@ -3150,6 +3197,7 @@ class Database:
         # запись про оплату и доставку входит в обе группы, и разрез по
         # категориям считается через соединение с этой таблицей.
         соединение = ""
+        выражение: str | None
         if group_by == "category":
             выражение = "h.category"
             соединение = " JOIN content_hits h ON h.job_id = c.job_id"
@@ -3471,7 +3519,7 @@ class Database:
         окно — `llm_brief`, он ответов не читает.
         """
         условие, args = self._окно_ответов(since, owner, until=until, agent=agent)
-        всего = int(self.query_one(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args)["n"])
+        всего = int(self.query_scalar(f"SELECT COUNT(*) n FROM jobs j WHERE {условие}", args))
         rows = self.query(
             "SELECT l.job_id, l.version, l.summary, l.reason, l.reason_quote, l.outcome, "
             "       l.outcome_quote, l.resolved, l.actions, l.trackers, "
@@ -3500,8 +3548,8 @@ class Database:
         задания = self._задания_окна()
         ответы = ("llm_results l INDEXED BY " + УКАЗАТЕЛЬ_ОТВЕТОВ
                   if self.has_index(УКАЗАТЕЛЬ_ОТВЕТОВ) else "llm_results l")
-        всего = int(self.query_one(
-            f"SELECT COUNT(*) n FROM {задания} WHERE {условие}", args)["n"])
+        всего = int(self.query_scalar(
+            f"SELECT COUNT(*) n FROM {задания} WHERE {условие}", args))
         группы = self.query(
             "SELECT COALESCE(l.error,'') = '' AS ok, COALESCE(l.reason,'') AS reason, "
             "       COALESCE(l.outcome,'') AS outcome, COUNT(*) AS n, "
@@ -3756,7 +3804,7 @@ class Database:
                 "created_by) VALUES (?,?,?,?,?,?)",
                 (str(label or "")[:120], "идёт", json.dumps(overrides, ensure_ascii=False),
                  now(), int(records), str(by or "")))
-            return int(курсор.lastrowid)
+            return int(курсор.lastrowid or 0)
 
     def golden_run_update(self, run_id: int, **поля: Any) -> None:
         if "result" in поля and not isinstance(поля["result"], (str, type(None))):
@@ -3824,9 +3872,9 @@ class Database:
             "MAX(created_at) AS last FROM llm_vectors")
         модели = [dict(r) for r in self.query(
             "SELECT model, COUNT(DISTINCT job_id) AS records FROM llm_vectors GROUP BY model")]
-        return {"records": int((строка or {})["records"] or 0) if строка else 0,
-                "parts": int((строка or {})["parts"] or 0) if строка else 0,
-                "last": (строка or {})["last"] if строка else None, "models": модели}
+        return {"records": int(строка["records"] or 0) if строка else 0,
+                "parts": int(строка["parts"] or 0) if строка else 0,
+                "last": строка["last"] if строка else None, "models": модели}
 
     def vectors_missing(self, *, model: str, limit: int = 100) -> list[str]:
         """Записи с ответом модели, у которых нет векторов этой модели."""
@@ -4256,7 +4304,9 @@ class Database:
         # Теперь позиции сохраняются, а неизвестный столбец приходит пустым.
         места = {к: н for н, к in enumerate(безопасные)}
         порядок = [места.get(к) for к in columns]
-        return [tuple(None if н is None else r[н] for н in порядок) for r in rows]
+        # Неизвестный столбец — пустое место (None), а не сдвиг номеров.
+        return [tuple(None if н is None else r[н] for н in порядок)  # type: ignore[misc]
+                for r in rows]
 
     def terms_matrix(self, *, since: float | None = None,
                      until: float | None = None,
@@ -4668,6 +4718,8 @@ class Database:
             conn.execute("DELETE FROM content_terms WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_hits WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM content_marks WHERE job_id=?", (job_id,))
+            # Отрезки по участникам — тональность и слова разговора.
+            conn.execute("DELETE FROM agent_segments WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM review_queue WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM llm_results WHERE job_id=?", (job_id,))
             # Эталон человека и векторы смысла — тоже о разговоре: эталон
@@ -5609,7 +5661,8 @@ class Database:
 
     def queue_events(self, *, station: str = "", since: float = 0.0,
                      until: float = 0.0, limit: int = 200000) -> list[dict[str, Any]]:
-        условия, аргументы = ["ts>=?"], [float(since or 0)]
+        условия: list[str] = ["ts>=?"]
+        аргументы: list[Any] = [float(since or 0)]
         if until:
             условия.append("ts<?")
             аргументы.append(float(until))
@@ -5866,6 +5919,88 @@ class Database:
         звонок["answered"] = bool(звонок.get("answered"))
         return звонок
 
+    def save_agent_segments(self, job_id: str, участники: list[dict[str, Any]], *,
+                            записанный: str = "", ног: int = 0, переводов: int = 0) -> None:
+        """Отрезки записи по участникам (заменяют прежние); пусто — убрать.
+
+        `ног` и `переводов` — с чем считалось: поздняя нога CDR или событие
+        перевода, пришедшие после подсчёта, возвращают запись в
+        `jobs_to_split`.
+        """
+        with self.write() as conn:
+            conn.execute("DELETE FROM agent_segments WHERE job_id=?", (str(job_id),))
+            conn.executemany(
+                "INSERT INTO agent_segments (job_id, agent, talk_s, words, replicas, "
+                "sentiment, share, recorded, legs, transfers, computed_at) "
+                "SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?)",
+                [(str(job_id), str(у["agent"]), float(у.get("talk_s") or 0),
+                  int(у.get("words") or 0), int(у.get("replicas") or 0),
+                  (у.get("sentiment") or {}).get("score"), у.get("share"),
+                  1 if str(у["agent"]) == записанный else 0, int(ног), int(переводов),
+                  now(), str(job_id))
+                 for у in участники])
+
+    def jobs_to_split(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Записанные ноги разговоров с переводом, которым нужны отрезки.
+
+        Нет отрезков вовсе — или ног с разговором у этого `linkedid` стало
+        больше или меньше, чем было при подсчёте (поздняя нога перевода
+        приходит отдельной строкой CDR, иногда — следующим заходом агента),
+        или пришли события перевода из AMI, которых при подсчёте не было.
+        """
+        строки = self.query(
+            "SELECT * FROM ("
+            "  SELECT c.job_id AS job_id, c.started_at AS started_at, "
+            "    (SELECT COUNT(*) FROM calls l WHERE l.station=c.station "
+            "       AND l.linkedid=c.linkedid AND COALESCE(l.billsec,0) > 0) AS legs, "
+            "    (SELECT COUNT(DISTINCT NULLIF(l.agent,'')) FROM calls l "
+            "       WHERE l.station=c.station AND l.linkedid=c.linkedid "
+            "       AND COALESCE(l.billsec,0) > 0) AS agents, "
+            "    (SELECT COUNT(*) FROM call_transfers t WHERE t.station=c.station "
+            "       AND t.linkedid=c.linkedid) AS transfers, "
+            "    (SELECT MAX(s.legs) FROM agent_segments s WHERE s.job_id=c.job_id) AS done, "
+            "    (SELECT MAX(s.transfers) FROM agent_segments s "
+            "       WHERE s.job_id=c.job_id) AS done_transfers "
+            "  FROM calls c JOIN jobs j ON j.id = c.job_id "
+            "  WHERE c.job_id IS NOT NULL AND COALESCE(c.linkedid,'') <> '' "
+            "    AND j.status='completed') "
+            "WHERE agents >= 2 AND (COALESCE(done, -1) <> legs "
+            "                       OR COALESCE(done_transfers, 0) <> transfers) "
+            "ORDER BY started_at DESC LIMIT ?", (max(1, int(limit)),))
+        return [dict(с) for с in строки]
+
+    def agent_segments_by_agent(self, where: str, args: list[Any],
+                                негатив: float = -0.15) -> list[dict[str, Any]]:
+        """Участие в разговорах с переводом по добавочным — для разрезов."""
+        return [dict(с) for с in self.query(
+            "SELECT s.agent AS agent, COUNT(*) AS records, SUM(s.talk_s) AS talk_s, "
+            "       SUM(s.words) AS words, "
+            "       SUM(CASE WHEN s.sentiment IS NOT NULL THEN 1 ELSE 0 END) AS scored, "
+            "       SUM(CASE WHEN s.sentiment < ? THEN 1 ELSE 0 END) AS negative, "
+            "       SUM(CASE WHEN s.recorded = 0 THEN 1 ELSE 0 END) AS received "
+            f"FROM agent_segments s JOIN jobs j ON j.id = s.job_id "
+            f"WHERE s.agent <> '' AND ({where}) GROUP BY s.agent", [негатив, *args])]
+
+    def call_transfers_add(self, station: str, переводы: list[dict[str, Any]]) -> int:
+        """События перевода станции (`telephony.transfers`); повтор не задваивает."""
+        if not переводы:
+            return 0
+        return self.executemany(
+            "INSERT OR IGNORE INTO call_transfers (station, linkedid, ts, kind, from_agent, "
+            "to_agent) VALUES (?,?,?,?,?,?)",
+            [(str(station), str(п["linkedid"]), float(п["ts"]), str(п["kind"]),
+              str(п.get("from_agent") or ""), str(п.get("to_agent") or "")) for п in переводы])
+
+    def call_transfers(self, звонок: dict[str, Any]) -> list[dict[str, Any]]:
+        """События перевода разговора: та же станция и тот же linkedid, по времени."""
+        связь = str(звонок.get("linkedid") or "")
+        if not связь:
+            return []
+        return [dict(с) for с in self.query(
+            "SELECT ts, kind, from_agent, to_agent FROM call_transfers "
+            "WHERE station=? AND linkedid=? ORDER BY ts LIMIT 50",
+            (str(звонок.get("station") or ""), связь))]
+
     def call_legs(self, звонок: dict[str, Any], *, предел: int = 20) -> list[dict[str, Any]]:
         """Другие ноги того же разговора: та же станция и тот же linkedid.
 
@@ -5931,15 +6066,15 @@ class Database:
         свод = self.query_one(
             f"SELECT COUNT(*) AS calls, COUNT(DISTINCT c.station || '|' || {ключ}) AS convs "
             f"FROM calls c{где}", args)
-        всего = int((свод or {})["convs"] or 0) if свод else 0
+        всего = int(свод["convs"] or 0) if свод else 0
         с_переводом = self.query_one(
             "SELECT COUNT(*) AS n FROM (SELECT 1 FROM calls c"
             f"{где} GROUP BY c.station, {ключ} "
             "HAVING COUNT(DISTINCT NULLIF(c.agent,'')) > 1)", args)
         return {"items": разговоры,
-                "calls": int((свод or {})["calls"] or 0) if свод else 0,
+                "calls": int(свод["calls"] or 0) if свод else 0,
                 "conversations": всего,
-                "transferred": int((с_переводом or {})["n"] or 0) if с_переводом else 0}
+                "transferred": int(с_переводом["n"] or 0) if с_переводом else 0}
 
     def call_dimensions(self, *, owner: str | list[str] | None = None,
                         station: str = "") -> dict[str, list[str]]:
@@ -6297,8 +6432,9 @@ class Database:
         """
         граница_файлов = float(before) if file_keys_before is None \
             else min(float(before), float(file_keys_before))
-        # События очередей — тем же сроком: в них номера звонков.
+        # События очередей и переводов — тем же сроком: в них номера звонков.
         self.execute("DELETE FROM queue_events WHERE ts < ?", (float(before),))
+        self.execute("DELETE FROM call_transfers WHERE ts < ?", (float(before),))
         return self.execute(
             "DELETE FROM calls WHERE imported_at < ? "
             "  AND (job_id IS NULL OR job_id NOT IN (SELECT id FROM jobs)) "
@@ -6333,9 +6469,10 @@ class Database:
         if id:
             существующий = self.employee_get(str(id))
         if существующий is None and поля.get("external_id"):
-            существующий = self.query_one(
+            найден = self.query_one(
                 "SELECT * FROM employees WHERE source=? AND external_id=?",
                 (str(поля.get("source") or "ручной"), str(поля["external_id"])))
+            существующий = dict(найден) if найден is not None else None
             существующий = dict(существующий) if существующий else None
         мгновение = now()
         if существующий is None:
@@ -6452,7 +6589,8 @@ class Database:
     def employee_list(self, *, query: str = "", department: str = "",
                       active: bool | None = None, source: str = "",
                       limit: int = 500, offset: int = 0) -> dict[str, Any]:
-        условия, параметры = [], []
+        условия: list[str] = []
+        параметры: list[Any] = []
         if query:
             # «_» и «%» — буквы запроса («ivan_petrov@…»), а не образцы LIKE.
             искомое = f"%{_экранировать_like(query.strip().lower())}%"
@@ -7121,7 +7259,7 @@ class Database:
                 (str(job_id), str(agent or ""), str(assigned_to or ""),
                  str(assigned_by or ""), now(), due_at,
                  auto_score, str(reason or ""), str(job_id), str(job_id)))
-            return int(курсор.lastrowid) if курсор.rowcount else None
+            return int(курсор.lastrowid or 0) if курсор.rowcount else None
 
     def qa_submit(self, review_id: int, *, reviewer: str, score: float | None,
                   agree: bool | None = None, items: Any = None,
@@ -7303,7 +7441,7 @@ class Database:
                 f"SELECT COUNT(*) AS n {откуда} WHERE {ждут_условие}", своё_args
             ) or {"n": 0})["n"] or 0),
             "agree_share": (round(float(общее["agreed"] or 0) / оценено, 3)
-                            if оценено else None),
+                            if оценено and общее else None),
             "avg_score": (round(float(общее["avg_score"]), 1)
                           if общее and общее["avg_score"] is not None else None),
             "bias": (round(float(общее["bias"]), 1)
@@ -7826,9 +7964,9 @@ class Database:
             "size_mb": round(size / 1024 / 1024, 2),
             "schema_version": SCHEMA_VERSION,
             "jobs": self.count_jobs(),
-            "segments": int(self.query_one("SELECT COUNT(*) n FROM segments")["n"]),
-            "metrics": int(self.query_one("SELECT COUNT(*) n FROM metrics")["n"]),
-            "events": int(self.query_one("SELECT COUNT(*) n FROM events")["n"]),
+            "segments": int(self.query_scalar("SELECT COUNT(*) n FROM segments")),
+            "metrics": int(self.query_scalar("SELECT COUNT(*) n FROM metrics")),
+            "events": int(self.query_scalar("SELECT COUNT(*) n FROM events")),
         }
 
     def close(self) -> None:

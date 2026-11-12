@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **250**, операций: **279**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **251**, операций: **280**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -350,6 +350,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/telephony/agent/ask` | Какие из этих звонков серверу ещё нужны | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/asrhub-agent.py` | Исходный текст агента | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/telephony/agent/call` | Звонок с записью от агента | ключ с правом записи (**admin** или **user**) |
+| `POST` | `/api/telephony/agent/cel` | Строки журнала CEL со станции агента: события перевода | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/chunk` | Сколько байт записи уже принято (докачка частями) | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/telephony/agent/chunk` | Часть записи от агента (докачка с места обрыва) | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/command` | Задание для агента, если оно есть | ключ с правом записи (**admin** или **user**) |
@@ -983,7 +984,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:1452-0751e7",
+  "instance": "vm:11413-431580",
   "instances": [],
   "workers": [
     {
@@ -1583,7 +1584,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794476073.5883167,
+    "generated_at": 1794481445.5112526,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1750,8 +1751,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.37",
-  "uptime_s": 1.6,
+  "version": "3.1.38",
+  "uptime_s": 1.8,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1831,8 +1832,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.37",
-  "uptime_s": 1.6,
+  "version": "3.1.38",
+  "uptime_s": 1.8,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1841,8 +1842,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.2,
-    "disk_free_gb": 22.8,
+    "ram_available_gb": 4.7,
+    "disk_free_gb": 21.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2591,8 +2592,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793871273.6601794,
-    "until": 1794476073.6601794
+    "since": 1793876645.5826886,
+    "until": 1794481445.5826886
   }
 }
 ```
@@ -2984,9 +2985,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 7.2,
+    "free_gb": 4.7,
     "reserve_gb": 4.0,
-    "budget_gb": 3.0,
+    "budget_gb": 1.3,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -3650,6 +3651,30 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 
 **Доступ:** ключ с правом записи (**admin** или **user**).
 
+
+### `POST /api/telephony/agent/cel`
+
+Строки журнала CEL со станции агента: события перевода.
+
+Строки журнала CEL станции (`{"agent_id": …, "lines": ["…", …]}`).
+
+Формат — отображение `asrhub-cel.csv` из раздела «Asterisk: диалплан»
+(`telephony.transfers.ОТОБРАЖЕНИЕ_CEL`). Из строк берутся события
+перевода — граница отрезков участников в разговоре с переводом; повтор
+тех же строк не задваивает событий.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": true,
+  "title": "Данные"
+}
+```
 
 ### `GET /api/telephony/agent/chunk`
 
@@ -5119,7 +5144,7 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 1.7,
+  "uptime_s": 1.9,
   "liveness": {
     "status": "ok",
     "checks": [
@@ -5161,7 +5186,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 22.8 ГБ",
+        "detail": "свободно 21.9 ГБ",
         "hint": ""
 …
 ```

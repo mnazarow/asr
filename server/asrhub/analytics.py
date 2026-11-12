@@ -21,6 +21,9 @@ from .pipeline import metrics as M
 
 log = get_logger("analytics")
 
+#: Чьи задания в разрезе: один владелец, несколько (отдел) или все (None).
+Владелец = str | list[str] | None
+
 #: Сколько меток показывать в разрезе. Метку задаёт клиент, и её мощность
 #: ничем не ограничена, в отличие от моделей, движков и языков.
 TAG_LIMIT = 100
@@ -282,7 +285,7 @@ class Analytics:
         "AS confidence_avg, "
         "AVG(CASE WHEN status='completed' THEN wer END) AS wer_avg")
 
-    def overview(self, period: str = "day", owner: str | None = None) -> dict[str, Any]:
+    def overview(self, period: str = "day", owner: Владелец = None) -> dict[str, Any]:
         since = self._since(period)
         этапы = ", ".join(
             f"SUM(CASE WHEN status='completed' THEN COALESCE({к},0) ELSE 0 END) AS {к}"
@@ -419,7 +422,7 @@ class Analytics:
     # --- ряды по времени -------------------------------------------------
 
     def timeseries(self, period: str = "day", buckets: int = 48,
-                   owner: str | None = None) -> dict[str, Any]:
+                   owner: Владелец = None) -> dict[str, Any]:
         since = self._since(period) or (time.time() - PERIODS["week"])
         span = max(time.time() - since, 60.0)
         width = span / buckets
@@ -486,7 +489,7 @@ class Analytics:
 
     # --- сравнение моделей -------------------------------------------------
 
-    def by_model(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+    def by_model(self, period: str = "month", owner: Владелец = None) -> list[dict[str, Any]]:
         since = self._since(period)
         # Движок — у самого свежего задания модели: SQLite отдаёт голую
         # колонку из той строки, на которой достигнут MAX (единственный
@@ -547,16 +550,16 @@ class Analytics:
     # Владелец передаётся во все срезы без исключения. В двух он терялся, и
     # обычный ключ видел в разделах «языки» и «движки» сводку по всему
     # серверу: и чужие числа, и чужие названия моделей.
-    def by_language(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+    def by_language(self, period: str = "month", owner: Владелец = None) -> list[dict[str, Any]]:
         return self._group(period, "language", "Язык не определён", owner)
 
-    def by_owner(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+    def by_owner(self, period: str = "month", owner: Владелец = None) -> list[dict[str, Any]]:
         return self._group(period, "owner", "аноним", owner)
 
-    def by_engine(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+    def by_engine(self, period: str = "month", owner: Владелец = None) -> list[dict[str, Any]]:
         return self._group(period, "engine", "—", owner)
 
-    def by_source(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+    def by_source(self, period: str = "month", owner: Владелец = None) -> list[dict[str, Any]]:
         return self._group(period, "source", "api", owner)
 
     #: Колонки, по которым бывает простой разрез: имя в базе — из этого
@@ -564,11 +567,11 @@ class Analytics:
     _РАЗРЕЗЫ = frozenset({"language", "owner", "engine", "source"})
 
     def _group(self, period: str, field: str, fallback: str,
-               owner: str | None = None) -> list[dict[str, Any]]:
+               owner: Владелец = None) -> list[dict[str, Any]]:
         if field not in self._РАЗРЕЗЫ:
             raise ValueError(f"неизвестный разрез: {field}")
         since = self._since(period)
-        rows = [{
+        rows: list[dict[str, Any]] = [{
             "key": str(г["k"]),
             "jobs": int(г["jobs"] or 0),
             "completed": int(г["completed"] or 0),
@@ -582,7 +585,7 @@ class Analytics:
         rows.sort(key=lambda r: r["jobs"], reverse=True)
         return rows
 
-    def errors(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+    def errors(self, period: str = "month", owner: Владелец = None) -> dict[str, Any]:
         since = self._since(period)
         # Упавшие — своей узкой выборкой без предела в десять тысяч: на
         # большом периоде коды переставали расти после десятитысячного
@@ -623,7 +626,7 @@ class Analytics:
         }
 
     def duration_histogram(self, period: str = "month", bins: int = 10,
-                          owner: str | None = None) -> dict[str, Any]:
+                          owner: Владелец = None) -> dict[str, Any]:
         since = self._since(period)
         durations = [float(j["media_duration_s"]) for j in self._значения(
             "media_duration_s", status="completed", since=since or None, owner=owner,
@@ -646,7 +649,7 @@ class Analytics:
                 "total": len(durations), "summary": M.summarize(durations)}
 
     def slowest(self, period: str = "month", limit: int = 15,
-                owner: str | None = None) -> list[dict[str, Any]]:
+                owner: Владелец = None) -> list[dict[str, Any]]:
         """Самые медленные готовые задания по RTF — запросом с пределом.
 
         Задания из кеша сюда не идут: у клона RTF чужой (оригинала), а
@@ -673,7 +676,7 @@ class Analytics:
     _ЧАС = "CAST(strftime('%H', created_at, 'unixepoch', 'localtime') AS INTEGER)"
     _ДЕНЬ = "((CAST(strftime('%w', created_at, 'unixepoch', 'localtime') AS INTEGER) + 6) % 7)"
 
-    def hourly_profile(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+    def hourly_profile(self, period: str = "month", owner: Владелец = None) -> dict[str, Any]:
         """Распределение нагрузки по часам суток и дням недели."""
         since = self._since(period)
         hours = [0] * 24
@@ -721,7 +724,7 @@ class Analytics:
         время = float(строка.get("own_proc") or 0)
         return (время / звук) if звук else 0.0
 
-    def efficiency(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+    def efficiency(self, period: str = "month", owner: Владелец = None) -> dict[str, Any]:
         """Оценка эффективности: сколько ресурсов уходит на час аудио."""
         since = self._since(period)
         строка = (self._группы(
@@ -762,7 +765,7 @@ class Analytics:
     # --- нагрузка по дням недели ------------------------------------------
 
     def weekly_heatmap(self, period: str = "month",
-                       owner: str | None = None) -> dict[str, Any]:
+                       owner: Владелец = None) -> dict[str, Any]:
         """Карта нагрузки «день недели × час».
 
         Суточный профиль усредняет будни с выходными и потому отвечает не на
@@ -800,7 +803,7 @@ class Analytics:
     # --- экономия на повторах ---------------------------------------------
 
     def cache_savings(self, period: str = "month",
-                      owner: str | None = None) -> dict[str, Any]:
+                      owner: Владелец = None) -> dict[str, Any]:
         """Сколько работы сняли повторы одного и того же файла.
 
         Сервер узнаёт уже виденный файл по хешу и отдаёт готовый результат.
@@ -827,7 +830,7 @@ class Analytics:
         # по кругу из-за ошибки в своей очереди. Ключ уходит в ответ: по нему
         # строка «файл пришёл N раз» раскрывается в сами эти N заданий. Имя
         # файла — у самого свежего повтора (голая колонка при MAX).
-        топ = [{"key": str(г["k"]), "hits": int(г["n"]),
+        топ: list[dict[str, Any]] = [{"key": str(г["k"]), "hits": int(г["n"]),
                 "filename": г.get("filename") or "",
                 "audio_hours": round(float(г["audio"] or 0) / 3600, 3)}
                for г in self._группы(
@@ -856,7 +859,7 @@ class Analytics:
     # --- надёжность --------------------------------------------------------
 
     def reliability(self, period: str = "month",
-                    owner: str | None = None) -> dict[str, Any]:
+                    owner: Владелец = None) -> dict[str, Any]:
         """Что происходит с заданием между приёмом и выдачей результата.
 
         Доля успеха отвечает «сколько дошло», но не «какой ценой». Задание,
@@ -864,7 +867,7 @@ class Analytics:
         прошло с первой, — а это разные состояния сервера.
         """
         since = self._since(period)
-        окно = {"since": since or None, "owner": owner}
+        окно: dict[str, Any] = {"since": since or None, "owner": owner}
         распределение: dict[int, int] = {}
         всего = готово = с_повтором = отказов = 0
         for г in self._группы("COALESCE(retries,0) AS r, status, COUNT(*) AS n",
@@ -910,7 +913,7 @@ class Analytics:
     # --- каким бывает звук --------------------------------------------------
 
     def audio_profile(self, period: str = "month",
-                      owner: str | None = None) -> dict[str, Any]:
+                      owner: Владелец = None) -> dict[str, Any]:
         """Свойства самих записей: формат, битрейт, темп речи, говорящие.
 
         Это разрез не про сервер, а про материал. Темп речи и доля тишины
@@ -992,7 +995,7 @@ class Analytics:
         измеренные = [j for j in jobs if j.get("snr_db") is not None]
         корзины: dict[str, list[dict[str, Any]]] = {}
         for j in измеренные:
-            корзины.setdefault(AP.snr_band(float(j["snr_db"])), []).append(j)
+            корзины.setdefault(AP.snr_band(float(j["snr_db"])) or "", []).append(j)
 
         def свод(items: list[dict[str, Any]]) -> dict[str, Any]:
             conf = [float(j["avg_confidence"]) for j in items if j.get("avg_confidence")]
@@ -1050,7 +1053,7 @@ class Analytics:
     # --- расход ресурсов ----------------------------------------------------
 
     def resources(self, period: str = "month",
-                  owner: str | None = None) -> dict[str, Any]:
+                  owner: Владелец = None) -> dict[str, Any]:
         """Память и устройства в разрезе моделей.
 
         Отвечает на вопрос, который задают перед покупкой второй карты:
@@ -1115,7 +1118,7 @@ class Analytics:
     # --- качество во времени ------------------------------------------------
 
     def quality_trend(self, period: str = "month", buckets: int = 24,
-                      owner: str | None = None) -> dict[str, Any]:
+                      owner: Владелец = None) -> dict[str, Any]:
         """Уверенность и WER по времени.
 
         Средняя уверенность за месяц — число, которое ничего не сообщает.
@@ -1171,7 +1174,7 @@ class Analytics:
     #: Базовое окно дрейфа — четыре недели до периода, как у Deepgram.
     БАЗА_ДНЕЙ = 28
 
-    def drift(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+    def drift(self, period: str = "week", owner: Владелец = None) -> dict[str, Any]:
         """Дрейф уверенности: распределение за период против четырёх недель
         до него — по моделям и по всем вместе.
 
@@ -1233,7 +1236,7 @@ class Analytics:
                      "посмотреть, что изменилось на входе, а не вердикт модели."),
         }
 
-    def control(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+    def control(self, period: str = "week", owner: Владелец = None) -> dict[str, Any]:
         """Контрольные карты по дням: уверенность, доля заданий с низкой
         уверенностью, доля подозрительных сегментов — пределы 2σ и 3σ по
         четырём неделям до периода."""
@@ -1423,7 +1426,7 @@ class Analytics:
             if wer_по_записям else None,
         }
 
-    def accuracy(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+    def accuracy(self, period: str = "month", owner: Владелец = None) -> dict[str, Any]:
         """Точность по записям с эталоном — срезами: модель, длительность,
         источник, язык. С MER и WIL: WER не ограничен единицей, и разрыв
         WER − MER показывает избыток вставок, то есть галлюцинации.
@@ -1464,7 +1467,7 @@ class Analytics:
                      "эталона — это около часа речи."),
         }
 
-    def calibration(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+    def calibration(self, period: str = "month", owner: Владелец = None) -> dict[str, Any]:
         """Калибровка уверенности по записям с эталоном: ECE, AUC и диаграмма
         надёжности — по всем и по моделям."""
         from .pipeline import calibration as C  # noqa: PLC0415
@@ -1496,7 +1499,7 @@ class Analytics:
 
     # --- латентность -----------------------------------------------------------
 
-    def latency(self, period: str = "month", owner: str | None = None) -> dict[str, Any]:
+    def latency(self, period: str = "month", owner: Владелец = None) -> dict[str, Any]:
         """Задержка по моделям и по длительности: p50/p95/p99 времени
         обработки и RTF, ожидание в очереди; для потока — секунды до первого
         текста.
@@ -1645,7 +1648,7 @@ class Analytics:
                      "предупреждение, на половину — критично."),
         }
 
-    def suspicious(self, period: str = "month", owner: str | None = None,
+    def suspicious(self, period: str = "month", owner: Владелец = None,
                    limit: int = 15) -> dict[str, Any]:
         """Подозрительные расшифровки: галлюцинации, повторы, разметка.
 
@@ -1725,7 +1728,7 @@ class Analytics:
 
     # --- разрез по меткам ---------------------------------------------------
 
-    def by_tag(self, period: str = "month", owner: str | None = None) -> list[dict[str, Any]]:
+    def by_tag(self, period: str = "month", owner: Владелец = None) -> list[dict[str, Any]]:
         """Метки — единственный разрез, который задаёт сам пользователь.
 
         Всё остальное сервер знает про себя: модель, движок, источник. А
@@ -1779,7 +1782,7 @@ class Analytics:
     # --- ожидание в очереди -------------------------------------------------
 
     def queue_latency(self, period: str = "month",
-                      owner: str | None = None) -> dict[str, Any]:
+                      owner: Владелец = None) -> dict[str, Any]:
         """Сколько задание ждало и от чего это зависело.
 
         Среднее ожидание скрывает именно то, на что жалуются: хвост. Ждали
@@ -1849,7 +1852,7 @@ class Analytics:
     #: Сколько секунд отдавать готовый сводный отчёт без пересборки.
     СРОК_ГОТОВОГО_ОТЧЁТА_С = 30.0
 
-    def _full_report(self, period: str, owner: str | None) -> dict[str, Any]:
+    def _full_report(self, period: str, owner: str | list[str] | None) -> dict[str, Any]:
         отчёт = self._разрезы(period, owner)
         # Окно, по которому всё это посчитано. Интерфейс раскрывает любое
         # число отчёта в список записей (`GET /api/drill`), и границы обязан
@@ -1864,7 +1867,7 @@ class Analytics:
         отчёт["truncated"] = self._усечено
         return отчёт
 
-    def _разрезы(self, period: str, owner: str | None) -> dict[str, Any]:
+    def _разрезы(self, period: str, owner: str | list[str] | None) -> dict[str, Any]:
         return {
             "overview": self.overview(period, owner),
             "timeseries": self.timeseries(period, owner=owner),

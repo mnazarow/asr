@@ -292,7 +292,7 @@ class Импортёр:
         self.failed = 0
         self._ami: AMIClient | None = None
         #: Чем было открыто соединение: адрес, порт, учётная запись, пароль.
-        self._подпись_ami: tuple[str, int, str, str] | None = None
+        self._подпись_ami: tuple[Any, ...] | None = None
         #: События AMI, прочитанные, но не записанные (база была недоступна):
         #: идут первыми в следующий заход — станция их больше не пришлёт.
         self._непринятые: list[Звонок] = []
@@ -606,6 +606,7 @@ class Импортёр:
                 self._указатель = None
             итог = self._scan(limit=limit, всё=всё, окно=окно)
             self._очереди()
+            self._переводы_cel()
             return итог
 
     def _очереди(self) -> int:
@@ -625,6 +626,27 @@ class Импортёр:
                         self.станция.name, путь, exc)
             return 0
         добавлено = self.db.queue_events_add(self.id, события)
+        self.db.set_kv(ключ, {"offset": позиция, "inode": inode, "at": time.time()})
+        return добавлено
+
+    def _переводы_cel(self) -> int:
+        """Приращение журнала CEL станции (`cel_file`): события перевода."""
+        путь = self.станция.путь("cel_file") if hasattr(self.станция, "cel_file") else None
+        if путь is None or not путь.is_file():
+            return 0
+        from . import transfers as события_перевода  # noqa: PLC0415
+
+        ключ = f"telephony:cel:{self.id}"
+        место = self.db.get_kv(ключ) or {}
+        try:
+            переводы, позиция, inode = события_перевода.прочитать_cel(
+                путь, int(место.get("offset") or 0), int(место.get("inode") or 0),
+                пояс=getattr(self.станция, "пояс", None))
+        except OSError as exc:
+            log.warning("Станция «%s»: журнал CEL %s не читается: %s",
+                        self.станция.name, путь, exc)
+            return 0
+        добавлено = self.db.call_transfers_add(self.id, переводы)
         self.db.set_kv(ключ, {"offset": позиция, "inode": inode, "at": time.time()})
         return добавлено
 
@@ -1144,7 +1166,8 @@ class Импортёр:
         клиент = self._ami
         if клиент is None:
             клиент = AMIClient(*подпись[:4], tls=подпись[4], ca_file=подпись[5],
-                               auth=подпись[6], события=подпись[7])
+                               auth=подпись[6], события=подпись[7],
+                               оставлять=self._события_ami_нужны(подпись[7]))
             try:
                 клиент.connect()
                 # Сокет вычитывается всё время, а не пять секунд в минуту:
@@ -1169,7 +1192,9 @@ class Импортёр:
                 self._ami_оборвана = None
         звонки: list[Звонок] = []
         очереди: list[dict[str, Any]] = []
+        переводы: list[dict[str, Any]] = []
         from . import queue_log as журнал_очередей  # noqa: PLC0415
+        from . import transfers as события_перевода  # noqa: PLC0415
 
         крайний = time.time() + 5.0
         while len(звонки) < limit and time.time() < крайний:
@@ -1209,6 +1234,11 @@ class Импортёр:
                     из_ami = журнал_очередей.из_события_ami(событие)
                     if из_ami is not None:
                         очереди.append(из_ami)
+                # Переводы (класс call) — граница отрезков участников.
+                if "call" in подпись[7]:
+                    перевод = события_перевода.из_события_ami(событие)
+                    if перевод is not None:
+                        переводы.append(перевод)
                 continue
             поля = {имя: событие.get(ключ, "") for ключ, имя in _ПОЛЯ_AMI.items()}
             звонок = звонок_из_полей(поля, пояс=self.станция.пояс)
@@ -1220,17 +1250,39 @@ class Импортёр:
             except Exception as exc:                        # noqa: BLE001
                 log.warning("Станция «%s»: события очередей из AMI не сохранены: %s",
                             self.станция.name, exc)
+        if переводы:
+            try:
+                self.db.call_transfers_add(self.id, переводы)
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("Станция «%s»: события перевода из AMI не сохранены: %s",
+                            self.станция.name, exc)
         return звонки
 
     def _классы_событий_ami(self) -> str:
-        """Какие события просить у AMI: звонки, а без queue_log — и очереди."""
+        """Какие события просить у AMI: звонки, без queue_log — и очереди,
+        с событиями перевода (`transfers` станции) — и класс `call`."""
         try:
             путь = self.станция.путь("queue_log") if getattr(self.станция, "queue_log", "") \
                 else None
             есть_журнал = путь is not None and путь.is_file()
         except OSError:
             есть_журнал = False
-        return "cdr" if есть_журнал else "cdr,agent"
+        классы = "cdr" if есть_журнал else "cdr,agent"
+        if getattr(self.станция, "transfers", False):
+            классы += ",call"
+        return классы
+
+    @staticmethod
+    def _события_ami_нужны(классы: str) -> frozenset[str] | None:
+        """Какие события фоновое чтение оставляет: с классом `call` — только
+        `Cdr`, события очередей и перевода; без него — все (их немного)."""
+        if "call" not in классы:
+            return None
+        from . import queue_log as журнал_очередей  # noqa: PLC0415
+        from . import transfers as события_перевода  # noqa: PLC0415
+
+        return frozenset({"cdr", *события_перевода.СОБЫТИЯ,
+                          *(журнал_очередей.СОБЫТИЯ_AMI if "agent" in классы else ())})
 
     def _закрыть_ami(self) -> None:
         """Закрывает соединение со станцией и забывает его подпись."""
@@ -2037,7 +2089,7 @@ class Телефония:
             except Exception as exc:                         # noqa: BLE001
                 сбои.append({"station": импортёр.id, "name": импортёр.станция.name,
                              "error": str(exc), "hint": ""})
-        свод = {"stations": итоги, "errors": сбои}
+        свод: dict[str, Any] = {"stations": итоги, "errors": сбои}
         for ключ in ("seen", "imported", "skipped", "deferred"):
             свод[ключ] = sum(int(и.get(ключ) or 0) for и in итоги)
         причины: dict[str, int] = {}

@@ -692,7 +692,7 @@ class AMIClient:
     def __init__(self, host: str, port: int = 5038, username: str = "",
                  secret: str = "", *, timeout: float = ТАЙМАУТ,
                  события: str = "cdr", tls: bool = False, ca_file: str = "",
-                 auth: str = "plain"):
+                 auth: str = "plain", оставлять: Any = None):
         self.host = host
         self.tls = bool(tls)
         #: С TLS у AMI свой порт — 5039 (`tlsbindport` в manager.conf).
@@ -723,6 +723,12 @@ class AMIClient:
         #: («on») — он отличает «событий нет вовсе» от «нет именно Cdr»;
         #: проверке связи не нужно ничего («off»).
         self.события = str(события or "cdr")
+        #: Какие события фоновое чтение оставляет (имена в нижнем регистре);
+        #: None — все. Класс `call` нужен ради двух событий перевода, а несёт
+        #: сотни событий каналов в секунду: без отбора они вытесняли бы `Cdr`
+        #: из очереди событий до того, как забор до них доберётся.
+        self.оставлять: frozenset[str] | None = (
+            frozenset(str(и).lower() for и in оставлять) if оставлять else None)
         self._sock: socket.socket | None = None
         self._буфер = b""
         #: Начало пакета, пришедшее до тайм-аута чтения: продолжение
@@ -894,6 +900,9 @@ class AMIClient:
                     self._есть_в_фоне.notify_all()
                 return
             if not пакет:
+                continue
+            if (self.оставлять is not None and "Response" not in пакет
+                    and str(пакет.get("Event") or "").lower() not in self.оставлять):
                 continue
             with self._есть_в_фоне:
                 (self._ответы_фона if "Response" in пакет else self._события_фона).append(пакет)

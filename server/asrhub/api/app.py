@@ -341,7 +341,7 @@ class EventHub:
                 self._прогресс_ждёт.pop(задание, None)
                 if len(self._прогресс_отправлен) > 4096:
                     for старый in sorted(self._прогресс_отправлен,
-                                         key=self._прогресс_отправлен.get)[:2048]:
+                                         key=lambda к: self._прогресс_отправлен[к])[:2048]:
                         self._прогресс_отправлен.pop(старый, None)
                 return False
             уже_ждёт = задание in self._прогресс_ждёт
@@ -988,6 +988,10 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         except Exception as exc:                            # noqa: BLE001
             log.debug("Отказ диалплана не записан в журнал: %s", exc)
 
+    #: Настройки уже не None — для вложенных классов, где проверка типов
+    #: этого не видит.
+    настройки: Settings = settings
+
     class _СчётТела:
         """Предел тела по тому, что пришло на самом деле, а не по заголовку.
 
@@ -1019,7 +1023,7 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             файл = тип.startswith("multipart/form-data")
             предел, limit_mb, multiplier = _предел_тела(путь, файл)
 
-            if settings.get("auth_enabled", True) and путь.startswith("/api/"):
+            if настройки.get("auth_enabled", True) and путь.startswith("/api/"):
                 отказ: ASRHubError | None = None
                 if путь == "/api/auth/login":
                     отказ = _предел_входа(scope)
@@ -1042,8 +1046,9 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                         # HTTPException, а не своё исключение: FastAPI
                         # пропускает его сквозь разбор формы как есть, а
                         # любое другое превращает в «ошибку разбора тела».
-                        raise StarletteHTTPException(status_code=413,
-                                                     detail=ошибка.to_dict())
+                        raise StarletteHTTPException(
+                            status_code=413,
+                            detail=ошибка.to_dict())  # type: ignore[arg-type]  # словарь ошибки, см. http_error_handler
                 return сообщение
 
             await self.app(scope, считать, send)

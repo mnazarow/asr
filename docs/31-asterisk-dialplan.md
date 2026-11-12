@@ -232,6 +232,28 @@ member => PJSIP/101
 member => PJSIP/102
 ```
 
+### Переводы: журнал CEL
+
+Нужен станции, которую сервер читает журналом CDR, а не по AMI: события перевода (`BLINDTRANSFER`, `ATTENDEDTRANSFER`) задают точную границу отрезков участников в разговоре с переводом (глава [21](21-telephony.md), «Разговор из нескольких ног»). Путь к журналу — поле станции «Журнал CEL». Со станцией по AMI файл не нужен. На живой станции отображение не проверялось.
+
+<!-- dialplan driver=pjsip mode=upload file=cel -->
+```ini
+; Граница перевода в разговоре с переводом — для станции без AMI: Asterisk
+; пишет события перевода в журнал CEL, сервер читает его (поле станции
+; «Журнал CEL»). Со станцией по AMI не нужно: события придут оттуда.
+;
+; /etc/asterisk/cel.conf — если CEL уже ведётся, добавьте два события к своим:
+;   [general]
+;   enable = yes
+;   events = BLINDTRANSFER,ATTENDEDTRANSFER
+;
+; /etc/asterisk/cel_custom.conf — журнал для ASR Hub. Файл ляжет в
+; /var/log/asterisk/cel-custom/asrhub-cel.csv. После правки:
+;   asterisk -rx "module reload cel_custom.so"
+[mappings]
+asrhub-cel.csv => ${CSV_QUOTE(${eventtype})},${CSV_QUOTE(${eventtime})},${CSV_QUOTE(${CHANNEL(channame)})},${CSV_QUOTE(${CHANNEL(uniqueid)})},${CSV_QUOTE(${CHANNEL(linkedid)})},${CSV_QUOTE(${CHANNEL(exten)})},${CSV_QUOTE(${eventextra})}
+```
+
 ## Файлы для chan_sip
 
 chan_sip устарел с Asterisk 17 и удалён в 21: на новых станциях используйте chan_pjsip. Для приёма звонков отличий немного — добавочный звонящего берётся из `CHANNEL(peername)` вместо `CHANNEL(endpoint)`, и иначе пишутся `Dial()` и участники очереди. Подпрограмма `asrhub-record` та же самая.

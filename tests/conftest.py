@@ -102,6 +102,20 @@ def _подтверждения_как_диалоги_playwright():
         Browser.new_context, Browser.new_page = контекст_был, страница_была
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _общий_браузер_на_файл():
+    """Общий браузер вкладок (`drill_seed.Вкладка`) живёт до конца файла."""
+    yield
+    import sys
+
+    # Помощник импортируют и как `drill_seed`, и как `tests.drill_seed` —
+    # это два модуля со своим общим браузером: закрыть надо оба.
+    for имя in ("drill_seed", "tests.drill_seed"):
+        помощник = sys.modules.get(имя)
+        if помощник is not None:
+            помощник.закрыть_общий_браузер()
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return ROOT

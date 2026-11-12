@@ -96,14 +96,15 @@ def test_вторая_часть_спрашивается_окном_перво�
 def test_день_календаря_раскрывается_сутками_сервера(сервер):
     """Браузер в Токио, сервер — в своём поясе: клетка дня раскрывается
     границами, которые прислал сервер, и в ней та же одна запись."""
-    from playwright.sync_api import sync_playwright
+    from drill_seed import общий_браузер
 
     адрес, _, день = сервер
-    игра = sync_playwright().start()
+    # Общий браузер файла (его же берут вкладки): второй Playwright в том же
+    # потоке не запускается. Пояс — у своего контекста.
+    контекст = общий_браузер().new_context(viewport={"width": 1600, "height": 1000},
+                                           color_scheme="dark", timezone_id="Asia/Tokyo")
     try:
-        обозреватель = игра.chromium.launch(executable_path=браузер())
-        с = обозреватель.new_page(viewport={"width": 1600, "height": 1000}, color_scheme="dark",
-                                  timezone_id="Asia/Tokyo")
+        с = контекст.new_page()
         запросы: list[str] = []
         с.on("request", lambda r: запросы.append(r.url))
         с.goto(f"{адрес}/#voice_quarter", wait_until="networkidle")
@@ -124,6 +125,5 @@ def test_день_календаря_раскрывается_сутками_с�
         assert float(раскрытие["since"]) == pytest.approx(сутки["since"])
         assert float(раскрытие["until"]) == pytest.approx(сутки["until"])
         assert с.locator(".drill-panel tbody tr").count() == сутки["completed"]
-        обозреватель.close()
     finally:
-        игра.stop()
+        контекст.close()

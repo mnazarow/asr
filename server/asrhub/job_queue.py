@@ -118,13 +118,13 @@ def разобрать_срок(значение: Any, *, сейчас: float | 
             относительный.group(2) or "m", 60)
         return момент + число * множитель
     try:
-        число = float(текст.replace(",", "."))
+        простое: float | None = float(текст.replace(",", "."))
     except ValueError:
-        число = None
-    if число is not None:
-        if число <= 0:
+        простое = None
+    if простое is not None:
+        if простое <= 0:
             return None
-        return число if число > 1e9 else момент + число * 60
+        return простое if простое > 1e9 else момент + простое * 60
     from datetime import datetime  # noqa: PLC0415
 
     try:
@@ -337,13 +337,16 @@ def _класс_с_проверкой(базовый: Any, допуск: Callabl
     import ipaddress
     import socket
 
+    #: Знак «тайм-аут не задан» у http.client — свой у модуля socket.
+    _ПО_УМОЛЧАНИЮ: Any = getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT", object())
+
     class Проверенное(базовый):  # type: ignore[misc, valid-type]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self._create_connection = self._проверенное_соединение
 
         def _проверенное_соединение(self, address: tuple[str, int],
-                                    timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,  # noqa: SLF001
+                                    timeout: Any = _ПО_УМОЛЧАНИЮ,
                                     source_address: Any = None) -> Any:
             host, port = address
             ответы = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -353,7 +356,7 @@ def _класс_с_проверкой(базовый: Any, допуск: Callabl
             for семейство, тип, протокол, _, адрес_сокета in ответы:
                 сокет = socket.socket(семейство, тип, протокол)
                 try:
-                    if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:  # noqa: SLF001
+                    if timeout is not _ПО_УМОЛЧАНИЮ:
                         сокет.settimeout(timeout)
                     if source_address:
                         сокет.bind(source_address)
@@ -1720,7 +1723,7 @@ class JobQueue:
                 # Словарь не растёт без предела: забываем тех, кого
                 # обслуживали давнее всех, — они и так впереди.
                 for старый in sorted(self._последний_старт,
-                                     key=self._последний_старт.get)[:2048]:
+                                     key=lambda к: self._последний_старт[к])[:2048]:
                     self._последний_старт.pop(старый, None)
 
         # Слот занят. Дальше два обращения к базе, и любой их срыв обязан
@@ -1965,7 +1968,7 @@ class JobQueue:
         известно = {к: м for к, м in свободно.items() if м is not None}
         if not известно:
             return своя
-        лучшая = max(известно, key=известно.get)
+        лучшая = max(известно, key=lambda к: известно[к])
         if своя in известно and известно[своя] >= 0.9 * известно[лучшая]:
             return своя
         return лучшая

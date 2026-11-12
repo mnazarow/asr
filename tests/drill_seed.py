@@ -237,16 +237,46 @@ def поднять(приложение: Any) -> tuple[str, Any]:
     return f"http://127.0.0.1:{порт}", остановить
 
 
-class Вкладка:
-    """Вкладка браузера, которая копит ошибки консоли и отказы сервера."""
+#: Браузер, общий для вкладок одного файла проверок: запуск Chromium —
+#: секунда, новый контекст — сотая. Закрывается после файла
+#: (`conftest._общий_браузер_на_файл`): другие файлы заводят Playwright
+#: сами, а два Playwright в одном потоке не уживаются.
+_ОБЩИЙ: dict[str, Any] = {}
 
-    def __init__(self, адрес: str, *, ширина: int = 1600, высота: int = 1000) -> None:
+
+def общий_браузер() -> Any:
+    if "браузер" not in _ОБЩИЙ:
         from playwright.sync_api import sync_playwright
 
-        self._игра = sync_playwright().start()
-        self._браузер = self._игра.chromium.launch(executable_path=браузер())
-        self.страница = self._браузер.new_page(viewport={"width": ширина, "height": высота},
-                                                  color_scheme="dark")
+        игра = sync_playwright().start()
+        _ОБЩИЙ["игра"] = игра
+        _ОБЩИЙ["браузер"] = игра.chromium.launch(executable_path=браузер())
+    return _ОБЩИЙ["браузер"]
+
+
+def закрыть_общий_браузер() -> None:
+    обозреватель, игра = _ОБЩИЙ.pop("браузер", None), _ОБЩИЙ.pop("игра", None)
+    for действие in ((обозреватель.close if обозреватель else None),
+                     (игра.stop if игра else None)):
+        if действие is None:
+            continue
+        try:
+            действие()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+class Вкладка:
+    """Вкладка браузера, которая копит ошибки консоли и отказы сервера.
+
+    Своя у каждой проверки — отдельный контекст (куки, хранилище) общего
+    браузера файла.
+    """
+
+    def __init__(self, адрес: str, *, ширина: int = 1600, высота: int = 1000) -> None:
+        self._контекст = общий_браузер().new_context(
+            viewport={"width": ширина, "height": высота}, color_scheme="dark")
+        self.страница = self._контекст.new_page()
         self.ошибки: list[str] = []
         self.запросы: list[str] = []
         self.адрес = адрес
@@ -259,8 +289,25 @@ class Вкладка:
         с.on("request", lambda r: self.запросы.append(r.url))
 
     def открыть(self, раздел: str) -> Any:
+        """Раздел — и ждать, пока он отрисован (`#content[data-ready]`).
+
+        Прежде — полторы секунды наугад на каждый переход, и на загруженной
+        машине их не хватало. Признак ставит `renderView`, когда раздел
+        дорисовался; после него — короткая выдержка на то, что раздел
+        догружает следом (тепловая карта, свод): без неё догрузка, пришедшая
+        после щелчка проверки, перерисовывала открытый список ещё раз.
+        """
         self.страница.goto(f"{self.адрес}/#{раздел}", wait_until="networkidle")
-        self.страница.wait_for_timeout(1200)
+        try:
+            self.страница.wait_for_function(
+                "() => { const к = document.querySelector('#content');"
+                " const вид = ((window.__asrhub || {}).state || {}).view;"
+                " return Boolean(к && вид && к.dataset.ready === вид); }", timeout=8000)
+        except Exception:                                    # noqa: BLE001
+            # Раздел с другим именем вида или форма входа — как раньше.
+            self.страница.wait_for_timeout(1200)
+            return self.страница
+        self.страница.wait_for_timeout(700)
         return self.страница
 
     def раскрытий(self) -> int:
@@ -276,8 +323,10 @@ class Вкладка:
         assert not настоящие, "\n".join(настоящие)
 
     def закрыть(self) -> None:
-        self._браузер.close()
-        self._игра.stop()
+        try:
+            self._контекст.close()
+        except Exception:                                    # noqa: BLE001
+            pass
 
 
 def отвечать(страница, да: bool) -> None:

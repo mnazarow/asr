@@ -365,6 +365,22 @@ class Отбор:
             аргументы.append(self.department)
         return " AND ".join(условия), аргументы
 
+    def где_участия(self, db: Any, since: float, until: float) -> tuple[str, list[Any]]:
+        """Записи окна для отрезков участников (`agent_segments s`).
+
+        Отбор по добавочному и отделу здесь — по участнику (`s.agent`), а не
+        по записанной ноге: второй оператор перевода участвовал в разговоре,
+        записанном под первым, и бывает из другого отдела.
+        """
+        где, аргументы = Отбор(owner=self.owner).где(db, since, until, готовые=True)
+        if self.agent:
+            где += " AND s.agent = ?"
+            аргументы = [*аргументы, self.agent]
+        if self.department:
+            где += f" AND s.agent IN ({Database.ДОБАВОЧНЫЕ_ОТДЕЛА})"
+            аргументы = [*аргументы, self.department]
+        return где, аргументы
+
     def где_звонков(self, db: Any, since: float, until: float) -> tuple[str, list[Any]]:
         """То же для журнала звонков: время начала звонка, владелец, отбор."""
         условия = ["cl.started_at >= ?", "cl.started_at < ?"]
@@ -755,7 +771,10 @@ class Отчёт:
                 "agent": номер, "jobs": 0, "completed": 0, "empty": 0, "failed": 0,
                 "talk_s": 0.0, "scored": 0, "negative": 0, "score_sum": 0.0, "score_n": 0,
                 "compliance_sum": 0.0, "compliance_n": 0, "analyzed": 0, "known": 0,
-                "yes": 0, "reasons": {}})
+                "yes": 0, "reasons": {},
+                # Разговоры с переводом — по своим отрезкам (`agent_segments`).
+                "split_records": 0, "split_received": 0, "split_talk_s": 0.0,
+                "split_scored": 0, "split_negative": 0})
 
         for г in self.db.query(
                 f"SELECT {ДОБАВОЧНЫЙ_ВЫРАЖЕНИЕ} AS a, j.status AS s, COUNT(*) AS n, "
@@ -799,6 +818,14 @@ class Отчёт:
             ч["yes"] += int(г["yes"] or 0)
             if г["reason"]:
                 ч["reasons"][г["reason"]] = ч["reasons"].get(г["reason"], 0) + n
+        где_у, арг_у = self.отбор.где_участия(self.db, о.since, о.until)
+        for г in self.db.agent_segments_by_agent(где_у, арг_у, негатив=НЕГАТИВ):
+            ч = строка(str(г["agent"] or ""))
+            ч["split_records"] += int(г["records"] or 0)
+            ч["split_received"] += int(г["received"] or 0)
+            ч["split_talk_s"] += float(г["talk_s"] or 0)
+            ч["split_scored"] += int(г["scored"] or 0)
+            ч["split_negative"] += int(г["negative"] or 0)
         return люди
 
     @staticmethod
@@ -819,6 +846,13 @@ class Отчёт:
             "score_sum": round(ч["score_sum"], 2), "score_n": ч["score_n"],
             "top_reason": причины[0][0] if причины else "",
             "top_reason_n": причины[0][1] if причины else 0,
+            # Участие в разговорах с переводом — по своим отрезкам записи:
+            # сколько таких разговоров, в скольких принял перевод (запись
+            # не на нём), сколько звучал сам и доля отрицательных своих
+            # отрезков (см. `telephony.segments`).
+            "split_records": ч["split_records"], "split_received": ч["split_received"],
+            "split_talk_hours": round(ч["split_talk_s"] / 3600, 2),
+            "split_negative_share": _доля(ч["split_negative"], ч["split_scored"]),
             "prev_completed": int((было or {}).get("completed") or 0),
             "prev_resolved_share": _доля(int((было or {}).get("yes") or 0),
                                          int((было or {}).get("known") or 0)),
