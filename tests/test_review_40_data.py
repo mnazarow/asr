@@ -68,7 +68,6 @@ def test_неудачный_повтор_возвращает_прежнюю_р�
     Движка нет на сервере, запись удалила АТС — и задание, вчера давшее
     расшифровку, уходило в «ошибку», а выгрузка отвечала 400.
     """
-    from asrhub import job_queue
     from asrhub.errors import DependencyMissing
 
     ид = _готовое_задание(client, sample_wav)
@@ -78,7 +77,7 @@ def test_неудачный_повтор_возвращает_прежнюю_р�
     def движка_нет(*a, **k):
         raise DependencyMissing("gigaam")
 
-    monkeypatch.setattr(job_queue, "process_job", движка_нет)
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", движка_нет)
     повтор = client.post(f"/api/jobs/{ид}/retry", json={"model": "gigaam-v3-ctc"})
     assert повтор.status_code == 200, повтор.text
 

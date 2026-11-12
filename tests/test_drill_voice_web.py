@@ -218,7 +218,8 @@ def test_раздел_рисуется_не_дожидаясь_второй_ча
             window.fetch = (адрес, ...прочее) => (String(адрес).includes('part=heavy')
               ? new Promise((готово) => setTimeout(готово, 2500)).then(() => настоящий(адрес, ...прочее))
               : настоящий(адрес, ...прочее));""")
-        с = окно.открыть("voice")
+        # Без ожидания тишины: вторая часть нарочно ещё не отвечена.
+        с = окно.открыть("voice", тишина=False)
         с.wait_for_selector("#vo-s1 tr.drill-item")
         assert с.evaluate("window.__asrhub.state.voice.lists") is None
         шапка = с.inner_text("#vo-head").lower()

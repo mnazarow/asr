@@ -987,7 +987,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:26013-7deb07",
+  "instance": "vm:13982-e6bcbe",
   "instances": [],
   "workers": [
     {
@@ -1587,7 +1587,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794495841.555501,
+    "generated_at": 1794503892.750087,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1754,7 +1754,7 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.41",
+  "version": "3.1.42",
   "uptime_s": 1.7,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
@@ -1835,7 +1835,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.41",
+  "version": "3.1.42",
   "uptime_s": 1.8,
   "hardware": {
     "os_name": "Linux",
@@ -2595,8 +2595,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793891041.6321528,
-    "until": 1794495841.6321528
+    "since": 1793899092.8364365,
+    "until": 1794503892.8364365
   }
 }
 ```
@@ -5147,7 +5147,7 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 1.8,
+  "uptime_s": 1.9,
   "liveness": {
     "status": "ok",
     "checks": [

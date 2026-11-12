@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 from .db_util import ОсноваБазы, now
+from .errors import StorageError
 from .logging_setup import get_logger
 
 log = get_logger("db")
@@ -748,3 +749,523 @@ class СодержаниеБазы(ОсноваБазы):
             f"FROM model_checks m JOIN jobs j ON j.id = m.job_id WHERE {' AND '.join(where)} "
             "ORDER BY m.created_at DESC LIMIT ?", [*args, limit])
         return [dict(r) for r in rows]
+
+    def llm_outcome_filter(self, kind: str, value: str) -> tuple[str, list[Any]]:
+        """Условие отбора заданий по исходу или причине из ответа модели."""
+        колонка = {"outcome": "outcome", "reason": "reason"}[kind]
+        return (f"jobs.id IN (SELECT job_id FROM llm_results WHERE {колонка} = ?)", [value])
+
+    def file_paths(self, job_ids: list[str]) -> dict[str, str]:
+        """Пути исходных файлов по номерам заданий.
+
+        Отдельным запросом, а не колонкой облегчённого списка: путь на
+        диске сервера — не то, что должно уезжать в таблицу результатов
+        каждому ключу. Нужен только контрольному прогону — он ставит
+        задание на тот же файл.
+        """
+        out: dict[str, str] = {}
+        for i in range(0, len(job_ids), 500):
+            кусок = job_ids[i:i + 500]
+            места = ",".join("?" for _ in кусок)
+            for r in self.query(f"SELECT id, file_path FROM jobs WHERE id IN ({места})", кусок):
+                if r["file_path"]:
+                    out[str(r["id"])] = str(r["file_path"])
+        return out
+
+    def checked_job_ids(self, since: float) -> set[str]:
+        return {str(r["job_id"]) for r in self.query(
+            "SELECT job_id FROM model_checks WHERE created_at >= ?", (since,))}
+
+    #: Что зовёт запись в очередь коучинга. Выражения постоянные; причина
+    #: подписывается в коде по тем же полям.
+    COACHING_REASONS: tuple[tuple[str, str], ...] = (
+        ("violations", "COALESCE(c.violations,0) > 0"),
+        ("low_score", "c.agent_score IS NOT NULL AND c.agent_score < 60"),
+        ("script", "c.compliance IS NOT NULL AND c.compliance < 0.5"),
+        ("monologue", "c.monologue_s >= 150"),
+        ("impolite", "c.empathy IS NOT NULL AND c.empathy < 0"),
+        ("objections", "COALESCE(c.objections_unhandled,0) > 0"),
+        ("frustrated", "COALESCE(c.frustration,0) > 0"),
+        ("profanity", "COALESCE(c.profanity_agent,0) > 0"),
+    )
+
+    def coaching_queue(self, *, since: float | None = None,
+                       until: float | None = None,
+                       owner: str | list[str] | None = None,
+                       agent: tuple[str, str] | None = None,
+                       limit: int = 50, include_done: bool = False) -> list[dict[str, Any]]:
+        """Записи, которые стоит разобрать с оператором, — худшие первыми.
+
+        Разобранные (отметка coaching=done) не показываются, пока не
+        попросят: очередь — это то, что осталось, а не всё, что было.
+        """
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        причины = " OR ".join(f"({выр})" for _, выр in self.COACHING_REASONS)
+        колонки = ", ".join(f"c.{к.strip()}" for к in self.CONTENT_COLUMNS.split(","))
+        готово = "" if include_done else " AND COALESCE(m.status,'') <> 'done'"
+        rows = self.query(
+            f"SELECT {колонки}, j.owner, j.model, j.tags, j.created_at, "
+            f"       j.media_duration_s, j.filename, m.status AS mark_status, "
+            f"       m.note AS mark_note, m.updated_at AS mark_at "
+            f"FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"LEFT JOIN content_marks m ON m.job_id = c.job_id AND m.kind = 'coaching' "
+            f"WHERE {условие} AND ({причины}){готово} "
+            f"ORDER BY c.agent_score IS NULL, c.agent_score ASC, c.sentiment ASC LIMIT ?",
+            [*args, limit])
+        return [dict(r) for r in rows]
+
+    def coaching_count(self, *, since: float | None = None,
+                       until: float | None = None,
+                       owner: str | list[str] | None = None,
+                       agent: tuple[str, str] | None = None,
+                       include_done: bool = False) -> int:
+        """Сколько записей в очереди коучинга всего — без предела выдачи.
+
+        Число в заголовке очереди раньше было длиной выданного списка: при
+        пятистах записях в очереди карточка оператора писала «20», и
+        очередь выглядела разобранной.
+        """
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        причины = " OR ".join(f"({выр})" for _, выр in self.COACHING_REASONS)
+        готово = "" if include_done else " AND COALESCE(m.status,'') <> 'done'"
+        row = self.query_one(
+            "SELECT COUNT(*) AS n FROM content c JOIN jobs j ON j.id = c.job_id "
+            "LEFT JOIN content_marks m ON m.job_id = c.job_id AND m.kind = 'coaching' "
+            f"WHERE {условие} AND ({причины}){готово}", args)
+        return int(row["n"]) if row else 0
+
+    def reference_records(self, *, since: float | None = None,
+                          until: float | None = None,
+                          owner: str | list[str] | None = None,
+                          limit: int = 20) -> list[dict[str, Any]]:
+        """Лучшие разговоры периода — по баллу и тональности, без нарушений —
+        и всё, что отмечено эталоном руками, независимо от периода."""
+        условие, args = self._content_where(since, until, owner)
+        колонки = ", ".join(f"c.{к.strip()}" for к in self.CONTENT_COLUMNS.split(","))
+        общие = (f"SELECT {колонки}, j.owner, j.model, j.tags, j.created_at, "
+                 f"       j.media_duration_s, j.filename, m.status AS mark_status, "
+                 f"       m.note AS mark_note "
+                 f"FROM content c JOIN jobs j ON j.id = c.job_id "
+                 f"LEFT JOIN content_marks m ON m.job_id = c.job_id AND m.kind = 'reference' ")
+        лучшие = self.query(
+            общие + f"WHERE {условие} AND c.agent_score IS NOT NULL "
+            "AND COALESCE(c.violations,0) = 0 AND c.sentiment IS NOT NULL "
+            "ORDER BY c.agent_score DESC, c.sentiment DESC LIMIT ?", [*args, limit])
+        # Разрез по владельцу нужен обоим запросам, а не только первому:
+        # отметка «эталон» ставится вручную, и без этого условия ключ
+        # подразделения видел чужие разговоры целиком — с именем файла,
+        # владельцем и всем разбором.
+        отбор_владельца, args_владельца = self._owner_clause(owner, "j")
+        отмеченные = self.query(
+            общие + "WHERE j.status='completed' AND m.status = 'yes' "
+            + (f"AND {отбор_владельца} " if отбор_владельца else "")
+            + "ORDER BY m.updated_at DESC LIMIT ?", [*args_владельца, limit])
+        out: list[dict[str, Any]] = []
+        видели: set[str] = set()
+        for r in [*отмеченные, *лучшие]:
+            if r["job_id"] in видели:
+                continue
+            видели.add(r["job_id"])
+            out.append(dict(r))
+        return out
+
+    def tracker_hits(self, *, since: float | None = None,
+                     until: float | None = None,
+                     owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+        """Срабатывания трекеров за окно — по журналу событий.
+
+        Категория лежит в данных события; группируем по ней прямо в базе.
+        На сборке SQLite без JSON (редкость, но бывает) — пустой список,
+        а не ошибка: сводка от этого не должна пропадать.
+
+        Разрез по владельцу такой же, как у соседей по разделу: без него
+        ключ подразделения видел строку «трекер сработал 340 раз» по всему
+        серверу — и чужие числа, и сам факт чужих срабатываний.
+        """
+        where = ["e.kind='tracker'"]
+        args: list[Any] = []
+        if since:
+            where.append("e.ts>=?")
+            args.append(since)
+        if until:
+            where.append("e.ts<?")
+            args.append(until)
+        соединение = "FROM events e "
+        if owner:
+            соединение += "JOIN jobs j ON j.id = e.job_id "
+            отбор, свои = self._owner_clause(owner, "j")
+            if отбор:
+                where.append(отбор)
+                args.extend(свои)
+        try:
+            rows = self.query(
+                "SELECT json_extract(e.data, '$.category') AS category, "
+                "       json_extract(e.data, '$.label') AS label, COUNT(*) AS hits, "
+                "       COUNT(DISTINCT e.job_id) AS records "
+                f"{соединение}WHERE {' AND '.join(where)} "
+                "GROUP BY category ORDER BY hits DESC", args)
+        except StorageError:
+            return []
+        return [dict(r) for r in rows if r["category"]]
+
+    def uncategorized_count(self, *, since: float | None = None,
+                            until: float | None = None,
+                            owner: str | list[str] | None = None) -> int:
+        """Разобранные записи окна без единой категории обращения.
+
+        Считаются по таблице разбора, а не по всем заданиям: запись, до
+        которой разбор ещё не дошёл, не «без категории», а «не смотрели».
+        """
+        условие, args = self._content_where(since, until, owner)
+        row = self.query_one(
+            "SELECT COUNT(*) AS n FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"WHERE {условие} AND NOT EXISTS (SELECT 1 FROM content_hits h "
+            "WHERE h.job_id = c.job_id AND h.kind = 'topic')", args)
+        return int(row["n"]) if row else 0
+
+    def content_series(self, *, since: float, until: float, buckets: int = 24,
+                       owner: str | list[str] | None = None,
+                       agent: tuple[str, str] | None = None,
+                       ) -> tuple[int, float, list[dict[str, Any]]]:
+        """Ряд показателей содержания по времени — свёртка в SQL.
+
+        Возвращает и число корзин, до которого пришлось урезать запрошенное.
+        Без него вызывающая сторона рисовала запрошенные двести корзин по
+        урезанному шагу: на часовом окне это восемь тысяч секунд вместо
+        трёх с половиной, то есть полуторачасовой пустой хвост в будущем,
+        который читается как «разговоров не было».
+        """
+        buckets, шаг = self._bucket_step(since, until, buckets)
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        rows = self.query(
+            "SELECT CAST((j.created_at-?)/? AS INTEGER) AS bucket, "
+            "       COUNT(*) AS records, AVG(c.sentiment) AS sentiment, "
+            "       SUM(CASE WHEN c.sentiment < -0.15 THEN 1 ELSE 0 END) AS negative, "
+            "       SUM(CASE WHEN c.sentiment IS NOT NULL THEN 1 ELSE 0 END) AS scored, "
+            "       SUM(COALESCE(c.alerts,0)) AS alerts, "
+            "       AVG(c.compliance) AS compliance, AVG(c.wpm) AS wpm, "
+            "       AVG(c.agent_score) AS agent_score, AVG(c.empathy) AS empathy, "
+            "       SUM(CASE WHEN COALESCE(c.violations,0) > 0 THEN 1 ELSE 0 END) AS violation_records, "
+            # Показатели сверх тональности — тем же рядом: динамика у них
+            # важнее среза, по срезу не отличить «всегда так» от «стало так».
+            "       AVG(c.mood) AS mood, AVG(c.stress) AS stress, "
+            "       AVG(c.effort) AS effort, AVG(c.fatigue) AS fatigue, "
+            "       AVG(c.clarity) AS clarity, AVG(c.accuracy) AS accuracy, "
+            "       AVG(c.politeness) AS politeness, AVG(c.rhythm) AS rhythm, "
+            "       AVG(c.personalization) AS personalization, "
+            "       AVG(c.diminutive_rate) AS diminutive_rate, "
+            "       AVG(c.filler_rate) AS filler_rate, AVG(c.nps) AS nps, "
+            "       SUM(CASE WHEN c.nps_group = 'промоутер' THEN 1 ELSE 0 END) AS promoters, "
+            "       SUM(CASE WHEN c.nps_group = 'критик' THEN 1 ELSE 0 END) AS detractors, "
+            "       SUM(CASE WHEN c.nps IS NOT NULL THEN 1 ELSE 0 END) AS nps_checked, "
+            # Названный балл — своим рядом: на одной оси с предсказанным его
+            # видно, а сложенный с ним он пропадает.
+            "       AVG(c.nps_said) AS nps_said, "
+            "       SUM(CASE WHEN c.nps_said IS NOT NULL THEN 1 ELSE 0 END) AS nps_said_count "
+            "FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"WHERE {условие} GROUP BY bucket ORDER BY bucket",
+            [since, шаг, *args])
+        return buckets, шаг, [dict(r) for r in rows]
+
+    def content_top(self, order: str, *, since: float | None = None,
+                    until: float | None = None,
+                    owner: str | list[str] | None = None,
+                    where: str = "", limit: int = 20,
+                    agent: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+        """Записи окна по заданному порядку — для списков «что послушать».
+
+        `order` и `where` приходят не от пользователя, а из перечня отборов
+        в `insights`: подставлять сюда строку из запроса нельзя, и вызывающая
+        сторона обязана это гарантировать.
+        """
+        условие, args = self._content_where(since, until, owner, where, agent=agent)
+        колонки = ", ".join(f"c.{к.strip()}" for к in self.CONTENT_COLUMNS.split(","))
+        rows = self.query(
+            f"SELECT {колонки}, j.owner, j.model, j.tags, j.created_at, "
+            f"       j.media_duration_s, j.filename "
+            f"FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"WHERE {условие} ORDER BY {order} LIMIT ?", [*args, limit])
+        return [dict(r) for r in rows]
+
+    def content_sample(self, columns: list[str], *, since: float | None = None,
+                       until: float | None = None,
+                       owner: str | list[str] | None = None,
+                       limit: int = 20000,
+                       agent: tuple[str, str] | None = None) -> list[tuple[float, ...]]:
+        """Выборка числовых признаков для расчёта связей.
+
+        Именно выборка, а не весь корпус: коэффициент корреляции по двадцати
+        тысячам записей отличается от коэффициента по ста тысячам в третьем
+        знаке, а поднимать впятеро больше строк ради этого незачем. Берутся
+        свежие: связь на прошлогодних настройках сервера — это ответ на
+        вопрос, которого никто не задавал.
+        """
+        безопасные = [к for к in columns if к in self.CONTENT_NUMERIC]
+        if not безопасные:
+            return []
+        поля = ", ".join(self.CONTENT_NUMERIC[к] for к in безопасные)
+        условие, args = self._content_where(since, until, owner, agent=agent)
+        rows = self.query(
+            f"SELECT {поля} FROM content c JOIN jobs j ON j.id = c.job_id "
+            f"WHERE {условие} ORDER BY j.created_at DESC LIMIT ?", [*args, limit])
+        if len(безопасные) == len(columns):
+            return [tuple(r) for r in rows]
+        # Столбец, которого здесь нет, раньше просто выпадал из выборки — а
+        # тот, кто её заказал, продолжал считать по номерам запрошенного
+        # списка. Номера съезжали, и «паузы» молча начинали означать «самую
+        # долгую паузу»: не ошибка, не исключение, а неверные числа в отчёте.
+        # Теперь позиции сохраняются, а неизвестный столбец приходит пустым.
+        места = {к: н for н, к in enumerate(безопасные)}
+        порядок = [места.get(к) for к in columns]
+        # Неизвестный столбец — пустое место (None), а не сдвиг номеров.
+        return [tuple(None if н is None else r[н] for н in порядок)  # type: ignore[misc]
+                for r in rows]
+
+    def terms_matrix(self, *, since: float | None = None,
+                     until: float | None = None,
+                     owner: str | list[str] | None = None,
+                     limit: int = 5000,
+                     min_terms: int = 5) -> list[tuple[str, dict[str, int]]]:
+        """Основы каждой записи окна: готовая разрежённая матрица «запись × слово».
+
+        Берётся из `content_terms`, а не из текстов: таблица заполняется при
+        разборе, и повторно разбирать сто тысяч расшифровок ради кластеризации
+        незачем — это часы работы вместо секунд.
+
+        Записи короче `min_terms` основ выбрасываются: на трёх словах похожесть
+        считается, но означает случайность, и такие записи склеиваются в один
+        огромный кластер «здравствуйте — до свидания».
+        """
+        условие, args = self._content_where(since, until, owner)
+        строки = self.query(
+            "SELECT t.job_id AS job_id, t.stem AS stem, t.n AS n "
+            "FROM content_terms t "
+            "JOIN jobs j ON j.id = t.job_id "
+            "JOIN content c ON c.job_id = t.job_id "
+            f"WHERE {условие} "
+            "  AND t.job_id IN ("
+            "    SELECT c2.job_id FROM content c2 JOIN jobs j2 ON j2.id = c2.job_id "
+            f"    WHERE {условие.replace('j.', 'j2.').replace('c.', 'c2.')} "
+            "    ORDER BY j2.created_at DESC LIMIT ?)",
+            [*args, *args, max(1, int(limit))])
+        по_записям: dict[str, dict[str, int]] = {}
+        for строка in строки:
+            по_записям.setdefault(str(строка["job_id"]), {})[
+                str(строка["stem"])] = int(строка["n"] or 1)
+        return [(ид, основы) for ид, основы in по_записям.items()
+                if len(основы) >= max(1, int(min_terms))]
+
+    def hits_for_jobs(self, job_ids: list[str]) -> dict[str, list[str]]:
+        """Какие категории сработали у каждой из записей.
+
+        Нужно, чтобы отличить тему, под которую правило уже написано, от той,
+        которой никто не заметил. Вторая — единственное, ради чего стоит
+        кластеризовать: первую и так видно в отчёте по категориям.
+        """
+        if not job_ids:
+            return {}
+        итог: dict[str, list[str]] = {}
+        # Партиями: SQLite держит предел на число параметров запроса, и на
+        # выборке в пять тысяч записей запрос одним куском просто не собрался бы.
+        шаг = 400
+        for начало in range(0, len(job_ids), шаг):
+            кусок = [str(и) for и in job_ids[начало:начало + шаг]]
+            места = ",".join("?" for _ in кусок)
+            for строка in self.query(
+                    f"SELECT job_id, category FROM content_hits "
+                    f"WHERE job_id IN ({места})", кусок):
+                итог.setdefault(str(строка["job_id"]), []).append(
+                    str(строка["category"]))
+        return итог
+
+    def top_terms(self, *, since: float | None = None,
+                  until: float | None = None,
+                  owner: str | list[str] | None = None,
+                  stems: list[str] | None = None,
+                  limit: int = 60, min_records: int = 2) -> list[dict[str, Any]]:
+        """Самые частые темы окна: основа, форма для показа, число записей.
+
+        Считается в базе группировкой по основе. Поднимать ради этого своды
+        записей в память нельзя: тема — это «в скольких записях встретилось
+        слово», а своды слов не содержат вовсе, они про числа.
+
+        Два запроса, а не один. Форму показа («поставки» вместо «поставк»)
+        сначала выбирал подзапрос в списке колонок — по одному на каждую
+        строку ответа. На двух миллионах основ он занимал шесть секунд из
+        шести с половиной: подзапрос выполнялся для каждой группы заново.
+        Теперь формы добираются вторым запросом и только для тех
+        нескольких десятков основ, которые пойдут в ответ.
+
+        Соединение с заданиями тоже не бесплатное, поэтому без окна и без
+        владельца его нет вовсе: в таблице основ лежат только завершённые
+        записи, а `delete_job` убирает их вместе с заданием — то есть
+        соединение в этом случае не отбрасывает ни одной строки.
+        """
+        # Перечень основ (`stems`) нужен сравнению окон: сколько раз именно
+        # ЭТИ темы встречались раньше. Без него прошлое окно спрашивалось
+        # своей верхушкой, и тема, не попавшая в срез, считалась
+        # встретившейся ноль раз — то есть новой.
+        if stems is not None and not stems:
+            return []
+        if stems is not None:
+            # Перечень основ сам задаёт размер ответа. Предел по умолчанию
+            # (60) молча срезал его: из девяноста запрошенных основ прошлого
+            # окна возвращались шестьдесят, остальные считались «было 0», и
+            # сортировка по величине изменения выносила наверх именно их —
+            # «что изменилось» целиком состояло из выдуманных скачков.
+            limit = max(int(limit or 0), len(stems))
+        нужен_join = bool(since or until or owner)
+        отбор = ""
+        отбор_args: list[Any] = []
+        if stems is not None:
+            места = ",".join("?" for _ in stems)
+            отбор = f" AND t.stem IN ({места})" if нужен_join \
+                else f" WHERE t.stem IN ({места})"
+            отбор_args = list(stems)
+        if нужен_join:
+            условие, args = self._content_where(since, until, owner)
+            источник = ("FROM content_terms t JOIN jobs j ON j.id = t.job_id "
+                        f"WHERE {условие}{отбор} ")
+        else:
+            источник, args = f"FROM content_terms t{отбор} ", []
+        args = [*args, *отбор_args]
+        rows = self.query(
+            # COUNT(*), а не COUNT(DISTINCT job_id): первичный ключ таблицы —
+            # (job_id, stem), то есть внутри группы по основе каждое задание
+            # встречается ровно один раз, и различать там нечего. Разница не
+            # косметическая: DISTINCT заводит временное дерево на два
+            # миллиона строк и стоит две секунды из двух с небольшим.
+            "SELECT t.stem AS stem, COUNT(*) AS records, "
+            "       SUM(t.n) AS mentions "
+            f"{источник}"
+            "GROUP BY t.stem HAVING records >= ? "
+            "ORDER BY records DESC, mentions DESC LIMIT ?",
+            [*args, min_records, limit])
+        формы = self.term_words([str(r["stem"]) for r in rows])
+        return [{"stem": r["stem"], "word": формы.get(str(r["stem"]), r["stem"]),
+                 "records": int(r["records"]), "mentions": int(r["mentions"] or 0)}
+                for r in rows]
+
+    def term_shift(self, *, since: float, before_since: float,
+                   owner: str | list[str] | None = None,
+                   size_now: int, size_before: int,
+                   min_records: int = 3, limit: int = 15) -> list[dict[str, Any]]:
+        """Основы, доля которых сильнее всего изменилась между двумя окнами.
+
+        Окна смежные: прошлое — от `before_since` до `since`, текущее — от
+        `since`. Оба считаются одним проходом с условной суммой, и порядок —
+        по модулю изменения доли прямо в базе, по ВСЕМ основам обоих окон.
+        Прежний способ брал кандидатов из верхушек окон по числу записей, и
+        тема, которой не стало совсем (сбой починили, акция кончилась), в
+        кандидаты не попадала: в верхушке текущего окна её нет, а в верхушке
+        прошлого ей мешали темы почаще — хотя её изменение самое большое.
+
+        `size_now` и `size_before` — число разобранных записей в окнах: доля
+        считается от них, как и в своде тем.
+        """
+        if not size_now or not size_before:
+            return []
+        условие, args = self._content_where(before_since, None, owner)
+        rows = self.query(
+            "SELECT t.stem AS stem, "
+            "       SUM(CASE WHEN j.created_at >= ? THEN 1 ELSE 0 END) AS now, "
+            "       SUM(CASE WHEN j.created_at < ? THEN 1 ELSE 0 END) AS before "
+            "FROM content_terms t JOIN jobs j ON j.id = t.job_id "
+            f"WHERE {условие} "
+            "GROUP BY t.stem HAVING now + before >= ? "
+            "ORDER BY ABS(now * ? - before * ?) DESC, now + before DESC, t.stem "
+            "LIMIT ?",
+            [since, since, *args, int(min_records),
+             100.0 / size_now, 100.0 / size_before, int(limit)])
+        формы = self.term_words([str(r["stem"]) for r in rows])
+        return [{"stem": r["stem"], "word": формы.get(str(r["stem"]), r["stem"]),
+                 "now": int(r["now"] or 0), "before": int(r["before"] or 0)}
+                for r in rows]
+
+    def new_terms(self, *, since: float, until: float | None = None,
+                  before_since: float | None, before_until: float,
+                  owner: str | list[str] | None = None,
+                  min_records: int = 3, limit: int = 15) -> list[dict[str, Any]]:
+        """Основы окна, которых в прошлом окне не было ни в одной записи.
+
+        Отдельный запрос, а не фильтр по верхушке тренда. Раньше новые слова
+        искались среди первых сотен основ по числу записей, потом среди
+        первых сотни по величине изменения — и только после этого
+        отбрасывалось всё, что звучало раньше. Настоящее новое слово редкое по
+        определению: «мегаакция» в трёх записях стояла 676-й из 677 и до
+        фильтра не доживала никогда, а список пустел.
+
+        Прошлое окно сворачивается в набор основ один раз (`NOT IN` по
+        подзапросу без связи с внешним — SQLite строит по нему временный
+        указатель), так что стоимость — два прохода по окнам, как у тренда.
+        """
+        условие, args = self._content_where(since, until, owner)
+        условие_было, args_было = self._content_where(before_since, before_until, owner)
+        rows = self.query(
+            "SELECT t.stem AS stem, COUNT(*) AS records, SUM(t.n) AS mentions "
+            "FROM content_terms t JOIN jobs j ON j.id = t.job_id "
+            f"WHERE {условие} AND t.stem NOT IN ("
+            "  SELECT t2.stem FROM content_terms t2 JOIN jobs j ON j.id = t2.job_id "
+            f"  WHERE {условие_было}) "
+            "GROUP BY t.stem HAVING records >= ? "
+            "ORDER BY records DESC, mentions DESC LIMIT ?",
+            [*args, *args_было, int(min_records), int(limit)])
+        формы = self.term_words([str(r["stem"]) for r in rows])
+        return [{"stem": r["stem"], "word": формы.get(str(r["stem"]), r["stem"]),
+                 "records": int(r["records"]), "mentions": int(r["mentions"] or 0)}
+                for r in rows]
+
+    def vocabulary_size(self) -> int:
+        """Сколько разных основ знает сервер — одно число, без выборки.
+
+        Нужно состоянию разбора, которое интерфейс опрашивает раз в
+        пятнадцать секунд. Раньше оно брало эту цифру из снимка корпусных
+        частот, а снимок сбрасывается после каждой порции фонового
+        разбора — то есть каждые пять секунд, пока архив разбирается.
+        Получалось, что ровно во время разбора кеш не работал никогда, и
+        каждый опрос полосы состояния делал полную группировку по таблице
+        основ: на архиве в сотню тысяч записей это секунды, причём под
+        общей блокировкой, которая на это же время останавливает и сам
+        разбор, и открытие карточки.
+        """
+        row = self.query_one("SELECT COUNT(*) AS n FROM content_vocab")
+        return int(row["n"]) if row else 0
+
+    def term_words(self, stems: list[str]) -> dict[str, str]:
+        """Самая частая форма показа для каждой из перечисленных основ.
+
+        Самая частая среди записей, а не первая попавшаяся: у одной основы
+        форм несколько («поставка», «поставки»), и произвольный выбор менял
+        бы подпись темы от отчёта к отчёту.
+        """
+        if not stems:
+            return {}
+        места = ",".join("?" for _ in stems)
+        rows = self.query(
+            f"SELECT stem, word, n FROM content_vocab WHERE stem IN ({места}) "
+            f"ORDER BY stem, n DESC, word", list(stems))
+        формы: dict[str, str] = {}
+        for r in rows:
+            формы.setdefault(str(r["stem"]), str(r["word"]))
+        return формы
+
+    def content_window_size(self, *, since: float | None = None,
+                            until: float | None = None,
+                            owner: str | list[str] | None = None) -> int:
+        """Сколько разобранных записей попадает в окно — знаменатель долей."""
+        where = ["j.status='completed'", "c.job_id IS NOT NULL"]
+        args: list[Any] = []
+        if since:
+            where.append("j.created_at>=?")
+            args.append(since)
+        if until:
+            where.append("j.created_at<?")
+            args.append(until)
+        if owner:
+            владельцы = [owner] if isinstance(owner, str) else list(owner)
+            where.append("j.owner IN (" + ",".join("?" for _ in владельцы) + ")")
+            args.extend(владельцы)
+        row = self.query_one(
+            "SELECT COUNT(*) AS n FROM jobs j JOIN content c ON c.job_id = j.id "
+            f"WHERE {' AND '.join(where)}", args)
+        return int(row["n"]) if row else 0

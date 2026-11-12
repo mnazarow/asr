@@ -183,7 +183,7 @@ def test_правка_числа_воркеров_не_поднимает_оче
 def test_уведомление_из_окна_остановки_досылается_после_запуска(сервер, приёмник, monkeypatch):
     state = сервер.app.state.hub
     очередь = state.queue
-    monkeypatch.setattr(jq, "process_job", подмена(hook=lambda _в: очередь._stop.set()))
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена(hook=lambda _в: очередь._stop.set()))
     задание = _поставить(state, _загрузка(state), webhook_url=приёмник.адрес())
     очередь.start()
     assert ждать(lambda: state.db.get_job(задание["id"])["status"] == "completed")
@@ -283,7 +283,7 @@ def test_оживший_экземпляр_не_стирает_реплики_с
         state.db.update_job(задание["id"], status="completed", instance_id=None,
                             segments_count=3)
 
-    monkeypatch.setattr(jq, "process_job", подмена(hook=сосед_досчитал))
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена(hook=сосед_досчитал))
     state.queue.start()
     assert ждать(lambda: (state.db.get_job(задание["id"]) or {}).get("status") == "completed")
     assert ждать(lambda: not state.queue._running)
@@ -309,7 +309,7 @@ def test_поздняя_отмена_повтора_возвращает_пре�
     def поздняя_отмена(_в):
         state.db.update_job(задание["id"], status="cancelled")
 
-    monkeypatch.setattr(jq, "process_job", подмена(hook=поздняя_отмена))
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена(hook=поздняя_отмена))
     state.queue.retry(задание["id"])
     state.queue.start()
     assert ждать(lambda: any(с["kind"] == "rescan_reverted"
@@ -350,7 +350,7 @@ def test_своё_задание_без_исполнителя_возвраща�
 
 def test_остановка_возвращает_и_задание_без_исполнителя(сервер, monkeypatch):
     state = сервер.app.state.hub
-    monkeypatch.setattr(jq, "process_job", подмена())
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена())
     очередь = state.queue
     state.queue.pause()                         # чтобы воркер не взял его сам
     задание = _поставить(state, _загрузка(state))
@@ -411,7 +411,7 @@ def test_справедливое_разделение_при_одном_вор�
     state = сервер.app.state.hub
     state.settings.set("scheduling_policy", "fair_share")
     порядок: list[str] = []
-    monkeypatch.setattr(jq, "process_job", подмена(
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена(
         hook=lambda в: порядок.append(Path(в["source"]).name)))
     # Записи разной длины: одинаковые файлы одного владельца с 3.1.32 ждут
     # идущего близнеца и берут его результат, а не идут в модель.
@@ -453,7 +453,7 @@ def test_рабочий_каталог_задания_в_temp_dir_и_со_сво
     быстрый = tmp_path / "быстрый"
     state.settings.set("temp_dir", str(быстрый))
     подменённая = подмена()
-    monkeypatch.setattr(jq, "process_job", подменённая)
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подменённая)
     задание = _поставить(state, _загрузка(state))
     state.queue.start()
     assert ждать(lambda: state.db.get_job(задание["id"])["status"] == "completed")
@@ -514,7 +514,7 @@ def test_причина_отказа_в_журнале_с_трассировко
     события: list[tuple[str, dict]] = []
     state.queue.on_event = lambda вид, данные: события.append((вид, данные))
     путь = "/opt/asrhub/data/models/hub/v3_ctc.ckpt"
-    monkeypatch.setattr(jq, "process_job", подмена(
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена(
         fail=FileNotFoundError(2, "No such file or directory", путь)))
     журнал = _Записи()
     logging.getLogger("asrhub.queue").addHandler(журнал)
@@ -602,7 +602,7 @@ def test_вытеснение_после_освобождения_соблюда
 
 def test_клон_из_кеша_несёт_поля_своей_загрузки(сервер, monkeypatch):
     state = сервер.app.state.hub
-    monkeypatch.setattr(jq, "process_job", подмена())
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена())
     первое = _поставить(state, _загрузка(state, "a.wav"), owner="alice")
     state.queue.start()
     assert ждать(lambda: state.db.get_job(первое["id"])["status"] == "completed")
@@ -634,7 +634,7 @@ def test_пауза_очереди_общая_и_переживает_перез
 
 def test_доклады_прогресса_пишутся_в_базу_не_на_каждый_кусок(сервер, monkeypatch):
     state = сервер.app.state.hub
-    monkeypatch.setattr(jq, "process_job", подмена(steps=60))
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", подмена(steps=60))
     записей = {"n": 0}
     настоящее = state.db.update_job_if_status
 

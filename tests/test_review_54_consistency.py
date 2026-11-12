@@ -11,7 +11,7 @@
   служебные переменные сценариев — нет.
 * Пик памяти замеряется и на занятом сервере, а общий счётчик обнуляется
   только когда задание идёт одно, — раньше это сторожила проверка, искавшая
-  в `job_queue.py` подстроку `measure_memory=True`.
+  в исходнике очереди подстроку `measure_memory=True`.
 * Первая фраза главы «Мониторинг» складывается в объявленное «всего».
 """
 from __future__ import annotations
@@ -175,7 +175,7 @@ def test_пик_памяти_замеряется_и_на_занятом_сер�
             оба_идут.wait(60)
         return настоящий(*args, **kwargs)
 
-    monkeypatch.setattr(job_queue, "process_job", обёртка)
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", обёртка)
     app = create_app(load(), start_queue=True)
     with TestClient(app) as c:
         def отправить(запись: Path = sample_wav) -> str:

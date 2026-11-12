@@ -628,7 +628,6 @@ def test_hung_engine_is_taken_off_and_the_worker_replaced(data_dir: Path,
     """Движок, зависший внутри библиотеки, держал слот и задание вечно."""
     import threading
 
-    from asrhub import job_queue as jq
     from asrhub.api import create_app
     from asrhub.config import load
     from fastapi.testclient import TestClient
@@ -645,7 +644,7 @@ def test_hung_engine_is_taken_off_and_the_worker_replaced(data_dir: Path,
             отпустить.wait(30)
         return обычная(source, settings, registry, **k)
 
-    monkeypatch.setattr(jq, "process_job", зависающая)
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", зависающая)
     with TestClient(create_app(load(), start_queue=False)) as клиент:
         state = клиент.app.state.hub
         queue = state.queue

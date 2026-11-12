@@ -136,6 +136,10 @@ const API = {
   _inflight: new Map(),
   /** Все незавершённые запросы на чтение — их снимает смена раздела. */
   _pending: new Set(),
+  /** Сколько запросов к серверу идёт сейчас — любых. Его читают проверки в
+   * браузере (`window.__asrhub.запросов()`): «раздел дочитал всё» вместо
+   * выдержки наугад после щелчка. */
+  _идёт: 0,
 
   /**
    * Снимает все незавершённые запросы на чтение.
@@ -212,6 +216,7 @@ const API = {
     }
     let response;
     let text;
+    this._идёт += 1;
     try {
       response = await fetch(path, opts);
       // Тело читается под тем же сигналом: отмена приходит и во время
@@ -232,6 +237,7 @@ const API = {
       throw { code: 'network', message: 'Сервер недоступен',
               hint: 'Проверьте, что служба asrhub запущена и доступна по сети.' };
     } finally {
+      this._идёт -= 1;
       if (own) this._pending.delete(own);
       if (таймер) clearTimeout(таймер);
     }
@@ -406,7 +412,8 @@ function заторможено() { return Date.now() < (state.тормозДо 
 
 function h(html) {
   const tpl = document.createElement('template');
-  tpl.innerHTML = html.trim();
+  // Строка или шаблон html`…` (Разметка): оба — строкой.
+  tpl.innerHTML = String(html).trim();
   return tpl.content.firstElementChild;
 }
 /* Экранирование для разметки — текста и значений атрибутов.
@@ -2047,7 +2054,8 @@ function installHotkeys() {
 
 const RENDERERS = {};
 window.__asrhub = { state, API, RENDERERS, go, toast, renderView, showHotkeys, fail,
-                    openTab: (адрес) => открытьВкладкой(адрес) };
+                    openTab: (адрес) => открытьВкладкой(адрес),
+                    запросов: () => API._идёт };
 // Чистые помощники разметки и чисел — для проверок в браузере и отладки из
 // консоли: сам файл завёрнут в функцию, и снаружи их иначе не достать.
 window.__asrhub.util = {
@@ -9862,8 +9870,8 @@ RENDERERS.pbx = {
         `/api/telephony/diagnose?station=${encodeURIComponent(state.pbxStation || '')}`);
       this.drawDiagResult(итог);
     } catch (err) {
-      if (место) место.innerHTML = `<div class="empty">Разбор не удался: ${
-        esc(err.message || '')}</div>`;
+      if (место) место.innerHTML = html`<div class="empty">Разбор не удался: ${
+        err.message || ''}</div>`;
     } finally {
       if (кнопка) { кнопка.disabled = false; кнопка.textContent = 'Разобрать забор'; }
     }
@@ -9877,23 +9885,24 @@ RENDERERS.pbx = {
       место.innerHTML = '<div class="empty">Станции не настроены.</div>';
       return;
     }
+    // Заголовок и подсказку card() экранирует сам; тело и кнопки — шаблоном.
     место.innerHTML = станции.map((с) => {
       const вид = СОСТОЯНИЕ_ВИД[с.state] || СОСТОЯНИЕ_ВИД.off;
       return card(`${с.name || с.station} · ${ПАТС_ИСТОЧНИКИ[с.source] || с.source}`,
         `${с.failed ? `${с.failed} неисправностей` : (с.warned ? `${с.warned} предупреждений` : 'всё в порядке')}`,
-        `<div class="banner ${с.state === 'fail' ? 'err' : (с.state === 'warn' ? 'warn' : '')}"
+        html`<div class="banner ${с.state === 'fail' ? 'err' : (с.state === 'warn' ? 'warn' : '')}"
            style="${с.state === 'ok' ? 'background:var(--bg-elev-2);color:inherit;border-color:var(--border)' : ''}">
-           ${esc(с.verdict || '')}</div>
+           ${с.verdict || ''}</div>
          <div class="table-wrap"><table><tbody>
-          ${(с.checks || []).map((п) => `<tr>
+          ${(с.checks || []).map((п) => html`<tr>
             <td style="width:18px"><span class="status-dot ${
               (СОСТОЯНИЕ_ВИД[п.state] || СОСТОЯНИЕ_ВИД.off).dot}"></span></td>
-            <td style="width:220px">${esc(п.title)}</td>
-            <td class="small">${esc(String(п.value || ''))}
-              ${п.hint ? `<div class="dim" style="margin-top:3px">${esc(п.hint)}</div>` : ''}</td>
-          </tr>`).join('')}
+            <td style="width:220px">${п.title}</td>
+            <td class="small">${String(п.value || '')}
+              ${п.hint && html`<div class="dim" style="margin-top:3px">${п.hint}</div>`}</td>
+          </tr>`)}
         </tbody></table></div>`,
-        `<span class="chip ${вид.cls}">${esc(вид.label)}</span>`);
+        html`<span class="chip ${вид.cls}">${вид.label}</span>`);
     }).join('');
   },
 
@@ -9967,15 +9976,15 @@ RENDERERS.pbx = {
     место.innerHTML = заходы.map((з) => card(
       `Сбор архива · ${з.station}`,
       з.running ? 'идёт' : 'завершён',
-      `<div class="grid cols-5">
-        ${kpi('Проходов', num(з.passes || 0), '')}
-        ${kpi('Увидено', num(з.seen || 0), 'звонков в журнале')}
-        ${kpi('Поставлено', num(з.imported || 0), 'в очередь распознавания')}
-        ${kpi('Пропущено', num(з.skipped || 0),
-          esc(Object.entries(з.reasons || {}).map(([к, в]) => `${к}: ${в}`).join(', ')))}
-        ${kpi('Вне периода', num(з.outside || 0), 'не попали в промежуток')}
+      html`<div class="grid cols-5">
+        ${raw(kpi('Проходов', num(з.passes || 0), ''))}
+        ${raw(kpi('Увидено', num(з.seen || 0), 'звонков в журнале'))}
+        ${raw(kpi('Поставлено', num(з.imported || 0), 'в очередь распознавания'))}
+        ${raw(kpi('Пропущено', num(з.skipped || 0),
+          esc(Object.entries(з.reasons || {}).map(([к, в]) => `${к}: ${в}`).join(', '))))}
+        ${raw(kpi('Вне периода', num(з.outside || 0), 'не попали в промежуток'))}
       </div>
-      ${з.error ? `<div class="banner err" style="margin-top:10px">${esc(з.error)}</div>` : ''}`)).join('');
+      ${з.error && html`<div class="banner err" style="margin-top:10px">${з.error}</div>`}`)).join('');
     if (заходы.some((з) => з.running)) {
       this.collectTimer = setTimeout(() => this.pollCollect(), 3000);
     }
@@ -10256,46 +10265,48 @@ RENDERERS.pbx = {
       : с.last_error ? ['err', 'ошибка источника']
       : с.running ? ['ok', 'работает']
       : !д.enabled ? ['', 'забор выключен'] : ['warn', 'поток стоит'];
-    return `<section class="card tight pbx-card" data-station="${esc(с.id)}">
+    // Р() отдаёт готовую разметку (ссылку раскрытия) — через raw().
+    const р = (...а) => raw(Р(...а));
+    return html`<section class="card tight pbx-card" data-station="${с.id}">
       <div class="card-head">
-        <h3 title="${esc(с.id)}">${esc(с.name)}</h3>
+        <h3 title="${с.id}">${с.name}</h3>
         <span class="chip ${состояние[0]}">${состояние[1]}</span>
         <span class="spacer"></span>
         <span class="chip" title="откуда сервер узнаёт о звонках">${
-          esc(ПАТС_ИСТОЧНИКИ[с.source] || с.source || '—')}</span>
+          ПАТС_ИСТОЧНИКИ[с.source] || с.source || '—'}</span>
       </div>
       <div style="padding:10px 14px 4px">
         <div class="row" style="gap:16px;align-items:flex-end">
           <div><div class="kpi-label">За период</div>
-            <div class="kpi-value" style="font-size:22px">${Р(свои.total, num(свои.total || 0, 0),
+            <div class="kpi-value" style="font-size:22px">${р(свои.total, num(свои.total || 0, 0),
               { ...её, title: `${с.name}: звонки за период` })}</div></div>
           <div><div class="kpi-label">Распознано</div>
-            <div class="kpi-value" style="font-size:22px">${Р(свои.queued, num(свои.queued || 0, 0),
+            <div class="kpi-value" style="font-size:22px">${р(свои.queued, num(свои.queued || 0, 0),
               { ...её, f: ['recognized'], title: `${с.name}: поставлено на распознавание` })}</div></div>
           <div><div class="kpi-label">Наговорено</div>
-            <div class="kpi-value" style="font-size:22px">${Р(свои.talk_s, fmtDur(свои.talk_s || 0),
+            <div class="kpi-value" style="font-size:22px">${р(свои.talk_s, fmtDur(свои.talk_s || 0),
               наговорено(`${с.name}: сначала самые долгие разговоры`, её))}</div></div>
           <span class="spacer"></span>
-          <div class="pbx-spark" data-station="${esc(с.id)}"></div>
+          <div class="pbx-spark" data-station="${с.id}"></div>
         </div>
         <div class="row wrap small dim" style="gap:6px;margin-top:8px">
-          <span title="всего в архиве этой станции">архив: ${Р(звонки.total,
+          <span title="всего в архиве этой станции">архив: ${р(звонки.total,
             num(звонки.total || 0, 0), { ...её, title: `${с.name}: весь архив` }, весь)}</span>
-          ${звонки.skipped ? `<span title="пропущено: короткие, без ответа, без записи">
-            · пропущено ${Р(звонки.skipped, num(звонки.skipped, 0),
+          ${звонки.skipped ? html`<span title="пропущено: короткие, без ответа, без записи">
+            · пропущено ${р(звонки.skipped, num(звонки.skipped, 0),
               { ...её, f: ['skipped'], title: `${с.name}: пропущено за всё время` }, весь)}</span>` : ''}
-          ${звонки.deferred ? `<span title="записи ещё дописываются — вернёмся к ним">
-            · отложено ${Р(звонки.deferred, num(звонки.deferred, 0),
+          ${звонки.deferred ? html`<span title="записи ещё дописываются — вернёмся к ним">
+            · отложено ${р(звонки.deferred, num(звонки.deferred, 0),
               { ...её, f: ['deferred'], title: `${с.name}: отложено` }, весь)}</span>` : ''}
-          ${с.last_run ? `<span>· заход ${esc(fmtTime(с.last_run))}</span>`
-            : '<span>· заходов ещё не было</span>'}
+          ${с.last_run ? html`<span>· заход ${fmtTime(с.last_run)}</span>`
+            : html`<span>· заходов ещё не было</span>`}
         </div>
-        ${с.last_error ? `<div class="banner err" style="margin:10px 0 0">
-          <b>Источник отвечает ошибкой.</b> ${esc(с.last_error)}</div>` : ''}
+        ${с.last_error && html`<div class="banner err" style="margin:10px 0 0">
+          <b>Источник отвечает ошибкой.</b> ${с.last_error}</div>`}
       </div>
       <div class="row wrap" style="gap:6px;padding:10px 14px 12px">
         <button class="ghost sm" data-act="calls" title="Журнал звонков этой станции">Звонки</button>
-        ${админ ? `
+        ${админ && html`
           <button class="ghost sm" data-act="test" title="Достучаться до источника и сказать, что именно не так">Проверить</button>
           <button class="btn sm" data-act="scan" title="Заход за новыми звонками прямо сейчас">Забрать</button>
           <button class="ghost sm" data-act="edit" title="Изменить поля станции">Изменить</button>
@@ -10303,7 +10314,7 @@ RENDERERS.pbx = {
             ? 'Перестать ходить на эту АТС; настройки и позиция чтения сохранятся'
             : 'Снова забирать записи с этой АТС'}">${с.enabled ? 'Выключить' : 'Включить'}</button>
           <button class="ghost sm danger" data-act="remove"
-            title="Убрать станцию из настроек; её звонки останутся в архиве">Убрать</button>` : ''}
+            title="Убрать станцию из настроек; её звонки останутся в архиве">Убрать</button>`}
       </div>
     </section>`;
   },
@@ -10319,26 +10330,28 @@ RENDERERS.pbx = {
       const чьё = (настроена || {}).name || с.station || 'без станции';
       // Строка — про свою станцию; пустой идентификатор — звонки без станции.
       const её = { станция: с.station };
-      const состояние = !настроена ? '<span class="dim">только в архиве</span>'
-        : !настроена.enabled ? '<span class="chip">выключена</span>'
-        : настроена.last_error ? `<span class="chip err" title="${esc(настроена.last_error)}">ошибка</span>`
-        : настроена.running ? '<span class="chip ok">работает</span>'
-        : !д.enabled ? '<span class="chip">забор выключен</span>'
-        : '<span class="chip warn">поток стоит</span>';
-      return `<tr>
-        <td>${esc(чьё)}</td>
-        <td class="small dim">${esc(ПАТС_ИСТОЧНИКИ[(настроена || {}).source] || '—')}</td>
-        <td class="num">${Р(с.total, num(с.total, 0),
+      const состояние = !настроена ? html`<span class="dim">только в архиве</span>`
+        : !настроена.enabled ? html`<span class="chip">выключена</span>`
+        : настроена.last_error ? html`<span class="chip err" title="${настроена.last_error}">ошибка</span>`
+        : настроена.running ? html`<span class="chip ok">работает</span>`
+        : !д.enabled ? html`<span class="chip">забор выключен</span>`
+        : html`<span class="chip warn">поток стоит</span>`;
+      // Р() отдаёт готовую разметку (ссылку раскрытия) — через raw().
+      const р = (...а) => raw(Р(...а));
+      return html`<tr>
+        <td>${чьё}</td>
+        <td class="small dim">${ПАТС_ИСТОЧНИКИ[(настроена || {}).source] || '—'}</td>
+        <td class="num">${р(с.total, num(с.total, 0),
           { ...её, title: `${чьё}: звонки за период` })}</td>
-        <td class="num">${с.total ? Р(с.answered, num((с.answered / с.total) * 100, 1) + ' %',
+        <td class="num">${с.total ? р(с.answered, num((с.answered / с.total) * 100, 1) + ' %',
           { ...её, f: ['answered'], title: `${чьё}: отвеченные` }) : '—'}</td>
-        <td class="num">${с.total ? Р(с.queued, num((с.queued / с.total) * 100, 1) + ' %',
+        <td class="num">${с.total ? р(с.queued, num((с.queued / с.total) * 100, 1) + ' %',
           { ...её, f: ['recognized'], title: `${чьё}: поставлено на распознавание` }) : '—'}</td>
-        <td class="num">${Р(с.talk_s, fmtDur(с.talk_s),
+        <td class="num">${р(с.talk_s, fmtDur(с.talk_s),
           наговорено(`${чьё}: сначала самые долгие разговоры`, её))}</td>
-        <td class="num">${Р(с.answered, fmtDur(среднее),
+        <td class="num">${р(с.answered, fmtDur(среднее),
           средний(`${чьё}: отвеченные, сначала самые долгие`, её))}</td>
-        <td class="num">${Р(с.skipped, num(с.skipped, 0),
+        <td class="num">${р(с.skipped, num(с.skipped, 0),
           { ...её, f: ['skipped'], title: `${чьё}: пропущено` })}</td>
         <td>${состояние}</td></tr>`;
     }).join('');
@@ -10620,11 +10633,11 @@ RENDERERS.pbx = {
       д = await API.latest('pbx-conversations', `/api/telephony/conversations?${пар}`);
     } catch (err) {
       if (err && err.silent) return;
-      место.innerHTML = `<div class="empty small">Недоступно: ${esc(err.message || '')}</div>`;
+      место.innerHTML = html`<div class="empty small">Недоступно: ${err.message || ''}</div>`;
       return;
     }
     const доля = д.conversations ? (д.transferred / д.conversations) * 100 : 0;
-    const шапка = `<div class="small" style="margin-bottom:8px">Звонков (ног) за период:
+    const шапка = html`<div class="small" style="margin-bottom:8px">Звонков (ног) за период:
       <b>${num(д.calls || 0, 0)}</b> → разговоров <b>${num(д.conversations || 0, 0)}</b>;
       с переводом — <b>${num(д.transferred || 0, 0)}</b> (${num(доля, 1)} %).</div>`;
     if (!(д.items || []).length) {
@@ -10632,14 +10645,14 @@ RENDERERS.pbx = {
         + '(или станция не передаёт linkedid).</div>';
       return;
     }
-    место.innerHTML = шапка + `<div class="table-wrap"><table class="table">
+    место.innerHTML = html`${шапка}<div class="table-wrap"><table class="table">
       <thead><tr><th>Начало</th><th>Кто участвовал</th><th class="num">Ног</th>
         <th class="num">Переводов</th><th class="num">Говорили</th><th>Запись</th></tr></thead>
-      <tbody>${д.items.map((р) => `<tr><td class="small">${esc(fmtTime(р.started_at))}</td>
-        <td>${р.agents.map((а) => `<b>${esc(а)}</b>`).join(' → ') || '—'}</td>
+      <tbody>${д.items.map((р) => html`<tr><td class="small">${fmtTime(р.started_at)}</td>
+        <td>${р.agents.length ? р.agents.map((а, н) => html`${н ? ' → ' : ''}<b>${а}</b>`) : '—'}</td>
         <td class="num">${num(р.legs, 0)}</td><td class="num">${num(р.transfers, 0)}</td>
         <td class="num">${fmtDur(р.talk_s)}</td>
-        <td>${р.job_id ? `<button class="ghost sm" data-open-job="${esc(р.job_id)}">Открыть</button>` : '—'}</td></tr>`).join('')}
+        <td>${р.job_id ? html`<button class="ghost sm" data-open-job="${р.job_id}">Открыть</button>` : '—'}</td></tr>`)}
       </tbody></table></div>`;
     qsa('[data-open-job]', место).forEach((к) => к.addEventListener('click',
       () => window.__asrhub.openJob(к.dataset.openJob)));
@@ -10660,7 +10673,7 @@ RENDERERS.pbx = {
       д = await API.latest('pbx-queue-log', `/api/telephony/queues?${пар}`);
     } catch (err) {
       if (err && err.silent) return;
-      место.innerHTML = `<div class="empty small">Недоступно: ${esc(err.message || '')}</div>`;
+      место.innerHTML = html`<div class="empty small">Недоступно: ${err.message || ''}</div>`;
       return;
     }
     if (!д.events) {
@@ -10671,22 +10684,22 @@ RENDERERS.pbx = {
     }
     const пр = (з) => (з === null || з === undefined ? '—' : `${num(з, 1)} %`);
     const сек = (з) => (з === null || з === undefined ? '—' : fmtDur(з));
-    место.innerHTML = `<div class="table-wrap"><table class="table">
+    место.innerHTML = html`<div class="table-wrap"><table class="table">
       <thead><tr><th>Очередь</th><th class="num">Встали</th><th class="num">Ответили</th>
         <th class="num">Ушли без ответа</th><th class="num">из них бросили</th>
         <th class="num">Ждали до ответа</th><th class="num">Ждали и ушли</th>
-        <th class="num" title="Ответили не дольше ${esc(String(д.threshold_s))} с">Уровень обслуживания</th>
+        <th class="num" title="Ответили не дольше ${String(д.threshold_s)} с">Уровень обслуживания</th>
         <th class="num">Не взяли трубку</th></tr></thead>
-      <tbody>${(д.queues || []).map((о) => `<tr><td>${esc(о.queue)}</td>
+      <tbody>${(д.queues || []).map((о) => html`<tr><td>${о.queue}</td>
         <td class="num">${num(о.entered, 0)}</td><td class="num">${num(о.answered, 0)}</td>
         <td class="num ${о.lost_share > 10 ? 'err' : ''}">${num(о.lost, 0)} · ${пр(о.lost_share)}</td>
         <td class="num">${num(о.abandoned, 0)}</td>
         <td class="num">${сек(о.avg_wait_s)}</td><td class="num">${сек(о.avg_lost_wait_s)}</td>
-        <td class="num">${пр(о.service_level)}</td><td class="num">${num(о.ringnoanswer, 0)}</td></tr>`).join('')}
+        <td class="num">${пр(о.service_level)}</td><td class="num">${num(о.ringnoanswer, 0)}</td></tr>`)}
       </tbody></table></div>
-      ${(д.agents || []).some((а) => а.ringnoanswer) ? `<div class="small" style="margin-top:8px">
+      ${(д.agents || []).some((а) => а.ringnoanswer) && html`<div class="small" style="margin-top:8px">
         Не взяли трубку чаще всех: ${(д.agents || []).filter((а) => а.ringnoanswer).slice(0, 8)
-          .map((а) => `<b>${esc(а.agent)}</b> — ${num(а.ringnoanswer, 0)}`).join(', ')}</div>` : ''}`;
+          .map((а, н) => html`${н ? ', ' : ''}<b>${а.agent}</b> — ${num(а.ringnoanswer, 0)}`)}</div>`}`;
   },
 
   peopleRows(строки, всего_периода, ось, д) {
@@ -16464,11 +16477,11 @@ async function drawLlmSetup(host) {
 RENDERERS.settings = {
   render(root) {
     const groups = state.catalog.groups;
-    root.innerHTML = `
+    root.innerHTML = html`
       <div class="settings-toolbar settings-groups">
         <div class="group-nav" id="group-nav">
-          ${groups.map((g) => `<button data-group="${esc(g.id)}"
-            class="${state.paramGroup === g.id ? 'active' : ''}">${esc(g.title)}</button>`).join('')}
+          ${groups.map((g) => html`<button data-group="${g.id}"
+            class="${state.paramGroup === g.id ? 'active' : ''}">${g.title}</button>`)}
           <!-- Доступ — не группа каталога, а отдельный раздел: ключ доступа и
                токен Hugging Face это не параметры со значением по умолчанию и
                диапазоном, а секреты, и правятся они иначе. Место здесь,
@@ -16480,7 +16493,7 @@ RENDERERS.settings = {
       <div class="settings-toolbar"
            ${state.paramGroup === ACCESS_GROUP ? 'hidden' : ''}>
         <input type="search" id="p-search" placeholder="поиск по параметрам"
-          value="${esc(state.paramSearch)}" style="width:260px">
+          value="${state.paramSearch}" style="width:260px">
         <label class="row" style="gap:6px;cursor:pointer">
           <input type="checkbox" id="p-advanced" ${state.showAdvanced ? 'checked' : ''}
             style="width:auto"><span class="small">показывать параметры для опытных</span></label>
@@ -16696,9 +16709,9 @@ RENDERERS.settings = {
     host.innerHTML = '';
     Object.entries(byGroup).forEach(([groupId, params]) => {
       const group = groups.find((g) => g.id === groupId) || { title: groupId, description: '' };
-      const section = h(`<section class="card">
-        <div class="card-head"><h3>${esc(group.title)}</h3>
-          <span class="hint">${esc(group.description)}</span>
+      const section = h(html`<section class="card">
+        <div class="card-head"><h3>${group.title}</h3>
+          <span class="hint">${group.description}</span>
           <span class="spacer"></span>
           <span class="chip">${params.length}</span></div>
         <div class="params"></div></section>`);
@@ -16743,22 +16756,22 @@ function wireCrmTest() {
       const запросы = (итог.requests && итог.requests.length) ? итог.requests
         : [{ method: 'POST', url: итог.url, body: итог.body, purpose: 'примечание' }];
       const ответ = итог.response || {};
-      вывод.innerHTML = `
-        <div><b>${esc(итог.kind)}</b> → <span class="mono">${esc(итог.url)}</span></div>
+      вывод.innerHTML = html`
+        <div><b>${итог.kind}</b> → <span class="mono">${итог.url}</span></div>
         <div style="margin-top:6px">Сделка: <span class="mono">${
-          esc(итог.entity_id || '— не определена')}</span>${итог.entity_example
-          ? ` <span class="small warn">в показанном запросе №1 подставлен для примера;
-              отправить без сделки нельзя — впишите её номер</span>` : ''}</div>
-        ${запросы.map((з) => `<div class="small dim" style="margin-top:8px">${
-          esc(з.purpose || '')}: <span class="mono">${esc(з.method || 'POST')} ${esc(з.url || '')}</span></div>
-          <pre class="mono small" style="white-space:pre-wrap;margin-top:4px">${esc(з.body || '')}</pre>`).join('')}
-        ${итог.sent ? `<div class="chip ok" style="margin-top:6px">CRM ответила ${
-          esc(String(ответ.status || ''))}</div>` : ''}
-        ${итог.sent && ответ.fields_error ? `<div class="small warn" style="margin-top:6px">
-          Примечание принято, свои поля — нет: ${esc(ответ.fields_error)}</div>` : ''}`;
+          итог.entity_id || '— не определена'}</span>${итог.entity_example
+          && html` <span class="small warn">в показанном запросе №1 подставлен для примера;
+              отправить без сделки нельзя — впишите её номер</span>`}</div>
+        ${запросы.map((з) => html`<div class="small dim" style="margin-top:8px">${
+          з.purpose || ''}: <span class="mono">${з.method || 'POST'} ${з.url || ''}</span></div>
+          <pre class="mono small" style="white-space:pre-wrap;margin-top:4px">${з.body || ''}</pre>`)}
+        ${итог.sent && html`<div class="chip ok" style="margin-top:6px">CRM ответила ${
+          String(ответ.status || '')}</div>`}
+        ${итог.sent && ответ.fields_error && html`<div class="small warn" style="margin-top:6px">
+          Примечание принято, свои поля — нет: ${ответ.fields_error}</div>`}`;
     } catch (err) {
-      вывод.innerHTML = `<span class="err">${esc(err.message || 'не получилось')}</span>${
-        err.hint ? ` <span class="dim">${esc(err.hint)}</span>` : ''}`;
+      вывод.innerHTML = html`<span class="err">${err.message || 'не получилось'}</span>${
+        err.hint && html` <span class="dim">${err.hint}</span>`}`;
     }
   };
   // Обе кнопки заняты, пока идёт запрос: второй щелчок по «Отправить
@@ -16787,8 +16800,8 @@ async function drawStationsBox(host) {
   try {
     д = await API.get('/api/telephony/stations');
   } catch (err) {
-    host.innerHTML = `<div class="card-head"><h3>Подключённые АТС</h3></div>
-      <div class="empty small">${esc((err && err.message) || 'нет доступа')}</div>`;
+    host.innerHTML = html`<div class="card-head"><h3>Подключённые АТС</h3></div>
+      <div class="empty small">${(err && err.message) || 'нет доступа'}</div>`;
     return;
   }
   if (!host.isConnected) return;
@@ -16796,28 +16809,28 @@ async function drawStationsBox(host) {
   // которого в ответе нет, — врезка всегда писала «Ни одной станции не
   // подключено», а «Добавить АТС» вело прямо к дублям.
   const станции = d_items(д);
-  host.innerHTML = `
+  host.innerHTML = html`
     <div class="card-head"><h3>Подключённые АТС</h3>
       <span class="hint">станций может быть сколько угодно: у каждой свой источник,
         учётные данные, каталог записей и правила</span>
       <span class="spacer"></span>
       <button class="ghost sm" id="set-pbx-open">Раздел «АТС»</button>
       <button class="primary sm" id="set-pbx-add">+ Добавить АТС</button></div>
-    ${станции.length ? `<div class="table-wrap"><table>
+    ${станции.length ? html`<div class="table-wrap"><table>
       <thead><tr><th>Станция</th><th style="width:150px">Источник</th>
         <th style="width:220px">Откуда берём</th><th style="width:110px">Состояние</th>
         <th style="width:90px"></th></tr></thead>
-      <tbody>${станции.map((с) => `<tr${с.enabled ? '' : ' class="dim"'}>
-        <td><b>${esc(с.name || с.id)}</b>
-          <div class="small dim mono">${esc(с.id)}</div></td>
-        <td class="small">${esc(ПАТС_ИСТОЧНИКИ[с.source] || с.source || '')}</td>
+      <tbody>${станции.map((с) => html`<tr class="${с.enabled ? '' : 'dim'}">
+        <td><b>${с.name || с.id}</b>
+          <div class="small dim mono">${с.id}</div></td>
+        <td class="small">${ПАТС_ИСТОЧНИКИ[с.source] || с.source || ''}</td>
         <td class="small dim truncate" style="max-width:220px">${
-          esc(с.cdr_file || с.host || с.recordings_dir || '')}</td>
+          с.cdr_file || с.host || с.recordings_dir || ''}</td>
         <td><span class="chip ${с.enabled ? 'ok' : ''}">${
           с.enabled ? 'включена' : 'выключена'}</span></td>
-        <td><button class="ghost sm" data-station="${esc(с.id)}">Правка</button></td>
-      </tr>`).join('')}</tbody></table></div>`
-      : `<div class="empty">Ни одной станции не подключено.
+        <td><button class="ghost sm" data-station="${с.id}">Правка</button></td>
+      </tr>`)}</tbody></table></div>`
+      : html`<div class="empty">Ни одной станции не подключено.
            <div class="small dim" style="margin-top:6px">Добавьте АТС здесь или поставьте
            на неё агента — раздел «АТС» → «Агенты на станциях».</div></div>`}
     <div class="small dim" style="padding:10px 16px 14px">

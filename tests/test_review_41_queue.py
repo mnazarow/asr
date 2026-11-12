@@ -186,7 +186,6 @@ def test_штатная_остановка_не_тратит_попытку(tmp_
 @pytest.fixture()
 def живая(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
     """Сервер с очередью и управляемым «распознаванием» вместо конвейера."""
-    from asrhub import job_queue
     from asrhub.api import create_app
     from asrhub.config import load
     from asrhub.errors import JobCancelled
@@ -209,7 +208,7 @@ def живая(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
             time.sleep(0.03)
         raise JobCancelled("слишком долго")
 
-    monkeypatch.setattr(job_queue, "process_job", process_job)
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", process_job)
     app = create_app(load(), start_queue=True)
     with TestClient(app) as клиент:
         yield клиент, управление

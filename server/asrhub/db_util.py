@@ -10,6 +10,31 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    import threading
+    from pathlib import Path
+
+#: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
+CLEANUP_BATCH = 5000
+
+#: Предел, до которого усекается журнал после контрольной точки, байт.
+#: Без него файл `-wal` сохраняет размер самого большого пика навсегда:
+#: после VACUUM на базе в 260 МБ рядом оставался журнал в 174 МБ.
+ПРЕДЕЛ_ЖУРНАЛА = 64 * 1024 * 1024
+
+#: Поля звонка, в которых есть кто-то конкретный: номера, имя звонящего,
+#: каналы (у прямых SIP-абонентов в имени канала стоит номер), путь к записи
+#: (в имени файла Asterisk пишет номер) и поля, которые станция заполняет
+#: своими данными. Ключ, станция, время, длительность, очередь и
+#: внутренний номер оператора остаются: без ключа импорт завёл бы звонок
+#: заново, а по остальному считаются нагрузка и отчёты.
+ПОЛЯ_ЛИЧНЫЕ_ЗВОНКА = ("src", "dst", "clid", "channel", "dstchannel",
+                      "recording", "userfield", "accountcode")
+ОБЕЗЛИЧИТЬ_ЗВОНОК = ", ".join(f"{поле}=''" for поле in ПОЛЯ_ЛИЧНЫЕ_ЗВОНКА)
+
+#: Признак «из указателя удаляли — пора вычистить» (см. `Database.fts_purge`).
+КЛЮЧ_УКАЗАТЕЛЬ_ГРЯЗНЫЙ = "fts.dirty"
+
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
 #: время ответа), — рядом с номером записи и без самого ответа.
@@ -76,6 +101,29 @@ class ОсноваБазы:
 
         @staticmethod
         def _цифры_номера(запрос: str) -> str: ...
+
+        path: Path
+        _write_lock: threading.RLock
+        _поколение_реплик: int
+        поколение_заданий: int
+        fts_ready: bool
+        journal_mode: str
+
+        def _bucket_step(self, since: float, until: float, buckets: int) -> tuple[int, float]: ...
+        def get_kv(self, key: str, default: Any = None) -> Any: ...
+        def count_jobs(self, *, status: str | list[str] | None = None,
+                       owner: str | list[str] | None = None,
+                       model: str | None = None, search: str | None = None,
+                       group_id: str | None = None,
+                       content: str | None = None,
+                       since: float | None = None,
+                       until: float | None = None) -> int: ...
+        def delete_job(self, job_id: str) -> None: ...
+        def file_used_elsewhere(self, file_path: str, except_id: str) -> bool: ...
+        def forget_calls(self, *, before: float,
+                         file_keys_before: float | None = None) -> int: ...
+        def other_instances(self, *, свежесть: float = ...) -> list[dict[str, Any]]: ...
+        def instances_prune(self, *, старше: float = ...) -> int: ...
 
         def _content_where(self, since: float | None, until: float | None,
                            owner: str | list[str] | None, extra: str = "",

@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 import pytest
-from drill_seed import Архив, Вкладка, браузер, поднять
+from drill_seed import Архив, Вкладка, браузер, дождаться_тишины, поднять
 from test_drill_pbx import досеять
 
 ДАННЫЕ = "window.__asrhub.state.pbxData"
@@ -49,7 +49,7 @@ def _число(текст: str) -> int:
 
 def _на_вкладку(с: Any, имя: str) -> None:
     с.click(f'#pbx-tabs button[data-tab="{имя}"]')
-    с.wait_for_timeout(500)
+    дождаться_тишины(с)
 
 
 def _строк(с: Any, где: str = "") -> int:
@@ -271,7 +271,7 @@ def test_нагрузка_точка_клетка_и_столбец(вкладк
     assert с.locator(".drill-title").inner_text().startswith("Звонки: ")
     # Переключатель линии перерисовывает только линию: список под ней цел.
     с.check("#pbx-load-talk")
-    с.wait_for_timeout(300)
+    дождаться_тишины(с)
     assert _строк(с, "#pbx-body") == min(50, лента[-1]["total"])
     с.locator("#pbx-body .drill-close").click()
     # Клетка карты: самая нагруженная.
@@ -291,7 +291,7 @@ def test_нагрузка_точка_клетка_и_столбец(вкладк
     # Она и не кнопка: в подсказке у неё нет строки «щелчок — список звонков».
     assert "pick" not in (клетка.get_attribute("class") or "")
     клетка.dispatch_event("click")
-    с.wait_for_timeout(300)
+    дождаться_тишины(с)
     assert вкладка.раскрытий() == до
     # Столбец длительностей: первая непустая корзина.
     корзины = [к for к in с.evaluate(f"{ДАННЫЕ}.durations") if к["count"]]
@@ -415,7 +415,7 @@ def test_заход_за_звонками_не_сносит_раскрытый_�
     с.locator("#pbx-top .drill-close").click()
     с.click("#pbx-scan-all")
     с.wait_for_function("() => !document.querySelector('#pbx-scan-all').disabled")
-    с.wait_for_timeout(500)
+    дождаться_тишины(с)
     assert заходов() == 2 and сводов() == до + 1
     вкладка.чисто()
 
@@ -457,7 +457,7 @@ def test_плитки_над_журналом_раскрываются_а_жур
         '#tel-status .drill-panel tbody tr td'); return я && я.innerText.trim() === '—'; }""")
     # Смена периода перечитывает журнал, а шапку и список под ней не трогает.
     с.click('#tel-period button[data-period="day"]')
-    с.wait_for_timeout(700)
+    дождаться_тишины(с)
     assert _строк(с, "#tel-status") == 50
     assert с.locator("#tel-calls tbody tr").count() <= журнал
     # Причина пропуска — чип с числом.
@@ -470,7 +470,7 @@ def test_плитки_над_журналом_раскрываются_а_жур
     assert _строк(с, "#tel-status") == сколько > 0
     # Чип станции остался отбором журнала, а не раскрытием.
     с.locator("#tel-status [data-station-chip]").first.click()
-    с.wait_for_timeout(700)
+    дождаться_тишины(с)
     assert с.evaluate("window.__asrhub.state.telStation") == "ats1"
     assert _строк(с, "#tel-status") == сколько
     # «Забрать сейчас»: шапка под раскрытым списком не перерисовывается,
@@ -479,7 +479,7 @@ def test_плитки_над_журналом_раскрываются_а_жур
     с.click("#tel-scan")
     с.wait_for_selector("#toasts .toast")
     с.wait_for_function("() => !document.querySelector('#tel-scan').disabled")
-    с.wait_for_timeout(500)
+    дождаться_тишины(с)
     assert _строк(с, "#tel-status") == сколько
     assert sum(1 for адрес in вкладка.запросы if "/api/telephony/calls" in адрес) == журналов + 1
     вкладка.чисто()

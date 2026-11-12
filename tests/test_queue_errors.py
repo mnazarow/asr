@@ -339,15 +339,10 @@ def test_failed_job_writes_the_reason_to_the_log(caplog):
     лечением оставалась недоступной именно там, куда идут разбираться.
     """
     import logging
-    import re
-    from pathlib import Path
 
-    источник = Path("server/asrhub/job_queue.py").read_text(encoding="utf-8")
-    блок = re.search(r'log\.error\("Задание %s провалено.*?\n\n', источник, re.S)
-    assert блок, "не найдена запись о провале задания"
-    assert "error.hint" in блок.group(0), "подсказка снова не пишется в журнал"
-
-    # И само поведение: многострочная подсказка ложится строками.
+    # Что очередь пишет подсказку проваленного задания в журнал — на
+    # настоящем воркере, см. `test_review_70`. Здесь — как ложится
+    # многострочная подсказка.
     from asrhub.errors import ModelLoadError
 
     отказ = ModelLoadError("Не удалось загрузить модель.",

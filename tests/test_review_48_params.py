@@ -200,7 +200,7 @@ def test_готовое_после_повтора_задание_не_показ
             raise EngineError("Сбой движка на первой попытке")
         return настоящий(*доводы, **ключи)
 
-    monkeypatch.setattr(job_queue, "process_job", process_job)
+    monkeypatch.setattr("asrhub.job_queue_worker.process_job", process_job)
     задание = _ждать(очередь, _отправить(очередь, sample_wav))
     assert задание["status"] == "completed" and int(задание["retries"]) == 1, задание
     assert задание["error_code"] is None, задание

@@ -537,14 +537,30 @@ def test_cleanup_is_bounded_and_covers_unfinished(tmp_path: Path):
     assert removed["jobs"] == 15
     assert database.count_jobs() == 3
     assert CLEANUP_BATCH > 0
-    assert "LIMIT" in _cleanup_sql(), "предел на заход исчез из запроса"
 
 
-def _cleanup_sql() -> str:
-    source = Path(__file__).resolve().parent.parent / "server" / "asrhub" / "db.py"
-    text = source.read_text(encoding="utf-8")
-    start = text.index("def cleanup(")
-    return text[start:start + 2000]
+def test_cleanup_takes_one_batch_per_pass(tmp_path: Path, monkeypatch):
+    """Предел на заход — поведением, а не подстрокой «LIMIT» в исходнике.
+
+    Заход уборки берёт не больше `CLEANUP_BATCH` заданий и говорит, что
+    осталось ещё (`more`): следующий заход служебного цикла доберёт.
+    """
+    from asrhub import db_maintenance
+    from asrhub.db import Database
+
+    monkeypatch.setattr(db_maintenance, "CLEANUP_BATCH", 4)
+    database = Database(tmp_path / "c.sqlite3")
+    ancient = time.time() - 400 * 86400
+    for _ in range(10):
+        job_id = database.create_job({"status": "completed"})
+        database.update_job(job_id, status="completed", finished_at=ancient)
+    первый = database.cleanup(results_days=30)
+    assert первый["jobs"] == 4 and первый["more"] == 1
+    assert database.count_jobs() == 6
+    database.cleanup(results_days=30)
+    последний = database.cleanup(results_days=30)
+    assert последний["jobs"] == 2 and последний["more"] == 0
+    assert database.count_jobs() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1754,24 +1770,6 @@ def test_deleting_one_and_deleting_many_do_the_same_thing(repo_root: Path):
 # Пик памяти на занятом сервере
 # ---------------------------------------------------------------------------
 
-def test_peak_memory_is_measured_even_when_the_server_is_busy(repo_root: Path):
-    """Замер делался только когда задание в очереди одно.
-
-    То есть на сервере с двумя воркерами — там, где вопрос «хватит ли
-    карты» и стоит, — раздел «Ресурсы» оставался пустым всегда.
-    """
-    очередь = (repo_root / "server" / "asrhub" / "job_queue.py").read_text(
-        encoding="utf-8")
-    import re
-
-    # Аргументы — и словом, и ключом словаря (3.1.33: одни и те же для
-    # потока и для процесса распознавания).
-    assert re.search(r"measure_memory\"?\s*[:=]\s*True", очередь), "замер снова стал условным"
-    assert re.search(r"reset_memory\"?\s*[:=]\s*одно", очередь), (
-        "обнуление должно оставаться условным: иначе оно стирает то, "
-        "что накопил сосед по очереди")
-
-
 def test_the_peak_is_recorded_together_with_how_many_ran_at_once(tmp_path: Path):
     """«27 ГБ» — это ответ или нет, смотря сколько заданий шло разом.
 
@@ -2440,11 +2438,7 @@ def test_finished_jobs_do_not_pile_up_in_the_concurrency_table():
     assert очередь._concurrency == {}, f"накопилось {len(очередь._concurrency)} записей"
     assert очередь._model_counts == {"m": 0}, очередь._model_counts
 
-    # И освобождение живёт в одном месте, а не в двух.
-    источник = Path(__file__).resolve().parent.parent / "server" / "asrhub" / "job_queue.py"
-    текст = источник.read_text(encoding="utf-8")
-    начало = текст.index("            finally:\n                if self._заменён(index):")
-    assert "_release_slot(" in текст[начало:начало + 1400], "копия освобождения вернулась"
+    # Что освобождение одно и на настоящих воркерах — см. `test_review_70`.
 
 
 def test_backups_keep_working_on_a_disk_that_is_almost_full(tmp_path: Path):

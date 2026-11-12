@@ -247,11 +247,9 @@ def test_vacuum_пропускается_при_соседе(tmp_path: Path):
 def test_vacuum_пропускается_без_места(tmp_path: Path, monkeypatch):
     import shutil
 
-    from asrhub import db as модуль
-
     db = _база_с_мусором(tmp_path / "a.db", 20)
     настоящее = shutil.disk_usage
-    monkeypatch.setattr(модуль.shutil, "disk_usage",
+    monkeypatch.setattr(shutil, "disk_usage",
                         lambda путь: настоящее(путь)._replace(free=1024))
     итог = db.vacuum()
     assert итог["done"] is False and "не хватит места" in итог["reason"]

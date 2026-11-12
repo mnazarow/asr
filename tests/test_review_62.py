@@ -28,14 +28,14 @@ def test_gpu_pick_by_free_memory_keeps_the_own_card_while_close(monkeypatch):
     значения = {"gpu_devices": "cuda:0, cuda:1", "gpu_pick": "free_memory"}
     очередь.settings = type("Н", (), {"get": lambda s, k, d=None: значения.get(k, d)})()
     память = {"cuda:0": 2 << 30, "cuda:1": 20 << 30}
-    monkeypatch.setattr(jq, "свободная_память", lambda к: память.get(к))
+    monkeypatch.setattr("asrhub.job_queue_worker.свободная_память", lambda к: память.get(к))
     assert очередь._карта_воркера(0, {"device": "auto"}) == "cuda:1"
     память["cuda:0"] = 19 << 30            # своя почти как лучшая — остаётся своя
     assert очередь._карта_воркера(0, {"device": "auto"}) == "cuda:0"
-    monkeypatch.setattr(jq, "свободная_память", lambda к: None)
+    monkeypatch.setattr("asrhub.job_queue_worker.свободная_память", lambda к: None)
     assert очередь._карта_воркера(1, {"device": "auto"}) == "cuda:1", "без сведений — по номеру"
     значения["gpu_pick"] = "worker"
-    monkeypatch.setattr(jq, "свободная_память", lambda к: память.get(к))
+    monkeypatch.setattr("asrhub.job_queue_worker.свободная_память", lambda к: память.get(к))
     assert очередь._карта_воркера(0, {"device": "auto"}) == "cuda:0"
 
 
