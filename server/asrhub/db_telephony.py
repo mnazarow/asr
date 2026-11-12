@@ -1,37 +1,22 @@
 """Часть базы о телефонии: звонки с АТС, события очередей, переводов и мостов,
 отрезки участников и разрезы раздела «АТС».
 
-Вынесено из `db.py` (3.1.39) примесью к `Database`: файл базы был самым
+Вынесено из `db.py` примесью к `Database`: файл базы был самым
 большим в сервере, а телефония — самая большая и самая обособленная его
 область. Методы и постоянные — те же, `Database` наследует их отсюда;
 соединения, запись и общий отбор по владельцу остаются в `db.py`.
 """
 from __future__ import annotations
 
-import sqlite3
 import time
-from collections.abc import Sequence
-from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from .db_util import _экранировать_like, now
+from .db_util import ОсноваБазы, _экранировать_like, now
 from .errors import StorageError
 
 
-class ТелефонияБазы:
+class ТелефонияБазы(ОсноваБазы):
     """Примесь к `Database`: всё о звонках станций."""
-
-    if TYPE_CHECKING:
-        # Основа — у `Database` (db.py); здесь только объявления для проверки типов.
-        def write(self) -> AbstractContextManager[sqlite3.Connection]: ...
-        def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]: ...
-        def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None: ...
-        def execute(self, sql: str, params: Sequence[Any] = ()) -> int: ...
-        def executemany(self, sql: str, rows: Sequence[Sequence[Any]]) -> int: ...
-
-        @staticmethod
-        def _owner_clause(owner: str | list[str] | None,
-                          alias: str = "j") -> tuple[str, list[Any]]: ...
 
     # --- звонки с АТС ----------------------------------------------------
     #

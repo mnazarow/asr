@@ -696,7 +696,7 @@ def test_уведомление_о_задании_с_номером_достав
         очередь._stop = потоки.Event()
         записи = {}
         очередь.db = type("Б", (), {"update_job": lambda self, i, **п: записи.update(п)})()
-        monkeypatch.setattr("asrhub.job_queue.ПОПЫТОК_ЗА_ЗАХОД", 2)
+        monkeypatch.setattr("asrhub.job_queue_notify.ПОПЫТОК_ЗА_ЗАХОД", 2)
         задание = {"id": "job1", "status": "completed", "finished_at": 1793000000.5,
                    "webhook_url": f"http://127.0.0.1:{сервер.server_port}/hook"}
         очередь._deliver_webhook(задание, b'{"a":1}')

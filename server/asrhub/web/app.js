@@ -6832,11 +6832,31 @@ RENDERERS.analytics = {
       const data = await API.latest('analytics', `/api/analytics?period=${state.period}`);
       state.analytics = data;
       this.draw(host, data);
+      this.устаревший(host, data);
     } catch (err) {
       fail(err);
       if (err && err.silent) return;    // пришёл ответ посвежее — он и отрисуется
       host.innerHTML = `<div class="empty">Не удалось загрузить аналитику: ${esc(err.message)}</div>`;
     }
+  },
+
+  /**
+   * Отчёт за квартал, год и всё время сервер отдаёт сразу, даже если он
+   * собран несколько минут назад, а свежий собирает фоном: на большом
+   * архиве сборка — секунды. Здесь — пометка, сколько отчёту, и один
+   * повторный запрос, когда свежий, скорее всего, готов.
+   */
+  устаревший(host, data) {
+    clearTimeout(this._повтор);
+    const старость = data && data.stale;
+    if (!старость) return;
+    host.insertAdjacentHTML('afterbegin', html`<div class="banner" id="analytics-stale"
+      style="margin-bottom:12px">Отчёт собран ${fmtDur(старость.age_s || 0)} назад; свежий
+      собирается — раздел обновится сам.</div>`.toString());
+    const период = state.period;
+    this._повтор = setTimeout(() => {
+      if (state.view === 'analytics' && state.period === период) this.load();
+    }, 15000);
   },
 
   draw(host, data) {
@@ -18345,16 +18365,16 @@ RENDERERS.monitoring = {
       return;
     }
     const записи = д.items || [];
-    место.innerHTML = записи.length ? `<div class="table-wrap"><table class="small">
+    место.innerHTML = записи.length ? html`<div class="table-wrap"><table class="small">
       <thead><tr><th>Когда</th><th>Было → стало</th><th>Метрика</th><th>Значение</th><th>Порог</th></tr></thead>
-      <tbody>${записи.map((з) => `<tr>
-        <td class="nowrap faint">${esc(fmtTime(з.ts))}</td>
-        <td><span class="chip ${ALERT_STATE_CLASS[з.from] || ''}">${esc(ALERT_STATE_LABEL[з.from] || з.from || '—')}</span>
-          → <span class="chip ${ALERT_STATE_CLASS[з.state] || ''}">${esc(ALERT_STATE_LABEL[з.state] || з.state)}</span></td>
-        <td><b>${esc(з.label || з.metric)}</b><div class="faint">${esc(з.severity || '')}</div></td>
-        <td class="nowrap">${esc(metricValue(з.value, з.unit))}</td>
-        <td class="nowrap dim">${знакПорога(з.direction, з.inclusive)} ${esc(metricValue(з.threshold, з.unit))}</td>
-      </tr>`).join('')}</tbody></table></div>`
+      <tbody>${записи.map((з) => html`<tr>
+        <td class="nowrap faint">${fmtTime(з.ts)}</td>
+        <td><span class="chip ${ALERT_STATE_CLASS[з.from] || ''}">${ALERT_STATE_LABEL[з.from] || з.from || '—'}</span>
+          → <span class="chip ${ALERT_STATE_CLASS[з.state] || ''}">${ALERT_STATE_LABEL[з.state] || з.state}</span></td>
+        <td><b>${з.label || з.metric}</b><div class="faint">${з.severity || ''}</div></td>
+        <td class="nowrap">${metricValue(з.value, з.unit)}</td>
+        <td class="nowrap dim">${знакПорога(з.direction, з.inclusive)} ${metricValue(з.threshold, з.unit)}</td>
+      </tr>`)}</tbody></table></div>`
       : '<div class="empty small">С запуска сервера тревоги не срабатывали.</div>';
   },
 
@@ -18564,46 +18584,46 @@ function alertsTable(alerts) {
   // Метки — рядом с именем метрики: две тревоги «Доля успеха» по разным
   // моделям выглядели одинаково, и не понять было, какая из моделей сбоит.
   const метки = (a) => Object.entries(a.labels || {})
-    .map(([к, з]) => `${esc(к)}=${esc(з)}`).join(', ');
-  const rows = (active.length ? active : alerts.slice(0, 12)).map((a) => `<tr>
+    .map(([к, з]) => `${к}=${з}`).join(', ');
+  const rows = (active.length ? active : alerts.slice(0, 12)).map((a) => html`<tr>
     <td><span class="chip ${ALERT_STATE_CLASS[a.state] || ''}">${
-      esc(ALERT_STATE_LABEL[a.state] || a.state)}</span></td>
-    <td><b>${esc(a.label)}</b><div class="small dim">${esc(a.metric)}${
+      ALERT_STATE_LABEL[a.state] || a.state}</span></td>
+    <td><b>${a.label}</b><div class="small dim">${a.metric}${
       метки(a) ? ` · ${метки(a)}` : ''}</div></td>
-    <td class="nowrap">${esc(metricValue(a.value, a.unit))}</td>
+    <td class="nowrap">${metricValue(a.value, a.unit)}</td>
     <td class="dim nowrap">${знакПорога(a.direction, a.inclusive)} ${
-      esc(metricValue(a.threshold, a.unit))}</td>
-    <td class="small">${esc(a.severity)}</td>
-    <td class="small dim">${esc(a.hint || '')}</td></tr>`).join('');
-  return `<div class="table-wrap"><table>
+      metricValue(a.threshold, a.unit)}</td>
+    <td class="small">${a.severity}</td>
+    <td class="small dim">${a.hint || ''}</td></tr>`);
+  return html`<div class="table-wrap"><table>
     <thead><tr><th>Состояние</th><th>Метрика</th><th>Значение</th><th>Порог</th>
       <th>Важность</th><th>Что делать</th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="6" class="empty">Тревог нет</td></tr>'}</tbody>
+    <tbody>${rows.length ? rows : html`<tr><td colspan="6" class="empty">Тревог нет</td></tr>`}</tbody>
   </table></div>${active.length ? '' :
-    '<p class="small dim" style="margin-top:8px">Показаны первые правила; все они в норме.</p>'}`;
+    html`<p class="small dim" style="margin-top:8px">Показаны первые правила; все они в норме.</p>`}`.toString();
 }
 
 function targetsTable(data) {
   // «Доставляется» — только после первой удачной отправки. Свежий приёмник,
   // к которому ещё не ходили, красной плашкой не пугает: судить не о чем.
   const состояние = (t) => {
-    if (t.enabled === false) return '<span class="chip idle">выключен</span>';
-    if (!t.last_attempt) return '<span class="chip idle">ещё не отправляли</span>';
-    return `<span class="chip ${t.healthy ? 'ok' : 'err'}">${t.healthy ? 'доставляется' : 'нет'}</span>`;
+    if (t.enabled === false) return html`<span class="chip idle">выключен</span>`;
+    if (!t.last_attempt) return html`<span class="chip idle">ещё не отправляли</span>`;
+    return html`<span class="chip ${t.healthy ? 'ok' : 'err'}">${t.healthy ? 'доставляется' : 'нет'}</span>`;
   };
-  const rows = (data.targets || []).map((t) => `<tr>
-    <td><b>${esc(t.name)}</b></td>
-    <td>${esc(TARGET_KIND_LABEL[t.kind] || t.kind)}</td>
-    <td class="small">${esc(t.url)}</td>
+  const rows = (data.targets || []).map((t) => html`<tr>
+    <td><b>${t.name}</b></td>
+    <td>${TARGET_KIND_LABEL[t.kind] || t.kind}</td>
+    <td class="small">${t.url}</td>
     <td>${t.interval_s} с</td>
     <td>${состояние(t)}
-      ${t.last_error ? `<div class="small dim">${esc(t.last_error)}</div>` : ''}
-      ${!t.last_error && t.last_info ? `<div class="small faint">${esc(t.last_info)}</div>` : ''}</td>
+      ${t.last_error ? html`<div class="small dim">${t.last_error}</div>` : ''}
+      ${!t.last_error && t.last_info ? html`<div class="small faint">${t.last_info}</div>` : ''}</td>
     <td class="small dim">отправлено ${t.sent}, ошибок ${t.failed}</td>
-    <td class="nowrap admin-only"><button class="ghost sm" data-toggle-target="${esc(t.name)}"
+    <td class="nowrap admin-only"><button class="ghost sm" data-toggle-target="${t.name}"
       title="${t.enabled === false ? 'Снова отправлять метрики сюда' : 'Перестать отправлять, не удаляя настройку'}">${
         t.enabled === false ? 'Включить' : 'Выключить'}</button>
-      <button class="ghost sm" data-drop-target="${esc(t.name)}"
+      <button class="ghost sm" data-drop-target="${t.name}"
       title="Убрать приёмник — метрики туда больше не пойдут">Убрать</button></td></tr>`).join('');
   return `<div class="table-wrap"><table>
     <thead><tr><th>Имя</th><th>Тип</th><th>Адрес</th><th>Интервал</th>
@@ -18901,34 +18921,34 @@ RENDERERS.logs = {
         table.innerHTML = `<div class="empty">Журнал не получен: ${
           esc((logsResult.reason && logsResult.reason.message) || 'ошибка запроса')}</div>`;
       } else if (table) {
-        table.innerHTML = logs.items.length ? `<table>
+        table.innerHTML = logs.items.length ? html`<table>
           <thead><tr><th style="width:70px">Время</th><th style="width:80px">Уровень</th>
             <th>Сообщение</th></tr></thead><tbody>
-          ${logs.items.slice().reverse().map((l) => `<tr>
-            <td class="small faint mono nowrap">${esc(l.time.split(' ')[1] || l.time)}</td>
+          ${logs.items.slice().reverse().map((l) => html`<tr>
+            <td class="small faint mono nowrap">${l.time.split(' ')[1] || l.time}</td>
             <td><span class="chip ${l.level === 'ERROR' ? 'err'
-              : l.level === 'WARNING' ? 'warn' : ''}">${esc(l.level)}</span></td>
-            <td class="small"><span class="faint mono">${esc(l.logger.replace('asrhub.', ''))}</span>
-              ${esc(l.message)}
-              ${l.job_id ? `<span class="chip" style="margin-left:6px">${
-                esc(String(l.job_id).slice(0, 12))}</span>` : ''}</td>
-          </tr>`).join('')}</tbody></table>` : '<div class="empty small">Записей нет</div>';
+              : l.level === 'WARNING' ? 'warn' : ''}">${l.level}</span></td>
+            <td class="small"><span class="faint mono">${l.logger.replace('asrhub.', '')}</span>
+              ${l.message}
+              ${l.job_id ? html`<span class="chip" style="margin-left:6px">${
+                String(l.job_id).slice(0, 12)}</span>` : ''}</td>
+          </tr>`)}</tbody></table>` : '<div class="empty small">Записей нет</div>';
       }
       const eventTable = qs('#event-table');
       if (eventTable && eventsFailed) {
         eventTable.innerHTML = `<div class="empty small">События не получены: ${
           esc((eventsResult.reason && eventsResult.reason.message) || 'ошибка запроса')}</div>`;
       } else if (eventTable) {
-        eventTable.innerHTML = events.items.length ? `<table>
+        eventTable.innerHTML = events.items.length ? html`<table>
           <thead><tr><th style="width:110px">Время</th><th style="width:120px">Событие</th>
             <th>Описание</th></tr></thead><tbody>
-          ${events.items.map((e) => `<tr>
+          ${events.items.map((e) => html`<tr>
             <td class="small faint nowrap">${fmtTime(e.ts)}</td>
-            <td><span class="chip">${esc(e.kind)}</span></td>
-            <td class="small">${esc(e.message || '')}
-              ${e.job_id ? `<button class="ghost sm"
-                ${act('openJob', e.job_id)}>задание</button>` : ''}</td>
-          </tr>`).join('')}</tbody></table>` : '<div class="empty small">Событий нет</div>';
+            <td><span class="chip">${e.kind}</span></td>
+            <td class="small">${e.message || ''}
+              ${e.job_id ? html`<button class="ghost sm"
+                ${raw(act('openJob', e.job_id))}>задание</button>` : ''}</td>
+          </tr>`)}</tbody></table>` : '<div class="empty small">Событий нет</div>';
       }
     } catch (err) {
       // Молча пустой журнал выглядит как «ошибок нет», хотя на деле мы просто

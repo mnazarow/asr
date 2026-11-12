@@ -103,6 +103,8 @@ class Analytics:
         #: заданий, отчёт). См. `full_report`.
         self._готовые: dict[tuple[str, str], tuple[float, int, dict[str, Any]]] = {}
         self._замок_готовых = threading.Lock()
+        #: Сборки длинных отчётов, идущие фоном: ключ → поток (`full_report`).
+        self._собираются: dict[tuple[str, str], threading.Thread] = {}
 
     @property
     def _выборки(self) -> dict[tuple[Any, ...], list[dict[str, Any]]] | None:
@@ -1838,9 +1840,25 @@ class Analytics:
         сейчас = time.monotonic()
         with self._замок_готовых:
             готовый = self._готовые.get(ключ)
-        if готовый and сейчас - готовый[0] < self.СРОК_ГОТОВОГО_ОТЧЁТА_С \
-                and готовый[1] == поколение:
-            return copy.deepcopy(готовый[2])
+        if готовый:
+            возраст = сейчас - готовый[0]
+            if возраст < self.СРОК_ГОТОВОГО_ОТЧЁТА_С and готовый[1] == поколение:
+                return copy.deepcopy(готовый[2])
+            # Квартал, год и всё время на архиве в сотни тысяч записей
+            # собираются секундами: прежний отчёт отдаётся сразу с пометкой,
+            # сколько ему, а свежий собирается фоном — следующий запрос
+            # получит его.
+            if period in self.ДЛИННЫЕ_ПЕРИОДЫ and возраст < self.СРОК_УСТАРЕВШЕГО_С:
+                self._пересобрать_фоном(ключ, period, owner)
+                отчёт = copy.deepcopy(готовый[2])
+                отчёт["stale"] = {"age_s": round(возраст), "refreshing": True}
+                return отчёт
+        return self._собрать(ключ, period, owner)
+
+    def _собрать(self, ключ: tuple[str, str], period: str,
+                 owner: str | list[str] | None) -> dict[str, Any]:
+        поколение = int(getattr(self.db, "поколение_заданий", 0) or 0)
+        сейчас = time.monotonic()
         with self._общая_выборка():
             отчёт = self._full_report(period, owner)
         with self._замок_готовых:
@@ -1849,8 +1867,34 @@ class Analytics:
             self._готовые[ключ] = (сейчас, поколение, copy.deepcopy(отчёт))
         return отчёт
 
+    def _пересобрать_фоном(self, ключ: tuple[str, str], period: str,
+                           owner: str | list[str] | None) -> None:
+        """Одна фоновая сборка на ключ: десять открытий раздела — одна сборка."""
+        with self._замок_готовых:
+            идёт = self._собираются.get(ключ)
+            if идёт is not None and идёт.is_alive():
+                return
+
+            def собрать() -> None:
+                try:
+                    self._собрать(ключ, period, owner)
+                except Exception as exc:                     # noqa: BLE001
+                    log.warning("Фоновая сборка отчёта «%s» не удалась: %s", period, exc)
+                finally:
+                    with self._замок_готовых:
+                        self._собираются.pop(ключ, None)
+
+            поток = threading.Thread(target=собрать, name="asrhub-analytics-report",
+                                     daemon=True)
+            self._собираются[ключ] = поток
+        поток.start()
+
     #: Сколько секунд отдавать готовый сводный отчёт без пересборки.
     СРОК_ГОТОВОГО_ОТЧЁТА_С = 30.0
+    #: Длинные окна: их устаревший отчёт отдаётся сразу, свежий — фоном.
+    ДЛИННЫЕ_ПЕРИОДЫ = frozenset({"quarter", "year", "all"})
+    #: Насколько старый отчёт длинного окна ещё можно отдать сразу.
+    СРОК_УСТАРЕВШЕГО_С = 600.0
 
     def _full_report(self, period: str, owner: str | list[str] | None) -> dict[str, Any]:
         отчёт = self._разрезы(period, owner)

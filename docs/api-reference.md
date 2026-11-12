@@ -984,7 +984,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:18624-f320c4",
+  "instance": "vm:9503-42265d",
   "instances": [],
   "workers": [
     {
@@ -1584,7 +1584,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794490122.1179872,
+    "generated_at": 1794492676.911272,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1751,8 +1751,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.39",
-  "uptime_s": 1.6,
+  "version": "3.1.40",
+  "uptime_s": 1.8,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1832,8 +1832,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.39",
-  "uptime_s": 1.6,
+  "version": "3.1.40",
+  "uptime_s": 1.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1843,7 +1843,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
     "ram_available_gb": 7.1,
-    "disk_free_gb": 22.9,
+    "disk_free_gb": 21.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2592,8 +2592,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793885322.2190933,
-    "until": 1794490122.2190933
+    "since": 1793887877.054113,
+    "until": 1794492677.054113
   }
 }
 ```
@@ -5144,7 +5144,7 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 1.7,
+  "uptime_s": 2.0,
   "liveness": {
     "status": "ok",
     "checks": [
@@ -5186,7 +5186,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 22.9 ГБ",
+        "detail": "свободно 21.9 ГБ",
         "hint": ""
 …
 ```

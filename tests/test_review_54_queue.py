@@ -220,7 +220,7 @@ def test_снятое_с_instance_lost_задание_уведомляет(се�
 def test_недоступный_приёмник_получает_уведомление_позже(сервер, monkeypatch):
     state = сервер.app.state.hub
     очередь = state.queue
-    monkeypatch.setattr(jq, "ПОПЫТОК_ЗА_ЗАХОД", 1)
+    monkeypatch.setattr("asrhub.job_queue_notify.ПОПЫТОК_ЗА_ЗАХОД", 1)
     с = socket.socket()
     с.bind(("127.0.0.1", 0))
     порт = с.getsockname()[1]

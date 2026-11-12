@@ -6,7 +6,7 @@
 
 | Каталог | Что в нём |
 |---|---|
-| `server/asrhub/` | сервер: FastAPI (`api/`: сборка — `app.py`, лента событий — `event_hub.py`, прослойки — `middleware.py`, маршруты — `routes_*.py`), очередь (`job_queue.py`; выход наружу и проверка адресов — `outbound.py`), база SQLite (`db.py`; звонки и события станций — примесь `db_telephony.py`), движки (`engines/`), конвейер (`pipeline/`), телефония (`telephony/`), контроль качества (`qc/`), мониторинг (`monitoring/`), каталог параметров (`catalog/params/` — по файлу на группу) |
+| `server/asrhub/` | сервер: FastAPI (`api/`: сборка — `app.py`, лента событий — `event_hub.py`, прослойки — `middleware.py`, маршруты — `routes_*.py`), очередь (`job_queue.py`; состояния задания — `job_status.py`, уведомления — примесь `job_queue_notify.py`, выход наружу и проверка адресов — `outbound.py`), база SQLite (`db.py`; примеси по областям: звонки и события станций — `db_telephony.py`, разбор содержания — `db_content.py`, языковая модель — `db_llm.py`; общее — `db_util.py`), движки (`engines/`), конвейер (`pipeline/`), телефония (`telephony/`), контроль качества (`qc/`), мониторинг (`monitoring/`), каталог параметров (`catalog/params/` — по файлу на группу) |
 | `server/asrhub/web/` | интерфейс: одна страница без сборщика — `index.html`, `app.js`, `charts.js`, `styles.css` |
 | `agent/` | агент станции (`asrhub-agent.py`, Python 3.6+ без зависимостей), его установщик и сценарий отправки диалплана `asrhub-dialplan` (POSIX sh + curl) |
 | `scripts/` | установка, обновление, служба, проверка окружения — bash и PowerShell парами |
