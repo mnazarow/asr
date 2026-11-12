@@ -79,11 +79,72 @@ def _цитата(разговор: str, основы_нужные: set[str]) ->
     return ""
 
 
+_ЧИСЛО = re.compile(r"\d[\d\s\-/]{1,30}\d|\d")
+
+
+def _поля(раздел: str, разговор: str) -> dict:
+    """Свои поля: число из реплики, где есть слова подписи или описания."""
+    итог: dict = {}
+    for ид, подпись, описание in re.findall(r"- id «([^»]+)», «([^»]+)»: (.+)", раздел or ""):
+        нужные = _основы(подпись) | _основы(описание)
+        значение = None
+        for строка in разговор.split("\n"):
+            реплика = re.sub(r"^[^:\n]{1,30}: ", "", строка)
+            if _основы(реплика) & нужные:
+                число = _ЧИСЛО.search(реплика)
+                if число:
+                    значение = число.group(0).strip()
+                    break
+        итог[ид] = значение
+    return итог
+
+
+def _раздел(user: str, начало: str) -> str:
+    """Кусок подсказки от заголовка до следующего пустого раздела."""
+    m = re.search(re.escape(начало) + r".*?(?=\n(?:Трекеры —|Вопросы о поведении|Поля, которые|"
+                  r"Отвечай только|Верни JSON)|\Z)", user or "", re.DOTALL)
+    return m.group(0) if m else ""
+
+
+def _ответы_скоркарты(вопросы: list, разговор: str, основы: set[str], почему: bool,
+                      часть: bool = False) -> list:
+    ответы = []
+    for id_, вопрос in вопросы:
+        есть = bool(_основы(вопрос) & основы)
+        ответ = "да" if есть else ("н/п" if часть else "нет")
+        пункт = {"id": id_, "answer": ответ, "quote": _цитата(разговор, _основы(вопрос))}
+        if почему:
+            пункт["why"] = ("в разговоре есть слова вопроса" if есть
+                            else "слов вопроса в разговоре нет")
+        ответы.append(пункт)
+    return ответы
+
+
 def reply(system: str, user: str) -> str:
     """Ответ заглушки на подсказку — строка JSON."""
     задача = _задача(system)
+    if задача in _ДРУГИЕ:
+        return _ДРУГИЕ[задача](user)
     разговор = _разговор(user)
     основы = _основы(разговор)
+    if задача == "part":
+        ответ: dict = {}
+        трекеры_раздел = _раздел(user, "Трекеры —")
+        if трекеры_раздел:
+            ответ["trackers"] = [
+                {"id": id_, "fired": bool(_основы(описание) & основы),
+                 "quote": _цитата(разговор, _основы(описание))}
+                for id_, _, описание in re.findall(r"- id «([^»]+)», «([^»]+)»: (.+)",
+                                                   трекеры_раздел)]
+        вопросы_раздел = _раздел(user, "Вопросы о поведении")
+        if вопросы_раздел:
+            ответ["answers"] = _ответы_скоркарты(
+                re.findall(r"- id «([^»]+)»: (.+)", вопросы_раздел), разговор, основы,
+                '"why"' in (user or ""), часть=True)
+        поля_раздел = _раздел(user, "Поля, которые")
+        if поля_раздел:
+            ответ["fields"] = _поля(поля_раздел, разговор)
+        return json.dumps(ответ, ensure_ascii=False)
     if задача == "chunk":
         предложения = [п.strip() for п in _ПРЕДЛОЖЕНИЕ.findall(re.sub(r"^[^:\n]{1,30}: ", "", разговор, flags=re.M))
                        if п.strip()]
@@ -115,10 +176,9 @@ def reply(system: str, user: str) -> str:
         }, ensure_ascii=False)
     if задача == "scorecard":
         вопросы = re.findall(r"- id «([^»]+)»: (.+)", user or "")
-        return json.dumps({"answers": [
-            {"id": id_, "answer": "да" if _основы(вопрос) & основы else "нет",
-             "quote": _цитата(разговор, _основы(вопрос))}
-            for id_, вопрос in вопросы]}, ensure_ascii=False)
+        return json.dumps({"answers": _ответы_скоркарты(вопросы, разговор, основы,
+                                                        '"why"' in (user or ""))},
+                          ensure_ascii=False)
 
     # Основной вызов.
     чистый = re.sub(r"^[^:\n]{1,30}: ", "", разговор, flags=re.M)
@@ -136,6 +196,9 @@ def reply(system: str, user: str) -> str:
     if причины:
         ответ["reason"] = _выбрать(причины, основы, ("друг", "проч"))
         ответ["reason_quote"] = _цитата(разговор, _основы(ответ["reason"] or ""))
+        if '"reason_why"' in (user or ""):
+            ответ["reason_why"] = (f"в разговоре есть слова причины «{ответ['reason']}»"
+                                   if ответ["reason_quote"] else "ни одна причина не названа прямо")
     if исходы:
         нижний = чистый.lower()
         if "перезвон" in нижний and any("перезвон" in и for и in исходы):
@@ -147,6 +210,8 @@ def reply(system: str, user: str) -> str:
         else:
             ответ["outcome"] = _выбрать(исходы, основы, ("неясн", "друг"))
         ответ["outcome_quote"] = _цитата(разговор, _основы(ответ["outcome"] or ""))
+        if '"outcome_why"' in (user or ""):
+            ответ["outcome_why"] = f"так закончился разговор: «{(чистый.strip().splitlines() or [''])[-1][:80]}»"
     if '"actions"' in (user or ""):
         действия = []
         for строка in разговор.split("\n"):
@@ -159,4 +224,105 @@ def reply(system: str, user: str) -> str:
                                      "when": срок.group(0).strip() if срок else None,
                                      "quote": предложение.strip()[:200]})
         ответ["actions"] = действия[:10]
+    if '"fields"' in (user or ""):
+        ответ["fields"] = _поля(_раздел(user, "Поля, которые"), разговор)
     return json.dumps(ответ, ensure_ascii=False)
+
+
+#: Задачи вне разбора одной записи — у каждой свой ответ (см. ниже).
+_ДРУГИЕ: dict = {}
+
+#: Размер вектора заглушки.
+РАЗМЕР_ВЕКТОРА = 64
+
+
+def vector(текст: str) -> list[float]:
+    """Вектор смысла заглушки: основы слов, разложенные по корзинам.
+
+    Похожие тексты (общие основы) дают близкие векторы — этого хватает,
+    чтобы поиск по смыслу работал в проверках и без модели.
+    """
+    import hashlib  # noqa: PLC0415
+    import math  # noqa: PLC0415
+
+    вектор = [0.0] * РАЗМЕР_ВЕКТОРА
+    for основа in _основы(текст) | {w.lower()[:4] for w in _СЛОВО.findall(текст or "")
+                                    if len(w) >= 4}:
+        номер = int(hashlib.md5(основа.encode("utf-8")).hexdigest()[:8], 16)  # noqa: S324
+        вектор[номер % РАЗМЕР_ВЕКТОРА] += 1.0
+    длина = math.sqrt(sum(x * x for x in вектор)) or 1.0
+    return [x / длина for x in вектор]
+
+
+def _выдержки(user: str) -> list[tuple[str, str]]:
+    """Строки выдержек «[номер] …» из блока подсказки."""
+    return re.findall(r"^\[([^\]]+)\]\s*(.*)$", _разговор(user), flags=re.M)
+
+
+def _вопрос(user: str) -> set[str]:
+    m = re.search(r"Вопрос аналитика: (.+)", user or "")
+    return _основы(m.group(1)) if m else set()
+
+
+def _ask_part(user: str) -> str:
+    нужные = _вопрос(user)
+    подходящие = [(н, т) for н, т in _выдержки(user) if _основы(т) & нужные]
+    return json.dumps({"points": [{"text": т[:200], "records": [н]}
+                                  for н, т in подходящие[:10]]}, ensure_ascii=False)
+
+
+def _ask(user: str) -> str:
+    нужные = _вопрос(user)
+    строки = _выдержки(user)
+    номера: list[str] = []
+    if строки:
+        номера = [н for н, т in строки if _основы(т) & нужные]
+    else:
+        # Сводка по выпискам: номера стоят в квадратных скобках в конце строк.
+        for найденные in re.findall(r"\[([^\]]*)\]\s*$", _разговор(user), flags=re.M):
+            номера.extend(н.strip() for н in найденные.split(",") if н.strip())
+    return json.dumps({
+        "answer": (f"По выдержкам к вопросу относятся записей: {len(номера)}. "
+                   "Ответ составлен заглушкой по совпадению слов."),
+        "records": номера[:20]}, ensure_ascii=False)
+
+
+def _coaching(user: str) -> str:
+    сильные, слабые, тренировать = [], [], []
+    for номер, текст in _выдержки(user):
+        нет = re.findall(r"«нет»: ([^(;]+)", текст)
+        if нет:
+            слабые.append({"text": f"Не выполнено: {нет[0].strip()}", "records": [номер]})
+            тренировать.append(f"Потренировать: {нет[0].strip()}")
+        else:
+            сильные.append({"text": "Разговор без замечаний скоркарты", "records": [номер]})
+    return json.dumps({"strengths": сильные[:5], "weaknesses": слабые[:5],
+                       "practice": list(dict.fromkeys(тренировать))[:5]}, ensure_ascii=False)
+
+
+def _trainer(user: str) -> str:
+    блоки = re.findall(r"<<<РАСШИФРОВКА (\w+)>>>\n(.*?)\n<<<КОНЕЦ РАСШИФРОВКИ \1>>>",
+                       user or "", re.DOTALL)
+    сценарий = блоки[0][1] if блоки else ""
+    диалог = блоки[1][1] if len(блоки) > 1 else ""
+    операторских = len(re.findall(r"^Сотрудник: ", диалог, flags=re.M))
+    причина = re.search(r"Причина обращения: ([^.]+)", сценарий)
+    if not операторских:
+        реплика = f"Здравствуйте, у меня вопрос: {причина.group(1) if причина else 'проблема'}."
+    elif операторских == 1:
+        реплика = "А когда это решится? Мне нужно точно знать срок."
+    else:
+        реплика = "Хорошо, спасибо, договорились."
+    return json.dumps({"reply": реплика, "done": операторских >= 2}, ensure_ascii=False)
+
+
+def _assist(user: str) -> str:
+    разговор = _разговор(user)
+    последняя = (разговор.strip().splitlines() or [""])[-1]
+    return json.dumps({"advice": "Уточните, что именно важно клиенту, и предложите "
+                                 f"конкретный шаг со сроком. (по реплике: «{последняя[-60:]}»)"},
+                      ensure_ascii=False)
+
+
+_ДРУГИЕ.update({"ask_part": _ask_part, "ask": _ask, "coaching": _coaching,
+                "trainer": _trainer, "assist": _assist})

@@ -723,8 +723,16 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
                   threshold: float = Query(default=0.0, ge=0.0, le=0.8),
                   min_size: int = Query(default=0, ge=0, le=500),
                   name: bool = Query(default=True),
+                  by: str = Query(default="words", pattern="^(words|meaning)$",
+                                  description="words — по словам (TF-IDF основ), "
+                                              "meaning — по смыслу пересказов (векторы)"),
                   principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Собирает записи периода в кучки по похожести и показывает непокрытые.
+
+    `by=meaning` — кучки по близости пересказов модели (векторы смысла,
+    `llm_embeddings`): «курьер не приехал» и «доставку не привезли» — одна
+    тема, хотя общих слов нет. Порог тогда — близость векторов (по
+    умолчанию 0,75).
 
     Категории показывают то, что уже искали. Новая причина звонков — сбой в
     приложении, слух в соцсетях, изменившийся тариф — не попадает никуда, и
@@ -747,18 +755,32 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
     владелец = scope_owner(principal)
     name = bool(name and principal.can_write)
     ключ = (period, tuple(владелец) if isinstance(владелец, list) else владелец,
-            threshold, min_size, name)
+            threshold, min_size, name, by)
     with _ТЕМЫ_ЗАМОК:
         готовое = _ТЕМЫ.get(ключ)
         if готовое and time.time() - готовое[0] < СРОК_ТЕМ:
             return готовое[1]
 
-    записи = состояние.db.terms_matrix(since=начало, owner=владелец)
-    частоты, корпус = индекс.corpus_frequency()
-    найденные = темы_модуль.собрать(
-        записи, частоты, корпус,
-        порог=threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
-        минимум=min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ)
+    if by == "meaning":
+        from ..llm import semantic  # noqa: PLC0415
+
+        клиент_модели = getattr(состояние, "llm", None)
+        if (клиент_модели is None or not клиент_модели.enabled
+                or not состояние.settings.get("llm_embeddings", False)):
+            raise error_response(ConfigError(
+                "Темы по смыслу считаются по векторам пересказов, а поиск по смыслу выключен.",
+                hint="Включите llm_embeddings и задайте llm_embed_model."))
+        найденные, по_векторам = semantic.кучки(состояние.db, клиент_модели, owner=владелец,
+                                                since=начало, порог=threshold,
+                                                минимум=min_size)
+        записи = [(str(н), {}) for н in range(по_векторам)]
+    else:
+        записи = состояние.db.terms_matrix(since=начало, owner=владелец)
+        частоты, корпус = индекс.corpus_frequency()
+        найденные = темы_модуль.собрать(
+            записи, частоты, корпус,
+            порог=threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
+            минимум=min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ)
     все_ид = [ид for тема in найденные for ид in тема.jobs]
     темы_модуль.пометить_покрытие(найденные,
                                   состояние.db.hits_for_jobs(все_ид))
@@ -797,7 +819,9 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
         "uncovered": sum(1 for т in найденные
                          if т.covered / т.size < темы_модуль.ПОКРЫТА_ДОЛЯ),
         "named_by_model": назвали,
-        "threshold": threshold or темы_модуль.ПОРОГ_ПОХОЖЕСТИ,
+        "by": by,
+        "threshold": threshold or (темы_модуль.ПОРОГ_ПОХОЖЕСТИ if by == "words"
+                                   else 0.75),
         "min_size": min_size or темы_модуль.МИНИМУМ_ЗАПИСЕЙ,
     })
     with _ТЕМЫ_ЗАМОК:

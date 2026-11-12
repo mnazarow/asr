@@ -246,7 +246,8 @@ class StreamSession:
     """
 
     def __init__(self, registry: Any, settings: dict[str, Any], *,
-                 source_format: str = "pcm_s16le", workdir: Path | None = None) -> None:
+                 source_format: str = "pcm_s16le", workdir: Path | None = None,
+                 llm: Any = None) -> None:
         self.settings = dict(settings)
         self.registry = registry
         self.decoder = _Decoder(source_format)
@@ -309,6 +310,14 @@ class StreamSession:
                 # Подсказки необязательны. Сессия распознавания из-за них
                 # падать не должна: человек в разговоре, и текст важнее.
                 log.warning("Подсказки в разговоре недоступны: %s", exc)
+        #: Совет модели поверх подсказок по правилам (`stream_assist_llm`):
+        #: считается в своём потоке и приходит со следующей репликой.
+        self.advisor: Any = None
+        if (self.assist is not None and settings.get("stream_assist_llm")
+                and llm is not None and getattr(llm, "enabled", False)):
+            from .llm.advice import Советчик  # noqa: PLC0415
+
+            self.advisor = Советчик(llm, settings)
 
     # -- жизненный цикл -----------------------------------------------------
 
@@ -502,6 +511,17 @@ class StreamSession:
                 return готово
             готово.extend(
                 StreamEvent("hint", extra=п.to_dict()) for п in подсказки)
+            советчик = getattr(self, "advisor", None)
+            if советчик is not None:
+                повод = next((п.title for п in подсказки
+                              if п.kind in ("objection", "tracker")), "")
+                try:
+                    советчик.предложить(помощник.реплики, повод)
+                except Exception as exc:                    # noqa: BLE001
+                    log.info("Совет модели не запрошен: %s", exc)
+        советчик = getattr(self, "advisor", None)
+        if советчик is not None:
+            готово.extend(StreamEvent("hint", extra=с) for с in советчик.готовые())
         return готово
 
     def _note_first_text(self) -> None:

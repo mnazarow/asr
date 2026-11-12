@@ -797,6 +797,32 @@ POST   /api/llm/queue/clear                        очистить, кроме 
 
 Строки очереди несут `instance` — какой сервер разбирает запись — и `heartbeat_at` — когда он последний раз подтвердил, что жив. Сбой соединения с сервером модели, его 429/502/503/504 и нехватка видеопамяти попытку у записи не тратят.
 
+## ИИ-аналитика поверх ответов модели
+
+```
+GET    /api/llm/commitments?period=month          договорённости: выполнено, ждёт срока, просрочено
+GET    /api/llm/first-contact?period=month        решено с первого обращения по факту
+GET    /api/llm/risks?period=week                 риск ухода и эскалации, балл и причины
+GET    /api/qc/insights?period=quarter            опрос клиента: сверка NPS и драйверы оценки
+GET    /api/llm/versions                          смены настройки модели (отметки на трендах)
+GET    /api/llm/golden                            золотой набор и точность текущих ответов
+PUT    /api/llm/golden/{job_id}                   эталон человека по записи
+DELETE /api/llm/golden/{job_id}                   убрать из набора
+POST   /api/llm/golden/run                        прогон набора, с подменой настроек (администратор)
+GET    /api/llm/golden/runs                       прогоны и их точность
+POST   /api/llm/ask                               вопрос к архиву: ответ со ссылками на записи
+GET    /api/llm/search?q=                         поиск по смыслу (llm_embeddings)
+POST   /api/llm/search/index                      векторы для разобранного архива (администратор)
+GET    /api/content/agents/{key}/plan             план обучения оператора
+POST   /api/content/agents/{key}/plan             составить план заново
+GET    /api/llm/trainer/scenarios                 сценарии тренажёра
+POST   /api/llm/trainer                           начать тренировку: {"job_id"} или {"reason"}
+POST   /api/llm/trainer/{session_id}/reply        реплика оператора: {"text"}
+POST   /api/llm/trainer/{session_id}/finish       закончить и оценить скоркартой
+```
+
+Разрез по владельцу — как у остальной аналитики. Своды считаются по требованию, без вызовов модели; вопрос к архиву, план обучения, тренажёр и поиск по смыслу зовут модель и требуют ключа с правом записи (поиск — любого). Карточка оператора (`GET /api/content/agents/{key}`) несёт блок `llm` (`agent` и `team`: доля решённых, итог скоркарты, ответы по вопросам, обещания без срока), строки `GET /api/content/employees` — `llm_analyzed`, `llm_resolved_share`, `llm_score`, `llm_undated_share`. Ответ `PUT /api/qa/{review_id}` принимает `scorecard` — ответы проверяющего на вопросы скоркарты модели, а `GET /api/qa` отдаёт согласие человека и модели по каждому вопросу (`stats.scorecard`). Ряды трендов (`GET /api/trends`) с показателями модели несут `markers` — смены её настройки в окне. Подробно — в главе [35. ИИ-аналитика](35-ai-analytics.md).
+
 ## Модель из сети
 
 ```

@@ -1538,6 +1538,13 @@ class Insights:
                                      since=начало, owner=owner, agent=оператор,
                                      where="c.agent_score IS NOT NULL", limit=5)
         очередь = self.coaching(period, owner, agent=оператор, limit=20)
+        # Ответы языковой модели — рядом с баллом правил: доля решённых,
+        # итог скоркарты с весами, ответы по вопросам, договорённости без
+        # срока. Без этого смысловой слой жил отдельно от оценки оператора.
+        from .llm import insight as по_модели  # noqa: PLC0415
+
+        модель = по_модели.оценка_операторов(self.db, since=начало or 0.0, owner=owner,
+                                             by=by, key=key)
         человек: dict[str, Any] = {"key": key}
         if by == "agent":
             self._подписать_сотрудников([человек])
@@ -1554,6 +1561,7 @@ class Insights:
             "compare": сравнение, "timeline": ход, "step_s": round(шаг, 1),
             "violations": нарушения, "worst": худшие, "best": лучшие,
             "coaching": очередь["items"], "coaching_total": очередь["total"],
+            "llm": {"agent": модель["items"].get(str(key)), "team": модель["team"]},
         }
 
     def employees(self, by: str = "agent", period: str = "week",
@@ -1582,13 +1590,21 @@ class Insights:
             for строка in self.db.call_tops(поле, owner=owner, since=начало, limit=limit):
                 звонки[строка["value"]] = строка
         команда = self.summary(period, owner)
+        from .llm import insight as по_модели  # noqa: PLC0415
+
+        модель = по_модели.оценка_операторов(self.db, since=начало or 0.0, owner=owner, by=by)
         люди = []
         for пункт in разрез["items"]:
             ключ = str(пункт.get("key") or пункт.get("group_key") or "—")
             свои_звонки = звонки.get(ключ) or {}
             прошлое_своё = прошлые.get(ключ) or {}
+            своё_модели = модель["items"].get(ключ) or {}
             люди.append({
                 **пункт, "key": ключ,
+                "llm_analyzed": своё_модели.get("analyzed") or 0,
+                "llm_resolved_share": своё_модели.get("resolved_share"),
+                "llm_score": своё_модели.get("score"),
+                "llm_undated_share": своё_модели.get("undated_share"),
                 "calls": свои_звонки.get("count"),
                 "talk_s": свои_звонки.get("talk_s"),
                 "avg_call_s": свои_звонки.get("avg_s"),
@@ -1602,6 +1618,7 @@ class Insights:
             })
         return {"by": by, "period": period, "items": люди,
                 "team": команда, "hidden": разрез.get("hidden", 0),
+                "llm_team": модель["team"],
                 "dimensions": [{"key": к, "title": (РАЗРЕЗЫ.get(к) or {}).get("title", к)}
                                for к in Database.AGENT_DIMENSIONS],
                 "metrics": list(ПРИЗНАКИ)}

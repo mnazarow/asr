@@ -130,6 +130,13 @@ class ContentIndex:
     def enabled(self) -> bool:
         return bool(self.settings.get("content_analysis", True)) if self.settings else True
 
+    def _сдвиг_nps(self) -> float:
+        """Поправка предсказанного NPS по своему архиву (`content_nps_shift`)."""
+        try:
+            return float((self.settings.get("content_nps_shift") if self.settings else 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _мат(self) -> bool:
         """Считать ли нецензурную лексику. По умолчанию — нет, см. словарь."""
         return bool(self.settings.get("content_profanity", False)) if self.settings else False
@@ -209,7 +216,8 @@ class ContentIndex:
             # по плохо расслышанной записи судить о конкретности ответов
             # нельзя, и без этой поправки хуже всех выглядели бы разговоры
             # с плохой линией, а не с плохими ответами.
-            confidence=задание.get("avg_confidence"))
+            confidence=задание.get("avg_confidence"),
+            nps_shift=self._сдвиг_nps())
         свод, основы = content.features(разбор)
         if save:
             self.db.save_content(job_id, свод, основы)
@@ -378,7 +386,8 @@ class ContentIndex:
                     document_frequency=частоты, corpus_size=корпус,
                     profanity=мат, categories=набор, thresholds=пороги,
                     timed=str(запись.get("source") or "") != "text",
-                    confidence=запись.get("avg_confidence"))
+                    confidence=запись.get("avg_confidence"),
+                    nps_shift=self._сдвиг_nps())
                 свод, основы = content.features(разбор)
                 self.db.save_content(job_id, свод, основы)
                 # Здоровье распознавания у записей, сделанных до его

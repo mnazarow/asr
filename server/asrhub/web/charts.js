@@ -392,6 +392,23 @@ function fmtNum(value, digits) {
       }
     });
 
+    // Отметки событий — вертикальные черты с подписью в подсказке: смена
+    // модели или подсказки, после которой ряд мог сдвинуться не из-за
+    // работы, а из-за того, как её стали мерить. `x` — позиция по подписям
+    // (может быть дробной: между корзинами).
+    (config.markers || []).forEach((m) => {
+      if (m === null || m === undefined || !isFinite(m.x)) return;
+      const x = xAt(Math.max(0, Math.min(count, m.x)));
+      const черта = el('line', { x1: x, x2: x, y1: ctx.pad.top, y2: ctx.pad.top + ctx.ih,
+                                 stroke: status().warn || faint(), 'stroke-width': 1.5,
+                                 'stroke-dasharray': '4 3', opacity: 0.9,
+                                 'data-marker': '1' }, ctx.svg);
+      const флажок = el('circle', { cx: x, cy: ctx.pad.top + 4, r: 4,
+                                    fill: status().warn || faint() }, ctx.svg);
+      attachTip(черта, m.title || 'отметка');
+      attachTip(флажок, m.title || 'отметка');
+    });
+
     // Слой перекрестия: одна подсказка на всю вертикаль
     const overlay = el('rect', { x: ctx.pad.left, y: ctx.pad.top, width: ctx.iw,
                                  height: ctx.ih, fill: 'transparent' }, ctx.svg);

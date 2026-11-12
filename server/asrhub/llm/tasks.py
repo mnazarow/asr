@@ -31,7 +31,9 @@ from .client import LLMClient, LLMError
 
 #: Версия подсказок. Меняется, когда меняется смысл вопросов к модели:
 #: старые ответы помечаются устаревшими и пересчитываются при разборе архива.
-VERSION = 1
+#: Версия 2 (3.1.31): пояснения к причине, исходу и ответам скоркарты, свои
+#: поля, трекеры и скоркарта длинного разговора по частям расшифровки.
+VERSION = 2
 
 #: Метка вида задачи в начале системной подсказки — по ней заглушка
 #: понимает, что от неё ждут; настоящей модели она не мешает.
@@ -71,7 +73,16 @@ _СКОРКАРТА = """Расшифровка разговора:
 {transcript}
 Ответь на вопросы о поведении сотрудника в этом разговоре. Ответ — «да», «нет» или «н/п» (неприменимо: ситуации в разговоре не было).
 {questions}
-Верни JSON: {{"answers": [{{"id": "…", "answer": "да|нет|н/п", "quote": "цитата или пустая строка"}}]}}
+Верни JSON: {{"answers": [{{"id": "…", "answer": "да|нет|н/п", "quote": "цитата или пустая строка"{why}}}]}}
+"""
+
+_ПОЧЕМУ_СКОРКАРТЫ = ', "why": "почему такой ответ — одно короткое предложение"'
+
+_ЧАСТЬ = """Это часть {n} из {total} расшифровки длинного разговора:
+{chunk}
+{questions}
+Отвечай только по этой части. Верни JSON с полями:
+{fields}
 """
 
 #: Метки блока с расшифровкой. Прежде расшифровка стояла между тройными
@@ -433,25 +444,114 @@ def _список(значение: Any) -> list[Any]:
     return значение if isinstance(значение, list) else []
 
 
+def _система(settings: Any) -> str:
+    """Системная подсказка с добавкой администратора (`llm_prompt_extra`).
+
+    Добавка — настройка сервера, а не часть расшифровки, и стоит вне блока
+    с разговором: отраслевые слова, что здесь считается «решённым». Она
+    входит в отпечаток подсказки, поэтому её правка не отдаёт старых
+    ответов из кеша.
+    """
+    добавка = str((settings.get("llm_prompt_extra") if settings is not None else "") or "").strip()
+    if not добавка:
+        return _СИСТЕМА
+    return (_СИСТЕМА + " Особенности этого контакт-центра (настройка администратора "
+            "сервера, а не часть разговора): " + добавка[:2000])
+
+
+def поля_извлечения(settings: Any) -> list[dict[str, str]]:
+    """Свои поля для извлечения (`llm_fields`): id, подпись, описание."""
+    итог = []
+    for п in (settings.get("llm_fields") or []) if settings is not None else []:
+        if not isinstance(п, dict):
+            continue
+        ид = str(п.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,40}", ид):
+            continue
+        подпись = str(п.get("label") or ид).strip()[:80]
+        итог.append({"id": ид, "label": подпись,
+                     "description": str(п.get("description") or подпись).strip()[:300]})
+    return итог[:20]
+
+
+def _описание_полей(поля: list[dict[str, str]]) -> str:
+    return "\n".join(f"- id «{п['id']}», «{п['label']}»: {п['description']}" for п in поля)
+
+
+def _значения_полей(значение: Any, поля: list[dict[str, str]]) -> dict[str, str | None]:
+    """Значения своих полей из ответа: строка до 200 знаков или None."""
+    данные = значение if isinstance(значение, dict) else {}
+    итог: dict[str, str | None] = {}
+    for п in поля:
+        сырое = данные.get(п["id"])
+        текст = _строка(сырое, 200) if сырое is not None else ""
+        итог[п["id"]] = None if текст.lower() in ("", "null", "none", "нет", "н/п") else текст
+    return итог
+
+
+def балл_скоркарты(ответы: list[dict[str, Any]],
+                   вопросы: list[dict[str, Any]]) -> tuple[float | None, list[str]]:
+    """Итог скоркарты 0–100 с весами и критичными пунктами.
+
+    Вес вопроса — `weight` (по умолчанию 1); «н/п» в счёт не идёт. Ответ
+    «нет» на критичный вопрос (`critical: true`) обнуляет итог — так в
+    автоматической оценке устроены пункты, без которых разговор не засчитан
+    (не назвал условия, нарушил закон). Возвращает балл (None — не на что
+    опереться) и список проваленных критичных пунктов.
+    """
+    свойства = {str(в.get("id")): в for в in вопросы if isinstance(в, dict)}
+    сумма = набрано = 0.0
+    провал: list[str] = []
+    for о in ответы:
+        в = свойства.get(str(о.get("id"))) or {}
+        try:
+            вес = max(0.0, float(в.get("weight", 1) or 0))
+        except (TypeError, ValueError):
+            вес = 1.0
+        if о.get("answer") not in ("да", "нет"):
+            continue
+        сумма += вес
+        if о["answer"] == "да":
+            набрано += вес
+        elif в.get("critical"):
+            провал.append(str(о.get("id")))
+    if провал:
+        return 0.0, провал
+    return (round(100.0 * набрано / сумма, 1) if сумма else None), провал
+
+
 def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
             settings: Any, agent_speaker: str = "",
-            script: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Полный смысловой разбор одной записи по включённым задачам."""
+            script: list[dict[str, Any]] | None = None,
+            reasons: list[str] | None = None,
+            outcomes: list[str] | None = None) -> dict[str, Any]:
+    """Полный смысловой разбор одной записи по включённым задачам.
+
+    `reasons` и `outcomes` — списки причин и исходов вместо общих из
+    настроек: так разбор берёт списки отдела (`llm_lists_by_department`).
+    """
     задачи = set(settings.get("llm_tasks") or [])
     предел = int(settings.get("llm_context_chars") or 12000)
-    причины = [str(x) for x in (settings.get("llm_reasons") or []) if str(x).strip()]
-    исходы = [str(x) for x in (settings.get("llm_outcomes") or []) if str(x).strip()]
+    причины = [str(x) for x in (reasons if reasons is not None
+                                else (settings.get("llm_reasons") or [])) if str(x).strip()]
+    исходы = [str(x) for x in (outcomes if outcomes is not None
+                               else (settings.get("llm_outcomes") or [])) if str(x).strip()]
     трекеры = [т for т in (settings.get("llm_trackers") or []) if isinstance(т, dict)]
     вопросы = [в for в in (settings.get("llm_scorecard") or []) if isinstance(в, dict)]
     if not вопросы and script:
         вопросы = [{"id": str(п.get("id") or f"item{i}"),
                     "question": f"Сотрудник выполнил пункт скрипта: {п.get('label')}?"}
                    for i, п in enumerate(script) if п.get("label")]
+    поля = поля_извлечения(settings)
+    пояснять = bool(settings.get("llm_explain", True))
+    по_частям = str(settings.get("llm_parts_mode") or "parts") != "summaries"
+    система = _система(settings)
 
     начало = time.perf_counter()
     итог: dict[str, Any] = {"summary": None, "reason": None, "outcome": None,
                             "resolved": None, "actions": None, "trackers": None,
-                            "scorecard": None, "chunks": 1, "calls": 0,
+                            "scorecard": None, "fields": None, "score": None,
+                            "chunks": 1, "calls": 0,
                             "model": client.model, "warnings": []}
     разговор = transcript_of(segments, text, agent_speaker=agent_speaker)
     # Обезличивание до модели (`llm_mask_pii`): расшифровка уходит на сервер
@@ -470,13 +570,14 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
         return итог
 
     куски = chunks_of(разговор, предел)
-    if len(куски) > 1:
+    части = куски if len(куски) > 1 else []
+    if части:
         пересказы = []
         пустых = 0
-        for n, кусок in enumerate(куски, 1):
+        for n, кусок in enumerate(части, 1):
             разбор = ответ_с("summary")
-            ответ = client.chat(МЕТКА.format(kind="chunk") + _СИСТЕМА,
-                                _ПЕРЕСКАЗ.format(n=n, total=len(куски), chunk=блок(кусок)),
+            ответ = client.chat(МЕТКА.format(kind="chunk") + система,
+                                _ПЕРЕСКАЗ.format(n=n, total=len(части), chunk=блок(кусок)),
                                 kind="chunk", validate=разбор)
             итог["calls"] += 1
             # Проверка полей здесь — только для кеша: часть без пересказа
@@ -495,16 +596,16 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
         # разговоры режутся на части всегда, так что это про них.
         if пустых:
             итог["warnings"].append(
-                f"без пересказа осталось частей: {пустых} из {len(куски)}")
+                f"без пересказа осталось частей: {пустых} из {len(части)}")
         if not пересказы:
             итог["warnings"].append(
                 "модель не пересказала ни одной части — разбирать нечего")
-            итог["chunks"] = len(куски)
+            итог["chunks"] = len(части)
             итог["latency_ms"] = round((time.perf_counter() - начало) * 1000, 1)
             return итог
         разговор = "\n".join(пересказы)
-        итог["chunks"] = len(куски)
-        итог["warnings"].append(f"разбор по пересказам {len(куски)} частей")
+        итог["chunks"] = len(части)
+        итог["warnings"].append(f"разбор по пересказам {len(части)} частей")
 
     # Цитаты сверяются с расшифровкой: модель вправе цитировать только
     # разговор, а цитата, которой в нём нет, — либо выдумка, либо то, что
@@ -513,46 +614,60 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
     сверять = итог["chunks"] == 1
     исходный = разговор
 
-    def цитата(значение: Any, где: str) -> str:
+    def цитата(значение: Any, где: str, текст_сверки: str | None = None) -> str:
         текст = _строка(значение)
-        if текст and сверять and not есть_в(текст, исходный):
+        образец = исходный if текст_сверки is None else текст_сверки
+        if текст and (сверять or текст_сверки is not None) and not есть_в(текст, образец):
             итог["warnings"].append(f"цитата не найдена в расшифровке: {где}")
         return текст
 
     основные = задачи & {"summary", "outcome", "actions"}
-    if основные:
-        поля = []
+    # Свои поля спрашиваются основным вызовом: у короткого разговора — по
+    # расшифровке, у длинного — по каждой части (ниже), потому что номер
+    # заказа в пересказ части обычно не доживает.
+    поля_в_основном = bool(поля) and not (части and по_частям)
+    if основные or поля_в_основном:
+        поля_ответа = []
         списки = []
         нужны: list[str] = []
         if "summary" in задачи:
             нужны.append("summary")
-            поля.append('"summary": "резюме в три-пять предложений: причина обращения, '
-                        'что сделано, чем закончилось"')
-            поля.append('"resolved": true, если вопрос клиента решён в разговоре, false, '
-                        'если не решён, null, если неясно')
+            поля_ответа.append('"summary": "резюме в три-пять предложений: причина обращения, '
+                               'что сделано, чем закончилось"')
+            поля_ответа.append('"resolved": true, если вопрос клиента решён в разговоре, false, '
+                               'если не решён, null, если неясно')
         if "outcome" in задачи:
             if причины:
                 нужны.append("reason")
                 списки.append("Причины обращения (выбери ровно одну): " + "; ".join(причины))
-                поля.append('"reason": "одна причина из списка"')
-                поля.append('"reason_quote": "цитата из расшифровки, по которой выбрана причина"')
+                поля_ответа.append('"reason": "одна причина из списка"')
+                поля_ответа.append('"reason_quote": "цитата из расшифровки, по которой выбрана причина"')
+                if пояснять:
+                    поля_ответа.append('"reason_why": "почему именно эта причина — одно короткое предложение"')
             if исходы:
                 нужны.append("outcome")
                 списки.append("Исходы разговора (выбери ровно один): " + "; ".join(исходы))
-                поля.append('"outcome": "один исход из списка"')
-                поля.append('"outcome_quote": "цитата, по которой выбран исход"')
+                поля_ответа.append('"outcome": "один исход из списка"')
+                поля_ответа.append('"outcome_quote": "цитата, по которой выбран исход"')
+                if пояснять:
+                    поля_ответа.append('"outcome_why": "почему именно этот исход — одно короткое предложение"')
         if "actions" in задачи:
             нужны.append("actions")
-            поля.append('"actions": список действий к исполнению, о которых договорились: '
-                        '[{"what": "что сделать", "who": "сотрудник" или "клиент", '
-                        '"when": "срок словами из разговора или null", '
-                        '"quote": "цитата"}]; пустой список, если договорённостей нет')
+            поля_ответа.append('"actions": список действий к исполнению, о которых договорились: '
+                               '[{"what": "что сделать", "who": "сотрудник" или "клиент", '
+                               '"when": "срок словами из разговора или null", '
+                               '"quote": "цитата"}]; пустой список, если договорённостей нет')
+        if поля_в_основном:
+            нужны.append("fields")
+            списки.append("Поля, которые нужно найти в разговоре:\n" + _описание_полей(поля))
+            поля_ответа.append('"fields": {"id поля": "значение, как оно прозвучало, или null, '
+                               'если в разговоре его нет"}')
         разбор = ответ_с(*нужны, хоть_одно=True)
         ответ = client.chat(
-            МЕТКА.format(kind="main") + _СИСТЕМА,
+            МЕТКА.format(kind="main") + система,
             _ОСНОВНОЙ.format(transcript=блок(разговор),
                              lists=("\n".join(списки) + "\n") if списки else "",
-                             fields="\n".join(поля)),
+                             fields="\n".join(поля_ответа)),
             kind="main", validate=разбор)
         итог["calls"] += 1
         данные = разбор(ответ)
@@ -564,12 +679,16 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
                 итог["reason"], попала = _из_списка(данные.get("reason"), причины,
                                                     ("друг", "проч"))
                 итог["reason_quote"] = цитата(данные.get("reason_quote"), "причина")
+                if пояснять:
+                    итог["reason_why"] = _строка(данные.get("reason_why"), 300) or None
                 if not попала:
                     итог["warnings"].append("причина вне списка")
             if исходы:
                 итог["outcome"], попала = _из_списка(данные.get("outcome"), исходы,
                                                      ("неясн", "друг"))
                 итог["outcome_quote"] = цитата(данные.get("outcome_quote"), "исход")
+                if пояснять:
+                    итог["outcome_why"] = _строка(данные.get("outcome_why"), 300) or None
                 if not попала:
                     итог["warnings"].append("исход вне списка")
         if "actions" in задачи:
@@ -580,66 +699,197 @@ def analyze(client: LLMClient, *, text: str, segments: list[dict[str, Any]],
                  "quote": цитата(д.get("quote"), "действие")}
                 for д in _список(действия)
                 if isinstance(д, dict) and _строка(д.get("what"))][:20]
+        if поля_в_основном:
+            итог["fields"] = _значения_полей(данные.get("fields"), поля)
 
-    if "trackers" in задачи and трекеры:
-        описания = "\n".join(
-            f"- id «{т.get('id')}», «{т.get('label')}»: {т.get('description') or т.get('label')}"
-            for т in трекеры if т.get("id"))
-        разбор = ответ_с("trackers")
-        ответ = client.chat(МЕТКА.format(kind="trackers") + _СИСТЕМА,
-                            _ТРЕКЕРЫ.format(transcript=блок(разговор), trackers=описания),
-                            kind="trackers", validate=разбор)
-        итог["calls"] += 1
-        данные = разбор(ответ)
-        ответы = {str(o.get("id")): o for o in _список(данные.get("trackers"))
-                  if isinstance(o, dict)}
-        итог["trackers"] = []
-        for т in трекеры:
-            if not т.get("id"):
-                continue
-            о = ответы.get(str(т.get("id")))
-            # «Да, сработал» и «нет, не было» — тоже ответы: первое слово
-            # решает. Прежде такой ответ читался как «не сработал».
-            сработал = _да_нет_ответ(о.get("fired")) if о else None
-            if о is None:
-                итог["warnings"].append(f"модель не ответила про трекер «{т.get('id')}»")
-            elif сработал is None:
-                итог["warnings"].append(f"ответ про трекер «{т.get('id')}» не разобран")
-            итог["trackers"].append(
-                {"id": str(т.get("id")), "label": str(т.get("label") or т.get("id")),
-                 "fired": bool(сработал),
-                 "quote": цитата((о or {}).get("quote"), f"трекер «{т.get('id')}»")})
-
-    if "scorecard" in задачи and вопросы:
-        список = "\n".join(f"- id «{в.get('id')}»: {в.get('question')}" for в in вопросы
-                           if в.get("id") and в.get("question"))
-        разбор = ответ_с("answers")
-        ответ = client.chat(МЕТКА.format(kind="scorecard") + _СИСТЕМА,
-                            _СКОРКАРТА.format(transcript=блок(разговор), questions=список),
-                            kind="scorecard", validate=разбор)
-        итог["calls"] += 1
-        данные = разбор(ответ)
-        ответы = {str(o.get("id")): o for o in _список(данные.get("answers"))
-                  if isinstance(o, dict)}
-        итог["scorecard"] = []
-        for в in вопросы:
-            if not (в.get("id") and в.get("question")):
-                continue
-            о = ответы.get(str(в.get("id")))
-            if о is None:
-                итог["warnings"].append(f"модель не ответила на вопрос «{в.get('id')}»")
-            ответ_модели = _ответ_скоркарты((о or {}).get("answer"))
-            if о is not None and ответ_модели is None:
-                итог["warnings"].append(
-                    f"ответ на вопрос «{в.get('id')}» не разобран: "
-                    f"«{_строка((о or {}).get('answer'), 40)}»")
-            итог["scorecard"].append({
-                "id": str(в.get("id")), "question": str(в.get("question")),
-                "answer": ответ_модели or "н/п",
-                "quote": цитата((о or {}).get("quote"), f"вопрос «{в.get('id')}»")})
+    нужны_трекеры = "trackers" in задачи and any(т.get("id") for т in трекеры)
+    нужна_скоркарта = "scorecard" in задачи and any(
+        в.get("id") and в.get("question") for в in вопросы)
+    if части and по_частям and (нужны_трекеры or нужна_скоркарта or поля):
+        # Длинный разговор: трекеры, скоркарта и свои поля — по каждой части
+        # ИСХОДНОГО текста, а не по пересказам. «Угроза судом» на сороковой
+        # минуте до пересказа части доживает не всегда, а цитата из
+        # пересказа — не цитата. Один вызов на часть со всеми тремя
+        # вопросами разом, затем сведение.
+        _по_частям(client, система, части, итог,
+                   трекеры if нужны_трекеры else [],
+                   вопросы if нужна_скоркарта else [], поля, пояснять, цитата)
+        if not поля:
+            итог["fields"] = None
+    else:
+        if нужны_трекеры:
+            описания = "\n".join(
+                f"- id «{т.get('id')}», «{т.get('label')}»: {т.get('description') or т.get('label')}"
+                for т in трекеры if т.get("id"))
+            разбор = ответ_с("trackers")
+            ответ = client.chat(МЕТКА.format(kind="trackers") + система,
+                                _ТРЕКЕРЫ.format(transcript=блок(разговор), trackers=описания),
+                                kind="trackers", validate=разбор)
+            итог["calls"] += 1
+            ответы = {str(o.get("id")): o for o in _список(разбор(ответ).get("trackers"))
+                      if isinstance(o, dict)}
+            итог["trackers"] = _трекеры_из(трекеры, ответы, итог, цитата)
+        if нужна_скоркарта:
+            список = "\n".join(f"- id «{в.get('id')}»: {в.get('question')}" for в in вопросы
+                               if в.get("id") and в.get("question"))
+            разбор = ответ_с("answers")
+            ответ = client.chat(
+                МЕТКА.format(kind="scorecard") + система,
+                _СКОРКАРТА.format(transcript=блок(разговор), questions=список,
+                                  why=_ПОЧЕМУ_СКОРКАРТЫ if пояснять else ""),
+                kind="scorecard", validate=разбор)
+            итог["calls"] += 1
+            ответы = {str(o.get("id")): o for o in _список(разбор(ответ).get("answers"))
+                      if isinstance(o, dict)}
+            итог["scorecard"] = _скоркарта_из(вопросы, ответы, итог, цитата, пояснять)
+    if итог.get("scorecard"):
+        итог["score"], провал = балл_скоркарты(итог["scorecard"], вопросы)
+        if провал:
+            итог["critical_failed"] = провал
 
     итог["latency_ms"] = round((time.perf_counter() - начало) * 1000, 1)
     return итог
+
+
+def _трекеры_из(трекеры: list[dict[str, Any]], ответы: dict[str, dict[str, Any]],
+                итог: dict[str, Any], цитата: Callable[..., str]) -> list[dict[str, Any]]:
+    готово = []
+    for т in трекеры:
+        if not т.get("id"):
+            continue
+        о = ответы.get(str(т.get("id")))
+        # «Да, сработал» и «нет, не было» — тоже ответы: первое слово
+        # решает. Прежде такой ответ читался как «не сработал».
+        сработал = _да_нет_ответ(о.get("fired")) if о else None
+        if о is None:
+            итог["warnings"].append(f"модель не ответила про трекер «{т.get('id')}»")
+        elif сработал is None:
+            итог["warnings"].append(f"ответ про трекер «{т.get('id')}» не разобран")
+        готово.append(
+            {"id": str(т.get("id")), "label": str(т.get("label") or т.get("id")),
+             "fired": bool(сработал),
+             "quote": цитата((о or {}).get("quote"), f"трекер «{т.get('id')}»")})
+    return готово
+
+
+def _скоркарта_из(вопросы: list[dict[str, Any]], ответы: dict[str, dict[str, Any]],
+                  итог: dict[str, Any], цитата: Callable[..., str],
+                  пояснять: bool) -> list[dict[str, Any]]:
+    готово = []
+    for в in вопросы:
+        if not (в.get("id") and в.get("question")):
+            continue
+        о = ответы.get(str(в.get("id")))
+        if о is None:
+            итог["warnings"].append(f"модель не ответила на вопрос «{в.get('id')}»")
+        ответ_модели = _ответ_скоркарты((о or {}).get("answer"))
+        if о is not None and ответ_модели is None:
+            итог["warnings"].append(
+                f"ответ на вопрос «{в.get('id')}» не разобран: "
+                f"«{_строка((о or {}).get('answer'), 40)}»")
+        пункт = {"id": str(в.get("id")), "question": str(в.get("question")),
+                 "answer": ответ_модели or "н/п",
+                 "quote": цитата((о or {}).get("quote"), f"вопрос «{в.get('id')}»")}
+        if пояснять:
+            пункт["why"] = _строка((о or {}).get("why"), 300) or None
+        готово.append(пункт)
+    return готово
+
+
+def _по_частям(client: LLMClient, система: str, части: list[str], итог: dict[str, Any],
+               трекеры: list[dict[str, Any]], вопросы: list[dict[str, Any]],
+               поля: list[dict[str, str]], пояснять: bool,
+               цитата: Callable[..., str]) -> None:
+    """Трекеры, скоркарта и поля по каждой части исходного текста — и сведение.
+
+    Сведение: трекер сработал, если сработал хоть в одной части (цитата —
+    из первой такой). Вопрос скоркарты — «нет», если хоть в одной части
+    «нет»; иначе «да», если хоть где-то «да»; иначе «н/п». Подсказка части
+    просит «н/п», когда ситуации в этой части нет: «представился в начале»
+    в двадцатой минуте неприменимо, а не «нет». Поле — первое найденное.
+    """
+    трекеры = [т for т in трекеры if т.get("id")]
+    вопросы = [в for в in вопросы if в.get("id") and в.get("question")]
+    нужны = [к for к, есть in (("trackers", трекеры), ("answers", вопросы), ("fields", поля))
+             if есть]
+    сработали: dict[str, dict[str, Any]] = {}
+    видели_трекер: set[str] = set()
+    по_вопросам: dict[str, list[tuple[str, dict[str, Any], str]]] = {}
+    значения: dict[str, str | None] = {п["id"]: None for п in поля}
+    for n, часть in enumerate(части, 1):
+        поля_ответа = []
+        вопросы_части = []
+        if трекеры:
+            вопросы_части.append(
+                "Трекеры — проверь по смыслу, а не по словам, сработал ли каждый в этой части:\n"
+                + "\n".join(f"- id «{т.get('id')}», «{т.get('label')}»: "
+                            f"{т.get('description') or т.get('label')}" for т in трекеры))
+            поля_ответа.append('"trackers": [{"id": "…", "fired": true или false, '
+                               '"quote": "цитата из этой части или пустая строка"}]')
+        if вопросы:
+            вопросы_части.append(
+                "Вопросы о поведении сотрудника — ответ «да», «нет» или «н/п»; «н/п», если "
+                "ситуации из вопроса в этой части нет:\n"
+                + "\n".join(f"- id «{в.get('id')}»: {в.get('question')}" for в in вопросы))
+            поля_ответа.append('"answers": [{"id": "…", "answer": "да|нет|н/п", '
+                               '"quote": "цитата или пустая строка"'
+                               + (', "why": "почему — одно короткое предложение"' if пояснять else "")
+                               + '}]')
+        if поля:
+            вопросы_части.append("Поля, которые нужно найти:\n" + _описание_полей(поля))
+            поля_ответа.append('"fields": {"id поля": "значение или null"}')
+        разбор = ответ_с(*нужны, хоть_одно=True)
+        ответ = client.chat(
+            МЕТКА.format(kind="part") + система,
+            _ЧАСТЬ.format(n=n, total=len(части), chunk=блок(часть),
+                          questions="\n".join(вопросы_части), fields="\n".join(поля_ответа)),
+            kind="part", validate=разбор)
+        итог["calls"] += 1
+        данные = разбор(ответ)
+        for о in _список(данные.get("trackers")):
+            if not isinstance(о, dict):
+                continue
+            ид = str(о.get("id"))
+            видели_трекер.add(ид)
+            if _да_нет_ответ(о.get("fired")) and ид not in сработали:
+                сработали[ид] = {"quote": цитата(о.get("quote"), f"трекер «{ид}», часть {n}",
+                                                 часть)}
+        for о in _список(данные.get("answers")):
+            if not isinstance(о, dict):
+                continue
+            ответ_модели = _ответ_скоркарты(о.get("answer")) or "н/п"
+            по_вопросам.setdefault(str(о.get("id")), []).append((ответ_модели, о, часть))
+        for ид, значение in _значения_полей(данные.get("fields"), поля).items():
+            if значения.get(ид) is None and значение is not None:
+                значения[ид] = значение
+    if трекеры:
+        итог["trackers"] = []
+        for т in трекеры:
+            ид = str(т.get("id"))
+            if ид not in видели_трекер:
+                итог["warnings"].append(f"модель не ответила про трекер «{ид}»")
+            итог["trackers"].append({"id": ид, "label": str(т.get("label") or ид),
+                                     "fired": ид in сработали,
+                                     "quote": (сработали.get(ид) or {}).get("quote", "")})
+    if вопросы:
+        итог["scorecard"] = []
+        for в in вопросы:
+            ид = str(в.get("id"))
+            ответы = по_вопросам.get(ид) or []
+            if not ответы:
+                итог["warnings"].append(f"модель не ответила на вопрос «{ид}»")
+            решающий = (next((о for о in ответы if о[0] == "нет"), None)
+                        or next((о for о in ответы if о[0] == "да"), None))
+            пункт = {"id": ид, "question": str(в.get("question")),
+                     "answer": решающий[0] if решающий else "н/п",
+                     "quote": (цитата(решающий[1].get("quote"), f"вопрос «{ид}»", решающий[2])
+                               if решающий else "")}
+            if пояснять:
+                пункт["why"] = (_строка(решающий[1].get("why"), 300) or None) if решающий else None
+            итог["scorecard"].append(пункт)
+    if поля:
+        итог["fields"] = значения
+    итог["warnings"].append(f"трекеры, скоркарта и поля — по {len(части)} частям расшифровки")
 
 
 def summarize_for_digest(результаты: list[dict[str, Any]]) -> dict[str, Any]:

@@ -38,7 +38,7 @@ import time
 from typing import Any
 
 from ..logging_setup import get_logger
-from . import tasks
+from . import policy, tasks
 from .client import LLMClient, LLMError
 
 log = get_logger("llm")
@@ -119,10 +119,25 @@ class LLMWorker:
     # --- снаружи ----------------------------------------------------------
 
     def enqueue(self, job_id: str) -> None:
-        """Свежая запись — в очередь разбора, если слой включён и разбор новых."""
-        if self.client.enabled and self.settings.get("llm_auto", True):
-            self.db.llmq_put(str(job_id), kind="свежая запись",
-                             priority=_целое(self.settings, "llm_queue_priority_new", 50))
+        """Свежая запись — в очередь разбора, если слой включён и разбор новых.
+
+        Короткий звонок и сомнительная расшифровка (`llm.policy`) сами в
+        очередь не встают: об этом событие в истории записи, а разобрать её
+        по просьбе можно всегда.
+        """
+        if not (self.client.enabled and self.settings.get("llm_auto", True)):
+            return
+        try:
+            job = self.db.get_job(str(job_id)) or {}
+        except Exception:                                    # noqa: BLE001
+            job = {}
+        причина = policy.пропустить(job, self.settings) if job else ""
+        if причина:
+            self.db.add_event(str(job_id), "llm", f"Смысловой разбор пропущен: {причина}",
+                              {"skipped": причина})
+            return
+        self.db.llmq_put(str(job_id), kind="свежая запись",
+                         priority=_целое(self.settings, "llm_queue_priority_new", 50))
 
     def enqueue_many(self, job_ids: Any, *, kind: str = "по просьбе",
                      priority: int | None = None) -> int:
@@ -248,13 +263,22 @@ class LLMWorker:
         сегменты = self.db.get_segments(job_id)
         скрипт = list(self.settings.get("content_script") or [])
         оператор = self._оператор(job_id, job, сегменты)
+        причины, исходы = self._списки_отдела(job_id)
+        self._отметить_версию()
         мимо = getattr(self.client, "мимо_кеша", None)
         with _для_записи(self.client, job_id), \
                 (мимо() if fresh and callable(мимо) else contextlib.nullcontext()):
             итог = tasks.analyze(self.client, text=str(job.get("text") or ""),
                                  segments=сегменты, settings=self.settings,
-                                 agent_speaker=оператор, script=скрипт)
+                                 agent_speaker=оператор, script=скрипт,
+                                 reasons=причины, outcomes=исходы)
         замечания = [str(з) for з in (итог.get("warnings") or []) if str(з).strip()]
+        сомнение = policy.сомнительная(job, self.settings)
+        if сомнение:
+            # Распознавание, похоже, ошиблось: ответ модели — пересказ того,
+            # что распознано, а не того, что сказано. Пометка видна в
+            # карточке рядом с ответом.
+            замечания.append(f"по сомнительной расшифровке: {сомнение}")
         # Пустой разбор — тот, в котором нет ответа ни на одну заказанную
         # задачу. Раньше пустым считался любой без резюме и исхода: сервер,
         # настроенный на одни трекеры или скоркарту (`llm_tasks`), получал на
@@ -276,14 +300,185 @@ class LLMWorker:
             scorecard=итог.get("scorecard"), chunks=итог.get("chunks") or 1,
             calls=итог.get("calls") or 0, latency_ms=итог.get("latency_ms"),
             warnings=замечания or None,
-            error=("; ".join(замечания) or None) if пусто else None)
+            error=("; ".join(замечания) or None) if пусто else None,
+            reason_why=итог.get("reason_why"), outcome_why=итог.get("outcome_why"),
+            fields=итог.get("fields"), score=итог.get("score"),
+            critical=итог.get("critical_failed") or None)
         self._сбои.pop(job_id, None)
         self.db.llmq_finish(
             job_id, error="; ".join(замечания) if пусто and замечания else "",
             latency_ms=итог.get("latency_ms"), calls=int(итог.get("calls") or 0),
             chunks=int(итог.get("chunks") or 1))
+        готово = self.db.llm_get(job_id) or итог
+        if not пусто:
+            self._после_ответа(job_id, job, готово, замечания)
         self._после_модели(job_id)
-        return self.db.llm_get(job_id) or итог
+        return готово
+
+    # --- после ответа -----------------------------------------------------
+
+    def _после_ответа(self, job_id: str, job: dict[str, Any], ответ: dict[str, Any],
+                      замечания: list[str]) -> None:
+        """Уведомление по умному трекеру, сомнительное — человеку, векторы смысла.
+
+        Каждое — отдельно и без права уронить разбор: ответ уже в базе, а
+        это надстройки над ним.
+        """
+        for шаг in (self._уведомить_трекеры, self._риск, self._сомнительное_человеку,
+                    self._векторы):
+            try:
+                шаг(job_id, job, ответ, замечания)
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("После смыслового разбора %s (%s): %s", job_id,
+                            шаг.__name__, exc)
+
+    def _уведомить_трекеры(self, job_id: str, job: dict[str, Any], ответ: dict[str, Any],
+                           _замечания: list[str]) -> None:
+        """Сработавший умный трекер — событием в истории и на `tracker_url`.
+
+        Тем же адресом и в той же форме, что трекер правил (`event: tracker`),
+        с пометкой `source: llm` и цитатой: приёмник, настроенный на трекеры
+        правил, принимает и эти, а отличить их может по полю.
+        """
+        if not self.settings.get("llm_trackers_notify", True):
+            return
+        сработали = [т for т in (ответ.get("trackers") or [])
+                     if isinstance(т, dict) and т.get("fired")]
+        if not сработали:
+            return
+        события = []
+        for т in сработали:
+            данные = {"job_id": job_id, "category": str(т.get("id")),
+                      "label": str(т.get("label") or т.get("id")), "kind": "llm",
+                      "source": "llm", "quote": str(т.get("quote") or "")[:300],
+                      "filename": job.get("filename"), "owner": job.get("owner"),
+                      "created_at": job.get("created_at")}
+            self.db.add_event(job_id, "tracker",
+                              f"Сработал умный трекер «{данные['label']}»", данные)
+            события.append(данные)
+        адрес = str(self.settings.get("tracker_url") or "").strip()
+        if not адрес:
+            return
+        from ..job_queue import check_outbound_url  # noqa: PLC0415
+        from ..maintenance import send_json  # noqa: PLC0415
+
+        внутренние = bool(self.settings.get("webhook_allow_internal"))
+        check_outbound_url(адрес, внутренние)
+
+        def отправить() -> None:
+            for событие in события:
+                send_json({"event": "tracker", **событие}, адрес, what="трекер",
+                          allow_internal=внутренние)
+
+        threading.Thread(target=отправить, name="asrhub-llm-tracker", daemon=True).start()
+
+    def _риск(self, job_id: str, job: dict[str, Any], ответ: dict[str, Any],
+              _замечания: list[str]) -> None:
+        """Высокий риск ухода или эскалации — событием и на `tracker_url`.
+
+        Балл — по ответу модели и разбору содержания (`insight.риск`); порог
+        — `llm_risk_threshold`. Событие `risk` идёт тем же адресом, что
+        трекеры: приёмник уже настроен, а отличить можно по полю `event`.
+        """
+        if not self.settings.get("llm_risk_notify", True):
+            return
+        from . import insight  # noqa: PLC0415
+
+        разбор = self.db.get_content(job_id) or {}
+        балл, причины = insight.риск({**разбор, **ответ})
+        if балл < insight.порог_риска(self.settings):
+            return
+        данные = {"job_id": job_id, "score": балл, "why": причины,
+                  "reason": ответ.get("reason"), "outcome": ответ.get("outcome"),
+                  "filename": job.get("filename"), "owner": job.get("owner"),
+                  "created_at": job.get("created_at")}
+        self.db.add_event(job_id, "risk", f"Высокий риск ухода или эскалации: {балл}", данные)
+        адрес = str(self.settings.get("tracker_url") or "").strip()
+        if not адрес:
+            return
+        from ..job_queue import check_outbound_url  # noqa: PLC0415
+        from ..maintenance import send_json  # noqa: PLC0415
+
+        внутренние = bool(self.settings.get("webhook_allow_internal"))
+        check_outbound_url(адрес, внутренние)
+        threading.Thread(target=send_json, args=({"event": "risk", **данные}, адрес),
+                         kwargs={"what": "риск", "allow_internal": внутренние},
+                         name="asrhub-llm-risk", daemon=True).start()
+
+    #: Замечания, по которым ответ модели стоит показать человеку.
+    СОМНЕНИЯ = ("вне списка", "цитата не найдена", "не разобран", "по сомнительной расшифровке")
+
+    def _сомнительное_человеку(self, job_id: str, job: dict[str, Any], ответ: dict[str, Any],
+                               замечания: list[str]) -> None:
+        """Сомнительный ответ модели — в очередь ручной проверки (`llm_doubtful_review`).
+
+        Только когда контроль качества включён, и не больше суточной нормы
+        проверок (`qa_daily`): поток проверок должен оставаться ровным, а не
+        заваливаться каждым ответом мимо списка.
+        """
+        if not self.settings.get("llm_doubtful_review", True):
+            return
+        from .. import qa as qa_mod  # noqa: PLC0415
+
+        свои = qa_mod.настройки(self.settings)
+        if not свои["enabled"]:
+            return
+        сомнения = [з for з in замечания if any(с in з for с in self.СОМНЕНИЯ)]
+        if not сомнения:
+            return
+        за_сутки = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM qa_reviews WHERE assigned_at>=? AND reason LIKE ?",
+            (time.time() - 86400.0, "сомнительный ответ модели%"))
+        if int((за_сутки or {"n": 0})["n"] or 0) >= max(1, свои["daily"]):
+            return
+        разбор = self.db.get_content(job_id) or {}
+        звонок = self.db.call_for_job(job_id) or {}
+        self.db.qa_assign(
+            job_id, assigned_to=свои["assign_to"], assigned_by="смысловой разбор",
+            due_at=time.time() + max(1.0, свои["due_hours"]) * 3600.0,
+            agent=str(звонок.get("agent") or разбор.get("agent_speaker") or ""),
+            auto_score=разбор.get("agent_score"),
+            reason=("сомнительный ответ модели: " + "; ".join(сомнения))[:300])
+
+    def _векторы(self, job_id: str, _job: dict[str, Any], ответ: dict[str, Any],
+                 _замечания: list[str]) -> None:
+        """Векторы смысла записи — для поиска по смыслу (`llm_embeddings`)."""
+        if not self.settings.get("llm_embeddings", False):
+            return
+        from . import semantic  # noqa: PLC0415
+
+        semantic.проиндексировать(self.db, self.client, self.settings, job_id, ответ)
+
+    def _списки_отдела(self, job_id: str) -> tuple[list[str] | None, list[str] | None]:
+        """Причины и исходы отдела сотрудника — по добавочному из журнала звонков."""
+        if not self.settings.get("llm_lists_by_department"):
+            return None, None
+        from .. import employees as справочник  # noqa: PLC0415
+
+        строка: dict[str, Any] = {"job_id": job_id}
+        try:
+            справочник.подписать_добавочные(self.db, [строка], имена=True)
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Отдел сотрудника для %s не найден: %s", job_id, exc)
+            return None, None
+        return policy.списки_отдела(self.settings, str(строка.get("agent_department") or ""))
+
+    def _отметить_версию(self) -> None:
+        """Журнал смен настройки модели — для отметок на трендах."""
+        отпечаток, значения = policy.отпечаток(self.settings, tasks.VERSION)
+        if отпечаток == getattr(self, "_отпечаток", None):
+            return
+        try:
+            последняя = self.db.llm_versions_last()
+            прежние = getattr(self, "_значения", None)
+            if последняя is None or последняя.get("fingerprint") != отпечаток:
+                self.db.llm_versions_note(
+                    version=tasks.VERSION, model=self.client.model, fingerprint=отпечаток,
+                    changes=policy.что_изменилось(прежние if последняя else None, значения))
+            self._отпечаток = отпечаток
+            self._значения = значения
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Отметка смены настройки модели не записана: %s", exc)
 
     def _после_модели(self, job_id: str) -> None:
         """Модель закончила с записью — пора примечанию в CRM, если оно её ждало.
@@ -444,15 +639,26 @@ class LLMWorker:
         Иначе в разделе «Очередь LLM» фоновый разбор архива выглядел бы
         пустотой: очередь пуста, а модель занята.
         """
-        строка = self.db.llmq_take()
+        сейчас = time.time()
+        архив_можно = policy.в_окне_архива(self.settings, сейчас)
+        предел = policy.предел_архива(self.settings)
+        if архив_можно and предел:
+            архив_можно = (self.db.llmq_archive_done_since(policy.начало_суток(сейчас))
+                           < предел)
+        # Вне окна архива (`llm_archive_hours`) и сверх суточного предела
+        # архивные строки ждут, а свежие записи и просьбы людей идут.
+        строка = self.db.llmq_take(skip_kinds=() if архив_можно else ("архив",))
         if строка is not None:
             return str(строка["job_id"])
-        if not self.settings.get("llm_backfill", False):
+        if not self.settings.get("llm_backfill", False) or not архив_можно:
             return None
         порция = max(1, _целое(self.settings, "llm_queue_batch", ПОРЦИЯ))
         остыть = _целое(self.settings, "llm_queue_cooldown_s", int(ОСТЫТЬ))
         свежий = time.time() - остыть
-        ожидают = self.db.llm_pending(tasks.VERSION, limit=порция)
+        ожидают = self.db.llm_pending(
+            tasks.VERSION, limit=порция, min_duration_s=policy.мин_длительность(self.settings),
+            skip_suspect_share=(policy.порог_сомнительных(self.settings)
+                                if policy.режим_сомнительных(self.settings) == "skip" else None))
         добавлено = 0
         for з in ожидают:
             job_id = str(з["id"])

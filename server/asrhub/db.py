@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -322,9 +322,76 @@ _LLM_RESULTS_SCHEMA = """
         latency_ms  REAL,
         error       TEXT,
         warnings    TEXT,
-        created_at  REAL NOT NULL
+        created_at  REAL NOT NULL,
+        -- Версия 36: пояснения модели к причине и исходу, свои поля
+        -- (`llm_fields`), итог скоркарты 0–100 с весами и проваленные
+        -- критичные пункты.
+        reason_why  TEXT,
+        outcome_why TEXT,
+        fields      TEXT,
+        score       REAL,
+        critical    TEXT
     ) WITHOUT ROWID
 """
+
+#: Версия 36: проверка модели и поиск по смыслу.
+#:
+#: `llm_golden` — золотой набор: ответы человека по записи (причина, исход,
+#: решён ли вопрос, трекеры, скоркарта). По нему прогоняется текущая или
+#: новая настройка модели до выката (`llm_golden_runs`).
+#: `llm_versions` — когда и на что менялась настройка модели: отметки на
+#: трендах, чтобы «доля решённых выросла» не путалась с «поменяли подсказку».
+#: `llm_vectors` — векторы смысла частей записи для поиска по смыслу.
+_LLM_TRUST_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS llm_golden (
+        job_id      TEXT PRIMARY KEY,
+        answers     TEXT NOT NULL,
+        note        TEXT DEFAULT '',
+        created_by  TEXT DEFAULT '',
+        created_at  REAL NOT NULL,
+        updated_at  REAL NOT NULL
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS llm_golden_runs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        label       TEXT DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'идёт',
+        overrides   TEXT,
+        started_at  REAL NOT NULL,
+        finished_at REAL,
+        records     INTEGER DEFAULT 0,
+        done        INTEGER DEFAULT 0,
+        result      TEXT,
+        error       TEXT DEFAULT '',
+        created_by  TEXT DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS llm_versions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        at          REAL NOT NULL,
+        version     INTEGER NOT NULL,
+        model       TEXT DEFAULT '',
+        fingerprint TEXT NOT NULL,
+        changes     TEXT DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS llm_vectors (
+        job_id      TEXT NOT NULL,
+        part        INTEGER NOT NULL,
+        model       TEXT DEFAULT '',
+        dim         INTEGER NOT NULL,
+        vector      BLOB NOT NULL,
+        text        TEXT DEFAULT '',
+        created_at  REAL NOT NULL,
+        PRIMARY KEY (job_id, part)
+    ) WITHOUT ROWID
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_llm_versions_at ON llm_versions(at)",
+]
 
 #: Кеш ответов модели по отпечатку подсказки: одна и та же запись с теми
 #: же подсказками второй раз модель не спрашивает.
@@ -477,6 +544,7 @@ _SCHEMA = [
     # --- версия 17: смысловой слой языковой модели ------------------------
     _LLM_RESULTS_SCHEMA,
     _LLM_CACHE_SCHEMA,
+    *_LLM_TRUST_SCHEMA,
     "CREATE INDEX IF NOT EXISTS idx_llm_results_created ON llm_results(created_at DESC)",
     # Уборка кеша по сроку: `created_at` в таблице WITHOUT ROWID стоит после
     # ответа модели, и без указателя часовая уборка читала все ответы —
@@ -693,7 +761,11 @@ _SCHEMA = [
         agree       INTEGER,
         items       TEXT,
         comment     TEXT,
-        reason      TEXT DEFAULT ''
+        reason      TEXT DEFAULT '',
+        -- Версия 36: ответы проверяющего на вопросы скоркарты модели
+        -- ({"id вопроса": "да|нет|н/п"}) — по ним считается согласие
+        -- человека и модели по каждому вопросу.
+        scorecard   TEXT
     )
     """,
     """
@@ -3165,7 +3237,7 @@ class Database:
     def llm_save(self, job_id: str, version: int, **поля: Any) -> None:
         """Кладёт ответ модели по записи; словари и списки — строкой JSON."""
         строка = dict(поля)
-        for к in ("actions", "trackers", "scorecard", "warnings"):
+        for к in ("actions", "trackers", "scorecard", "warnings", "fields", "critical"):
             if isinstance(строка.get(к), (list, dict)):
                 строка[к] = json.dumps(строка[к], ensure_ascii=False)
         if строка.get("resolved") is not None:
@@ -3186,7 +3258,9 @@ class Database:
         return _row_to_llm(row) if row else None
 
     def llm_pending(self, version: int, limit: int = 50, *, since: float | None = None,
-                    owner: str | list[str] | None = None) -> list[dict[str, Any]]:
+                    owner: str | list[str] | None = None,
+                    min_duration_s: float = 0.0,
+                    skip_suspect_share: float | None = None) -> list[dict[str, Any]]:
         """Завершённые записи без ответа модели текущей версии — новые первыми.
 
         Контрольные прогоны мимо: это та же запись второй раз. Записи из
@@ -3201,6 +3275,19 @@ class Database:
         if since is not None:
             where.append("j.created_at >= ?")
             args.append(since)
+        # Пороги отбора для модели (`llm.policy`): короткие звонки и
+        # сомнительные расшифровки архив не берёт — переписка порога
+        # длительности не знает, длительности у неё нет.
+        if min_duration_s and min_duration_s > 0:
+            where.append("(COALESCE(j.source,'') = 'text' OR COALESCE(j.media_duration_s,0) <= 0 "
+                         "OR j.media_duration_s >= ?)")
+            args.append(float(min_duration_s))
+        if skip_suspect_share is not None:
+            where.append("NOT (COALESCE(j.suspect_share,0) >= ? OR "
+                         "COALESCE(j.quality_flags,'') LIKE '%phrase%' OR "
+                         "COALESCE(j.quality_flags,'') LIKE '%repeat%' OR "
+                         "COALESCE(j.quality_flags,'') LIKE '%compression%')")
+            args.append(float(skip_suspect_share) if skip_suspect_share > 0 else 2.0)
         # Разрез по владельцу: «разобрать всё неразобранное» от обычного ключа
         # ставило в очередь весь архив сервера, хотя тот же отбор через
         # /llm/backfill доступен только администратору.
@@ -3403,6 +3490,236 @@ class Database:
             f"SELECT l.latency_ms FROM {self._задания_окна()} JOIN {ответы} ON l.job_id = j.id "
             f"WHERE {условие} AND COALESCE(l.error,'') = '' AND l.latency_ms IS NOT NULL", args)
         return [float(r["latency_ms"]) for r in rows]
+
+    # --- версия 36: оценка по ответам модели, эталоны, отметки, векторы ---
+
+    def llm_window_rows(self, since: float, *, until: float | None = None,
+                        owner: str | list[str] | None = None, agent: str = "",
+                        by: str = "", key: str | None = None,
+                        limit: int = 200_000) -> list[dict[str, Any]]:
+        """Ответы модели окна без сбоя — с разговором, звонком и разбором.
+
+        Для сводов поверх ответов модели: оценка оператора, контроль
+        договорённостей, решение с первого обращения, драйверы оценки
+        клиента, риск ухода. `by`/`key` — оператор в разрезе карточки
+        (`AGENT_DIMENSIONS`); JSON-колонки разобраны.
+        """
+        условие, args = self._окно_ответов(since, owner, until=until, agent=agent)
+        if by:
+            выражение = self.AGENT_DIMENSIONS.get(by)
+            if выражение is None:
+                raise ValueError(f"неизвестный разрез оператора: {by}")
+            if key is not None:
+                условие += " AND " + выражение
+                args.append(str(key))
+        группа = self.CONTENT_GROUPS.get(by or "agent", self.CONTENT_GROUPS["agent"])
+        строки = self.query(
+            "SELECT j.id AS job_id, j.created_at, j.filename, j.media_duration_s, j.owner, "
+            "       l.resolved, l.reason, l.outcome, l.actions, l.trackers, l.scorecard, "
+            "       l.score, l.critical, l.warnings, l.fields, l.summary, "
+            "       c.agent_speaker, c.nps, c.sentiment, c.sentiment_shift, c.mood_shift, "
+            "       c.stress, c.frustration, c.repeat_contact, c.alerts, c.agent_score, "
+            f"      {группа} AS group_key, "
+            "       (SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id LIMIT 1) AS agent, "
+            "       (SELECT cl.src FROM calls cl WHERE cl.job_id = j.id LIMIT 1) AS src, "
+            "       (SELECT cl.dst FROM calls cl WHERE cl.job_id = j.id LIMIT 1) AS dst, "
+            "       (SELECT cl.direction FROM calls cl WHERE cl.job_id = j.id LIMIT 1) AS direction, "
+            "       (SELECT cl.started_at FROM calls cl WHERE cl.job_id = j.id LIMIT 1) AS call_at "
+            f"FROM {self._задания_окна()} JOIN llm_results l ON l.job_id = j.id "
+            "LEFT JOIN content c ON c.job_id = j.id "
+            f"WHERE {условие} AND COALESCE(l.error,'') = '' "
+            "ORDER BY j.created_at DESC, j.id DESC LIMIT ?", [*args, max(1, int(limit))])
+        готово = []
+        for r in строки:
+            з = dict(r)
+            for к in ("actions", "trackers", "scorecard", "warnings", "fields", "critical"):
+                if isinstance(з.get(к), str):
+                    try:
+                        з[к] = json.loads(з[к])
+                    except (TypeError, ValueError):
+                        з[к] = None
+            if з.get("resolved") is not None:
+                з["resolved"] = bool(з["resolved"])
+            готово.append(з)
+        return готово
+
+    def calls_by_numbers(self, since: float, until: float) -> list[dict[str, Any]]:
+        """Звонки окна с номерами — для поиска повторов и перезвонов по номеру."""
+        return [dict(r) for r in self.query(
+            "SELECT uniqueid, job_id, src, dst, direction, started_at, answered, billsec, agent "
+            "FROM calls WHERE started_at >= ? AND started_at < ? "
+            "ORDER BY started_at", (float(since), float(until)))]
+
+    def llm_versions_last(self) -> dict[str, Any] | None:
+        строка = self.query_one("SELECT * FROM llm_versions ORDER BY id DESC LIMIT 1")
+        return dict(строка) if строка else None
+
+    def llm_versions_note(self, *, version: int, model: str, fingerprint: str,
+                          changes: str) -> bool:
+        """Отметка смены настройки модели — если отпечаток не тот, что последний."""
+        with self.write() as conn:
+            последняя = conn.execute(
+                "SELECT fingerprint FROM llm_versions ORDER BY id DESC LIMIT 1").fetchone()
+            if последняя is not None and последняя["fingerprint"] == fingerprint:
+                return False
+            conn.execute("INSERT INTO llm_versions (at, version, model, fingerprint, changes) "
+                         "VALUES (?,?,?,?,?)",
+                         (now(), int(version), str(model or ""), str(fingerprint),
+                          str(changes or "")[:500]))
+            return True
+
+    def llm_versions_list(self, since: float = 0.0,
+                          until: float | None = None) -> list[dict[str, Any]]:
+        где = "at >= ?" + (" AND at < ?" if until is not None else "")
+        args: list[Any] = [float(since)] + ([float(until)] if until is not None else [])
+        return [dict(r) for r in self.query(
+            f"SELECT id, at, version, model, fingerprint, changes FROM llm_versions "
+            f"WHERE {где} ORDER BY at", args)]
+
+    def golden_put(self, job_id: str, answers: dict[str, Any], *, note: str = "",
+                   by: str = "") -> bool:
+        """Эталон человека по записи. False — записи нет."""
+        сейчас = now()
+        with self.write() as conn:
+            есть = conn.execute("SELECT 1 FROM jobs WHERE id=?", (str(job_id),)).fetchone()
+            if есть is None:
+                return False
+            conn.execute(
+                "INSERT INTO llm_golden (job_id, answers, note, created_by, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET "
+                "answers=excluded.answers, note=excluded.note, updated_at=excluded.updated_at",
+                (str(job_id), json.dumps(answers, ensure_ascii=False), str(note or "")[:500],
+                 str(by or ""), сейчас, сейчас))
+            return True
+
+    def golden_get(self, job_id: str) -> dict[str, Any] | None:
+        строка = self.query_one("SELECT * FROM llm_golden WHERE job_id=?", (str(job_id),))
+        if строка is None:
+            return None
+        з = dict(строка)
+        try:
+            з["answers"] = json.loads(з["answers"] or "{}")
+        except (TypeError, ValueError):
+            з["answers"] = {}
+        return з
+
+    def golden_list(self, *, owner: str | list[str] | None = None,
+                    limit: int = 500) -> list[dict[str, Any]]:
+        своё, своё_args = self._owner_clause(owner, "j")
+        строки = self.query(
+            "SELECT g.job_id, g.answers, g.note, g.created_by, g.created_at, g.updated_at, "
+            "       j.filename, j.created_at AS job_created_at "
+            "FROM llm_golden g JOIN jobs j ON j.id = g.job_id "
+            + (f"WHERE {своё} " if своё else "")
+            + "ORDER BY g.updated_at DESC LIMIT ?", [*своё_args, max(1, int(limit))])
+        готово = []
+        for r in строки:
+            з = dict(r)
+            try:
+                з["answers"] = json.loads(з["answers"] or "{}")
+            except (TypeError, ValueError):
+                з["answers"] = {}
+            готово.append(з)
+        return готово
+
+    def golden_delete(self, job_id: str) -> bool:
+        return bool(self.execute("DELETE FROM llm_golden WHERE job_id=?", (str(job_id),)))
+
+    def golden_run_create(self, *, label: str, overrides: dict[str, Any], records: int,
+                          by: str = "") -> int:
+        with self.write() as conn:
+            курсор = conn.execute(
+                "INSERT INTO llm_golden_runs (label, status, overrides, started_at, records, "
+                "created_by) VALUES (?,?,?,?,?,?)",
+                (str(label or "")[:120], "идёт", json.dumps(overrides, ensure_ascii=False),
+                 now(), int(records), str(by or "")))
+            return int(курсор.lastrowid)
+
+    def golden_run_update(self, run_id: int, **поля: Any) -> None:
+        if "result" in поля and not isinstance(поля["result"], (str, type(None))):
+            поля["result"] = json.dumps(поля["result"], ensure_ascii=False)
+        if not поля:
+            return
+        имена = ", ".join(f"{к}=?" for к in поля)
+        self.execute(f"UPDATE llm_golden_runs SET {имена} WHERE id=?",
+                     [*поля.values(), int(run_id)])
+
+    def golden_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        готово = []
+        for r in self.query("SELECT * FROM llm_golden_runs ORDER BY id DESC LIMIT ?",
+                            (max(1, int(limit)),)):
+            з = dict(r)
+            for к in ("overrides", "result"):
+                try:
+                    з[к] = json.loads(з[к]) if з.get(к) else None
+                except (TypeError, ValueError):
+                    з[к] = None
+            готово.append(з)
+        return готово
+
+    def vectors_put(self, job_id: str, части: list[tuple[int, str, list[float]]], *,
+                    model: str) -> None:
+        """Векторы смысла частей записи — заменяют прежние этой записи."""
+        import array  # noqa: PLC0415
+
+        with self.write() as conn:
+            if conn.execute("SELECT 1 FROM jobs WHERE id=?", (str(job_id),)).fetchone() is None:
+                return
+            conn.execute("DELETE FROM llm_vectors WHERE job_id=?", (str(job_id),))
+            for номер, текст, вектор in части:
+                данные = array.array("f", [float(x) for x in вектор]).tobytes()
+                conn.execute(
+                    "INSERT INTO llm_vectors (job_id, part, model, dim, vector, text, created_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (str(job_id), int(номер), str(model or ""), len(вектор), данные,
+                     str(текст or "")[:2000], now()))
+
+    def vectors_iter(self, *, model: str, owner: str | list[str] | None = None,
+                     since: float | None = None, until: float | None = None) -> Any:
+        """Векторы модели — с задачей и временем записи; по одной строке."""
+        где = ["v.model = ?"]
+        args: list[Any] = [str(model or "")]
+        своё, своё_args = self._owner_clause(owner, "j")
+        if своё:
+            где.append(своё)
+            args.extend(своё_args)
+        if since:
+            где.append("j.created_at >= ?")
+            args.append(float(since))
+        if until:
+            где.append("j.created_at < ?")
+            args.append(float(until))
+        курсор = self.conn.execute(
+            "SELECT v.job_id, v.part, v.dim, v.vector, v.text, j.created_at, j.filename "
+            "FROM llm_vectors v JOIN jobs j ON j.id = v.job_id "
+            f"WHERE {' AND '.join(где)}", args)
+        yield from курсор
+
+    def vectors_stats(self) -> dict[str, Any]:
+        строка = self.query_one(
+            "SELECT COUNT(DISTINCT job_id) AS records, COUNT(*) AS parts, "
+            "MAX(created_at) AS last FROM llm_vectors")
+        модели = [dict(r) for r in self.query(
+            "SELECT model, COUNT(DISTINCT job_id) AS records FROM llm_vectors GROUP BY model")]
+        return {"records": int((строка or {})["records"] or 0) if строка else 0,
+                "parts": int((строка or {})["parts"] or 0) if строка else 0,
+                "last": (строка or {})["last"] if строка else None, "models": модели}
+
+    def vectors_missing(self, *, model: str, limit: int = 100) -> list[str]:
+        """Записи с ответом модели, у которых нет векторов этой модели."""
+        return [str(r["job_id"]) for r in self.query(
+            "SELECT l.job_id FROM llm_results l JOIN jobs j ON j.id = l.job_id "
+            "WHERE COALESCE(l.error,'') = '' AND COALESCE(l.summary,'') <> '' "
+            "AND NOT EXISTS (SELECT 1 FROM llm_vectors v WHERE v.job_id = l.job_id "
+            "                AND v.model = ?) "
+            "ORDER BY j.created_at DESC LIMIT ?", (str(model or ""), max(1, int(limit))))]
+
+    def llmq_archive_done_since(self, since: float) -> int:
+        """Сколько архивных записей разобрано (или взято) с момента `since`."""
+        строка = self.query_one(
+            "SELECT COUNT(*) AS n FROM llm_queue WHERE kind='архив' AND started_at >= ?",
+            (float(since),))
+        return int((строка or {"n": 0})["n"] or 0)
 
     def filenames(self, job_ids: Sequence[str]) -> dict[str, str]:
         """Имена файлов по номерам заданий — порциями, одним запросом на порцию."""
@@ -4192,6 +4509,11 @@ class Database:
             conn.execute("DELETE FROM content_marks WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM review_queue WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM llm_results WHERE job_id=?", (job_id,))
+            # Эталон человека и векторы смысла — тоже о разговоре: эталон
+            # хранит причину и исход словами проверяющего, вектор — кусок
+            # пересказа.
+            conn.execute("DELETE FROM llm_golden WHERE job_id=?", (job_id,))
+            conn.execute("DELETE FROM llm_vectors WHERE job_id=?", (job_id,))
             # И строку очереди разбора. Без неё удаление записи оставляло в
             # очереди сироту: в состоянии «идёт» её не брала ни одна уборка
             # (`llmq_prune` ходит по завершённым), кнопка «Очистить» её
@@ -6072,7 +6394,8 @@ class Database:
             (str(job_id), kind, self.LLMQ_ЖДЁТ, int(priority), мгновение, source, owner,
              self.LLMQ_ЖДЁТ, self.LLMQ_ЖДЁТ, self.LLMQ_ЖДЁТ, self.LLMQ_ИДЁТ)) > 0
 
-    def llmq_take(self, *, instance: str = "") -> dict[str, Any] | None:
+    def llmq_take(self, *, instance: str = "",
+                  skip_kinds: Sequence[str] = ()) -> dict[str, Any] | None:
         """Берёт следующую запись и помечает её выполняющейся.
 
         Отбор и пометка — одним запросом под замком записи: иначе два
@@ -6085,10 +6408,12 @@ class Database:
 
         мгновение = now()
         with self.write() as conn:
+            мимо = [str(в) for в in skip_kinds if str(в)]
             строка = conn.execute(
                 "SELECT * FROM llm_queue WHERE state=? "
-                "ORDER BY priority DESC, enqueued_at LIMIT 1",
-                (self.LLMQ_ЖДЁТ,)).fetchone()
+                + (f"AND COALESCE(kind,'') NOT IN ({','.join('?' for _ in мимо)}) " if мимо else "")
+                + "ORDER BY priority DESC, enqueued_at LIMIT 1",
+                (self.LLMQ_ЖДЁТ, *мимо)).fetchone()
             if строка is None:
                 return None
             conn.execute(
@@ -6429,7 +6754,7 @@ class Database:
 
     def qa_submit(self, review_id: int, *, reviewer: str, score: float | None,
                   agree: bool | None = None, items: Any = None,
-                  comment: str = "") -> bool:
+                  comment: str = "", scorecard: dict[str, str] | None = None) -> bool:
         """Записывает исход проверки. False — такой проверки нет или она закрыта.
 
         Чтение и запись — одной транзакцией, а запись — только пока проверка
@@ -6452,12 +6777,15 @@ class Database:
                 своё = abs(float(авто) - float(score)) <= 10.0
             курсор = conn.execute(
                 "UPDATE qa_reviews SET status='done', reviewer=?, reviewed_at=?, "
-                "score=?, agree=?, items=?, comment=? WHERE id=? AND status='pending'",
+                "score=?, agree=?, items=?, comment=?, scorecard=? "
+                "WHERE id=? AND status='pending'",
                 (str(reviewer or ""), now(),
                  None if score is None else float(score),
                  None if своё is None else int(bool(своё)),
                  json.dumps(items, ensure_ascii=False) if items is not None else None,
-                 str(comment or ""), int(review_id)))
+                 str(comment or ""),
+                 json.dumps(scorecard, ensure_ascii=False) if scorecard else None,
+                 int(review_id)))
             return bool(курсор.rowcount)
 
     def qa_for_job(self, job_id: str) -> dict[str, Any] | None:
@@ -6469,13 +6797,17 @@ class Database:
         """
         строка = self.query_one(
             "SELECT id, status, agent, assigned_to, assigned_by, assigned_at, due_at, "
-            "reviewer, reviewed_at, auto_score, score, agree, comment, reason "
+            "reviewer, reviewed_at, auto_score, score, agree, comment, reason, scorecard "
             "FROM qa_reviews WHERE job_id=? ORDER BY id DESC LIMIT 1", (str(job_id),))
         if строка is None:
             return None
         запись = dict(строка)
         if запись.get("agree") is not None:
             запись["agree"] = bool(запись["agree"])
+        try:
+            запись["scorecard"] = json.loads(запись["scorecard"]) if запись.get("scorecard") else None
+        except (TypeError, ValueError):
+            запись["scorecard"] = None
         return запись
 
     def qa_get(self, review_id: int) -> dict[str, Any] | None:
@@ -6561,7 +6893,40 @@ class Database:
         всего = int((общее["n"] if общее else 0) or 0)
         оценено = int((общее["rated"] if общее else 0) or 0)
         ждут_условие = "q.status='pending'" + (f" AND {своё}" if своё else "")
+        # Согласие человека и модели по каждому вопросу скоркарты: где
+        # модель спорит с проверяющими, вопрос надо переформулировать или не
+        # доверять ему.
+        по_вопросам: dict[str, dict[str, Any]] = {}
+        for строка in self.query(
+                "SELECT q.scorecard AS human, l.scorecard AS model "
+                f"{откуда} JOIN llm_results l ON l.job_id = q.job_id "
+                f"WHERE {условие} AND q.scorecard IS NOT NULL AND l.scorecard IS NOT NULL",
+                args):
+            try:
+                человек = json.loads(строка["human"] or "{}")
+                модель = {str(о.get("id")): о.get("answer")
+                          for о in json.loads(строка["model"] or "[]") if isinstance(о, dict)}
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not isinstance(человек, dict):
+                continue
+            for ид, ответ in человек.items():
+                if ид not in модель or ответ not in ("да", "нет", "н/п"):
+                    continue
+                пункт = по_вопросам.setdefault(str(ид), {"id": str(ид), "n": 0, "agree": 0,
+                                                         "model_yes_human_no": 0,
+                                                         "model_no_human_yes": 0})
+                пункт["n"] += 1
+                if модель[ид] == ответ:
+                    пункт["agree"] += 1
+                elif модель[ид] == "да" and ответ == "нет":
+                    пункт["model_yes_human_no"] += 1
+                elif модель[ид] == "нет" and ответ == "да":
+                    пункт["model_no_human_yes"] += 1
+        согласие_модели = [{**п, "agree_share": round(п["agree"] / п["n"], 3)}
+                           for п in sorted(по_вопросам.values(), key=lambda п: п["id"])]
         return {
+            "scorecard": согласие_модели,
             "done": всего,
             "pending": int((self.query_one(
                 f"SELECT COUNT(*) AS n {откуда} WHERE {ждут_условие}", своё_args
@@ -6804,7 +7169,7 @@ class Database:
         for таблица in ("content", "content_terms", "content_hits",
                         "content_marks", "review_queue", "llm_results",
                         "llm_queue", "segments", "events", "qa_reviews",
-                        "llm_cache"):
+                        "llm_cache", "llm_golden", "llm_vectors"):
             итог["rows"] += self.execute(
                 f"DELETE FROM {таблица} WHERE job_id IS NOT NULL "
                 "AND job_id NOT IN (SELECT id FROM jobs)")
@@ -7129,7 +7494,7 @@ def _экранировать_like(значение: str) -> str:
 
 def _row_to_llm(row: sqlite3.Row) -> dict[str, Any]:
     out = dict(row)
-    for к in ("actions", "trackers", "scorecard", "warnings"):
+    for к in ("actions", "trackers", "scorecard", "warnings", "fields", "critical"):
         raw = out.get(к)
         if isinstance(raw, str):
             try:

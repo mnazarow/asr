@@ -569,6 +569,57 @@ class LLMClient:
                 log.debug("Кеш ответа модели не записан: %s", exc)
         return ответ
 
+    @property
+    def embed_model(self) -> str:
+        """Модель векторов смысла (`llm_embed_model`), иначе — разговорная."""
+        return str(self.settings.get("llm_embed_model") or "").strip() or self.model
+
+    def embed(self, тексты: list[str]) -> list[list[float]]:
+        """Векторы смысла текстов — для поиска по смыслу.
+
+        Ollama — `/api/embed` (векторизующая модель: nomic-embed-text,
+        bge-m3), совместимый сервер — `/v1/embeddings`. Заглушка считает
+        вектор по основам слов: похожие слова — похожие векторы, этого
+        хватает проверкам и показу без модели.
+        """
+        if not self.enabled:
+            raise LLMError("Языковая модель выключена (llm_backend = off).")
+        if not тексты:
+            return []
+        начало = time.perf_counter()
+        with self._семафор():
+            try:
+                if self.backend == "stub":
+                    from . import stub  # noqa: PLC0415
+
+                    векторы = [stub.vector(т) for т in тексты]
+                elif self.backend == "ollama":
+                    данные = self._http("POST", f"{self.url}/api/embed",
+                                        {"model": self.embed_model, "input": тексты},
+                                        timeout=self.timeout)
+                    векторы = [[float(з) for з in ряд] for ряд in (данные.get("embeddings") or [])]
+                else:
+                    данные = self._http("POST", f"{self.url}/v1/embeddings",
+                                        {"model": self.embed_model, "input": тексты},
+                                        timeout=self.timeout)
+                    векторы = [[float(з) for з in (р.get("embedding") or [])]
+                               for р in (данные.get("data") or [])]
+            except LLMError as exc:
+                with self._lock:
+                    self.errors += 1
+                    self.last_error = str(exc)
+                raise LLMError(
+                    f"Векторы смысла не посчитаны: {exc}. Для поиска по смыслу нужна "
+                    f"модель векторизации (у Ollama — nomic-embed-text или bge-m3) в "
+                    f"llm_embed_model.") from exc
+        if len(векторы) != len(тексты) or not all(векторы):
+            raise LLMError(f"Модель «{self.embed_model}» не вернула векторов: для поиска по "
+                           f"смыслу нужна модель векторизации (llm_embed_model).")
+        with self._lock:
+            self.calls += 1
+            self.total_ms += (time.perf_counter() - начало) * 1000
+        return векторы
+
     def _забыть(self, ключ: str) -> None:
         try:
             self.db.llm_cache_forget(ключ)

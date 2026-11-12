@@ -240,10 +240,19 @@ def qa_submit(review_id: int, request: Request,
             raise error_response(ConfigError("Балл должен быть числом.")) from None
         if not 0.0 <= балл <= 100.0:
             raise error_response(ConfigError("Балл — от нуля до ста."))
+    # Ответы проверяющего на вопросы скоркарты модели — по ним считается
+    # согласие человека и модели по каждому вопросу (`stats.scorecard`).
+    скоркарта = данные.get("scorecard")
+    if скоркарта is not None:
+        if not isinstance(скоркарта, dict) or any(
+                str(ответ) not in ("да", "нет", "н/п") for ответ in скоркарта.values()):
+            raise error_response(ConfigError(
+                "Ответы скоркарты — объект {\"id вопроса\": \"да|нет|н/п\"}."))
+        скоркарта = {str(к)[:64]: str(з) for к, з in list(скоркарта.items())[:50]}
     записано = состояние.db.qa_submit(
         int(review_id), reviewer=проверяющий,
         score=балл, agree=данные.get("agree"), items=данные.get("items"),
-        comment=str(данные.get("comment") or ""))
+        comment=str(данные.get("comment") or ""), scorecard=скоркарта or None)
     if not записано:
         raise error_response(ConfigError(
             f"Проверка {review_id} не найдена или уже закрыта."))

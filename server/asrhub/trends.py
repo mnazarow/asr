@@ -1076,6 +1076,20 @@ class Trends:
                 for п in ПОКАЗАТЕЛИ if is_admin or not п.admin_only],
         }
 
+    def _отметки_модели(self, начало: float, конец: float,
+                        выбранные: list[Any]) -> list[dict[str, Any]]:
+        """Смены настройки модели в окне — если среди рядов есть ряды модели."""
+        if not any(getattr(п, "group", "") == "llm" or str(getattr(п, "id", "")).startswith("llm_")
+                   for п in выбранные):
+            return []
+        try:
+            смены = self.db.llm_versions_list(начало or 0.0, конец)
+        except Exception:                                    # noqa: BLE001
+            return []
+        return [{"at": с["at"], "kind": "llm",
+                 "title": f"модель: {с.get('changes') or 'смена настройки'}",
+                 "model": с.get("model"), "version": с.get("version")} for с in смены]
+
     def series(self, period: str = "month", *, bucket: str = "auto",
                metrics: list[str] | None = None,
                owner: str | list[str] | None = None,
@@ -1199,6 +1213,10 @@ class Trends:
             # `buckets`.
             "window": {"since": начало, "until": конец},
             "buckets": точки_времени,
+            # Смены настройки языковой модели внутри окна — отметками на
+            # графике: «доля решённых выросла» сразу после смены подсказки
+            # или модели — не обязательно правда о работе.
+            "markers": self._отметки_модели(начало, конец, выбранные),
             # Последняя корзина — текущая, неполная: в «последнее», минимум,
             # максимум, наклон и среднее счётных на корзину она не входит.
             "partial_last": bool(неполная),

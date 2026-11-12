@@ -3737,12 +3737,12 @@ RENDERERS.dictation = {
       this.hints.unshift(сообщение);
       this.hints = this.hints.slice(0, 5);
       const цвет = { violation: 'err', objection: 'warn', tracker: 'accent',
-                     script: '' };
+                     script: '', advice: 'info' };
       место.innerHTML = this.hints.map((п) => `
         <div class="row" style="gap:8px;align-items:flex-start;margin-bottom:6px">
           <span class="chip ${цвет[п.kind] || ''}">${esc({
             violation: 'нарушение', objection: 'возражение',
-            tracker: 'важное', script: 'скрипт' }[п.kind] || п.kind)}</span>
+            tracker: 'важное', script: 'скрипт', advice: 'совет модели' }[п.kind] || п.kind)}</span>
           <div><b>${esc(п.title || '')}</b>${
             п.detail ? `<div class="small dim">${esc(п.detail)}</div>` : ''}</div>
         </div>`).join('');
@@ -5353,6 +5353,7 @@ function qaTab(job) {
         (расхождение до 10 баллов).</div>
       <label class="small dim" for="qa-score">Ваш балл, 0–100</label>
       <input type="number" id="qa-score" min="0" max="100" step="1" style="width:120px" class="mono">
+      <div id="qa-scorecard"></div>
       <label class="small dim" for="qa-comment">Комментарий — что было не так или что хорошо</label>
       <textarea id="qa-comment" rows="3" maxlength="2000"></textarea>
       <div class="row" style="gap:8px">
@@ -5365,6 +5366,7 @@ function qaTab(job) {
 function bindQaTab(backdrop, job, перерисовать) {
   const кнопка = qs('#qa-submit', backdrop);
   if (!кнопка) return;
+  ИИ.скоркартаПроверки(backdrop, job);
   кнопка.onclick = async () => {
     const поле = qs('#qa-score', backdrop);
     const ошибка = qs('#qa-error', backdrop);
@@ -5378,8 +5380,11 @@ function bindQaTab(backdrop, job, перерисовать) {
     ошибка.textContent = '';
     кнопка.disabled = true;
     try {
+      const скоркарта = {};
+      qsa('[data-qa-sc]', backdrop).forEach((в) => { if (в.value) скоркарта[в.dataset.qaSc] = в.value; });
       await API.put(`/api/qa/${encodeURIComponent(job.qa.id)}`,
-                    { score: балл, comment: qs('#qa-comment', backdrop).value.trim() });
+                    Object.assign({ score: балл, comment: qs('#qa-comment', backdrop).value.trim() },
+                                  Object.keys(скоркарта).length ? { scorecard: скоркарта } : {}));
       const авто = job.qa.auto_score;
       Object.assign(job.qa, {
         status: 'done', score: балл, comment: qs('#qa-comment', backdrop).value.trim(),
@@ -5655,20 +5660,30 @@ async function loadJobLlm(backdrop, job) {
         ${р.reason ? `<span class="chip info" title="${esc(р.reason_quote ? `причина обращения, по цитате: «${р.reason_quote}»` : 'причина обращения (из списка)')}">${esc(р.reason)}</span>` : ''}
         ${р.outcome ? `<span class="chip accent" title="${esc(р.outcome_quote ? `исход, по цитате: «${р.outcome_quote}»` : 'исход (из списка)')}">${esc(р.outcome)}</span>` : ''}
         ${решено}
+        ${р.score !== null && р.score !== undefined ? `<span class="chip ${р.score >= 80 ? 'ok' : р.score >= 50 ? 'warn' : 'err'}" title="итог скоркарты модели с весами вопросов">скоркарта ${num(р.score, 0)}</span>` : ''}
+        ${(р.critical || []).length ? `<span class="chip err" title="ответ «нет» на критичный вопрос обнуляет итог">критичный пункт: ${esc(р.critical.join(', '))}</span>` : ''}
         <span class="spacer"></span>
+        <button class="ghost sm" id="job-llm-golden" title="Отметить ответы человека — для проверки модели (золотой набор)">В золотой набор</button>
+        <button class="ghost sm" id="job-llm-train" title="Тренажёр: модель сыграет этого клиента, скоркарта оценит ответы">Тренировать</button>
         <button class="ghost sm" id="job-llm-run" title="Спросить модель заново">Заново</button></div>
       ${р.error ? `<div class="small" style="color:var(--err)">Модель не ответила: ${esc(р.error)}</div>` : ''}
       ${р.summary ? `<div style="line-height:1.6">${esc(р.summary)}</div>` : ''}
       ${(р.reason_quote || р.outcome_quote) ? `<div class="small dim" style="margin-top:6px">По цитатам: ${[р.reason_quote && `причина — «${esc(р.reason_quote)}»`, р.outcome_quote && `исход — «${esc(р.outcome_quote)}»`].filter(Boolean).join('; ')}</div>` : ''}
+      ${(р.reason_why || р.outcome_why) ? `<div class="small dim" style="margin-top:4px">Почему: ${[р.reason_why && `причина — ${esc(р.reason_why)}`, р.outcome_why && `исход — ${esc(р.outcome_why)}`].filter(Boolean).join('; ')}</div>` : ''}
+      ${р.fields && Object.keys(р.fields).length ? `<div class="small" style="margin-top:8px"><b>Поля</b>: ${Object.entries(р.fields).map(([к, з]) => `<span class="chip ${з ? 'info' : ''}" title="своё поле ${esc(к)}">${esc(к)}: ${esc(з === null || з === undefined ? '—' : з)}</span>`).join(' ')}</div>` : ''}
       ${(р.actions || []).length ? `<div class="small dim" style="margin-top:8px"><b>Действия к исполнению</b></div>
         <ul style="margin:4px 0 0 18px;padding:0">${р.actions.map((а) => `<li>${esc(а.what)} <span class="faint">— ${esc(а.who || '')}${а.when ? `, ${esc(а.when)}` : ''}</span></li>`).join('')}</ul>` : ''}
       ${(р.trackers || []).some((т) => т.fired) ? `<div class="small" style="margin-top:8px"><b>Умные трекеры</b>: ${р.trackers.filter((т) => т.fired).map((т) => `<span class="chip warn" title="${esc(т.quote || '')}">${esc(т.label)}</span>`).join(' ')}</div>` : ''}
-      ${(р.scorecard || []).length ? `<div class="small" style="margin-top:8px"><b>Скоркарта</b>: ${р.scorecard.map((в) => `<span class="chip ${в.answer === 'да' ? 'ok' : в.answer === 'нет' ? 'err' : ''}" title="${esc(в.quote || '')}">${esc(в.question)} — ${esc(в.answer)}</span>`).join(' ')}</div>` : ''}
+      ${(р.scorecard || []).length ? `<div class="small" style="margin-top:8px"><b>Скоркарта</b>: ${р.scorecard.map((в) => `<span class="chip ${в.answer === 'да' ? 'ok' : в.answer === 'нет' ? 'err' : ''}" title="${esc([в.quote && `«${в.quote}»`, в.why].filter(Boolean).join(' — '))}">${esc(в.question)} — ${esc(в.answer)}</span>`).join(' ')}</div>` : ''}
       ${(р.warnings || []).length ? `<div class="small" style="margin-top:6px;color:var(--warn)">Замечания разбора: ${esc(р.warnings.join('; '))}</div>` : ''}
       <div class="small faint" style="margin-top:8px">Сгенерировано моделью ${esc(р.model || '')}${р.latency_ms ? ` за ${num(р.latency_ms / 1000, 1)} с` : ''}${р.chunks > 1 ? ` по пересказам ${num(р.chunks)} частей` : ''}${stale ? ' · подсказки с тех пор менялись' : ''} — может ошибаться; причина и исход выбраны из закрытых списков.</div>
     </div>`;
     const кнопка = qs('#job-llm-run', host);
     if (кнопка) кнопка.onclick = () => запустить(кнопка);
+    const эталон = qs('#job-llm-golden', host);
+    if (эталон) эталон.onclick = () => ИИ.эталон(job, р);
+    const тренировать = qs('#job-llm-train', host);
+    if (тренировать) тренировать.onclick = () => ИИ.тренажёрС(job.id);
   };
   const запустить = async (кнопка) => {
     кнопка.disabled = true; кнопка.textContent = 'Модель думает…';
@@ -8153,8 +8168,20 @@ RENDERERS.trends = {
       // Точка ряда раскрывается в записи своей корзины. Если на графике
       // одно железо — раскрывать нечего, и подсказка щелчка не обещает.
       const естьЗаписи = выбраны.some((и) => (ряды.get(и) || {}).drill);
+      // Смены настройки модели — отметками: «доля решённых выросла» сразу
+      // после смены подсказки — не обязательно правда о работе.
+      const отметки = (д.markers || []).map((м) => {
+        const корзины = д.buckets || [];
+        let i = корзины.findIndex((ts, к) => м.at >= ts
+          && (к + 1 >= корзины.length || м.at < корзины[к + 1]));
+        if (i < 0) return null;
+        const конец = i + 1 < корзины.length ? корзины[i + 1] : (д.window || {}).until;
+        const доля = конец > корзины[i] ? (м.at - корзины[i]) / (конец - корзины[i]) : 0;
+        return { x: i + Math.max(0, Math.min(0.99, доля)),
+                 title: `${fmtTime(м.at)} — ${м.title || 'смена настройки модели'}` };
+      }).filter(Boolean);
       window.Charts.line(место, Object.assign(
-        { series: серии, labels: метки, tip: true, height: 300 },
+        { series: серии, labels: метки, tip: true, height: 300, markers: отметки },
         естьЗаписи ? { onPick: (номер) => this.pick(номер),
                        pickHint: 'щелчок — записи за этой точкой' } : {}));
       // Своей легенды здесь нет: Charts.line рисует её сам для двух рядов и
@@ -13952,6 +13979,8 @@ RENDERERS.content.drawDiscovered = function (host) {
     <div class="card-head"><h3>Темы без правил</h3>
       <span class="hint">о чём говорят там, куда никто не написал правило</span>
       <span class="spacer"></span>
+      <select id="topics-by" style="width:150px" title="Как собирать кучки: по похожести слов или по смыслу пересказов модели (нужен поиск по смыслу)">
+        <option value="words">по словам</option><option value="meaning">по смыслу</option></select>
       <button class="ghost sm" id="topics-go">Поискать</button></div>
     <div class="params" style="padding:14px 16px" id="topics-body">
       <p class="small dim">Категории показывают то, что уже искали. Новая
@@ -13965,7 +13994,7 @@ RENDERERS.content.drawDiscovered = function (host) {
     тело.innerHTML = '<div class="empty small">Смотрю архив…</div>';
     try {
       const итог = await API.get(
-        `/api/content/discover?period=${state.contentPeriod}`);
+        `/api/content/discover?period=${state.contentPeriod}&by=${qs('#topics-by', место).value}`);
       const темы = итог.topics || [];
       // Раскрытие. Кучка собирается по похожести в памяти одного запроса:
       // условия, которым её можно было бы отобрать в базе, у неё нет, а
@@ -21911,4 +21940,631 @@ RENDERERS.staff = {
     }
   },
 };
+
+/* ===================================================================
+ * ИИ-аналитика поверх ответов модели (заход 59).
+ *
+ * Карточка записи: эталон человека (золотой набор) и тренажёр по этому
+ * разговору. Ручная проверка: ответы проверяющего на вопросы скоркарты
+ * модели. Карточка оператора: доля решённых, итог скоркарты, обещания без
+ * срока, план обучения. «Голосовая аналитика»: контроль договорённостей,
+ * решение с первого обращения, риск ухода, вопрос к архиву и поиск по
+ * смыслу. «Контроль качества»: сверка предсказанного NPS с опросом и что
+ * снижает оценку. «Очередь LLM»: золотой набор и его прогоны. Отдельный
+ * раздел «Тренажёр».
+ * =================================================================== */
+
+const ИИ = {
+  ссылка(ид, имя) {
+    return `<a href="#" data-open="${esc(ид)}">${esc(имя || ид)}</a>`;
+  },
+
+  связать(место) {
+    qsa('[data-open]', место).forEach((к) => {
+      к.onclick = (е) => { е.preventDefault(); window.__asrhub.openJob(к.dataset.open); };
+    });
+  },
+
+  доля(значение, знаков) {
+    return значение === null || значение === undefined ? '—' : `${num(значение, знаков ?? 0)} %`;
+  },
+
+  /* Эталон человека по записи — в золотой набор. Поля заполнены ответом
+   * модели: исправить проще, чем вписать с нуля. */
+  async эталон(job, р) {
+    let прежний = null;
+    try {
+      const набор = await API.get('/api/llm/golden');
+      прежний = (набор.items || []).find((з) => з.job_id === job.id) || null;
+    } catch (err) { /* набор недоступен — начнём с ответа модели */ }
+    const основа = (прежний && прежний.answers) || {};
+    const выбрать = (имя, значение, варианты) => `<select data-g="${имя}" style="width:100%">
+      ${варианты.map(([з, п]) => `<option value="${esc(з)}" ${String(значение) === String(з) ? 'selected' : ''}>${esc(п)}</option>`).join('')}</select>`;
+    const решено = основа.resolved !== undefined ? основа.resolved : р.resolved;
+    const трекеры = р.trackers || [];
+    const скоркарта = р.scorecard || [];
+    const поля = р.fields || {};
+    const фон = h(`<div class="modal-backdrop"><div class="modal" style="max-width:620px">
+      <div class="modal-head"><b>Эталон человека: золотой набор</b><span class="spacer"></span>
+        <button class="ghost icon" data-close aria-label="Закрыть" title="Закрыть">✕</button></div>
+      <div class="modal-body stack" style="gap:10px">
+        <div class="small dim">Отметьте, как на самом деле: по таким записям считается точность
+          модели и прогоняется новая подсказка до выката. Поля заполнены ответом модели.</div>
+        <label class="small dim">Причина обращения
+          <input data-g="reason" value="${esc(основа.reason ?? р.reason ?? '')}" style="width:100%"></label>
+        <label class="small dim">Исход
+          <input data-g="outcome" value="${esc(основа.outcome ?? р.outcome ?? '')}" style="width:100%"></label>
+        <label class="small dim">Вопрос решён
+          ${выбрать('resolved', решено === null || решено === undefined ? '' : решено,
+                    [['', 'не отмечать'], ['true', 'да'], ['false', 'нет']])}</label>
+        ${трекеры.length ? `<div class="small dim">Умные трекеры — сработали ли на самом деле</div>
+          ${трекеры.map((т) => `<label class="small row" style="gap:6px"><input type="checkbox" data-gt="${esc(т.id)}"
+            ${((основа.trackers || {})[т.id] ?? т.fired) ? 'checked' : ''}> ${esc(т.label || т.id)}</label>`).join('')}` : ''}
+        ${скоркарта.length ? `<div class="small dim">Скоркарта — как ответил бы проверяющий</div>
+          ${скоркарта.map((в) => `<label class="small dim">${esc(в.question)}
+            ${выбрать(`sc:${в.id}`, (основа.scorecard || {})[в.id] ?? в.answer,
+                      [['да', 'да'], ['нет', 'нет'], ['н/п', 'н/п']])}</label>`).join('')}` : ''}
+        ${Object.keys(поля).length ? `<div class="small dim">Свои поля</div>
+          ${Object.entries(поля).map(([к, з]) => `<label class="small dim">${esc(к)}
+            <input data-gf="${esc(к)}" value="${esc((основа.fields || {})[к] ?? з ?? '')}" style="width:100%"></label>`).join('')}` : ''}
+        <div class="small err" data-g-err></div>
+      </div>
+      <div class="modal-foot">${прежний ? '<button class="ghost" data-g-del>Убрать из набора</button>' : ''}
+        <span class="spacer"></span><button class="ghost" data-close>Отмена</button>
+        <button class="primary" data-g-save>Сохранить эталон</button></div></div></div>`);
+    document.body.appendChild(фон);
+    mountModal(фон, { label: 'Эталон человека' });
+    qsa('[data-close]', фон).forEach((к) => { к.onclick = () => closeModal(фон); });
+    const удалить = qs('[data-g-del]', фон);
+    if (удалить) удалить.onclick = async () => {
+      try {
+        await API.del(`/api/llm/golden/${encodeURIComponent(job.id)}`);
+        toast('Запись убрана из золотого набора', 'ok');
+        closeModal(фон);
+      } catch (err) { fail(err); }
+    };
+    qs('[data-g-save]', фон).onclick = async () => {
+      const тело = {};
+      const причина = qs('[data-g="reason"]', фон).value.trim();
+      const исход = qs('[data-g="outcome"]', фон).value.trim();
+      if (причина) тело.reason = причина;
+      if (исход) тело.outcome = исход;
+      const р_ = qs('[data-g="resolved"]', фон).value;
+      if (р_) тело.resolved = р_ === 'true';
+      if (трекеры.length) {
+        тело.trackers = {};
+        qsa('[data-gt]', фон).forEach((ф) => { тело.trackers[ф.dataset.gt] = ф.checked; });
+      }
+      if (скоркарта.length) {
+        тело.scorecard = {};
+        скоркарта.forEach((в) => { тело.scorecard[в.id] = qs(`[data-g="sc:${CSS.escape(в.id)}"]`, фон).value; });
+      }
+      const свои = qsa('[data-gf]', фон);
+      if (свои.length) {
+        тело.fields = {};
+        свои.forEach((ф) => { тело.fields[ф.dataset.gf] = ф.value.trim() || null; });
+      }
+      try {
+        await API.put(`/api/llm/golden/${encodeURIComponent(job.id)}`, тело);
+        toast('Эталон сохранён', 'ok', 'Точность модели по набору — в разделе «Очередь LLM»');
+        closeModal(фон);
+      } catch (err) {
+        qs('[data-g-err]', фон).textContent = err.hint ? `${err.message} ${err.hint}` : err.message;
+      }
+    };
+  },
+
+  тренажёрС(ид) {
+    state.trainerJob = ид;
+    qsa('.modal-backdrop').forEach((фон) => closeModal(фон));
+    go('trainer');
+  },
+
+  /* Ручная проверка: ответы проверяющего на вопросы скоркарты модели. */
+  async скоркартаПроверки(backdrop, job) {
+    const место = qs('#qa-scorecard', backdrop);
+    if (!место) return;
+    let р;
+    try {
+      р = ((await API.get(`/api/content/jobs/${encodeURIComponent(job.id)}/llm`)) || {}).result;
+    } catch (err) { return; }
+    const вопросы = (р && р.scorecard) || [];
+    if (!вопросы.length || !место.isConnected) return;
+    место.innerHTML = `<div class="small dim" style="margin-bottom:4px">Вопросы скоркарты модели —
+        ваш ответ (по ним считается согласие человека и модели по каждому вопросу)</div>
+      ${вопросы.map((в) => `<label class="small row" style="gap:8px;margin:2px 0">
+        <select data-qa-sc="${esc(в.id)}" style="width:110px">
+          <option value="">—</option><option>да</option><option>нет</option><option>н/п</option></select>
+        <span>${esc(в.question)} <span class="faint">(модель: ${esc(в.answer)})</span></span></label>`).join('')}`;
+  },
+
+  /* Карточка оператора: ответы модели рядом с баллом правил. */
+  оператор(host, карточка, by, ключ) {
+    if (!host) return;
+    const м = (карточка.llm || {}).agent;
+    const к = (карточка.llm || {}).team || {};
+    const старый = qs('[data-llm-operator]', host);
+    if (старый) старый.remove();
+    const блок = document.createElement('div');
+    блок.dataset.llmOperator = '1';
+    if (!м || !м.analyzed) {
+      блок.innerHTML = card('По ответам модели', '', `<div class="empty small">За период модель
+        не разобрала ни одного разговора этого оператора.</div>`);
+      host.appendChild(блок);
+      return;
+    }
+    const сравнение = (имя, своё, команды, знаков, хвост) => `<tr><td>${esc(имя)}</td>
+      <td class="num mono">${своё === null || своё === undefined ? '—' : num(своё, знаков) + (хвост || '')}</td>
+      <td class="num mono faint">${команды === null || команды === undefined ? '—' : num(команды, знаков) + (хвост || '')}</td></tr>`;
+    const командные = Object.fromEntries((к.scorecard || []).map((в) => [в.id, в]));
+    блок.innerHTML = card('По ответам модели',
+      `разобрано ${num(м.analyzed)} разговоров · сгенерировано моделью, может ошибаться`,
+      `<div class="grid cols-2">
+        <div class="table-wrap"><table><thead><tr><th></th><th class="num">Оператор</th>
+          <th class="num">Команда</th></tr></thead><tbody>
+          ${сравнение('Вопрос решён, %', м.resolved_share, к.resolved_share, 1)}
+          ${сравнение('Итог скоркарты', м.score, к.score, 0)}
+          ${сравнение('Провалов критичных пунктов', м.critical_failed, к.critical_failed, 0)}
+          ${сравнение('Обещаний без срока, %', м.undated_share, к.undated_share, 1)}
+        </tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Вопрос скоркарты</th>
+          <th class="num">да, %</th><th class="num">команда</th></tr></thead><tbody>
+          ${(м.scorecard || []).map((в) => `<tr><td class="small">${esc(в.question || в.id)}</td>
+            <td class="num mono">${ИИ.доля(в.yes_share)}</td>
+            <td class="num mono faint">${ИИ.доля((командные[в.id] || {}).yes_share)}</td></tr>`).join('')
+            || '<tr><td colspan="3" class="small faint">Скоркарта не настроена</td></tr>'}
+        </tbody></table></div>
+      </div>
+      <div id="llm-plan" style="margin-top:12px"></div>`,
+      '<button class="btn sm" data-llm-plan>Составить план обучения</button>');
+    host.appendChild(блок);
+    const план = qs('#llm-plan', блок);
+    const нарисовать = (п) => {
+      if (!п) { план.innerHTML = '<div class="small faint">План обучения ещё не составляли.</div>'; return; }
+      if (п.hidden) { план.innerHTML = '<div class="small faint">План составлен другим ключом.</div>'; return; }
+      const пункты = (список, вид) => (список || []).map((з) => `<li><span class="chip ${вид}">${esc(з.text)}</span>
+        ${(з.records || []).map((и) => ИИ.ссылка(и, 'запись')).join(', ')}</li>`).join('');
+      план.innerHTML = `<div class="small dim">План обучения — ${esc(fmtTime(п.created_at))},
+          по ${num(п.records)} разговорам · модель ${esc(п.model || '')}</div>
+        <div class="grid cols-3" style="margin-top:6px">
+          <div><b class="small">Получается</b><ul class="small">${пункты(п.strengths, 'ok') || '<li class="faint">—</li>'}</ul></div>
+          <div><b class="small">Не получается</b><ul class="small">${пункты(п.weaknesses, 'warn') || '<li class="faint">—</li>'}</ul></div>
+          <div><b class="small">Потренировать</b><ul class="small">${(п.practice || []).map((т) => `<li>${esc(т)}</li>`).join('') || '<li class="faint">—</li>'}</ul></div>
+        </div>`;
+      ИИ.связать(план);
+    };
+    API.get(`/api/content/agents/${encodeURIComponent(ключ)}/plan?by=${encodeURIComponent(by)}`)
+      .then((о) => нарисовать(о.plan)).catch(() => нарисовать(null));
+    qs('[data-llm-plan]', блок).onclick = async (е) => {
+      const кнопка = е.currentTarget;
+      кнопка.disabled = true; кнопка.textContent = 'Модель думает…';
+      try {
+        const о = await API.post(`/api/content/agents/${encodeURIComponent(ключ)}/plan?by=${encodeURIComponent(by)}`);
+        нарисовать(о.plan);
+      } catch (err) { fail(err); }
+      кнопка.disabled = false; кнопка.textContent = 'Составить план обучения';
+    };
+  },
+};
+
+// Сотрудники: столбцы по ответам модели и свой набор столбцов.
+СОТРУДНИК_КОЛОНКИ.push(
+  ['llm_analyzed', 'Разобрано моделью', 0, 0, 'разговоров с ответом модели за период'],
+  ['llm_resolved_share', 'Решено (модель), %', 1, 1, 'доля разговоров, где модель сочла вопрос решённым'],
+  ['llm_score', 'Скоркарта модели', 0, 1, 'итог скоркарты модели 0–100 с весами вопросов'],
+  ['llm_undated_share', 'Обещаний без срока, %', 1, -1, 'обещания сотрудника без названного срока'],
+);
+СОТРУДНИК_НАБОРЫ.splice(СОТРУДНИК_НАБОРЫ.findIndex((н) => н.key === 'all'), 0,
+  { key: 'llm', title: 'По ответам модели',
+    columns: ['records', 'llm_analyzed', 'llm_resolved_share', 'llm_score',
+              'llm_undated_share', 'agent_score'] });
+
+// Карточка оператора в «Аналитике записей» и в «Аналитике по сотрудникам».
+(() => {
+  const рисовалКонтент = RENDERERS.content.drawAgentCard;
+  RENDERERS.content.drawAgentCard = async function (host) {
+    await рисовалКонтент.call(this, host);
+    try {
+      const к = await API.get(`/api/content/agents/${encodeURIComponent(state.contentAgent)}?period=${
+        state.contentPeriod}&by=${state.contentAgentBy}`);
+      ИИ.оператор(host, к, state.contentAgentBy, state.contentAgent);
+    } catch (err) { /* карточка без блока модели */ }
+  };
+  const открывалСотрудника = RENDERERS.employees.openCard;
+  RENDERERS.employees.openCard = async function (ключ) {
+    await открывалСотрудника.call(this, ключ);
+    const место = qs('#emp-card');
+    if (!место || !место.innerHTML || state.employeeKey !== ключ) return;
+    try {
+      const к = await API.get(`/api/content/agents/${encodeURIComponent(ключ)}?by=${
+        state.employeeBy}&period=${state.employeePeriod}`);
+      ИИ.оператор(место, к, state.employeeBy, ключ);
+    } catch (err) { /* карточка без блока модели */ }
+  };
+})();
+
+// «Голосовая аналитика»: вопрос к архиву, договорённости, первое
+// обращение, риск ухода.
+ГОЛОС_ВКЛАДКИ.push(['ask', 'Вопрос к архиву']);
+(() => {
+  const голос = RENDERERS.voice;
+  const рисовал = голос.draw;
+  голос.draw = function () {
+    const место = qs('#vo-body');
+    if (место && this.вкладка === 'ask') { this.drawAsk(место); return; }
+    рисовал.call(this);
+    if (!место) return;
+    if (this.вкладка === 'actions' && (state.voice || {}).lists === 'ready') this.drawCommitments(место);
+    if (this.вкладка === 'trackers' && (state.voice || {}).lists === 'ready') this.drawRisks(место);
+    if (this.вкладка === 'summary') this.drawFirstContact(место);
+  };
+
+  голос.параметрыОкна = function () {
+    const окно = (state.voice || {}).window || {};
+    const п = new URLSearchParams({ period: this.период });
+    if (окно.since) п.set('since', окно.since);
+    if (окно.until) п.set('until', окно.until);
+    if (this.добавочный) п.set('agent', this.добавочный);
+    return п.toString();
+  };
+
+  голос.drawCommitments = async function (место) {
+    const блок = document.createElement('div');
+    блок.innerHTML = card('Контроль договорённостей',
+      'обещали перезвонить к сроку — был ли звонок клиенту (журнал звонков)',
+      '<div class="empty small">Сверяю с журналом звонков…</div>');
+    место.appendChild(блок);
+    let д;
+    try { д = await API.get(`/api/llm/commitments?${this.параметрыОкна()}`); } catch (err) {
+      блок.innerHTML = card('Контроль договорённостей', '', `<div class="empty small">${esc(err.message)}</div>`);
+      return;
+    }
+    if (!блок.isConnected) return;
+    const с = д.counts || {};
+    const заголовки = д.titles || {};
+    const цвет = { overdue: 'err', done: 'ok', waiting: 'info', undated: 'warn', unchecked: '', no_number: '' };
+    блок.innerHTML = card('Контроль договорённостей',
+      `запас к сроку ${num(д.grace_hours)} ч · без срока ждём ${num(д.days)} дн`,
+      `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('Просрочено', num(с.overdue || 0), 'обещали перезвонить — звонка не было')}
+        ${kpi('Выполнено', num(с.done || 0), 'звонок клиенту был до срока')}
+        ${kpi('Ждут срока', num((с.waiting || 0) + (с.undated || 0)), 'срок ещё не наступил')}
+        ${kpi('Держат слово', ИИ.доля(д.kept_share), 'выполнено среди проверяемых')}
+      </div>
+      ${(д.items || []).length ? `<div class="table-wrap"><table><thead><tr><th>Состояние</th>
+        <th>Что обещано</th><th>Срок</th><th>Добавочный</th><th>Запись</th><th>Звонок клиенту</th></tr></thead>
+        <tbody>${д.items.slice(0, 100).map((п) => `<tr>
+          <td><span class="chip ${цвет[п.status] || ''}">${esc(заголовки[п.status] || п.status_title)}</span></td>
+          <td class="small">${esc(п.what)}</td>
+          <td class="small dim nowrap">${п.due ? esc(fmtTime(п.due)) : esc(п.when || '—')}</td>
+          <td class="small nowrap">${добавочный(п)}</td>
+          <td class="small truncate" style="max-width:180px">${ИИ.ссылка(п.job_id, п.filename)}</td>
+          <td class="small nowrap">${п.callback_at ? (п.callback_job_id ? ИИ.ссылка(п.callback_job_id, fmtTime(п.callback_at)) : esc(fmtTime(п.callback_at))) : '—'}</td>
+        </tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Договорённостей сотрудника за период нет.</div>'}`);
+    ИИ.связать(блок);
+  };
+
+  голос.drawFirstContact = async function (место) {
+    const блок = document.createElement('div');
+    место.appendChild(блок);
+    let д;
+    try { д = await API.get(`/api/llm/first-contact?${this.параметрыОкна()}`); } catch (err) { return; }
+    if (!блок.isConnected || !д.known) return;
+    блок.innerHTML = card('Решено с первого обращения',
+      `по факту: клиент не позвонил снова с той же причиной за ${num(д.days)} дн`,
+      `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('По словам модели', ИИ.доля(д.model_share, 1), `решён в ${num(д.resolved_by_model)} из ${num(д.known)}`)}
+        ${kpi('По факту', ИИ.доля(д.fcr_share, 1), 'без повторного звонка с той же причиной')}
+        ${kpi('Вернулись', num(д.reopened), 'модель сказала «решён», а клиент позвонил снова')}
+        ${kpi('Возможно', num(д.possible), 'повторный звонок ещё не разобран моделью')}
+      </div>
+      ${(д.items || []).length ? `<div class="table-wrap"><table><thead><tr><th>Первый разговор</th>
+        <th>Причина</th><th>Повтор</th></tr></thead><tbody>${д.items.slice(0, 30).map((п) => `<tr>
+          <td class="small">${ИИ.ссылка(п.job_id, п.filename)} <span class="faint">${esc(fmtTime(п.created_at))}</span></td>
+          <td class="small">${esc(п.reason || '—')}</td>
+          <td class="small">${п.repeat_job_id ? ИИ.ссылка(п.repeat_job_id, fmtTime(п.repeat_at)) : esc(fmtTime(п.repeat_at))}</td>
+        </tr>`).join('')}</tbody></table></div>` : ''}`);
+    ИИ.связать(блок);
+  };
+
+  голос.drawRisks = async function (место) {
+    const блок = document.createElement('div');
+    место.appendChild(блок);
+    let д;
+    try { д = await API.get(`/api/llm/risks?${this.параметрыОкна()}`); } catch (err) { return; }
+    if (!блок.isConnected) return;
+    const с = д.counts || {};
+    блок.innerHTML = card('Риск ухода и эскалации',
+      `высокий — от ${num(д.threshold)} баллов из 100; балл — из уже посчитанных признаков`,
+      `<div class="grid cols-3" style="margin-bottom:10px">
+        ${kpi('Высокий', num(с.high || 0), 'уведомление уходит на адрес трекеров')}
+        ${kpi('Средний', num(с.medium || 0), 'стоит послушать')}
+        ${kpi('Низкий', num(с.low || 0), `из ${num(д.analyzed)} разобранных`)}
+      </div>
+      ${(д.items || []).length ? `<div class="table-wrap"><table><thead><tr><th class="num">Балл</th>
+        <th>Запись</th><th>Добавочный</th><th>Почему</th></tr></thead><tbody>${д.items.map((п) => `<tr>
+          <td class="num mono"><span class="chip ${п.level === 'high' ? 'err' : 'warn'}">${num(п.score)}</span></td>
+          <td class="small truncate" style="max-width:200px">${ИИ.ссылка(п.job_id, п.filename)}</td>
+          <td class="small nowrap">${добавочный(п)}</td>
+          <td class="small">${(п.why || []).map((з) => esc(з)).join('; ')}</td>
+        </tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Разговоров с заметным риском нет.</div>'}`);
+    ИИ.связать(блок);
+  };
+
+  голос.drawAsk = function (место) {
+    место.innerHTML = `${card('Вопрос к архиву',
+      'обычными словами, по пересказам модели за выбранный период и добавочный; ответ — со ссылками на записи',
+      `<div class="row" style="gap:8px">
+        <input id="vo-ask-q" placeholder="Например: почему клиенты отказываются от доставки?"
+          maxlength="500" style="flex:1" aria-label="Вопрос к архиву">
+        <button class="primary" id="vo-ask-go">Спросить</button></div>
+      <div id="vo-ask-a" style="margin-top:12px"></div>`)}
+      ${card('Поиск по смыслу',
+      'находит разговоры по смыслу, а не по словам: «курьер не приехал» по запросу «недовольны сроками»',
+      `<div class="row" style="gap:8px">
+        <input id="vo-sem-q" placeholder="Что искать по смыслу" maxlength="300" style="flex:1"
+          aria-label="Поиск по смыслу">
+        <button class="btn" id="vo-sem-go">Найти</button>
+        <button class="ghost sm" id="vo-sem-index" title="Посчитать векторы для разобранных записей, у которых их ещё нет">Посчитать векторы</button></div>
+      <div id="vo-sem-a" style="margin-top:12px"></div>`)}`;
+    const спросить = async () => {
+      const вопрос = qs('#vo-ask-q').value.trim();
+      const ответ = qs('#vo-ask-a');
+      if (!вопрос) { qs('#vo-ask-q').focus(); return; }
+      ответ.innerHTML = '<div class="empty small">Модель читает пересказы…</div>';
+      try {
+        const окно = (state.voice || {}).window || {};
+        const д = await API.post('/api/llm/ask', { question: вопрос, period: this.период,
+          since: окно.since, until: окно.until, agent: this.добавочный });
+        ответ.innerHTML = `<div style="line-height:1.6">${esc(д.answer || '')}</div>
+          <div class="small dim" style="margin-top:6px">По ${num(д.used)} записям, вызовов модели: ${num(д.calls)}.
+            ${(д.records || []).length ? `Опирается на: ${д.records.map((з) => ИИ.ссылка(з.job_id, з.filename)).join(', ')}` : ''}</div>
+          <div class="small faint" style="margin-top:4px">Сгенерировано моделью — может ошибаться; проверяйте по записям.</div>`;
+        ИИ.связать(ответ);
+      } catch (err) {
+        ответ.innerHTML = `<div class="empty small">${esc(err.message)}${err.hint ? ` ${esc(err.hint)}` : ''}</div>`;
+      }
+    };
+    qs('#vo-ask-go').onclick = спросить;
+    qs('#vo-ask-q').addEventListener('keydown', (е) => { if (е.key === 'Enter') спросить(); });
+    const найти = async () => {
+      const запрос = qs('#vo-sem-q').value.trim();
+      const итог = qs('#vo-sem-a');
+      if (запрос.length < 2) { qs('#vo-sem-q').focus(); return; }
+      итог.innerHTML = '<div class="empty small">Ищу…</div>';
+      try {
+        const период = this.период === 'hour' ? 'day' : this.период;
+        const д = await API.get(`/api/llm/search?q=${encodeURIComponent(запрос)}&period=${период}`);
+        итог.innerHTML = (д.items || []).length ? `<div class="table-wrap"><table><thead><tr>
+            <th class="num">Близость</th><th>Запись</th><th>Фрагмент</th></tr></thead><tbody>
+          ${д.items.map((з) => `<tr><td class="num mono">${num(з.score, 2)}</td>
+            <td class="small truncate" style="max-width:200px">${ИИ.ссылка(з.job_id, з.filename)}</td>
+            <td class="small">${esc(з.text)}</td></tr>`).join('')}</tbody></table></div>
+          <div class="small faint">Векторов: ${num((д.index || {}).records)} записей · модель ${esc(д.model || '')}</div>`
+          : `<div class="empty small">Близкого по смыслу не нашлось (просмотрено частей: ${num(д.scanned)}).</div>`;
+        ИИ.связать(итог);
+      } catch (err) {
+        итог.innerHTML = `<div class="empty small">${esc(err.message)}${err.hint ? ` ${esc(err.hint)}` : ''}</div>`;
+      }
+    };
+    qs('#vo-sem-go').onclick = найти;
+    qs('#vo-sem-q').addEventListener('keydown', (е) => { if (е.key === 'Enter') найти(); });
+    qs('#vo-sem-index').onclick = async (е) => {
+      try {
+        const д = await API.post('/api/llm/search/index?limit=2000');
+        toast(д.started ? 'Векторы считаются в фоне' : (д.reason || 'Уже считаются'), 'ok');
+      } catch (err) { fail(err); }
+      е.currentTarget.blur();
+    };
+  };
+})();
+
+// «Контроль качества»: опрос клиента против предсказания и драйверы оценки.
+(() => {
+  const кк = RENDERERS.qc;
+  const грузил = кк.loadReport;
+  кк.loadReport = async function (...аргументы) {
+    const итог = await грузил.apply(this, аргументы);
+    this.drawInsights();
+    return итог;
+  };
+  кк.drawInsights = async function () {
+    const сводка = qs('#qc-summary');
+    if (!сводка) return;
+    let место = qs('#qc-insights');
+    if (!место) {
+      место = document.createElement('div');
+      место.id = 'qc-insights';
+      сводка.after(место);
+    }
+    const период = { 7: 'week', 30: 'month', 90: 'quarter', 365: 'year' }[state.qcDays] || 'quarter';
+    let д;
+    try { д = await API.get(`/api/qc/insights?period=${период}`); } catch (err) { return; }
+    if (!место.isConnected) return;
+    const с = д.calibration || {};
+    место.innerHTML = card('Оценка клиента и прогноз',
+      `опросов с оценкой за период: ${num(д.surveys)} · средняя ${д.average === null || д.average === undefined ? '—' : num(д.average, 0) + ' %'}`,
+      `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('Пар для сверки', num(с.pairs || 0), с.enough ? 'достаточно для поправки' : 'для поправки нужно от десяти')}
+        ${kpi('Средняя ошибка', с.mae === undefined ? '—' : `${num(с.mae, 1)} п.`, 'прогноз NPS ×10 против оценки клиента, %')}
+        ${kpi('Сдвиг', с.bias === undefined ? '—' : `${с.bias > 0 ? '+' : ''}${num(с.bias, 1)} п.`, 'плюс — клиенты мягче прогноза')}
+        ${kpi('Поправка', с.suggested_shift === null || с.suggested_shift === undefined ? '—'
+                : `${num(с.suggested_shift, 1)}`, `сейчас ${num(с.current_shift || 0, 1)} балла NPS`)}
+      </div>
+      ${(с.groups || []).length ? `<div class="small dim" style="margin-bottom:8px">${с.groups.map((г) =>
+        `${esc(г.group)}: ${num(г.n)} опросов, оценка ${г.actual === null ? '—' : num(г.actual, 0) + ' %'}`).join(' · ')}</div>` : ''}
+      ${с.suggested_shift !== null && с.suggested_shift !== undefined && с.suggested_shift !== с.current_shift
+        ? '<button class="btn sm" id="qc-apply-shift">Применить поправку</button> <span class="small dim">к новым разборам; архив — после «Пересчитать архив» в «Аналитике записей»</span>' : ''}
+      <div style="margin-top:12px"><b class="small">Что сопутствует низкой оценке</b>
+        <span class="small faint"> — ${esc(д.note || '')}</span></div>
+      ${(д.drivers || []).length ? `<div class="table-wrap"><table><thead><tr><th>Признак разговора</th>
+        <th class="num">Опросов</th><th class="num">Оценка, %</th><th class="num">Без него</th><th class="num">Разница</th></tr></thead>
+        <tbody>${д.drivers.slice(0, 15).map((д_) => `<tr><td class="small">${esc(д_.feature)}</td>
+          <td class="num mono">${num(д_.n)}</td><td class="num mono">${num(д_.score, 0)}</td>
+          <td class="num mono faint">${д_.without === null ? '—' : num(д_.without, 0)}</td>
+          <td class="num mono"><span class="chip ${д_.delta < -5 ? 'err' : д_.delta > 5 ? 'ok' : ''}">${д_.delta > 0 ? '+' : ''}${num(д_.delta, 1)}</span></td>
+        </tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Мало опросов с разобранными разговорами.</div>'}`);
+    const применить = qs('#qc-apply-shift', место);
+    if (применить) применить.onclick = async () => {
+      try {
+        await API.put('/api/settings', { content_nps_shift: с.suggested_shift });
+        toast('Поправка предсказанного NPS применена', 'ok');
+        this.drawInsights();
+      } catch (err) { fail(err); }
+    };
+  };
+})();
+
+// «Очередь LLM»: золотой набор — точность модели и прогоны.
+(() => {
+  const очередь = RENDERERS.llmqueue;
+  const рисовала = очередь.render;
+  очередь.render = async function (root) {
+    const итог = await рисовала.call(this, root);
+    if (!qs('#lq-golden', root)) {
+      const место = document.createElement('div');
+      место.id = 'lq-golden';
+      root.appendChild(место);
+    }
+    this.drawGolden();
+    return итог;
+  };
+  очередь.drawGolden = async function () {
+    const место = qs('#lq-golden');
+    if (!место) return;
+    let д;
+    try { д = await API.get('/api/llm/golden'); } catch (err) { return; }
+    if (!место.isConnected) return;
+    const т = д.current || {};
+    const поля = т.fields || {};
+    const подписи = { reason: 'причина', outcome: 'исход', resolved: 'решён ли', trackers: 'трекеры',
+                      scorecard: 'скоркарта', fields: 'поля' };
+    const точность = (з) => (з === null || з === undefined ? '—' : `${num(з * 100, 0)} %`);
+    место.innerHTML = card('Золотой набор',
+      'ответы человека по записям — по ним проверяется модель и новая подсказка до выката',
+      `<div class="grid cols-4" style="margin-bottom:10px">
+        ${kpi('Записей в наборе', num(т.records || 0), 'эталон отмечается в карточке записи')}
+        ${kpi('Точность сейчас', точность(т.accuracy), `по ${num(т.answered || 0)} ответам модели`)}
+        ${Object.entries(поля).filter(([, з]) => з.n).slice(0, 2).map(([к, з]) =>
+          kpi(`Точность: ${подписи[к] || к}`, точность(з.accuracy), `${num(з.ok)} из ${num(з.n)}`)).join('')}
+      </div>
+      <div class="row wrap" style="gap:8px;margin-bottom:10px">
+        <input id="lq-g-label" placeholder="Подпись прогона" maxlength="120" style="width:200px" aria-label="Подпись прогона">
+        <input id="lq-g-model" placeholder="Другая модель (необязательно)" style="width:220px" aria-label="Другая модель">
+        <input id="lq-g-extra" placeholder="Добавка к подсказке (необязательно)" style="flex:1;min-width:220px" aria-label="Добавка к подсказке">
+        <button class="btn sm" id="lq-g-run">Прогнать набор</button>
+      </div>
+      ${(д.runs || []).length ? `<div class="table-wrap"><table><thead><tr><th>Прогон</th><th>Когда</th>
+        <th>Подмена</th><th class="num">Готово</th><th class="num">Точность</th><th>Состояние</th></tr></thead><tbody>
+        ${д.runs.map((п) => `<tr><td class="small">${esc(п.label || `№${п.id}`)}</td>
+          <td class="small faint nowrap">${esc(fmtTime(п.started_at))}</td>
+          <td class="small">${esc(Object.entries(п.overrides || {}).map(([к, з]) => `${к}=${typeof з === 'string' ? з.slice(0, 40) : JSON.stringify(з).slice(0, 40)}`).join('; ') || 'текущие настройки')}</td>
+          <td class="num mono">${num(п.done)} / ${num(п.records)}</td>
+          <td class="num mono">${точность(((п.result || {}).accuracy))}</td>
+          <td class="small">${esc(п.status)}${п.error ? `: ${esc(п.error)}` : ''}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}
+      ${(д.items || []).length ? `<details style="margin-top:10px"><summary class="small">Записи набора (${num(д.items.length)})</summary>
+        <div class="table-wrap"><table><thead><tr><th>Запись</th><th>Эталон</th><th>Модель</th><th class="num">Совпало</th></tr></thead><tbody>
+        ${д.items.map((з) => `<tr><td class="small truncate" style="max-width:200px">${ИИ.ссылка(з.job_id, з.filename)}</td>
+          <td class="small">${esc([з.answers.reason, з.answers.outcome].filter(Boolean).join(' · '))}</td>
+          <td class="small faint">${esc([(з.model || {}).reason, (з.model || {}).outcome].filter(Boolean).join(' · ') || '—')}</td>
+          <td class="num mono">${з.n ? `${num(з.ok)} / ${num(з.n)}` : '—'}</td></tr>`).join('')}
+        </tbody></table></div></details>` : '<div class="empty small">Набор пуст: откройте запись и нажмите «В золотой набор» в блоке «Смысл разговора».</div>'}`);
+    ИИ.связать(место);
+    qs('#lq-g-run', место).onclick = async (е) => {
+      const подмена = {};
+      const модель = qs('#lq-g-model', место).value.trim();
+      const добавка = qs('#lq-g-extra', место).value.trim();
+      if (модель) подмена.llm_model = модель;
+      if (добавка) подмена.llm_prompt_extra = добавка;
+      е.currentTarget.disabled = true;
+      try {
+        await API.post('/api/llm/golden/run', { label: qs('#lq-g-label', место).value.trim(),
+                                                overrides: подмена });
+        toast('Прогон золотого набора начат', 'ok', 'Ход — в таблице прогонов');
+        setTimeout(() => this.drawGolden(), 1500);
+      } catch (err) { fail(err); е.currentTarget.disabled = false; }
+    };
+  };
+})();
+
+// Раздел «Тренажёр»: модель играет клиента, скоркарта оценивает.
+VIEWS.trainer = { title: 'Тренажёр', subtitle: 'Учебный разговор: модель играет клиента по сценарию из настоящего разговора, скоркарта оценивает ответы оператора' };
+RENDERERS.trainer = {
+  async render(root) {
+    let д = { items: [], reasons: [] };
+    try { д = await API.get('/api/llm/trainer/scenarios'); } catch (err) { /* без сценариев */ }
+    const из_карточки = state.trainerJob || '';
+    state.trainerJob = '';
+    root.innerHTML = `${card('Сценарий', 'разговор из архива или причина обращения',
+      `<div class="row wrap" style="gap:8px">
+        <select id="tr-scenario" style="min-width:320px;flex:1" aria-label="Сценарий">
+          ${из_карточки ? `<option value="job:${esc(из_карточки)}">запись ${esc(из_карточки)}</option>` : ''}
+          ${(д.items || []).map((с) => `<option value="job:${esc(с.job_id)}">${esc(с.reason || '—')}: ${esc((с.summary || '').slice(0, 90))}</option>`).join('')}
+          ${(д.reasons || []).map((п) => `<option value="reason:${esc(п)}">причина: ${esc(п)}</option>`).join('')}
+        </select>
+        <button class="primary" id="tr-start">Начать тренировку</button></div>`)}
+      <div id="tr-chat"></div>`;
+    qs('#tr-start').onclick = () => this.start();
+    if (из_карточки) this.start();
+  },
+
+  async start() {
+    const выбор = qs('#tr-scenario').value || '';
+    const [вид, значение] = [выбор.split(':')[0], выбор.slice(выбор.indexOf(':') + 1)];
+    const место = qs('#tr-chat');
+    место.innerHTML = '<div class="empty">Модель готовит клиента…</div>';
+    try {
+      this.сессия = await API.post('/api/llm/trainer', вид === 'job' ? { job_id: значение } : { reason: значение });
+      this.draw();
+    } catch (err) {
+      место.innerHTML = `<div class="empty">${esc(err.message)}${err.hint ? ` ${esc(err.hint)}` : ''}</div>`;
+    }
+  },
+
+  draw() {
+    const с = this.сессия;
+    const место = qs('#tr-chat');
+    if (!с || !место) return;
+    const итог = с.result;
+    место.innerHTML = card('Разговор', с.done ? 'тренировка закончена' : (с.client_done ? 'клиент готов закончить разговор' : 'ваш ход'),
+      `<div class="stack" style="gap:6px;max-height:420px;overflow-y:auto" id="tr-lines">
+        ${(с.history || []).map((р) => `<div class="row" style="gap:8px;align-items:flex-start">
+          <span class="chip ${р.role === 'client' ? 'info' : 'accent'}" style="min-width:90px">${р.role === 'client' ? 'Клиент' : 'Оператор'}</span>
+          <span>${esc(р.text)}</span></div>`).join('')}</div>
+      ${с.done ? '' : `<div class="row" style="gap:8px;margin-top:10px">
+        <input id="tr-reply" placeholder="Ваш ответ клиенту" maxlength="1000" style="flex:1" aria-label="Ваш ответ клиенту">
+        <button class="primary" id="tr-send">Ответить</button>
+        <button class="btn" id="tr-finish">Закончить и оценить</button></div>`}
+      ${итог ? `<div style="margin-top:12px"><b>Оценка</b>${итог.score !== null && итог.score !== undefined ? ` — итог скоркарты <span class="chip ${итог.score >= 80 ? 'ok' : итог.score >= 50 ? 'warn' : 'err'}">${num(итог.score, 0)}</span>` : ''}
+        ${итог.summary ? `<div class="small dim" style="margin-top:4px">${esc(итог.summary)}</div>` : ''}
+        <ul class="small">${(итог.scorecard || []).map((в) => `<li><span class="chip ${в.answer === 'да' ? 'ok' : в.answer === 'нет' ? 'err' : ''}">${esc(в.answer)}</span> ${esc(в.question)}${в.why ? ` <span class="faint">— ${esc(в.why)}</span>` : ''}</li>`).join('')}</ul></div>` : ''}`);
+    const строки = qs('#tr-lines', место);
+    if (строки) строки.scrollTop = строки.scrollHeight;
+    const поле = qs('#tr-reply', место);
+    const отправить = async () => {
+      const текст = поле.value.trim();
+      if (!текст) { поле.focus(); return; }
+      поле.disabled = true;
+      try {
+        this.сессия = await API.post(`/api/llm/trainer/${encodeURIComponent(с.id)}/reply`, { text: текст });
+        this.draw();
+        const новое = qs('#tr-reply');
+        if (новое) новое.focus();
+      } catch (err) { fail(err); поле.disabled = false; }
+    };
+    if (поле) {
+      qs('#tr-send', место).onclick = отправить;
+      поле.addEventListener('keydown', (е) => { if (е.key === 'Enter') отправить(); });
+      qs('#tr-finish', место).onclick = async (е) => {
+        е.currentTarget.disabled = true;
+        try {
+          this.сессия = await API.post(`/api/llm/trainer/${encodeURIComponent(с.id)}/finish`);
+          this.draw();
+        } catch (err) { fail(err); е.currentTarget.disabled = false; }
+      };
+    }
+  },
+};
+
 })();

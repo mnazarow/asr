@@ -94,6 +94,8 @@ class Настройки:
     send_transcript: bool = False
     mask_pii: bool = False
     timeout_s: float = 10.0
+    #: Договорённости со сроком — задачами CRM (`crm_tasks`).
+    tasks: bool = False
 
     @classmethod
     def из_настроек(cls, settings: Any) -> Настройки:
@@ -119,7 +121,8 @@ class Настройки:
             fields=поля,
             send_transcript=bool(settings.get("crm_send_transcript", False)),
             mask_pii=bool(settings.get("crm_mask_pii", False)),
-            timeout_s=float(settings.get("crm_timeout_s") or 10.0))
+            timeout_s=float(settings.get("crm_timeout_s") or 10.0),
+            tasks=bool(settings.get("crm_tasks", False)))
 
     def проблема(self) -> str:
         if not self.enabled:
@@ -187,6 +190,27 @@ def собрать(job: dict[str, Any], разбор: dict[str, Any] | None = No
         "link": (f"{base_url.rstrip('/')}/#/jobs/{job.get('id')}"
                  if base_url else str(job.get("id") or "")),
     }
+    # Свои поля модели (`llm_fields`) — плоско, `field_<id>`: их можно
+    # сопоставить с полями CRM той же строкой crm_fields.
+    for ид, значение in (модель.get("fields") or {}).items() if isinstance(
+            модель.get("fields"), dict) else []:
+        данные[f"field_{ид}"] = значение if значение is not None else ""
+    # Договорённости сотрудника со сроком — будущие задачи CRM (`crm_tasks`):
+    # срок словами («завтра») переводится в момент от времени разговора.
+    from .llm import deadlines  # noqa: PLC0415
+
+    когда = float(звонок.get("started_at") or job.get("created_at") or 0) or None
+    задачи = []
+    for д in _список(модель.get("actions")):
+        if not isinstance(д, dict) or not д.get("what"):
+            continue
+        if str(д.get("who") or "сотрудник").lower().startswith("клиент"):
+            continue
+        срок = deadlines.срок(д.get("when"), когда) if (д.get("when") and когда) else None
+        if срок is not None:
+            задачи.append({"text": str(д.get("what"))[:500], "due": срок,
+                           "when": str(д.get("when") or "")})
+    данные["tasks"] = задачи[:10]
     if mask:
         # Обезличивается всё текстовое, а не только расшифровка, пересказ и
         # номер: действия к исполнению несут цитату («перезвоню на номер 8 916
@@ -194,6 +218,8 @@ def собрать(job: dict[str, Any], разбор: dict[str, Any] | None = No
         for ключ, значение in данные.items():
             if ключ != "link" and isinstance(значение, str) and значение:
                 данные[ключ] = masking.mask_text(значение)
+        for задача in данные["tasks"]:
+            задача["text"] = masking.mask_text(задача["text"])
     return данные
 
 
@@ -338,6 +364,14 @@ def запросы(данные: dict[str, Any], настройки: Настр�
         if значения:
             итог.append(Запрос("PATCH", основа, dict(заголовки),
                                тело({"custom_fields_values": значения}), "поля"))
+        if настройки.tasks and данные.get("tasks"):
+            # Задача amoCRM — к той же сущности; срок — секунды эпохи,
+            # тип 1 — «связаться».
+            итог.append(Запрос(
+                "POST", f"{настройки.url.rstrip('/')}/api/v4/tasks", dict(заголовки),
+                тело([{"text": з["text"], "complete_till": int(з["due"]),
+                       "entity_id": int(entity_id), "entity_type": сущность,
+                       "task_type_id": 1} for з in данные["tasks"]]), "задачи"))
         return итог
 
     if настройки.kind == "bitrix24":
@@ -356,11 +390,25 @@ def запросы(данные: dict[str, Any], настройки: Настр�
         if значимые and entity_id:
             итог.append(Запрос("POST", f"{основа}/crm.{тип}.update.json", dict(заголовки),
                                тело({"id": entity_id, "fields": значимые}), "поля"))
+        if настройки.tasks and данные.get("tasks") and entity_id:
+            # Дело в карточке сущности (crm.activity.todo.add): владелец —
+            # тип сущности числом (лид 1, сделка 2, контакт 3, компания 4).
+            import datetime as _dt  # noqa: PLC0415
+
+            владелец = {"lead": 1, "deal": 2, "contact": 3, "company": 4}.get(тип, 2)
+            for з in данные["tasks"]:
+                срок = _dt.datetime.fromtimestamp(float(з["due"])).astimezone().isoformat()
+                итог.append(Запрос(
+                    "POST", f"{основа}/crm.activity.todo.add.json", dict(заголовки),
+                    тело({"ownerTypeId": владелец, "ownerId": entity_id, "deadline": срок,
+                          "title": з["text"][:255], "description": з["text"]}), "задачи"))
         return итог
 
     # «custom» — своё тело: всё, что есть, плюс сопоставленные имена. Так
     # подключается то, чего мы не знаем, без правки кода.
     тело_свой = {**данные, **свои}
+    if not настройки.tasks:
+        тело_свой.pop("tasks", None)
     if entity_id:
         тело_свой["entity_id"] = entity_id
     if настройки.token:

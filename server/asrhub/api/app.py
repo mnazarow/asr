@@ -49,6 +49,7 @@ from .deps import (
 )
 from .routes_agent import router as agent_router
 from .routes_agent import управление as agent_admin_router
+from .routes_ai import router as ai_router
 from .routes_auth import audit_router, users_router
 from .routes_auth import router as auth_router
 from .routes_backup import router as backup_router
@@ -1162,6 +1163,9 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     app.include_router(content_router)
     app.include_router(review_router)
     app.include_router(llm_router)
+    # ИИ-аналитика поверх ответов модели: своды, золотой набор, вопрос к
+    # архиву, поиск по смыслу, тренажёр. Пути — свои, без «{раздел}».
+    app.include_router(ai_router)
     # Шлюз к модели из сети идёт ПОСЛЕ маршрутов слоя: у них общая
     # приставка «/api/llm», и порядок здесь — единственное, что отделяет
     # «/api/llm/v1/models» (список для чужих клиентов) от «/api/llm/models»
@@ -1455,7 +1459,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
             session = StreamSession(
                 state.registry, merged,
                 source_format=str(config.get("format") or "pcm_s16le"),
-                workdir=Path(settings.get("temp_dir") or settings.paths.tmp))
+                workdir=Path(settings.get("temp_dir") or settings.paths.tmp),
+                llm=getattr(state, "llm", None))
 
             ready = await _в_потоке_диктовки(session.start)
             await websocket.send_text(наружу(ready))

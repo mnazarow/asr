@@ -513,7 +513,8 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
             confidence: float | None = None,
             categories: list[Any] | None = None,
             thresholds: speech.Пороги | None = None,
-            timed: bool = True) -> dict[str, Any]:
+            timed: bool = True,
+            nps_shift: float = 0.0) -> dict[str, Any]:
     """Разбор одной записи.
 
     `agent_speaker` — кто из говорящих оператор: по нему проверяется скрипт.
@@ -596,7 +597,8 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
         оператор=оператор, клиент=клиент, по_имени=по_имени,
         фрустрация=len(фрустрация), повторное=len(повторное),
         мат=(len(мат) if profanity else None),
-        решено=_решён(категории, сегменты), confidence=confidence)
+        решено=_решён(категории, сегменты), confidence=confidence,
+        nps_shift=nps_shift)
 
     return {
         "version": VERSION,
