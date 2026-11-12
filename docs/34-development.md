@@ -56,7 +56,7 @@ shellcheck -S error scripts/*.sh scripts/lib/*.sh
 
 ## Сборочный конвейер
 
-`.github/workflows/ci.yml`: на каждый push и запрос на слияние — линтеры (ruff, ESLint, `node --test`, shellcheck) и быстрый ярус на Python 3.10 и 3.12; раз в сутки и по кнопке — полный набор с браузером (`ASRHUB_REQUIRE_BROWSER=1`) и покрытием (`--cov=asrhub`, отчёт `coverage.xml` — артефактом прогона) и сборка колеса с проверкой, что в него попали агент и руководство.
+`.github/workflows/ci.yml`: на каждый push и запрос на слияние — линтеры (ruff, ESLint, `node --test`, shellcheck) и быстрый ярус на Python 3.10 и 3.12; раз в сутки и по кнопке — полный набор с браузером (`ASRHUB_REQUIRE_BROWSER=1`) и покрытием (`--cov=asrhub`, отчёт `coverage.xml` — артефактом прогона) и сборка колеса с проверкой, что в него попали агент и руководство; там же — сборка образа Docker (профиль minimal, процессор) и проверка, что контейнер отвечает на `/api/health`.
 
 `eslint.config.mjs` в корне — настройка ESLint 9 для `server/asrhub/web`: правила ловят ошибки, а не стиль. Проверка `test_eslint_config_is_clean_when_eslint_is_available` запускает его, если ESLint есть на машине (`eslint` в `PATH` или путь к нему в `ASRHUB_ESLINT`), и пропускается без него.
 

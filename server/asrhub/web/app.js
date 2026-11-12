@@ -479,7 +479,8 @@ document.addEventListener('click', (ev) => {
   if (!th || ev.target.closest('button, a, input, select, label')) return;
   const таблица = th.closest('table');
   if (таблица.dataset.nosort !== undefined || th.dataset.nosort !== undefined
-      || th.dataset.sort !== undefined || таблица.querySelector('th[data-sort]')) return;
+      || th.dataset.sort !== undefined || таблица.querySelector('th[data-sort], th[data-order]'))
+    return;
   const тело = таблица.tBodies[0];
   if (!тело || тело.rows.length < 2 || тело.querySelector('td[colspan]')) return;
   const номер = Array.from(th.parentNode.children).indexOf(th);
@@ -4622,6 +4623,13 @@ const Bulk = {
 // ==========================================================================
 
 RENDERERS.results = {
+  /** Заголовок столбца, который сортирует весь список на сервере. */
+  заголовок(поле, имя, вид) {
+    const порядок = (qs('#r-order') || {}).value || '';
+    const стрелка = порядок === `${поле} ASC` ? 'asc' : порядок === `${поле} DESC` ? 'desc' : '';
+    return `<th${вид ? ` class="${вид}"` : ''} data-order="${поле}" role="button" tabindex="0"
+      title="Сортировать весь список по столбцу"${стрелка ? ` data-sorted="${стрелка}"` : ''}>${esc(имя)}</th>`;
+  },
   render(root) {
     root.innerHTML = `
       <section class="card">
@@ -4722,6 +4730,27 @@ RENDERERS.results = {
     }
     qs('#r-search').oninput = () => { clearTimeout(timer); timer = setTimeout(() => this.load(), 300); };
     qs('#r-order').onchange = () => this.load();
+    // Щелчок по заголовку столбца — порядок всего списка на сервере, а не
+    // строк текущей страницы: первый щелчок — по убыванию (для имени и
+    // модели — по алфавиту), второй — в обратную сторону.
+    // Слушает обёртка таблицы: она создаётся заново с разделом, и обработчик
+    // не копится при каждом входе в «Результаты».
+    qs('#results-table').addEventListener('click', (ev) => {
+      const th = ev.target.closest && ev.target.closest('th[data-order]');
+      if (!th) return;
+      const поле = th.dataset.order;
+      const сейчас = qs('#r-order').value;
+      const сначала = ['filename', 'model'].includes(поле) ? 'ASC' : 'DESC';
+      const обратно = сначала === 'ASC' ? 'DESC' : 'ASC';
+      const новый = сейчас === `${поле} ${сначала}` ? `${поле} ${обратно}` : `${поле} ${сначала}`;
+      const выбор = qs('#r-order');
+      if (![...выбор.options].some((о) => о.value === новый)) {
+        выбор.appendChild(h(`<option value="${esc(новый)}">${esc(th.textContent.trim())} ${
+          новый.endsWith('ASC') ? '↑' : '↓'}</option>`));
+      }
+      выбор.value = новый;
+      this.load();
+    });
     // Отбор по содержанию приходит и снаружи — из «Аналитики записей»,
     // где щелчок по отбору «что послушать» ведёт сюда за самим списком.
     // Категории обращений дописываются в тот же список: их набор живёт в
@@ -4822,10 +4851,12 @@ RENDERERS.results = {
       host.innerHTML = data.items.length ? обрезано + `<table>
         <thead><tr><th class="pick"><input type="checkbox" id="r-pick-all"
             title="Выбрать все на странице"></th>
-          <th>Файл</th><th>Модель</th><th class="num">Длит.</th>
-          <th class="num">Слов</th><th class="num">Сегм.</th><th class="num">RTF</th>
-          <th class="num">Уверенность</th><th>Говорящие</th>
-          <th class="num" title="Оценка клиента из опроса контроля качества">Оценка</th><th>Готово</th>
+          ${[['filename', 'Файл', ''], ['model', 'Модель', ''], ['media_duration_s', 'Длит.', 'num'],
+             ['words_count', 'Слов', 'num'], ['segments_count', 'Сегм.', 'num'], ['rtf', 'RTF', 'num'],
+             ['avg_confidence', 'Уверенность', 'num'], ['speakers_count', 'Говорящие', '']]
+            .map(([поле, имя, вид]) => this.заголовок(поле, имя, вид)).join('')}
+          <th class="num" title="Оценка клиента из опроса контроля качества" data-nosort>Оценка</th>
+          ${this.заголовок('finished_at', 'Готово', '')}
           <th style="width:230px">Выгрузка</th></tr></thead><tbody>
         ${data.items.map((job) => `<tr data-id="${job.id}">
           <td class="pick"><input type="checkbox" class="pick-one" value="${job.id}"

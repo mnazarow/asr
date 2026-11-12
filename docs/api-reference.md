@@ -965,7 +965,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:16062-beedab",
+  "instance": "vm:6778-672861",
   "instances": [],
   "workers": [
     {
@@ -1565,7 +1565,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794457924.529021,
+    "generated_at": 1794459378.3783739,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1732,8 +1732,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.33",
-  "uptime_s": 1.8,
+  "version": "3.1.34",
+  "uptime_s": 1.2,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1813,8 +1813,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.33",
-  "uptime_s": 1.9,
+  "version": "3.1.34",
+  "uptime_s": 1.3,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1823,8 +1823,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 4.0,
-    "disk_free_gb": 23.9,
+    "ram_available_gb": 6.1,
+    "disk_free_gb": 22.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2573,8 +2573,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793853124.6452212,
-    "until": 1794457924.6452212
+    "since": 1793854578.4729216,
+    "until": 1794459378.4729216
   }
 }
 ```
@@ -2966,9 +2966,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 4.0,
+    "free_gb": 6.1,
     "reserve_gb": 4.0,
-    "budget_gb": 0.8,
+    "budget_gb": 2.3,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -5064,14 +5064,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 2.0,
+  "uptime_s": 1.4,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 2 с",
+        "detail": "работает 1 с",
         "hint": ""
       },
       {
@@ -5106,7 +5106,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 23.9 ГБ",
+        "detail": "свободно 22.9 ГБ",
         "hint": ""
 …
 ```

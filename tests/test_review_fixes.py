@@ -1762,8 +1762,12 @@ def test_peak_memory_is_measured_even_when_the_server_is_busy(repo_root: Path):
     """
     очередь = (repo_root / "server" / "asrhub" / "job_queue.py").read_text(
         encoding="utf-8")
-    assert "measure_memory=True" in очередь, "замер снова стал условным"
-    assert "reset_memory=одно" in очередь, (
+    import re
+
+    # Аргументы — и словом, и ключом словаря (3.1.33: одни и те же для
+    # потока и для процесса распознавания).
+    assert re.search(r"measure_memory\"?\s*[:=]\s*True", очередь), "замер снова стал условным"
+    assert re.search(r"reset_memory\"?\s*[:=]\s*одно", очередь), (
         "обнуление должно оставаться условным: иначе оно стирает то, "
         "что накопил сосед по очереди")
 

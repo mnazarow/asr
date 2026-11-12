@@ -524,6 +524,46 @@ class WorkerState:
 
 
 
+def свободная_память(устройство: str) -> int | None:
+    """Свободная память видеокарты `cuda:N` в байтах; None — узнать нечем.
+
+    Сначала torch (`mem_get_info` — то, что видит процесс), затем
+    nvidia-smi. Ответ nvidia-smi держится две секунды: воркеры стартуют
+    пачкой, и десять вызовов программы подряд ни к чему.
+    """
+    номер = устройство.split(":", 1)[1] if ":" in устройство else "0"
+    if not номер.isdigit():
+        return None
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            return int(torch.cuda.mem_get_info(int(номер))[0])
+    except Exception:                                        # noqa: BLE001
+        pass
+    сейчас = time.monotonic()
+    if сейчас - _NVIDIA_SMI["при"] > 2.0:
+        _NVIDIA_SMI["при"], _NVIDIA_SMI["карты"] = сейчас, {}
+        программа = shutil.which("nvidia-smi")
+        if программа:
+            import subprocess  # noqa: PLC0415
+
+            try:
+                вывод = subprocess.run(
+                    [программа, "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5, check=False).stdout
+                for строка in вывод.splitlines():
+                    части = [ч.strip() for ч in строка.split(",")]
+                    if len(части) == 2 and части[0].isdigit() and части[1].isdigit():
+                        _NVIDIA_SMI["карты"][части[0]] = int(части[1]) * 1024 * 1024
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return _NVIDIA_SMI["карты"].get(номер)
+
+
+_NVIDIA_SMI: dict[str, Any] = {"при": 0.0, "карты": {}}
+
+
 class Будильник:
     """Пробуждение воркеров: как `threading.Event`, но будит одного.
 
@@ -1911,7 +1951,24 @@ class JobQueue:
         # Явная карта («cuda:1») и процессор — как попросили.
         if просили not in ("", "auto", "cuda", "gpu", "rocm"):
             return ""
-        return карты[int(index) % len(карты)]
+        своя = карты[int(index) % len(карты)]
+        try:
+            по_памяти = str(self.settings.get("gpu_pick") or "worker") == "free_memory"
+        except Exception:                                    # noqa: BLE001
+            по_памяти = False
+        if not по_памяти or len(карты) < 2:
+            return своя
+        # По свободной памяти: карта, где её больше всего. Своя карта воркера
+        # остаётся, пока на ней свободно не меньше 90 % от лучшей: прыжок на
+        # другую карту стоит загрузки модели заново.
+        свободно = {к: свободная_память(к) for к in карты}
+        известно = {к: м for к, м in свободно.items() if м is not None}
+        if not известно:
+            return своя
+        лучшая = max(известно, key=известно.get)
+        if своя in известно and известно[своя] >= 0.9 * известно[лучшая]:
+            return своя
+        return лучшая
 
     def _заменён(self, index: int) -> bool:
         """Поток воркера заменён сторожем зависших — ему пора уйти."""

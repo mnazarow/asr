@@ -697,6 +697,16 @@ curl -sS -H 'X-API-Key: ah_ВАШ_КЛЮЧ' \
 
 Сценарий написан на POSIX sh и нужен ему только curl: он работает на CentOS 7, Debian, Ubuntu, AlmaLinux и в образах FreePBX, Issabel и VitalPBX без доустановки.
 
+## Запись по ссылке: FreeSWITCH, 3CX, облачные АТС
+
+Тот же приём (`POST /api/telephony/dialplan/call`) годится не только для Asterisk. АТС, которая отдаёт запись по HTTP, присылает вместо файла поле `recording_url` (синонимы `record_url`, `recording_link`): сервер скачивает запись сам — только `http` и `https`, с тем же пределом размера (`max_upload_mb`) и той же проверкой адреса и перенаправлений, что у обратных вызовов. Адреса внутренней сети разрешает `recording_url_allow_internal` — иначе ключ с правом записи заставлял бы сервер ходить внутрь. Расширение — по пути ссылки или по `Content-Type`. Ссылка не открылась — ответ 503 с `retry_after_s`: отправитель повторит позже.
+
+```bash
+curl -fsS "$ASRHUB_URL/api/telephony/dialplan/call?station=fs" -H "X-API-Key: $КЛЮЧ" \
+  -d uniqueid=8f2c-01 -d src=79161234567 -d dst=101 -d direction=in -d billsec=95 \
+  -d disposition=ANSWERED -d recording_url=https://pbx.example.ru/rec/8f2c-01.wav
+```
+
 ## Устранение неполадок
 
 | Что видно | Почему | Что делать |

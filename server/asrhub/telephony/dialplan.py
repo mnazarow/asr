@@ -74,6 +74,10 @@ from .stations import список as станции_из_настроек
     "epoch": "started_at",
     "userfield": "userfield", "accountcode": "accountcode",
     "recording": "recording", "path": "recording", "file": "recording",
+    # Ссылка на запись — для АТС, которые отдают её по HTTP (FreeSWITCH,
+    # 3CX, облачные): сервер скачивает её сам (3.1.34).
+    "recording_url": "recording_url", "record_url": "recording_url",
+    "recording_link": "recording_url",
     "ready": "ready",
     "dry_run": "dry_run", "test": "dry_run",
     "linkedid": "linkedid", "sequence": "sequence",

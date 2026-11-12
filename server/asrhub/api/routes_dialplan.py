@@ -238,6 +238,66 @@ def _сохранить_дорожки(state: Any, дорожки: dict[str, Upl
             часть.unlink(missing_ok=True)
 
 
+#: Сколько ждать сервер записей по ссылке.
+СРОК_СКАЧИВАНИЯ_С = 120
+
+
+def _скачать(state: Any, адрес: str) -> tuple[Path, int]:
+    """Запись по ссылке (`recording_url`) — в каталог загрузок.
+
+    Только http и https; адрес и каждое перенаправление проверяются, как у
+    обратного вызова (`check_outbound_url`): внутренние адреса — лишь при
+    `recording_url_allow_internal`. Предел — `max_upload_mb`; расширение —
+    по пути ссылки или по Content-Type.
+    """
+    from ..job_queue import check_outbound_url, открыватель_наружу  # noqa: PLC0415
+
+    внутрь = bool(state.settings.get("recording_url_allow_internal", False))
+    адрес = str(адрес or "").strip()
+    check_outbound_url(адрес, allow_internal=внутрь)
+    предел = int(float(state.settings.get("max_upload_mb") or 2048) * 1024 * 1024)
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    запрос = urllib.request.Request(адрес, headers={"User-Agent": "ASR-Hub"})
+    try:
+        ответ = открыватель_наружу(allow_internal=внутрь).open(
+            запрос, timeout=СРОК_СКАЧИВАНИЯ_С)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise _недоступен(f"Запись по ссылке не скачалась: {exc}",
+                          "Проверьте, что ссылка открывается с сервера ASR Hub. "
+                          "Запрос будет повторён.") from exc
+    with ответ:
+        if getattr(ответ, "status", 200) >= 400:
+            raise _недоступен(f"Сервер записей ответил {ответ.status}.",
+                              "Проверьте ссылку на запись.")
+        расширение = Path(urlparse(адрес).path).suffix.lower()
+        if расширение not in Д.ЗВУК:
+            вид = str(ответ.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            расширение = {"audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+                          "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/ogg": ".ogg",
+                          "audio/flac": ".flac", "audio/x-flac": ".flac",
+                          "audio/mp4": ".m4a"}.get(вид, "")
+        Д.проверить_расширение(f"запись{расширение}" if расширение else адрес[-60:])
+        цель = state.settings.paths.uploads / f"{new_id('pbx')}{расширение}"
+        размер = 0
+        try:
+            with цель.open("wb") as выход:
+                while True:
+                    кусок = ответ.read(1 << 20)
+                    if not кусок:
+                        break
+                    размер += len(кусок)
+                    if размер > предел:
+                        raise FileTooLarge(размер / 1048576, предел / 1048576)
+                    выход.write(кусок)
+        except BaseException:
+            цель.unlink(missing_ok=True)
+            raise
+    return цель, размер
+
+
 def _сохранить(state: Any, файл: UploadFile, расширение: str) -> tuple[Path, int]:
     """Запись из запроса — в каталог загрузок, с пределом размера.
 
@@ -297,7 +357,8 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
         # Способ — сразу, по самому запросу: и отказ, и повтор показываются в
         # журнале с тем, как станция пыталась передать запись.
         "mode": ("upload" if загрузка is not None else
-                 "path" if поля.get("recording") else "none")}
+                 "path" if поля.get("recording") else
+                 "url" if поля.get("recording_url") else "none")}
     сохранённый: Path | None = None
     занят_ключ = ""
     try:
@@ -397,6 +458,15 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
         elif поля.get("recording"):
             путь = Д.путь_записи(станция, поля["recording"])
             готов = Д.да(поля.get("ready"))
+        elif поля.get("recording_url"):
+            # Ссылка на запись: сервер скачивает её сам — с той же проверкой
+            # адреса, что у обратных вызовов, и тем же пределом размера.
+            готов = True
+            if not проба:
+                сохранённый, размер = _скачать(state, поля["recording_url"])
+                путь = сохранённый
+                отметка["bytes"] = размер
+                тело["bytes"] = размер
         else:
             # Ни файла, ни пути. С каталогом записей сервер поищет запись по
             # идентификатору — после выдержки, как для журнала. Без каталога

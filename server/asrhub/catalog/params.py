@@ -4712,6 +4712,33 @@ _p(P(
 ))
 
 _p(P(
+    key="gpu_pick",
+    label="Как выбирать карту из пула",
+    group="runtime",
+    type="enum",
+    default="worker",
+    server_only=True,
+    advanced=True,
+    description=(
+        "worker — воркер N всегда считает на карте N (кеш модели всегда тёплый). "
+        "free_memory — задание идёт на карту, где больше всего свободной памяти; своя "
+        "карта воркера остаётся, пока на ней свободно не меньше 90 % от лучшей. Память — "
+        "по torch или nvidia-smi."
+    ),
+    recommendation=(
+        "worker — когда карты одинаковые и заняты только сервером. free_memory — когда "
+        "карты разные или их делят с другими программами."
+    ),
+    examples=[Ex("Одинаковые карты", "worker", ""), Ex("Карты делят с обучением", "free_memory", "")],
+    options=[
+        {"value": "worker", "label": "Карта по номеру воркера"},
+        {"value": "free_memory", "label": "Карта с большей свободной памятью"},
+    ],
+    see_also=["gpu_devices"],
+    impact={"quality": "neutral", "speed": "up", "memory": "neutral"},
+))
+
+_p(P(
     key="gpu_devices",
     label="Пул видеокарт",
     group="runtime",
@@ -8262,6 +8289,29 @@ _p(P(
 ))
 
 _p(P(
+    key="recording_url_allow_internal",
+    label="Скачивать записи по ссылке из внутренней сети",
+    group="telephony",
+    type="bool",
+    default=False,
+    advanced=True,
+    description=(
+        "Звонок можно прислать со ссылкой на запись (поле recording_url в "
+        "POST /api/telephony/dialplan/call) — так её отдают FreeSWITCH, 3CX и облачные "
+        "АТС; сервер скачивает запись сам. Без этой настройки адреса внутренней сети "
+        "(10.x, 192.168.x, 127.x) запрещены той же проверкой, что у обратных вызовов: "
+        "иначе ключ с правом записи заставлял бы сервер ходить во внутреннюю сеть."
+    ),
+    recommendation=(
+        "Включайте, если сервер записей АТС — в вашей сети; ключ станции тогда держите "
+        "только у неё."
+    ),
+    examples=[Ex("Облачная АТС", False, ""), Ex("FreeSWITCH в своей сети", True, "")],
+    see_also=["max_upload_mb", "webhook_allow_internal"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
     key="audiosocket_port",
     label="Порт AudioSocket",
     group="telephony",
@@ -8330,6 +8380,42 @@ _p(P(
     examples=[Ex("По умолчанию", "", "")],
     see_also=["audiosocket_port"],
     impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="qc_inbound",
+    label="Опрос по входящему звонку",
+    group="qc",
+    type="bool",
+    default=False,
+    description=(
+        "Телефон сервера принимает входящие вызовы и проводит опрос сразу: станция "
+        "переводит клиента на номер телефона после разговора с оператором — без "
+        "обратного звонка. Кого оценивают — заголовок SIP X-ASRHub-Ext (добавочный) или "
+        "X-ASRHub-Call (ключ звонка «станция:uniqueid» в архиве). Без настройки на "
+        "входящий вызов телефон отвечает «занято»."
+    ),
+    recommendation=(
+        "Для линий, где клиент готов ответить сразу: перевод после разговора не стоит "
+        "звонка и не тревожит клиента позже. Группа — qc_inbound_group."
+    ),
+    examples=[Ex("Только обратный звонок", False, ""), Ex("Перевод на опрос", True, "")],
+    see_also=["qc_inbound_group", "qc_groups"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="qc_inbound_group",
+    label="Группа входящих опросов",
+    group="qc",
+    type="str",
+    default="",
+    description="Имя группы, вопросы которой задаются на входящий вызов. Пусто — первая включённая.",
+    recommendation="Отдельная короткая группа: клиент только что говорил с оператором.",
+    examples=[Ex("Первая группа", "", ""), Ex("Своя группа", "После разговора", "")],
+    see_also=["qc_inbound"],
+    impact=_НЕЙТРАЛЬНО,
+    advanced=True,
 ))
 
 _p(P(

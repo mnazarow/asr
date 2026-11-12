@@ -808,6 +808,9 @@ class КонтрольКачества:
                     местный=str(self.settings.get("qc_sip_local_ip") or ""))
                 self._подпись_телефона = подпись
             телефон = self._телефон
+            # Опрос без обратного звонка: станция переводит клиента на телефон
+            # сервера, и он снимает трубку сам (qc_inbound).
+            телефон.входящие = self._входящий if bool(self.settings.get("qc_inbound")) else None
             if bool(self.settings.get("qc_sip_register")):
                 if телефон.зарегистрирован_до - time.time() < 60:
                     try:
@@ -1094,6 +1097,56 @@ class КонтрольКачества:
                                      self.settings.get("webhook_allow_internal"))},
                          name="asrhub-qc-notify", daemon=True).start()
 
+    def _входящий(self, разговор: Разговор, запрос: Any) -> None:
+        """Опрос по входящему звонку: клиента перевели на телефон сервера.
+
+        Группа — `qc_inbound_group` (пусто — первая включённая). Кого оценивают:
+        заголовок `X-ASRHub-Ext` (добавочный оператора) или `X-ASRHub-Call` —
+        ключ звонка в архиве («станция:uniqueid»), по нему же связь с записью
+        разговора. Номер клиента — из From. Список «не звонить» здесь не
+        действует: клиент пришёл сам.
+        """
+        try:
+            имя = str(self.settings.get("qc_inbound_group") or "").strip()
+            группы = [г for г in self.группы() if г.enabled and г.questions]
+            группа = next((г for г in группы if г.name == имя), None) if имя else \
+                (группы[0] if группы else None)
+            if группа is None:
+                log.warning("Контроль качества: входящий звонок, но группы для него нет "
+                            "(qc_inbound_group)")
+                разговор.положить()
+                return
+            от = str(запрос.взять("from") or "")
+            найдено = re.search(r"sip:([^@;>]+)@", от)
+            клиент = чистый_номер(найдено.group(1) if найдено else "")
+            ключ = re.sub(r"[^0-9A-Za-z:._@-]", "", str(запрос.взять("x-asrhub-call") or ""))[:128]
+            добавочный = re.sub(r"[^0-9A-Za-z_.]", "",
+                                str(запрос.взять("x-asrhub-ext") or ""))[:32]
+            звонок = self.db.query_one(
+                "SELECT agent, owner, job_id, station FROM calls WHERE uniqueid=?",
+                (ключ,)) if ключ else None
+            сейчас = time.time()
+            опрос = {"id": new_id("qc"), "kind": "входящий", "group_name": группа.name,
+                     "number": клиент, "ext": добавочный or (звонок["agent"] if звонок else ""),
+                     "owner": звонок["owner"] if звонок else "",
+                     "job_id": звонок["job_id"] if звонок else None,
+                     "station": звонок["station"] if звонок else ""}
+            self.db.execute(
+                "INSERT INTO qc_surveys (id, call_key, kind, group_name, ext, number, station, "
+                "owner, job_id, call_at, created_at, due_at, started_at, status, attempts) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                (опрос["id"], f"in:{ключ}" if ключ else None, "входящий", группа.name,
+                 опрос["ext"], клиент, опрос["station"], опрос["owner"], опрос["job_id"],
+                 сейчас, сейчас, сейчас, сейчас, ЗВОНИТ))
+            звуки = {текст: tts.приготовить(текст, self.settings, self.каталог_звука(),
+                                           образец_голоса=группа.voice_sample)
+                     for текст in группа.фразы()}
+            self._после_ответа(опрос, группа, звуки, разговор, попытка=1, проба=False,
+                               автоответчик=False)
+        except Exception as exc:                            # noqa: BLE001
+            log.exception("Контроль качества: входящий опрос прерван: %s", exc)
+            разговор.положить()
+
     def _не_дозвонились(self, номер: str, попытка: int, проба: bool, exc: ОшибкаSIP, *,
                         итог: str = НЕ_ДОЗВОНИЛИСЬ) -> None:
         пределе = int(self._число("qc_max_attempts", 2))
@@ -1207,10 +1260,18 @@ class КонтрольКачества:
             log.exception("Контроль качества: вызов %s упал", номер)
             self._закрыть(номер, ОШИБКА, error=self.последняя_ошибка)
             return
+        self._после_ответа(опрос, группа, звуки, разговор, попытка=попытка, проба=проба)
+
+    def _после_ответа(self, опрос: dict[str, Any], группа: Группа, звуки: dict[str, Any],
+                      разговор: Разговор, *, попытка: int, проба: bool,
+                      автоответчик: bool | None = None) -> None:
+        """Трубку сняли: провести опрос, положить трубку, записать итог."""
+        номер = опрос["id"]
         ответил = time.time()
         self.db.execute("UPDATE qc_surveys SET answered_at=?, sip_code=200, error='' WHERE id=?",
                         (ответил, номер))
-        автоответчик = bool(self.settings.get("qc_amd", False))
+        if автоответчик is None:
+            автоответчик = bool(self.settings.get("qc_amd", False))
         записать = bool(self.settings.get("qc_record", False))
         распознать = self.распознать if (группа.voice_answers or any(
             в.kind == КОММЕНТАРИЙ for в in группа.questions)) else None

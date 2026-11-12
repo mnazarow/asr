@@ -106,3 +106,26 @@ jobs:
           for нужно in ("share/asrhub/agent/asrhub-dialplan", "share/asrhub/docs/01-quickstart.md"):
               assert any(и.endswith(нужно) for и in имена), нужно
           PY
+
+  docker:
+    # Образ собирается раз в сутки и по кнопке: профиль minimal на процессоре,
+    # контейнер поднимается и отвечает на /api/health. Сборка с видеокартой
+    # и тяжёлыми движками — на своей машине (docker compose build).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: сборка образа (minimal, cpu)
+        run: >-
+          docker build -f docker/Dockerfile --build-arg PROFILE=minimal
+          --build-arg ACCEL=cpu -t asrhub:ci .
+      - name: контейнер отвечает
+        run: |
+          docker run -d --name asrhub-ci -p 18080:8080 -e ASRHUB_ADMIN_PASSWORD=ci-password-1 asrhub:ci
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:18080/api/health >/dev/null; then echo готово; exit 0; fi
+            sleep 2
+          done
+          docker logs asrhub-ci
+          exit 1

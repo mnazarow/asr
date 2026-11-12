@@ -2433,6 +2433,11 @@ class Database:
             "media_duration_s DESC", "media_duration_s ASC", "rtf ASC", "rtf DESC",
             "finished_at DESC", "processing_time_s DESC", "updated_at DESC",
             "queued_at ASC", "queued_at DESC", "deadline ASC",
+            # Столбцы «Результатов» — щелчком по заголовку (3.1.34).
+            "finished_at ASC", "filename ASC", "filename DESC", "model ASC", "model DESC",
+            "words_count DESC", "words_count ASC", "segments_count DESC", "segments_count ASC",
+            "avg_confidence DESC", "avg_confidence ASC", "speakers_count DESC",
+            "speakers_count ASC",
         }
         if order not in allowed_order:
             order = "created_at DESC"
