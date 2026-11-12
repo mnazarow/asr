@@ -5673,7 +5673,7 @@ class Database:
 
     def call_kpi(self, *, owner: str | list[str] | None = None,
                  station: str = "", queue: str = "",
-                 since: float = 0.0, until: float = 0.0,
+                 since: float | None = 0.0, until: float | None = 0.0,
                  service_level_s: float = 20.0,
                  repeat_window_days: float = 7.0) -> dict[str, Any]:
         """Показатели контакт-центра по журналу звонков.

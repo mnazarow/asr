@@ -408,7 +408,7 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
             _ПРИНИМАЮТСЯ.add(ключ)
             занят_ключ = ключ
         прежняя = _строка(state, ключ)
-        отложен = bool(прежняя) and str(прежняя.get("skipped") or "").startswith(
+        отложен = прежняя is not None and str(прежняя.get("skipped") or "").startswith(
             state.db.ОТЛОЖЕН)
         # Запись можно дослать к звонку, который лёг без неё: сценарий на 413
         # и 415 шлёт звонок без файла, и без этого правила запись потом не
@@ -799,6 +799,9 @@ def config(request: Request,
                                                              "MixMonitor r()/t() (1/yes/true)"),
            norec_code: str = Query("", max_length=4,
                                    description="Код «не записывать» в разговоре, например *7"),
+           live: str = Query("", max_length=260,
+                             description="Приём AudioSocket «узел:порт» — живой разговор "
+                                         "двух людей (рецепт не проверен на станции)"),
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     require_write(principal)
     state = get_state(request)
@@ -806,7 +809,8 @@ def config(request: Request,
         п = К.параметры(driver=driver, mode=mode, station=station,
                         url=url or _адрес_сервера(request, state), base=base,
                         format=format, key_in=key_in, trunk=trunk,
-                        internal_len=internal_len, tracks=tracks, norec_code=norec_code)
+                        internal_len=internal_len, tracks=tracks, norec_code=norec_code,
+                        live=live)
     except ValueError as exc:
         raise error_response(ConfigError(f"Параметры настройки: {exc}.")) from exc
     return К.собрать(п, версия=str(state.version))

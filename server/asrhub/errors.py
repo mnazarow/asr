@@ -267,9 +267,9 @@ class FileTooLarge(ASRHubError):
     code = "file_too_large"
     http_status = 413
 
-    def __init__(self, size_mb: float, limit_mb: int):
+    def __init__(self, size_mb: float, limit_mb: float):
         super().__init__(
-            f"Размер файла {size_mb:.1f} МБ превышает предел {limit_mb} МБ.",
+            f"Размер файла {size_mb:.1f} МБ превышает предел {limit_mb:g} МБ.",
             hint=("Увеличьте max_upload_mb в настройках сервера или разбейте файл на части. "
                   "Не забудьте про client_max_body_size в nginx, если используете обратный прокси."),
             details={"size_mb": size_mb, "limit_mb": limit_mb},

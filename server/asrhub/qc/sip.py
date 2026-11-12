@@ -11,16 +11,19 @@
 
 * регистрация (REGISTER) и вызов (INVITE) с дайджест-аутентификацией
   (MD5 и SHA-256, с `qop=auth` и без);
-* транспорт UDP, `rport`, повторы запроса, CANCEL по сроку ответа;
-* звук G.711 (PCMA и PCMU) по RTP, кадры по 20 мс;
+* транспорт UDP (`rport`, повторы запроса), TCP или TLS — одно соединение
+  со станцией, по нему же приходят её запросы; CANCEL по сроку ответа;
+* звук G.711 (PCMA и PCMU) по RTP, кадры по 20 мс; по желанию — SRTP с
+  ключами в SDP (SDES, см. `srtp`);
 * кнопки телефона тремя способами, какими их присылает Asterisk:
   события RTP (RFC 4733, `dtmfmode=rfc2833`), SIP INFO и тоны в самом звуке
   (`inband`) — по двум частотам, алгоритмом Гёрцеля.
 
 Входящие вызовы принимаются, только если задан обработчик (`входящие`,
 настройка qc_inbound); без него на INVITE телефон отвечает «занято». Чего
-нет намеренно: TCP и TLS, SRTP, перевод и удержание. Библиотек нет тоже:
-чистый Python, два сокета и поток чтения на каждый.
+нет намеренно: перевод, удержание, DTLS-SRTP (WebRTC). Библиотек нет тоже:
+чистый Python (`ssl` из стандартной библиотеки), сокеты и поток чтения на
+каждый.
 """
 from __future__ import annotations
 
@@ -29,7 +32,9 @@ import math
 import queue
 import random
 import re
+import select
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -38,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..logging_setup import get_logger
+from . import srtp as шифр_звука
 
 log = get_logger("qc")
 
@@ -52,6 +58,10 @@ log = get_logger("qc")
 #: Первый повтор запроса по UDP и предел ожидания ответа (RFC 3261: T1, 64·T1).
 T1 = 0.5
 СРОК_ЗАПРОСА_С = 16.0
+#: Транспорты SIP. По TCP и TLS запрос не повторяется: доставку держит соединение.
+ТРАНСПОРТЫ = ("udp", "tcp", "tls")
+#: Предел одного сообщения SIP в потоке TCP/TLS.
+ПРЕДЕЛ_СООБЩЕНИЯ = 65535
 
 _ЧАСТОТЫ_СТРОК = (697.0, 770.0, 852.0, 941.0)
 _ЧАСТОТЫ_СТОЛБЦОВ = (1209.0, 1336.0, 1477.0, 1633.0)
@@ -351,18 +361,21 @@ def _выбрать_вызов(сообщение: Сообщение) -> tuple[
 
 
 def предложение_sdp(адрес: str, порт: int, *, кодек: str = "",
-                    кнопки: int = 101) -> bytes:
+                    кнопки: int = 101, крипто: str = "") -> bytes:
     """SDP-предложение. `кодек` — ответ на повторное приглашение в идущем
     разговоре: только кодек, который уже идёт (RFC 3264, 6.1: ответ не
-    расширяет набор), и тот номер событий кнопок, что выбрала станция."""
+    расширяет набор), и тот номер событий кнопок, что выбрала станция.
+    `крипто` — ключ SRTP строкой `a=crypto` (SDES): тогда профиль RTP/SAVP."""
     номер = random.randint(10_000_000, 99_999_999)
     кодеки = [кодек] if кодек in НОМЕР_КОДЕКА else ["PCMA", "PCMU"]
+    профиль = "RTP/SAVP" if крипто else "RTP/AVP"
     строки = [
         "v=0", f"o=- {номер} {номер} IN IP4 {адрес}", "s=ASR Hub",
         f"c=IN IP4 {адрес}", "t=0 0",
-        f"m=audio {порт} RTP/AVP {' '.join(str(НОМЕР_КОДЕКА[к]) for к in кодеки)} {кнопки}",
+        f"m=audio {порт} {профиль} {' '.join(str(НОМЕР_КОДЕКА[к]) for к in кодеки)} {кнопки}",
         *[f"a=rtpmap:{НОМЕР_КОДЕКА[к]} {к}/8000" for к in кодеки],
         f"a=rtpmap:{кнопки} telephone-event/8000", f"a=fmtp:{кнопки} 0-16",
+        *([f"a=crypto:{крипто}"] if крипто else []),
         "a=ptime:20", "a=sendrecv",
     ]
     return ("\r\n".join(строки) + "\r\n").encode("ascii")
@@ -374,23 +387,30 @@ def разобрать_sdp(тело: bytes) -> dict[str, Any]:
     порт = 0
     нагрузки: list[int] = []
     карта: dict[int, str] = {}
+    профиль = ""
+    крипто: list[шифр_звука.Ключ] = []
     в_звуке = False
     for строка in тело.decode("utf-8", "replace").splitlines():
         строка = строка.strip()
         if строка.startswith("m="):
             части = строка[2:].split()
-            в_звуке = bool(части) and части[0] == "audio"
-            if в_звуке and len(части) >= 4 and not порт:
+            в_звуке = bool(части) and части[0] == "audio" and not порт
+            if в_звуке and len(части) >= 4:
                 порт = int(части[1]) if части[1].isdigit() else 0
+                профиль = части[2].upper()
                 нагрузки = [int(ч) for ч in части[3:] if ч.isdigit()]
+        elif строка.startswith("a=crypto:") and в_звуке:
+            ключ = шифр_звука.разобрать_крипто(строка[9:])
+            if ключ is not None:
+                крипто.append(ключ)
         elif строка.startswith("c=") and (в_звуке or not адрес):
             части = строка[2:].split()
             if len(части) >= 3:
                 адрес = части[2].split("/")[0]
         elif строка.startswith("a=rtpmap:") and в_звуке:
-            номер, _, имя = строка[9:].partition(" ")
-            if номер.isdigit():
-                карта[int(номер)] = имя.split("/")[0].upper()
+            номер_строкой, _, имя = строка[9:].partition(" ")
+            if номер_строкой.isdigit():
+                карта[int(номер_строкой)] = имя.split("/")[0].upper()
     кодек = ""
     for номер in нагрузки:
         имя = карта.get(номер) or {0: "PCMU", 8: "PCMA"}.get(номер, "")
@@ -398,7 +418,18 @@ def разобрать_sdp(тело: bytes) -> dict[str, Any]:
             кодек = имя
             break
     кнопки = next((н for н in нагрузки if карта.get(н) == "TELEPHONE-EVENT"), 0)
-    return {"адрес": адрес, "порт": порт, "кодек": кодек, "кнопки": кнопки}
+    return {"адрес": адрес, "порт": порт, "кодек": кодек, "кнопки": кнопки,
+            "профиль": профиль, "крипто": крипто}
+
+
+def выбрать_ключ(ключи: list[шифр_звука.Ключ], *, тег: int | None = None
+                 ) -> шифр_звука.Ключ | None:
+    """Ключ SRTP станции: с нашим тегом (ответ на наше предложение) или
+    первый посильный из её предложения."""
+    for ключ in ключи:
+        if тег is None or ключ.тег == тег:
+            return ключ
+    return None
 
 
 def местный_адрес(узел: str, порт: int) -> str:
@@ -457,6 +488,28 @@ class Разговор:
         self._звук_клиента = bytearray()
         self._звук_сервера = bytearray()
         self._ноль = 0.0
+        #: SRTP: свой ключ (из нашего SDP) шифрует передачу, ключ станции —
+        #: приём. None — звук открытый.
+        self.ключ_srtp: шифр_звука.Ключ | None = None
+        self.srtp_отправка: шифр_звука.SRTP | None = None
+        self.srtp_приём: шифр_звука.SRTP | None = None
+
+    @property
+    def шифрован(self) -> bool:
+        return self.srtp_отправка is not None and self.srtp_приём is not None
+
+    def включить_srtp(self, свой: шифр_звука.Ключ, их: шифр_звука.Ключ) -> None:
+        """Ключи согласованы: свой — на передачу, ключ станции — на приём.
+
+        Набор (длина подписи) — тот, что выбрала станция; передача с тем же
+        мастер-ключом, что был в нашем SDP.
+        """
+        свой = шифр_звука.Ключ(их.тег, их.набор, свой.мастер)
+        if self.srtp_отправка is None or self.srtp_отправка.ключ != свой:
+            self.srtp_отправка = шифр_звука.SRTP(свой)
+        if self.srtp_приём is None or self.srtp_приём.ключ != их:
+            self.srtp_приём = шифр_звука.SRTP(их)
+        self.ключ_srtp = свой
 
     # -- приём -------------------------------------------------------------
 
@@ -476,6 +529,13 @@ class Разговор:
                 return
             if len(данные) < 12 or данные[0] >> 6 != 2:
                 continue
+            if self.srtp_приём is not None:
+                # Чужой или испорченный пакет подпись не проходит и не
+                # слушается вовсе: ни как звук, ни как кнопка.
+                раскрыто = self.srtp_приём.раскрыть(данные)
+                if раскрыто is None:
+                    continue
+                данные = раскрыто
             # Симметричный RTP: за NAT станция шлёт звук не с того адреса,
             # что назвала в SDP. Отвечаем туда, откуда он пришёл на деле.
             if self.куда is None or (self.получено == 0 and откуда != self.куда):
@@ -576,8 +636,11 @@ class Разговор:
         self._первый = False
         self._номер = (self._номер + 1) & 0xFFFF
         self._метка_времени = (self._метка_времени + КАДР) & 0xFFFFFFFF
+        пакет = заголовок + нагрузка
+        if self.srtp_отправка is not None:
+            пакет = self.srtp_отправка.защитить(пакет)
         try:
-            self._сокет.sendto(заголовок + нагрузка, self.куда)
+            self._сокет.sendto(пакет, self.куда)
             self.отправлено += 1
         except OSError:
             pass
@@ -681,25 +744,50 @@ class Телефон:
     АГЕНТ = "ASRHub-QC"
 
     def __init__(self, узел: str, порт: int = 5060, *, пользователь: str, пароль: str = "",
-                 имя: str = "", местный: str = "", срок_регистрации: int = 300) -> None:
+                 имя: str = "", местный: str = "", срок_регистрации: int = 300,
+                 транспорт: str = "udp", проверять_сертификат: bool = True,
+                 файл_ца: str = "", srtp: bool = False) -> None:
         self.узел = str(узел).strip()
+        self.транспорт = str(транспорт or "udp").strip().lower()
+        if self.транспорт not in ТРАНСПОРТЫ:
+            raise ОшибкаSIP(f"Транспорт SIP «{транспорт}» не поддерживается: udp, tcp или tls.")
+        # У TLS свой порт (5061); 5060 по умолчанию для TLS — почти всегда
+        # недосмотр, а не настройка станции.
         self.порт = int(порт or 5060)
+        if self.транспорт == "tls" and self.порт == 5060:
+            self.порт = 5061
         self.пользователь = str(пользователь).strip()
         self.пароль = пароль
         self.имя = имя
         self.срок_регистрации = срок_регистрации
+        #: Шифровать звук (SRTP, ключи в SDP): вызов без согласия станции на
+        #: шифрование не состоится. Входящее шифрованное предложение
+        #: принимается и без этого флага.
+        self.srtp = bool(srtp)
+        self._проверять = bool(проверять_сертификат)
+        self._файл_ца = str(файл_ца or "").strip()
         try:
             self._ip_станции = socket.gethostbyname(self.узел)
         except OSError as exc:
             raise ОшибкаSIP(f"Адрес станции «{self.узел}» не найден: {exc}") from exc
-        self.местный = местный.strip() or местный_адрес(self._ip_станции, self.порт)
-        self._сокет = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self._сокет.bind(("0.0.0.0", 0))                # noqa: S104 — станция отвечает извне
-        except OSError as exc:
-            self._сокет.close()
-            raise ОшибкаSIP(f"Не удалось открыть порт для SIP: {exc}") from exc
-        self.местный_порт = self._сокет.getsockname()[1]
+        self._местный_задан = местный.strip()
+        self.местный = self._местный_задан or местный_адрес(self._ip_станции, self.порт)
+        self._сокет: socket.socket | None = None
+        #: TCP/TLS: одно соединение со станцией — по нему же её запросы к нам.
+        self._соединение: socket.socket | None = None
+        self._замок_связи = threading.Lock()
+        self._есть_связь = threading.Event()
+        self.местный_порт = 0
+        if self.надёжный:
+            self._соединиться()
+        else:
+            self._сокет = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                self._сокет.bind(("0.0.0.0", 0))            # noqa: S104 — станция отвечает извне
+            except OSError as exc:
+                self._сокет.close()
+                raise ОшибкаSIP(f"Не удалось открыть порт для SIP: {exc}") from exc
+            self.местный_порт = self._сокет.getsockname()[1]
         self._ответы: dict[tuple[str, int], queue.Queue[Сообщение]] = {}
         self._разговоры: dict[str, Разговор] = {}
         #: Наши 200 на повторные приглашения, ждущие ACK: (call-id, CSeq) → когда.
@@ -722,13 +810,72 @@ class Телефон:
 
     # -- низкий уровень ----------------------------------------------------
 
+    @property
+    def надёжный(self) -> bool:
+        """TCP или TLS: запросы не повторяются, ответы идут тем же соединением."""
+        return self.транспорт != "udp"
+
     def _via(self, ветка: str = "") -> str:
-        return (f"SIP/2.0/UDP {self.местный}:{self.местный_порт};"
+        return (f"SIP/2.0/{self.транспорт.upper()} {self.местный}:{self.местный_порт};"
                 f"branch={ветка or 'z9hG4bK' + uuid.uuid4().hex[:16]};rport")
 
     @property
+    def _параметр_транспорта(self) -> str:
+        return f";transport={self.транспорт}" if self.надёжный else ""
+
+    @property
     def _контакт(self) -> str:
-        return f"<sip:{self.пользователь}@{self.местный}:{self.местный_порт}>"
+        return (f"<sip:{self.пользователь}@{self.местный}:{self.местный_порт}"
+                f"{self._параметр_транспорта}>")
+
+    def адрес_станции(self, кто: str = "") -> str:
+        """URI запроса к станции: `sip:[кто@]узел[:порт][;transport=…]`."""
+        порт = "" if (self.порт == 5060 and not self.надёжный) else f":{self.порт}"
+        return f"sip:{кто + '@' if кто else ''}{self.узел}{порт}{self._параметр_транспорта}"
+
+    def _контекст_tls(self) -> ssl.SSLContext:
+        контекст = ssl.create_default_context(cafile=self._файл_ца or None)
+        if not self._проверять:
+            контекст.check_hostname = False
+            контекст.verify_mode = ssl.CERT_NONE
+        return контекст
+
+    def _соединиться(self) -> None:
+        """Соединение TCP/TLS со станцией (заново — после обрыва)."""
+        try:
+            сырое = socket.create_connection((self._ip_станции, self.порт), timeout=10.0)
+        except OSError as exc:
+            raise ОшибкаSIP(
+                f"Станция {self.узел}:{self.порт} не принимает SIP по "
+                f"{self.транспорт.upper()}: {exc}. Проверьте порт и транспорт на станции "
+                "(у TLS обычно 5061).") from exc
+        соединение: socket.socket
+        if self.транспорт == "tls":
+            try:
+                соединение = self._контекст_tls().wrap_socket(сырое, server_hostname=self.узел)
+            except (ssl.SSLError, OSError) as exc:
+                сырое.close()
+                совет = ("сертификат станции не подтверждён: укажите файл удостоверяющего "
+                         "центра (qc_sip_ca_file) или, только для проверки, выключите "
+                         "проверку (qc_sip_tls_verify)"
+                         if isinstance(exc, ssl.SSLCertVerificationError)
+                         else "проверьте, что на этом порту станция ждёт TLS")
+                raise ОшибкаSIP(f"TLS со станцией {self.узел}:{self.порт} не установлен: "
+                                f"{exc}; {совет}.") from exc
+        else:
+            соединение = сырое
+        соединение.settimeout(0.2)
+        старое = self._соединение
+        self._соединение = соединение
+        self.местный_порт = соединение.getsockname()[1]
+        if not self._местный_задан:
+            self.местный = соединение.getsockname()[0]
+        self._есть_связь.set()
+        if старое is not None:
+            try:
+                старое.close()
+            except OSError:
+                pass
 
     @property
     def _от(self) -> str:
@@ -736,12 +883,41 @@ class Телефон:
         return (f'"{имя}" ' if имя else "") + f"<sip:{self.пользователь}@{self.узел}>"
 
     def _послать(self, данные: bytes) -> None:
-        try:
-            self._сокет.sendto(данные, (self._ip_станции, self.порт))
-        except OSError as exc:
-            raise ОшибкаSIP(f"Станция {self.узел}:{self.порт} недоступна: {exc}") from exc
+        if not self.надёжный:
+            assert self._сокет is not None
+            try:
+                self._сокет.sendto(данные, (self._ip_станции, self.порт))
+            except OSError as exc:
+                raise ОшибкаSIP(f"Станция {self.узел}:{self.порт} недоступна: {exc}") from exc
+            return
+        with self._замок_связи:
+            for попытка in (1, 2):
+                try:
+                    if self._соединение is None:
+                        self._соединиться()
+                    assert self._соединение is not None
+                    self._соединение.sendall(данные)
+                    return
+                except (OSError, ОшибкаSIP) as exc:
+                    # Станция закрыла простаивавшее соединение — одно новое.
+                    if self._соединение is not None:
+                        try:
+                            self._соединение.close()
+                        except OSError:
+                            pass
+                    self._соединение = None
+                    self._есть_связь.clear()
+                    if попытка == 2 or self._закрыт.is_set():
+                        if isinstance(exc, ОшибкаSIP):
+                            raise
+                        raise ОшибкаSIP(
+                            f"Станция {self.узел}:{self.порт} недоступна: {exc}") from exc
 
     def _чтение(self) -> None:
+        if self.надёжный:
+            self._чтение_потока()
+            return
+        assert self._сокет is not None
         self._сокет.settimeout(0.5)
         while not self._закрыт.is_set():
             try:
@@ -750,30 +926,92 @@ class Телефон:
                 continue
             except OSError:
                 return
-            сообщение = разобрать(данные)
-            if сообщение is None:
+            self._входящее(данные, откуда)
+
+    def _чтение_потока(self) -> None:
+        """TCP/TLS: сообщения из потока байт — по Content-Length (RFC 3261, 18.3)."""
+        буфер = b""
+        текущее: socket.socket | None = None
+        while not self._закрыт.is_set():
+            if not self._есть_связь.wait(0.5):
                 continue
+            соединение = self._соединение
+            if соединение is None:
+                self._есть_связь.clear()
+                continue
+            if соединение is not текущее:
+                текущее, буфер = соединение, b""
             try:
-                if сообщение.ответ:
-                    номер, _ = сообщение.cseq
-                    with self._замок:
-                        очередь = self._ответы.get((сообщение.взять("call-id"), номер))
-                        разговор = self._разговоры.get(сообщение.взять("call-id"))
-                        брошен = сообщение.взять("call-id") in self._брошенные
-                    if очередь is not None:
-                        очередь.put(сообщение)
-                    elif (разговор is not None and разговор.цель
-                          and сообщение.cseq[1] == "INVITE" and 200 <= сообщение.код < 300):
-                        # Станция повторяет 200: наш ACK потерялся — шлём ещё раз,
-                        # иначе она положит трубку через 32 секунды.
-                        self._ack(разговор)
-                    elif (брошен and сообщение.cseq[1] == "INVITE"
-                          and 200 <= сообщение.код < 300):
-                        self._положить_брошенный(сообщение)
-                else:
-                    self._запрос(сообщение, откуда)
-            except Exception as exc:                        # noqa: BLE001
-                log.debug("Сообщение SIP не обработано: %s", exc)
+                # Чтение и запись одного соединения TLS из разных потоков
+                # OpenSSL не допускает: ждём данных без замка, читаем — под
+                # тем же замком, что и пишем.
+                if not (isinstance(соединение, ssl.SSLSocket) and соединение.pending()):
+                    готово, _, _ = select.select([соединение], [], [], 0.5)
+                    if not готово:
+                        continue
+                with self._замок_связи:
+                    if self._соединение is not соединение:
+                        continue
+                    кусок = соединение.recv(65535)
+            except (TimeoutError, ssl.SSLWantReadError):
+                continue
+            except (OSError, ValueError):
+                кусок = b""
+            if not кусок:
+                # Станция закрыла соединение: следующий запрос откроет новое.
+                with self._замок_связи:
+                    if self._соединение is соединение:
+                        self._соединение = None
+                        self._есть_связь.clear()
+                try:
+                    соединение.close()
+                except OSError:
+                    pass
+                continue
+            буфер += кусок
+            while True:
+                буфер = буфер.lstrip(b"\r\n")      # проверки связи — пустые строки
+                голова, найдено, хвост = буфер.partition(b"\r\n\r\n")
+                if not найдено:
+                    if len(буфер) > ПРЕДЕЛ_СООБЩЕНИЯ:
+                        буфер = b""
+                    break
+                совпало = re.search(rb"(?im)^(?:content-length|l)\s*:\s*(\d+)", голова)
+                длина = int(совпало.group(1)) if совпало else 0
+                if длина > ПРЕДЕЛ_СООБЩЕНИЯ:
+                    буфер = b""
+                    break
+                if len(хвост) < длина:
+                    break
+                данные = голова + b"\r\n\r\n" + хвост[:длина]
+                буфер = хвост[длина:]
+                self._входящее(данные, (self._ip_станции, self.порт))
+
+    def _входящее(self, данные: bytes, откуда: tuple[str, int]) -> None:
+        сообщение = разобрать(данные)
+        if сообщение is None:
+            return
+        try:
+            if сообщение.ответ:
+                номер, _ = сообщение.cseq
+                with self._замок:
+                    очередь = self._ответы.get((сообщение.взять("call-id"), номер))
+                    разговор = self._разговоры.get(сообщение.взять("call-id"))
+                    брошен = сообщение.взять("call-id") in self._брошенные
+                if очередь is not None:
+                    очередь.put(сообщение)
+                elif (разговор is not None and разговор.цель
+                      and сообщение.cseq[1] == "INVITE" and 200 <= сообщение.код < 300):
+                    # Станция повторяет 200: наш ACK потерялся — шлём ещё раз,
+                    # иначе она положит трубку через 32 секунды.
+                    self._ack(разговор)
+                elif (брошен and сообщение.cseq[1] == "INVITE"
+                      and 200 <= сообщение.код < 300):
+                    self._положить_брошенный(сообщение)
+            else:
+                self._запрос(сообщение, откуда)
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("Сообщение SIP не обработано: %s", exc)
 
     def _ответить(self, запрос: Сообщение, откуда: tuple[str, int], код: int,
                   причина: str, *, тело: bytes = b"",
@@ -788,9 +1026,14 @@ class Телефон:
                       ("Call-ID", запрос.взять("call-id")), ("CSeq", запрос.взять("cseq")),
                       ("User-Agent", self.АГЕНТ)]
         заголовки += ещё or []
+        данные = собрать(f"SIP/2.0 {код} {причина}", заголовки, тело)
         try:
-            self._сокет.sendto(собрать(f"SIP/2.0 {код} {причина}", заголовки, тело), откуда)
-        except OSError:
+            if self.надёжный:
+                self._послать(данные)
+            else:
+                assert self._сокет is not None
+                self._сокет.sendto(данные, откуда)
+        except (OSError, ОшибкаSIP):
             pass
 
     def _запрос(self, запрос: Сообщение, откуда: tuple[str, int]) -> None:
@@ -825,12 +1068,23 @@ class Телефон:
                 # Повторное приглашение в идущем разговоре (обновление сессии,
                 # смена адреса звука): подтверждаем тем же предложением.
                 описание = разобрать_sdp(запрос.тело)
+                if разговор.ключ_srtp is not None and запрос.тело:
+                    # Шифрованный разговор шифрованным и остаётся: новое
+                    # предложение без ключа не принимается, новый ключ
+                    # станции — принимается.
+                    их = выбрать_ключ(описание["крипто"])
+                    if их is None:
+                        self._ответить(запрос, откуда, 488, "Not Acceptable Here")
+                        return
+                    разговор.включить_srtp(разговор.ключ_srtp, их)
                 if описание["адрес"] and описание["порт"]:
                     разговор.куда = (описание["адрес"], описание["порт"])
                 порт = разговор._сокет.getsockname()[1]
                 ответ_200: dict[str, Any] = {
                     "тело": предложение_sdp(self.местный, порт, кодек=разговор.кодек,
-                                            кнопки=разговор.номер_кнопок),
+                                            кнопки=разговор.номер_кнопок,
+                                            крипто=разговор.ключ_srtp.строка
+                                            if разговор.ключ_srtp else ""),
                     "ещё": [("Contact", self._контакт), ("Content-Type", "application/sdp")]}
                 self._ответить(запрос, откуда, 200, "OK", **ответ_200)
                 # 200 на INVITE повторяется, пока не придёт ACK (RFC 3261,
@@ -861,6 +1115,11 @@ class Телефон:
         if not описание["кодек"] or not описание["порт"]:
             self._ответить(запрос, откуда, 488, "Not Acceptable Here")
             return
+        их = выбрать_ключ(описание["крипто"])
+        if (их is None and (self.srtp or "SAVP" in описание["профиль"])):
+            # Нужно шифрование, а ключа нет (или он в непонятном виде).
+            self._ответить(запрос, откуда, 488, "Not Acceptable Here")
+            return
         звук = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         звук.bind(("0.0.0.0", 0))                           # noqa: S104
         порт = звук.getsockname()[1]
@@ -876,11 +1135,15 @@ class Телефон:
         разговор.кодек = описание["кодек"]
         разговор.номер_кнопок = описание["кнопки"] or 101
         разговор.куда = (описание["адрес"] or откуда[0], описание["порт"])
+        if их is not None:
+            разговор.включить_srtp(шифр_звука.новый_ключ(их.тег, их.набор), их)
         with self._замок:
             self._разговоры[call_id] = разговор
         ответ: dict[str, Any] = {
             "тело": предложение_sdp(self.местный, порт, кодек=разговор.кодек,
-                                    кнопки=разговор.номер_кнопок),
+                                    кнопки=разговор.номер_кнопок,
+                                    крипто=разговор.ключ_srtp.строка
+                                    if разговор.ключ_srtp else ""),
             "ещё": [("Contact", self._контакт), ("Content-Type", "application/sdp")],
             "метка_кому": метка}
         self._ответить(запрос, откуда, 100, "Trying")
@@ -932,7 +1195,7 @@ class Телефон:
                 try:
                     ответ = очередь.get(timeout=min(осталось, max(0.05, следующий - time.monotonic())))
                 except queue.Empty:
-                    if time.monotonic() >= следующий and повтор < 8:
+                    if time.monotonic() >= следующий and повтор < 8 and not self.надёжный:
                         self._послать(данные)
                         повтор *= 2
                         следующий = time.monotonic() + повтор
@@ -949,7 +1212,7 @@ class Телефон:
     def зарегистрировать(self, срок: int | None = None) -> int:
         """REGISTER; ответ — на сколько секунд станция приняла регистрацию."""
         срок = self.срок_регистрации if срок is None else срок
-        адрес = f"sip:{self.узел}"
+        адрес = self.адрес_станции() if self.надёжный else f"sip:{self.узел}"
         учётные: tuple[str, str] | None = None
         for _ in range(3):
             self._cseq_рег += 1
@@ -1008,11 +1271,14 @@ class Телефон:
         порт_звука = звук.getsockname()[1]
         call_id = f"{uuid.uuid4().hex}@{self.местный}"
         разговор = Разговор(self, call_id, звук)
-        адрес = f"sip:{номер}@{self.узел}" + (f":{self.порт}" if self.порт != 5060 else "")
+        адрес = self.адрес_станции(номер)
         метка = uuid.uuid4().hex[:10]
         от = f"{self._от};tag={метка}"
         кому = f"<sip:{номер}@{self.узел}>"
-        тело = предложение_sdp(self.местный, порт_звука)
+        if self.srtp:
+            разговор.ключ_srtp = шифр_звука.новый_ключ()
+        тело = предложение_sdp(self.местный, порт_звука, крипто=разговор.ключ_srtp.строка
+                               if разговор.ключ_srtp else "")
         with self._замок:
             self._разговоры[call_id] = разговор
         cseq = 0
@@ -1103,6 +1369,8 @@ class Телефон:
                 try:
                     ответ = очередь.get(timeout=max(0.05, min(конец, следующий) - сейчас))
                 except queue.Empty:
+                    if self.надёжный:
+                        continue                # по TCP/TLS повторы не нужны
                     if not был_ответ and time.monotonic() >= следующий and повтор < 8:
                         self._послать(данные)
                         повтор *= 2
@@ -1157,6 +1425,18 @@ class Телефон:
             self._bye(разговор)
             raise ОшибкаSIP("Станция не предложила G.711 (alaw или ulaw): "
                             "разрешите кодек у номера телефона.", 488)
+        if разговор.ключ_srtp is not None:
+            их = выбрать_ключ(описание["крипто"], тег=разговор.ключ_srtp.тег)
+            if их is None:
+                # Станция ответила открытым звуком — разговор без шифрования
+                # не ведём: ключ клиента и его ответы ушли бы в сеть как есть.
+                разговор.кем_завершён = "сервер"
+                разговор.завершён.set()
+                self._bye(разговор)
+                raise ОшибкаSIP("Станция не согласилась шифровать звук (SRTP): включите у "
+                                "номера media_encryption=sdes (chan_pjsip) или "
+                                "encryption=yes (chan_sip), либо выключите qc_srtp.", 488)
+            разговор.включить_srtp(разговор.ключ_srtp, их)
         разговор.кодек = описание["кодек"]
         разговор.номер_кнопок = описание["кнопки"] or 101
         разговор.куда = (описание["адрес"] or self._ip_станции, описание["порт"])
@@ -1252,10 +1532,14 @@ class Телефон:
             except ОшибкаSIP:
                 pass
         self._закрыт.set()
-        try:
-            self._сокет.close()
-        except OSError:
-            pass
+        self._есть_связь.set()                  # разбудить поток чтения
+        for сокет in (self._сокет, self._соединение):
+            if сокет is None:
+                continue
+            try:
+                сокет.close()
+            except OSError:
+                pass
 
 
 def _кнопка_из_info(запрос: Сообщение) -> str:

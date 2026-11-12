@@ -388,7 +388,7 @@ def _поля_csv(строка: str) -> list[str] | None:
     одно поле даёт в этом месте название приложения или дату, и ни то ни
     другое на «1757500001.1» не похоже.
     """
-    попытки = ({}, {"escapechar": "\\"})
+    попытки: tuple[dict[str, Any], ...] = ({}, {"escapechar": "\\"})
     запасной: list[str] | None = None
     for настройки in попытки:
         try:
@@ -1009,9 +1009,14 @@ class AMIClient:
         except AMIError:
             return {}
 
-    def события(self, stop: threading.Event, *, on_event: Any = None,
-                idle: float = 1.0) -> None:
-        """Читает поток событий, пока не попросят остановиться."""
+    def читать_события(self, stop: threading.Event, *, on_event: Any = None,
+                       idle: float = 1.0) -> None:
+        """Читает поток событий, пока не попросят остановиться.
+
+        Назывался `события` — так же, как поле с классами событий для входа
+        (`self.события = "cdr"`): поле затеняло метод, и вызов падал «'str'
+        object is not callable». Нашла проверка типов в заходе 64.
+        """
         while not stop.is_set():
             try:
                 событие = self.пакет(timeout=idle)
@@ -1029,9 +1034,8 @@ class AMIClient:
         self.connect()
         return self
 
-    def __exit__(self, *_: Any) -> bool:
+    def __exit__(self, *_: Any) -> None:
         self.close()
-        return False
 
 
 def проверить(host: str, port: int, username: str, secret: str,

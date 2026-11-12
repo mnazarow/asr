@@ -4632,11 +4632,19 @@ const Bulk = {
   },
 
   bind(host) {
-    qsa('.pick-one', host).forEach((box) => box.addEventListener('change', () => {
-      if (box.checked) this.ids.add(box.value); else this.ids.delete(box.value);
-      this.sync();
-    }));
+    // Строки, оставшиеся на месте при мягком обновлении, уже слушают:
+    // второй обработчик на тот же флажок не вешается.
+    qsa('.pick-one', host).forEach((box) => {
+      if (box.dataset.bulkBound) return;
+      box.dataset.bulkBound = '1';
+      box.addEventListener('change', () => {
+        if (box.checked) this.ids.add(box.value); else this.ids.delete(box.value);
+        this.sync();
+      });
+    });
     const all = qs('#r-pick-all', host);
+    if (all && !all.dataset.bulkBound) all.dataset.bulkBound = '1';
+    else if (all) return this.sync();
     if (all) all.addEventListener('change', () => {
       qsa('.pick-one', host).forEach((box) => {
         box.checked = all.checked;
@@ -4948,7 +4956,29 @@ RENDERERS.results = {
       // Метки на странице — подсказки для окна «Метка» массового действия.
       state.knownTags = [...new Set([...(state.knownTags || []), ...data.items.flatMap((j) =>
         String(j.tags || '').split(',').map((т) => т.trim()).filter(Boolean))])].slice(-200);
-      host.innerHTML = data.items.length ? обрезано + `<table>
+      if (!data.items.length) {
+        host.dataset.mark = '';
+        host.innerHTML = `<div class="empty">${search || содержание
+          ? 'По этому отбору записей нет — уточните поиск или выберите «любое содержание».'
+          : 'Завершённых заданий пока нет'}</div>`;
+        this.drawPager(data);
+        return;
+      }
+      const пары = data.items.map((job) => [job.id, this.строка(job)]);
+      // Тот же отбор и порядок — строки на месте: отмеченные флажки, фокус и
+      // выделенный текст в неизменившихся строках остаются (см. `обновитьСтроки`).
+      const отпечаток = JSON.stringify([search, order, содержание || '', окно ? окно.label : '']);
+      const тело = host.querySelector('table > tbody');
+      if (тело && host.dataset.mark === отпечаток) {
+        обновитьСтроки(тело, пары);
+        const полосаОбрезки = qs('#r-trunc', host);
+        if (полосаОбрезки) полосаОбрезки.innerHTML = обрезано;
+        Bulk.bind(host);
+        this.drawPager(data);
+        return;
+      }
+      host.dataset.mark = отпечаток;
+      host.innerHTML = `<div id="r-trunc">${обрезано}</div><table>
         <thead><tr><th class="pick"><input type="checkbox" id="r-pick-all"
             title="Выбрать все на странице"></th>
           ${[['filename', 'Файл', ''], ['model', 'Модель', ''], ['media_duration_s', 'Длит.', 'num'],
@@ -4957,46 +4987,48 @@ RENDERERS.results = {
             .map(([поле, имя, вид]) => this.заголовок(поле, имя, вид)).join('')}
           <th class="num" title="Оценка клиента из опроса контроля качества" data-nosort>Оценка</th>
           ${this.заголовок('finished_at', 'Готово', '')}
-          <th style="width:230px">Выгрузка</th></tr></thead><tbody>
-        ${data.items.map((job) => `<tr data-id="${job.id}">
-          <td class="pick"><input type="checkbox" class="pick-one" value="${job.id}"
-            aria-label="Выбрать ${esc(job.filename)}" ${Bulk.has(job.id) ? 'checked' : ''}></td>
-          <td><div class="truncate" style="max-width:260px">${esc(job.filename)}</div>
-            ${job.match && job.match.snippet
-              ? `<div class="found small truncate" style="max-width:260px" tabindex="0" role="button"
-                     data-enter-click
-                     title="Открыть на ${fmtDur(job.match.start_s)}"
-                     ${act('openAt', job.id, Number(job.match.start_s) || 0)}>
-                   <span class="at">${fmtDur(job.match.start_s)}</span> ${markSnippet(job.match.snippet)}
-                 </div>`
-              : `<div class="small faint truncate" style="max-width:260px">${
-                  esc((job.text || job.text_preview || '').slice(0, 70))}</div>`}</td>
-          <td class="small dim">${esc(job.model || '')}</td>
-          <td class="num">${fmtDur(job.media_duration_s)}</td>
-          <td class="num">${num(job.words_count)}</td>
-          <td class="num">${num(job.segments_count)}</td>
-          <td class="num">${job.rtf ? num(job.rtf, 3) : '—'}</td>
-          <td class="num">${job.avg_confidence ? pct(job.avg_confidence, 0) : '—'}</td>
-          <td class="num">${job.speakers_count || '—'}</td>
-          <td class="num">${job.qc && job.qc.score_pct !== null && job.qc.score_pct !== undefined
-            ? `<span class="chip ${job.qc.score_pct < 60 ? 'err' : job.qc.score_pct < 80 ? 'warn' : 'ok'}"
-                title="Оценка клиента в опросе: ${esc(String(job.qc.score ?? ''))}">${num(job.qc.score_pct, 0)} %</span>`
-            : (job.qc ? `<span class="small faint" title="Опрос: ${esc(job.qc.status || '')}">—</span>` : '')}</td>
-          <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
-          <td class="exports"><div class="row" style="gap:3px;flex-wrap:nowrap">
-            <button class="ghost sm" ${act('playRecording', job.id)}
-              title="Прослушать запись">▶</button>
-            ${['txt', 'srt', 'json', 'docx'].map((f) =>
-              `<button class="btn sm" ${act('download', job.id, f)}
-                 title="Скачать в формате ${f}">${f}</button>`).join('')}
-            <button class="ghost sm" ${act('openJob', job.id)}>Открыть</button>
-          </div></td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty">${search || содержание
-        ? 'По этому отбору записей нет — уточните поиск или выберите «любое содержание».'
-        : 'Завершённых заданий пока нет'}</div>`;
+          <th style="width:230px">Выгрузка</th></tr></thead><tbody></tbody></table>`;
+      обновитьСтроки(host.querySelector('table > tbody'), пары);
       Bulk.bind(host);
       this.drawPager(data);
     } catch (err) { fail(err); }
+  },
+
+  /** Строка «Результатов» шаблоном html`…`: имя файла и отрывок — текстом. */
+  строка(job) {
+    const оценка = job.qc && job.qc.score_pct !== null && job.qc.score_pct !== undefined
+      ? html`<span class="chip ${job.qc.score_pct < 60 ? 'err' : job.qc.score_pct < 80 ? 'warn' : 'ok'}"
+          title="Оценка клиента в опросе: ${String(job.qc.score ?? '')}">${num(job.qc.score_pct, 0)} %</span>`
+      : (job.qc ? html`<span class="small faint" title="Опрос: ${job.qc.status || ''}">—</span>` : '');
+    const отрывок = job.match && job.match.snippet
+      ? html`<div class="found small truncate" style="max-width:260px" tabindex="0" role="button"
+             data-enter-click title="Открыть на ${fmtDur(job.match.start_s)}"
+             ${raw(act('openAt', job.id, Number(job.match.start_s) || 0))}>
+           <span class="at">${fmtDur(job.match.start_s)}</span> ${raw(markSnippet(job.match.snippet))}
+         </div>`
+      : html`<div class="small faint truncate" style="max-width:260px">${
+          (job.text || job.text_preview || '').slice(0, 70)}</div>`;
+    return html`<tr data-id="${job.id}">
+      <td class="pick"><input type="checkbox" class="pick-one" value="${job.id}"
+        aria-label="Выбрать ${job.filename}" ${Bulk.has(job.id) ? 'checked' : ''}></td>
+      <td><div class="truncate" style="max-width:260px">${job.filename}</div>${отрывок}</td>
+      <td class="small dim">${job.model || ''}</td>
+      <td class="num">${fmtDur(job.media_duration_s)}</td>
+      <td class="num">${num(job.words_count)}</td>
+      <td class="num">${num(job.segments_count)}</td>
+      <td class="num">${job.rtf ? num(job.rtf, 3) : '—'}</td>
+      <td class="num">${job.avg_confidence ? pct(job.avg_confidence, 0) : '—'}</td>
+      <td class="num">${job.speakers_count || '—'}</td>
+      <td class="num">${оценка}</td>
+      <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
+      <td class="exports"><div class="row" style="gap:3px;flex-wrap:nowrap">
+        <button class="ghost sm" ${raw(act('playRecording', job.id))}
+          title="Прослушать запись">▶</button>
+        ${['txt', 'srt', 'json', 'docx'].map((f) =>
+          html`<button class="btn sm" ${raw(act('download', job.id, f))}
+             title="Скачать в формате ${f}">${f}</button>`)}
+        <button class="ghost sm" ${raw(act('openJob', job.id))}>Открыть</button>
+      </div></td></tr>`;
   },
 
   drawPager(data) {
@@ -9090,32 +9122,46 @@ RENDERERS.telephony = {
           : 'Проверьте период и отбор либо нажмите «Забрать сейчас».'}</div>`;
       return;
     }
-    const строки = звонки.map((з) => {
+    // Строки — шаблоном html`…`: номер, оператор, очередь и начало
+    // расшифровки приходят со станции и экранируются сами.
+    const имена = new Map(((state.telStatus || {}).stations || []).map((с) => [с.id, с.name]));
+    const пусто = html`<span class="dim">—</span>`;
+    const пары = звонки.map((з) => {
       const статус = з.job_id
-        ? `<a href="#" ${act('openJob', з.job_id)}
-             title="Открыть карточку задания">${esc(STATUS_LABELS[з.job_status] || з.job_status || 'в очереди')}</a>`
-        : `<span class="dim" title="почему не распознан">${esc(з.skipped || '—')}</span>`;
+        ? html`<a href="#" ${raw(act('openJob', з.job_id))}
+             title="Открыть карточку задания">${STATUS_LABELS[з.job_status] || з.job_status || 'в очереди'}</a>`
+        : html`<span class="dim" title="почему не распознан">${з.skipped || '—'}</span>`;
       const направление = з.direction
-        ? `<span class="chip ${з.direction === 'входящий' ? 'ok' : ''}">${esc(з.direction)}</span>`
-        : '<span class="dim">—</span>';
-      const имена = new Map(((state.telStatus || {}).stations || []).map((с) => [с.id, с.name]));
-      return `<tr>
-        <td class="small">${esc(fmtTime(з.started_at))}</td>
-        <td class="small">${з.station
-          ? esc(имена.get(з.station) || з.station) : '<span class="dim">—</span>'}</td>
+        ? html`<span class="chip ${з.direction === 'входящий' ? 'ok' : ''}">${з.direction}</span>`
+        : пусто;
+      return [з.uniqueid || `${з.station}:${з.started_at}:${з.src}`, html`<tr>
+        <td class="small">${fmtTime(з.started_at)}</td>
+        <td class="small">${з.station ? имена.get(з.station) || з.station : пусто}</td>
         <td>${направление}</td>
-        <td class="mono small">${esc(з.src || '—')}</td>
-        <td class="mono small">${esc(з.dst || '—')}</td>
-        <td class="small">${esc(з.queue || '—')}</td>
-        <td class="small">${esc(з.agent || '—')}</td>
-        <td class="small" title="${з.duration ? `всего с гудками ${esc(fmtDur(з.duration))}` : ''}">${
-          з.billsec ? fmtDur(з.billsec) : '<span class="dim">—</span>'}</td>
+        <td class="mono small">${з.src || '—'}</td>
+        <td class="mono small">${з.dst || '—'}</td>
+        <td class="small">${з.queue || '—'}</td>
+        <td class="small">${з.agent || '—'}</td>
+        <td class="small" title="${з.duration ? `всего с гудками ${fmtDur(з.duration)}` : ''}">${
+          з.billsec ? fmtDur(з.billsec) : пусто}</td>
         <td class="small">${з.answered ? 'ответили'
-          : esc(ИТОГ_ЗВОНКА[з.disposition] || (з.disposition || '').toLowerCase() || '—')}</td>
+          : ИТОГ_ЗВОНКА[з.disposition] || (з.disposition || '').toLowerCase() || '—'}</td>
         <td class="small">${статус}</td>
-        <td class="small dim" title="${esc(з.preview || '')}">${esc((з.preview || '').slice(0, 80))}</td>
-      </tr>`;
-    }).join('');
+        <td class="small dim" title="${з.preview || ''}">${(з.preview || '').slice(0, 80)}</td>
+      </tr>`];
+    });
+    // Тот же отбор, та же страница и то же число звонков — строки на месте
+    // (после «Забрать сейчас» журнал перечитывается, а смотрят его как раз в
+    // эту минуту), иначе — таблица заново.
+    const отпечаток = JSON.stringify([state.telPeriod, state.telDirection, state.telStation,
+      state.telQueue, state.telAgent, state.telSearch, state.telOnlyQueued]
+      .map((з) => з || '').concat([свод.offset || 0, свод.limit || 50, свод.total || 0]));
+    const тело = коробка.querySelector('table > tbody');
+    if (тело && коробка.dataset.mark === отпечаток) {
+      обновитьСтроки(тело, пары);
+      return;
+    }
+    коробка.dataset.mark = отпечаток;
     const страниц = Math.ceil((свод.total || 0) / (свод.limit || 50));
     const текущая = Math.floor((свод.offset || 0) / (свод.limit || 50)) + 1;
     коробка.innerHTML = `
@@ -9131,9 +9177,10 @@ RENDERERS.telephony = {
           <thead><tr><th>Начало</th><th>АТС</th><th>Направление</th><th>Кто</th><th>Кому</th>
             <th>Очередь</th><th>Оператор</th><th>Разговор</th><th>Итог</th>
             <th>Распознавание</th><th>Начало расшифровки</th></tr></thead>
-          <tbody>${строки}</tbody>
+          <tbody></tbody>
         </table></div>
       </section>`;
+    обновитьСтроки(коробка.querySelector('table > tbody'), пары);
     const назад = qs('#tel-prev');
     const вперёд = qs('#tel-next');
     if (назад) назад.addEventListener('click', () => {
@@ -11283,6 +11330,7 @@ RENDERERS.dialplan = {
       // Стороны раздельно — только при отправке файлом.
       tracks: state.dpMode === 'path' ? '' : (ф.tracks || ''),
       norec_code: ф.norec_code || '',
+      live: ф.live || '',
     };
   },
 
@@ -11332,6 +11380,9 @@ RENDERERS.dialplan = {
         ${поле('norec_code', 'Код «не записывать»', `<input type="text" maxlength="4"
           data-dp="norec_code" placeholder="*7" value="${esc(з.norec_code || '')}">`,
           'оператор набирает его в разговоре — запись останавливается (features.conf)')}
+        ${поле('live', 'Живой разговор: приём AudioSocket', `<input type="text"
+          data-dp="live" placeholder="10.0.5.2:9092" value="${esc(з.live || '')}">`,
+          'оба голоса — в ASR Hub на лету (ChanSpy); рецепт не проверен на живой станции')}
       </div>`);
     let таймер = null;
     qsa('[data-dp]', место).forEach((вход) => {
@@ -11351,6 +11402,7 @@ RENDERERS.dialplan = {
     const пар = new URLSearchParams({ driver: state.dpDriver, mode: state.dpMode, ...з });
     if (!з.tracks) пар.delete('tracks');
     if (!з.norec_code) пар.delete('norec_code');
+    if (!з.live) пар.delete('live');
     let собрано;
     try {
       собрано = await API.latest('dialplan-config', `/api/telephony/dialplan/config?${пар}`);
@@ -11851,8 +11903,9 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
         ${с.last_error ? `<div class="small dim" style="margin-top:4px">Последняя ошибка: ${esc(с.last_error)}</div>` : ''}
       </div>
       <div class="grid cols-6" style="margin-bottom:16px">
-        ${kpi('Телефон', esc(рег.state || '—'), рег.state === 'зарегистрирован'
-          ? 'станция приняла регистрацию' : esc(рег.error || 'регистрируется при первом звонке'))}
+        ${kpi('Телефон', esc(рег.state || '—'), `${рег.state === 'зарегистрирован'
+          ? 'станция приняла регистрацию' : esc(рег.error || 'регистрируется при первом звонке')}
+          · ${esc(String(с.transport || 'udp').toUpperCase())}, звук ${с.srtp ? 'шифруется (SRTP)' : 'открытый'}`)}
         ${kpi('Голос', голос.available ? esc(голос.name) : 'нет', голос.available
           ? (голос.clone ? 'по загруженному образцу голоса' : `голос ${esc(голос.voice || 'по умолчанию')}`)
           : 'синтезатор не найден')}

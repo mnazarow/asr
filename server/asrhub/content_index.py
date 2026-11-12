@@ -65,6 +65,8 @@ class ContentIndex:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._частоты: dict[str, int] = {}
+        #: Счётчики состояния раздела (кешируются ненадолго, сбрасываются записью).
+        self._кеш_состояния: dict[str, Any] = {}
         self._размер_корпуса = 0
         self._частоты_на = 0.0
         #: Последняя ошибка разбора — её показывает состояние раздела. Без
@@ -438,7 +440,7 @@ class ContentIndex:
                 try:
                     self.db.save_content(
                         job_id, {"version": content.VERSION,
-                                 "detail": {"error": str(exc)[:500]}}, {})
+                                 "detail": {"error": str(exc)[:500]}}, [])
                 except Exception:                            # noqa: BLE001
                     log.debug("Не удалось пометить запись %s", job_id)
         self.backfilled += сделано

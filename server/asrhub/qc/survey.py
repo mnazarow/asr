@@ -787,7 +787,8 @@ class КонтрольКачества:
     def _подпись(self) -> str:
         return "|".join(str(self.settings.get(к) or "") for к in (
             "qc_sip_host", "qc_sip_port", "qc_sip_user", "qc_sip_password",
-            "qc_sip_local_ip", "qc_caller_name", "qc_sip_register"))
+            "qc_sip_local_ip", "qc_caller_name", "qc_sip_register", "qc_sip_transport",
+            "qc_sip_tls_verify", "qc_sip_ca_file", "qc_srtp"))
 
     def телефон(self) -> Телефон:
         """Телефон с действующей регистрацией; при смене настроек — новый."""
@@ -805,7 +806,11 @@ class КонтрольКачества:
                     пользователь=str(self.settings.get("qc_sip_user")).strip(),
                     пароль=str(self.settings.get("qc_sip_password") or ""),
                     имя=str(self.settings.get("qc_caller_name") or ""),
-                    местный=str(self.settings.get("qc_sip_local_ip") or ""))
+                    местный=str(self.settings.get("qc_sip_local_ip") or ""),
+                    транспорт=str(self.settings.get("qc_sip_transport") or "udp"),
+                    проверять_сертификат=bool(self.settings.get("qc_sip_tls_verify", True)),
+                    файл_ца=str(self.settings.get("qc_sip_ca_file") or ""),
+                    srtp=bool(self.settings.get("qc_srtp")))
                 self._подпись_телефона = подпись
             телефон = self._телефон
             # Опрос без обратного звонка: станция переводит клиента на телефон
@@ -845,7 +850,8 @@ class КонтрольКачества:
                 телефон.зарегистрировать(0)
             return {"ok": True, "state": self.регистрация.get("state"),
                     "local": f"{телефон.местный}:{телефон.местный_порт}",
-                    "server": f"{телефон.узел}:{телефон.порт}"}
+                    "server": f"{телефон.узел}:{телефон.порт}",
+                    "transport": телефон.транспорт, "srtp": телефон.srtp}
         except ОшибкаSIP as exc:
             return {"ok": False, "error": str(exc), "code": exc.код}
 
@@ -866,6 +872,8 @@ class КонтрольКачества:
             поток.join(timeout=0.1)
         with self._замок:
             self._закрыть_телефон()
+        # Служба синтеза держит модель в памяти — с остановкой опросов она не нужна.
+        tts.остановить_службы()
 
     def _цикл(self) -> None:
         while not self._стоп.wait(self.ШАГ_С):
@@ -1428,6 +1436,10 @@ class КонтрольКачества:
             "missing": self.настроен(),
             "running": bool(self._поток and self._поток.is_alive()),
             "registration": dict(self.регистрация),
+            # Как телефон говорит со станцией: показывается рядом с
+            # регистрацией, чтобы открытый звук не был неожиданностью.
+            "transport": str(self.settings.get("qc_sip_transport") or "udp"),
+            "srtp": bool(self.settings.get("qc_srtp")),
             "tts": tts.движок(self.settings, tts.образец(self.каталог_звука())),
             "groups": len(группы),
             "groups_active": sum(1 for г in группы if г.enabled and г.questions),

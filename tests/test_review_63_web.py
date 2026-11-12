@@ -103,3 +103,65 @@ def test_queue_rows_update_in_place_and_keep_focus(стенд):
             assert not ошибки, ошибки
         finally:
             движок.close()
+
+
+def test_results_and_calls_rows_update_in_place(стенд):
+    """Заход 64: «Результаты» и журнал звонков — те же мягкие строки и html`…`."""
+    from playwright.sync_api import sync_playwright
+
+    адрес, хранилище = стенд
+    db = хранилище.db
+    готовые = [з["id"] for з in db.list_jobs(status="completed", limit=50)]
+    assert len(готовые) >= 3
+    db.update_job(готовые[0], filename='<b onmouseover="window.__взлом=1">жирный</b>.wav')
+
+    with sync_playwright() as игра:
+        движок = игра.chromium.launch(executable_path=браузер())
+        try:
+            страница = движок.new_page(viewport={"width": 1500, "height": 900},
+                                       bypass_csp=False)
+            страница.add_init_script(
+                f"try {{ localStorage.setItem('asrhub_key', '{КЛЮЧ}'); }} catch (e) {{}}")
+            ошибки: list[str] = []
+            страница.on("pageerror", lambda e: ошибки.append(str(e)))
+            страница.goto(f"{адрес}/#results", wait_until="networkidle")
+            страница.wait_for_function(
+                "() => document.querySelectorAll('#results-table tbody tr').length >= 3")
+            assert страница.locator("#results-table").inner_text().count('<b onmouseover') == 1
+            assert страница.evaluate("() => document.querySelector('#results-table tbody b')") is None
+            # Отметить строку флажком, пометить элементы, перечитать тот же отбор.
+            страница.evaluate("""() => {
+                const строки = [...document.querySelectorAll('#results-table tbody tr')];
+                строки.forEach((с) => { с.__метка = 1; });
+                строки[1].querySelector('.pick-one').click();
+            }""")
+            страница.dispatch_event("#r-order", "change")
+            страница.wait_for_timeout(800)
+            итог = страница.evaluate("""() => {
+                const строки = [...document.querySelectorAll('#results-table tbody tr')];
+                return {
+                    всего: строки.length,
+                    на_месте: строки.filter((с) => с.__метка).length,
+                    отмечена: строки[1].querySelector('.pick-one').checked,
+                };
+            }""")
+            # Отмеченная строка сменила разметку (checked) — заменена, но с
+            # флажком; остальные — те же элементы.
+            assert итог["на_месте"] >= итог["всего"] - 1 and итог["отмечена"], итог
+
+            страница.goto(f"{адрес}/#telephony", wait_until="networkidle")
+            страница.wait_for_timeout(1500)
+            строк = страница.evaluate(
+                "() => document.querySelectorAll('#tel-calls tbody tr').length")
+            assert строк > 0
+            страница.evaluate("""() => document.querySelectorAll('#tel-calls tbody tr')
+                .forEach((с) => { с.__метка = 1; })""")
+            # Тот же отбор станции ещё раз — журнал перечитывается с сервера.
+            страница.dispatch_event("#tel-station", "change")
+            страница.wait_for_timeout(1000)
+            на_месте = страница.evaluate("""() => [...document.querySelectorAll('#tel-calls tbody tr')]
+                .filter((с) => с.__метка).length""")
+            assert на_месте == строк, (на_месте, строк)
+            assert not ошибки, ошибки
+        finally:
+            движок.close()

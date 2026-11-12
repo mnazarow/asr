@@ -967,7 +967,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:9895-2cfef0",
+  "instance": "vm:12852-c2319c",
   "instances": [],
   "workers": [
     {
@@ -1567,7 +1567,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794465643.8868542,
+    "generated_at": 1794471972.6977706,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1734,8 +1734,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.35",
-  "uptime_s": 2.0,
+  "version": "3.1.36",
+  "uptime_s": 1.7,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1815,8 +1815,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.35",
-  "uptime_s": 2.0,
+  "version": "3.1.36",
+  "uptime_s": 1.7,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1825,8 +1825,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.3,
-    "disk_free_gb": 22.9,
+    "ram_available_gb": 7.1,
+    "disk_free_gb": 21.8,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2575,8 +2575,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793860843.9644542,
-    "until": 1794465643.9644542
+    "since": 1793867172.76746,
+    "until": 1794471972.76746
   }
 }
 ```
@@ -2968,9 +2968,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 6.3,
+    "free_gb": 7.1,
     "reserve_gb": 4.0,
-    "budget_gb": 2.4,
+    "budget_gb": 3.0,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -4021,6 +4021,7 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 | `internal_len` | в адресе | integer | `3` | Длина внутреннего номера в примерах |
 | `tracks` | в адресе | string | — | Писать стороны раздельно: MixMonitor r()/t() (1/yes/true) |
 | `norec_code` | в адресе | string | — | Код «не записывать» в разговоре, например *7 |
+| `live` | в адресе | string | — | Приём AudioSocket «узел:порт» — живой разговор двух людей (рецепт не проверен на станции) |
 
 ### `DELETE /api/telephony/dialplan/key/{station_id}`
 
@@ -5102,7 +5103,7 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 2.1,
+  "uptime_s": 1.8,
   "liveness": {
     "status": "ok",
     "checks": [
@@ -5144,7 +5145,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 22.9 ГБ",
+        "detail": "свободно 21.8 ГБ",
         "hint": ""
 …
 ```

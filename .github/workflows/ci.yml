@@ -71,8 +71,11 @@ jobs:
       - name: зависимости
         run: pip install -r requirements/dev.txt
       - name: быстрый ярус
+        # Параллельно по файлам: стенды модуля (сервер, браузер) живут в одном
+        # процессе, а файлы расходятся по ядрам машины конвейера.
         run: >-
           python -m pytest tests -q -p no:cacheprovider -rf --timeout=600
+          -n auto --dist loadfile
           -m "not web and not scripts and not drill and not slow"
 
   full:

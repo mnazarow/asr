@@ -7,12 +7,18 @@
 
 Сценарий абонента (`кнопки`) — что он нажимает после каждой прослушанной
 фразы. Фраза считается прослушанной, когда после звука наступила тишина.
+
+Транспорт — UDP, TCP или TLS (`транспорт`, для TLS — `сертификат` и ключ);
+`srtp` — звук шифруется ключами из SDP, как у Asterisk с
+media_encryption=sdes.
 """
 from __future__ import annotations
 
 import hashlib
 import random
+import re
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -20,6 +26,7 @@ import uuid
 from typing import Any
 
 from asrhub.qc import sip
+from asrhub.qc import srtp as шифр
 
 
 class МиниАТС:
@@ -27,7 +34,19 @@ class МиниАТС:
                  кнопки: list[str] | None = None, ответ: str = "answer",
                  положить_после: int | None = None, qop: bool = True,
                  без_пароля: bool = False, кодек: str = "PCMA",
-                 глотать_отмену: int = 0, перепригласить: bool = False) -> None:
+                 глотать_отмену: int = 0, перепригласить: bool = False,
+                 транспорт: str = "udp", сертификат: tuple[str, str] | None = None,
+                 srtp: bool = False) -> None:
+        self.транспорт = транспорт
+        self.srtp = srtp
+        #: SRTP: ключ станции, контексты приёма и передачи, отвергнутые пакеты.
+        self.ключ_станции = шифр.новый_ключ() if srtp else None
+        self.srtp_приём: шифр.SRTP | None = None
+        self.srtp_отправка: шифр.SRTP | None = None
+        self.открытых_пакетов = 0           # пакеты звука, которые прочлись бы без ключа
+        self.соединений = 0
+        self._соединение: socket.socket | None = None
+        self._замок_связи = threading.Lock()
         self.пароль = пароль
         self.способ = способ                # rfc2833 | info | inband
         self.кнопки = list(кнопки or [])
@@ -42,8 +61,19 @@ class МиниАТС:
         self.перепригласить = перепригласить
         self.ответы_на_повтор: list[sip.Сообщение] = []
         self.ack_с_паролем: list[bool] = []
-        self.сокет = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if транспорт == "udp":
+            self.сокет = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        else:
+            self.сокет = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.сокет.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.сокет.bind(("127.0.0.1", 0))
+        if транспорт != "udp":
+            self.сокет.listen(4)
+        self._tls: ssl.SSLContext | None = None
+        if транспорт == "tls":
+            assert сертификат is not None
+            self._tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self._tls.load_cert_chain(*сертификат)
         self.порт = self.сокет.getsockname()[1]
         self.звук = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.звук.bind(("127.0.0.1", 0))
@@ -61,8 +91,66 @@ class МиниАТС:
         self.от_заголовок = ""
         self._стоп = threading.Event()
         self._разговор: dict[str, Any] = {}
-        self._потоки = [threading.Thread(target=self._sip, daemon=True)]
+        self._потоки = [threading.Thread(
+            target=self._sip if транспорт == "udp" else self._принимать, daemon=True)]
         self._потоки[0].start()
+
+    @property
+    def _via_сторона(self) -> str:
+        return f"SIP/2.0/{self.транспорт.upper()} 127.0.0.1:{self.порт}"
+
+    def _отправить(self, данные: bytes, откуда: Any) -> None:
+        if self.транспорт == "udp":
+            self.сокет.sendto(данные, откуда)
+            return
+        with self._замок_связи:
+            if self._соединение is not None:
+                self._соединение.sendall(данные)
+
+    def _принимать(self) -> None:
+        """TCP/TLS: телефон соединяется сам; сообщения — по Content-Length."""
+        self.сокет.settimeout(0.2)
+        while not self._стоп.is_set():
+            try:
+                сырое, _ = self.сокет.accept()
+            except (TimeoutError, OSError):
+                continue
+            try:
+                соединение = (self._tls.wrap_socket(сырое, server_side=True)
+                              if self._tls is not None else сырое)
+            except (ssl.SSLError, OSError):
+                сырое.close()
+                continue
+            соединение.settimeout(0.2)
+            with self._замок_связи:
+                self._соединение = соединение
+            self.соединений += 1
+            threading.Thread(target=self._читать, args=(соединение,), daemon=True).start()
+
+    def _читать(self, соединение: socket.socket) -> None:
+        буфер = b""
+        while not self._стоп.is_set():
+            try:
+                with self._замок_связи:
+                    кусок = соединение.recv(65535)
+            except (TimeoutError, ssl.SSLWantReadError):
+                time.sleep(0.01)
+                continue
+            except OSError:
+                return
+            if not кусок:
+                return
+            буфер += кусок
+            while True:
+                голова, найдено, хвост = буфер.partition(b"\r\n\r\n")
+                if not найдено:
+                    break
+                совпало = re.search(rb"(?im)^content-length\s*:\s*(\d+)", голова)
+                длина = int(совпало.group(1)) if совпало else 0
+                if len(хвост) < длина:
+                    break
+                буфер = хвост[длина:]
+                self._обработать(голова + b"\r\n\r\n" + хвост[:длина], "поток")
 
     # -- SIP ----------------------------------------------------------------
 
@@ -76,7 +164,7 @@ class МиниАТС:
         заголовки += [("From", запрос.взять("from")), ("To", кому),
                       ("Call-ID", запрос.взять("call-id")), ("CSeq", запрос.взять("cseq"))]
         заголовки += ещё or []
-        self.сокет.sendto(sip.собрать(f"SIP/2.0 {код} {причина}", заголовки, тело), откуда)
+        self._отправить(sip.собрать(f"SIP/2.0 {код} {причина}", заголовки, тело), откуда)
 
     def _пароль_верен(self, запрос: sip.Сообщение) -> bool:
         if self.без_пароля:
@@ -113,79 +201,92 @@ class МиниАТС:
                 continue
             except OSError:
                 return
-            сообщение = sip.разобрать(данные)
-            if сообщение is not None and сообщение.ответ \
-                    and сообщение.cseq == (2, "INVITE") and сообщение.код == 200:
-                self.ответы_на_повтор.append(сообщение)
-                # ACK — только на третий 200: телефон обязан повторять ответ.
-                if len(self.ответы_на_повтор) == 3:
-                    self._ack_повтора(сообщение)
-                continue
-            if сообщение is None or сообщение.ответ:
-                continue
-            метод = сообщение.метод
-            self.журнал.append(метод)
-            if метод == "REGISTER":
-                if not self._пароль_верен(сообщение):
-                    self._спросить_пароль(сообщение, откуда)
-                    continue
-                срок = сообщение.взять("expires", "300")
-                if срок == "0":
-                    self.снята_регистрация = True
-                else:
-                    self.регистраций += 1
-                self._ответить(сообщение, откуда, 200, "OK", метка="reg", ещё=[
-                    ("Contact", f"{сообщение.взять('contact').split(';')[0]};expires={срок}")])
-            elif метод == "INVITE":
-                if not self._пароль_верен(сообщение):
-                    self._спросить_пароль(сообщение, откуда)
-                    continue
-                if сообщение.взять("call-id") in self._разговор:
-                    continue                                # повтор запроса
-                номер = сообщение.начало.split()[1].split(":")[1].split("@")[0]
-                self.набрано.append(номер)
-                self.от_заголовок = сообщение.взять("from")
-                self._ответить(сообщение, откуда, 100, "Trying")
-                if self.ответ == "notfound":
-                    self._ответить(сообщение, откуда, 404, "Not Found", метка="nf")
-                    continue
-                if self.ответ == "busy":
-                    self._ответить(сообщение, откуда, 486, "Busy Here", метка="busy")
-                    continue
-                self._ответить(сообщение, откуда, 180, "Ringing", метка="abc")
-                self._разговор = {"call-id": сообщение.взять("call-id"), "invite": сообщение,
-                                  "откуда": откуда, "sdp": sip.разобрать_sdp(сообщение.тело),
-                                  "contact": сообщение.взять("contact")}
-                if self.ответ == "answer":
-                    тело = ("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n"
-                            f"t=0 0\r\nm=audio {self.порт_звука} RTP/AVP "
-                            f"{sip.НОМЕР_КОДЕКА[self.кодек]} 101\r\n"
-                            f"a=rtpmap:{sip.НОМЕР_КОДЕКА[self.кодек]} {self.кодек}/8000\r\n"
-                            "a=rtpmap:101 telephone-event/8000\r\n").encode()
-                    self._ответить(сообщение, откуда, 200, "OK", тело=тело, метка="abc", ещё=[
-                        ("Contact", f"<sip:pbx@127.0.0.1:{self.порт}>"),
-                        ("Content-Type", "application/sdp")])
-            elif метод == "ACK":
-                self.ack_с_паролем.append(bool(сообщение.взять("authorization")
-                                               or сообщение.взять("proxy-authorization")))
-                if self._разговор and self.ответ == "answer" and "поток" not in self._разговор:
-                    поток = threading.Thread(target=self._абонент, daemon=True)
-                    self._разговор["поток"] = поток
-                    поток.start()
-            elif метод == "CANCEL":
-                if self.глотать_отмену > 0:
-                    self.глотать_отмену -= 1           # «потерялся» в сети
-                    continue
-                self.отменён.set()
-                self._ответить(сообщение, откуда, 200, "OK", метка="abc")
-                if self._разговор:
-                    self._ответить(self._разговор["invite"], откуда, 487,
-                                   "Request Terminated", метка="abc")
-            elif метод == "BYE":
-                self.bye_от_телефона.set()
-                self._ответить(сообщение, откуда, 200, "OK")
+            self._обработать(данные, откуда)
+
+    def _обработать(self, данные: bytes, откуда: Any) -> None:
+        сообщение = sip.разобрать(данные)
+        if сообщение is not None and сообщение.ответ \
+                and сообщение.cseq == (2, "INVITE") and сообщение.код == 200:
+            self.ответы_на_повтор.append(сообщение)
+            # ACK — только на третий 200: телефон обязан повторять ответ.
+            if len(self.ответы_на_повтор) == 3:
+                self._ack_повтора(сообщение)
+            return
+        if сообщение is None or сообщение.ответ:
+            return
+        метод = сообщение.метод
+        self.журнал.append(метод)
+        if метод == "REGISTER":
+            if not self._пароль_верен(сообщение):
+                self._спросить_пароль(сообщение, откуда)
+                return
+            срок = сообщение.взять("expires", "300")
+            if срок == "0":
+                self.снята_регистрация = True
             else:
-                self._ответить(сообщение, откуда, 200, "OK")
+                self.регистраций += 1
+            self._ответить(сообщение, откуда, 200, "OK", метка="reg", ещё=[
+                ("Contact", f"{сообщение.взять('contact').split(';')[0]};expires={срок}")])
+        elif метод == "INVITE":
+            if not self._пароль_верен(сообщение):
+                self._спросить_пароль(сообщение, откуда)
+                return
+            if сообщение.взять("call-id") in self._разговор:
+                return                                # повтор запроса
+            номер = сообщение.начало.split()[1].split(":")[1].split("@")[0]
+            self.набрано.append(номер)
+            self.от_заголовок = сообщение.взять("from")
+            self._ответить(сообщение, откуда, 100, "Trying")
+            if self.ответ == "notfound":
+                self._ответить(сообщение, откуда, 404, "Not Found", метка="nf")
+                return
+            if self.ответ == "busy":
+                self._ответить(сообщение, откуда, 486, "Busy Here", метка="busy")
+                return
+            self._ответить(сообщение, откуда, 180, "Ringing", метка="abc")
+            self._разговор = {"call-id": сообщение.взять("call-id"), "invite": сообщение,
+                              "откуда": откуда, "sdp": sip.разобрать_sdp(сообщение.тело),
+                              "contact": сообщение.взять("contact")}
+            if self.ответ == "answer":
+                крипто = ""
+                if self.srtp and self._разговор["sdp"]["крипто"]:
+                    # Как Asterisk: свой ключ с тегом и набором из предложения.
+                    их = self._разговор["sdp"]["крипто"][0]
+                    assert self.ключ_станции is not None
+                    свой = шифр.Ключ(их.тег, их.набор, self.ключ_станции.мастер)
+                    self.srtp_приём = шифр.SRTP(их)
+                    self.srtp_отправка = шифр.SRTP(свой)
+                    крипто = f"a=crypto:{свой.строка}\r\n"
+                тело = ("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n"
+                        f"t=0 0\r\nm=audio {self.порт_звука} "
+                        f"{'RTP/SAVP' if крипто else 'RTP/AVP'} "
+                        f"{sip.НОМЕР_КОДЕКА[self.кодек]} 101\r\n"
+                        f"a=rtpmap:{sip.НОМЕР_КОДЕКА[self.кодек]} {self.кодек}/8000\r\n"
+                        "a=rtpmap:101 telephone-event/8000\r\n" + крипто).encode()
+                self._ответить(сообщение, откуда, 200, "OK", тело=тело, метка="abc", ещё=[
+                    ("Contact", f"<sip:pbx@127.0.0.1:{self.порт}>"),
+                    ("Content-Type", "application/sdp")])
+        elif метод == "ACK":
+            self.ack_с_паролем.append(bool(сообщение.взять("authorization")
+                                           or сообщение.взять("proxy-authorization")))
+            if self._разговор and self.ответ == "answer" and "поток" not in self._разговор:
+                поток = threading.Thread(target=self._абонент, daemon=True)
+                self._разговор["поток"] = поток
+                поток.start()
+        elif метод == "CANCEL":
+            if self.глотать_отмену > 0:
+                self.глотать_отмену -= 1           # «потерялся» в сети
+                return
+            self.отменён.set()
+            self._ответить(сообщение, откуда, 200, "OK", метка="abc")
+            if self._разговор:
+                self._ответить(self._разговор["invite"], откуда, 487,
+                               "Request Terminated", метка="abc")
+        elif метод == "BYE":
+            self.bye_от_телефона.set()
+            self._ответить(сообщение, откуда, 200, "OK")
+        else:
+            self._ответить(сообщение, откуда, 200, "OK")
 
     # -- абонент ------------------------------------------------------------
 
@@ -196,7 +297,10 @@ class МиниАТС:
                                 (состояние["время"] if метка is None else метка) & 0xFFFFFFFF,
                                 0x1234)
         состояние["номер"] += 1
-        self.звук.sendto(заголовок + нагрузка, self._разговор["куда"])
+        пакет = заголовок + нагрузка
+        if self.srtp_отправка is not None:
+            пакет = self.srtp_отправка.защитить(пакет)
+        self.звук.sendto(пакет, self._разговор["куда"])
 
     def _нажать(self, кнопка: str, состояние: dict[str, int]) -> None:
         self.нажато.append(кнопка)
@@ -204,8 +308,8 @@ class МиниАТС:
             invite = self._разговор["invite"]
             цель = sip._адрес_в_скобках(self._разговор["contact"])
             тело = f"Signal={кнопка}\r\nDuration=160\r\n".encode()
-            self.сокет.sendto(sip.собрать(f"INFO {цель} SIP/2.0", [
-                ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.порт};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
+            self._отправить(sip.собрать(f"INFO {цель} SIP/2.0", [
+                ("Via", f"{self._via_сторона};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
                 ("From", invite.взять("to") + ";tag=abc"), ("To", invite.взять("from")),
                 ("Call-ID", invite.взять("call-id")), ("CSeq", f"{random.randint(2, 999)} INFO"),
                 ("Content-Type", "application/dtmf-relay")], тело), self._разговор["откуда"])
@@ -248,6 +352,13 @@ class МиниАТС:
             except OSError:
                 return
             пусто_подряд = 0
+            if self.srtp_приём is not None:
+                открыто = self.srtp_приём.раскрыть(данные)
+                if открыто is None:
+                    continue
+                данные = открыто
+            elif данные[1] & 0x7F in (0, 8, 101):
+                self.открытых_пакетов += 1
             нагрузка = данные[12:]
             self.получено_звука += len(нагрузка)
             if нагрузка.count(тишина) > len(нагрузка) * 0.9:
@@ -274,8 +385,8 @@ class МиниАТС:
                 "a=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n"
                 "a=rtpmap:101 telephone-event/8000\r\n").encode()
         self._повтор_from = invite.взять("to") + ";tag=abc"
-        self.сокет.sendto(sip.собрать(f"INVITE {цель} SIP/2.0", [
-            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.порт};branch=z9hG4bKre{uuid.uuid4().hex[:8]}"),
+        self._отправить(sip.собрать(f"INVITE {цель} SIP/2.0", [
+            ("Via", f"{self._via_сторона};branch=z9hG4bKre{uuid.uuid4().hex[:8]}"),
             ("From", self._повтор_from), ("To", invite.взять("from")),
             ("Call-ID", invite.взять("call-id")), ("CSeq", "2 INVITE"),
             ("Contact", f"<sip:pbx@127.0.0.1:{self.порт}>"),
@@ -283,23 +394,25 @@ class МиниАТС:
 
     def _ack_повтора(self, ответ: sip.Сообщение) -> None:
         цель = sip._адрес_в_скобках(self._разговор["contact"])
-        self.сокет.sendto(sip.собрать(f"ACK {цель} SIP/2.0", [
-            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.порт};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
+        self._отправить(sip.собрать(f"ACK {цель} SIP/2.0", [
+            ("Via", f"{self._via_сторона};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
             ("From", self._повтор_from), ("To", ответ.взять("to")),
             ("Call-ID", ответ.взять("call-id")), ("CSeq", "2 ACK")]), self._разговор["откуда"])
 
     def _положить(self) -> None:
         invite = self._разговор["invite"]
         цель = sip._адрес_в_скобках(self._разговор["contact"])
-        self.сокет.sendto(sip.собрать(f"BYE {цель} SIP/2.0", [
-            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.порт};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
+        self._отправить(sip.собрать(f"BYE {цель} SIP/2.0", [
+            ("Via", f"{self._via_сторона};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
             ("From", invite.взять("to") + ";tag=abc"), ("To", invite.взять("from")),
             ("Call-ID", invite.взять("call-id")), ("CSeq", "77 BYE")]),
             self._разговор["откуда"])
 
     def закрыть(self) -> None:
         self._стоп.set()
-        for сокет in (self.сокет, self.звук):
+        for сокет in (self.сокет, self.звук, self._соединение):
+            if сокет is None:
+                continue
             try:
                 сокет.close()
             except OSError:

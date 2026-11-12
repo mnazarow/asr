@@ -12,6 +12,7 @@ server/asrhub/api/routes_ai.py
 server/asrhub/api/routes_auth.py
 server/asrhub/api/routes_backup.py
 server/asrhub/api/routes_content.py
+server/asrhub/api/routes_dialplan.py
 server/asrhub/api/routes_drill.py
 server/asrhub/api/routes_employees.py
 server/asrhub/api/routes_llm.py
@@ -43,6 +44,7 @@ server/asrhub/content/names.py
 server/asrhub/content/rules.py
 server/asrhub/content/sentiment.py
 server/asrhub/content_export.py
+server/asrhub/content_index.py
 server/asrhub/crm.py
 server/asrhub/drill.py
 server/asrhub/employees.py
@@ -107,8 +109,11 @@ server/asrhub/pipeline/waveform.py
 server/asrhub/processor.py
 server/asrhub/qa.py
 server/asrhub/qc/__init__.py
+server/asrhub/qc/sip.py
+server/asrhub/qc/srtp.py
 server/asrhub/qc/survey.py
 server/asrhub/qc/tts.py
+server/asrhub/qc/tts_service.py
 server/asrhub/quality.py
 server/asrhub/resources.py
 server/asrhub/review.py
@@ -117,6 +122,7 @@ server/asrhub/selfcheck.py
 server/asrhub/settings_access.py
 server/asrhub/streaming.py
 server/asrhub/telephony/__init__.py
+server/asrhub/telephony/asterisk.py
 server/asrhub/telephony/audiosocket.py
 server/asrhub/telephony/dialplan.py
 server/asrhub/telephony/dialplan_config.py

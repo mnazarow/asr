@@ -652,7 +652,7 @@ def analyze(*, text: str, segments: list[dict[str, Any]] | None = None,
     }
 
 
-def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Раскладывает разбор на то, как он лежит в базе.
 
     Первое — свод: два десятка чисел, по которым считаются разрезы по
@@ -665,7 +665,7 @@ def features(разбор: dict[str, Any]) -> tuple[dict[str, Any], dict[str, in
     отдельной таблицы, а не колонки; база забирает их при сохранении.
     """
     разбор = dict(разбор)
-    основы = разбор.pop("terms", None) or {}
+    основы = разбор.pop("terms", None) or []
     тон = разбор.get("sentiment") or {}
     речь = разбор.get("speech") or {}
     сущности = разбор.get("entities") or {}

@@ -81,6 +81,9 @@ class Параметры:
     tracks: bool = False
     #: Код «не записывать» посреди разговора (`features.conf`); пусто — без него.
     norec_code: str = ""
+    #: Живой разговор двух людей в ASR Hub по AudioSocket: «узел:порт»
+    #: приёма (audiosocket_host/port сервера); пусто — без него.
+    live: str = ""
 
 
 def параметры(**сырые: Any) -> Параметры:
@@ -136,7 +139,46 @@ def параметры(**сырые: Any) -> Параметры:
     п.norec_code = код
     if п.tracks and п.mode != "upload":
         raise ValueError("раздельные дорожки — только при отправке файлом (upload)")
+    живой = str(сырые.get("live") or "").strip()
+    if живой and not re.fullmatch(r"[A-Za-z0-9.\-]{1,253}:\d{1,5}", живой):
+        raise ValueError("приём живого разговора — узел:порт, например 10.0.5.2:9092")
+    if живой and not 0 < int(живой.rsplit(":", 1)[1]) < 65536:
+        raise ValueError("порт приёма живого разговора — от 1 до 65535")
+    п.live = живой
     return п
+
+
+def живой_разговор(п: Параметры) -> str:
+    """Оба голоса разговора — в ASR Hub на лету: ChanSpy через Local-канал."""
+    return f"""\
+; Живой разговор двух людей — в ASR Hub по AudioSocket (Asterisk 16.6+).
+;
+; ВНИМАНИЕ: рецепт собран по документации Asterisk и на живой станции не
+; проверялся. Сначала — пробный звонок на тестовом номере.
+;
+; AudioSocket() забирает звук канала себе, поэтому разговор слушает «шпион»:
+; Local-канал, одна половина которого слушает разговор (ChanSpy — обе
+; стороны вместе), а другая отдаёт услышанное в AudioSocket. Свой разговор
+; шпион находит по группе SPYGROUP — чужие он не слышит.
+;
+; Вызов — на канале разговора до Dial() или Queue() (рядом с asrhub-record):
+;   same => n,Gosub(asrhub-live,s,1)
+; На сервере: audiosocket_port (и audiosocket_host — {п.live.rsplit(":", 1)[0]}),
+; события call.live приходят в веб-интерфейс и по веб-сокету.
+
+[asrhub-live]
+exten => s,1,Set(ASRHUB_LIVE=${{FILTER(0-9,${{UNIQUEID}})}})
+ same => n,Set(SPYGROUP=asrhub${{ASRHUB_LIVE}})
+ ; a — не ждать ответа шпиона: разговор идёт своим чередом.
+ same => n,Originate(Local/${{ASRHUB_LIVE}}@asrhub-live-spy/n,app,AudioSocket,${{UUID()}}\\,{п.live},,,a)
+ same => n,Return()
+
+[asrhub-live-spy]
+; q — без объявлений, E — выйти, когда разговор кончился, g() — только свой.
+exten => _X.,1,Answer()
+ same => n,ChanSpy(,qEg(asrhub${{EXTEN}}))
+ same => n,Hangup()
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +557,10 @@ def собрать(п: Параметры, *, версия: str = "") -> dict[st
         {"id": "queues", "title": "Очереди: кто ответил",
          "path": "/etc/asterisk/queues.conf", "lang": "asterisk", "text": очереди(п)},
     ]
+    if п.live:
+        файлы.append({"id": "live", "title": "Живой разговор двух людей (не проверено)",
+                      "path": "/etc/asterisk/extensions_asrhub_live.conf",
+                      "lang": "asterisk", "text": живой_разговор(п)})
     if п.norec_code:
         файлы.append({"id": "features", "title": "Код «не записывать» в разговоре",
                       "path": "/etc/asterisk/features_applicationmap_custom.conf",
