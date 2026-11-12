@@ -1128,7 +1128,6 @@ function fmtNum(value, digits) {
     const gap = Math.min(8, slot * 0.25);
     const ширина = Math.max(2, slot - gap);
     const yAt = (v) => ctx.pad.top + ctx.ih - (v / ctx.yMax) * ctx.ih;
-    const цвета = palette();
     for (let i = 0; i < n; i += 1) {
       let низ = ctx.pad.top + ctx.ih;
       const x = ctx.pad.left + i * slot + gap / 2;

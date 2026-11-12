@@ -9,11 +9,18 @@
     PYTHONPATH=server python3 docs/make_screenshots.py            # все
     PYTHONPATH=server python3 docs/make_screenshots.py 03-results  # один
 
-Снимки состояний (открытая карточка, редактор, окно) он не трогает: их
-место в главе описывает конкретный шаг, и снимать их надо вместе с текстом.
-Не трогает и разделы, которым демонстрационного архива мало, чтобы снимок
-что-то показал: «Очередь LLM» (нужна идущая очередь разбора) и «Резервные
-копии» (нужны копии).
+Кроме обзорных снимков разделов — снимки состояний (`СОСТОЯНИЯ`):
+открытая карточка записи и её вкладки, карточка модели, окно горячих
+клавиш, вкладки «АТС», «Аналитики записей» и других разделов. Состояние
+открывается вызовом той же функции интерфейса, что и щелчок (`window.__asrhub`),
+а не поиском кнопки по тексту: так снимок не ломается от переименования.
+
+Тема — светлая: так снимки читаются и на экране, и на бумаге (Word, PDF).
+Не снимаются разделы, которым демонстрационного архива мало, чтобы снимок
+что-то показал: «Очередь LLM» (нужна идущая очередь разбора), «Резервные
+копии» (нужны копии) и экран входа (нужен стенд со входом).
+
+Из `docs/build.sh`: `bash docs/build.sh --screenshots` — снимки, потом сборка.
 """
 from __future__ import annotations
 
@@ -52,6 +59,35 @@ sys.path.insert(0, str(КОРЕНЬ / "server"))
     "86-qc": ("qc", True),
     "87-manual": ("manual/32-quality-control", False),
 }
+
+
+#: Снимок состояния → (раздел, действие в странице — выражение JS, которое
+#: открывает нужное состояние; `ЗАПИСЬ` подставляется идентификатором
+#: готовой записи архива, `МОДЕЛЬ` — модели).
+СОСТОЯНИЯ: dict[str, tuple[str, str]] = {
+    "13-model-card": ("models", "window.__asrhub.showModel(МОДЕЛЬ)"),
+    "14-job-card": ("results", "window.__asrhub.openJob(ЗАПИСЬ)"),
+    "17-hotkeys": ("transcribe", "window.__asrhub.showHotkeys()"),
+    "21-waveform": ("results", "window.__asrhub.openJob(ЗАПИСЬ)"),
+    "29-content-breakdowns": ("content", "РАЗДЕЛ_ВКЛАДКА('groups')"),
+    "30-content-topics": ("content", "РАЗДЕЛ_ВКЛАДКА('topics')"),
+    "31-content-records": ("content", "РАЗДЕЛ_ВКЛАДКА('records')"),
+    "56-content-agents": ("content", "РАЗДЕЛ_ВКЛАДКА('agents')"),
+    "64-job-reference-tab": ("results", "window.__asrhub.openJob(ЗАПИСЬ, {tab: 'reference'})"),
+    "69-job-llm": ("results", "window.__asrhub.openJob(ЗАПИСЬ, {tab: 'analysis'})"),
+    "75-employees": ("employees", ""),
+    "82-voice": ("voice", ""),
+    "84-agents": ("pbx", "ВКЛАДКА_АТС('agents')"),
+    "25-load-charts": ("pbx", "ВКЛАДКА_АТС('load')"),
+}
+
+#: Как переключить вкладку раздела: «АТС» и «Аналитика записей».
+_ВКЛАДКИ = """
+window.ВКЛАДКА_АТС = (имя) => { const к = document.querySelector(
+  `#pbx-tabs button[data-tab="${имя}"]`); if (к) к.click(); };
+window.РАЗДЕЛ_ВКЛАДКА = (имя) => { const к = document.querySelector(
+  `#content-tabs button[data-tab="${имя}"]`); if (к) к.click(); };
+"""
 
 
 def _контроль_качества(хаб) -> None:
@@ -103,8 +139,10 @@ def main(отбор: list[str]) -> int:
     try:
         with sync_playwright() as игра:
             движок = игра.chromium.launch(executable_path=браузер())
-            страница = движок.new_page(viewport={"width": 1680, "height": 1020}, color_scheme="dark",
-                                       device_scale_factor=2)
+            страница = движок.new_page(viewport={"width": 1680, "height": 1020},
+                                       color_scheme="light", device_scale_factor=2)
+            страница.add_init_script("try { localStorage.setItem('asrhub_theme', 'light'); }"
+                                     " catch (e) {}")
             for имя, (раздел, целиком) in СНИМКИ.items():
                 if отбор and имя not in отбор:
                     continue
@@ -112,6 +150,23 @@ def main(отбор: list[str]) -> int:
                 страница.wait_for_timeout(2000)
                 страница.screenshot(path=str(куда / f"{имя}.png"), full_page=целиком)
                 print(f"  {имя}.png ← {раздел}")
+            хаб = архив.app.state.hub
+            запись = next((с["id"] for с in хаб.db.query(
+                "SELECT id FROM jobs WHERE status='completed' ORDER BY created_at DESC LIMIT 1")),
+                "")
+            модель = str(хаб.settings.get("model") or "demo-simulator")
+            for имя, (раздел, действие) in СОСТОЯНИЯ.items():
+                if отбор and имя not in отбор:
+                    continue
+                страница.goto(f"{адрес}/#{раздел}", wait_until="networkidle")
+                страница.wait_for_timeout(1500)
+                if действие:
+                    страница.evaluate(_ВКЛАДКИ)
+                    страница.evaluate(действие.replace("ЗАПИСЬ", json.dumps(запись))
+                                      .replace("МОДЕЛЬ", json.dumps(модель)))
+                    страница.wait_for_timeout(2000)
+                страница.screenshot(path=str(куда / f"{имя}.png"))
+                print(f"  {имя}.png ← {раздел}: {действие or 'раздел'}")
             движок.close()
     finally:
         остановить()

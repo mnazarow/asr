@@ -156,3 +156,53 @@ def свод(события: list[dict[str, Any]], *, порог_с: float = 20.
             "queues": sorted(очереди.values(), key=lambda о: -о["entered"]),
             "agents": sorted(операторы.values(),
                              key=lambda а: (-а["ringnoanswer"], -а["answered"]))}
+
+
+# ---------------------------------------------------------------------------
+# События очередей из AMI — для станций без доступного queue_log
+# ---------------------------------------------------------------------------
+
+#: Событие AMI → событие queue_log. Класс событий AMI — `agent`.
+СОБЫТИЯ_AMI = {
+    "queuecallerjoin": "ENTERQUEUE", "join": "ENTERQUEUE",
+    "queuecallerabandon": "ABANDON",
+    "agentconnect": "CONNECT",
+    "agentcomplete": "COMPLETEAGENT",
+    "agentringnoanswer": "RINGNOANSWER",
+}
+
+
+def из_события_ami(событие: dict[str, Any], *, сейчас: float | None = None) -> dict[str, Any] | None:
+    """Событие AMI класса `agent` → строка разреза очередей; None — не наше.
+
+    Время — из `Timestamp` (при `timestampevents=yes` в manager.conf), иначе
+    время приёма. `HoldTime` — сколько звонок ждал, `TalkTime` — разговор,
+    `RingTime` у `AgentConnect` — секунды, у `AgentRingNoAnswer` —
+    миллисекунды (так их отдаёт Asterisk).
+    """
+    import time  # noqa: PLC0415
+
+    вид = СОБЫТИЯ_AMI.get(str(событие.get("Event") or "").strip().lower())
+    if вид is None:
+        return None
+    if вид == "COMPLETEAGENT" and str(событие.get("Reason") or "").lower() == "caller":
+        вид = "COMPLETECALLER"
+    момент = _число(событие.get("Timestamp")) or (сейчас if сейчас is not None else time.time())
+    оператор = событие.get("MemberName") or событие.get("Interface") or ""
+    if вид in ("CONNECT", "COMPLETEAGENT", "COMPLETECALLER", "RINGNOANSWER"):
+        оператор = событие.get("Interface") or событие.get("MemberName") or ""
+    итог: dict[str, Any] = {
+        "ts": момент, "callid": str(событие.get("Uniqueid") or событие.get("UniqueID") or "")[:64],
+        "queue": str(событие.get("Queue") or "")[:64],
+        "agent": _оператор(str(оператор)) if вид != "ENTERQUEUE" and вид != "ABANDON" else "",
+        "event": вид, "wait_s": None, "ring_s": None, "talk_s": None,
+    }
+    if вид in ("CONNECT", "ABANDON", "COMPLETEAGENT", "COMPLETECALLER"):
+        итог["wait_s"] = _число(событие.get("HoldTime"))
+    if вид == "CONNECT" and событие.get("RingTime") not in (None, ""):
+        итог["ring_s"] = _число(событие.get("RingTime"))
+    if вид == "RINGNOANSWER":
+        итог["ring_s"] = _число(событие.get("RingTime")) / 1000.0
+    if вид in ("COMPLETEAGENT", "COMPLETECALLER"):
+        итог["talk_s"] = _число(событие.get("TalkTime"))
+    return итог

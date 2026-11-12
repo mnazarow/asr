@@ -1106,3 +1106,8 @@ table.vp-agents a[data-agent], #vp-depts a[data-dept] { color: inherit; text-dec
   .manual-layout { display: block; }
   .manual-main { border: 0; box-shadow: none; padding: 0; }
 }
+
+/* Сортировка по столбцу (app.js): заголовок — щелчком, направление — стрелкой. */
+table.table > thead th:not([data-nosort]) { cursor: pointer; }
+table.table > thead th[data-sorted="asc"]::after { content: " ▲"; font-size: 0.75em; opacity: 0.7; }
+table.table > thead th[data-sorted="desc"]::after { content: " ▼"; font-size: 0.75em; opacity: 0.7; }

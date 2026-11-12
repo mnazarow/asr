@@ -21,8 +21,10 @@ import json
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from ..db import Database, new_id
@@ -38,7 +40,9 @@ log = get_logger("qc")
 ПРОЙДЕН, ЧАСТИЧНО, БЕЗ_ОТВЕТА = "пройден", "частично", "без ответа"
 ОТКАЗ, НЕ_ДОЗВОНИЛИСЬ, ОШИБКА = "отказ", "не дозвонились", "ошибка"
 УСТАРЕЛ, ОТМЕНЁН = "устарел", "отменён"
-ИТОГОВЫЕ = (ПРОЙДЕН, ЧАСТИЧНО, БЕЗ_ОТВЕТА, ОТКАЗ, НЕ_ДОЗВОНИЛИСЬ, ОШИБКА, УСТАРЕЛ, ОТМЕНЁН)
+АВТООТВЕТЧИК = "автоответчик"
+ИТОГОВЫЕ = (ПРОЙДЕН, ЧАСТИЧНО, БЕЗ_ОТВЕТА, ОТКАЗ, НЕ_ДОЗВОНИЛИСЬ, ОШИБКА, УСТАРЕЛ, ОТМЕНЁН,
+            АВТООТВЕТЧИК)
 #: Клиент снял трубку.
 ДОЗВОНИЛИСЬ = (ПРОЙДЕН, ЧАСТИЧНО, БЕЗ_ОТВЕТА, ОТКАЗ)
 #: Клиент ответил хотя бы на один вопрос.
@@ -64,14 +68,74 @@ log = get_logger("qc")
 ОТКАЗ_ПРИНЯТ = "Мы больше не будем звонить вам с опросом. Всего доброго."
 
 
+#: Виды вопросов: оценка кнопкой (или голосом) и свободный комментарий.
+ОЦЕНКА, КОММЕНТАРИЙ = "scale", "comment"
+#: Условия ветвления: ответ на прежний вопрос ниже, выше или равен числу.
+УСЛОВИЯ = ("below", "above", "equals")
+#: Числа словами — для голосовых ответов («пять», «пятёрка»).
+ЧИСЛА_СЛОВАМИ = {
+    "ноль": 0, "нуль": 0, "один": 1, "одна": 1, "единица": 1, "раз": 1, "два": 2, "две": 2,
+    "двойка": 2, "три": 3, "тройка": 3, "четыре": 4, "четвёрка": 4, "четверка": 4,
+    "пять": 5, "пятёрка": 5, "пятерка": 5, "шесть": 6, "шестёрка": 6, "шестерка": 6,
+    "семь": 7, "семёрка": 7, "семерка": 7, "восемь": 8, "восьмёрка": 8, "восьмерка": 8,
+    "девять": 9, "девятка": 9,
+}
+
+
 @dataclass(slots=True)
 class Вопрос:
     text: str
     low: int = 1
     high: int = 5
+    #: `scale` — оценка кнопкой (и голосом, если группа это разрешает);
+    #: `comment` — свободный ответ голосом, распознаётся в текст.
+    kind: str = ОЦЕНКА
+    #: Ветвление: {"question": N, "below"|"above"|"equals": число} — вопрос
+    #: задаётся, только если ответ на вопрос N подходит.
+    when: dict[str, int] | None = None
+    #: Свои слова для голосового ответа: {"да": 1, "нет": 2}.
+    words: dict[str, int] = field(default_factory=dict)
+    #: Сколько секунд слушать комментарий.
+    seconds: int = 15
 
     def to_dict(self) -> dict[str, Any]:
-        return {"text": self.text, "min": self.low, "max": self.high}
+        данные: dict[str, Any] = {"text": self.text, "min": self.low, "max": self.high}
+        if self.kind != ОЦЕНКА:
+            данные.update(kind=self.kind, seconds=self.seconds)
+        if self.when:
+            данные["when"] = dict(self.when)
+        if self.words:
+            данные["words"] = dict(self.words)
+        return данные
+
+    def задать_ли(self, ответы: list[dict[str, Any]]) -> bool:
+        """Условие ветвления по уже полученным ответам."""
+        if not self.when:
+            return True
+        номер = int(self.when.get("question") or 0) - 1
+        if not 0 <= номер < len(ответы):
+            return False
+        цифра = ответы[номер].get("digit")
+        if цифра is None:
+            return False
+        if "below" in self.when:
+            return int(цифра) < int(self.when["below"])
+        if "above" in self.when:
+            return int(цифра) > int(self.when["above"])
+        return int(цифра) == int(self.when.get("equals", -1))
+
+    def цифра_из_речи(self, текст: str) -> int | None:
+        """Голосовой ответ → кнопка шкалы: свои слова вопроса, затем числа."""
+        слова = re.findall(r"[0-9]+|[а-яёa-z]+", str(текст or "").lower())
+        свои = {str(к).lower(): int(з) for к, з in self.words.items()}
+        for слово in слова:
+            if слово in свои:
+                return свои[слово]
+        for слово in слова:
+            число = int(слово) if слово.isdigit() else ЧИСЛА_СЛОВАМИ.get(слово)
+            if число is not None and self.low <= число <= self.high:
+                return число
+        return None
 
 
 @dataclass(slots=True)
@@ -92,6 +156,10 @@ class Группа:
     #: Отделы справочника сотрудников: добавочный сотрудника из такого отдела
     #: входит в группу и без перечисления номеров (см. `содержит`).
     departments: tuple[str, ...] = ()
+    #: Принимать ответ голосом, если кнопку не нажали («пять», «да»).
+    voice_answers: bool = False
+    #: Образец голоса группы — имя загруженной аудиозаписи (иначе общий).
+    voice_sample: str = ""
     _номера: frozenset[str] = frozenset()
     _отрезки: tuple[tuple[int, int, int], ...] = ()
 
@@ -116,7 +184,8 @@ class Группа:
                 "sample_percent": self.sample_percent, "greeting": self.greeting,
                 "questions": [в.to_dict() for в in self.questions],
                 "goodbye": self.goodbye, "optout_digit": self.optout_digit,
-                "repeats": self.repeats, "departments": list(self.departments)}
+                "repeats": self.repeats, "departments": list(self.departments),
+                "voice_answers": self.voice_answers, "voice_sample": self.voice_sample}
 
     def фразы(self) -> list[str]:
         """Все тексты, которые понадобятся в разговоре, — для подготовки звука."""
@@ -137,6 +206,27 @@ def _целое(значение: Any, запасное: int, низ: int, ве�
     if not низ <= число <= верх:
         raise ValueError(f"{что}: от {низ} до {верх}, получено {число}")
     return число
+
+
+def _да(значение: Any) -> bool:
+    if isinstance(значение, str):
+        return значение.strip().lower() not in ("0", "false", "no", "off", "нет", "")
+    return bool(значение)
+
+
+def _условие(значение: Any, прежние: list[Вопрос], где: str) -> dict[str, int] | None:
+    """Условие ветвления вопроса — по ответу на один из прежних вопросов."""
+    if значение in (None, "", {}):
+        return None
+    if not isinstance(значение, dict):
+        raise ValueError(f"{где}: when — объект {{\"question\": 1, \"below\": 3}}")
+    номер = _целое(значение.get("question"), 0, 1, ПРЕДЕЛ_ВОПРОСОВ, f"{где}, when.question")
+    if номер > len(прежние) or прежние[номер - 1].kind != ОЦЕНКА:
+        raise ValueError(f"{где}: when.question — номер одного из прежних вопросов с оценкой")
+    виды = [в for в in УСЛОВИЯ if в in значение]
+    if len(виды) != 1:
+        raise ValueError(f"{где}: в when одно из below, above, equals")
+    return {"question": номер, виды[0]: _целое(значение[виды[0]], 0, 0, 9, f"{где}, when")}
 
 
 def _отделы(значение: Any) -> tuple[str, ...]:
@@ -219,15 +309,28 @@ def разобрать_группы(значение: Any) -> list[Группа]
                 raise ValueError(f"{где}, вопрос {н}: пустой текст")
             if len(текст) > tts.ДЛИНА_ФРАЗЫ and not текст.startswith(("file:", tts.ЗАГРУЖЕННАЯ)):
                 raise ValueError(f"{где}, вопрос {н}: длиннее {tts.ДЛИНА_ФРАЗЫ} знаков")
+            вид = str(сырой.get("kind") or ОЦЕНКА).strip().lower()
+            if вид not in (ОЦЕНКА, КОММЕНТАРИЙ):
+                raise ValueError(f"{где}, вопрос {н}: kind — scale или comment")
             низ = _целое(сырой.get("min"), 1, 0, 9, f"{где}, вопрос {н}, min")
             верх = _целое(сырой.get("max"), 5, 0, 9, f"{где}, вопрос {н}, max")
-            if низ >= верх:
+            if вид == ОЦЕНКА and низ >= верх:
                 raise ValueError(f"{где}, вопрос {н}: min меньше max (кнопки от {низ} до {верх}?)")
-            вопросы.append(Вопрос(текст, низ, верх))
+            условие = _условие(сырой.get("when"), вопросы, f"{где}, вопрос {н}")
+            слова = сырой.get("words") or {}
+            if not isinstance(слова, dict) or any(
+                    not str(з).isdigit() or not низ <= int(з) <= верх for з in слова.values()):
+                raise ValueError(f"{где}, вопрос {н}: words — слова и кнопки шкалы "
+                                 f"от {низ} до {верх}, например {{\"да\": 1, \"нет\": 2}}")
+            вопросы.append(Вопрос(
+                текст, низ, верх, kind=вид, when=условие,
+                words={" ".join(str(к).lower().split()): int(з) for к, з in слова.items()},
+                seconds=_целое(сырой.get("seconds"), 15, 3, 60, f"{где}, вопрос {н}, seconds")))
         отказ = str(запись.get("optout_digit") or "").strip()
         if отказ and отказ not in tuple("0123456789*#"):
             raise ValueError(f"{где}: optout_digit — одна кнопка телефона")
-        if отказ and any(в.low <= int(отказ) <= в.high for в in вопросы if отказ.isdigit()):
+        if отказ and any(в.low <= int(отказ) <= в.high for в in вопросы
+                         if отказ.isdigit() and в.kind == ОЦЕНКА):
             raise ValueError(f"{где}: кнопка отказа «{отказ}» попадает в шкалу оценок")
         включена = запись.get("enabled", True)
         if isinstance(включена, str):
@@ -247,7 +350,11 @@ def разобрать_группы(значение: Any) -> list[Группа]
             optout_digit=отказ,
             repeats=_целое(запись.get("repeats"), 1, 0, 3, f"{где}, repeats"),
             departments=_отделы(запись.get("departments")),
+            voice_answers=_да(запись.get("voice_answers", False)),
+            voice_sample=str(запись.get("voice_sample") or "").strip(),
         )
+        if группа.voice_sample and not tts.имя_годится(группа.voice_sample):
+            raise ValueError(f"{где}: voice_sample — имя загруженной аудиозаписи")
         for что, текст in (("приветствие", группа.greeting), ("прощание", группа.goodbye)):
             if len(текст) > tts.ДЛИНА_ФРАЗЫ and not текст.startswith(("file:", tts.ЗАГРУЖЕННАЯ)):
                 raise ValueError(f"{где}: {что} длиннее {tts.ДЛИНА_ФРАЗЫ} знаков")
@@ -412,12 +519,102 @@ def отобрать(звонок: dict[str, Any], группы: list[Групп
 # Сценарий разговора
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Звук клиента: речь, автоответчик, голосовые ответы
+# ---------------------------------------------------------------------------
+
+#: Кадр разбора речи — 20 мс при 8 кГц, 16 бит.
+_КАДР_РЕЧИ = 320
+#: Порог громкости кадра речи (среднеквадратичное, из 32767): около −36 дБ.
+ПОРОГ_РЕЧИ = 500
+
+
+def кадры_речи(pcm: bytes) -> list[bool]:
+    """Есть ли речь в каждом кадре 20 мс (по громкости)."""
+    import array  # noqa: PLC0415
+
+    итог: list[bool] = []
+    for начало in range(0, len(pcm) - _КАДР_РЕЧИ + 1, _КАДР_РЕЧИ):
+        отсчёты = array.array("h", pcm[начало:начало + _КАДР_РЕЧИ])
+        мощность = sum(о * о for о in отсчёты) / max(1, len(отсчёты))
+        итог.append(мощность > ПОРОГ_РЕЧИ * ПОРОГ_РЕЧИ)
+    return итог
+
+
+def _самая_длинная(кадры: list[bool]) -> int:
+    лучшая = подряд = 0
+    for речь in кадры:
+        подряд = подряд + 1 if речь else 0
+        лучшая = max(лучшая, подряд)
+    return лучшая
+
+
+def определить_автоответчик(разговор: Any, *, срок_с: float = 4.0) -> str:
+    """Человек, автоответчик или тишина — по первым секундам после ответа.
+
+    Человек говорит коротко («Алло», «Да») и замолкает, ожидая ответа.
+    Автоответчик и голосовая почта читают длинное приветствие без пауз.
+    Признаки: сплошная речь дольше 2,4 с — автоответчик; короткая реплика
+    (до 1,8 с речи) и за ней 0,8 с тишины — человек; ни звука 2,5 с —
+    тишина (опрос идёт как обычно: молча ждут и люди).
+    """
+    начало = разговор.сейчас_с()
+    while разговор.жив:
+        разговор.молчать(0.1)
+        прошло = разговор.сейчас_с() - начало
+        кадры = кадры_речи(разговор.звук_клиента(с=начало))
+        речи = sum(кадры)
+        if _самая_длинная(кадры) * 0.02 > 2.4:
+            return "автоответчик"
+        if речи:
+            первая = кадры.index(True)
+            последняя = len(кадры) - 1 - кадры[::-1].index(True)
+            тишина_после = (len(кадры) - 1 - последняя) * 0.02
+            if речи * 0.02 <= 1.8 and тишина_после >= 0.8 and последняя > первая:
+                return "человек"
+        elif прошло >= 2.5:
+            return "тишина"
+        if прошло >= срок_с:
+            return "автоответчик" if речи * 0.02 > 2.0 else "человек"
+    return "положили"
+
+
+def _выслушать(разговор: Any, срок_с: float, *, тишина_с: float = 0.9,
+               кнопки: bool = True) -> tuple[str, bytes]:
+    """Ждёт кнопку или голосовой ответ: (кнопка, звук речи клиента).
+
+    Голосом ответ кончается, когда после речи наступила тишина `тишина_с`;
+    кнопка обрывает ожидание сразу.
+    """
+    начало = разговор.сейчас_с()
+    конец = time.monotonic() + max(0.0, срок_с)
+    while time.monotonic() < конец and разговор.жив:
+        нажато = разговор.ждать_кнопку(0.2)
+        if нажато and кнопки:
+            return нажато, b""
+        кадры = кадры_речи(разговор.звук_клиента(с=начало))
+        if any(кадры):
+            последняя = len(кадры) - 1 - кадры[::-1].index(True)
+            if (len(кадры) - 1 - последняя) * 0.02 >= тишина_с:
+                break
+    звук = разговор.звук_клиента(с=начало)
+    return "", (звук if sum(кадры_речи(звук)) * 0.02 >= 0.2 else b"")
+
+
 def провести(разговор: Разговор, группа: Группа, звуки: dict[str, tts.Фраза], *,
-             ждать_кнопку_с: float = 7.0) -> dict[str, Any]:
+             ждать_кнопку_с: float = 7.0,
+             распознать: Callable[[bytes], str] | None = None,
+             автоответчик: bool = False) -> dict[str, Any]:
     """Проговаривает опрос и собирает оценки.
 
-    Ответ: `answers` — по записи на вопрос (digit — None, если не ответили),
-    `optout` — клиент нажал кнопку отказа, `hangup` — положил трубку раньше.
+    Ответ: `answers` — по записи на вопрос (digit — None, если не ответили;
+    `skipped` — вопрос не задавался по условию ветвления; `comment` — текст
+    комментария; `voice` — что клиент сказал вместо кнопки), `optout` —
+    клиент нажал кнопку отказа, `hangup` — положил трубку раньше,
+    `machine` — ответил автоответчик.
+
+    `распознать` — PCM 16 бит 8 кГц → текст: для голосовых ответов и
+    комментариев. Без него вопросы-комментарии пропускаются.
     """
     def сказать(текст: str, *, прерывать: bool = False) -> str:
         фраза = звуки.get(текст)
@@ -425,12 +622,24 @@ def провести(разговор: Разговор, группа: Груп�
             return ""
         return разговор.проиграть(фраза.звук(разговор.кодек), прерывать=прерывать)
 
+    def в_текст(звук: bytes) -> str:
+        if not звук or распознать is None:
+            return ""
+        try:
+            return " ".join(str(распознать(звук) or "").split())
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Контроль качества: голосовой ответ не распознан: %s", exc)
+            return ""
+
     ответы: list[dict[str, Any]] = [
-        {"text": в.text, "min": в.low, "max": в.high, "digit": None} for в in группа.questions]
+        {"text": в.text, "min": в.low, "max": в.high, "digit": None,
+         **({"kind": в.kind} if в.kind != ОЦЕНКА else {})} for в in группа.questions]
     отказ = False
     # Пауза после ответа: человек подносит трубку к уху, а станция ещё
     # достраивает звуковой канал — первые полсекунды иначе теряются.
     разговор.молчать(0.6)
+    if автоответчик and определить_автоответчик(разговор) == "автоответчик":
+        return {"answers": ответы, "optout": False, "hangup": False, "machine": True}
     разговор.сбросить_кнопки()
     сказать(группа.greeting)
     # Нажатое на приветствии ответом на первый вопрос не становится — кроме
@@ -443,13 +652,32 @@ def провести(разговор: Разговор, группа: Груп�
             отказ = True
     разговор.сбросить_кнопки()
     подряд_молчал = 0
+    голосом = группа.voice_answers and распознать is not None
     for номер, вопрос in enumerate(группа.questions):
         if отказ or not разговор.жив:
             break
+        if not вопрос.задать_ли(ответы):
+            ответы[номер]["skipped"] = True
+            continue
+        if вопрос.kind == КОММЕНТАРИЙ:
+            if распознать is None:
+                ответы[номер]["skipped"] = True
+                continue
+            сказать(вопрос.text)
+            _, звук = _выслушать(разговор, вопрос.seconds, тишина_с=2.0, кнопки=False)
+            ответы[номер]["comment"] = в_текст(звук)
+            continue
         получено: int | None = None
         for попытка in range(группа.repeats + 1):
-            нажато = сказать(вопрос.text, прерывать=True) or разговор.ждать_кнопку(ждать_кнопку_с)
-            if not разговор.жив and not нажато:
+            нажато = сказать(вопрос.text, прерывать=True)
+            сказано = ""
+            if not нажато:
+                if голосом:
+                    нажато, звук = _выслушать(разговор, ждать_кнопку_с)
+                    сказано = в_текст(звук) if not нажато else ""
+                else:
+                    нажато = разговор.ждать_кнопку(ждать_кнопку_с)
+            if not разговор.жив and not нажато and not сказано:
                 break
             if нажато and нажато == группа.optout_digit:
                 отказ = True
@@ -457,8 +685,14 @@ def провести(разговор: Разговор, группа: Груп�
             if нажато.isdigit() and вопрос.low <= int(нажато) <= вопрос.high:
                 получено = int(нажато)
                 break
+            if сказано:
+                ответы[номер]["voice"] = сказано
+                цифра = вопрос.цифра_из_речи(сказано)
+                if цифра is not None:
+                    получено = цифра
+                    break
             if попытка < группа.repeats and разговор.жив:
-                if нажато:
+                if нажато or сказано:
                     сказать(НЕ_ПОНЯЛ)
                 разговор.сбросить_кнопки()
         ответы[номер]["digit"] = получено
@@ -510,6 +744,13 @@ class КонтрольКачества:
         self.регистрация: dict[str, Any] = {"state": "выключено", "error": "", "at": 0.0}
         self.последняя_ошибка = ""
         self._сбой_телефона_до = 0.0
+        #: Сколько линий станция приняла разом и до какого времени это помнить.
+        self._линий: tuple[int, float] = (0, 0.0)
+        self._замок_линий = threading.Lock()
+        #: PCM 16 бит 8 кГц → текст: голосовые ответы и комментарии. Ставит
+        #: приложение (движок распознавания по умолчанию); None — без них.
+        self.распознать: Callable[[bytes], str] | None = None
+        self._уборка_записей = 0.0
 
     # -- настройки ---------------------------------------------------------
 
@@ -643,6 +884,12 @@ class КонтрольКачества:
         self._держать_регистрацию()
         self.найти_новые()
         self.обзвон()
+        if time.time() - self._уборка_записей > 3600:
+            self._уборка_записей = time.time()
+            try:
+                self.убрать_старые_записи()
+            except Exception as exc:                        # noqa: BLE001
+                log.debug("Старые записи опросов не убраны: %s", exc)
 
     def _держать_регистрацию(self) -> None:
         """Регистрация обновляется и между звонками.
@@ -779,7 +1026,7 @@ class КонтрольКачества:
             "AND call_at < ?", (УСТАРЕЛ, сейчас, ЖДЁТ, сейчас - СРОК_ДАВНОСТИ_Ч * 3600))
         if not self.можно_звонить() or сейчас < self._сбой_телефона_до:
             return 0
-        свободно = int(self._число("qc_parallel", 1)) - len(self._идут)
+        свободно = self._предел_линий() - len(self._идут)
         if свободно <= 0:
             return 0
         строки = self.db.query(
@@ -847,6 +1094,39 @@ class КонтрольКачества:
                                      self.settings.get("webhook_allow_internal"))},
                          name="asrhub-qc-notify", daemon=True).start()
 
+    def _не_дозвонились(self, номер: str, попытка: int, проба: bool, exc: ОшибкаSIP, *,
+                        итог: str = НЕ_ДОЗВОНИЛИСЬ) -> None:
+        пределе = int(self._число("qc_max_attempts", 2))
+        if попытка < пределе and not проба:
+            self._закрыть(номер, ЖДЁТ, sip_code=exc.код, error=str(exc),
+                          due_at=time.time() + 60 * self._число("qc_retry_min", 30))
+        else:
+            self._закрыть(номер, итог, sip_code=exc.код, error=str(exc))
+
+    def _упёрлись_в_линии(self, exc: ОшибкаSIP) -> bool:
+        """«Занято» при наших же идущих звонках — предел линий номера на станции.
+
+        С `qc_parallel` больше одного станция с `call-limit=1` (или
+        `max_contacts=1` у номера) отвечает на второй одновременный вызов
+        «занято». Раньше это считалось занятым клиентом и тратило его
+        попытку. Теперь предел запоминается на десять минут: обзвон идёт не
+        больше линиями, чем станция приняла, а опрос встаёт обратно.
+        """
+        with self._замок_линий:
+            других = sum(1 for поток in self._идут.values() if поток.is_alive()) - 1
+            if других < 1:
+                return False
+            self._линий = (max(1, других), time.time() + 600)
+        log.warning("Контроль качества: станция отвечает «занято» на %d-й одновременный "
+                    "вызов — обзвон идёт не больше %d линиями десять минут (call-limit у "
+                    "номера телефона?)", других + 1, других)
+        return True
+
+    def _предел_линий(self) -> int:
+        предел = int(self._число("qc_parallel", 1))
+        линий, до = self._линий
+        return min(предел, линий) if time.time() < до else предел
+
     def _вызов(self, опрос: dict[str, Any]) -> None:
         """Один звонок клиенту от набора до итога в базе."""
         номер = опрос["id"]
@@ -865,7 +1145,8 @@ class КонтрольКачества:
                 return
             # Звук готовится до набора: синтез занимает секунды, а в трубке
             # они были бы тишиной.
-            звуки = {текст: tts.приготовить(текст, self.settings, self.каталог_звука())
+            звуки = {текст: tts.приготовить(текст, self.settings, self.каталог_звука(),
+                                           образец_голоса=группа.voice_sample)
                      for текст in группа.фразы()}
             телефон = self.телефон()
             # Префикс выхода в город внутреннему номеру не нужен.
@@ -873,13 +1154,19 @@ class КонтрольКачества:
                 str(self.settings.get("qc_dial_prefix") or "").strip() + опрос["number"]
             разговор = телефон.позвонить(
                 набор, ждать_ответа_с=self._число("qc_answer_timeout_s", 30))
-        except (НеОтвечает, Занято) as exc:
-            пределе = int(self._число("qc_max_attempts", 2))
-            if попытка < пределе and not проба:
-                self._закрыть(номер, ЖДЁТ, sip_code=exc.код, error=str(exc),
-                              due_at=time.time() + 60 * self._число("qc_retry_min", 30))
-            else:
-                self._закрыть(номер, НЕ_ДОЗВОНИЛИСЬ, sip_code=exc.код, error=str(exc))
+        except Занято as exc:
+            if self._упёрлись_в_линии(exc):
+                # «Занято» при наших же идущих звонках — предел вызовов у
+                # номера телефона на станции (call-limit, max_contacts), а не
+                # клиент: попытку не тратим, опрос ждёт свободной линии.
+                self.db.execute(
+                    "UPDATE qc_surveys SET status=?, attempts=MAX(attempts-1,0), due_at=? "
+                    "WHERE id=?", (ЖДЁТ, time.time() + 60, номер))
+                return
+            self._не_дозвонились(номер, попытка, проба, exc)
+            return
+        except НеОтвечает as exc:
+            self._не_дозвонились(номер, попытка, проба, exc)
             return
         except ОшибкаSIP as exc:
             self.последняя_ошибка = str(exc)
@@ -923,20 +1210,38 @@ class КонтрольКачества:
         ответил = time.time()
         self.db.execute("UPDATE qc_surveys SET answered_at=?, sip_code=200, error='' WHERE id=?",
                         (ответил, номер))
+        автоответчик = bool(self.settings.get("qc_amd", False))
+        записать = bool(self.settings.get("qc_record", False))
+        распознать = self.распознать if (группа.voice_answers or any(
+            в.kind == КОММЕНТАРИЙ for в in группа.questions)) else None
+        if автоответчик or записать or распознать is not None:
+            разговор.начать_запись()
         try:
             итог = провести(разговор, группа, звуки,
-                            ждать_кнопку_с=self._число("qc_digit_timeout_s", 7))
+                            ждать_кнопку_с=self._число("qc_digit_timeout_s", 7),
+                            распознать=распознать, автоответчик=автоответчик)
         except Exception as exc:                            # noqa: BLE001
             log.exception("Контроль качества: разговор %s прерван ошибкой", номер)
             итог = {"answers": [], "optout": False, "hangup": True, "error": str(exc)}
         finally:
             разговор.положить()
+        запись = self._сохранить_запись(номер, разговор) if записать else ""
+        if итог.get("machine"):
+            self._не_дозвонились(номер, попытка, проба, ОшибкаSIP("ответил автоответчик"),
+                                 итог=АВТООТВЕТЧИК)
+            if запись:
+                self.db.execute("UPDATE qc_surveys SET recording=? WHERE id=?", (запись, номер))
+            return
         средняя, процент, ответов = оценка(итог["answers"])
+        # Ждали ответа только на заданные вопросы с оценкой: пропущенные по
+        # ветвлению и комментарии «пройден» не портят.
+        ждали = sum(1 for о in итог["answers"]
+                    if not о.get("skipped") and о.get("kind", ОЦЕНКА) == ОЦЕНКА)
         if итог["optout"]:
             статус = ОТКАЗ
             if not проба:
                 self.в_стоп_лист(опрос["number"], "клиент отказался от опросов", номер)
-        elif ответов and ответов == len(итог["answers"]):
+        elif ответов and ответов >= ждали:
             статус = ПРОЙДЕН
         elif ответов:
             статус = ЧАСТИЧНО
@@ -945,7 +1250,45 @@ class КонтрольКачества:
         self._закрыть(номер, статус, answers=json.dumps(итог["answers"], ensure_ascii=False),
                       score=средняя, score_pct=процент,
                       talk_s=round(time.time() - ответил, 1),
-                      error=str(итог.get("error") or ""))
+                      error=str(итог.get("error") or ""), recording=запись)
+
+    def каталог_записей_опросов(self) -> Path:
+        return Path(self.settings.paths.results) / "qc"
+
+    def _сохранить_запись(self, номер: str, разговор: Разговор) -> str:
+        """Запись опроса в WAV (слева клиент, справа сервер); путь или ''."""
+        import struct  # noqa: PLC0415
+
+        try:
+            данные = разговор.запись_стерео()
+            if not данные:
+                return ""
+            каталог = self.каталог_записей_опросов()
+            каталог.mkdir(parents=True, exist_ok=True)
+            путь = каталог / f"{номер}.wav"
+            заголовок = (b"RIFF" + struct.pack("<I", 36 + len(данные)) + b"WAVEfmt "
+                         + struct.pack("<IHHIIHH", 16, 1, 2, 8000, 32000, 4, 16)
+                         + b"data" + struct.pack("<I", len(данные)))
+            путь.write_bytes(заголовок + данные)
+            return str(путь)
+        except Exception as exc:                            # noqa: BLE001
+            log.warning("Контроль качества: запись опроса %s не сохранена: %s", номер, exc)
+            return ""
+
+    def убрать_старые_записи(self) -> int:
+        """Записи опросов старше `qc_record_days` — с диска и из строки опроса."""
+        дней = self._число("qc_record_days", 30)
+        if дней <= 0:
+            return 0
+        срок = time.time() - дней * 86400
+        убрано = 0
+        for строка in self.db.query(
+                "SELECT id, recording FROM qc_surveys WHERE COALESCE(recording,'')<>'' "
+                "AND COALESCE(finished_at, created_at) < ?", (срок,)):
+            Path(строка["recording"]).unlink(missing_ok=True)
+            self.db.execute("UPDATE qc_surveys SET recording='' WHERE id=?", (строка["id"],))
+            убрано += 1
+        return убрано
 
     # -- ручные действия ---------------------------------------------------
 
@@ -1047,6 +1390,9 @@ def опрос_наружу(строка: Any) -> dict[str, Any]:
         данные["answers"] = json.loads(данные.get("answers") or "[]")
     except ValueError:
         данные["answers"] = []
+    # Путь на диске сервера наружу не уходит — только признак, что запись есть.
+    запись = str(данные.pop("recording", "") or "")
+    данные["has_recording"] = bool(запись) and Path(запись).is_file()
     return данные
 
 

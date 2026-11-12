@@ -4676,6 +4676,70 @@ _p(P(
 ))
 
 _p(P(
+    key="worker_isolation",
+    label="Где считает воркер",
+    group="runtime",
+    type="enum",
+    default="thread",
+    server_only=True,
+    advanced=True,
+    description=(
+        "thread — распознавание идёт в потоке сервера, модель одна на всех воркеров. "
+        "process — у каждого воркера свой постоянный процесс со своим кешем моделей. "
+        "Зависший вызов движка (драйвер видеокарты, взаимная блокировка в библиотеке) "
+        "в режиме thread сторож снимает, но поток и его память живут до перезапуска "
+        "службы; в режиме process процесс завершается, и память освобождается сразу. "
+        "Аварийное завершение процесса (нехватка памяти) не роняет сервер: задание "
+        "повторяется (worker_process_died), процесс поднимается заново. Действует на "
+        "следующее задание, перезапуск не нужен."
+    ),
+    recommendation=(
+        "thread — на одной видеокарте: в режиме process у каждого воркера своя копия "
+        "модели, и двум воркерам нужна вдвое большая память. process — на нескольких "
+        "картах вместе с gpu_devices (воркер — своя карта, свой процесс) и там, где "
+        "движок уже зависал."
+    ),
+    examples=[
+        Ex("Одна видеокарта", "thread", ""),
+        Ex("Две карты, пул", "process", "вместе с gpu_devices: cuda:0, cuda:1"),
+    ],
+    options=[
+        {"value": "thread", "label": "В потоке сервера"},
+        {"value": "process", "label": "В своём процессе на воркер"},
+    ],
+    see_also=["gpu_devices", "max_concurrent_jobs", "job_timeout_s"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "up"},
+))
+
+_p(P(
+    key="gpu_devices",
+    label="Пул видеокарт",
+    group="runtime",
+    type="str",
+    default="",
+    server_only=True,
+    advanced=True,
+    description=(
+        "Видеокарты через запятую (cuda:0, cuda:1), между которыми делятся воркеры: "
+        "воркер N считает на карте N по кругу, и у каждой карты свой экземпляр модели "
+        "в кеше. Без пула одна и та же модель живёт на одной карте, и вторая карта "
+        "этой модели не помогает. Задание с явной картой или с device: cpu считается "
+        "там, где просили. Пусто — пула нет."
+    ),
+    recommendation=(
+        "Число воркеров (max_concurrent_jobs) — не меньше числа карт; моделей в памяти "
+        "(model_cache_size) — с расчётом на одну карту. На нескольких картах удобно "
+        "вместе с worker_isolation: process."
+    ),
+    examples=[
+        Ex("Две карты", "cuda:0, cuda:1", "max_concurrent_jobs: 2"),
+        Ex("Без пула", "", ""),
+    ],
+    see_also=["worker_isolation", "max_concurrent_jobs", "device"],
+    impact={"quality": "neutral", "speed": "up", "memory": "up"},
+))
+
+_p(P(
     key="oom_retry_batch_divisor",
     label="Делитель пакета при нехватке памяти",
     group="runtime",
@@ -8193,6 +8257,155 @@ _p(P(
     ),
     examples=[Ex("По одному", 1, ""), Ex("Три линии", 3, "")],
     see_also=["qc_sip_user"],
+    impact=_НЕЙТРАЛЬНО,
+    advanced=True,
+))
+
+_p(P(
+    key="audiosocket_port",
+    label="Порт AudioSocket",
+    group="telephony",
+    type="int",
+    default=0,
+    minimum=0,
+    maximum=65535,
+    server_only=True,
+    advanced=True,
+    description=(
+        "TCP-порт, на котором сервер принимает живой звук разговоров по протоколу "
+        "AudioSocket (Asterisk 16.6+: приложение AudioSocket(<uuid>,<адрес>:<порт>)). "
+        "Звук распознаётся на лету, фразы рассылаются по веб-сокету событиями call.live, "
+        "итог разговора — в ленте событий. 0 — приём выключен. Меняется с перезапуском."
+    ),
+    recommendation=(
+        "9092 и audiosocket_host — адрес, который видит станция. Протокол без "
+        "шифрования и без ключа: открывайте порт только станции (межсетевой экран)."
+    ),
+    examples=[Ex("Выключено", 0, ""), Ex("Станция в той же сети", 9092, "")],
+    see_also=["audiosocket_host", "audiosocket_owner", "audiosocket_model"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="audiosocket_host",
+    label="Адрес приёма AudioSocket",
+    group="telephony",
+    type="str",
+    default="127.0.0.1",
+    server_only=True,
+    advanced=True,
+    description="На каком адресе слушать AudioSocket. 127.0.0.1 — только станция на этой же машине.",
+    recommendation="Адрес в сети станции, а не 0.0.0.0: у протокола нет ни ключа, ни шифрования.",
+    examples=[Ex("Станция на этой машине", "127.0.0.1", ""), Ex("Сеть АТС", "10.0.5.2", "")],
+    see_also=["audiosocket_port"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="audiosocket_owner",
+    label="Кому показывать живые разговоры",
+    group="telephony",
+    type="str",
+    default="",
+    advanced=True,
+    description=(
+        "Владелец (имя ключа или подразделения), которому уходят события call.live "
+        "вместе с администраторами. Пусто — только администраторам."
+    ),
+    recommendation="Руководитель контакт-центра или пусто.",
+    examples=[Ex("Только администраторы", "", ""), Ex("Руководитель смены", "supervisor", "")],
+    see_also=["audiosocket_port"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="audiosocket_model",
+    label="Модель для живых разговоров",
+    group="telephony",
+    type="str",
+    default="",
+    advanced=True,
+    description="Модель распознавания живых разговоров. Пусто — модель сервера по умолчанию.",
+    recommendation="Потоковая модель (Vosk, GigaAM v3, T-one): задержка — доли секунды.",
+    examples=[Ex("По умолчанию", "", "")],
+    see_also=["audiosocket_port"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="qc_amd",
+    label="Распознавать автоответчик",
+    group="qc",
+    type="bool",
+    default=False,
+    description=(
+        "Первые секунды после ответа сервер слушает: человек говорит коротко («Алло») "
+        "и замолкает, автоответчик и голосовая почта читают длинное приветствие без пауз. "
+        "Сплошная речь дольше 2,4 с — опрос не начинается, звонок повторяется позже "
+        "(qc_max_attempts), а последняя попытка закрывается состоянием «автоответчик». "
+        "Тишина — опрос идёт как обычно."
+    ),
+    recommendation=(
+        "Включайте для звонков на мобильные: там голосовая почта отвечает на каждый "
+        "второй недозвон. Цена — до двух с половиной секунд тишины перед приветствием."
+    ),
+    examples=[Ex("Мобильные клиенты", True, ""), Ex("Внутренние номера", False, "")],
+    see_also=["qc_max_attempts"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="qc_record",
+    label="Записывать опросы",
+    group="qc",
+    type="bool",
+    default=False,
+    description=(
+        "Сохранять звук опроса: слева клиент, справа голос опроса. Запись открывается "
+        "ссылкой «запись» в журнале опросов (GET /api/qc/surveys/{id}/audio) и "
+        "убирается через qc_record_days суток."
+    ),
+    recommendation=(
+        "Для разбора спорных оценок и проверки голосовых ответов. Запись разговора с "
+        "клиентом — персональные данные: предупредите о ней в приветствии."
+    ),
+    examples=[Ex("Без записи", False, ""), Ex("Разбор спорных оценок", True, "")],
+    see_also=["qc_record_days"],
+    impact=_НЕЙТРАЛЬНО,
+))
+
+_p(P(
+    key="qc_record_days",
+    label="Хранить записи опросов, суток",
+    group="qc",
+    type="int",
+    default=30,
+    minimum=0,
+    maximum=3650,
+    description="Через сколько суток запись опроса удаляется. 0 — хранить, пока опрос в журнале.",
+    recommendation="Месяц — хватает на разбор жалоб.",
+    examples=[Ex("Месяц", 30, "")],
+    see_also=["qc_record"],
+    impact=_НЕЙТРАЛЬНО,
+    advanced=True,
+))
+
+_p(P(
+    key="qc_voice_model",
+    label="Модель для голосовых ответов",
+    group="qc",
+    type="str",
+    default="",
+    description=(
+        "Какой моделью распознавать голосовые ответы и комментарии опроса (группы с "
+        "voice_answers и вопросы kind: comment). Пусто — модель сервера по умолчанию."
+    ),
+    recommendation=(
+        "Лёгкая быстрая модель русского языка: ответ из одного-двух слов, а клиент ждёт "
+        "на линии."
+    ),
+    examples=[Ex("По умолчанию", "", ""), Ex("Лёгкая", "gigaam-v3-ctc", "")],
+    see_also=["qc_groups"],
     impact=_НЕЙТРАЛЬНО,
     advanced=True,
 ))

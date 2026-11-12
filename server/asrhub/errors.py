@@ -448,6 +448,17 @@ class EngineHung(ASRHubError):
         )
 
 
+class WorkerProcessDied(ASRHubError):
+    """Дочерний процесс распознавания завершился посреди задания."""
+
+    code = "worker_process_died"
+    http_status = 500
+    retryable = True
+    hint = ("Процесс распознавания завершился аварийно (нехватка памяти, сбой "
+            "драйвера) — задание будет повторено. Если повторяется — журнал сервера "
+            "и системный журнал (dmesg, journalctl -k).")
+
+
 class EngineBusy(ASRHubError):
     """Модель занята другой работой дольше, чем готов ждать вызывающий."""
 

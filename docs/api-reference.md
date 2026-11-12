@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **246**, операций: **274**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **248**, операций: **276**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -317,6 +317,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/qc/summary` | Оценки клиентов за период | любой действующий ключ |
 | `GET` | `/api/qc/surveys` | Журнал опросов | любой действующий ключ |
 | `GET` | `/api/qc/surveys/export` | Выгрузка опросов в CSV или Excel | любой действующий ключ |
+| `GET` | `/api/qc/surveys/{survey_id}/audio` | Запись опроса (WAV, слева клиент) | любой действующий ключ |
 | `POST` | `/api/qc/surveys/{survey_id}/cancel` | Отменить ждущий опрос | ключ с ролью **admin** |
 | `POST` | `/api/qc/test-call` | Пробный звонок с опросом | ключ с ролью **admin** |
 | `POST` | `/api/qc/tts` | Прослушать фразу голосом опроса | ключ с ролью **admin** |
@@ -370,6 +371,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/telephony/dialplan/pulse` | Пульс сценария отправки: жив, сколько ждёт в очереди | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/dialplan/status` | Приём из диалплана: станции, счётчики, журнал | ключ с ролью **admin** |
 | `GET` | `/api/telephony/dimensions` | Очереди и операторы для отбора | любой ключ; выборка сужается до его заданий |
+| `GET` | `/api/telephony/live` | Живые разговоры (AudioSocket), которые идут сейчас | ключ с ролью **admin** |
 | `GET` | `/api/telephony/overview` | Всё для раздела «АТС» одним ответом | любой действующий ключ |
 | `GET` | `/api/telephony/queues` | Очереди: ожидание, брошенные, уровень обслуживания | ключ с ролью **admin** |
 | `POST` | `/api/telephony/reconcile` | Сверить станции с архивом за вчера | ключ с ролью **admin** |
@@ -963,7 +965,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:21336-b2cc0e",
+  "instance": "vm:16062-beedab",
   "instances": [],
   "workers": [
     {
@@ -1563,7 +1565,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794451954.1133611,
+    "generated_at": 1794457924.529021,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1730,8 +1732,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.32",
-  "uptime_s": 4.4,
+  "version": "3.1.33",
+  "uptime_s": 1.8,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1811,8 +1813,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.32",
-  "uptime_s": 4.5,
+  "version": "3.1.33",
+  "uptime_s": 1.9,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1821,8 +1823,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.1,
-    "disk_free_gb": 24.0,
+    "ram_available_gb": 4.0,
+    "disk_free_gb": 23.9,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2571,8 +2573,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793847154.1937199,
-    "until": 1794451954.1937199
+    "since": 1793853124.6452212,
+    "until": 1794457924.6452212
   }
 }
 ```
@@ -2964,9 +2966,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 7.1,
+    "free_gb": 4.0,
     "reserve_gb": 4.0,
-    "budget_gb": 3.0,
+    "budget_gb": 0.8,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -3979,7 +3981,8 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 | `key_in` | в адресе | string | `header` | Ключ в заголовке или в адресе |
 | `trunk` | в адресе | string | `provider` | Имя транка в примерах |
 | `internal_len` | в адресе | integer | `3` | Длина внутреннего номера в примерах |
-| `tracks` | в адресе | boolean | `False` | Писать стороны раздельно: MixMonitor r()/t() |
+| `tracks` | в адресе | string | — | Писать стороны раздельно: MixMonitor r()/t() (1/yes/true) |
+| `norec_code` | в адресе | string | — | Код «не записывать» в разговоре, например *7 |
 
 ### `DELETE /api/telephony/dialplan/key/{station_id}`
 
@@ -4040,6 +4043,13 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 | Параметр | Где | Тип | По умолчанию | Описание |
 |---|---|---|---|---|
 | `station` | в адресе | string | — | — |
+
+### `GET /api/telephony/live`
+
+Живые разговоры (AudioSocket), которые идут сейчас.
+
+**Доступ:** ключ с ролью **admin**.
+
 
 ### `GET /api/telephony/overview`
 
@@ -5054,14 +5064,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 4.5,
+  "uptime_s": 2.0,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 5 с",
+        "detail": "работает 2 с",
         "hint": ""
       },
       {
@@ -5096,7 +5106,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 24.0 ГБ",
+        "detail": "свободно 23.9 ГБ",
         "hint": ""
 …
 ```
@@ -5878,6 +5888,19 @@ NPS (`content_nps_shift`), если опросов достаточно; при�
 | `search` | в адресе | string | — | Часть номера клиента |
 | `since_days` | в адресе | integer | `30` | — |
 | `fmt` | в адресе | string | `csv` | csv или xlsx (книга с листом отчёта) |
+
+### `GET /api/qc/surveys/{survey_id}/audio`
+
+Запись опроса (WAV, слева клиент).
+
+Запись опроса при `qc_record` — в том же охвате, что журнал.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `survey_id` | в пути | string | обязателен | — |
 
 ### `POST /api/qc/surveys/{survey_id}/cancel`
 

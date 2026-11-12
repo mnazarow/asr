@@ -57,7 +57,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '3.1.32'
+$Version = '3.1.33'
 # -Formats по умолчанию «txt»: перекрывать им output_formats из -Settings
 # можно, только если формат задан явно.
 $FormatsGiven = $PSBoundParameters.ContainsKey('Formats')

@@ -35,6 +35,10 @@ jobs:
       - name: синтаксис интерфейса
         run: |
           for f in server/asrhub/web/*.js; do node --check "$f"; done
+      - name: ESLint и проверки помощников интерфейса
+        run: |
+          npx --yes eslint@9.17.0 --config eslint.config.mjs server/asrhub/web
+          node --test tests/js/*.test.mjs
       - name: shellcheck
         run: |
           sudo apt-get install -y shellcheck
@@ -84,8 +88,15 @@ jobs:
         run: |
           pip install -r requirements/dev.txt
           python -m playwright install --with-deps chromium
-      - name: полный набор
-        run: python -m pytest tests -q -p no:cacheprovider -rf --timeout=900
+      - name: полный набор с покрытием
+        run: >-
+          python -m pytest tests -q -p no:cacheprovider -rf --timeout=900
+          --cov=asrhub --cov-report=term:skip-covered --cov-report=xml:coverage.xml
+      - name: отчёт о покрытии
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
       - name: пакет собирается и несёт агента и руководство
         run: |
           pip wheel --no-deps -w dist .

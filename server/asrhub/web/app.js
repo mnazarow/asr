@@ -20,23 +20,41 @@ const localStorage = (() => {
     родное = window.localStorage;
     родное.getItem('asrhub_theme');
   } catch (e) { родное = null; }
+  // Ключ доступа, вставленный руками, по умолчанию живёт до закрытия
+  // вкладки (sessionStorage), а не навсегда: хранилище браузера читает
+  // любой скрипт страницы и любое расширение. Навсегда — только по флажку
+  // «Запомнить на этом устройстве». Вход логином ключа не хранит вовсе.
+  const СЕАНСОВЫЕ = new Set(['asrhub_key']);
+  let сеанс = null;
+  try { сеанс = window.sessionStorage; сеанс.getItem('asrhub_key'); } catch (e) { сеанс = null; }
   return {
     /** Переживёт ли записанное перезагрузку страницы. */
-    persistent: родное !== null,
+    persistent: родное !== null || сеанс !== null,
     getItem(ключ) {
       try {
+        const s = сеанс && СЕАНСОВЫЕ.has(ключ) ? сеанс.getItem(ключ) : null;
+        if (s !== null) return s;
         const v = родное ? родное.getItem(ключ) : null;
         if (v !== null) return v;
       } catch (e) { /* ниже — из памяти */ }
       return память.has(ключ) ? память.get(ключ) : null;
     },
-    setItem(ключ, значение) {
+    setItem(ключ, значение, { запомнить = true } = {}) {
       память.set(ключ, String(значение));
-      try { if (родное) родное.setItem(ключ, String(значение)); } catch (e) { /* только память */ }
+      try {
+        if (СЕАНСОВЫЕ.has(ключ) && !запомнить && сеанс) {
+          сеанс.setItem(ключ, String(значение));
+          if (родное) родное.removeItem(ключ);
+          return;
+        }
+        if (сеанс && СЕАНСОВЫЕ.has(ключ)) сеанс.removeItem(ключ);
+        if (родное) родное.setItem(ключ, String(значение));
+      } catch (e) { /* только память */ }
     },
     removeItem(ключ) {
       память.delete(ключ);
       try { if (родное) родное.removeItem(ключ); } catch (e) { /* только память */ }
+      try { if (сеанс) сеанс.removeItem(ключ); } catch (e) { /* только память */ }
     },
   };
 })();
@@ -405,6 +423,8 @@ function esc(value) {
 
 /**
  * Значение аргументом во встроенный обработчик: onclick="f(${jsArg(x)})".
+ * Встроенных обработчиков в разметке больше нет (см. `act`); помощник
+ * оставлен для совместимости расширений, которые им пользуются.
  *
  * esc() там не защищает, как обещал комментарий выше: сущность &#39;
  * браузер раскодирует раньше, чем разберёт JS, и апостроф в значении
@@ -417,6 +437,75 @@ function esc(value) {
 function jsArg(value) {
   return esc(JSON.stringify(String(value === null || value === undefined ? '' : value)));
 }
+
+/**
+ * Действие элемента без встроенного обработчика: `<button ${act('openJob', id)}>`.
+ *
+ * Политика содержимого страницы не разрешает встроенные onclick="…"
+ * ('unsafe-inline' для скриптов снят): подставленная строка с кавычкой
+ * больше не может стать кодом. Имя — функция `window.__asrhub`, аргументы —
+ * JSON в атрибуте; щелчок ловит один общий обработчик (см. ниже).
+ */
+function act(name, ...args) {
+  return ` data-act="${esc(name)}" data-args="${esc(JSON.stringify(args))}"`;
+}
+
+document.addEventListener('click', (ev) => {
+  const цель = ev.target && ev.target.closest ? ev.target.closest('[data-act]') : null;
+  if (!цель) return;
+  const действие = (window.__asrhub || {})[цель.dataset.act];
+  if (typeof действие !== 'function') return;
+  if (цель.tagName === 'A') ev.preventDefault();
+  let аргументы = [];
+  try { аргументы = JSON.parse(цель.dataset.args || '[]'); } catch (e) { аргументы = []; }
+  действие(...аргументы);
+});
+/* Сортировка по столбцу — во всех таблицах `.table`, щелчком по заголовку.
+ *
+ * Сортируются строки, которые уже на экране: у разделов со своим порядком
+ * на сервере (список заданий, журнал звонков) это порядок внутри страницы.
+ * Не сортируются таблицы со своей сортировкой (`th[data-sort]`), с
+ * раскрывающимися строками (`td[colspan]`) и помеченные `data-nosort`.
+ * Число сравнивается как число: «1 234,5», «12 %», «3 мин» — по первому
+ * числу в ячейке; `data-sort-value` у ячейки важнее её текста.
+ */
+function числоЯчейки(текст) {
+  const найдено = String(текст).replace(/\u00a0| /g, '').replace('−', '-')
+    .match(/-?\d+(?:[.,]\d+)?/);
+  return найдено ? parseFloat(найдено[0].replace(',', '.')) : null;
+}
+document.addEventListener('click', (ev) => {
+  const th = ev.target && ev.target.closest ? ev.target.closest('table.table > thead th') : null;
+  if (!th || ev.target.closest('button, a, input, select, label')) return;
+  const таблица = th.closest('table');
+  if (таблица.dataset.nosort !== undefined || th.dataset.nosort !== undefined
+      || th.dataset.sort !== undefined || таблица.querySelector('th[data-sort]')) return;
+  const тело = таблица.tBodies[0];
+  if (!тело || тело.rows.length < 2 || тело.querySelector('td[colspan]')) return;
+  const номер = Array.from(th.parentNode.children).indexOf(th);
+  const вниз = th.dataset.sorted === 'asc';
+  qsa('th[data-sorted]', таблица).forEach((x) => { delete x.dataset.sorted; });
+  th.dataset.sorted = вниз ? 'desc' : 'asc';
+  const ключ = (строка) => {
+    const ячейка = строка.cells[номер];
+    const текст = ячейка ? (ячейка.dataset.sortValue ?? ячейка.textContent).trim() : '';
+    return { текст, число: числоЯчейки(текст) };
+  };
+  const строки = Array.from(тело.rows).map((строка) => [ключ(строка), строка]);
+  строки.sort(([а], [б]) => {
+    let итог = а.число !== null && б.число !== null ? а.число - б.число : 0;
+    if (!итог) итог = а.текст.localeCompare(б.текст, 'ru', { numeric: true });
+    return вниз ? -итог : итог;
+  });
+  строки.forEach(([, строка]) => тело.appendChild(строка));
+});
+
+// Строка-ссылка с клавиатуры: Enter на элементе с data-enter-click — щелчок.
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter' || !ev.target || !ev.target.closest) return;
+  const цель = ev.target.closest('[data-enter-click]');
+  if (цель && цель === ev.target) цель.click();
+});
 function qs(sel, root) { return (root || document).querySelector(sel); }
 function qsa(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
 
@@ -554,8 +643,6 @@ const STATUS_CLASS = {
 };
 /** Итоги без расшифровки: запись обработана, слов в ней нет. Не ошибки. */
 const EMPTY_STATUSES = ['no_speech', 'short'];
-/** Все конечные состояния — для «готовых и упавших» и для повтора. */
-const FINISHED_STATUSES = ['completed', 'failed', 'cancelled', ...EMPTY_STATUSES];
 const QUALITY_LABELS = {
   excellent: 'отличное', good: 'хорошее', fair: 'среднее',
   poor: 'слабое', none: 'нет русского',
@@ -716,6 +803,8 @@ function promptApiKey() {
     нужен программам — человеку проще войти логином и паролем.</p>
     <div class="stack" style="gap:10px">
       <input type="password" id="key-input" placeholder="ah_…" autocomplete="off">
+      <label class="small"><input type="checkbox" id="key-remember"> Запомнить на этом
+        устройстве <span class="dim">— иначе ключ забудется, когда вкладка закроется</span></label>
       <button class="primary" id="key-save">Сохранить и войти</button>
       <div class="small dim" style="margin-top:6px">
         <a href="#" id="key-by-login">Войти по логину и паролю</a>
@@ -723,7 +812,8 @@ function promptApiKey() {
     </div></div>`);
   content.appendChild(card);
   qs('#key-save').onclick = () => {
-    localStorage.setItem('asrhub_key', qs('#key-input').value.trim());
+    localStorage.setItem('asrhub_key', qs('#key-input').value.trim(),
+      { запомнить: qs('#key-remember').checked });
     // Без хранилища ключ живёт только в памяти страницы: перезагрузка его
     // потеряла бы, и вход по ключу не состоялся бы никогда.
     if (!localStorage.persistent) { bootstrap(); return; }
@@ -1146,16 +1236,83 @@ function go(view) {
   document.title = `${meta.title} — ASR Hub`;
   // Смена hash сама по себе вызовет render(); флаг гасит повторную отрисовку,
   // иначе каждый переход слал все запросы раздела дважды.
-  if (location.hash.replace('#', '') !== view) {
+  if (location.hash.replace('#', '').split('?')[0] !== view) {
     state.hashGoing = true;
-    location.hash = view;
+    location.hash = адресРаздела(view);
   }
   renderView();
 }
 
+/* Отбор и период раздела — в адресе страницы: `#pbx?pbxPeriod=month`.
+ *
+ * Ссылку на «АТС за месяц по станции филиала» можно переслать, а кнопка
+ * «Назад» возвращает прежний период внутри раздела, а не уводит из него.
+ * В адрес попадают только простые значения из списка ниже; изменение
+ * запоминается после щелчка или выбора (одной записью истории).
+ */
+const СОСТОЯНИЕ_В_АДРЕСЕ = {
+  pbx: ['pbxTab', 'pbxPeriod', 'pbxStation'],
+  telephony: ['telPeriod', 'telStation', 'telAgent', 'telOnlyQueued'],
+  trends: ['trendsPeriod', 'trendsBucket', 'trendsNorm', 'trendsSmooth', 'trendsCompare'],
+  employees: ['employeePeriod'],
+  content: ['contentPeriod', 'contentKind'],
+  qc: ['qcDays'],
+};
+//: Значения по умолчанию в адрес не пишутся: `#pbx`, а не `#pbx?pbxTab=overview`.
+const ПО_УМОЛЧАНИЮ_В_АДРЕСЕ = {
+  pbxTab: 'overview', pbxPeriod: 'week', telPeriod: 'week', trendsPeriod: 'month',
+  trendsBucket: 'auto', trendsSmooth: '0', trendsNorm: 'auto', employeePeriod: 'month',
+  contentPeriod: 'month', contentKind: 'negative', qcDays: 30,
+};
+//: Значения-идентификаторы: остаются строкой, даже если похожи на число.
+const СТРОКОЙ_В_АДРЕСЕ = new Set(['pbxStation', 'telStation', 'telAgent']);
+
+function адресРаздела(view) {
+  const пар = new URLSearchParams();
+  (СОСТОЯНИЕ_В_АДРЕСЕ[view] || []).forEach((ключ) => {
+    const значение = state[ключ];
+    if (значение !== undefined && значение !== null && значение !== '' && значение !== false
+        && String(значение) !== String(ПО_УМОЛЧАНИЮ_В_АДРЕСЕ[ключ] ?? '')) {
+      пар.set(ключ, String(значение));
+    }
+  });
+  const строка = пар.toString();
+  return строка ? `${view}?${строка}` : view;
+}
+
+function состояниеИзАдреса(view, строка) {
+  const пар = new URLSearchParams(строка || '');
+  (СОСТОЯНИЕ_В_АДРЕСЕ[view] || []).forEach((ключ) => {
+    // Нет в адресе — значит, по умолчанию: «Назад» к `#pbx` возвращает и
+    // период, а не оставляет последний выбранный.
+    if (!пар.has(ключ)) {
+      state[ключ] = ПО_УМОЛЧАНИЮ_В_АДРЕСЕ[ключ];
+      return;
+    }
+    const значение = пар.get(ключ);
+    state[ключ] = значение === 'true' ? true
+      : (!СТРОКОЙ_В_АДРЕСЕ.has(ключ) && /^-?\d+(\.\d+)?$/.test(значение) ? Number(значение)
+        : значение);
+  });
+}
+
+let таймерАдреса = null;
+function запомнитьВАдресе() {
+  clearTimeout(таймерАдреса);
+  таймерАдреса = setTimeout(() => {
+    if (!СОСТОЯНИЕ_В_АДРЕСЕ[state.view]) return;
+    const нужный = адресРаздела(state.view);
+    if (location.hash.replace('#', '') !== нужный) {
+      try { history.pushState(null, '', `#${нужный}`); } catch (e) { /* без истории — без неё */ }
+    }
+  }, 400);
+}
+document.addEventListener('click', запомнитьВАдресе);
+document.addEventListener('change', запомнитьВАдресе);
+
 function render() {
   if (state.hashGoing) { state.hashGoing = false; return; }
-  const hash = location.hash.replace('#', '');
+  const [hash, запрос] = location.hash.replace('#', '').split('?');
   // Ссылка на запись снаружи — из примечания в CRM (public_url): #/jobs/<id>.
   // Раздела с таким именем нет, и ссылка открывала главную страницу, а не
   // расшифровку, ради которой по ней шли.
@@ -1178,6 +1335,7 @@ function render() {
     go('manual');
     return;
   }
+  if (VIEWS[hash]) состояниеИзАдреса(hash, запрос);
   go(VIEWS[hash] ? hash : 'transcribe');
 }
 
@@ -1798,6 +1956,7 @@ window.__asrhub.util = {
   kpi: (...а) => kpi(...а), delta: (...а) => delta(...а), pct: (...а) => pct(...а),
   num: (...а) => num(...а), fmtBytes: (...а) => fmtBytes(...а),
   metricValue: (...а) => metricValue(...а), jsArg: (...а) => jsArg(...а),
+  act: (...а) => act(...а),
   причинаОтказа: (...а) => причинаОтказа(...а), handleEvent: (...а) => handleEvent(...а),
 };
 
@@ -2786,7 +2945,6 @@ function описаниеПресета(preset) {
 RENDERERS.transcribe = {
   render(root) {
     const s = state.jobSettings;
-    const model = modelById(s.model) || state.models[0];
 
     root.innerHTML = `
       <div class="split">
@@ -2822,7 +2980,7 @@ RENDERERS.transcribe = {
           <section class="card">
             <div class="card-head"><h3>Активные задания</h3>
               <span class="spacer"></span>
-              <button class="ghost sm" onclick="__asrhub.go('queue')">Вся очередь →</button>
+              <button class="ghost sm" ${act('go', 'queue')}>Вся очередь →</button>
             </div>
             <div id="active-jobs"></div>
           </section>
@@ -2830,7 +2988,7 @@ RENDERERS.transcribe = {
           <section class="card">
             <div class="card-head"><h3>Последние результаты</h3>
               <span class="spacer"></span>
-              <button class="ghost sm" onclick="__asrhub.go('results')">Все результаты →</button>
+              <button class="ghost sm" ${act('go', 'results')}>Все результаты →</button>
             </div>
             <div id="recent-jobs"></div>
           </section>
@@ -2879,7 +3037,7 @@ RENDERERS.transcribe = {
                 <label>Подсказка модели (имена, термины)</label>
                 <div id="slot-prompt" style="margin-top:4px"></div>
               </div>
-              <button class="ghost" onclick="__asrhub.go('settings')">
+              <button class="ghost" ${act('go', 'settings')}>
                 Все настройки (${(state.params || []).length}) →</button>
             </div>
           </section>
@@ -3094,7 +3252,7 @@ RENDERERS.transcribe = {
           <td class="num">${fmtDur(job.media_duration_s)}</td>
           <td class="num">${job.rtf ? num(job.rtf, 3) : '—'}</td>
           <td>${statusChip(job.status)}</td>
-          <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(job.id)})">
+          <td><button class="ghost sm" ${act('openJob', job.id)}>
             Открыть</button></td></tr>`).join('')}
         </tbody></table></div>` : '<div class="empty small">Пока нет завершённых заданий</div>';
     }).catch((err) => {
@@ -3238,7 +3396,7 @@ function renderFileList() {
       <span class="truncate" style="flex:1">${esc(f.name)}</span>
       <span class="faint small nowrap">${fmtBytes(f.size)}</span>
       <button class="ghost sm" aria-label="Убрать файл ${esc(f.name)}"
-            title="Убрать из списка" onclick="__asrhub.removeFile(${i})">✕</button>
+            title="Убрать из списка" ${act('removeFile', i)}>✕</button>
     </div>`).join('');
   const btn = qs('#btn-submit');
   if (btn) {
@@ -4176,20 +4334,20 @@ RENDERERS.queue = {
       <td class="small faint nowrap">${fmtAgo(job.created_at)}</td>
       <td><div class="row" style="gap:3px">
         ${active ? `<button class="ghost sm" title="Поднять наверх"
-            data-action="top" onclick="__asrhub.jobAction(${jsArg(job.id)},'top')">▲</button>
+            data-action="top" ${act('jobAction', job.id, 'top')}>▲</button>
           <button class="ghost sm" title="Опустить"
-            data-action="bottom" onclick="__asrhub.jobAction(${jsArg(job.id)},'bottom')">▼</button>` : ''}
+            data-action="bottom" ${act('jobAction', job.id, 'bottom')}>▼</button>` : ''}
         ${job.status === 'queued' ? `<button class="ghost sm" title="Приостановить"
-            data-action="pause" onclick="__asrhub.jobAction(${jsArg(job.id)},'pause')">⏸</button>` : ''}
+            data-action="pause" ${act('jobAction', job.id, 'pause')}>⏸</button>` : ''}
         ${job.status === 'paused' ? `<button class="ghost sm" title="Возобновить"
-            data-action="resume" onclick="__asrhub.jobAction(${jsArg(job.id)},'resume')">▶</button>` : ''}
+            data-action="resume" ${act('jobAction', job.id, 'resume')}>▶</button>` : ''}
         ${active ? `<button class="ghost sm danger" title="Отменить"
-            data-action="cancel" onclick="__asrhub.jobAction(${jsArg(job.id)},'cancel')">✕</button>` : ''}
+            data-action="cancel" ${act('jobAction', job.id, 'cancel')}>✕</button>` : ''}
         ${job.status === 'failed' || EMPTY_STATUSES.includes(job.status)
           ? `<button class="ghost sm" title="Повторить"
-            data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')">↻</button>` : ''}
+            data-action="retry" ${act('jobAction', job.id, 'retry')}>↻</button>` : ''}
         <button class="ghost sm" data-action="open"
-          onclick="__asrhub.openJob(${jsArg(job.id)})">Открыть</button>
+          ${act('openJob', job.id)}>Открыть</button>
       </div></td>
     </tr>`;
   },
@@ -4675,9 +4833,9 @@ RENDERERS.results = {
           <td><div class="truncate" style="max-width:260px">${esc(job.filename)}</div>
             ${job.match && job.match.snippet
               ? `<div class="found small truncate" style="max-width:260px" tabindex="0" role="button"
-                     onkeydown="if (event.key === 'Enter') this.click()"
+                     data-enter-click
                      title="Открыть на ${fmtDur(job.match.start_s)}"
-                     onclick="__asrhub.openAt(${jsArg(job.id)}, ${Number(job.match.start_s) || 0})">
+                     ${act('openAt', job.id, Number(job.match.start_s) || 0)}>
                    <span class="at">${fmtDur(job.match.start_s)}</span> ${markSnippet(job.match.snippet)}
                  </div>`
               : `<div class="small faint truncate" style="max-width:260px">${
@@ -4695,12 +4853,12 @@ RENDERERS.results = {
             : (job.qc ? `<span class="small faint" title="Опрос: ${esc(job.qc.status || '')}">—</span>` : '')}</td>
           <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
           <td class="exports"><div class="row" style="gap:3px;flex-wrap:nowrap">
-            <button class="ghost sm" onclick="__asrhub.playRecording(${jsArg(job.id)})"
+            <button class="ghost sm" ${act('playRecording', job.id)}
               title="Прослушать запись">▶</button>
             ${['txt', 'srt', 'json', 'docx'].map((f) =>
-              `<button class="btn sm" onclick="__asrhub.download(${jsArg(job.id)},${jsArg(f)})"
+              `<button class="btn sm" ${act('download', job.id, f)}
                  title="Скачать в формате ${f}">${f}</button>`).join('')}
-            <button class="ghost sm" onclick="__asrhub.openJob(${jsArg(job.id)})">Открыть</button>
+            <button class="ghost sm" ${act('openJob', job.id)}>Открыть</button>
           </div></td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">${search || содержание
         ? 'По этому отбору записей нет — уточните поиск или выберите «любое содержание».'
@@ -5223,15 +5381,15 @@ function showJobModal(job, opts) {
     <div class="modal-foot">
       <span class="small faint mono">${esc(job.id)}</span>
       <span class="spacer"></span>
-      <button class="btn sm" onclick="__asrhub.saveRecording(${jsArg(job.id)})"
+      <button class="btn sm" ${act('saveRecording', job.id)}
         title="Скачать исходную запись">запись</button>
       ${job.status === 'completed' ? ['txt', 'srt', 'vtt', 'json', 'csv', 'docx'].map((f) =>
-        `<button class="btn sm" onclick="__asrhub.download(${jsArg(job.id)},${jsArg(f)})"
+        `<button class="btn sm" ${act('download', job.id, f)}
            title="Скачать в формате ${f}">${f}</button>`).join('') : ''}
       ${job.status === 'failed'
-        ? `<button class="primary" data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')">
+        ? `<button class="primary" data-action="retry" ${act('jobAction', job.id, 'retry')}>
              Повторить</button>` : EMPTY_STATUSES.includes(job.status)
-          ? `<button class="btn sm" data-action="retry" onclick="__asrhub.jobAction(${jsArg(job.id)},'retry')"
+          ? `<button class="btn sm" data-action="retry" ${act('jobAction', job.id, 'retry')}
                title="Распознать заново — например, после того как понизили порог детектора речи">
              Распознать заново</button>` : ''}
     </div></div></div>`);
@@ -6413,11 +6571,11 @@ RENDERERS.analytics = {
           ).join('')}
         </div>
         <span class="spacer"></span>
-        <button class="btn sm" onclick="__asrhub.exportAnalytics('xlsx')"
+        <button class="btn sm" ${act('exportAnalytics', 'xlsx')}
           title="Тот же отчёт книгой Excel: по листу на разрез">Выгрузить в Excel</button>
-        <button class="ghost sm" onclick="__asrhub.exportAnalytics('csv')"
+        <button class="ghost sm" ${act('exportAnalytics', 'csv')}
           title="Архив CSV — если Excel под рукой нет">CSV</button>
-        <button class="btn sm" onclick="__asrhub.openTab('/api/metrics')"
+        <button class="btn sm" ${act('openTab', '/api/metrics')}
           title="Снимок метрик в формате Prometheus — в новой вкладке">Метрики Prometheus</button>
       </div>
       <div id="analytics-body"><div class="empty">Загрузка аналитики…</div></div>`;
@@ -7080,7 +7238,7 @@ function drawExtraAnalytics(data) {
             <td class="small dim">${esc(з.model || '—')}</td>
             <td class="num mono">${num(з.suspect_segments)} / ${num(з.segments_count)}</td>
             <td class="small dim">${esc((з.flags || []).map((ф) => ПРИЗНАКИ_КАЧЕСТВА[ф] || ф).join(', '))}</td>
-            <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(з.id)})">Открыть</button></td></tr>`).join('')
+            <td><button class="ghost sm" ${act('openJob', з.id)}>Открыть</button></td></tr>`).join('')
             || '<tr><td colspan="5" class="empty small">Подозрительных записей нет</td></tr>'}</tbody>
         </table></div>
         <p class="small faint" style="margin-top:10px">
@@ -7255,7 +7413,7 @@ function drawExtraAnalytics(data) {
         <div>${таблица('Длительность', т.by_duration)}${(т.by_source || []).length > 1 ? `<div style="margin-top:8px">${таблица('Источник', т.by_source)}</div>` : ''}</div>
       </div></div>
       ${(т.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Хуже всего</b>: ${т.worst.slice(0, 5).map((з) =>
-        `<a href="#" class="link" onclick="window.__asrhub.openJob(${jsArg(з.id)});return false">${esc(з.filename || з.id)}</a> — ${проц(з.wer)}`).join('; ')}</div>` : ''}
+        `<a href="#" class="link" ${act('openJob', з.id)}>${esc(з.filename || з.id)}</a> — ${проц(з.wer)}`).join('; ')}</div>` : ''}
       <p class="small faint" style="margin-top:8px">${esc(т.note || '')}${
         [...(т.by_model || []), ...(т.by_duration || [])].some((р) => !р.enough) ? ' † — срезу не хватает слов.' : ''}</p>`;
     }
@@ -7287,7 +7445,7 @@ function drawExtraAnalytics(data) {
           <td class="num">${num(п.checks)}</td><td class="num mono">${проц(п.wer_avg)}</td>
           <td class="num mono">${проц(п.mer_avg)}</td></tr>`).join('')}</tbody></table>` : ''}
       ${(сг.worst || []).length ? `<div class="small" style="margin-top:8px"><b>Сильнее всего разошлись</b>: ${сг.worst.slice(0, 5).map((з) =>
-        `<a href="#" onclick="window.__asrhub.openJob(${jsArg(з.job_id)});return false">${esc(з.filename || з.job_id)}</a> — ${проц(з.wer)}${
+        `<a href="#" ${act('openJob', з.job_id)}>${esc(з.filename || з.job_id)}</a> — ${проц(з.wer)}${
           з.snr_db !== null && з.snr_db !== undefined && з.snr_db < 10 ? ' <span class="chip warn" title="шумная запись">шум</span>' : ''}`).join('; ')}</div>` : ''}
       <p class="small faint" style="margin-top:8px">${esc(сг.note || '')}</p>`;
       const дни = сг.by_day || [];
@@ -8662,7 +8820,7 @@ RENDERERS.telephony = {
           <span class="spacer"></span>
           ${админ ? `<button class="btn sm" id="tel-scan"
             title="Заход за новыми звонками по всем включённым станциям">Забрать сейчас</button>` : ''}
-          <button class="ghost sm" onclick="__asrhub.go('pbx')"
+          <button class="ghost sm" ${act('go', 'pbx')}
             title="Состояние станций, нагрузка, очереди и операторы">Раздел «АТС» →</button>
         </div>
         <div class="grid cols-4" style="padding:14px 16px">
@@ -8803,7 +8961,7 @@ RENDERERS.telephony = {
     }
     const строки = звонки.map((з) => {
       const статус = з.job_id
-        ? `<a href="#" onclick="__asrhub.openJob(${jsArg(з.job_id)});return false"
+        ? `<a href="#" ${act('openJob', з.job_id)}
              title="Открыть карточку задания">${esc(STATUS_LABELS[з.job_status] || з.job_status || 'в очереди')}</a>`
         : `<span class="dim" title="почему не распознан">${esc(з.skipped || '—')}</span>`;
       const направление = з.direction
@@ -10100,7 +10258,7 @@ RENDERERS.pbx = {
         <div class="card-head"><h3>Операторы: всё вместе</h3>
           <span class="hint">звонки, наговоренное время, доля отвеченных</span>
           <span class="spacer"></span>
-          <button class="ghost sm" onclick="__asrhub.go('employees')"
+          <button class="ghost sm" ${act('go', 'employees')}
             title="Показатели речи, вежливости и скрипта по каждому сотруднику">Аналитика по сотрудникам →</button>
         </div>
         <div class="table-wrap"><table class="table">
@@ -10993,6 +11151,7 @@ RENDERERS.dialplan = {
       internal_len: ф.internal_len || 3,
       // Стороны раздельно — только при отправке файлом.
       tracks: state.dpMode === 'path' ? '' : (ф.tracks || ''),
+      norec_code: ф.norec_code || '',
     };
   },
 
@@ -11039,6 +11198,9 @@ RENDERERS.dialplan = {
           <option value=""${з.tracks ? '' : ' selected'}>нет — одной смесью</option>
           <option value="1"${з.tracks ? ' selected' : ''}>да — MixMonitor r()/t()</option></select>`,
           'клиент и оператор в своих файлах: «кто говорит» без разделения по голосам')}
+        ${поле('norec_code', 'Код «не записывать»', `<input type="text" maxlength="4"
+          data-dp="norec_code" placeholder="*7" value="${esc(з.norec_code || '')}">`,
+          'оператор набирает его в разговоре — запись останавливается (features.conf)')}
       </div>`);
     let таймер = null;
     qsa('[data-dp]', место).forEach((вход) => {
@@ -11057,6 +11219,7 @@ RENDERERS.dialplan = {
     const з = this.formValues();
     const пар = new URLSearchParams({ driver: state.dpDriver, mode: state.dpMode, ...з });
     if (!з.tracks) пар.delete('tracks');
+    if (!з.norec_code) пар.delete('norec_code');
     let собрано;
     try {
       собрано = await API.latest('dialplan-config', `/api/telephony/dialplan/config?${пар}`);
@@ -11339,6 +11502,7 @@ const QC_СОСТОЯНИЯ = {
   'частично': ['частично', 'ok'], 'без ответа': ['снял трубку, не ответил', 'warn'],
   'отказ': ['отказался от опросов', 'warn'], 'не дозвонились': ['не дозвонились', 'warn'],
   'ошибка': ['ошибка', 'err'], 'устарел': ['устарел', ''], 'отменён': ['отменён', ''],
+  'автоответчик': ['ответил автоответчик', 'warn'],
 };
 
 const QC_ПОЛЯ_ТЕЛЕФОНА = [
@@ -12050,8 +12214,15 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
   drawJournal() {
     const ж = state.qcJournal || {};
     const записи = ж.items || [];
+    // Голосом сказанное — в подсказке цифры; пропущенный по ветвлению — «·»;
+    // комментарий — текстом под ответами.
     const ответы = (з) => (з.answers || []).length
-      ? з.answers.map((о) => `<span title="${esc(о.text)}" class="mono">${о.digit === null || о.digit === undefined ? '–' : esc(о.digit)}</span>`).join(' ')
+      ? з.answers.filter((о) => о.kind !== 'comment').map((о) => {
+        if (о.skipped) return `<span title="${esc(о.text)}: не задавался по условию" class="faint">·</span>`;
+        const подсказка = о.voice ? `${о.text} — сказал: «${о.voice}»` : о.text;
+        return `<span title="${esc(подсказка)}" class="mono">${о.digit === null || о.digit === undefined ? '–' : esc(о.digit)}${о.voice ? '🗣' : ''}</span>`;
+      }).join(' ') + з.answers.filter((о) => о.kind === 'comment' && о.comment)
+        .map((о) => `<div class="small dim" title="${esc(о.text)}">«${esc(о.comment)}»</div>`).join('')
       : '<span class="faint">—</span>';
     qs('#qc-journal').innerHTML = card('Журнал опросов',
       `кому звонили и что ответили; показано ${записи.length} из ${num(ж.total || 0, 0)}`,
@@ -12071,6 +12242,7 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
             <td class="num">${з.score === null || з.score === undefined ? '—' : `<b>${num(з.score, 2)}</b>`}</td>
             <td class="num">${num(з.attempts || 0, 0)}</td>
             <td class="small">${з.job_id ? `<a href="#" data-qc-job="${esc(з.job_id)}">разговор</a>` : ''}
+              ${з.has_recording ? `<a href="#" data-qc-audio="${esc(з.id)}">запись</a>` : ''}
               ${з.status === 'ждёт' && !this._толькоОтчёт ? `<a href="#" data-qc-cancel="${esc(з.id)}">отменить</a>` : ''}</td></tr>`;
         }).join('')}</tbody></table></div>`
         : `<div class="empty small">За период опросов не было.${this._толькоОтчёт ? ''
@@ -12089,6 +12261,11 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
       ев.preventDefault();
       state.resultsSearch = ссылка.dataset.qcJob;
       go('results');
+    }));
+    qsa('[data-qc-audio]').forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
+      ев.preventDefault();
+      скачатьФайл(`/api/qc/surveys/${encodeURIComponent(ссылка.dataset.qcAudio)}/audio`,
+        `qc-${ссылка.dataset.qcAudio}.wav`);
     }));
     qsa('[data-qc-cancel]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
       ев.preventDefault();
@@ -12338,9 +12515,9 @@ RENDERERS.content = {
           ).join('')}
         </div>
         <span class="spacer"></span>
-        <button class="btn sm" onclick="__asrhub.exportContent('xlsx')"
+        <button class="btn sm" ${act('exportContent', 'xlsx')}
           title="Весь отчёт книгой Excel: по листу на раздел">Выгрузить в Excel</button>
-        <button class="ghost sm" onclick="__asrhub.exportContent('csv')"
+        <button class="ghost sm" ${act('exportContent', 'csv')}
           title="Архив CSV — если Excel под рукой нет">CSV</button>
         <button class="ghost sm admin-only" id="content-recompute"
           title="Пересчитать разбор всего архива — после смены словарей или скрипта">Пересчитать</button>
@@ -13257,7 +13434,7 @@ RENDERERS.content = {
         <div class="analysis-lines">${д.action_items.slice(0, 8).map((а) => `<div class="analysis-line">
           <span class="ts mono">${fmtTime(а.created_at).slice(0, 5)}</span>
           <span class="who">${esc(а.who || '')}</span>
-          <span class="what"><a href="#" onclick="window.__asrhub.openJob(${jsArg(а.job_id)}, {tab: 'analysis'});return false">${esc(а.what)}</a>${а.when ? ` <span class="chip">${esc(а.when)}</span>` : ''}</span></div>`).join('')}</div>` : ''}
+          <span class="what"><a href="#" ${act('openJob', а.job_id, {tab: 'analysis'})}>${esc(а.what)}</a>${а.when ? ` <span class="chip">${esc(а.when)}</span>` : ''}</span></div>`).join('')}</div>` : ''}
       <div class="small faint" style="margin-top:8px">Сгенерировано языковой моделью: причина и исход выбраны из закрытых списков, резюме и действия — пересказ модели, который может ошибаться. Отбор записей по исходу и причине — в «Результатах».</div>`);
     if (исходы.length) {
       Charts.donut(qs('#llm-outcomes', host), {
@@ -13548,7 +13725,6 @@ RENDERERS.content = {
   // --- что послушать -------------------------------------------------------
 
   async tab_records(host) {
-    const период = state.contentPeriod;
     const перечень = await API.latest('content-kinds', '/api/content/kinds');
     const виды = перечень.kinds || [];
     state.contentKind = state.contentKind && виды.some((к) => к.key === state.contentKind)
@@ -13642,7 +13818,7 @@ RENDERERS.content = {
           <td class="num mono">${num(з.interruptions)}</td>
           <td class="num mono">${з.compliance === null ? '—' : pct(з.compliance, 0)}</td>
           <td class="num mono nowrap">${fmtDur(з.media_duration_s)}</td>
-          <td><button class="ghost sm" onclick="__asrhub.openJob(${jsArg(з.job_id)})"
+          <td><button class="ghost sm" ${act('openJob', з.job_id)}
                 >Открыть</button></td></tr>`).join('')}</tbody></table></div>`
       : '<div class="empty">По этому отбору записей за период нет</div>', действия, true);
     const кнопка = qs('#content-all');
@@ -13980,7 +14156,7 @@ RENDERERS.content.bindMarks = function (host) {
   }));
   qsa('[data-open]', host).forEach((a) => a.addEventListener('click', (e) => {
     e.preventDefault();
-    __asrhub.openJob(a.dataset.open);
+    window.__asrhub.openJob(a.dataset.open);
   }));
 };
 
@@ -15068,9 +15244,9 @@ RENDERERS.models = {
             <td><span class="chip badge-license ${m.commercial_use ? '' : 'err'}">${
               esc(m.license)}</span></td>
             <td><div class="row" style="gap:4px">
-              <button class="ghost sm" onclick="__asrhub.showModel(${jsArg(m.id)})">Подробно</button>
-              <button class="ghost sm" onclick="__asrhub.useModel(${jsArg(m.id)})">Выбрать</button>
-              <button class="ghost sm" onclick="__asrhub.downloadModel(${jsArg(m.id)})"
+              <button class="ghost sm" ${act('showModel', m.id)}>Подробно</button>
+              <button class="ghost sm" ${act('useModel', m.id)}>Выбрать</button>
+              <button class="ghost sm" ${act('downloadModel', m.id)}
                 title="Загрузить веса">↓</button>
             </div></td></tr>`).join('')}</tbody></table></div>
       </section>`).join('');
@@ -15086,7 +15262,7 @@ window.__asrhub.useModel = (id) => {
 
 window.__asrhub.downloadModel = async (id) => {
   try {
-    const result = await API.post(`/api/models/${encodeURIComponent(id)}/download`);
+    await API.post(`/api/models/${encodeURIComponent(id)}/download`);
     toast('Загрузка весов запущена', 'ok', 'Следите за прогрессом в разделе «Журнал»');
   } catch (err) { fail(err); }
 };
@@ -15118,7 +15294,7 @@ window.__asrhub.showModel = async (id) => {
           status.engine_available ? 'установлен' : 'не установлен'}</span>
         <span class="spacer"></span>
         ${!status.downloaded ? `<button class="primary sm"
-          onclick="__asrhub.downloadModel(${jsArg(m.id)})">Загрузить веса</button>` : ''}
+          ${act('downloadModel', m.id)}>Загрузить веса</button>` : ''}
       </div>${!status.engine_available ? `<div class="small dim" style="margin-top:8px">${
         esc(status.engine_reason || '')}</div>` : ''}</div>` : ''}
 
@@ -15161,7 +15337,7 @@ window.__asrhub.showModel = async (id) => {
     <div class="modal-foot">
       <span class="small faint mono">${esc(m.source)}${m.revision ? ' · ' + esc(m.revision) : ''}</span>
       <span class="spacer"></span>
-      <button onclick="__asrhub.useModel(${jsArg(m.id)})" class="primary">
+      <button ${act('useModel', m.id)} class="primary">
         Использовать эту модель</button>
     </div></div></div>`);
   mountModal(backdrop);
@@ -15253,7 +15429,7 @@ RENDERERS.compare = {
       return m ? `<span class="chip accent">${esc(m.name)}
         <button class="ghost sm" style="padding:0 4px"
           aria-label="Убрать модель из сравнения"
-          onclick="__asrhub.cmpRemove(${jsArg(id)})">✕</button></span>` : '';
+          ${act('cmpRemove', id)}>✕</button></span>` : '';
     }).join('');
 
     const models = state.compare.map(modelById).filter(Boolean);
@@ -15648,7 +15824,7 @@ async function loadAccessKeys() {
         <td><span class="chip ${k.role === 'admin' ? 'accent' : ''}">${esc(k.role)}</span></td>
         <td class="small dim">${esc(квотыСловами(k) || '—')}</td>
         <td><button class="ghost sm danger"
-          onclick="__asrhub.revokeKey(${jsArg(k.key_id || '')})">отозвать</button></td>
+          ${act('revokeKey', k.key_id || '')}>отозвать</button></td>
       </tr>`).join('')}</tbody></table></div>` : '<div class="empty small">Ключей нет</div>';
   } catch (err) {
     box.innerHTML = '<div class="empty small">Список ключей доступен администратору</div>';
@@ -17103,7 +17279,7 @@ RENDERERS.employees = {
           <div><h4 style="margin:0 0 8px;font-size:13px">Разобрать с сотрудником</h4>
             ${(карточка.coaching || []).length ? `<div class="stack">${
               карточка.coaching.slice(0, 8).map((з) => `<div class="row small" style="gap:8px">
-                <a href="#" onclick="__asrhub.openJob(${jsArg(з.job_id || з.id)});return false"
+                <a href="#" ${act('openJob', з.job_id || з.id)}
                    title="${esc(з.filename || з.job_id || '')}">${
                   esc((з.filename || з.job_id || '').slice(0, 34))}</a>
                 <span class="spacer"></span>
@@ -17114,7 +17290,7 @@ RENDERERS.employees = {
           <div><h4 style="margin:0 0 8px;font-size:13px">Лучшие разговоры</h4>
             ${(карточка.best || []).length ? `<div class="stack">${
               карточка.best.slice(0, 8).map((з) => `<div class="row small" style="gap:8px">
-                <a href="#" onclick="__asrhub.openJob(${jsArg(з.job_id || з.id)});return false"
+                <a href="#" ${act('openJob', з.job_id || з.id)}
                    title="${esc(з.filename || з.job_id || '')}">${
                   esc((з.filename || з.job_id || '').slice(0, 34))}</a>
                 <span class="spacer"></span>
@@ -17522,9 +17698,9 @@ RENDERERS.system = {
             style="width:auto">вход</label></td>
         <td><div class="row" style="gap:4px">
           <button class="ghost sm"
-            onclick="__asrhub.resetPassword(${jsArg(u.id)},${jsArg(u.username)})">пароль</button>
+            ${act('resetPassword', u.id, u.username)}>пароль</button>
           <button class="ghost sm danger"
-            onclick="__asrhub.deleteUser(${jsArg(u.id)},${jsArg(u.username)})">удалить</button>
+            ${act('deleteUser', u.id, u.username)}>удалить</button>
         </div></td></tr>`).join('');
       host.innerHTML = `${data.default_password_in_use ? `<div class="banner warn small">
         Действует пароль по умолчанию (${esc(data.default_username)}/admin123).
@@ -17565,7 +17741,7 @@ RENDERERS.system = {
             k.mask_pii ? ' <span class="chip" title="персональные данные в ответах заменяются пометками">обезличен</span>' : ''}</td>
           <td class="small dim">${esc(квотыСловами(k) || '—')}</td>
           <td><button class="ghost sm danger"
-            onclick="__asrhub.revokeKey(${jsArg(k.key_id || '')})">отозвать</button>
+            ${act('revokeKey', k.key_id || '')}>отозвать</button>
           </td></tr>`).join('')}</tbody></table>`
         : '<div class="empty small">Ключей нет — аутентификация отключена</div>';
     } catch (err) {
@@ -18476,7 +18652,7 @@ RENDERERS.logs = {
             <td><span class="chip">${esc(e.kind)}</span></td>
             <td class="small">${esc(e.message || '')}
               ${e.job_id ? `<button class="ghost sm"
-                onclick="__asrhub.openJob(${jsArg(e.job_id)})">задание</button>` : ''}</td>
+                ${act('openJob', e.job_id)}>задание</button>` : ''}</td>
           </tr>`).join('')}</tbody></table>` : '<div class="empty small">Событий нет</div>';
       }
     } catch (err) {
@@ -18507,7 +18683,7 @@ RENDERERS.help = {
         <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
           <span><b>Полное руководство</b> — в разделе «Документация»: все главы этой версии,
             оглавление и поиск по тексту.</span><span class="spacer"></span>
-          <button class="primary sm" onclick="__asrhub.go('manual')">Открыть документацию</button>
+          <button class="primary sm" ${act('go', 'manual')}>Открыть документацию</button>
         </div></div>
       <div class="grid cols-2">
         ${card('С чего начать', '', `<div class="small dim" style="line-height:1.75">

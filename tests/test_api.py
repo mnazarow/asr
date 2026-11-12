@@ -337,7 +337,8 @@ def _emitted_event_names() -> set[str]:
     names: set[str] = set()
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        names |= set(re.findall(r'_emit\(\s*"([a-z]+\.[a-z]+)"', text))
+        # `_emit` — очередь; `опубликовать` — прочие источники (AudioSocket).
+        names |= set(re.findall(r'(?:_emit|опубликовать)\(\s*"([a-z]+\.[a-z]+)"', text))
     return names
 
 

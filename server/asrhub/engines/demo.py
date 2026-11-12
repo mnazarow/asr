@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import time
 from pathlib import Path
@@ -55,6 +56,11 @@ class DemoEngine(Engine):
                     progress: ProgressCallback | None) -> TranscriptionResult:
         info = probe(audio_path)
         duration = info.duration_s
+        # Имитация зависшего движка — для проверки сторожа зависших: вызов
+        # молчит, не докладывая о ходе, как застрявший драйвер.
+        зависнуть = float(os.environ.get("ASRHUB_DEMO_HANG_S") or 0)
+        if зависнуть > 0:
+            time.sleep(зависнуть)
 
         # Детерминированность: один и тот же файл даёт один и тот же текст.
         seed = int(hashlib.blake2b(str(audio_path).encode(), digest_size=8).hexdigest(), 16)

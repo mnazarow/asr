@@ -726,19 +726,31 @@ def test_отказ_422_читается_по_русски(стенд, брау�
 
 
 def test_аргумент_обработчика_не_ломается_апострофом(стенд, браузер):
-    """Сущность &#39; раскодируется до разбора JS — апостроф закрывал строку."""
-    вкладка = _вкладка(браузер, стенд["адрес"])
-    _открыть(вкладка, "transcribe")
+    """Сущность &#39; раскодируется до разбора JS — апостроф закрывал строку.
+
+    С 3.1.33 встроенных обработчиков нет вовсе (data-act, политика
+    содержимого без 'unsafe-inline'): аргумент едет JSON в атрибуте, а
+    встроенный onclick страница не исполняет, даже если его подставить.
+    """
+    # Политика содержимого — настоящая: проверки обходят её по умолчанию
+    # (conftest, ради wait_for_function), а здесь она и проверяется.
+    контекст = браузер.new_context(bypass_csp=False)
+    вкладка = контекст.new_page()
+    вкладка.goto(f"{стенд['адрес']}/#transcribe", wait_until="networkidle")
+    вкладка.wait_for_timeout(1500)
     получено = вкладка.evaluate("""() => {
       window.__получено = null;
       window.__asrhub.проверка = (x) => { window.__получено = x; };
       const значение = "a');window.__взлом=1;//\\\\\\"";
       const узел = document.createElement('div');
-      узел.innerHTML = `<button id="jsarg" onclick="__asrhub.проверка(${window.__asrhub.util.jsArg(значение)})">x</button>`;
+      узел.innerHTML = `<button id="jsarg"${window.__asrhub.util.act('проверка', значение)}>x</button>`
+        + `<button id="inline" onclick="window.__взлом=2">y</button>`;
       document.body.appendChild(узел);
       document.querySelector('#jsarg').click();
+      document.querySelector('#inline').click();
       return [window.__получено === значение, window.__взлом === undefined];
     }""")
+    контекст.close()
     assert получено == [True, True], получено
 
 

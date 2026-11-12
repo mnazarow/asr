@@ -27,7 +27,7 @@ class МиниАТС:
                  кнопки: list[str] | None = None, ответ: str = "answer",
                  положить_после: int | None = None, qop: bool = True,
                  без_пароля: bool = False, кодек: str = "PCMA",
-                 глотать_отмену: int = 0) -> None:
+                 глотать_отмену: int = 0, перепригласить: bool = False) -> None:
         self.пароль = пароль
         self.способ = способ                # rfc2833 | info | inband
         self.кнопки = list(кнопки or [])
@@ -37,6 +37,11 @@ class МиниАТС:
         self.без_пароля = без_пароля
         self.кодек = кодек
         self.глотать_отмену = глотать_отмену   # сколько первых CANCEL «потерять»
+        #: Повторное приглашение посреди разговора: ответы телефона на него и
+        #: были ли учётные данные в ACK на 200.
+        self.перепригласить = перепригласить
+        self.ответы_на_повтор: list[sip.Сообщение] = []
+        self.ack_с_паролем: list[bool] = []
         self.сокет = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.сокет.bind(("127.0.0.1", 0))
         self.порт = self.сокет.getsockname()[1]
@@ -109,6 +114,13 @@ class МиниАТС:
             except OSError:
                 return
             сообщение = sip.разобрать(данные)
+            if сообщение is not None and сообщение.ответ \
+                    and сообщение.cseq == (2, "INVITE") and сообщение.код == 200:
+                self.ответы_на_повтор.append(сообщение)
+                # ACK — только на третий 200: телефон обязан повторять ответ.
+                if len(self.ответы_на_повтор) == 3:
+                    self._ack_повтора(сообщение)
+                continue
             if сообщение is None or сообщение.ответ:
                 continue
             метод = сообщение.метод
@@ -154,6 +166,8 @@ class МиниАТС:
                         ("Contact", f"<sip:pbx@127.0.0.1:{self.порт}>"),
                         ("Content-Type", "application/sdp")])
             elif метод == "ACK":
+                self.ack_с_паролем.append(bool(сообщение.взять("authorization")
+                                               or сообщение.взять("proxy-authorization")))
                 if self._разговор and self.ответ == "answer" and "поток" not in self._разговор:
                     поток = threading.Thread(target=self._абонент, daemon=True)
                     self._разговор["поток"] = поток
@@ -214,6 +228,8 @@ class МиниАТС:
     def _абонент(self) -> None:
         описание = self._разговор["sdp"]
         self._разговор["куда"] = (описание["адрес"], описание["порт"])
+        if self.перепригласить:
+            self._повторно_пригласить()
         состояние = {"номер": 1, "время": 1000}
         тишина = sip.ТИШИНА[self.кодек]
         очередь = list(self.кнопки)
@@ -249,6 +265,28 @@ class МиниАТС:
                     кнопка = очередь.pop(0)
                     if кнопка:                  # пустая — фразу слушают молча
                         self._нажать(кнопка, состояние)
+
+    def _повторно_пригласить(self) -> None:
+        invite = self._разговор["invite"]
+        цель = sip._адрес_в_скобках(self._разговор["contact"])
+        тело = ("v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n"
+                f"t=0 0\r\nm=audio {self.порт_звука} RTP/AVP 8 0 101\r\n"
+                "a=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n"
+                "a=rtpmap:101 telephone-event/8000\r\n").encode()
+        self._повтор_from = invite.взять("to") + ";tag=abc"
+        self.сокет.sendto(sip.собрать(f"INVITE {цель} SIP/2.0", [
+            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.порт};branch=z9hG4bKre{uuid.uuid4().hex[:8]}"),
+            ("From", self._повтор_from), ("To", invite.взять("from")),
+            ("Call-ID", invite.взять("call-id")), ("CSeq", "2 INVITE"),
+            ("Contact", f"<sip:pbx@127.0.0.1:{self.порт}>"),
+            ("Content-Type", "application/sdp")], тело), self._разговор["откуда"])
+
+    def _ack_повтора(self, ответ: sip.Сообщение) -> None:
+        цель = sip._адрес_в_скобках(self._разговор["contact"])
+        self.сокет.sendto(sip.собрать(f"ACK {цель} SIP/2.0", [
+            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.порт};branch=z9hG4bK{uuid.uuid4().hex[:8]}"),
+            ("From", self._повтор_from), ("To", ответ.взять("to")),
+            ("Call-ID", ответ.взять("call-id")), ("CSeq", "2 ACK")]), self._разговор["откуда"])
 
     def _положить(self) -> None:
         invite = self._разговор["invite"]

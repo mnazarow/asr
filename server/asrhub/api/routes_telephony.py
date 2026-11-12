@@ -250,6 +250,17 @@ def queues(request: Request, period: str = Query(default="week",
     return итог
 
 
+@router.get("/live", summary="Живые разговоры (AudioSocket), которые идут сейчас")
+def live(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    require_admin(principal)
+    state = get_state(request)
+    приём = getattr(state, "audiosocket", None)
+    адрес = приём.адрес if приём is not None else None
+    return {"enabled": адрес is not None,
+            "listen": f"{адрес[0]}:{адрес[1]}" if адрес else "",
+            "items": приём.идут() if приём is not None else []}
+
+
 @router.get("/stations", summary="Список станций")
 def stations(request: Request,
              principal: Principal = Depends(authenticate)) -> dict[str, Any]:

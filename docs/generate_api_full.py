@@ -189,6 +189,7 @@ ADMIN_ROUTES = {
     ("/api/telephony/stations/{station_id}/enabled", "post"),
     ("/api/telephony/diagnose", "post"), ("/api/telephony/rewind", "post"),
     ("/api/telephony/reconcile", "post"), ("/api/telephony/queues", "get"),
+    ("/api/telephony/live", "get"),
     ("/api/telephony/collect", "get"), ("/api/telephony/collect", "post"),
     ("/api/telephony/agents", "get"), ("/api/telephony/agents/{agent_id}", "delete"),
     ("/api/telephony/agents/{agent_id}/command", "post"),

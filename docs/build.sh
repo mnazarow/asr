@@ -4,6 +4,8 @@
 #
 #   bash docs/build.sh                 полная сборка
 #   bash docs/build.sh --no-pdf        без обновления оглавления и PDF
+#   bash docs/build.sh --screenshots   сначала снять снимки интерфейса заново
+#                                      (docs/make_screenshots.py, нужен playwright)
 #
 # Что происходит:
 #   1. Справочные разделы (модели, параметры, пресеты) собираются из каталога
@@ -27,13 +29,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${ROOT}/build"
 OUT="${BUILD}/ASR Hub — документация.docx"
 MAKE_PDF=1
+SCREENSHOTS=0
 
-[[ "${1:-}" == "--no-pdf" ]] && MAKE_PDF=0
+for arg in "$@"; do
+  case "${arg}" in
+    --no-pdf) MAKE_PDF=0 ;;
+    --screenshots) SCREENSHOTS=1 ;;
+    *) echo "Неизвестный ключ: ${arg} (есть --no-pdf и --screenshots)" >&2; exit 2 ;;
+  esac
+done
 
 command -v pandoc >/dev/null || { echo "Нужен pandoc: apt install pandoc"; exit 127; }
 
 mkdir -p "${BUILD}"
 cd "${ROOT}"
+
+if [ "${SCREENSHOTS}" -eq 1 ]; then
+  echo "0/8 Снимки интерфейса"
+  PYTHONPATH="${ROOT}/server" python3 docs/make_screenshots.py
+fi
 
 echo "1/8 Справочные разделы из каталога"
 python3 docs/generate.py

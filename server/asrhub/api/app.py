@@ -680,6 +680,14 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                               S.integer(settings, "model_idle_unload_s", 900))
     hub = EventHub()
     queue = JobQueue(db, settings, registry, on_event=hub.publish)
+    # События заданий, которые считают соседние серверы над общей базой.
+    from ..events_bridge import МостСобытий  # noqa: PLC0415
+
+    мост = МостСобытий(db, hub.publish)
+    # Живые разговоры со станции по протоколу AudioSocket (audiosocket_port).
+    from ..telephony.audiosocket import ПриёмAudioSocket  # noqa: PLC0415
+
+    живые = ПриёмAudioSocket(registry, settings, hub.publish, db)
     analytics = Analytics(db)
     state = AppState(settings=settings, db=db, registry=registry,
                      queue=queue, analytics=analytics, queue_enabled=start_queue)
@@ -738,6 +746,38 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     # Контроль качества: обратный звонок клиенту с опросом. Собирается
     # всегда, звонит только при включённой настройке (см. qc/survey.py).
     state.qc = КонтрольКачества(db, settings)
+    state.audiosocket = живые
+
+    def _распознать_ответ(pcm: bytes) -> str:
+        """Голосовой ответ или комментарий опроса (PCM 16 бит 8 кГц) → текст.
+
+        Модель — по умолчанию сервера (или `qc_voice_model`); ждём её не
+        дольше пяти секунд и при занятой поднимаем второй экземпляр, как у
+        распознавания на лету: клиент на линии ждать очередь не будет.
+        """
+        import tempfile  # noqa: PLC0415
+        import wave  # noqa: PLC0415
+
+        настройки = settings.merged({})
+        модель = str(settings.get("qc_voice_model") or "").strip()
+        if модель:
+            настройки["model"] = модель
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir=str(settings.paths.tmp),
+                                         delete=False) as файл:
+            путь = Path(файл.name)
+        try:
+            with wave.open(str(путь), "wb") as запись:
+                запись.setnchannels(1)
+                запись.setsampwidth(2)
+                запись.setframerate(8000)
+                запись.writeframes(pcm)
+            with registry.lease(настройки, wait_s=5.0, отдельный_если_занят=True) as движок:
+                итог = движок.transcribe(путь, настройки, None)
+        finally:
+            путь.unlink(missing_ok=True)
+        return " ".join(с.text.strip() for с in итог.segments if с.text).strip()
+
+    state.qc.распознать = _распознать_ответ
 
     def _закрыть_пул_диктовки() -> None:
         пул = (getattr(state, "stream_pool", None) or {}).get("пул")
@@ -749,6 +789,12 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         hub.bind(asyncio.get_running_loop())
         if start_queue:
             queue.start()
+        мост.start()
+        try:
+            живые.start()
+        except OSError as exc:
+            log.error("AudioSocket не запущен: порт %s занят или недоступен: %s",
+                      settings.get("audiosocket_port"), exc)
         state.monitoring.start()
         state.content.start()
         state.llm_worker.start()
@@ -768,6 +814,8 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         # Каждый шаг — под своей защитой: сбой одного не должен отменять
         # остальные, иначе отметка экземпляра так и висела бы пять минут.
         for название, шаг in (("очередь", queue.stop),
+                              ("события соседей", мост.stop),
+                              ("AudioSocket", живые.stop),
                               ("мониторинг", state.monitoring.stop),
                               ("разбор содержания", state.content.stop),
                               ("языковая модель", state.llm_worker.stop),
@@ -1730,12 +1778,14 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     return app
 
 
-#: Политика содержимого главной страницы. Встроенные обработчики (onclick)
-#: пока требуют 'unsafe-inline', но запросы, картинки и звук — только к
-#: самому серверу: внедрённая строка не уведёт ключ из localStorage
-#: на чужой адрес ни fetch, ни картинкой.
+#: Политика содержимого главной страницы. Скрипты — только файлами с самого
+#: сервера: встроенных обработчиков (onclick="…") в разметке больше нет
+#: (data-act, см. app.js), и внедрённая строка кодом не станет. Запросы,
+#: картинки и звук — тоже только к самому серверу. Встроенные стили
+#: остаются ('unsafe-inline' у style-src): ими раскрашены полосы и графики,
+#: а исполнить через стиль ничего нельзя.
 _ПОЛИТИКА_СТРАНИЦЫ = (
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "default-src 'self'; script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
     "media-src 'self' blob:; connect-src 'self' ws: wss:; font-src 'self' data:; "
     "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'")

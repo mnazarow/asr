@@ -727,6 +727,8 @@ def config(request: Request,
            # снят, и bool-параметр отвечал на это 422 — раздел не собирал файлы.
            tracks: str = Query("", max_length=8, description="Писать стороны раздельно: "
                                                              "MixMonitor r()/t() (1/yes/true)"),
+           norec_code: str = Query("", max_length=4,
+                                   description="Код «не записывать» в разговоре, например *7"),
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     require_write(principal)
     state = get_state(request)
@@ -734,7 +736,7 @@ def config(request: Request,
         п = К.параметры(driver=driver, mode=mode, station=station,
                         url=url or _адрес_сервера(request, state), base=base,
                         format=format, key_in=key_in, trunk=trunk,
-                        internal_len=internal_len, tracks=tracks)
+                        internal_len=internal_len, tracks=tracks, norec_code=norec_code)
     except ValueError as exc:
         raise error_response(ConfigError(f"Параметры настройки: {exc}.")) from exc
     return К.собрать(п, версия=str(state.version))

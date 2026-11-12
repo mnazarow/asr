@@ -47,6 +47,8 @@ python -m pytest tests/test_dialplan.py -q -k "сценарий"              # 
 ```bash
 ruff check server tests agent/asrhub-agent.py examples
 for f in server/asrhub/web/*.js; do node --check "$f"; done
+npx eslint@9 --config eslint.config.mjs server/asrhub/web   # необъявленные имена, eval, мёртвый код
+node --test tests/js/*.test.mjs                               # помощники интерфейса без браузера
 shellcheck -S warning -s sh agent/asrhub-dialplan
 shellcheck -S warning agent/install.sh
 shellcheck -S error scripts/*.sh scripts/lib/*.sh
@@ -54,7 +56,11 @@ shellcheck -S error scripts/*.sh scripts/lib/*.sh
 
 ## Сборочный конвейер
 
-`.github/workflows/ci.yml`: на каждый push и запрос на слияние — линтеры и быстрый ярус на Python 3.10 и 3.12; раз в сутки и по кнопке — полный набор с браузером (`ASRHUB_REQUIRE_BROWSER=1`) и сборка колеса с проверкой, что в него попали агент и руководство.
+`.github/workflows/ci.yml`: на каждый push и запрос на слияние — линтеры (ruff, ESLint, `node --test`, shellcheck) и быстрый ярус на Python 3.10 и 3.12; раз в сутки и по кнопке — полный набор с браузером (`ASRHUB_REQUIRE_BROWSER=1`) и покрытием (`--cov=asrhub`, отчёт `coverage.xml` — артефактом прогона) и сборка колеса с проверкой, что в него попали агент и руководство.
+
+`eslint.config.mjs` в корне — настройка ESLint 9 для `server/asrhub/web`: правила ловят ошибки, а не стиль. Проверка `test_eslint_config_is_clean_when_eslint_is_available` запускает его, если ESLint есть на машине (`eslint` в `PATH` или путь к нему в `ASRHUB_ESLINT`), и пропускается без него.
+
+**Проход «роль × раздел × тема × ширина»** (`tests/test_review_61_web.py`): каждый раздел меню под администратором, пользователем и ключом «только чтение», в светлой и тёмной теме, на 1600 и 390 точках. Ловит исключения в скрипте, 5xx, пустой раздел и страницу шире экрана телефона.
 
 ## Согласованность кода и документации
 
@@ -79,8 +85,8 @@ python3 docs/generate_api_full.py http://127.0.0.1:8099
 
 - Главы — `docs/NN-имя.md`, номер главы берётся из имени файла. Новая глава — строка в `docs/00-README.md` и в списке `docs/assemble.py`.
 - Раздел «Документация» интерфейса показывает те же файлы (`manual.py`); картинки — из `docs/images`.
-- Обзорные снимки разделов пересъёмка: `PYTHONPATH=server python3 docs/make_screenshots.py` (на демонстрационном архиве).
-- Word и PDF: `bash docs/build.sh` (нужен pandoc).
+- Снимки интерфейса: `PYTHONPATH=server python3 docs/make_screenshots.py` (на демонстрационном архиве, светлая тема): обзорные снимки разделов и снимки состояний — карточка записи и её вкладки, карточка модели, окно горячих клавиш, вкладки «АТС» и «Аналитики записей». Один снимок — именем: `… make_screenshots.py 14-job-card`.
+- Word и PDF: `bash docs/build.sh` (нужен pandoc); `--screenshots` — сначала снять снимки заново. Предложения (`proposal-*.md`) и полный справочник API входят в документ приложениями.
 
 ## Выпуск версии
 

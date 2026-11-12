@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -713,7 +713,10 @@ _SCHEMA = [
         ts       REAL NOT NULL,
         kind     TEXT NOT NULL,
         message  TEXT,
-        data     TEXT
+        data     TEXT,
+        -- Какой сервер записал событие: соседи над общей базой пересылают
+        -- своим подписчикам только чужие (см. events_bridge).
+        instance TEXT DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, ts)",
@@ -1086,7 +1089,9 @@ _SCHEMA = [
         answers      TEXT DEFAULT '',
         score        REAL,
         score_pct    REAL,
-        talk_s       REAL DEFAULT 0
+        talk_s       REAL DEFAULT 0,
+        -- Запись опроса (qc_record): путь к WAV, слева клиент, справа сервер.
+        recording    TEXT DEFAULT ''
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_qc_call ON qc_surveys(call_key)",
@@ -2097,8 +2102,10 @@ class Database:
             conn.execute(f"INSERT INTO jobs ({columns}) VALUES ({holders})",
                          list(payload.values()))
             conn.execute(
-                "INSERT INTO events (job_id, ts, kind, message, data) VALUES (?,?,?,?,NULL)",
-                (job_id, ts, "created", f"Задание создано: {payload.get('filename', '')}"))
+                "INSERT INTO events (job_id, ts, kind, message, data, instance) "
+                "VALUES (?,?,?,?,NULL,?)",
+                (job_id, ts, "created", f"Задание создано: {payload.get('filename', '')}",
+                 INSTANCE_ID))
         self.поколение_заданий += 1
         return job_id
 
@@ -3965,6 +3972,12 @@ class Database:
         цифры = self._цифры_номера(запрос)
         if not цифры or len(цифры) < 5:
             return 0
+        # Запись опроса — голос субъекта: уходит вместе со строкой.
+        for строка in self.query(
+                "SELECT recording FROM qc_surveys WHERE instr(number, ?) > 0 "
+                "AND COALESCE(recording,'')<>''", (цифры,)):
+            with contextlib.suppress(OSError):
+                Path(строка["recording"]).unlink(missing_ok=True)
         return self.execute(
             "DELETE FROM qc_surveys WHERE instr(number, ?) > 0 AND status NOT IN ('ждёт','звонит')",
             (цифры,)) + self.execute(
@@ -4915,8 +4928,10 @@ class Database:
                      for имя, значение, модель, движок in metrics])
             if events:
                 conn.executemany(
-                    "INSERT INTO events (job_id, ts, kind, message, data) VALUES (?,?,?,?,NULL)",
-                    [(job_id, момент, str(вид), str(текст)) for вид, текст in events])
+                    "INSERT INTO events (job_id, ts, kind, message, data, instance) "
+                    "VALUES (?,?,?,?,NULL,?)",
+                    [(job_id, момент, str(вид), str(текст), INSTANCE_ID)
+                     for вид, текст in events])
         self._поколение_реплик += 1
         return True
 
@@ -4952,11 +4967,32 @@ class Database:
                   data: dict[str, Any] | None = None) -> None:
         try:
             self.execute(
-                "INSERT INTO events (job_id, ts, kind, message, data) VALUES (?,?,?,?,?)",
+                "INSERT INTO events (job_id, ts, kind, message, data, instance) "
+                "VALUES (?,?,?,?,?,?)",
                 (job_id, now(), kind, message,
-                 json.dumps(data, ensure_ascii=False) if data else None))
+                 json.dumps(data, ensure_ascii=False) if data else None, INSTANCE_ID))
         except StorageError:
             log.warning("Не удалось записать событие %s для %s", kind, job_id)
+
+    def последнее_событие(self) -> int:
+        строка = self.query_one("SELECT MAX(id) AS n FROM events")
+        return int(строка["n"] or 0) if строка is not None else 0
+
+    def события_соседей(self, после: int, *, предел: int = 500) -> list[dict[str, Any]]:
+        """События заданий, записанные другими серверами над этой базой."""
+        # Все строки после метки, а не только чужие: метка должна проходить
+        # и через свои, иначе каждый опрос заново перебирал бы их.
+        return [dict(с, own=str(с["instance"] or "") in ("", INSTANCE_ID)) for с in self.query(
+            "SELECT e.id, e.job_id, e.kind, e.message, e.instance, j.owner, j.status, "
+            "j.filename FROM events e LEFT JOIN jobs j ON j.id = e.job_id "
+            "WHERE e.id > ? ORDER BY e.id LIMIT ?", (int(после), int(предел)))]
+
+    def ход_соседей(self) -> list[dict[str, Any]]:
+        """Ход заданий, которые сейчас считают другие серверы."""
+        return [dict(с) for с in self.query(
+            "SELECT id, owner, progress, stage FROM jobs "
+            "WHERE status='running' AND COALESCE(instance_id,'') NOT IN ('', ?)",
+            (INSTANCE_ID,))]
 
     def get_events(self, job_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         if job_id:

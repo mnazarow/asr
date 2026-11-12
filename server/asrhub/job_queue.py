@@ -523,6 +523,51 @@ class WorkerState:
         return data
 
 
+
+class Будильник:
+    """Пробуждение воркеров: как `threading.Event`, но будит одного.
+
+    С `Event` каждое новое задание будило всех простаивающих воркеров: на
+    сервере с восемью воркерами это восемь запросов к базе за одним
+    заданием, семь из которых возвращались ни с чем. Здесь сигнал достаётся
+    одному ждущему; несколько сигналов подряд (пачка заданий) копятся, но не
+    больше `ПРЕДЕЛ`. Воркеры всё равно просыпаются раз в секунду сами, так
+    что потерянный сигнал стоит не больше секунды. Остановка будит всех.
+    """
+
+    ПРЕДЕЛ = 16
+
+    def __init__(self) -> None:
+        self._условие = threading.Condition()
+        self._сигналов = 0
+        self._все = False
+
+    def set(self) -> None:
+        with self._условие:
+            self._сигналов = min(self._сигналов + 1, self.ПРЕДЕЛ)
+            self._условие.notify(1)
+
+    def set_all(self) -> None:
+        with self._условие:
+            self._все = True
+            self._условие.notify_all()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        with self._условие:
+            if not self._сигналов and not self._все:
+                self._условие.wait(timeout)
+            if self._сигналов:
+                self._сигналов -= 1
+                return True
+            return self._все
+
+    def clear(self) -> None:
+        """Сигнал уже снят в `wait` — для совместимости с `Event`."""
+
+    def is_set(self) -> bool:
+        return bool(self._сигналов) or self._все
+
+
 class JobQueue:
     """Менеджер очереди с пулом рабочих потоков."""
 
@@ -543,7 +588,7 @@ class JobQueue:
         self._lock = threading.RLock()
         #: Проверка предела очереди и заведение задания — одним шагом (см. `submit`).
         self._замок_приёма = threading.Lock()
-        self._wake = threading.Event()
+        self._wake = Будильник()
         self._stop = threading.Event()
         self._paused = False
         self._workers: list[threading.Thread] = []
@@ -590,6 +635,9 @@ class JobQueue:
         self._последний_старт: dict[str, float] = {}
         #: Потоки воркеров по номеру — чтобы поднять заново умерший.
         self._потоки: dict[int, threading.Thread] = {}
+        #: Дочерние процессы распознавания по номеру воркера
+        #: (`worker_isolation: process`, см. `worker_process`).
+        self._дочерние: dict[int, Any] = {}
         self._пауза_прочитана = 0.0
         self._started = False
 
@@ -682,9 +730,15 @@ class JobQueue:
             pool, self._webhooks = self._webhooks, None
         if pool is not None:
             pool.shutdown(wait=False)
-        self._wake.set()
+        разбудить_всех = getattr(self._wake, "set_all", self._wake.set)
+        разбудить_всех()
         for thread in self._workers:
             thread.join(timeout=timeout / max(1, len(self._workers)))
+        for дочерний in list(getattr(self, "_дочерние", {}).values()):
+            try:
+                дочерний.остановить()
+            except Exception as exc:                        # noqa: BLE001
+                log.debug("Процесс воркера не остановлен: %s", exc)
         try:
             возвращено = self._вернуть_свои_при_остановке()
             if возвращено:
@@ -1820,6 +1874,45 @@ class JobQueue:
 
     # --- рабочий цикл -----------------------------------------------------
 
+    def _изоляция_процессом(self) -> bool:
+        try:
+            return str(self.settings.get("worker_isolation") or "thread") == "process"
+        except Exception:                                    # noqa: BLE001
+            return False
+
+    def _дочерний(self, index: int) -> Any:
+        """Процесс распознавания воркера — в режиме `worker_isolation: process`."""
+        if not self._изоляция_процессом():
+            return None
+        дочерние = self.__dict__.setdefault("_дочерние", {})
+        with self._lock:
+            дочерний = дочерние.get(index)
+            if дочерний is None:
+                from .worker_process import ДочернийВоркер  # noqa: PLC0415
+
+                дочерний = ДочернийВоркер(
+                    index, размер_кеша=max(1, int(self.settings.get("model_cache_size") or 1)),
+                    простой_с=int(self.settings.get("model_idle_unload_s") or 900))
+                дочерние[index] = дочерний
+            return дочерний
+
+    def _карта_воркера(self, index: int, merged: dict[str, Any]) -> str:
+        """Карта из пула `gpu_devices` для воркера; пусто — пула нет или карта задана."""
+        try:
+            сырые = self.settings.get("gpu_devices") or []
+        except Exception:                                    # noqa: BLE001
+            return ""
+        if isinstance(сырые, str):
+            сырые = [ч.strip() for ч in сырые.replace(";", ",").split(",")]
+        карты = [str(к).strip() for к in сырые if str(к).strip()]
+        if not карты:
+            return ""
+        просили = str(merged.get("device") or "auto").strip().lower()
+        # Явная карта («cuda:1») и процессор — как попросили.
+        if просили not in ("", "auto", "cuda", "gpu", "rocm"):
+            return ""
+        return карты[int(index) % len(карты)]
+
     def _заменён(self, index: int) -> bool:
         """Поток воркера заменён сторожем зависших — ему пора уйти."""
         return self._потоки.get(index) not in (None, threading.current_thread())
@@ -1903,6 +1996,12 @@ class JobQueue:
             merged["_fallback_from"] = str(params["_fallback_from"])
             merged["_fallback_reason"] = str(params.get("_fallback_reason") or "")
 
+        # Пул видеокарт: задание без явного номера карты считает воркер на
+        # «своей» карте (номер воркера по кругу), и у каждой карты свой
+        # экземпляр модели в кеше — вторая карта больше не простаивает.
+        карта = self._карта_воркера(state.index, merged)
+        if карта:
+            merged["device"] = карта
         paths = self.settings.paths
         workdir = safe_workdir(self._каталог_временных(), self._имя_рабочего(job_id))
         outdir = paths.results / job_id
@@ -2040,15 +2139,20 @@ class JobQueue:
         except Exception as exc:                             # noqa: BLE001
             log.warning("Результат близнеца для %s не взят: %s", job_id, exc,
                         extra={"job_id": job_id})
+        аргументы: dict[str, Any] = {
+            "workdir": workdir, "outdir": outdir,
+            "basename": Path(job.get("filename") or job_id).stem,
+            "filename": str(job.get("filename") or ""),
+            "progress": progress, "cancelled": cancelled,
+            "deadline": (started + timeout) if timeout else None, "timeout_s": timeout,
+            "measure_memory": True, "reset_memory": одно}
+        дочерний = self._дочерний(state.index)
         try:
-            outcome = process_job(
-                Path(job["file_path"]), merged, self.registry,
-                workdir=workdir, outdir=outdir,
-                basename=Path(job.get("filename") or job_id).stem,
-                filename=str(job.get("filename") or ""),
-                progress=progress, cancelled=cancelled,
-                deadline=(started + timeout) if timeout else None, timeout_s=timeout,
-                measure_memory=True, reset_memory=одно)
+            if дочерний is not None:
+                outcome = дочерний.выполнить(Path(job["file_path"]), merged, **аргументы)
+            else:
+                outcome = process_job(Path(job["file_path"]), merged, self.registry,
+                                      **аргументы)
         except ASRHubError as exc:
             self._handle_failure(job, exc, merged, outdir=outdir)
             return
@@ -3345,6 +3449,16 @@ class JobQueue:
 
     def _снять_зависшее(self, index: int, state: WorkerState) -> bool:
         job_id, model = str(state.job_id), str(state.model or "")
+        # Процесс распознавания — завершить: память и замок модели уходят с
+        # ним, а поток воркера получает «движок не отвечает» и сам проводит
+        # задание как неудачное. Поток заменять не нужно.
+        дочерний = getattr(self, "_дочерние", {}).get(index)
+        if дочерний is not None and дочерний.жив():
+            log.error("Воркер %d: движок не отвечает по заданию %s дольше предела %.0f с — "
+                      "процесс распознавания завершается", index, job_id, state.срок_с,
+                      extra={"job_id": job_id, "model": model})
+            state.доклад = time.monotonic()
+            return дочерний.завершить("движок не отвечает")
         job = self.db.get_job(job_id) or {"id": job_id}
         ошибка = EngineHung(int(state.срок_с), миг_доклада=time.monotonic() - state.доклад)
         снято = self.db.update_job_if_status(

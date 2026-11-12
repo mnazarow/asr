@@ -79,6 +79,8 @@ class Параметры:
     #: Писать стороны раздельно: MixMonitor r()/t() — клиент и оператор в
     #: своих файлах. Сервер сводит их в стерео и знает «кто говорит» точно.
     tracks: bool = False
+    #: Код «не записывать» посреди разговора (`features.conf`); пусто — без него.
+    norec_code: str = ""
 
 
 def параметры(**сырые: Any) -> Параметры:
@@ -128,6 +130,10 @@ def параметры(**сырые: Any) -> Параметры:
         raise ValueError("длина внутреннего номера — число от 2 до 6")
     п.internal_len = длина
     п.tracks = str(сырые.get("tracks") or "").strip().lower() in ("1", "true", "yes", "on")
+    код = str(сырые.get("norec_code") or "").strip()
+    if код and not re.fullmatch(r"[0-9*#]{1,4}", код):
+        raise ValueError("код «не записывать» — до четырёх знаков из 0–9, * и #")
+    п.norec_code = код
     if п.tracks and п.mode != "upload":
         raise ValueError("раздельные дорожки — только при отправке файлом (upload)")
     return п
@@ -196,7 +202,7 @@ exten => s,1,NoOp(ASR Hub: запись ${{UNIQUEID}}, ${{ARG1}}, ${{ARG2}})
  same => n,Set(ASRHUB_QUEUE=${{ARG3}})
  same => n,Set(ASRHUB_TAG=${{ARG4}})
  same => n,Set(ASRHUB_STARTED=${{EPOCH}})
- same => n,Set(ASRHUB_REL={ПОДКАТАЛОГ}/${{STRFTIME(${{EPOCH}},,%Y/%m/%d)}}/${{UNIQUEID}}.{п.format})
+{_код_в_разговоре(п)} same => n,Set(ASRHUB_REL={ПОДКАТАЛОГ}/${{STRFTIME(${{EPOCH}},,%Y/%m/%d)}}/${{UNIQUEID}}.{п.format})
  ; «Не записывать»: согласие не дано (см. asrhub-norec) — звонок уйдёт в
  ; журнал без записи.
  same => n,GotoIf($["${{ASRHUB_RECORD}}" = "0"]?handler)
@@ -222,6 +228,32 @@ exten => s,1,Set(__ASRHUB_RECORD=0)
 [asrhub-tag]
 exten => s,1,Set(__ASRHUB_TAG2=${{FILTER(0-9A-Za-z_.-,${{ARG1}})}})
  same => n,Return()
+"""
+
+
+def _код_в_разговоре(п: Параметры) -> str:
+    """Включить код «не записывать» в этом разговоре (DYNAMIC_FEATURES)."""
+    if not п.norec_code:
+        return ""
+    return (" ; Код «не записывать» в разговоре (features.conf, раздел applicationmap):\n"
+            " ; у входящего его набирает оператор (callee), у исходящего — он же (caller).\n"
+            " same => n,Set(__DYNAMIC_FEATURES=${DYNAMIC_FEATURES}#"
+            "${IF($[\"${ARG1}\" = \"out\"]?asrhub_norec_out:asrhub_norec_in)})\n")
+
+
+def коды_в_разговоре(п: Параметры) -> str:
+    """Раздел applicationmap для features.conf: код «не записывать»."""
+    return f"""\
+; Код «не записывать» посреди разговора: оператор набирает {п.norec_code} — запись
+; останавливается, звонок уходит в ASR Hub без неё с пометкой «не записывать».
+; FreePBX: файл features_applicationmap_custom.conf; голый Asterisk — раздел
+; [applicationmap] в features.conf. После правки: asterisk -rx "module reload features".
+;
+; MixMonitor идёт на канале, где вызван asrhub-record: у входящего это канал
+; клиента (peer для оператора-callee), у исходящего — канал самого оператора.
+[applicationmap]
+asrhub_norec_in => {п.norec_code},peer/callee,Gosub(asrhub-norec,s,1)
+asrhub_norec_out => {п.norec_code},self/caller,Gosub(asrhub-norec,s,1)
 """
 
 
@@ -483,6 +515,10 @@ def собрать(п: Параметры, *, версия: str = "") -> dict[st
         {"id": "queues", "title": "Очереди: кто ответил",
          "path": "/etc/asterisk/queues.conf", "lang": "asterisk", "text": очереди(п)},
     ]
+    if п.norec_code:
+        файлы.append({"id": "features", "title": "Код «не записывать» в разговоре",
+                      "path": "/etc/asterisk/features_applicationmap_custom.conf",
+                      "lang": "asterisk", "text": коды_в_разговоре(п)})
     if п.mode == "upload":
         файлы += [
             {"id": "install", "title": "Установка сценария отправки",

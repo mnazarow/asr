@@ -556,6 +556,23 @@ def _ячейка(значение: Any) -> Any:
     return значение
 
 
+@router.get("/surveys/{survey_id}/audio", summary="Запись опроса (WAV, слева клиент)")
+async def survey_audio(survey_id: str, request: Request,
+                       principal: Principal = Depends(authenticate)) -> FileResponse:
+    """Запись опроса при `qc_record` — в том же охвате, что журнал."""
+    state, владельцы = _читатель(request, principal)
+    строка = state.db.query_one("SELECT owner, recording FROM qc_surveys WHERE id=?",
+                                (survey_id,))
+    if строка is None or (владельцы is not None and строка["owner"] not in владельцы):
+        raise error_response(JobNotFound(survey_id))
+    путь = Path(str(строка["recording"] or ""))
+    каталог = state.qc.каталог_записей_опросов().resolve()
+    if not строка["recording"] or not путь.is_file() or каталог not in путь.resolve().parents:
+        raise error_response(JobNotFound(survey_id).with_hint(
+            "Запись этого опроса не сохранялась (qc_record) или уже удалена."))
+    return FileResponse(путь, media_type="audio/wav", filename=f"qc-{survey_id}.wav")
+
+
 @router.post("/surveys/{survey_id}/cancel", summary="Отменить ждущий опрос")
 async def cancel(survey_id: str, request: Request,
                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:

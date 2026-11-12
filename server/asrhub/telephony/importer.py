@@ -1136,14 +1136,15 @@ class Импортёр:
                    self.станция.username, self.станция.secret,
                    bool(getattr(self.станция, "tls", False)),
                    str(getattr(self.станция, "ca_file", "") or ""),
-                   str(getattr(self.станция, "auth", "") or "plain"))
+                   str(getattr(self.станция, "auth", "") or "plain"),
+                   self._классы_событий_ami())
         if self._ami is not None and self._подпись_ami != подпись:
             log.info("Настройки AMI изменились — соединение открывается заново")
             self._закрыть_ami()
         клиент = self._ami
         if клиент is None:
             клиент = AMIClient(*подпись[:4], tls=подпись[4], ca_file=подпись[5],
-                               auth=подпись[6])
+                               auth=подпись[6], события=подпись[7])
             try:
                 клиент.connect()
                 # Сокет вычитывается всё время, а не пять секунд в минуту:
@@ -1167,6 +1168,9 @@ class Импортёр:
                                  "у станции не задан или не виден серверу)")
                 self._ami_оборвана = None
         звонки: list[Звонок] = []
+        очереди: list[dict[str, Any]] = []
+        from . import queue_log as журнал_очередей  # noqa: PLC0415
+
         крайний = time.time() + 5.0
         while len(звонки) < limit and time.time() < крайний:
             try:
@@ -1199,12 +1203,34 @@ class Импортёр:
             if not событие:
                 break
             if str(событие.get("Event") or "").lower() != "cdr":
+                # События очередей (класс agent) — когда queue_log станции
+                # серверу не виден: ожидание, брошенные, пропуски операторов.
+                if "agent" in подпись[7]:
+                    из_ami = журнал_очередей.из_события_ami(событие)
+                    if из_ami is not None:
+                        очереди.append(из_ami)
                 continue
             поля = {имя: событие.get(ключ, "") for ключ, имя in _ПОЛЯ_AMI.items()}
             звонок = звонок_из_полей(поля, пояс=self.станция.пояс)
             if звонок.uniqueid:
                 звонки.append(звонок)
+        if очереди:
+            try:
+                self.db.queue_events_add(self.id, очереди)
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("Станция «%s»: события очередей из AMI не сохранены: %s",
+                            self.станция.name, exc)
         return звонки
+
+    def _классы_событий_ami(self) -> str:
+        """Какие события просить у AMI: звонки, а без queue_log — и очереди."""
+        try:
+            путь = self.станция.путь("queue_log") if getattr(self.станция, "queue_log", "") \
+                else None
+            есть_журнал = путь is not None and путь.is_file()
+        except OSError:
+            есть_журнал = False
+        return "cdr" if есть_журнал else "cdr,agent"
 
     def _закрыть_ami(self) -> None:
         """Закрывает соединение со станцией и забывает его подпись."""
