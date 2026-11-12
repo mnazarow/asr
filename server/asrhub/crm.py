@@ -428,7 +428,7 @@ def _послать(запрос_crm: Запрос, настройки: Наст
     import urllib.error
     import urllib.request
 
-    from .job_queue import check_outbound_url, открыватель_наружу
+    from .outbound import check_outbound_url, открыватель_наружу
 
     проверенный = check_outbound_url(запрос_crm.url, allow_internal)
     запрос_http = urllib.request.Request(проверенный, data=запрос_crm.body,

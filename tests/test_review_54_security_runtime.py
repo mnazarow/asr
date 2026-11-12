@@ -863,9 +863,9 @@ def test_билет_живёт_по_монотонным_часам(monkeypatch)
 
 def test_рассылка_не_ждёт_зависшего_подписчика(monkeypatch):
     """03-api-core, недоделки: зависший клиент задерживал рассылку всем."""
-    from asrhub.api import app as модуль
+    from asrhub.api import event_hub as модуль
 
-    monkeypatch.setattr(модуль, "ОТПРАВКА_СОБЫТИЯ_С", 0.2, raising=False)
+    monkeypatch.setattr(модуль, "ОТПРАВКА_СОБЫТИЯ_С", 0.2)
 
     class Зависший:
         async def send_text(self, текст):

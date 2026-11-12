@@ -1262,9 +1262,12 @@ def _по_участникам(state: Any, principal: Any, звонок: dict[st
         переводы = [{**п, "from_agent": скрыть(п.get("from_agent")),
                      "to_agent": скрыть(п.get("to_agent"))}
                     for п in state.db.call_transfers(звонок)]
+        # Мосты: добавочный чужого участника — так же «другой участник».
+        мосты = [{**м, "agent": скрыть(м.get("agent"))} for м in state.db.bridge_events(звонок)]
         итог = отрезки_мод.по_участникам(
             звонок, свои, state.db.get_segments(str(job.get("id") or "")),
-            длительность=float(job.get("media_duration_s") or 0), переводы=переводы)
+            длительность=float(job.get("media_duration_s") or 0), переводы=переводы,
+            мосты=мосты)
     except Exception as exc:                                # noqa: BLE001
         log.debug("Отрезки по участникам не посчитаны: %s", exc)
         return None

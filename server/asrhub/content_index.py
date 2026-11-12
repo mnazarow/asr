@@ -322,7 +322,7 @@ class ContentIndex:
         if события and адрес:
             # Та же проверка, что у обратного вызова задания: адрес из
             # настроек уходит в urlopen, и внутренняя сеть для него закрыта.
-            from .job_queue import check_outbound_url  # noqa: PLC0415
+            from .outbound import check_outbound_url  # noqa: PLC0415
 
             try:
                 check_outbound_url(адрес, bool(self.settings.get("webhook_allow_internal")))
@@ -579,17 +579,23 @@ class ContentIndex:
                 continue
             ноги = self.db.call_legs(звонок)
             переводы = self.db.call_transfers(звонок)
+            мосты = self.db.bridge_events(звонок)
             итог = отрезки.по_участникам(
                 звонок, ноги, self.db.get_segments(job_id),
-                длительность=float(задание.get("media_duration_s") or 0), переводы=переводы)
+                длительность=float(задание.get("media_duration_s") or 0), переводы=переводы,
+                мосты=мосты)
             # Нечего делить (окна короче секунды) — пометка без участника,
             # чтобы запись не перебиралась каждым проходом.
             участники = итог["agents"] if итог else [{"agent": ""}]
             self.db.save_agent_segments(job_id, участники,
                                         записанный=str(звонок.get("agent") or ""),
                                         ног=int(строка["legs"] or 0),
-                                        переводов=int(строка["transfers"] or 0))
+                                        переводов=int(строка["transfers"] or 0),
+                                        мостов=int(строка["bridges"] or 0))
             сделано += 1
+        # События мостов нужны только разговорам с переводом: у остальных
+        # (а их подавляющее большинство) они уходят через сутки.
+        self.db.bridge_events_prune(older_than=time.time() - 86400)
         return сделано
 
     def _loop(self) -> None:

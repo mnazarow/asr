@@ -259,7 +259,7 @@ def _fetch(url: str, target: Path, *, limit_bytes: int, check_url: Any = None) -
     ссылка: иначе внешний сервер с ответом «302 → внутренний адрес»
     заставлял бы нас скачать внутреннее.
     """
-    from .job_queue import открыватель_наружу  # noqa: PLC0415
+    from .outbound import открыватель_наружу  # noqa: PLC0415
 
     request = urllib.request.Request(encode_url(url),
                                      headers={"User-Agent": "ASRHub/3.0"})

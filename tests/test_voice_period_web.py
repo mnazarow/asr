@@ -203,6 +203,6 @@ def test_граница_перевода_в_карточке_записи(вкл
     с.evaluate("window.__asrhub.openJob('ui-transfer')")
     с.wait_for_selector("#call-by-agent")
     блок = с.inner_text("#call-by-agent")
-    assert "перевод с предупреждением" in блок and "событию AMI" in блок
+    assert "перевод с предупреждением" in блок and "событию перевода" in блок
     assert "1:00" in блок and "101" in блок and "102" in блок
     вкладка.чисто()

@@ -11349,27 +11349,27 @@ RENDERERS.dialplan = {
       ${станции.length ? `<div class="table-wrap" style="margin-bottom:16px"><table class="table">
         <thead><tr><th>Станция</th><th>Пороги</th><th>Владелец и приоритет</th>
           <th>Каталог для приёма путём</th><th>Последнее обращение</th><th>В архиве</th><th></th></tr></thead>
-        <tbody>${станции.map((с) => {
+        <tbody>${html`${станции.map((с) => {
           const п = с.intake || {};
           const з = с.calls || {};
-          return `<tr${с.enabled ? '' : ' class="dim"'}>
-            <td><b>${esc(с.name)}</b><div class="small dim mono">${esc(с.id)}</div>
-              ${с.enabled ? '' : '<span class="chip warn">выключена</span>'}</td>
+          return html`<tr class="${с.enabled ? '' : 'dim'}">
+            <td><b>${с.name}</b><div class="small dim mono">${с.id}</div>
+              ${с.enabled ? '' : html`<span class="chip warn">выключена</span>`}</td>
             <td class="small">короче ${num(с.min_duration_s || 0, 0)} с — мимо;
               ${с.skip_unanswered ? 'без ответа — мимо' : 'без ответа — тоже'}</td>
-            <td class="small">${esc(с.owner || '—')} · ${num(с.priority || 0, 0)}
+            <td class="small">${с.owner || '—'} · ${num(с.priority || 0, 0)}
               <div class="small dim">${с.intake_key
-                ? `ключ «${esc(с.intake_key)}» · <a href="#" data-dp-unbind="${esc(с.id)}"
+                ? html`ключ «${с.intake_key}» · <a href="#" data-dp-unbind="${с.id}"
                     title="Станция примет звонки от следующего ключа, который их пришлёт">отвязать</a>`
                 : 'ключ: закрепится за первым, кто пришлёт звонок'}</div></td>
-            <td class="small mono">${esc(с.recordings_dir || '— только файлом')}</td>
-            <td class="small">${п.last_at ? esc(fmtAgo(п.last_at)) : '<span class="dim">не было</span>'}
-              ${п.last_error ? `<div class="small err" title="${esc(п.last_error)}">${
-                esc(String(п.last_error).slice(0, 80))}</div>` : ''}
-              ${пульсСценария(с.pulse)}</td>
+            <td class="small mono">${с.recordings_dir || '— только файлом'}</td>
+            <td class="small">${п.last_at ? fmtAgo(п.last_at) : html`<span class="dim">не было</span>`}
+              ${п.last_error ? html`<div class="small err" title="${п.last_error}">${
+                String(п.last_error).slice(0, 80)}</div>` : ''}
+              ${raw(пульсСценария(с.pulse))}</td>
             <td class="small">${num(з.total || 0, 0)} звонков, ${num(з.queued || 0, 0)} с записью</td>
-            <td><button class="ghost sm" data-dp-edit="${esc(с.id)}">Изменить</button></td></tr>`;
-        }).join('')}</tbody></table></div>` : ''}`;
+            <td><button class="ghost sm" data-dp-edit="${с.id}">Изменить</button></td></tr>`;
+        })}`}</tbody></table></div>` : ''}`;
     const включить = qs('#dp-enable');
     if (включить) включить.onclick = async () => {
       try {
@@ -12448,14 +12448,14 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
     const доля = (з) => (з === null || з === undefined ? '—' : `${num(з, 0)}%`);
     const полоска = (в_) => {
       const всего = Object.values(в_.distribution || {}).reduce((а, б) => а + б, 0);
-      if (!всего) return '<span class="faint">ответов нет</span>';
+      if (!всего) return html`<span class="faint">ответов нет</span>`;
       const части = [];
       for (let ц = Number(в_.min); ц <= Number(в_.max); ц += 1) {
         const число = (в_.distribution || {})[String(ц)] || 0;
-        части.push(`<span title="кнопка ${ц}: ${число}" style="display:inline-block;min-width:34px;
+        части.push(html`<span title="кнопка ${ц}: ${число}" style="display:inline-block;min-width:34px;
           margin-right:4px"><b>${ц}</b> <span class="dim">${num(100 * число / всего, 0)}%</span></span>`);
       }
-      return части.join('');
+      return части;
     };
     qs('#qc-summary').innerHTML = `
       <div class="grid cols-5" style="margin-bottom:16px">
@@ -12470,18 +12470,18 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
         (с.extensions || []).length ? `<div class="table-wrap"><table class="table" id="qc-ext-table">
           <thead><tr><th>Добавочный</th><th>Сотрудник</th><th>Группа</th><th class="num">Опросов</th>
             <th class="num">Дозвон</th><th class="num">Оценили</th><th class="num">Средняя</th></tr></thead>
-          <tbody>${с.extensions.map((з) => `<tr><td class="mono">${esc(з.ext || '—')}</td>
-            <td>${esc(з.name || '')} <span class="faint">${esc(з.department || '')}</span></td>
-            <td>${esc(з.group)}</td><td class="num">${num(з.surveys, 0)}</td>
+          <tbody>${html`${с.extensions.map((з) => html`<tr><td class="mono">${з.ext || '—'}</td>
+            <td>${з.name || ''} <span class="faint">${з.department || ''}</span></td>
+            <td>${з.group}</td><td class="num">${num(з.surveys, 0)}</td>
             <td class="num">${доля(з.answer_rate)}</td><td class="num">${num(з.rated, 0)}</td>
-            <td class="num"><b>${оценка(з)}</b></td></tr>`).join('')}</tbody></table></div>`
+            <td class="num"><b>${оценка(з)}</b></td></tr>`)}`}</tbody></table></div>`
           : '<div class="empty small">За период опросов не было.</div>')}
       ${(с.questions || []).length ? card('Ответы по вопросам', 'какие кнопки нажимали',
         `<div class="table-wrap"><table class="table"><thead><tr><th>Группа</th><th>Вопрос</th>
           <th class="num">Задан</th><th class="num">Ответили</th><th class="num">Средняя</th><th>Нажатия</th></tr></thead>
-          <tbody>${с.questions.map((з) => `<tr><td>${esc(з.group)}</td><td>${esc(з.text)}</td>
+          <tbody>${html`${с.questions.map((з) => html`<tr><td>${з.group}</td><td>${з.text}</td>
             <td class="num">${num(з.asked, 0)}</td><td class="num">${num(з.answered, 0)}</td>
-            <td class="num"><b>${оценка(з)}</b></td><td>${полоска(з)}</td></tr>`).join('')}</tbody></table></div>`) : ''}`;
+            <td class="num"><b>${оценка(з)}</b></td><td>${полоска(з)}</td></tr>`)}`}</tbody></table></div>`) : ''}`;
   },
 
   drawJournal() {
@@ -12489,36 +12489,38 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
     const записи = ж.items || [];
     // Голосом сказанное — в подсказке цифры; пропущенный по ветвлению — «·»;
     // комментарий — текстом под ответами.
-    const ответы = (з) => (з.answers || []).length
-      ? з.answers.filter((о) => о.kind !== 'comment').map((о) => {
-        if (о.skipped) return `<span title="${esc(о.text)}: не задавался по условию" class="faint">·</span>`;
+    const ответы = (з) => ((з.answers || []).length
+      ? html`${з.answers.filter((о) => о.kind !== 'comment').map((о, н) => {
+        const пробел = н ? ' ' : '';
+        if (о.skipped) return html`${пробел}<span title="${о.text}: не задавался по условию" class="faint">·</span>`;
         const подсказка = о.voice ? `${о.text} — сказал: «${о.voice}»` : о.text;
-        return `<span title="${esc(подсказка)}" class="mono">${о.digit === null || о.digit === undefined ? '–' : esc(о.digit)}${о.voice ? '🗣' : ''}</span>`;
-      }).join(' ') + з.answers.filter((о) => о.kind === 'comment' && о.comment)
-        .map((о) => `<div class="small dim" title="${esc(о.text)}">«${esc(о.comment)}»</div>`).join('')
-      : '<span class="faint">—</span>';
+        return html`${пробел}<span title="${подсказка}" class="mono">${о.digit === null || о.digit === undefined ? '–' : о.digit}${о.voice ? '🗣' : ''}</span>`;
+      })}${з.answers.filter((о) => о.kind === 'comment' && о.comment)
+        .map((о) => html`<div class="small dim" title="${о.text}">«${о.comment}»</div>`)}`
+      : html`<span class="faint">—</span>`);
+    const строка = (з) => {
+      const [подпись, вид] = QC_СОСТОЯНИЯ[з.status] || [з.status, ''];
+      return html`<tr><td class="small">${fmtTime(з.created_at)}</td>
+            <td class="mono">${з.number}${з.kind === 'проба' ? html` <span class="chip">проба</span>` : ''}</td>
+            <td class="mono">${з.ext || '—'} <span class="faint">${з.ext_name || ''}</span></td>
+            <td>${з.group_name}</td>
+            <td><span class="chip ${вид}">${подпись}</span>
+              ${з.status === 'ждёт' && з.due_at ? html`<span class="small faint">с ${fmtTime(з.due_at)}</span>` : ''}
+              ${з.error && з.status !== 'пройден' ? html`<div class="small faint">${з.error}</div>` : ''}</td>
+            <td>${ответы(з)}</td>
+            <td class="num">${з.score === null || з.score === undefined ? '—' : html`<b>${num(з.score, 2)}</b>`}</td>
+            <td class="num">${num(з.attempts || 0, 0)}</td>
+            <td class="small">${з.job_id ? html`<a href="#" data-qc-job="${з.job_id}">разговор</a>` : ''}
+              ${з.has_recording ? html`<a href="#" data-qc-audio="${з.id}">запись</a>` : ''}
+              ${з.status === 'ждёт' && !this._толькоОтчёт ? html`<a href="#" data-qc-cancel="${з.id}">отменить</a>` : ''}</td></tr>`;
+    };
     qs('#qc-journal').innerHTML = card('Журнал опросов',
       `кому звонили и что ответили; показано ${записи.length} из ${num(ж.total || 0, 0)}`,
-      записи.length ? `<div class="table-wrap"><table class="table" id="qc-journal-table">
+      записи.length ? html`<div class="table-wrap"><table class="table" id="qc-journal-table">
         <thead><tr><th style="width:140px">Заведён</th><th>Клиент</th><th>Добавочный</th><th>Группа</th>
           <th>Состояние</th><th>Ответы</th><th class="num">Оценка</th><th class="num">Попыток</th><th></th></tr></thead>
-        <tbody>${записи.map((з) => {
-          const [подпись, вид] = QC_СОСТОЯНИЯ[з.status] || [з.status, ''];
-          return `<tr><td class="small">${fmtTime(з.created_at)}</td>
-            <td class="mono">${esc(з.number)}${з.kind === 'проба' ? ' <span class="chip">проба</span>' : ''}</td>
-            <td class="mono">${esc(з.ext || '—')} <span class="faint">${esc(з.ext_name || '')}</span></td>
-            <td>${esc(з.group_name)}</td>
-            <td><span class="chip ${вид}">${esc(подпись)}</span>
-              ${з.status === 'ждёт' && з.due_at ? `<span class="small faint">с ${fmtTime(з.due_at)}</span>` : ''}
-              ${з.error && з.status !== 'пройден' ? `<div class="small faint">${esc(з.error)}</div>` : ''}</td>
-            <td>${ответы(з)}</td>
-            <td class="num">${з.score === null || з.score === undefined ? '—' : `<b>${num(з.score, 2)}</b>`}</td>
-            <td class="num">${num(з.attempts || 0, 0)}</td>
-            <td class="small">${з.job_id ? `<a href="#" data-qc-job="${esc(з.job_id)}">разговор</a>` : ''}
-              ${з.has_recording ? `<a href="#" data-qc-audio="${esc(з.id)}">запись</a>` : ''}
-              ${з.status === 'ждёт' && !this._толькоОтчёт ? `<a href="#" data-qc-cancel="${esc(з.id)}">отменить</a>` : ''}</td></tr>`;
-        }).join('')}</tbody></table></div>`
-        : `<div class="empty small">За период опросов не было.${this._толькоОтчёт ? ''
+        <tbody>${записи.map(строка)}</tbody></table></div>`
+        : html`<div class="empty small">За период опросов не было.${this._толькоОтчёт ? ''
           : ' Сделайте пробный звонок — он появится здесь.'}</div>`,
       записи.length ? `<button class="ghost sm" id="qc-export">Выгрузить CSV</button>
         <button class="ghost sm" id="qc-export-xlsx"
@@ -22277,31 +22279,32 @@ RENDERERS.staff = {
         '<div class="empty">Под отбор никто не подошёл.</div>');
       return;
     }
+    const строка = (ч) => html`<tr class="${ч.active ? '' : 'dim'}">
+          <td>${[ч.last_name, ч.first_name, ч.middle_name].filter(Boolean).join(' ') || '—'}
+            ${ч.source && ч.source !== 'ручной'
+              ? html`<span class="chip small" title="Источник карточки">${ч.source}</span>` : ''}</td>
+          <td class="small">${ч.position || ''}</td>
+          <td class="small">${ч.department || ''}</td>
+          <td class="mono">${ч.phone_ext || ''}</td>
+          <td class="small mono">${ч.phone_mobile || ''}</td>
+          <td class="small">${ч.email || ''}</td>
+          <td><span class="chip ${ч.active ? 'ok' : ''}">${ч.active ? 'работает' : 'уволен'}</span></td>
+          <td class="nowrap">
+            <button class="ghost sm" data-edit="${ч.id}">Правка</button>
+            <button class="ghost sm" data-del="${ч.id}" title="Удалить карточку">×</button>
+          </td></tr>`;
     место.innerHTML = card('Сотрудники',
       `${люди.length} из ${num(д.total || люди.length)}`,
-      `<div class="table-wrap"><table>
+      html`<div class="table-wrap"><table>
         <thead><tr>
           <th>ФИО</th><th style="width:200px">Должность</th><th style="width:180px">Отдел</th>
           <th style="width:90px">Внутр.</th><th style="width:150px">Мобильный</th>
           <th style="width:200px">Почта</th><th style="width:90px">Статус</th>
           <th style="width:120px"></th>
         </tr></thead><tbody>
-        ${люди.map((ч) => `<tr${ч.active ? '' : ' class="dim"'}>
-          <td>${esc([ч.last_name, ч.first_name, ч.middle_name].filter(Boolean).join(' ') || '—')}
-            ${ч.source && ч.source !== 'ручной'
-              ? `<span class="chip small" title="Источник карточки">${esc(ч.source)}</span>` : ''}</td>
-          <td class="small">${esc(ч.position || '')}</td>
-          <td class="small">${esc(ч.department || '')}</td>
-          <td class="mono">${esc(ч.phone_ext || '')}</td>
-          <td class="small mono">${esc(ч.phone_mobile || '')}</td>
-          <td class="small">${esc(ч.email || '')}</td>
-          <td><span class="chip ${ч.active ? 'ok' : ''}">${ч.active ? 'работает' : 'уволен'}</span></td>
-          <td class="nowrap">
-            <button class="ghost sm" data-edit="${esc(ч.id)}">Правка</button>
-            <button class="ghost sm" data-del="${esc(ч.id)}" title="Удалить карточку">×</button>
-          </td></tr>`).join('')}
+        ${люди.map(строка)}
       </tbody></table></div>
-      ${люди.length < Number(д.total || 0) ? `<div class="row small dim" style="padding:8px 4px;gap:10px">
+      ${люди.length < Number(д.total || 0) ? html`<div class="row small dim" style="padding:8px 4px;gap:10px">
         <span>Показано ${num(люди.length)} из ${num(д.total)}.</span>
         <button class="ghost sm" id="st-more">Показать ещё</button></div>` : ''}`);
     // Справочник на тысячи карточек: дальше пятисот было не достать без

@@ -359,8 +359,8 @@ class LLMWorker:
         адрес = str(self.settings.get("tracker_url") or "").strip()
         if not адрес:
             return
-        from ..job_queue import check_outbound_url  # noqa: PLC0415
         from ..maintenance import send_json  # noqa: PLC0415
+        from ..outbound import check_outbound_url  # noqa: PLC0415
 
         внутренние = bool(self.settings.get("webhook_allow_internal"))
         check_outbound_url(адрес, внутренние)
@@ -396,8 +396,8 @@ class LLMWorker:
         адрес = str(self.settings.get("tracker_url") or "").strip()
         if not адрес:
             return
-        from ..job_queue import check_outbound_url  # noqa: PLC0415
         from ..maintenance import send_json  # noqa: PLC0415
+        from ..outbound import check_outbound_url  # noqa: PLC0415
 
         внутренние = bool(self.settings.get("webhook_allow_internal"))
         check_outbound_url(адрес, внутренние)

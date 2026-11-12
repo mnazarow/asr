@@ -13,6 +13,15 @@ Asterisk 12+ сообщает о переводе событиями `BlindTrans
 момент, вид, добавочные «от» и «к». Номер вне станции (перевод на
 городской или мобильный) не хранится: в разрезах по сотрудникам он не
 нужен, а хранить его — значит отвечать за него при удалении по требованию.
+
+Ещё точнее — мосты (с 3.1.39). `BridgeEnter`/`BridgeLeave` из AMI или
+`BRIDGE_ENTER`/`BRIDGE_EXIT` из CEL говорят, когда канал вошёл в мост и
+вышел из него. Записанный канал (на нём MixMonitor) слышит участника,
+только пока оба в одном мосту: это и есть окно участника на времени
+записи — без догадок по ногам CDR, и для участников очереди через
+`Local`-каналы тоже. Строки `bridge_events`: станция, `linkedid`,
+момент, вход или выход, `uniqueid` канала, мост и добавочный канала;
+имя канала (в нём бывает номер клиента) не хранится.
 """
 from __future__ import annotations
 
@@ -23,6 +32,8 @@ from .queue_log import _оператор
 
 #: События AMI, которые здесь разбираются (имена в нижнем регистре).
 СОБЫТИЯ = frozenset({"blindtransfer", "attendedtransfer"})
+#: События входа в мост и выхода из него.
+МОСТЫ = frozenset({"bridgeenter", "bridgeleave"})
 
 #: Сколько цифр может быть у добавочного. Длиннее — номер вне станции.
 ЦИФР_ДОБАВОЧНОГО = 6
@@ -80,12 +91,42 @@ def из_события_ami(событие: dict[str, Any], *,
     return {"ts": момент, "linkedid": связь, "kind": род, "from_agent": от, "to_agent": к}
 
 
+def из_моста_ami(событие: dict[str, Any], *,
+                 сейчас: float | None = None) -> dict[str, Any] | None:
+    """`BridgeEnter`/`BridgeLeave` → строка `bridge_events`; None — не наше."""
+    вид = str(событие.get("Event") or "").strip().lower()
+    if вид not in МОСТЫ:
+        return None
+    return _мост(вид == "bridgeenter", событие.get("Timestamp"), событие.get("Linkedid"),
+                 событие.get("Uniqueid"), событие.get("BridgeUniqueid"),
+                 событие.get("Channel"), сейчас=сейчас)
+
+
+def _мост(вход: bool, момент: Any, связь: Any, uid: Any, мост: Any, канал: Any, *,
+          сейчас: float | None = None) -> dict[str, Any] | None:
+    связь, uid, мост = (str(з or "").strip()[:64] for з in (связь, uid, мост))
+    if not (связь and uid and мост):
+        return None
+    когда = _число(момент)
+    if когда <= 0:
+        когда = сейчас if сейчас is not None else time.time()
+    return {"ts": когда, "linkedid": связь, "kind": "enter" if вход else "leave",
+            "uniqueid": uid, "bridge": мост, "agent": _добавочный(канал)}
+
+
+def разделить(строки: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Строки разбора — на переводы (`call_transfers`) и мосты (`bridge_events`)."""
+    переводы = [с for с in строки if с["kind"] in ("blind", "attended")]
+    мосты = [с for с in строки if с["kind"] in ("enter", "leave")]
+    return переводы, мосты
+
+
 # ---------------------------------------------------------------------------
 # Журнал CEL — для станций без AMI (журнал CDR, каталог записей)
 # ---------------------------------------------------------------------------
 
-#: События CEL о переводе (Asterisk 12+).
-СОБЫТИЯ_CEL = frozenset({"BLINDTRANSFER", "ATTENDEDTRANSFER"})
+#: События CEL о переводе и мостах (Asterisk 12+).
+СОБЫТИЯ_CEL = frozenset({"BLINDTRANSFER", "ATTENDEDTRANSFER", "BRIDGE_ENTER", "BRIDGE_EXIT"})
 
 #: Строка `cel_custom.conf`, которой станция пишет журнал для сервера:
 #: событие, время, канал, uniqueid, linkedid, номер и `eventextra` (JSON с
@@ -120,12 +161,14 @@ def _момент_cel(значение: str, пояс: Any = None) -> float:
 
 
 def из_строки_cel(поля: list[str], *, пояс: Any = None) -> dict[str, Any] | None:
-    """Строка журнала CEL (`ОТОБРАЖЕНИЕ_CEL`) → строка `call_transfers`; None — не наша.
+    """Строка журнала CEL (`ОТОБРАЖЕНИЕ_CEL`) → строка `call_transfers` или
+    `bridge_events` (вид `enter`/`leave`, см. `разделить`); None — не наша.
 
     `BLINDTRANSFER` пишется на канале переводившего, адресат — `extension`
     в `eventextra`; `ATTENDEDTRANSFER` (мост к мосту) — на канале
     переводившего, адресат — `transfer_target_channel_name`. Перевод в
     приложение (`app` в `eventextra`) адресата-добавочного не имеет.
+    `BRIDGE_ENTER`/`BRIDGE_EXIT` — канал вошёл в мост `bridge_id` и вышел.
     """
     import json  # noqa: PLC0415
 
@@ -144,6 +187,9 @@ def из_строки_cel(поля: list[str], *, пояс: Any = None) -> dict[
         доп = {}
     if not isinstance(доп, dict):
         доп = {}
+    if вид in ("BRIDGE_ENTER", "BRIDGE_EXIT"):
+        return _мост(вид == "BRIDGE_ENTER", момент, связь, поля[3], доп.get("bridge_id"),
+                     поля[2])
     if вид == "BLINDTRANSFER":
         к = _добавочный(доп.get("extension"))
         род = "blind"

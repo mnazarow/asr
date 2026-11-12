@@ -47,7 +47,7 @@ def _отрезки(db, job_id: str) -> dict[str, dict]:
 def test_схема_39_и_таблица_отрезков(хаб):
     from asrhub.db import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 39
+    assert SCHEMA_VERSION >= 39
     колонки = {с["name"] for с in хаб.db.query("PRAGMA table_info(agent_segments)")}
     assert {"job_id", "agent", "talk_s", "words", "sentiment", "recorded", "legs"} <= колонки
 
@@ -292,7 +292,7 @@ def test_граница_перевода_по_событию(хаб):
                                  переводы=[перевод])
     # «Коллега, клиент по доставке» (56–58 с) — снова 101: это он говорил.
     assert [(о["agent"], о["replicas"]) for о in итог["segments"]] == [("101", 4), ("102", 2)]
-    assert "событию AMI" in итог["note"]
+    assert "событию перевода" in итог["note"]
     assert итог["transfers"] == [{"at_s": 60.0, "kind": "attended", "from_agent": "101",
                                   "to_agent": "102"}]
     # Без события — как раньше: общее окно отдаётся подключившемуся позже.
@@ -409,7 +409,7 @@ def test_агент_присылает_журнал_cel(агентский_се�
     итог = агентский_сервер.post("/api/telephony/agent/cel", headers={"X-API-Key": "ah_admin"},
                                  json={"agent_id": ответ["agent_id"], "lines": строки})
     assert итог.status_code == 200, итог.text
-    assert итог.json() == {"received": 2, "transfers": 1, "added": 1}
+    assert итог.json() == {"received": 2, "transfers": 1, "added": 1, "bridges": 0}
     слишком = агентский_сервер.post("/api/telephony/agent/cel",
                                     headers={"X-API-Key": "ah_admin"},
                                     json={"agent_id": ответ["agent_id"], "lines": "не список"})

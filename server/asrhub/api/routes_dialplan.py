@@ -250,7 +250,7 @@ def _скачать(state: Any, адрес: str) -> tuple[Path, int]:
     `recording_url_allow_internal`. Предел — `max_upload_mb`; расширение —
     по пути ссылки или по Content-Type.
     """
-    from ..job_queue import check_outbound_url, открыватель_наружу  # noqa: PLC0415
+    from ..outbound import check_outbound_url, открыватель_наружу  # noqa: PLC0415
 
     внутрь = bool(state.settings.get("recording_url_allow_internal", False))
     адрес = str(адрес or "").strip()

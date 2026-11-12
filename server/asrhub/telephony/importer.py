@@ -639,14 +639,16 @@ class Импортёр:
         ключ = f"telephony:cel:{self.id}"
         место = self.db.get_kv(ключ) or {}
         try:
-            переводы, позиция, inode = события_перевода.прочитать_cel(
+            строки, позиция, inode = события_перевода.прочитать_cel(
                 путь, int(место.get("offset") or 0), int(место.get("inode") or 0),
                 пояс=getattr(self.станция, "пояс", None))
         except OSError as exc:
             log.warning("Станция «%s»: журнал CEL %s не читается: %s",
                         self.станция.name, путь, exc)
             return 0
+        переводы, мосты = события_перевода.разделить(строки)
         добавлено = self.db.call_transfers_add(self.id, переводы)
+        self.db.bridge_events_add(self.id, мосты)
         self.db.set_kv(ключ, {"offset": позиция, "inode": inode, "at": time.time()})
         return добавлено
 
@@ -1193,6 +1195,7 @@ class Импортёр:
         звонки: list[Звонок] = []
         очереди: list[dict[str, Any]] = []
         переводы: list[dict[str, Any]] = []
+        мосты: list[dict[str, Any]] = []
         from . import queue_log as журнал_очередей  # noqa: PLC0415
         from . import transfers as события_перевода  # noqa: PLC0415
 
@@ -1239,6 +1242,9 @@ class Импортёр:
                     перевод = события_перевода.из_события_ami(событие)
                     if перевод is not None:
                         переводы.append(перевод)
+                    мост = события_перевода.из_моста_ami(событие)
+                    if мост is not None:
+                        мосты.append(мост)
                 continue
             поля = {имя: событие.get(ключ, "") for ключ, имя in _ПОЛЯ_AMI.items()}
             звонок = звонок_из_полей(поля, пояс=self.станция.пояс)
@@ -1250,9 +1256,10 @@ class Импортёр:
             except Exception as exc:                        # noqa: BLE001
                 log.warning("Станция «%s»: события очередей из AMI не сохранены: %s",
                             self.станция.name, exc)
-        if переводы:
+        if переводы or мосты:
             try:
                 self.db.call_transfers_add(self.id, переводы)
+                self.db.bridge_events_add(self.id, мосты)
             except Exception as exc:                        # noqa: BLE001
                 log.warning("Станция «%s»: события перевода из AMI не сохранены: %s",
                             self.станция.name, exc)
@@ -1281,7 +1288,7 @@ class Импортёр:
         from . import queue_log as журнал_очередей  # noqa: PLC0415
         from . import transfers as события_перевода  # noqa: PLC0415
 
-        return frozenset({"cdr", *события_перевода.СОБЫТИЯ,
+        return frozenset({"cdr", *события_перевода.СОБЫТИЯ, *события_перевода.МОСТЫ,
                           *(журнал_очередей.СОБЫТИЯ_AMI if "agent" in классы else ())})
 
     def _закрыть_ami(self) -> None:

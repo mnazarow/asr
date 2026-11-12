@@ -592,7 +592,7 @@ def send_json(payload: dict[str, Any], url: str, *, what: str = "сводка",
             # проверяется и на каждом перенаправлении. Обычный urlopen шёл по
             # «302 → http://169.254.169.254/…» куда скажут — проверка адреса
             # приёмника в настройках этого не ловила.
-            from .job_queue import открыватель_наружу  # noqa: PLC0415
+            from .outbound import открыватель_наружу  # noqa: PLC0415
 
             открыватель = открыватель_наружу(bool(allow_internal))
             with открыватель.open(запрос, timeout=DIGEST_TIMEOUT) as ответ:

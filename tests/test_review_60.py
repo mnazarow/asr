@@ -201,7 +201,7 @@ def test_pick_skips_a_job_whose_twin_is_running(database):
 
 def test_progress_is_thinned_and_last_value_wins(monkeypatch: pytest.MonkeyPatch):
     """Движок докладывает долю на каждый кусок звука — подписчикам это не нужно."""
-    from asrhub.api import app as модуль
+    from asrhub.api import event_hub as модуль
 
     monkeypatch.setattr(модуль, "ПРОГРЕСС_НЕ_ЧАЩЕ_С", 0.15)
     hub = модуль.EventHub()
@@ -222,7 +222,7 @@ def test_progress_is_thinned_and_last_value_wins(monkeypatch: pytest.MonkeyPatch
 
 
 def test_history_is_a_bounded_deque():
-    from asrhub.api import app as модуль
+    from asrhub.api import event_hub as модуль
 
     hub = модуль.EventHub()
     for номер in range(модуль.ИСТОРИЯ_СОБЫТИЙ + 50):

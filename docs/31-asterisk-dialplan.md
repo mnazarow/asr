@@ -242,10 +242,11 @@ member => PJSIP/102
 ; пишет события перевода в журнал CEL, сервер читает его (поле станции
 ; «Журнал CEL»). Со станцией по AMI не нужно: события придут оттуда.
 ;
-; /etc/asterisk/cel.conf — если CEL уже ведётся, добавьте два события к своим:
+; /etc/asterisk/cel.conf — если CEL уже ведётся, добавьте эти события к своим
+; (вход в мост и выход из него — окно участника, перевод — его граница):
 ;   [general]
 ;   enable = yes
-;   events = BLINDTRANSFER,ATTENDEDTRANSFER
+;   events = BLINDTRANSFER,ATTENDEDTRANSFER,BRIDGE_ENTER,BRIDGE_EXIT
 ;
 ; /etc/asterisk/cel_custom.conf — журнал для ASR Hub. Файл ляжет в
 ; /var/log/asterisk/cel-custom/asrhub-cel.csv. После правки:

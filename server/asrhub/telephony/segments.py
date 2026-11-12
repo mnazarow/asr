@@ -23,9 +23,17 @@ MixMonitor с `b` пишет с соединения). Реплика расши
 него: при переводе с предупреждением второй оператор снимает трубку на
 консультации, пока клиент слушает музыку ожидания, и по CDR его окно
 начиналось раньше, чем клиент его слышит.
+
+Точнее всего — по мостам (`bridge_events`, с 3.1.39): записанный канал
+слышит участника, только пока оба в одном мосту. Окно участника — пересечение
+его пребывания в мосту с пребыванием там записанного канала; ноль записи —
+первый вход записанного канала в мост (MixMonitor с `b` пишет с него).
+Участник очереди через `Local`-канал узнаётся так же: `Local/101@…;1`
+стоит в мосту с клиентом. Окна по CDR остаются у тех, о ком событий нет.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any
 
 from ..content.sentiment import score_text
@@ -56,11 +64,106 @@ def _ноль(звонок: dict[str, Any], ноги: list[dict[str, Any]]) -> f
     return min(ответы) if ответы else _ответ(звонок)
 
 
+def якорь(звонок: dict[str, Any]) -> str:
+    """`uniqueid` записанного канала на станции (без приставки станции)."""
+    свой = str(звонок.get("pbx_uid") or "").strip()
+    if свой:
+        return свой
+    ключ = str(звонок.get("uniqueid") or "")
+    return ключ.split(":", 1)[1] if ":" in ключ else ключ
+
+
+def _пребывание(мосты: list[dict[str, Any]]) -> tuple[dict[tuple[str, str], list[tuple[float, float]]],
+                                                      dict[str, str]]:
+    """Пребывание каналов в мостах: (uniqueid, мост) → [(вошёл, вышел)]."""
+    вошёл: dict[tuple[str, str], float] = {}
+    итог: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    агенты: dict[str, str] = {}
+    for с in sorted(мосты, key=lambda м: (_число(м.get("ts")), м.get("kind") != "leave")):
+        ключ = (str(с.get("uniqueid") or ""), str(с.get("bridge") or ""))
+        if с.get("agent"):
+            агенты.setdefault(ключ[0], str(с["agent"]))
+        if с.get("kind") == "enter":
+            вошёл.setdefault(ключ, _число(с.get("ts")))
+        elif ключ in вошёл:
+            итог[ключ].append((вошёл.pop(ключ), _число(с.get("ts"))))
+    for ключ, когда in вошёл.items():
+        итог[ключ].append((когда, float("inf")))
+    return итог, агенты
+
+
+def _ноль_по_мостам(звонок: dict[str, Any], мосты: list[dict[str, Any]] | None) -> float | None:
+    if not мосты:
+        return None
+    свой = якорь(звонок)
+    входы = [_число(м.get("ts")) for м in мосты
+             if м.get("kind") == "enter" and str(м.get("uniqueid") or "") == свой]
+    return min(входы) if входы else None
+
+
+def ноль_записи(звонок: dict[str, Any], ноги: list[dict[str, Any]],
+                мосты: list[dict[str, Any]] | None = None) -> float:
+    """Ноль времени записи: первый вход записанного канала в мост, без событий
+    мостов — ответ записанной ноги CDR."""
+    по_мостам = _ноль_по_мостам(звонок, мосты)
+    return по_мостам if по_мостам is not None else _ноль(звонок, ноги)
+
+
+def _слить(отрезки: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    итог: list[tuple[float, float]] = []
+    for с, по in sorted(отрезки):
+        if итог and с <= итог[-1][1] + 0.5:
+            итог[-1] = (итог[-1][0], max(итог[-1][1], по))
+        else:
+            итог.append((с, по))
+    return итог
+
+
+def окна_по_мостам(звонок: dict[str, Any], мосты: list[dict[str, Any]] | None, *,
+                   ноль: float, длительность: float = 0.0
+                   ) -> dict[str, list[tuple[float, float]]] | None:
+    """Окна добавочных по мостам на времени записи; None — записанного канала
+    в событиях нет. Окно — пока участник и записанный канал в одном мосту."""
+    if not мосты:
+        return None
+    пребывание, агенты = _пребывание(мосты)
+    свой = якорь(звонок)
+    мои = {мост: отрезки for (uid, мост), отрезки in пребывание.items() if uid == свой}
+    if not мои:
+        return None
+    сырые: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for (uid, мост), отрезки in пребывание.items():
+        кто = агенты.get(uid, "")
+        if not кто:
+            continue
+        if uid == свой:
+            # Запись на канале самого оператора (исходящий): его окно — всё,
+            # что канал пробыл в мостах.
+            сырые[кто].extend(отрезки)
+            continue
+        for с, по in отрезки:
+            for мс, мпо in мои.get(мост, []):
+                if min(по, мпо) > max(с, мс):
+                    сырые[кто].append((max(с, мс), min(по, мпо)))
+    конец = длительность if длительность > 0 else float("inf")
+    итог: dict[str, list[tuple[float, float]]] = {}
+    for кто, отрезки in сырые.items():
+        на_записи = [(max(0.0, с - ноль), min(конец, по - ноль)) for с, по in отрезки]
+        годные = [(round(с, 1), round(по, 1)) for с, по in _слить(на_записи)
+                  if по - с >= МИН_ОКНО_С and по != float("inf")]
+        if годные:
+            итог[кто] = годные
+    return итог
+
+
 def окна(звонок: dict[str, Any], ноги: list[dict[str, Any]], *,
          длительность: float = 0.0,
-         переводы: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+         переводы: list[dict[str, Any]] | None = None,
+         мосты: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Окна участников на времени записи — по ногам с ответом и добавочным.
 
+    `мосты` — вход в мост и выход (`bridge_events`): у добавочного, о
+    котором они есть, окна по CDR заменяются окнами по мостам.
     `переводы` — события перевода разговора (`call_transfers`): момент
     перевода — конец окна переводившего и начало окна принявшего, если
     момент внутри окна.
@@ -69,7 +172,7 @@ def окна(звонок: dict[str, Any], ноги: list[dict[str, Any]], *,
     с_разговором = [н for н in все if _число(н.get("billsec")) > 0]
     if not с_разговором:
         return []
-    ноль = _ноль(звонок, ноги)
+    ноль = ноль_записи(звонок, ноги, мосты)
     итог: list[dict[str, Any]] = []
     for нога in sorted(с_разговором, key=lambda н: (int(_число(н.get("sequence"))),
                                                      _число(н.get("started_at")))):
@@ -87,6 +190,19 @@ def окна(звонок: dict[str, Any], ноги: list[dict[str, Any]], *,
                      "uniqueid": str(нога.get("uniqueid") or ""),
                      "queue": str(нога.get("queue") or ""),
                      "recorded": нога is звонок})
+    по_мостам = окна_по_мостам(звонок, мосты, ноль=ноль, длительность=длительность)
+    if по_мостам:
+        уточнённые: list[dict[str, Any]] = []
+        for кто in dict.fromkeys(о["agent"] for о in итог):
+            свои = [о for о in итог if о["agent"] == кто]
+            if кто not in по_мостам:
+                уточнённые.extend(свои)
+                continue
+            уточнённые.extend({"agent": кто, "from_s": с, "to_s": по,
+                               "uniqueid": свои[0]["uniqueid"], "queue": свои[0]["queue"],
+                               "recorded": any(о["recorded"] for о in свои),
+                               "by_bridge": True} for с, по in по_мостам[кто])
+        итог = sorted(уточнённые, key=lambda о: (о["from_s"], о["to_s"]))
     for перевод in переводы or []:
         момент = round(_число(перевод.get("ts")) - ноль, 1)
         от, к = str(перевод.get("from_agent") or ""), str(перевод.get("to_agent") or "")
@@ -112,7 +228,8 @@ def _чьё(окна_: list[dict[str, Any]], момент: float) -> dict[str, A
 
 def по_участникам(звонок: dict[str, Any], ноги: list[dict[str, Any]],
                   реплики: list[dict[str, Any]], *, длительность: float = 0.0,
-                  переводы: list[dict[str, Any]] | None = None
+                  переводы: list[dict[str, Any]] | None = None,
+                  мосты: list[dict[str, Any]] | None = None
                   ) -> dict[str, Any] | None:
     """Отрезки записи по участникам и оценка каждого; None — участник один.
 
@@ -120,7 +237,7 @@ def по_участникам(звонок: dict[str, Any], ноги: list[dict[
     времени записи), `agents` — итог по участнику: сколько звучал, слов,
     доля разговора и тональность его отрезков.
     """
-    окна_ = окна(звонок, ноги, длительность=длительность, переводы=переводы)
+    окна_ = окна(звонок, ноги, длительность=длительность, переводы=переводы, мосты=мосты)
     if len({о["agent"] for о in окна_}) < 2:
         return None
     отрезки: list[dict[str, Any]] = []
@@ -164,10 +281,18 @@ def по_участникам(звонок: dict[str, Any], ноги: list[dict[
         итог["share"] = round(итог["talk_s"] / всего_звучало, 3)
         итог["talk_s"] = round(итог["talk_s"], 1)
     по_событиям = any(о.get("by_event") for о in окна_)
+    по_мостам = any(о.get("by_bridge") for о in окна_)
+    ноль = ноль_записи(звонок, ноги, мосты)
+    if по_мостам:
+        пометка = "по входу участников в мост с записанным каналом"
+    elif по_событиям:
+        пометка = "по времени ног CDR, граница перевода — по событию перевода"
+    else:
+        пометка = "по времени ног CDR; на границе перевода реплика может уйти соседу"
     return {"windows": окна_, "segments": отрезки, "agents": list(участники.values()),
-            "zero": "ответ записанной ноги",
-            "transfers": [{"at_s": round(_число(п.get("ts")) - _ноль(звонок, ноги), 1),
+            "zero": ("первый вход записанного канала в мост"
+                     if _ноль_по_мостам(звонок, мосты) is not None else "ответ записанной ноги"),
+            "transfers": [{"at_s": round(_число(п.get("ts")) - ноль, 1),
                            "kind": п.get("kind"), "from_agent": п.get("from_agent"),
                            "to_agent": п.get("to_agent")} for п in переводы or []],
-            "note": ("по времени ног CDR, граница перевода — по событию AMI" if по_событиям
-                     else "по времени ног CDR; на границе перевода реплика может уйти соседу")}
+            "note": пометка}

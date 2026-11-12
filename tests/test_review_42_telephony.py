@@ -315,11 +315,14 @@ def test_пустая_запись_не_висит_в_отложенных(tmp_p
 def test_отложенный_стареет_от_первого_откладывания(tmp_path: Path, monkeypatch):
     """Каждое повторное откладывание продлевало жизнь: безнадёжный звонок вечен."""
     import asrhub.db as модуль_бд
+    import asrhub.db_telephony as модуль_звонков
 
     db = база(tmp_path)
     t0 = time.time() - 30 * 3600
     часы = {"сейчас": t0}
-    monkeypatch.setattr(модуль_бд, "now", lambda: часы["сейчас"])
+    # Звонки — в примеси `db_telephony` (3.1.39), остальное — в `db`.
+    for модуль in (модуль_бд, модуль_звонков):
+        monkeypatch.setattr(модуль, "now", lambda: часы["сейчас"])
     for сдвиг in (0, 10 * 3600, 20 * 3600, 29 * 3600):
         часы["сейчас"] = t0 + сдвиг
         db.save_call("pbx:вечный", job_id=None, skipped=f"{db.ОТЛОЖЕН}файл ещё растёт",

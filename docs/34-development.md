@@ -6,7 +6,7 @@
 
 | Каталог | Что в нём |
 |---|---|
-| `server/asrhub/` | сервер: FastAPI (`api/`), очередь (`job_queue.py`), база SQLite (`db.py`), движки (`engines/`), конвейер (`pipeline/`), телефония (`telephony/`), контроль качества (`qc/`), мониторинг (`monitoring/`), каталог параметров (`catalog/params.py`) |
+| `server/asrhub/` | сервер: FastAPI (`api/`: сборка — `app.py`, лента событий — `event_hub.py`, прослойки — `middleware.py`, маршруты — `routes_*.py`), очередь (`job_queue.py`; выход наружу и проверка адресов — `outbound.py`), база SQLite (`db.py`; звонки и события станций — примесь `db_telephony.py`), движки (`engines/`), конвейер (`pipeline/`), телефония (`telephony/`), контроль качества (`qc/`), мониторинг (`monitoring/`), каталог параметров (`catalog/params/` — по файлу на группу) |
 | `server/asrhub/web/` | интерфейс: одна страница без сборщика — `index.html`, `app.js`, `charts.js`, `styles.css` |
 | `agent/` | агент станции (`asrhub-agent.py`, Python 3.6+ без зависимостей), его установщик и сценарий отправки диалплана `asrhub-dialplan` (POSIX sh + curl) |
 | `scripts/` | установка, обновление, служба, проверка окружения — bash и PowerShell парами |
@@ -74,7 +74,7 @@ python -m mypy --ignore-missing-imports --follow-imports=silent server/asrhub ag
 
 - **Маршруты.** Каждый маршрут API должен быть в справочнике (`docs/api-reference.md`, его собирает `docs/generate_api_full.py` с работающего сервера), а маршрут для администратора — в списке `ADMIN_ROUTES` генератора. Пути и параметры, упомянутые в главах, должны существовать.
 - **Коды ошибок** из `errors.py` — в таблице главы 8.
-- **Параметры** — только из каталога `catalog/params.py`: у каждого описание, рекомендация, примеры. Глава 4 и таблицы параметров собираются `docs/generate.py`.
+- **Параметры** — только из каталога `catalog/params/` (файл своей группы: `server.py`, `telephony.py`, `llm.py`…; порядок групп — `ФАЙЛЫ_ГРУПП` в `__init__.py`): у каждого описание, рекомендация, примеры. Глава 4 и таблицы параметров собираются `docs/generate.py`.
 - **Метрики** — из `monitoring/catalog.py` с описанием и порогом; глава 16 собирается тем же генератором, встроенные тревоги и правила Prometheus берутся из порогов.
 - **Готовые файлы Asterisk** в главе 31 — те же, что отдаёт сервер: блоки `<!-- dialplan … -->` пересобирает `docs/generate.py`.
 - **Ссылки и якоря** между главами разрешаются (якоря — как у GitHub).

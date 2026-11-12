@@ -368,7 +368,7 @@ class MonitoringService:
         адрес = str((settings.get("alert_url") if settings else "") or "").strip()
         if not адрес or settings is None:
             return
-        from ..job_queue import check_outbound_url  # noqa: PLC0415
+        from ..outbound import check_outbound_url  # noqa: PLC0415
 
         try:
             check_outbound_url(адрес, bool(settings.get("webhook_allow_internal")))

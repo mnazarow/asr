@@ -36,7 +36,7 @@ try {
 $script:AsrHubVersion = (Get-Content -Raw -ErrorAction SilentlyContinue `
     (Join-Path $PSScriptRoot '..\..\VERSION'))
 if ([string]::IsNullOrWhiteSpace($script:AsrHubVersion)) {
-    $script:AsrHubVersion = '3.1.38'
+    $script:AsrHubVersion = '3.1.39'
 } else {
     $script:AsrHubVersion = $script:AsrHubVersion.Trim()
 }

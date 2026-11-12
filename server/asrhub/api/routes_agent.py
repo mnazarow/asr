@@ -458,10 +458,14 @@ def cel(request: Request, данные: dict[str, Any],
             hint="Присылайте журнал CEL порциями."))
     from ..telephony import transfers as события_перевода  # noqa: PLC0415
 
-    переводы = [п for п in (события_перевода.из_строки_cel(поля) for поля in csv.reader(
-        str(с)[:4000] for с in строки)) if п is not None]
-    добавлено = state.db.call_transfers_add(_агентская_станция(agent_id), переводы)
-    return {"received": len(строки), "transfers": len(переводы), "added": добавлено}
+    переводы, мосты = события_перевода.разделить([п for п in (
+        события_перевода.из_строки_cel(поля) for поля in csv.reader(
+            str(с)[:4000] for с in строки)) if п is not None])
+    станция = _агентская_станция(agent_id)
+    добавлено = state.db.call_transfers_add(станция, переводы)
+    мостов = state.db.bridge_events_add(станция, мосты)
+    return {"received": len(строки), "transfers": len(переводы), "added": добавлено,
+            "bridges": мостов}
 
 
 #: Предел одной части записи: части по 8 МБ проходят любой прокси.

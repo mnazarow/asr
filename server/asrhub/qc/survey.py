@@ -1149,8 +1149,8 @@ class КонтрольКачества:
         строка = self.db.query_one("SELECT * FROM qc_surveys WHERE id=?", (номер,))
         if строка is None or строка["kind"] != "опрос":
             return
-        from ..job_queue import check_outbound_url  # noqa: PLC0415
         from ..maintenance import send_json  # noqa: PLC0415
+        from ..outbound import check_outbound_url  # noqa: PLC0415
 
         try:
             check_outbound_url(адрес, bool(self.settings.get("webhook_allow_internal")))

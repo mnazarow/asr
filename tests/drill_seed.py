@@ -266,6 +266,22 @@ def закрыть_общий_браузер() -> None:
             pass
 
 
+def дождаться_раздела(страница: Any, *, запас_мс: int = 700, предел_мс: int = 8000) -> None:
+    """Ждать, пока раздел отрисован (`#content[data-ready]` = текущий раздел),
+    и короткий запас на то, что раздел догружает следом. Нет признака за
+    `предел_мс` (форма входа, раздел другого вида) — полторы секунды, как раньше.
+    """
+    try:
+        страница.wait_for_function(
+            "() => { const к = document.querySelector('#content');"
+            " const вид = ((window.__asrhub || {}).state || {}).view;"
+            " return Boolean(к && вид && к.dataset.ready === вид); }", timeout=предел_мс)
+    except Exception:                                        # noqa: BLE001
+        страница.wait_for_timeout(1200)
+        return
+    страница.wait_for_timeout(запас_мс)
+
+
 class Вкладка:
     """Вкладка браузера, которая копит ошибки консоли и отказы сервера.
 
@@ -298,16 +314,7 @@ class Вкладка:
         после щелчка проверки, перерисовывала открытый список ещё раз.
         """
         self.страница.goto(f"{self.адрес}/#{раздел}", wait_until="networkidle")
-        try:
-            self.страница.wait_for_function(
-                "() => { const к = document.querySelector('#content');"
-                " const вид = ((window.__asrhub || {}).state || {}).view;"
-                " return Boolean(к && вид && к.dataset.ready === вид); }", timeout=8000)
-        except Exception:                                    # noqa: BLE001
-            # Раздел с другим именем вида или форма входа — как раньше.
-            self.страница.wait_for_timeout(1200)
-            return self.страница
-        self.страница.wait_for_timeout(700)
+        дождаться_раздела(self.страница)
         return self.страница
 
     def раскрытий(self) -> int:
