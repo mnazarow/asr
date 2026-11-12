@@ -210,12 +210,44 @@ class LLMWorker:
                 log.debug("Строка очереди %s не закрыта: %s", job_id, второй)
             raise LLMError(f"Разбор записи не удался: {текст}") from exc
 
+    def _оператор(self, job_id: str, job: dict[str, Any],
+                  сегменты: list[dict[str, Any]]) -> str:
+        """Кто оператор — тот же, что у разбора содержания этой записи.
+
+        Раньше бралась только настройка `content_agent_speaker`, а она по
+        умолчанию пуста: разбор содержания определял оператора сам («кто
+        заговорил первым», у переписки — названная при приёме сторона), а
+        модель получала разговор без единой подписи «Сотрудник» — и отвечала
+        на вопросы о поведении сотрудника, угадывая, кто он.
+        """
+        заданный = str(self.settings.get("content_agent_speaker") or "").strip()
+        if заданный and str(job.get("source") or "") != "text":
+            return заданный
+        try:
+            разбор = self.db.get_content(job_id) or {}
+        except Exception:                                    # noqa: BLE001
+            разбор = {}
+        if разбор.get("agent_speaker"):
+            return str(разбор["agent_speaker"])
+        # Разбора содержания нет (выключен, ещё не дошёл) — то же правило,
+        # что у него (`ContentIndex.оператор_записи`).
+        if str(job.get("source") or "") == "text":
+            from .. import textchat  # noqa: PLC0415
+
+            параметры = job.get("params") or {}
+            подсказка = str((параметры.get("agent") if isinstance(параметры, dict) else "")
+                            or заданный or "")
+            return str(textchat.оператор_среди(сегменты, подсказка) or "")
+        from ..content import compliance  # noqa: PLC0415
+
+        return str(compliance.agent(сегменты) or "")
+
     def _разобрать(self, job_id: str, job: dict[str, Any], *,
                    fresh: bool = False) -> dict[str, Any]:
         """Сам разбор: вызовы модели и запись ответа в базу."""
         сегменты = self.db.get_segments(job_id)
         скрипт = list(self.settings.get("content_script") or [])
-        оператор = str(self.settings.get("content_agent_speaker") or "")
+        оператор = self._оператор(job_id, job, сегменты)
         мимо = getattr(self.client, "мимо_кеша", None)
         with _для_записи(self.client, job_id), \
                 (мимо() if fresh and callable(мимо) else contextlib.nullcontext()):

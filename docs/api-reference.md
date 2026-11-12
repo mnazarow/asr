@@ -939,7 +939,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:27554",
+  "instance": "vm:1506",
   "instances": [],
   "workers": [
     {
@@ -1539,7 +1539,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794426327.8901012,
+    "generated_at": 1794441375.600221,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1706,8 +1706,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.29",
-  "uptime_s": 1.5,
+  "version": "3.1.30",
+  "uptime_s": 1.6,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1787,8 +1787,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.29",
-  "uptime_s": 1.6,
+  "version": "3.1.30",
+  "uptime_s": 1.7,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1797,8 +1797,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 3.5,
-    "disk_free_gb": 26.1,
+    "ram_available_gb": 7.2,
+    "disk_free_gb": 24.8,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2060,10 +2060,10 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/usage
 
 ```json
 {
-  "owner": "без аутентификации",
+  "owner": "создан автоматически при первом запуске",
   "group": "",
   "scope": [
-    "без аутентификации"
+    "создан автоматически при первом запуске"
   ],
   "window": "последние сутки",
   "used": {
@@ -2511,8 +2511,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793821527.9749792,
-    "until": 1794426327.9749792
+    "since": 1793836575.6635492,
+    "until": 1794441375.6635492
   }
 }
 ```
@@ -2761,9 +2761,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 3.5,
+    "free_gb": 7.2,
     "reserve_gb": 4.0,
-    "budget_gb": 0.4,
+    "budget_gb": 3.0,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -4685,7 +4685,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 26.1 ГБ",
+        "detail": "свободно 24.8 ГБ",
         "hint": ""
 …
 ```
