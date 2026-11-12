@@ -7,8 +7,10 @@ import functools
 import hashlib
 import json
 import re
+import threading
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,6 +185,12 @@ def _route_fallback(path: str) -> str:
 
 #: Сколько ждать отправки одного события одному подписчику ленты.
 ОТПРАВКА_СОБЫТИЯ_С = 5.0
+#: Прогресс одного задания уходит подписчикам не чаще раза в столько секунд
+#: (последнее значение побеждает): движок докладывает долю на каждый кусок
+#: звука, и на десятке воркеров лента событий была в основном прогрессом.
+ПРОГРЕСС_НЕ_ЧАЩЕ_С = 0.2
+#: Сколько последних событий помнит лента для новых подписчиков.
+ИСТОРИЯ_СОБЫТИЙ = 200
 
 #: Сколько ждать первого сообщения сессии диктовки. Молчащий сокет держал
 #: место среди сессий (и поток сервера) бесконечно.
@@ -236,7 +244,13 @@ class EventHub:
         self._clients: dict[WebSocket, Подписчик] = {}
         self._streams: dict[WebSocket, Подписчик] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._history: list[dict[str, Any]] = []
+        # Очередь с пределом и замком: публикуют рабочие потоки, читает цикл
+        # событий. Список с обрезкой `[-200:]` копировался на каждое событие
+        # и читался без замка — посреди замены.
+        self._history: deque[dict[str, Any]] = deque(maxlen=ИСТОРИЯ_СОБЫТИЙ)
+        self._замок = threading.Lock()
+        self._прогресс_отправлен: dict[str, float] = {}
+        self._прогресс_ждёт: dict[str, tuple[str, dict[str, Any]]] = {}
         #: Проверка «ключ ещё действует» — без базы, на каждое событие:
         #: отозванный ключ не получает больше ни одного сообщения.
         self.ключ_действует: Any = None
@@ -304,10 +318,53 @@ class EventHub:
 
     def publish(self, kind: str, data: dict[str, Any]) -> None:
         """Вызывается из рабочих потоков — переносим в цикл событий."""
+        задание = data.get("id") if isinstance(data.get("id"), str) else None
+        if задание is not None:
+            if kind == "job.progress":
+                if self._придержать(задание, kind, data):
+                    return
+            else:
+                # Любое другое событие задания отменяет придержанный прогресс:
+                # «готово», а за ним запоздалые «95 %» читались как откат.
+                with self._замок:
+                    self._прогресс_ждёт.pop(задание, None)
+                    self._прогресс_отправлен.pop(задание, None)
+        self._опубликовать(kind, data)
+
+    def _придержать(self, задание: str, kind: str, data: dict[str, Any]) -> bool:
+        """Прореживает прогресс: не чаще `ПРОГРЕСС_НЕ_ЧАЩЕ_С`, последнее побеждает."""
+        сейчас = time.monotonic()
+        with self._замок:
+            последний = self._прогресс_отправлен.get(задание)
+            if последний is None or сейчас - последний >= ПРОГРЕСС_НЕ_ЧАЩЕ_С:
+                self._прогресс_отправлен[задание] = сейчас
+                self._прогресс_ждёт.pop(задание, None)
+                if len(self._прогресс_отправлен) > 4096:
+                    for старый in sorted(self._прогресс_отправлен,
+                                         key=self._прогресс_отправлен.get)[:2048]:
+                        self._прогресс_отправлен.pop(старый, None)
+                return False
+            уже_ждёт = задание in self._прогресс_ждёт
+            self._прогресс_ждёт[задание] = (kind, data)
+        if not уже_ждёт:
+            таймер = threading.Timer(max(0.01, ПРОГРЕСС_НЕ_ЧАЩЕ_С - (сейчас - последний)),
+                                     self._дослать, args=(задание,))
+            таймер.daemon = True
+            таймер.start()
+        return True
+
+    def _дослать(self, задание: str) -> None:
+        with self._замок:
+            ждёт = self._прогресс_ждёт.pop(задание, None)
+            if ждёт is None:
+                return
+            self._прогресс_отправлен[задание] = time.monotonic()
+        self._опубликовать(*ждёт)
+
+    def _опубликовать(self, kind: str, data: dict[str, Any]) -> None:
         message = {"type": kind, "ts": time.time(), **data}
-        self._history.append(message)
-        if len(self._history) > 200:
-            self._history = self._history[-200:]
+        with self._замок:
+            self._history.append(message)
         loop = self._loop
         if loop is None or not self._clients:
             return
@@ -394,12 +451,16 @@ class EventHub:
                     is_admin: bool | None = None) -> list[dict[str, Any]]:
         """История в том же объёме и виде, в каком подписчик получал бы её вживую."""
         подписчик = self._как_подписчик(подписчик, is_admin)
+        with self._замок:
+            история = list(self._history)
         return [self._наружу(m, подписчик.mask)
-                for m in self._history if self._visible(m, подписчик)]
+                for m in история if self._visible(m, подписчик)]
 
     @property
     def history(self) -> list[dict[str, Any]]:
-        return [{k: v for k, v in m.items() if k != "_owner"} for m in self._history]
+        with self._замок:
+            история = list(self._history)
+        return [{k: v for k, v in m.items() if k != "_owner"} for m in история]
 
     @property
     def count(self) -> int:
@@ -589,6 +650,13 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
     from .. import backup as _копии  # noqa: PLC0415
 
     прежняя_база = _копии.применить_отложенное(settings.paths.db)
+    # Прежние ключи доступа открытым текстом — хешем, и в файл настроек
+    # (см. `Settings.перевести_ключи`).
+    try:
+        if settings.перевести_ключи() and settings.config_file is not None:
+            settings.persist_api_keys()
+    except Exception as exc:                                 # noqa: BLE001
+        log.warning("Прежние ключи доступа не переведены в хеш: %s", exc)
     db = _открыть_базу(settings)
     if прежняя_база:
         db.add_event(None, "restore_applied",
@@ -617,6 +685,9 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
                      queue=queue, analytics=analytics, queue_enabled=start_queue)
     писатель = audit.Писатель(db)
     state.audit_writer = писатель
+    # Копия журнала доступа — во внешний syslog, если он задан (см.
+    # `audit.ПриёмникSyslog`); адрес читается на каждой строке.
+    db.audit_sink = audit.ПриёмникSyslog(settings)
     # Лента событий проверяет ключ подписчика на каждое событие — тем же
     # правилом, что HTTP: отозванный ключ не получает больше ничего.
     hub.ключ_действует = lambda token: ключ_действует(state, token)
@@ -1244,6 +1315,10 @@ def create_app(settings: Settings | None = None, *, start_queue: bool = True) ->
         if info is not None:
             if info.get("enabled") is False:
                 return None, "", (4401, "Ключ доступа отсутствует или недействителен")
+            if str(info.get("role") or "") == "metrics":
+                # Ключ «только метрики» не получает ни ленты событий, ни
+                # диктовки: у него нет прав ни на что, кроме сбора метрик.
+                return None, "", (4403, "Ключ только для метрик")
             return участник_ключа(state, token, info), "", None
         # Вход по логину и паролю — кукой сессии. Браузер отправляет куку и при
         # рукопожатии WebSocket, поэтому билет здесь не нужен.

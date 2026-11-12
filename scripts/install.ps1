@@ -60,6 +60,8 @@ param(
     [string]$HfTokenFile = '',
     [switch]$SkipModels,
     [switch]$NoService,
+    # Базовые зависимости ровно проверенных версий (requirements\constraints.txt).
+    [switch]$Pinned,
     [switch]$NoGpuDriver,
     [ValidateSet('', 'none', 'mfa', 'whisperx')][string]$Alignment = '',
     [switch]$Interactive,
@@ -917,8 +919,10 @@ if ($Mode -eq 'docker') {
 
     Write-Step 'Установка зависимостей сервера'
     Invoke-WithRetry -Attempts 3 -Description 'базовые зависимости' -Action {
+        $ограничения = Join-Path $Prefix 'requirements\constraints.txt'
+        $закрепить = if ($Pinned -and (Test-Path $ограничения)) { @('-c', $ограничения) } else { @() }
         Invoke-Checked -Command $venvPip -Arguments (@('install') + $pipFlags +
-            @('-r', (Join-Path $Prefix 'requirements\base.txt')))
+            @('-r', (Join-Path $Prefix 'requirements\base.txt')) + $закрепить)
     } | Out-Null
     Write-Ok 'Базовые зависимости установлены'
 

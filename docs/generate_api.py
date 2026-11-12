@@ -83,13 +83,19 @@ def access_note(path: str, method: str) -> str:
     return "любой действующий ключ"
 
 
+#: Код возврата «сервер недоступен» — его различает docs/build.sh.
+НЕТ_СВЯЗИ = 3
+
+
 def main(argv: list[str]) -> int:
     base = (argv[1] if len(argv) > 1 else "http://127.0.0.1:8080").rstrip("/")
     key = find_key(argv[2] if len(argv) > 2 else "", base=base)
 
     schema = load_schema(base)
     if schema is None:
-        return 1
+        # Код 3 — «сервер недоступен»: сборка руководства оставляет прошлую
+        # версию главы. Любой другой ненулевой код — ошибка самого генератора.
+        return НЕТ_СВЯЗИ
 
     paths = {p: ops for p, ops in schema["paths"].items() if p.startswith(PREFIX)}
     out: list[str] = []

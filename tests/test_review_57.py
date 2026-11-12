@@ -566,7 +566,11 @@ def test_выгрузка_опросов_csv(кк):
     пройден = next(с for с in строки if ";пройден;" in с)
     assert пройден.endswith(";4;")
     assert "'=HYPERLINK" in текст
-    assert кк.get("/api/qc/surveys/export", headers={"X-API-Key": "ah_user"}).status_code == 403
+    # С 3.1.32 выгрузка открыта и не администратору — в охвате его заданий:
+    # опросы без задания этого ключа ему не достаются.
+    чужому = кк.get("/api/qc/surveys/export", headers={"X-API-Key": "ah_user"})
+    assert чужому.status_code == 200
+    assert "79991112233" not in чужому.text and ";пройден;" not in чужому.text
 
 
 def test_завершённый_опрос_уходит_на_адрес(кк, monkeypatch):
@@ -847,7 +851,10 @@ def test_новый_ключ_хранится_хешем_и_работает(dat
                        headers=админ).json()["key"]
         файл = yaml.safe_load(конфиг.read_text(encoding="utf-8"))["api_keys"]
         assert хеш_ключа(новый) in файл and новый not in конфиг.read_text(encoding="utf-8")
-        assert "ah_old_plain_key_000000000000" in файл           # прежний — как был
+        # Прежний ключ открытым текстом при запуске переводится в хеш (3.1.32)
+        # и продолжает работать.
+        assert "ah_old_plain_key_000000000000" not in файл
+        assert хеш_ключа("ah_old_plain_key_000000000000") in файл
         assert c.get("/api/jobs", headers={"X-API-Key": новый}).status_code == 200
         список = c.get("/api/keys", headers=админ).json()["items"]
         запись = next(к for к in список if к["name"] == "интеграция-57")

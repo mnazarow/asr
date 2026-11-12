@@ -1515,8 +1515,18 @@ def проверить_адрес(url: str) -> str:
     return адрес
 
 
+def _заголовок(строка: str) -> tuple[str, str] | None:
+    """«Authorization: Bearer x» → (имя, значение); негодное — None."""
+    имя, _, значение = str(строка or "").partition(":")
+    имя, значение = имя.strip(), значение.strip()
+    if not имя or not значение or not re.fullmatch(r"[A-Za-z0-9-]+", имя) \
+            or any(з in значение for з in "\r\n"):
+        return None
+    return имя, значение
+
+
 def загрузить(url: str, *, timeout: float = ТАЙМАУТ,
-              максимум_мб: int = МАКСИМУМ_МБ) -> bytes:
+              максимум_мб: int = МАКСИМУМ_МБ, заголовок: str = "") -> bytes:
     """Скачивает выгрузку по открытому адресу. Возвращает байты как есть.
 
     Авторизация не нужна и не поддерживается: справочник выкладывают
@@ -1547,6 +1557,12 @@ def загрузить(url: str, *, timeout: float = ТАЙМАУТ,
         # файл. Просим что угодно — разберёмся по содержимому.
         "Accept": "*/*",
     })
+    # Авторизация портала (`employees_auth_header`): заголовок уходит только
+    # на сам адрес — при перенаправлении на другой узел он не повторяется
+    # (add_unredirected_header), чтобы токен портала не унесло на чужой сервер.
+    пара = _заголовок(заголовок) if заголовок else None
+    if пара is not None:
+        запрос.add_unredirected_header(*пара)
     собрано = bytearray()
     заявлено: int | None = None
     try:
@@ -1570,8 +1586,9 @@ def загрузить(url: str, *, timeout: float = ТАЙМАУТ,
     except urllib.error.HTTPError as ошибка:
         raise ConfigError(
             f"Справочник по адресу {адрес} недоступен: ответ {ошибка.code}.",
-            hint="Проверьте, что ссылка открывается с самого сервера и без "
-                 "входа по паролю: загрузка идёт без авторизации.") from ошибка
+            hint="Проверьте, что ссылка открывается с самого сервера. Портал "
+                 "требует входа — задайте заголовок авторизации "
+                 "(employees_auth_header), например «Authorization: Bearer …».") from ошибка
     except urllib.error.URLError as ошибка:
         raise ConfigError(
             f"Не удалось скачать справочник: {адрес} ({ошибка.reason}).",
@@ -1611,9 +1628,67 @@ def загрузить(url: str, *, timeout: float = ТАЙМАУТ,
 УВОЛЬНЕНИЙ_БЕЗ_ВОПРОСОВ = 5
 
 
+def из_каталога(settings: Any, *, соединение: Any = None) -> str:
+    """Справочник из каталога LDAP (Active Directory) — таблицей для `импорт`.
+
+    Вход через каталог уже настроен (адрес, база поиска, сертификат), а
+    справочник вели отдельной выгрузкой. Здесь каталог читается служебной
+    учётной записью (`employees_ldap_bind_dn`, `employees_ldap_password`)
+    отбором `employees_ldap_filter`: ФИО, должность, отдел, внутренний,
+    рабочий и мобильный телефоны, почта. Отключённые учётные записи AD
+    (userAccountControl с битом 2) идут «не работает».
+    """
+    from . import ldap_auth  # noqa: PLC0415
+
+    настройки = ldap_auth.Настройки.из_настроек(settings)
+    if not настройки.url or not настройки.base_dn:
+        raise ConfigError("Каталог не настроен: нужны auth_ldap_url и auth_ldap_base_dn.",
+                          hint="Раздел «Настройки» → «Доступ» → вход через каталог.")
+    связь = соединение
+    if связь is None:
+        связь = ldap_auth.соединение(
+            настройки, str(settings.get("employees_ldap_bind_dn") or ""),
+            str(settings.get("employees_ldap_password") or ""))
+    if связь is None:
+        raise ConfigError("Каталог не принял служебную учётную запись справочника.",
+                          hint="Проверьте employees_ldap_bind_dn и employees_ldap_password.")
+    отбор = str(settings.get("employees_ldap_filter") or "").strip() or (
+        "(&(objectCategory=person)(objectClass=user)(|(ipPhone=*)(telephoneNumber=*)))")
+    атрибуты = ["sn", "givenName", "middleName", "displayName", "title", "department",
+                "ipPhone", "telephoneNumber", "mobile", "mail", "userAccountControl"]
+    связь.search(настройки.base_dn, отбор, attributes=атрибуты)
+    буфер = io.StringIO()
+    запись = csv.writer(буфер, delimiter=";")
+    запись.writerow(["Фамилия", "Имя", "Отчество", "Должность", "Отдел",
+                     "Внутренний номер", "Телефон рабочий", "Мобильный", "Почта", "Работает"])
+    for элемент in list(getattr(связь, "entries", ()) or ()):
+        def одно(имя: str, элемент: Any = элемент) -> str:
+            return ldap_auth._одно(элемент, имя)
+
+        фамилия, имя = одно("sn"), одно("givenName")
+        if not фамилия and not имя:
+            части = одно("displayName").split()
+            фамилия, имя = (части + ["", ""])[:2]
+        try:
+            отключён = int(одно("userAccountControl") or 0) & 2
+        except ValueError:
+            отключён = 0
+        запись.writerow([фамилия, имя, одно("middleName"), одно("title"), одно("department"),
+                         одно("ipPhone"), одно("telephoneNumber"), одно("mobile"),
+                         одно("mail"), "нет" if отключён else "да"])
+    отпустить = getattr(связь, "unbind", None)
+    if callable(отпустить) and соединение is None:
+        try:
+            отпустить()
+        except Exception:                                    # noqa: BLE001
+            pass
+    return буфер.getvalue()
+
+
 def импорт(db: Any, *, url: str = "", данные: bytes | str | None = None,
            source: str = "справочник", deactivate_missing: bool = True,
-           тип: str = "", dry_run: bool = False, force: bool = False) -> dict[str, Any]:
+           тип: str = "", dry_run: bool = False, force: bool = False,
+           заголовок: str = "") -> dict[str, Any]:
     """Скачать (или взять готовое), разобрать и записать в базу.
 
     Возвращает сводку в том виде, в каком её показывают человеку: сколько
@@ -1632,7 +1707,7 @@ def импорт(db: Any, *, url: str = "", данные: bytes | str | None = N
     """
     начало = time.monotonic()
     if данные is None:
-        данные = загрузить(url)
+        данные = загрузить(url, заголовок=заголовок)
         откуда = url
     else:
         откуда = url or "файл"

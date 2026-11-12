@@ -255,6 +255,24 @@ class EngineRegistry:
                 взятый.lock.release()
             self._освободить(первый)
 
+    def забыть_занятые(self, model_id: str) -> int:
+        """Убирает из кеша занятые экземпляры модели, не выгружая их.
+
+        Для сторожа зависших: зависший движок держит свой замок навсегда, и
+        следующее задание на той же модели встало бы за ним. Забытый
+        экземпляр живёт, пока его держит зависший поток; следующее задание
+        загрузит модель заново.
+        """
+        with self._lock:
+            ключи = [к for к, e in self._cache.items()
+                     if e.spec.id == model_id and self._is_busy(e)]
+            for ключ in ключи:
+                self._cache.pop(ключ, None)
+        if ключи:
+            log.warning("Модель «%s»: зависший экземпляр убран из кеша (%d)", model_id,
+                        len(ключи))
+        return len(ключи)
+
     def _is_busy(self, engine: Engine) -> bool:
         return self._busy.get(id(engine), 0) > 0
 

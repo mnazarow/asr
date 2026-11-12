@@ -163,3 +163,18 @@ def client(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
     app = create_app(load(), start_queue=True)
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def _приёмники_уведомлений_без_пауз():
+    """Пауза мёртвого приёмника уведомлений (3.1.32) — на процесс, а проверки
+    делят процесс: приёмник на «127.0.0.1:9», не ответивший трём прежним
+    проверкам, ставился бы на паузу и в следующей."""
+    try:
+        from asrhub import job_queue
+    except ImportError:
+        yield
+        return
+    job_queue._УЗЛЫ_УВЕДОМЛЕНИЙ.clear()
+    yield
+    job_queue._УЗЛЫ_УВЕДОМЛЕНИЙ.clear()

@@ -387,6 +387,14 @@ def _проверить(request: Request, x_api_key: str | None,
                              "«Доступ» веб-интерфейса.")
     if info.get("enabled") is False:
         raise ForbiddenError("Ключ доступа отключён.")
+    if str(info.get("role") or "") == "metrics" and not путь_метрик(request):
+        # Ключ для системы сбора метрик: ему открыты метрики, пробы и сводное
+        # состояние — и больше ничего. Раньше закрыть метрики значило выдать
+        # сборщику ключ readonly, а он читает все записи и расшифровки.
+        raise ForbiddenError(
+            "Ключ только для метрик.",
+            hint="Этим ключом можно читать /api/metrics и /api/monitoring/*; "
+                 "для остального нужен ключ с ролью user, readonly или admin.")
 
     limit = int(info.get("rate_limit") or state.settings.get("rate_limit_per_minute") or 0)
     state.check_rate(token, limit)
@@ -500,6 +508,51 @@ def require_admin(principal: Principal) -> Principal:
     return principal
 
 
+#: Что открыто ключу с ролью `metrics` — только чтение.
+_ПУТИ_МЕТРИК = ("/api/metrics", "/api/health", "/api/monitoring/")
+
+
+def путь_метрик(request: Request) -> bool:
+    """Запрос к метрикам, пробам или состоянию — то, что открыто ключу `metrics`."""
+    if request.method not in ("GET", "HEAD"):
+        return False
+    путь = request.url.path
+    return any(путь == п or (п.endswith("/") and путь.startswith(п)) for п in _ПУТИ_МЕТРИК)
+
+
+def сеть_метрик_разрешена(request: Request) -> bool:
+    """Адрес клиента — в белом списке сетей для метрик (пустой список — любой).
+
+    Белый список действует и при `monitoring_public: true`: метрики без
+    ключа, но только для сборщика из своей сети — обычная настройка для
+    Prometheus в том же контуре.
+    """
+    import ipaddress  # noqa: PLC0415
+
+    state = get_state(request)
+    сети = state.settings.get("metrics_allowed_networks") or []
+    if isinstance(сети, str):
+        сети = [ч.strip() for ч in сети.replace(";", ",").split(",")]
+    сети = [str(с).strip() for с in сети if str(с).strip()]
+    if not сети:
+        return True
+    from .. import audit  # noqa: PLC0415
+
+    адрес = audit.адрес(request.headers, request.client,
+                        state.settings.get("trusted_proxies")) or ""
+    try:
+        ip = ipaddress.ip_address(адрес.strip("[]"))
+    except ValueError:
+        return False
+    for сеть in сети:
+        try:
+            if ip in ipaddress.ip_network(сеть, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def допуск_к_метрикам(request: Request) -> None:
     """Допуск к метрикам и пробам: свободно при `monitoring_public`, иначе — как везде.
 
@@ -507,8 +560,16 @@ def допуск_к_метрикам(request: Request) -> None:
     вошедший логином и паролем получал 401 в разделе «Мониторинг», а при
     выключенной аутентификации сервер требовал ключ, которого у него не
     было. Теперь разбор общий с остальными маршрутами: ключ, билет, сессия.
+
+    Белый список сетей (`metrics_allowed_networks`) проверяется первым и
+    действует при любом способе входа.
     """
     state = get_state(request)
+    if not сеть_метрик_разрешена(request):
+        raise error_response(ForbiddenError(
+            "Метрики с этого адреса не отдаются.",
+            hint="Адрес не входит в metrics_allowed_networks. Добавьте сеть "
+                 "сборщика метрик в настройках или обратитесь к администратору."))
     if state.settings.get("monitoring_public", True):
         return
     try:

@@ -392,12 +392,25 @@ async def импорт(request: Request,
     # каждую операцию сокета), разбор и запись в базу. Обработчик здесь
     # асинхронный ради разбора тела, и прямой вызов останавливал весь сервер
     # на время скачивания: при медленном портале /health ждал секунды.
+    # Заголовок авторизации портала — только для адреса из настройки: адрес,
+    # присланный в запросе, может вести куда угодно, и токен ушёл бы туда.
+    из_настройки = str(state.settings.get("employees_url") or "").strip()
+    заголовок = (str(state.settings.get("employees_auth_header") or "")
+                 if адрес and адрес == из_настройки else "")
+    тип = str(тело.get("format") or "")
+    if данные is None and адрес.lower() in ("ldap", "ldap:"):
+        # Справочник из каталога LDAP: читается служебной учётной записью.
+        try:
+            данные = await asyncio.to_thread(справочник.из_каталога, state.settings)
+        except ASRHubError as exc:
+            raise error_response(exc) from exc
+        адрес, тип = "", "csv"
     try:
         итог = await asyncio.to_thread(
             functools.partial(справочник.импорт, state.db, url=адрес, данные=данные,
                               source=источник, deactivate_missing=убирать,
-                              тип=str(тело.get("format") or ""), dry_run=пробно,
-                              force=силой))
+                              тип=тип, dry_run=пробно,
+                              force=силой, заголовок=заголовок))
     except ASRHubError as exc:
         raise error_response(exc) from exc
     if пробно:

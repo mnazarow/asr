@@ -358,8 +358,13 @@ def создать(db: Any, settings: Any, *, kind: str = "full", comment: str =
     подчистить(settings, место_под_ещё_одну=True, вид=kind)
     класть_результаты = (bool(settings.get("backup_include_results", False))
                          if include_results is None else bool(include_results))
+    # Исходные записи (`uploads`) по умолчанию в копию не входят: это самая
+    # большая часть данных. Флажок `backup_include_uploads` их добавляет —
+    # без него восстановленный сервер показывает расшифровки, но не играет
+    # звук и не может перераспознать.
+    класть_записи = bool(settings.get("backup_include_uploads", False))
     if kind == "full":
-        _хватит_ли_места(db, settings, место, класть_результаты)
+        _хватит_ли_места(db, settings, место, класть_результаты, класть_записи)
 
     начало = time.time()
     состав = ["settings.json"]
@@ -403,6 +408,12 @@ def создать(db: Any, settings: Any, *, kind: str = "full", comment: str =
                     shutil.copytree(каталог_результатов, временный / "results",
                                     dirs_exist_ok=True)
                     состав.append("results/")
+            if класть_записи:
+                каталог_записей = Path(settings.paths.uploads)
+                if каталог_записей.is_dir():
+                    shutil.copytree(каталог_записей, временный / "uploads",
+                                    dirs_exist_ok=True)
+                    состав.append("uploads/")
         опись = _опись(db, settings, kind, comment, состав)
         (временный / ОПИСЬ).write_text(
             json.dumps(опись, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -451,7 +462,128 @@ def создать(db: Any, settings: Any, *, kind: str = "full", comment: str =
     except Exception:                                        # noqa: BLE001
         pass
     подчистить(settings)
+    вынести(цель, settings, db)
     return _описание(цель).to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Шифрование и вынос копии с сервера
+# ---------------------------------------------------------------------------
+
+#: Расширение зашифрованной копии (openssl enc, AES-256-CBC, PBKDF2).
+ЗАШИФРОВАНО = ".enc"
+#: Метка начала файла `openssl enc` с солью.
+_МЕТКА_OPENSSL = b"Salted__"
+KV_ВЫНОС = "backup:export"
+
+
+def зашифрована(путь: Path) -> bool:
+    """Зашифрован ли файл копии (`openssl enc` с солью)."""
+    try:
+        with open(путь, "rb") as файл:
+            return файл.read(8) == _МЕТКА_OPENSSL
+    except OSError:
+        return False
+
+
+def _openssl(аргументы: list[str], пароль: str, *, срок_с: float = 3600.0) -> None:
+    import subprocess  # noqa: PLC0415
+
+    окружение = {**os.environ, "ASRHUB_BACKUP_PASS": пароль}
+    try:
+        subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
+                        "-salt", *аргументы, "-pass", "env:ASRHUB_BACKUP_PASS"],
+                       env=окружение, check=True, capture_output=True, timeout=срок_с)
+    except FileNotFoundError as exc:
+        raise ConfigError("Для шифрования копий нужна программа openssl.",
+                          hint="Установите пакет openssl.") from exc
+    except subprocess.CalledProcessError as exc:
+        ошибка = (exc.stderr or b"").decode("utf-8", "replace").strip()[:300]
+        raise ConfigError(
+            f"openssl завершился с ошибкой: {ошибка or exc.returncode}",
+            hint="Если это расшифровка — проверьте пароль копий (backup_password).") from exc
+
+
+def зашифровать(путь: Path, пароль: str) -> Path:
+    """Зашифрованная копия рядом: `<имя>.enc`, права 0600."""
+    цель = путь.with_name(путь.name + ЗАШИФРОВАНО)
+    _openssl(["-in", str(путь), "-out", str(цель)], пароль)
+    os.chmod(цель, 0o600)
+    return цель
+
+
+def расшифровать(путь: Path, пароль: str, куда: Path) -> Path:
+    """Расшифровывает копию в `куда` (права 0600)."""
+    if not пароль:
+        raise ConfigError("Копия зашифрована, а пароль копий не задан.",
+                          hint="Укажите backup_password — тот, с которым копия снималась.")
+    _openssl(["-d", "-in", str(путь), "-out", str(куда)], пароль)
+    os.chmod(куда, 0o600)
+    return куда
+
+
+def вынести(цель: Path, settings: Any, db: Any = None, *, ждать: bool = False) -> bool:
+    """Вынос копии с сервера: команда «после копии» в фоне.
+
+    Команда (`backup_post_command`) задаётся только в файле настроек или
+    переменной окружения — не из интерфейса: это запуск программы на
+    сервере. `{file}` в ней заменяется путём копии; если задан пароль
+    копий (`backup_password`), это путь зашифрованного `.enc`, который
+    удаляется после команды, — наружу уходит только шифрованное.
+    Возвращает, запущен ли вынос.
+    """
+    команда = str(settings.get("backup_post_command") or "").strip()
+    if not команда:
+        return False
+    поток = threading.Thread(target=_вынести, args=(цель, settings, db, команда),
+                             name="asrhub-backup-export", daemon=True)
+    поток.start()
+    if ждать:
+        поток.join()
+    return True
+
+
+def _вынести(цель: Path, settings: Any, db: Any, команда: str) -> None:
+    import shlex  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    пароль = str(settings.get("backup_password") or "")
+    срок = float(settings.get("backup_post_timeout_s") or 1800)
+    файл = цель
+    итог: dict[str, Any] = {"ts": time.time(), "copy": цель.name, "ok": False,
+                            "encrypted": bool(пароль)}
+    try:
+        if пароль:
+            файл = зашифровать(цель, пароль)
+        части = [ч.replace("{file}", str(файл)) for ч in shlex.split(команда)]
+        if not any("{file}" in ч for ч in shlex.split(команда)):
+            части.append(str(файл))
+        ответ = subprocess.run(части, capture_output=True, timeout=срок, check=False,
+                               env={**os.environ, "ASRHUB_BACKUP_FILE": str(файл)})
+        итог["code"] = ответ.returncode
+        итог["ok"] = ответ.returncode == 0
+        if not итог["ok"]:
+            итог["error"] = (ответ.stderr or ответ.stdout or b"").decode(
+                "utf-8", "replace").strip()[-500:]
+    except subprocess.TimeoutExpired:
+        итог["error"] = f"команда не завершилась за {срок:.0f} с"
+    except (OSError, ValueError, ConfigError) as exc:
+        итог["error"] = getattr(exc, "message", None) or str(exc)
+    finally:
+        if файл != цель:
+            файл.unlink(missing_ok=True)
+    if итог["ok"]:
+        log.info("Копия %s вынесена командой «после копии»", цель.name)
+    else:
+        log.warning("Копия %s не вынесена: %s", цель.name, итог.get("error"))
+    if db is not None:
+        try:
+            db.set_kv(KV_ВЫНОС, итог)
+            db.add_event(None, "backup_exported" if итог["ok"] else "backup_export_failed",
+                         f"Вынос копии {цель.name}: "
+                         + ("готово" if итог["ok"] else str(итог.get("error") or "сбой")))
+        except Exception:                                    # noqa: BLE001
+            pass
 
 
 def _состав_архива(корень: Path, *, исключить: Path | None = None) -> list[Path]:
@@ -476,7 +608,8 @@ def _состав_архива(корень: Path, *, исключить: Path |
     return состав
 
 
-def _хватит_ли_места(db: Any, settings: Any, место: Path, с_результатами: bool) -> None:
+def _хватит_ли_места(db: Any, settings: Any, место: Path, с_результатами: bool,
+                     с_записями: bool = False) -> None:
     """Отказ заранее, если на снимок базы не хватит места.
 
     Полная копия собирается во временном каталоге рядом с архивом: снимок
@@ -491,12 +624,14 @@ def _хватит_ли_места(db: Any, settings: Any, место: Path, с_�
         нужно = 2 * база.stat().st_size if база.is_file() else 0
     except (OSError, TypeError, ValueError):
         return
-    if с_результатами:
-        каталог_результатов = Path(settings.paths.results)
+    for нужен, вид in ((с_результатами, "results"), (с_записями, "uploads")):
+        if not нужен:
+            continue
         try:
-            нужно += 2 * sum(ф.stat().st_size for ф in каталог_результатов.rglob("*")
+            каталог_данных = Path(getattr(settings.paths, вид))
+            нужно += 2 * sum(ф.stat().st_size for ф in каталог_данных.rglob("*")
                              if ф.is_file())
-        except OSError:
+        except (OSError, AttributeError):
             pass
     try:
         свободно = shutil.disk_usage(место).free
@@ -706,6 +841,9 @@ def свод(settings: Any) -> dict[str, Any]:
         "keep_count": _целое(settings, "backup_keep", 0),
         "kind": str(settings.get("backup_kind") or "full"),
         "include_results": bool(settings.get("backup_include_results", False)),
+        "include_uploads": bool(settings.get("backup_include_uploads", False)),
+        "encrypted_export": bool(str(settings.get("backup_password") or "")),
+        "export_command": bool(str(settings.get("backup_post_command") or "").strip()),
         "kinds": [{"key": к, "title": з} for к, з in ВИДЫ.items()],
         # База, подготовленная «Вернуть данные» и ждущая перезапуска. Её не
         # было видно нигде: нажали, не перезапустили — и через две недели
@@ -1052,6 +1190,17 @@ def восстановить(db: Any, settings: Any, name: str, *, what: str = "
                             "Восстановление отменено, рабочая база не тронута.",
                             hint="Проверьте свободное место в каталоге данных.") from exc
                     итог["results"] = True
+                записи = временный / "uploads"
+                if записи.is_dir():
+                    try:
+                        shutil.copytree(записи, Path(settings.paths.uploads),
+                                        dirs_exist_ok=True)
+                    except OSError as exc:
+                        raise StorageError(
+                            f"Исходные записи из копии не скопированы: {exc}. "
+                            "Восстановление отменено, рабочая база не тронута.",
+                            hint="Проверьте свободное место в каталоге данных.") from exc
+                    итог["uploads"] = True
             if значения is not None:
                 итог["applied"] = _применить_настройки(значения, settings)
         except BaseException:
@@ -1564,6 +1713,20 @@ def восстановить_из_файла(путь: Path | str, settings: Any
             hint="Остановите все серверы над этим каталогом данных; отметка "
                  "остановленного сервера гаснет за пять минут.")
     итог: dict[str, Any] = {"source": str(источник)}
+    if зашифрована(источник):
+        открытый = Path(tempfile.mkdtemp(prefix="asrhub-decrypt-",
+                                         dir=str(_временный_каталог(settings))))
+        имя = источник.name[:-len(ЗАШИФРОВАНО)] if источник.name.endswith(ЗАШИФРОВАНО) \
+            else источник.name
+        try:
+            расшифрованный = расшифровать(источник, str(settings.get("backup_password") or ""),
+                                          открытый / имя)
+            ответ = восстановить_из_файла(расшифрованный, settings)
+        finally:
+            shutil.rmtree(открытый, ignore_errors=True)
+        ответ["source"] = str(источник)
+        ответ["decrypted"] = True
+        return ответ
     if источник.name.endswith(".db"):
         итог.update(_вернуть_базу(источник, settings))
     else:
@@ -1616,6 +1779,11 @@ def принять(settings: Any, имя_файла: str, поток: Any) -> di
     """
     место = _готовый_каталог(settings)
     короткое = os.path.basename(str(имя_файла or "").strip())
+    # Зашифрованная копия (вынесенная с сервера с паролем копий) принимается
+    # и расшифровывается здесь же: в каталоге копий лежат открытые архивы.
+    шифр = короткое.endswith(РАСШИРЕНИЕ + ЗАШИФРОВАНО)
+    if шифр:
+        короткое = короткое[:-len(ЗАШИФРОВАНО)]
     архив = короткое.endswith(РАСШИРЕНИЕ)
     if not архив and not короткое.endswith(".db"):
         raise ConfigError(
@@ -1652,6 +1820,13 @@ def принять(settings: Any, имя_файла: str, поток: Any) -> di
                     raise ConfigError("Файл слишком велик.",
                                       hint="Это точно резервная копия?")
                 файл.write(кусок)
+        if шифр or зашифрована(черновик):
+            открытый = черновик.with_name(черновик.name + ".plain")
+            try:
+                расшифровать(черновик, str(settings.get("backup_password") or ""), открытый)
+                открытый.replace(черновик)
+            finally:
+                открытый.unlink(missing_ok=True)
         if архив:
             опись = _прочитать_опись(черновик)
             if not опись.get("kind"):
@@ -1793,6 +1968,7 @@ def разобрать_время(значение: Any, по_умолчанию
     return час, минута
 
 
-__all__ = ["ВИДЫ", "Копия", "восстановить", "восстановить_из_файла", "каталог",
+__all__ = ["ВИДЫ", "Копия", "вынести", "зашифровать", "расшифровать",
+           "восстановить", "восстановить_из_файла", "каталог",
            "подчистить", "пора", "принять", "разобрать_время", "свод", "создать",
            "список", "удалить"]

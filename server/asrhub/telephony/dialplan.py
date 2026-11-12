@@ -77,6 +77,11 @@ from .stations import список as станции_из_настроек
     "ready": "ready",
     "dry_run": "dry_run", "test": "dry_run",
     "linkedid": "linkedid", "sequence": "sequence",
+    # Метка звонка (сервисный код в разговоре или CRM) — в метки задания;
+    # record=0 — «этот звонок не записывать» (сервисный код в диалплане);
+    # recording_rejected — сценарий шлёт звонок без записи, которую сервер
+    # не принял (413/415), и копия звонка с записью лежит у станции в failed/.
+    "tag": "tag", "record": "record", "recording_rejected": "recording_rejected",
 }
 
 #: Предел длины одного поля. Номера и имена каналов короче в разы; длинное

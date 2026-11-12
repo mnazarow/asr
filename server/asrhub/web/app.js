@@ -4510,6 +4510,9 @@ RENDERERS.results = {
             <option value="violation">с нарушениями оператора</option>
             <option value="low_score">балл оператора ниже 60</option>
             <option value="impolite">невежливый оператор</option>
+            <option value="qc:low">оценка клиента ниже 60 % (опрос)</option>
+            <option value="qc:high">оценка клиента от 80 % (опрос)</option>
+            <option value="qc:any">есть оценка клиента</option>
           </select>
           <select id="r-order" style="width:190px">
             <option value="created_at DESC">Сначала новые</option>
@@ -4663,7 +4666,8 @@ RENDERERS.results = {
             title="Выбрать все на странице"></th>
           <th>Файл</th><th>Модель</th><th class="num">Длит.</th>
           <th class="num">Слов</th><th class="num">Сегм.</th><th class="num">RTF</th>
-          <th class="num">Уверенность</th><th>Говорящие</th><th>Готово</th>
+          <th class="num">Уверенность</th><th>Говорящие</th>
+          <th class="num" title="Оценка клиента из опроса контроля качества">Оценка</th><th>Готово</th>
           <th style="width:230px">Выгрузка</th></tr></thead><tbody>
         ${data.items.map((job) => `<tr data-id="${job.id}">
           <td class="pick"><input type="checkbox" class="pick-one" value="${job.id}"
@@ -4685,6 +4689,10 @@ RENDERERS.results = {
           <td class="num">${job.rtf ? num(job.rtf, 3) : '—'}</td>
           <td class="num">${job.avg_confidence ? pct(job.avg_confidence, 0) : '—'}</td>
           <td class="num">${job.speakers_count || '—'}</td>
+          <td class="num">${job.qc && job.qc.score_pct !== null && job.qc.score_pct !== undefined
+            ? `<span class="chip ${job.qc.score_pct < 60 ? 'err' : job.qc.score_pct < 80 ? 'warn' : 'ok'}"
+                title="Оценка клиента в опросе: ${esc(String(job.qc.score ?? ''))}">${num(job.qc.score_pct, 0)} %</span>`
+            : (job.qc ? `<span class="small faint" title="Опрос: ${esc(job.qc.status || '')}">—</span>` : '')}</td>
           <td class="small faint nowrap">${fmtAgo(job.finished_at)}</td>
           <td class="exports"><div class="row" style="gap:3px;flex-wrap:nowrap">
             <button class="ghost sm" onclick="__asrhub.playRecording(${jsArg(job.id)})"
@@ -4868,6 +4876,12 @@ const Player = {
       play.disabled = true;
       scrub.disabled = true;
     };
+    if (options.noAudio) {
+      // Сервер сказал, что файла записи нет (`audio_available: false`): не
+      // ходим за ним вовсе — запрос дал бы 400 и красную строку в консоли.
+      fail(options.noAudio === true ? 'исходный файл записи не сохранён' : String(options.noAudio));
+      return { audio: el, ensure() {}, seek() {}, destroy() {} };
+    }
     const источник = Player.attach(el, id, fail);
     // Без загрузки при открытии (вход по ключу) «▶» доступна сразу: по ней
     // запись и скачивается.
@@ -6186,7 +6200,8 @@ function setupJobPlayer(backdrop, job, segments, show, options) {
     }
   };
 
-  const player = Player.mount(host, job.id, { onTime: highlight });
+  const player = Player.mount(host, job.id, { onTime: highlight,
+    noAudio: job.audio_available === false });
 
   // Щелчок по сегменту — переход к нему. Слушаем на теле вкладок, а не на
   // самих сегментах: вкладка перерисовывается целиком, и обработчики,
@@ -8914,6 +8929,25 @@ const ПАТС_ПОЛЯ = [
     desc: 'Пароль этой учётной записи. В ответах интерфейса он не показывается.',
     rec: 'Не переиспользуйте пароль администратора АТС.',
     examples: ['длинная случайная строка'] },
+  { key: 'queue_log', label: 'Журнал очередей', type: 'text',
+    desc: 'Путь к queue_log Asterisk, если сервер его видит: время ожидания, брошенные '
+        + 'в очереди звонки и пропуски операторов. Читается с запомненной позиции.',
+    rec: 'Обычно /var/log/asterisk/queue_log. Со станции за агентом строки присылает агент.',
+    examples: ['/var/log/asterisk/queue_log'] },
+  { key: 'auth', label: 'Способ входа в AMI', type: 'select', only: 'ami',
+    options: [['plain', 'паролем (как в manager.conf)'], ['md5', 'по MD5 через Challenge']],
+    desc: 'По MD5 пароль по сети не передаётся: станция выдаёт вызов, сервер отвечает '
+        + 'хешем от вызова и пароля.',
+    rec: 'Без TLS выбирайте MD5: паролем вход виден любому, кто слушает сеть.',
+    examples: ['md5 — AMI без TLS', 'plain — при TLS'] },
+  { key: 'tls', label: 'AMI по TLS', type: 'bool', only: 'ami',
+    desc: 'Шифровать соединение с AMI (tlsenable в manager.conf, порт 5039).',
+    rec: 'Включайте, если станция в другой сети: события Cdr несут номера клиентов.',
+    examples: ['выключено — АТС на этом же сервере', 'включено — филиал по сети'] },
+  { key: 'ca_file', label: 'Центр сертификации AMI', type: 'text', only: 'ami',
+    desc: 'Файл сертификата центра, которым подписан сертификат станции. Пусто — системные.',
+    rec: 'Для самоподписанного сертификата станции укажите сам этот сертификат.',
+    examples: ['/etc/asrhub/pbx-ca.pem'] },
   { key: 'cdr_file', label: 'Журнал звонков', type: 'text', only: 'cdr_csv',
     desc: 'Путь к файлу Master.csv, который Asterisk пишет после каждого звонка.',
     rec: 'Обычно /var/log/asterisk/cdr-csv/Master.csv. Нужен доступ на чтение '
@@ -9175,6 +9209,26 @@ RENDERERS.pbx = {
   /* Шапка: сколько станций и что с ними прямо сейчас. Она одна и та же на
    * всех вкладках — это ответ на вопрос «всё ли работает», а его задают
    * независимо от того, какой график открыт. */
+  /* Суточная сверка «станция ↔ архив»: звонков на станции больше, чем в
+   * архиве, — потеря по дороге, о которой иначе узнают через месяц. */
+  reconcileChip(св) {
+    if (!св || !(св.items || []).length) return '';
+    const плохие = св.items.filter((и) => и.ok === false);
+    return плохие.length
+      ? `<span class="chip err" title="${esc(плохие.map((и) => и.summary || и.error || '').join('; '))}">сверка за ${
+          esc(св.day || '')}: потери на ${плохие.length} ${plural(плохие.length, 'станции', 'станциях', 'станциях')}</span>`
+      : `<span class="chip ok" title="Журналы и записи станций за ${esc(св.day || '')} сошлись с архивом">сверка за ${
+          esc(св.day || '')}: сошлось</span>`;
+  },
+
+  reconcileLine(св) {
+    if (!св || !(св.items || []).some((и) => и.ok === false)) return '';
+    return `<div class="banner err" style="margin:0 16px 12px">${св.items.filter((и) => и.ok === false)
+      .map((и) => esc(и.summary || `${и.name}: ${и.error || 'сверка не удалась'}`)).join('<br>')}
+      <div class="small dim">Дошлите потерянное: «Забрать со всех» с полным сбором или
+      «asrhub-dialplan --resend» на станции.</div></div>`;
+  },
+
   drawTop() {
     const место = qs('#pbx-top');
     const д = state.pbxData || {};
@@ -9202,11 +9256,13 @@ RENDERERS.pbx = {
             `${с.name}: ${с.last_error || 'поток не запущен'}`).join('; '))}">${
             беда.length} ${plural(беда.length, 'станция требует', 'станции требуют',
             'станций требуют')} внимания</span>` : ''}
+          ${this.reconcileChip(д.reconcile)}
           <span class="spacer"></span>
           <span class="small dim">${esc(ТЕЛЕФОНИЯ_ПЕРИОДЫ[д.period] || '')}${
             state.pbxStation ? ` · ${esc((станции.find((с) => с.id === state.pbxStation) || {}).name
               || state.pbxStation)}` : ''}</span>
         </div>
+        ${this.reconcileLine(д.reconcile)}
         <div class="grid cols-6" style="padding:14px 16px">
           ${kpi('Звонков за период',
                 Р(за.total, num(за.total || 0, 0), { title: 'Звонки за период' }),
@@ -9552,6 +9608,10 @@ RENDERERS.pbx = {
           Подставьте ключ доступа с правом записи (раздел «Настройки» →
           «Доступ»). Агент поставится службой, проверит себя и начнёт
           присылать звонки. Полная установка и ключи — в справке.</div>
+        ${(данные || {}).agent_sha256 ? `<div class="small dim" style="margin-top:6px">
+          sha256 агента на этом сервере (${esc((данные || {}).server_version || '')}):
+          <span class="mono">${esc(данные.agent_sha256)}</span> — установщик сверяет его
+          с отпечатком в ответе сервера и печатает; сверьте глазами.</div>` : ''}
         <details style="margin-top:10px"><summary class="small">Без ключа в командной
           строке (надёжнее на общей станции)</summary>
           <div class="small dim" style="margin:6px 0">Ключ, переданный аргументом, виден
@@ -9574,10 +9634,10 @@ RENDERERS.pbx = {
               <div class="small dim mono">${esc(а.host || '')} · ${esc(а.id)}</div>
               ${а.last_error ? `<div class="small err">${esc(а.last_error)}</div>` : ''}</td>
             <td class="small mono">${esc(а.station || '')}</td>
-            <td class="small">${esc(а.version || '—')}${а.version && state.serverVersion
-              && а.version !== state.serverVersion ? `<div class="small warn"
-              title="Агент берётся из установки сервера: переустановите его на станции
-той же командой, что выше">сервер ${esc(state.serverVersion)} — обновите</div>` : ''}
+            <td class="small">${esc(а.version || '—')}${а.outdated ? `<span class="chip warn"
+              title="Агент старее сервера. Переустановите его той же командой, что выше,
+или включите auto_update в настройках агента: он скачает новый и сверит sha256">устарел</span>
+              <div class="small warn">сервер ${esc((данные || {}).server_version || state.serverVersion || '')}</div>` : ''}
               <div class="small dim">${esc(а.asterisk || '')}</div></td>
             <td class="small ${давно > 86400 ? 'err' : ''}">${
               а.last_seen ? fmtAgo(а.last_seen) : 'ни разу'}</td>
@@ -10056,7 +10116,19 @@ RENDERERS.pbx = {
             <th class="num">Наговорено</th><th class="num">Средний разговор</th>
             <th class="num">Доля периода</th></tr></thead>
           <tbody>${this.peopleRows(очереди, (д.period_calls || {}).total, 'queue', д)}</tbody></table></div>
+      </section>
+      <section class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Разговоры и переводы</h3>
+          <span class="hint">ноги одного разговора (linkedid) — одной строкой: кто участвовал по порядку</span></div>
+        <div id="pbx-conversations" style="padding:12px 16px"><div class="empty small">Загрузка…</div></div>
+      </section>
+      <section class="card admin-only" style="margin-top:14px">
+        <div class="card-head"><h3>Ожидание и потери в очередях</h3>
+          <span class="hint">по журналу очередей станции (queue_log): ждали, бросили, не взяли</span></div>
+        <div id="pbx-queue-log" style="padding:12px 16px"><div class="empty small">Загрузка…</div></div>
       </section>`;
+    if ((state.me || {}).role === 'admin') this.drawQueueLog();
+    this.drawConversations();
 
     const цвет = Charts.palette()[0];
     const { О, средний } = this.раскрытие(д);
@@ -10087,6 +10159,89 @@ RENDERERS.pbx = {
              'avg', (з) => fmtDur(з.avg_s), 'queue');
     столбики('#pbx-agent-avg', операторы.slice().sort((a, b) => b.avg_s - a.avg_s),
              'avg', (з) => fmtDur(з.avg_s), 'agent');
+  },
+
+  /* Разговор как единица: перевод с оператора на оператора в журнале — это
+   * несколько ног, и счёт по ногам завышал и звонки, и время каждого. */
+  async drawConversations() {
+    const место = qs('#pbx-conversations');
+    if (!место) return;
+    const пар = new URLSearchParams({
+      period: ['day', 'week', 'month', 'quarter', 'year'].includes(state.pbxPeriod)
+        ? state.pbxPeriod : 'week', transferred: 'true', limit: '50' });
+    if (state.pbxStation) пар.set('station', state.pbxStation);
+    let д;
+    try {
+      д = await API.latest('pbx-conversations', `/api/telephony/conversations?${пар}`);
+    } catch (err) {
+      if (err && err.silent) return;
+      место.innerHTML = `<div class="empty small">Недоступно: ${esc(err.message || '')}</div>`;
+      return;
+    }
+    const доля = д.conversations ? (д.transferred / д.conversations) * 100 : 0;
+    const шапка = `<div class="small" style="margin-bottom:8px">Звонков (ног) за период:
+      <b>${num(д.calls || 0, 0)}</b> → разговоров <b>${num(д.conversations || 0, 0)}</b>;
+      с переводом — <b>${num(д.transferred || 0, 0)}</b> (${num(доля, 1)} %).</div>`;
+    if (!(д.items || []).length) {
+      место.innerHTML = шапка + '<div class="empty small">Разговоров с переводом за период нет '
+        + '(или станция не передаёт linkedid).</div>';
+      return;
+    }
+    место.innerHTML = шапка + `<div class="table-wrap"><table class="table">
+      <thead><tr><th>Начало</th><th>Кто участвовал</th><th class="num">Ног</th>
+        <th class="num">Переводов</th><th class="num">Говорили</th><th>Запись</th></tr></thead>
+      <tbody>${д.items.map((р) => `<tr><td class="small">${esc(fmtTime(р.started_at))}</td>
+        <td>${р.agents.map((а) => `<b>${esc(а)}</b>`).join(' → ') || '—'}</td>
+        <td class="num">${num(р.legs, 0)}</td><td class="num">${num(р.transfers, 0)}</td>
+        <td class="num">${fmtDur(р.talk_s)}</td>
+        <td>${р.job_id ? `<button class="ghost sm" data-open-job="${esc(р.job_id)}">Открыть</button>` : '—'}</td></tr>`).join('')}
+      </tbody></table></div>`;
+    qsa('[data-open-job]', место).forEach((к) => к.addEventListener('click',
+      () => window.__asrhub.openJob(к.dataset.openJob)));
+  },
+
+  /* События queue_log: время ожидания, брошенные, уровень обслуживания и
+   * пропуски операторов — то, чего журнал звонков не знает: брошенный в
+   * очереди звонок в нём неотличим от «без ответа». */
+  async drawQueueLog() {
+    const место = qs('#pbx-queue-log');
+    if (!место) return;
+    const пар = new URLSearchParams({
+      period: ['day', 'week', 'month', 'quarter', 'year'].includes(state.pbxPeriod)
+        ? state.pbxPeriod : 'week' });
+    if (state.pbxStation) пар.set('station', state.pbxStation);
+    let д;
+    try {
+      д = await API.latest('pbx-queue-log', `/api/telephony/queues?${пар}`);
+    } catch (err) {
+      if (err && err.silent) return;
+      место.innerHTML = `<div class="empty small">Недоступно: ${esc(err.message || '')}</div>`;
+      return;
+    }
+    if (!д.events) {
+      место.innerHTML = `<div class="empty small">Событий очередей нет. Укажите у станции
+        «Журнал очередей» (обычно /var/log/asterisk/queue_log) или присылайте его строки
+        агентом (POST /api/telephony/agent/queue_log).</div>`;
+      return;
+    }
+    const пр = (з) => (з === null || з === undefined ? '—' : `${num(з, 1)} %`);
+    const сек = (з) => (з === null || з === undefined ? '—' : fmtDur(з));
+    место.innerHTML = `<div class="table-wrap"><table class="table">
+      <thead><tr><th>Очередь</th><th class="num">Встали</th><th class="num">Ответили</th>
+        <th class="num">Ушли без ответа</th><th class="num">из них бросили</th>
+        <th class="num">Ждали до ответа</th><th class="num">Ждали и ушли</th>
+        <th class="num" title="Ответили не дольше ${esc(String(д.threshold_s))} с">Уровень обслуживания</th>
+        <th class="num">Не взяли трубку</th></tr></thead>
+      <tbody>${(д.queues || []).map((о) => `<tr><td>${esc(о.queue)}</td>
+        <td class="num">${num(о.entered, 0)}</td><td class="num">${num(о.answered, 0)}</td>
+        <td class="num ${о.lost_share > 10 ? 'err' : ''}">${num(о.lost, 0)} · ${пр(о.lost_share)}</td>
+        <td class="num">${num(о.abandoned, 0)}</td>
+        <td class="num">${сек(о.avg_wait_s)}</td><td class="num">${сек(о.avg_lost_wait_s)}</td>
+        <td class="num">${пр(о.service_level)}</td><td class="num">${num(о.ringnoanswer, 0)}</td></tr>`).join('')}
+      </tbody></table></div>
+      ${(д.agents || []).some((а) => а.ringnoanswer) ? `<div class="small" style="margin-top:8px">
+        Не взяли трубку чаще всех: ${(д.agents || []).filter((а) => а.ringnoanswer).slice(0, 8)
+          .map((а) => `<b>${esc(а.agent)}</b> — ${num(а.ringnoanswer, 0)}`).join(', ')}</div>` : ''}`;
   },
 
   peopleRows(строки, всего_периода, ось, д) {
@@ -10836,6 +10991,8 @@ RENDERERS.dialplan = {
       key_in: ф.key_in || 'header',
       trunk: ф.trunk || 'provider',
       internal_len: ф.internal_len || 3,
+      // Стороны раздельно — только при отправке файлом.
+      tracks: state.dpMode === 'path' ? '' : (ф.tracks || ''),
     };
   },
 
@@ -10878,6 +11035,10 @@ RENDERERS.dialplan = {
           'имя вашего провайдера в pjsip.conf или sip.conf')}
         ${поле('internal_len', 'Длина внутреннего номера', `<input type="number" min="2" max="6"
           data-dp="internal_len" value="${esc(String(з.internal_len))}">`, 'для шаблона _XXX в примере')}
+        ${путём ? '' : поле('tracks', 'Стороны раздельно', `<select data-dp="tracks">
+          <option value=""${з.tracks ? '' : ' selected'}>нет — одной смесью</option>
+          <option value="1"${з.tracks ? ' selected' : ''}>да — MixMonitor r()/t()</option></select>`,
+          'клиент и оператор в своих файлах: «кто говорит» без разделения по голосам')}
       </div>`);
     let таймер = null;
     qsa('[data-dp]', место).forEach((вход) => {
@@ -10895,6 +11056,7 @@ RENDERERS.dialplan = {
     if (!место) return;
     const з = this.formValues();
     const пар = new URLSearchParams({ driver: state.dpDriver, mode: state.dpMode, ...з });
+    if (!з.tracks) пар.delete('tracks');
     let собрано;
     try {
       собрано = await API.latest('dialplan-config', `/api/telephony/dialplan/config?${пар}`);
@@ -11200,14 +11362,12 @@ function qcНоваяГруппа(умолчания) {
 
 RENDERERS.qc = {
   async render(root) {
-    if ((state.me || {}).role !== 'admin') {
-      root.innerHTML = `<div class="empty">Контроль качества настраивает и смотрит администратор:
-        здесь учётные данные телефона и номера клиентов.</div>`;
-      return;
-    }
     if (!state.qcDays) state.qcDays = 30;
-    root.innerHTML = `
-      <div class="settings-toolbar">
+    // Не администратору — только отчёт и журнал своего подразделения
+    // (руководитель отдела): телефон, группы обзвона, голос и список
+    // «не звонить» остаются за администратором, и сервер их не отдаёт.
+    this._толькоОтчёт = (state.me || {}).role !== 'admin';
+    const периоды = `<div class="settings-toolbar">
         <span class="small dim">Период отчёта:</span>
         <div class="group-nav" id="qc-days">
           ${[[7, 'неделя'], [30, 'месяц'], [90, 'квартал'], [365, 'год']].map(([д, имя]) =>
@@ -11215,7 +11375,23 @@ RENDERERS.qc = {
         </div>
         <span class="spacer"></span>
         <button class="ghost sm" id="qc-refresh" title="Обновить состояние, отчёт и журнал">Обновить</button>
-      </div>
+      </div>`;
+    if (this._толькоОтчёт) {
+      root.innerHTML = `${периоды}
+        <div class="banner" style="margin-bottom:12px">Оценки клиентов по опросам своего
+          подразделения. Телефон, группы обзвона и список «не звонить» настраивает администратор.</div>
+        <div id="qc-summary"><div class="empty">Читаю отчёт…</div></div>
+        <div id="qc-journal"></div>`;
+      qsa('#qc-days button').forEach((к) => к.addEventListener('click', () => {
+        state.qcDays = Number(к.dataset.days);
+        qsa('#qc-days button').forEach((x) => x.classList.toggle('active', x === к));
+        this.loadReport();
+      }));
+      qs('#qc-refresh').onclick = () => this.loadReport();
+      await this.loadReport();
+      return;
+    }
+    root.innerHTML = `${периоды}
       <div id="qc-state"></div>
       ${this.intro()}
       <div class="grid cols-2" style="margin-bottom:16px">
@@ -11332,13 +11508,13 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
       const [свод, журнал, стоп] = await Promise.all([
         API.get(`/api/qc/summary?since_days=${state.qcDays}`),
         API.get(`/api/qc/surveys?since_days=${state.qcDays}&limit=100`),
-        API.get('/api/qc/stoplist')]);
+        this._толькоОтчёт ? Promise.resolve(null) : API.get('/api/qc/stoplist')]);
       state.qcSummary = свод;
       state.qcJournal = журнал;
       state.qcStop = стоп;
       this.drawSummary();
       this.drawJournal();
-      this.drawStoplist();
+      if (!this._толькоОтчёт) this.drawStoplist();
       // Пока есть идущие звонки, журнал обновляется сам.
       clearTimeout(this._таймер);
       if ((журнал.items || []).some((з) => з.status === 'звонит') && state.view === 'qc') {
@@ -11895,13 +12071,20 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
             <td class="num">${з.score === null || з.score === undefined ? '—' : `<b>${num(з.score, 2)}</b>`}</td>
             <td class="num">${num(з.attempts || 0, 0)}</td>
             <td class="small">${з.job_id ? `<a href="#" data-qc-job="${esc(з.job_id)}">разговор</a>` : ''}
-              ${з.status === 'ждёт' ? `<a href="#" data-qc-cancel="${esc(з.id)}">отменить</a>` : ''}</td></tr>`;
+              ${з.status === 'ждёт' && !this._толькоОтчёт ? `<a href="#" data-qc-cancel="${esc(з.id)}">отменить</a>` : ''}</td></tr>`;
         }).join('')}</tbody></table></div>`
-        : '<div class="empty small">За период опросов не было. Сделайте пробный звонок — он появится здесь.</div>',
-      записи.length ? '<button class="ghost sm" id="qc-export">Выгрузить CSV</button>' : '');
+        : `<div class="empty small">За период опросов не было.${this._толькоОтчёт ? ''
+          : ' Сделайте пробный звонок — он появится здесь.'}</div>`,
+      записи.length ? `<button class="ghost sm" id="qc-export">Выгрузить CSV</button>
+        <button class="ghost sm" id="qc-export-xlsx"
+          title="Книга Excel: журнал опросов и лист отчёта по группам и добавочным">Выгрузить в Excel</button>` : '');
     const выгрузка = qs('#qc-export');
     if (выгрузка) выгрузка.onclick = () => скачатьФайл(
       `/api/qc/surveys/export?since_days=${encodeURIComponent(state.qcDays || 30)}`, 'qc-surveys.csv');
+    const книга = qs('#qc-export-xlsx');
+    if (книга) книга.onclick = () => скачатьФайл(
+      `/api/qc/surveys/export?fmt=xlsx&since_days=${encodeURIComponent(state.qcDays || 30)}`,
+      'qc-surveys.xlsx');
     qsa('[data-qc-job]').forEach((ссылка) => ссылка.addEventListener('click', (ев) => {
       ев.preventDefault();
       state.resultsSearch = ссылка.dataset.qcJob;
@@ -15242,7 +15425,8 @@ async function renderAccessSection(host) {
                  style="flex:1;min-width:160px">
           <select id="access-new-role" style="width:130px">
             <option value="user">user</option><option value="admin">admin</option>
-            <option value="readonly">readonly</option></select>
+            <option value="readonly">readonly</option>
+            <option value="metrics" title="Только метрики и пробы: для Prometheus, Zabbix">metrics</option></select>
           <button class="primary sm" id="access-new">Создать</button></div>
           ${поляКлюча('access-new')}
           <p class="small dim" style="margin-top:8px">Полное значение ключа
@@ -15273,7 +15457,10 @@ async function renderAccessSection(host) {
           <label class="row" style="gap:6px;align-items:center">
             <input type="checkbox" id="audit-failed"><span class="small">только отказы</span></label>
           <button class="ghost sm" id="audit-more">Показать ещё</button>
+          <button class="ghost sm" id="audit-verify"
+            title="Сверить цепочку хешей: правка строки или вырезанные строки рвут её">Проверить целостность</button>
         </div>
+        <div id="audit-verify-out" class="small" style="margin:6px 0"></div>
         <div id="audit-rows"></div>
       </div>
     </section>` : ''}`;
@@ -15337,6 +15524,17 @@ async function renderAccessSection(host) {
     qs('#audit-actor').addEventListener('change', обновить);
     qs('#audit-failed').addEventListener('change', обновить);
     qs('#audit-more').addEventListener('click', () => loadAudit(false));
+    qs('#audit-verify').addEventListener('click', (e) => занятьКнопку(e.currentTarget, async () => {
+      const out = qs('#audit-verify-out');
+      try {
+        const r = await API.get('/api/audit/verify');
+        out.innerHTML = r.ok
+          ? `<span class="chip ok">цепочка цела</span> проверено строк: ${num(r.checked)}${
+              r.legacy ? ` · без хеша (записаны до цепочки): ${num(r.legacy)}` : ''}${
+              r.syslog ? ' · копия уходит в syslog' : ' · копии в syslog нет — отрезанный хвост цепочка не покажет'}`
+          : `<span class="chip err">цепочка разорвана</span> на строке ${esc(String(r.broken_id))}: ${esc(r.reason || '')}`;
+      } catch (err) { fail(err); }
+    }));
     await loadAudit(true);
   }
 }
@@ -16123,7 +16321,8 @@ async function drawStationsBox(host) {
 
 const РЕЗЕРВ_ПАРАМЕТРЫ = [
   'backup_enabled', 'backup_time', 'backup_interval_hours', 'backup_kind',
-  'backup_keep_days', 'backup_keep', 'backup_include_results', 'backup_dir',
+  'backup_keep_days', 'backup_keep', 'backup_include_results', 'backup_include_uploads',
+  'backup_dir', 'backup_password',
 ];
 
 RENDERERS.backup = {
@@ -16137,7 +16336,7 @@ RENDERERS.backup = {
         <span class="spacer"></span>
         <label class="ghost sm admin-only" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px"
           title="Положить в каталог копию, снятую на другом сервере">
-          Загрузить копию<input type="file" id="bk-upload" accept=".gz,.db" hidden></label>
+          Загрузить копию<input type="file" id="bk-upload" accept=".gz,.db,.enc" hidden></label>
         <button class="ghost sm admin-only" id="bk-cleanup"
           title="Убрать копии старше срока хранения прямо сейчас">Подчистить</button>
         <button class="ghost sm" id="bk-refresh" title="Обновить данные раздела">Обновить</button>
@@ -16217,7 +16416,26 @@ RENDERERS.backup = {
         ${!д.total ? `<div class="banner" style="margin:0 16px 14px">
           Копий пока нет. Снимите копию настроек прямо сейчас — она весит килобайты,
           а хранит всю работу по подбору параметров.</div>` : ''}
+        <div class="small dim" style="padding:0 16px 14px">${this.exportLine(д)}</div>
       </section>`;
+  },
+
+  /* Вынос копии с сервера: команда «после копии» и шифрование. Копия на том
+   * же диске, что и база, от потери диска не спасает — об этом строка. */
+  exportLine(д) {
+    const состав = `В полную копию входят база и настройки${
+      д.include_results ? ', файлы результатов' : ''}${
+      д.include_uploads ? ' и исходные записи' : '; исходные записи (uploads) — нет'}.`;
+    if (!д.export_command) {
+      return `${состав} Вынос с сервера не настроен: команда «после копии» `
+        + '(backup_post_command) задаётся в файле настроек.';
+    }
+    const в = д.export || null;
+    const итог = в ? (в.ok
+      ? `<span class="chip ok">вынесена</span> ${esc(в.copy || '')} ${esc(fmtAgo(в.ts))}`
+      : `<span class="chip err">вынос не удался</span> ${esc(в.copy || '')}: ${esc(в.error || '')}`)
+      : 'выносов ещё не было';
+    return `${состав} Вынос: ${д.encrypted_export ? 'шифрованной копией' : 'открытой копией'} · ${итог}`;
   },
 
   drawList() {
@@ -17095,7 +17313,8 @@ RENDERERS.system = {
             <input type="text" id="key-name" placeholder="название ключа" style="flex:1">
             <select id="key-role" style="width:130px">
               <option value="user">user</option><option value="admin">admin</option>
-              <option value="readonly">readonly</option></select>
+              <option value="readonly">readonly</option>
+              <option value="metrics" title="Только метрики и пробы: для Prometheus, Zabbix">metrics</option></select>
             <button class="primary sm" id="key-create">Создать</button></div>
           ${поляКлюча('key-new')}
           <label class="small dim" style="display:flex;gap:6px;align-items:center;margin-top:6px">
@@ -22158,6 +22377,17 @@ const ИИ = {
   { key: 'llm', title: 'По ответам модели',
     columns: ['records', 'llm_analyzed', 'llm_resolved_share', 'llm_score',
               'llm_undated_share', 'agent_score'] });
+
+// Оценка клиента из опроса контроля качества — рядом с показателями разговоров.
+СОТРУДНИК_КОЛОНКИ.push(
+  ['qc_surveys', 'Опросов с оценкой', 0, 0, 'сколько клиентов оценили разговор в опросе'],
+  ['qc_score_pct', 'Оценка клиента, %', 1, 1, 'средняя оценка клиентов в опросе контроля качества'],
+  ['qc_low', 'Низких оценок', 0, -1, 'оценок ниже 60 %'],
+);
+СОТРУДНИК_НАБОРЫ.splice(СОТРУДНИК_НАБОРЫ.findIndex((н) => н.key === 'all'), 0,
+  { key: 'qc', title: 'Оценка клиентов',
+    columns: ['records', 'calls', 'qc_surveys', 'qc_score_pct', 'qc_low', 'agent_score',
+              'llm_score'] });
 
 // Карточка оператора в «Аналитике записей» и в «Аналитике по сотрудникам».
 (() => {

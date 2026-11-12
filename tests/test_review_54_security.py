@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 from asrhub.api import create_app
-from asrhub.config import load
+from asrhub.config import load, хеш_ключа
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -501,8 +501,11 @@ def test_отозванный_автоключ_не_воскресает(data_di
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "config.yaml").write_text("server:\n  auth_enabled: true\n", encoding="utf-8")
     первый = load()
-    (ключ,) = list(первый.api_keys)
-    assert (data_dir / "api-key.txt").read_text(encoding="utf-8").strip() == ключ
+    # С 3.1.32 ключ первого запуска лежит в настройках хешем: сам ключ — только
+    # в api-key.txt, а словарь ключей находит его и по нему, и по хешу.
+    (имя,) = list(первый.api_keys)
+    ключ = (data_dir / "api-key.txt").read_text(encoding="utf-8").strip()
+    assert ключ in первый.api_keys and имя in (ключ, хеш_ключа(ключ))
     app = create_app(первый, start_queue=False)
     with TestClient(app) as клиент:
         ответ = клиент.delete(f"/api/keys/{ключ[:16]}", headers=H(ключ))

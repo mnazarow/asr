@@ -348,6 +348,8 @@ def test_a_failure_before_the_pipeline_does_not_leave_the_job_running(tmp_path, 
     очередь._retiring = set()
     очередь._states = {0: jq.WorkerState(index=0)}
     очередь._cancelled = set()
+    # Поток воркера в учёте сторожа зависших (3.1.32): пусто — не заменён.
+    очередь._потоки = {}
     очередь._release_slot = lambda job_id, model: None
     выдать = [job]
 

@@ -39,6 +39,24 @@ def _служба(request: Request, principal: Principal) -> Any:
     return state, служба
 
 
+def _читатель(request: Request, principal: Principal) -> tuple[Any, list[str] | None]:
+    """Отчёты опросов: администратору — всё, остальным — своё подразделение.
+
+    Руководителю отдела нужен отчёт по своей группе, а не телефон, группы
+    обзвона и список «не звонить»: те маршруты остаются за администратором.
+    Охват — как у списка заданий: свои и коллеги по подразделению.
+    """
+    from .deps import scope_owner  # noqa: PLC0415
+
+    state = get_state(request)
+    if principal.is_admin:
+        return state, None
+    охват = scope_owner(principal)
+    if охват is None:
+        return state, None
+    return state, [охват] if isinstance(охват, str) else list(охват)
+
+
 @router.get("/status", summary="Состояние контроля качества")
 async def status(request: Request, principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     """Включён ли обзвон, зарегистрирован ли телефон, чем синтезируется речь,
@@ -361,9 +379,12 @@ async def test_call(request: Request, number: str = Body(..., embed=True),
 
 
 def _отбор_опросов(status: str, group: str, ext: str, search: str,
-                   since_days: int) -> tuple[str, list[Any]]:
+                   since_days: int, владельцы: list[str] | None = None) -> tuple[str, list[Any]]:
     условия = ["s.created_at>=?"]
     параметры: list[Any] = [time.time() - since_days * 86400]
+    if владельцы is not None:
+        условия.append("s.owner IN (" + (",".join("?" * len(владельцы)) or "''") + ")")
+        параметры.extend(владельцы)
     for поле, значение in (("s.status", status), ("s.group_name", group), ("s.ext", ext)):
         if значение:
             условия.append(f"{поле}=?")
@@ -384,8 +405,8 @@ async def surveys(request: Request, principal: Principal = Depends(authenticate)
                   since_days: int = Query(30, ge=1, le=3650),
                   limit: int = Query(100, ge=1, le=500),
                   offset: int = Query(0, ge=0)) -> dict[str, Any]:
-    state, _ = _служба(request, principal)
-    где, параметры = _отбор_опросов(status, group, ext, search, since_days)
+    state, владельцы = _читатель(request, principal)
+    где, параметры = _отбор_опросов(status, group, ext, search, since_days, владельцы)
 
     def прочитать() -> dict[str, Any]:
         всего = state.db.query_one(
@@ -420,17 +441,76 @@ _КОЛОНКИ_ВЫГРУЗКИ = (("Создан", "created_at"), ("Разго
                      ("Задание разговора", "job_id"))
 
 
-@router.get("/surveys/export", summary="Выгрузка опросов в CSV")
+@router.get("/surveys/export", summary="Выгрузка опросов в CSV или Excel")
 async def surveys_export(request: Request, principal: Principal = Depends(authenticate),
                          status: str = Query("", description="Состояние"),
                          group: str = Query("", description="Имя группы"),
                          ext: str = Query("", description="Добавочный номер"),
                          search: str = Query("", description="Часть номера клиента"),
-                         since_days: int = Query(30, ge=1, le=3650)) -> Response:
+                         since_days: int = Query(30, ge=1, le=3650),
+                         fmt: str = Query("csv", pattern="^(csv|xlsx)$",
+                                          description="csv или xlsx (книга с листом отчёта)"),
+                         ) -> Response:
     """Тот же отбор, что у журнала, — все строки, по колонке на каждый
-    вопрос группы. CSV для Excel: разделитель «;», UTF-8 с BOM."""
-    state, _ = _служба(request, principal)
-    где, параметры = _отбор_опросов(status, group, ext, search, since_days)
+    вопрос группы. CSV для Excel: разделитель «;», UTF-8 с BOM. XLSX — книга
+    из двух листов: журнал опросов и отчёт (оценки по группам и добавочным)."""
+    state, владельцы = _читатель(request, principal)
+    где, параметры = _отбор_опросов(status, group, ext, search, since_days, владельцы)
+
+    def строки_журнала() -> tuple[list[str], list[list[Any]]]:
+        строки = state.db.query(
+            f"SELECT s.*, COALESCE(c.job_id, s.job_id) AS call_job_id "  # noqa: S608
+            f"FROM qc_surveys s LEFT JOIN calls c ON c.uniqueid = s.call_key "
+            f"WHERE {где} ORDER BY s.created_at DESC LIMIT 100000", параметры)
+        записи = [опросы.опрос_наружу(с) for с in строки]
+        люди = state.db.employees_by_ext([з["ext"] for з in записи if з.get("ext")])
+        вопросов = max((len(з.get("answers") or []) for з in записи), default=0)
+        шапка = ([з for з, _ in _КОЛОНКИ_ВЫГРУЗКИ]
+                 + [f"Вопрос {н + 1}" for н in range(вопросов)])
+        итог: list[list[Any]] = []
+        for з in записи:
+            человек = люди.get(з.get("ext") or "") or {}
+            з["ext_name"] = " ".join(ч for ч in (человек.get("last_name"),
+                                                 человек.get("first_name")) if ч)
+            з["job_id"] = з.pop("call_job_id", None) or ""
+            for поле in ("created_at", "call_at", "finished_at"):
+                з[поле] = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(з[поле])))
+                           if з.get(поле) else "")
+            ответы = [("" if о.get("digit") is None else о.get("digit"))
+                      for о in (з.get("answers") or [])]
+            итог.append([_ячейка(з.get(поле)) for _, поле in _КОЛОНКИ_ВЫГРУЗКИ]
+                        + ответы + [""] * (вопросов - len(ответы)))
+        return шапка, итог
+
+    def книга() -> bytes:
+        from ..analytics_export import _собрать_xlsx  # noqa: PLC0415
+
+        шапка, строки = строки_журнала()
+        свод = state.db.query(
+            "SELECT s.group_name AS g, s.ext AS e, COUNT(*) AS n, "  # noqa: S608
+            "SUM(CASE WHEN s.score_pct IS NOT NULL THEN 1 ELSE 0 END) AS rated, "
+            "AVG(s.score_pct) AS avg_pct, "
+            "SUM(CASE WHEN s.score_pct < 60 THEN 1 ELSE 0 END) AS low "
+            f"FROM qc_surveys s LEFT JOIN calls c ON c.uniqueid = s.call_key WHERE {где} "
+            "GROUP BY s.group_name, s.ext ORDER BY s.group_name, avg_pct", параметры)
+        отчёт = [[с["g"] or "—", с["e"] or "—", int(с["n"] or 0), int(с["rated"] or 0),
+                  round(float(с["avg_pct"]), 1) if с["avg_pct"] is not None else None,
+                  int(с["low"] or 0)] for с in свод]
+        return _собрать_xlsx(
+            [("Опросы", шапка, строки),
+             ("Отчёт", ["Группа", "Добавочный", "Опросов", "С оценкой", "Оценка, %",
+                        "Ниже 60 %"], отчёт)],
+            f"Опросы контроля качества за {since_days} дн.")
+
+    if fmt == "xlsx":
+        try:
+            данные = await asyncio.to_thread(книга)
+        except ASRHubError as exc:
+            raise error_response(exc) from exc
+        имя = time.strftime("qc-surveys-%Y%m%d.xlsx")
+        return Response(данные, media_type="application/vnd.openxmlformats-officedocument."
+                                           "spreadsheetml.sheet",
+                        headers={"Content-Disposition": f'attachment; filename="{имя}"'})
 
     def собрать() -> str:
         import csv  # noqa: PLC0415
@@ -493,10 +573,12 @@ async def summary(request: Request, principal: Principal = Depends(authenticate)
                   since_days: int = Query(30, ge=1, le=3650),
                   group: str = Query("", description="Имя группы")) -> dict[str, Any]:
     """Сколько опросов, какая доля дозвона и ответа, средняя оценка — всего,
-    по группам, по добавочным и по вопросам с распределением нажатий."""
-    state, _ = _служба(request, principal)
+    по группам, по добавочным и по вопросам с распределением нажатий.
+    Не администратору — по звонкам своего подразделения."""
+    state, владельцы = _читатель(request, principal)
     return await asyncio.to_thread(
-        опросы.сводка, state.db, since=time.time() - since_days * 86400, группа=group)
+        опросы.сводка, state.db, since=time.time() - since_days * 86400, группа=group,
+        владельцы=владельцы)
 
 
 @router.get("/stoplist", summary="Список «не звонить»")

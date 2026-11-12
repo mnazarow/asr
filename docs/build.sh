@@ -45,11 +45,19 @@ ASRHUB_API_BASE="${ASRHUB_API_BASE:-http://127.0.0.1:8080}"
 # Ключ передаём так же, как это делает build-api.sh: без него защищённые
 # маршруты отвечают 401, и глава собирается с пустыми примерами — молча.
 ASRHUB_API_KEY="${ASRHUB_API_KEY:-}"
-if python3 docs/generate_api.py "${ASRHUB_API_BASE}" "${ASRHUB_API_KEY}" 2>/dev/null; then
-  :
-else
+# Код 3 — «сервер недоступен» (оставляем прошлую версию главы); любой другой
+# ненулевой — ошибка генератора, и сборка с ней не должна молча проходить:
+# прежде любая ошибка выдавалась за «сервер недоступен».
+api_rc=0
+python3 docs/generate_api.py "${ASRHUB_API_BASE}" "${ASRHUB_API_KEY}" \
+  2>"${TMPDIR:-/tmp}/asrhub-generate-api.err" || api_rc=$?
+if [ "${api_rc}" -eq 3 ]; then
   echo "  сервер на ${ASRHUB_API_BASE} недоступен — оставлена прошлая версия"
   echo "  (запустите сервер и повторите, чтобы примеры обновились)"
+elif [ "${api_rc}" -ne 0 ]; then
+  echo "  генератор справочника API мониторинга упал (код ${api_rc}):" >&2
+  cat "${TMPDIR:-/tmp}/asrhub-generate-api.err" >&2
+  exit "${api_rc}"
 fi
 
 echo "3/8 Схемы"

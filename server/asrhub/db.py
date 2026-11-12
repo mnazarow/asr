@@ -30,7 +30,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 #: Узкий указатель по ответам языковой модели: всё, чем ответы считают и
 #: отбирают (сбой, причина, исход, «решён ли вопрос», версия подсказок,
@@ -788,7 +788,11 @@ _SCHEMA = [
         method    TEXT DEFAULT '',
         path      TEXT DEFAULT '',
         status    INTEGER DEFAULT 0,
-        ip        TEXT DEFAULT ''
+        ip        TEXT DEFAULT '',
+        -- Цепочка хешей: sha256 от хеша предыдущей строки и полей этой.
+        -- Правка или удаление строки посреди журнала рвёт цепочку, и
+        -- проверка (`audit_verify`) показывает, где именно.
+        hash      TEXT DEFAULT ''
     )
     """,
     """
@@ -987,7 +991,10 @@ _SCHEMA = [
         -- карточке звонка видны остальные ноги: перевод, очередь, второй
         -- оператор. Источники, которые их не знают, оставляют пустыми.
         linkedid     TEXT DEFAULT '',
-        sequence     INTEGER DEFAULT 0
+        sequence     INTEGER DEFAULT 0,
+        -- Версия 37: набранный городской номер (DID) — линия, на которую
+        -- звонили (FreePBX пишет его в CDR отдельной колонкой).
+        did          TEXT DEFAULT ''
     )
     """,
     # --- версия 23: сотрудники, агенты на АТС, очередь к языковой модели ---
@@ -1126,6 +1133,24 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_calls_station ON calls(station, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_linked ON calls(station, linkedid)",
+    # Версия 37: события очередей из queue_log — ожидание, брошенные,
+    # пропущенные операторами. Ключ — станция, звонок, событие, время и
+    # оператор: повторное чтение журнала строк не задваивает.
+    """
+    CREATE TABLE IF NOT EXISTS queue_events (
+        station  TEXT NOT NULL DEFAULT '',
+        ts       REAL NOT NULL,
+        callid   TEXT NOT NULL DEFAULT '',
+        queue    TEXT NOT NULL DEFAULT '',
+        agent    TEXT NOT NULL DEFAULT '',
+        event    TEXT NOT NULL,
+        wait_s   REAL,
+        ring_s   REAL,
+        talk_s   REAL,
+        PRIMARY KEY (station, callid, event, ts, agent)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_queue_events_ts ON queue_events(station, ts)",
     # Версия 33: добавочный по заданию без чтения строки звонка — им
     # подписываются таблицы «Голосовой аналитики» и разрез по добавочным.
     "CREATE INDEX IF NOT EXISTS idx_calls_job_agent ON calls(job_id, agent)",
@@ -1324,6 +1349,10 @@ class Database:
         #: Поколение реплик: растёт при каждой их записи и удалении. Память
         #: поиска (`jobs_matching`) действительна только в своём поколении.
         self._поколение_реплик = 0
+        #: Поколение заданий: растёт на каждом заведении, удалении и смене
+        #: статуса задания (не на прогрессе). По нему кеш сводных отчётов
+        #: понимает, что считать заново (`Analytics.full_report`).
+        self.поколение_заданий = 0
         #: Указатели, про которые уже известно, что они в базе есть.
         self._известные_указатели: set[str] = set()
         #: Что сервер рассказывает о себе в отметке жизни (версия, файловая
@@ -2063,13 +2092,25 @@ class Database:
             payload["waveform"] = json.dumps(payload["waveform"], ensure_ascii=False)
         columns = ", ".join(payload)
         holders = ", ".join("?" for _ in payload)
-        self.execute(f"INSERT INTO jobs ({columns}) VALUES ({holders})", list(payload.values()))
-        self.add_event(job_id, "created", f"Задание создано: {payload.get('filename', '')}")
+        # Задание и событие «создано» — одной транзакцией.
+        with self.write() as conn:
+            conn.execute(f"INSERT INTO jobs ({columns}) VALUES ({holders})",
+                         list(payload.values()))
+            conn.execute(
+                "INSERT INTO events (job_id, ts, kind, message, data) VALUES (?,?,?,?,NULL)",
+                (job_id, ts, "created", f"Задание создано: {payload.get('filename', '')}"))
+        self.поколение_заданий += 1
         return job_id
+
+    #: Поля, смена которых не меняет сводных отчётов: прогресс и отметки жизни.
+    _НЕ_МЕНЯЮТ_ОТЧЁТЫ = frozenset({"progress", "stage", "heartbeat_at", "updated_at",
+                                   "instance_id"})
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
+        if not set(fields) <= self._НЕ_МЕНЯЮТ_ОТЧЁТЫ:
+            self.поколение_заданий += 1
         fields["updated_at"] = now()
         _serialize_json_fields(fields)
         assignments = ", ".join(f"{k}=?" for k in fields)
@@ -2194,7 +2235,57 @@ class Database:
     #: причина из ответа языковой модели. Перечень нужен и здесь, и в
     #: обработчике списка заданий: он проверяет отбор до запроса, и без
     #: общего перечня новый отбор работал бы в базе и отвергался ручкой.
-    PREFIX_FILTERS: tuple[str, ...] = ("category:", "outcome:", "reason:")
+    PREFIX_FILTERS: tuple[str, ...] = ("category:", "outcome:", "reason:", "qc:")
+
+    #: Отбор по оценке клиента из опроса контроля качества: `qc:low` (ниже
+    #: 60 %), `qc:mid`, `qc:high` (от 80 %), `qc:any` (оценка есть), `qc:none`
+    #: (опрос был, оценки нет).
+    QC_FILTERS = {
+        "low": "q.score_pct < 60", "mid": "q.score_pct >= 60 AND q.score_pct < 80",
+        "high": "q.score_pct >= 80", "any": "q.score_pct IS NOT NULL",
+        "none": "q.score_pct IS NULL",
+    }
+
+    def qc_by(self, by: str, *, since: float | None = None,
+              owner: str | list[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Оценка клиента по сотрудникам (добавочный опроса), очередям или станциям.
+
+        `agent` — добавочный оператора (`ext` опроса), `station` — станция,
+        `queue` — очередь звонка (из журнала звонков по заданию).
+        """
+        колонка = {"agent": "q.ext", "station": "q.station",
+                   "queue": "(SELECT c.queue FROM calls c WHERE c.job_id = q.job_id LIMIT 1)",
+                   "owner": "q.owner"}.get(by)
+        if колонка is None:
+            return {}
+        условия, аргументы = ["q.score_pct IS NOT NULL"], []
+        if since:
+            условия.append("q.created_at >= ?")
+            аргументы.append(float(since))
+        if owner:
+            владельцы = [owner] if isinstance(owner, str) else list(owner)
+            условия.append("q.owner IN (" + ",".join("?" * len(владельцы)) + ")")
+            аргументы.extend(владельцы)
+        строки = self.query(
+            f"SELECT {колонка} AS k, COUNT(*) AS n, AVG(q.score_pct) AS avg_pct, "
+            "SUM(CASE WHEN q.score_pct < 60 THEN 1 ELSE 0 END) AS low "
+            f"FROM qc_surveys q WHERE {' AND '.join(условия)} GROUP BY k", аргументы)
+        return {str(с["k"] or "—"): {"surveys": int(с["n"] or 0),
+                                     "avg_pct": round(float(с["avg_pct"]), 1)
+                                     if с["avg_pct"] is not None else None,
+                                     "low": int(с["low"] or 0)}
+                for с in строки}
+
+    def qc_scores(self, job_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Оценки клиента по заданиям страницы — одним запросом."""
+        if not job_ids:
+            return {}
+        места = ",".join("?" * len(job_ids))
+        return {str(с["job_id"]): {"score": с["score"], "score_pct": с["score_pct"],
+                                   "status": с["status"]}
+                for с in self.query(
+                    "SELECT job_id, score, score_pct, status FROM qc_surveys "
+                    f"WHERE job_id IN ({места})", list(job_ids))}
 
     def _jobs_where(self, *, status: str | list[str] | None = None,
                     owner: str | list[str] | None = None,
@@ -2222,6 +2313,12 @@ class Database:
             where.append("EXISTS (SELECT 1 FROM content_hits h "
                          "WHERE h.job_id = jobs.id AND h.category = ?)")
             args.append(content[len(self.CATEGORY_FILTER):])
+        elif content and content.startswith("qc:"):
+            условие = self.QC_FILTERS.get(content[3:])
+            if условие is None:
+                return None
+            where.append("EXISTS (SELECT 1 FROM qc_surveys q WHERE q.job_id = jobs.id "
+                         f"AND {условие})")
         elif content and content.startswith(("outcome:", "reason:")):
             # Исход и причина из ответа языковой модели — значение из
             # списка настроек, в запрос попадает только параметром.
@@ -2632,12 +2729,25 @@ class Database:
             [*args, limit])
         return [dict(r) for r in rows]
 
-    def content_pending(self, version: int, limit: int = 200) -> list[dict[str, Any]]:
+    def content_pending(self, version: int, limit: int = 200, *,
+                        finished_after: float | None = None) -> list[dict[str, Any]]:
         """Завершённые задания, разбор которых устарел или его нет вовсе.
 
         Нужен для пересчёта: разбор появился позже архива, а словари и
         правила меняются — по версии видно, что пора считать заново.
+
+        `finished_after` — только завершённые позже метки: фоновому поиску
+        не нужно каждые две минуты обходить весь архив, если всё до метки
+        уже разобрано (см. `ContentIndex.backfill_once`).
         """
+        после = ""
+        аргументы: list[Any] = [version]
+        if finished_after is not None:
+            # Без отметки завершения (задание, заведённое готовым) — тоже:
+            # иначе метка прятала бы его навсегда.
+            после = "  AND (j.finished_at IS NULL OR j.finished_at > ?) "
+            аргументы.append(float(finished_after))
+        аргументы.append(limit)
         rows = self.query(
             "SELECT j.id, j.text, j.media_duration_s, j.quality_flags, "
             # `source` нужен пересчёту архива: у переписки нет времени, и
@@ -2650,8 +2760,9 @@ class Database:
             # в разборе содержания ей не место.
             "  AND COALESCE(j.source,'') <> 'control' "
             "  AND (c.job_id IS NULL OR c.version < ?) "
+            + после +
             "ORDER BY j.created_at DESC LIMIT ?",
-            (version, limit))
+            аргументы)
         return [dict(r) for r in rows]
 
     def content_stats(self, version: int, *,
@@ -4480,6 +4591,37 @@ class Database:
                 каталоги.add(настоящий(str(строка[2])))
         return файлы, каталоги, номера
 
+    def file_referenced(self, пути: list[str], имя: str) -> bool:
+        """Держит ли какое-нибудь задание этот файл загрузки.
+
+        Для суточной уборки, которая идёт от файлов на диске к базе: сперва
+        точные написания пути по индексу `idx_jobs_file`, и только если их
+        нет — сравнение по имени файла (путь в базе мог быть записан через
+        ссылку или из другого корня). До второго шага доходят одни сироты.
+        """
+        пути = [п for п in dict.fromkeys(пути) if п]
+        if пути and self.query_one(
+                "SELECT 1 FROM jobs WHERE file_path IN (" + ",".join("?" * len(пути))
+                + ") LIMIT 1", пути) is not None:
+            return True
+        if not имя:
+            return False
+        имя = имя.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        # Разделитель — и прямая, и обратная черта (сервер под Windows).
+        return self.query_one(
+            "SELECT 1 FROM jobs WHERE file_path LIKE ? ESCAPE '\\' "
+            "OR file_path LIKE ? ESCAPE '\\' LIMIT 1",
+            ("%/" + имя, "%\\\\" + имя)) is not None
+
+    def results_referenced(self, номер: str, пути: list[str]) -> bool:
+        """Держит ли задание каталог результатов: по номеру (ключ) или по пути."""
+        if номер and self.query_one("SELECT 1 FROM jobs WHERE id=?", (номер,)) is not None:
+            return True
+        пути = [п for п in dict.fromkeys(пути) if п]
+        return bool(пути) and self.query_one(
+            "SELECT 1 FROM jobs WHERE result_path IN (" + ",".join("?" * len(пути))
+            + ") LIMIT 1", пути) is not None
+
     def file_used_elsewhere(self, file_path: str, except_id: str) -> bool:
         """Ссылается ли на этот файл записи другое задание.
 
@@ -4496,6 +4638,7 @@ class Database:
 
     def delete_job(self, job_id: str) -> None:
         self._поколение_реплик += 1
+        self.поколение_заданий += 1
         with self.write() as conn:
             conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM events WHERE job_id=?", (job_id,))
@@ -4579,6 +4722,8 @@ class Database:
             where += " AND instance_id=?"
             args.append(expected_instance)
         changed = self.execute(f"UPDATE jobs SET {columns} WHERE {where}", args)
+        if changed and not set(fields) <= self._НЕ_МЕНЯЮТ_ОТЧЁТЫ:
+            self.поколение_заданий += 1
         return bool(changed)
 
     # --- уведомления ----------------------------------------------------
@@ -4587,7 +4732,10 @@ class Database:
         """Задания, чьё уведомление пора (до)слать: ждущие и брошенные посреди доставки."""
         строки = self.query(
             "SELECT id FROM jobs WHERE webhook_status IN ('pending', 'sending') "
-            "AND COALESCE(webhook_next_at, 0) <= ? LIMIT ?", (now(), max(1, int(limit))))
+            "AND COALESCE(webhook_next_at, 0) <= ? "
+            # Старшие первыми: без порядка выборка шла по rowid, и при
+            # большом хвосте свежие ждущие могли обгонять давно ждущие.
+            "ORDER BY COALESCE(webhook_next_at, 0) LIMIT ?", (now(), max(1, int(limit))))
         return [str(с["id"]) for с in строки]
 
     def webhook_claim(self, job_id: str, *, hold_s: float) -> bool:
@@ -4647,6 +4795,30 @@ class Database:
             "ORDER BY finished_at DESC LIMIT 1", аргументы)
         return _row_to_job(row) if row else None
 
+    def ждут_близнеца(self, ids: list[str], идущие: list[str]) -> set[str]:
+        """Какие из заданий `ids` ждут идущего близнеца.
+
+        Близнец — задание того же владельца с той же записью и теми же
+        настройками (отпечаток `_hash` в параметрах), которое выполняется
+        сейчас: в базе или только что взято этим процессом (`идущие` —
+        захват в базе пишется уже после выборки). Задание с выключенной
+        дедупликацией не ждёт никого.
+        """
+        if not ids:
+            return set()
+        место_ids = ",".join("?" * len(ids))
+        место_идущих = ",".join("?" * len(идущие)) if идущие else "''"
+        rows = self.query(
+            "SELECT c.id FROM jobs c WHERE c.id IN (" + место_ids + ") "
+            "AND c.file_hash IS NOT NULL AND c.file_hash<>'' "
+            "AND IFNULL(json_extract(c.params, '$.deduplicate_jobs'), 1) "
+            "AND EXISTS (SELECT 1 FROM jobs r WHERE r.file_hash=c.file_hash "
+            "AND r.id<>c.id AND r.owner IS c.owner "
+            "AND (r.status='running' OR r.id IN (" + место_идущих + ")) "
+            "AND json_extract(r.params, '$._hash')=json_extract(c.params, '$._hash'))",
+            [*ids, *идущие])
+        return {str(r["id"]) for r in rows}
+
     # --- сегменты -------------------------------------------------------
 
     def save_segments(self, job_id: str, segments: list[dict[str, Any]]) -> None:
@@ -4696,6 +4868,8 @@ class Database:
 
     def finish_job(self, job_id: str, segments: list[dict[str, Any]], *,
                    expected: list[str], expected_instance: str | None,
+                   events: list[tuple[str, str]] | None = None,
+                   metrics: list[tuple[str, float, str, str]] | None = None,
                    **fields: Any) -> bool:
         """Отметка «готово» и реплики — одной транзакцией и одним условием.
 
@@ -4709,6 +4883,12 @@ class Database:
         отметка, и тем же условием: не прошла — не тронуто ничего, ни
         реплик соседа, ни прежних реплик задания (повтор готового задания,
         отменённый в последний миг, остаётся с прежним текстом).
+
+        События (`events`: вид, текст) и показатели (`metrics`: имя,
+        значение, модель, движок) пишутся той же транзакцией: раньше на
+        каждое готовое задание шёл десяток отдельных транзакций — признаки
+        качества, четыре показателя, предупреждения, «готово», — и на
+        сетевом хранилище это десяток fsync.
         """
         rows = self._строки_реплик(job_id, segments)
         fields["updated_at"] = now()
@@ -4720,11 +4900,23 @@ class Database:
         if expected_instance is not None:
             where += " AND instance_id=?"
             args.append(expected_instance)
+        self.поколение_заданий += 1
         with self.write() as conn:
             if conn.execute(f"UPDATE jobs SET {columns} WHERE {where}", args).rowcount != 1:
                 return False
             conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
             conn.executemany(self._ВСТАВКА_РЕПЛИКИ, rows)
+            момент = now()
+            if metrics:
+                conn.executemany(
+                    "INSERT INTO metrics (ts, name, value, job_id, model, engine, labels) "
+                    "VALUES (?,?,?,?,?,?,NULL)",
+                    [(момент, str(имя), float(значение or 0.0), job_id, модель, движок)
+                     for имя, значение, модель, движок in metrics])
+            if events:
+                conn.executemany(
+                    "INSERT INTO events (job_id, ts, kind, message, data) VALUES (?,?,?,?,NULL)",
+                    [(job_id, момент, str(вид), str(текст)) for вид, текст in events])
         self._поколение_реплик += 1
         return True
 
@@ -4772,6 +4964,39 @@ class Database:
                 "SELECT * FROM events WHERE job_id=? ORDER BY ts DESC LIMIT ?", (job_id, limit))
         else:
             rows = self.query("SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,))
+        out = []
+        for row in rows:
+            item = dict(row)
+            if item.get("data"):
+                try:
+                    item["data"] = json.loads(item["data"])
+                except (TypeError, ValueError):
+                    pass
+            out.append(item)
+        return out
+
+    def get_events_for(self, owners: str | list[str], *, public_kinds: tuple[str, ...] = (),
+                       limit: int = 100) -> list[dict[str, Any]]:
+        """Лента событий для владельца (или группы) — отбором в SQL.
+
+        Раньше лента обычного ключа поднимала до двух тысяч его заданий и
+        сверяла события с ними в Python на каждый опрос; события старше этих
+        двух тысяч тихо пропадали. Теперь — соединение с `jobs` по владельцу.
+        """
+        владельцы = [owners] if isinstance(owners, str) else list(owners or [])
+        if not владельцы:
+            return []
+        места = ",".join("?" * len(владельцы))
+        условия = [f"(e.job_id IS NOT NULL AND j.owner IN ({места}))"]
+        аргументы: list[Any] = [*владельцы]
+        if public_kinds:
+            условия.append("(e.job_id IS NULL AND e.kind IN ("
+                           + ",".join("?" * len(public_kinds)) + "))")
+            аргументы.extend(public_kinds)
+        rows = self.query(
+            "SELECT e.* FROM events e LEFT JOIN jobs j ON j.id=e.job_id "
+            f"WHERE {' OR '.join(условия)} ORDER BY e.ts DESC LIMIT ?",
+            [*аргументы, int(limit)])
         out = []
         for row in rows:
             item = dict(row)
@@ -5058,6 +5283,27 @@ class Database:
             conn.execute("DELETE FROM kv WHERE key=?", (key,))
         return True
 
+    def kv_claim(self, key: str, value: Any, *, stale_s: float) -> Any:
+        """Занимает ключ, если он свободен или устарел; иначе отдаёт значение.
+
+        Проверка и запись — одной транзакцией записи: два одновременных
+        запроса не займут один ключ оба. Ответ None — ключ наш.
+        """
+        мгновение = now()
+        with self.write() as conn:
+            строка = conn.execute("SELECT value, ts FROM kv WHERE key=?", (key,)).fetchone()
+            if строка is not None and мгновение - float(строка["ts"] or 0) < stale_s:
+                try:
+                    return json.loads(строка["value"])
+                except (TypeError, ValueError):
+                    return {}
+            conn.execute("INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?,?,?)",
+                         (key, json.dumps(value, ensure_ascii=False), мгновение))
+        return None
+
+    def del_kv(self, key: str) -> None:
+        self.execute("DELETE FROM kv WHERE key=?", (key,))
+
     def get_kv(self, key: str, default: Any = None) -> Any:
         row = self.query_one("SELECT value FROM kv WHERE key=?", (key,))
         if row is None:
@@ -5306,6 +5552,32 @@ class Database:
             f"SELECT uniqueid FROM calls{где} ORDER BY imported_at DESC LIMIT ?",
             (*args, max(1, int(limit or self.ПРЕДЕЛ_ИЗВЕСТНЫХ_ЗВОНКОВ))))
         return {str(r["uniqueid"]) for r in rows}
+
+    # --- события очередей (queue_log) -----------------------------------
+
+    def queue_events_add(self, station: str, события: list[dict[str, Any]]) -> int:
+        """Сохраняет события очередей станции; повтор строки не задваивает."""
+        if not события:
+            return 0
+        return self.executemany(
+            "INSERT OR IGNORE INTO queue_events (station, ts, callid, queue, agent, event, "
+            "wait_s, ring_s, talk_s) VALUES (?,?,?,?,?,?,?,?,?)",
+            [(station, float(с["ts"]), str(с.get("callid") or ""), str(с.get("queue") or ""),
+              str(с.get("agent") or ""), str(с["event"]), с.get("wait_s"), с.get("ring_s"),
+              с.get("talk_s")) for с in события])
+
+    def queue_events(self, *, station: str = "", since: float = 0.0,
+                     until: float = 0.0, limit: int = 200000) -> list[dict[str, Any]]:
+        условия, аргументы = ["ts>=?"], [float(since or 0)]
+        if until:
+            условия.append("ts<?")
+            аргументы.append(float(until))
+        if station:
+            условия.append("station=?")
+            аргументы.append(station)
+        return [dict(с) for с in self.query(
+            f"SELECT * FROM queue_events WHERE {' AND '.join(условия)} ORDER BY ts LIMIT ?",
+            [*аргументы, int(limit)])]
 
     def call_counts(self, *, owner: str | list[str] | None = None,
                     station: str = "") -> dict[str, Any]:
@@ -5571,6 +5843,62 @@ class Database:
             (str(звонок.get("station") or ""), связь, str(звонок.get("uniqueid") or ""),
              max(1, int(предел))))
         return [dict(с) for с in строки]
+
+    def conversations(self, *, owner: str | list[str] | None = None, station: str = "",
+                      since: float | None = None, until: float | None = None,
+                      limit: int = 500, only_transferred: bool = False) -> dict[str, Any]:
+        """Разговоры как единица: ноги одного linkedid — одной строкой.
+
+        Asterisk 12+ пишет перевод, очередь и второго оператора отдельными
+        строками CDR, и отчёты считали ногу за звонок: один разговор с двумя
+        переводами — три звонка, три оператора по полному времени. Здесь
+        ноги сводятся по (станция, linkedid; без него — сам звонок): кто
+        участвовал по порядку, сколько было переводов, когда разговор начался
+        и кончился и сколько в нём говорили.
+        """
+        части, args = self._условия_звонков(owner, station, since, until)
+        где = f" WHERE {' AND '.join(части)}" if части else ""
+        ключ = "COALESCE(NULLIF(c.linkedid,''), COALESCE(NULLIF(c.pbx_uid,''), c.uniqueid))"
+        строки = self.query(
+            f"SELECT c.station AS station, {ключ} AS conv, COUNT(*) AS legs, "
+            "MIN(c.started_at) AS started_at, "
+            "MAX(c.started_at + COALESCE(c.duration, c.billsec, 0)) AS ended_at, "
+            "SUM(COALESCE(c.billsec,0)) AS talk_s, "
+            "MAX(CASE WHEN c.answered THEN 1 ELSE 0 END) AS answered, "
+            "GROUP_CONCAT(CASE WHEN COALESCE(c.agent,'')<>'' THEN c.agent END, ',') AS agents, "
+            "MAX(c.direction) AS direction, MAX(c.src) AS src, "
+            "MAX(c.job_id) AS job_id, MAX(c.queue) AS queue "
+            # Ноги — по порядку разговора (sequence, начало): так склеиваются
+            # участники в GROUP_CONCAT и на старом SQLite без ORDER BY в нём.
+            f"FROM (SELECT * FROM calls c{где} ORDER BY c.sequence, c.started_at) c "
+            f"GROUP BY c.station, {ключ} "
+            + ("HAVING COUNT(DISTINCT NULLIF(c.agent,'')) > 1 " if only_transferred else "")
+            + "ORDER BY started_at DESC LIMIT ?", [*args, max(1, int(limit))])
+        разговоры = []
+        for с in строки:
+            по_порядку: list[str] = []
+            for кто in str(с["agents"] or "").split(","):
+                if кто and (not по_порядку or по_порядку[-1] != кто):
+                    по_порядку.append(кто)
+            разговоры.append({
+                "station": с["station"], "conversation": с["conv"], "legs": int(с["legs"] or 0),
+                "started_at": с["started_at"], "ended_at": с["ended_at"],
+                "talk_s": int(с["talk_s"] or 0), "answered": bool(с["answered"]),
+                "agents": по_порядку, "transfers": max(0, len(по_порядку) - 1),
+                "direction": с["direction"] or "", "src": с["src"] or "",
+                "job_id": с["job_id"], "queue": с["queue"] or ""})
+        свод = self.query_one(
+            f"SELECT COUNT(*) AS calls, COUNT(DISTINCT c.station || '|' || {ключ}) AS convs "
+            f"FROM calls c{где}", args)
+        всего = int((свод or {})["convs"] or 0) if свод else 0
+        с_переводом = self.query_one(
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM calls c"
+            f"{где} GROUP BY c.station, {ключ} "
+            "HAVING COUNT(DISTINCT NULLIF(c.agent,'')) > 1)", args)
+        return {"items": разговоры,
+                "calls": int((свод or {})["calls"] or 0) if свод else 0,
+                "conversations": всего,
+                "transferred": int((с_переводом or {})["n"] or 0) if с_переводом else 0}
 
     def call_dimensions(self, *, owner: str | list[str] | None = None,
                         station: str = "") -> dict[str, list[str]]:
@@ -5928,6 +6256,8 @@ class Database:
         """
         граница_файлов = float(before) if file_keys_before is None \
             else min(float(before), float(file_keys_before))
+        # События очередей — тем же сроком: в них номера звонков.
+        self.execute("DELETE FROM queue_events WHERE ts < ?", (float(before),))
         return self.execute(
             "DELETE FROM calls WHERE imported_at < ? "
             "  AND (job_id IS NULL OR job_id NOT IN (SELECT id FROM jobs)) "
@@ -6989,16 +7319,65 @@ class Database:
         смог записать «посмотрел список записей», хуже отсутствующего
         журнала.
         """
+        поля = {"ts": now(), "actor": str(actor or "")[:128],
+                "actor_id": str(actor_id or "")[:64], "kind": str(kind or "")[:16],
+                "role": str(role or "")[:32], "action": str(action or "")[:200],
+                "method": str(method or "")[:8], "path": str(path or "")[:500],
+                "status": int(status or 0), "ip": str(ip or "")[:64]}
         try:
-            self.execute(
-                "INSERT INTO audit (ts, actor, actor_id, kind, role, action, "
-                "method, path, status, ip) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (now(), str(actor or "")[:128], str(actor_id or "")[:64],
-                 str(kind or "")[:16], str(role or "")[:32],
-                 str(action or "")[:200], str(method or "")[:8],
-                 str(path or "")[:500], int(status or 0), str(ip or "")[:64]))
+            with self.write() as conn:
+                прежняя = conn.execute(
+                    "SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+                поля["hash"] = хеш_строки_журнала(
+                    str(прежняя[0] or "") if прежняя else "", поля)
+                conn.execute(
+                    "INSERT INTO audit (ts, actor, actor_id, kind, role, action, "
+                    "method, path, status, ip, hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    tuple(поля[к] for к in (*ПОЛЯ_ЖУРНАЛА, "hash")))
         except Exception as exc:                            # noqa: BLE001
             log.warning("Журнал доступа не записан: %s", exc)
+            return
+        приёмник = self.audit_sink
+        if приёмник is not None:
+            try:
+                приёмник(поля)
+            except Exception as exc:                        # noqa: BLE001
+                log.debug("Строка журнала не отправлена во внешний приёмник: %s", exc)
+
+    #: Внешний приёмник строк журнала доступа (syslog) — ставит сервер.
+    audit_sink: Any = None
+
+    def audit_verify(self, *, limit: int = 1_000_000) -> dict[str, Any]:
+        """Проверяет цепочку хешей журнала доступа.
+
+        Первая оставшаяся строка — опора (строки старше срока хранения
+        убраны уборкой, их хешей нет). Строки без хеша — записанные до
+        появления цепочки — пропускаются и цепочку не рвут, если идут до первой
+        строки с хешем. Возвращает число проверенных строк и первую
+        несошедшуюся — по ней видно, где журнал правили или вырезали.
+        """
+        проверено = 0
+        прежний: str | None = None
+        без_хеша = 0
+        for строка in self.query(
+                "SELECT id, hash, " + ", ".join(ПОЛЯ_ЖУРНАЛА)
+                + " FROM audit ORDER BY id LIMIT ?", (max(1, int(limit)),)):
+            запись = dict(строка)
+            хеш = str(запись.get("hash") or "")
+            if not хеш:
+                if прежний is not None:
+                    return {"ok": False, "checked": проверено, "broken_id": запись["id"],
+                            "reason": "строка без хеша посреди цепочки"}
+                без_хеша += 1
+                continue
+            if прежний is not None and хеш_строки_журнала(прежний, запись) != хеш:
+                return {"ok": False, "checked": проверено, "broken_id": запись["id"],
+                        "reason": "хеш не сходится: строку правили, или перед ней "
+                                  "удалены строки"}
+            прежний = хеш
+            проверено += 1
+        return {"ok": True, "checked": проверено, "legacy": без_хеша,
+                "last_hash": прежний or ""}
 
     def audit_list(self, *, limit: int = 200, offset: int = 0,
                    since: float = 0.0, until: float = 0.0,
@@ -7200,6 +7579,24 @@ class Database:
         return self.execute(
             "DELETE FROM content_vocab WHERE NOT EXISTS ("
             "  SELECT 1 FROM content_terms t WHERE t.stem = content_vocab.stem)")
+
+    def optimize(self, *, analysis_limit: int = 400) -> bool:
+        """Суточное обновление статистики планировщика — `PRAGMA optimize`.
+
+        Не полный `ANALYZE`: проверено запуском, что на перекошенных данных
+        он ухудшил один запрос (`crm_waiting`: 0 мс → 340 мс, полный проход
+        вместо `idx_jobs_crm`). `optimize` пересобирает статистику только
+        таблиц, где она нужна, а `analysis_limit` ограничивает выборку
+        строк — заход идёт доли секунды и на большом архиве.
+        """
+        try:
+            with self.write() as conn:
+                conn.execute(f"PRAGMA analysis_limit={max(100, int(analysis_limit))}")
+                conn.execute("PRAGMA optimize")
+            return True
+        except StorageError as exc:
+            log.warning("PRAGMA optimize не выполнен: %s", exc)
+            return False
 
     def fts_purge(self, *, шаг: int = 2000, предел_с: float = 600.0) -> bool:
         """Физически вычищает из указателя удалённые реплики.
@@ -7484,6 +7881,21 @@ def _значение_не_того_вида(exc: sqlite3.Error) -> None:
             "Значение поля не того вида: ожидались текст, число или «да/нет».",
             hint="Проверьте тело запроса: вложенные объекты и списки в этих "
                  "полях не принимаются.") from exc
+
+
+#: Поля строки журнала доступа, входящие в хеш, — в этом порядке.
+ПОЛЯ_ЖУРНАЛА = ("ts", "actor", "actor_id", "kind", "role", "action", "method",
+                "path", "status", "ip")
+
+
+def хеш_строки_журнала(прежний: str, поля: dict[str, Any]) -> str:
+    """sha256 от хеша предыдущей строки и полей этой — звено цепочки журнала."""
+    import hashlib  # noqa: PLC0415
+
+    тело = json.dumps([прежний, *[поля.get(к) if к != "ts" else round(float(поля.get(к) or 0), 6)
+                                  for к in ПОЛЯ_ЖУРНАЛА]],
+                      ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(тело.encode("utf-8")).hexdigest()
 
 
 def _экранировать_like(значение: str) -> str:

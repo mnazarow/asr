@@ -36,6 +36,7 @@ from ..errors import (
     ConfigError,
     FileTooLarge,
     ForbiddenError,
+    InProgress,
     JobNotFound,
     ModelNotFound,
     QuotaExceeded,
@@ -768,6 +769,13 @@ async def create_job(
         if прежнее is not None:
             await file.close()
             return прежнее
+        # Два одновременных запроса с одним ключом: оба не нашли задания и
+        # оба завели бы своё. Первый занимает ключ пометкой «принимается»,
+        # второй ждёт его задание (до полуминуты) или получает 409.
+        прежнее = await _занять_ключ_повтора(state, principal, ключ_повтора)
+        if прежнее is not None:
+            await file.close()
+            return прежнее
 
     filename = Path(file.filename or "upload.wav").name
     suffix = Path(filename).suffix.lower()
@@ -828,12 +836,14 @@ async def create_job(
                 owner=principal.name, api_key_name=principal.name,
                 priority=priority, group_id=group_id, source="web",
                 tags=tags, reference_text=reference_text, webhook_url=webhook_url,
-                deadline=_срок_из_формы(deadline)),
+                deadline=_срок_из_формы(deadline), duration_s=длительность),
             incoming_bytes=size, incoming_audio_s=длительность)
     except Exception:
         # Ловим всё: ASRHubError, HTTPException от разбора полей и любую
         # неожиданную ошибку — файл не должен пережить неудачный запрос.
         target.unlink(missing_ok=True)
+        if ключ_повтора:
+            await asyncio.to_thread(state.db.del_kv, _имя_ключа_повтора(principal, ключ_повтора))
         raise
 
     # Данные звонка — ПОСЛЕ создания задания и вне защиты с уборкой файла.
@@ -890,6 +900,43 @@ def _по_ключу_повтора(state: Any, principal: Principal, ключ: 
     job = dict(job)
     job["idempotent_replay"] = True
     return job
+
+
+#: Сколько держится пометка «принимается» по ключу повтора, с: дольше
+#: загрузка с разбором длительности не идёт, а упавший запрос не должен
+#: занимать ключ навсегда.
+СРОК_ПРИЁМА = 600.0
+
+#: Сколько второй запрос ждёт задание первого, с.
+ЖДАТЬ_ПРИЁМА = 30.0
+
+
+async def _занять_ключ_повтора(state: Any, principal: Principal,
+                               ключ: str) -> dict[str, Any] | None:
+    """Пометка «принимается»; занято — ждём задание первого запроса или 409."""
+    имя = _имя_ключа_повтора(principal, ключ)
+    занято = await asyncio.to_thread(state.db.kv_claim, имя,
+                                     {"pending": True, "at": time.time()}, stale_s=СРОК_ПРИЁМА)
+    if занято is None:
+        return None
+    if isinstance(занято, dict) and занято.get("job_id"):
+        готовое = await asyncio.to_thread(_по_ключу_повтора, state, principal, ключ)
+        if готовое is not None:
+            return готовое
+    конец = time.monotonic() + ЖДАТЬ_ПРИЁМА
+    while time.monotonic() < конец:
+        await asyncio.sleep(0.25)
+        готовое = await asyncio.to_thread(_по_ключу_повтора, state, principal, ключ)
+        if готовое is not None:
+            return готовое
+        запись = await asyncio.to_thread(state.db.get_kv, имя)
+        if запись is None:
+            # Первый запрос сорвался и снял пометку — принимаем сами.
+            if await asyncio.to_thread(state.db.kv_claim, имя,
+                                       {"pending": True, "at": time.time()},
+                                       stale_s=СРОК_ПРИЁМА) is None:
+                return None
+    raise error_response(InProgress("Загрузка с этим ключом идемпотентности ещё принимается."))
 
 
 def _запомнить_ключ_повтора(state: Any, principal: Principal, ключ: str, job_id: str) -> None:
@@ -983,7 +1030,7 @@ async def create_batch(
                     file_path=target, filename=filename, settings=merged,
                     owner=principal.name, api_key_name=principal.name,
                     priority=priority, group_id=group, source="web-batch",
-                    deadline=срок),
+                    deadline=срок, duration_s=длительность),
                 incoming_bytes=size, incoming_audio_s=длительность)
             if данные_звонка:
                 # Ключ архива — по заданию: иначе второй файл пакета
@@ -1065,7 +1112,8 @@ def list_jobs(
                     "hallucination, speakers_mismatch), по звуку на входе "
                     "(bad_audio, noisy, clipped) или по ответу языковой модели "
                     "(llm_unresolved, llm_actions, llm_missing, llm_failed, "
-                    "llm_done, outcome:<исход>, reason:<причина>)"),
+                    "llm_done, outcome:<исход>, reason:<причина>) или по оценке "
+                    "клиента из опроса (qc:low, qc:mid, qc:high, qc:any, qc:none)"),
     light: bool = Query(default=False,
                         description="Только поля для таблицы, без текста и сегментов"),
     principal: Principal = Depends(authenticate),
@@ -1101,6 +1149,13 @@ def list_jobs(
                               order=order, light=light, content=content, until=until)
     if not light:
         jobs = [_без_раскладки(j, principal) for j in jobs]
+    # Оценка клиента из опроса контроля качества — колонкой списка
+    # «Результатов»: одним запросом на страницу.
+    оценки = state.db.qc_scores([str(j["id"]) for j in jobs])
+    for job in jobs:
+        оценка = оценки.get(str(job["id"]))
+        if оценка is not None:
+            job["qc"] = оценка
     # При поиске к каждой строке добавляется сама найденная фраза с
     # обрамлением и её время. Без этого список отвечал «нашлось в этом
     # разговоре» и замолкал: дальше человек открывал карточку и искал
@@ -1204,6 +1259,10 @@ def get_job(request: Request, job_id: str,
     else:
         job.pop("waveform", None)
     job["events"] = state.db.get_events(job_id, limit=100)
+    # Есть ли файл записи: карточка не просит звук, которого нет (иначе —
+    # 400 и красная строка в консоли браузера на каждой такой карточке).
+    путь = str(job.get("file_path") or "")
+    job["audio_available"] = bool(путь) and Path(путь).is_file()
     # Срок выполнения сорван (или уже не будет соблюдён): признак для карточки
     # и для внешних систем, чтобы не сравнивать время самим.
     if job.get("deadline"):

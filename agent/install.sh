@@ -317,8 +317,8 @@ download() {
     # давало «000000»: curl печатает 000 и выходит с ошибкой, и к его
     # ответу дописывался ещё один.
     code="$(curl -sS --connect-timeout 10 --max-time 300 -K "${TMP_DIR}/curl.cfg" \
-             ${tls[@]+"${tls[@]}"} -o "${dest}" -w '%{http_code}' "${address}" \
-             2>"${TMP_DIR}/curl.err")" || true
+             ${tls[@]+"${tls[@]}"} -D "${dest}.headers" -o "${dest}" -w '%{http_code}' \
+             "${address}" 2>"${TMP_DIR}/curl.err")" || true
   elif wget --help 2>&1 | grep -q -- '--config'; then
     ( umask 077; printf 'header = X-API-Key: %s\n' "${KEY}" >"${TMP_DIR}/wgetrc" )
     while IFS= read -r part; do [ -n "${part}" ] && tls+=("${part}"); done < <(tls_wget)
@@ -703,6 +703,39 @@ do_uninstall() {
 # Установка
 # ---------------------------------------------------------------------------
 
+# Целостность кода, который ставится на станцию: сервер отдаёт sha256 в
+# заголовке X-ASRHub-SHA256, установщик сверяет и показывает его. По http без
+# TLS заголовок подменяется вместе с файлом — тогда сверка ловит только порчу
+# по дороге, о чём и предупреждаем: для защиты от подмены нужен https.
+file_sha256() {
+  if have sha256sum; then sha256sum "$1" | cut -d' ' -f1
+  elif have shasum; then shasum -a 256 "$1" | cut -d' ' -f1
+  elif [ -n "${PYTHON_BIN}" ]; then
+    "${PYTHON_BIN}" -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$1"
+  fi
+}
+
+verify_sha256() {
+  local file="$1" actual expected=""
+  actual="$(file_sha256 "${file}")"
+  if [ -f "${file}.headers" ]; then
+    expected="$(tr -d '\r' <"${file}.headers" | sed -n 's/^[Xx]-[Aa][Ss][Rr][Hh][Uu][Bb]-[Ss][Hh][Aa]256: *//p' | tail -n 1)"
+  fi
+  if [ -n "${expected}" ] && [ -n "${actual}" ] && [ "${expected}" != "${actual}" ]; then
+    die "sha256 скачанного агента не совпал с отпечатком сервера." \
+        "Файл изменён по дороге (прокси, перехват). Ожидалось ${expected}, получено ${actual}. \
+Повторите установку по https."
+  fi
+  if [ -n "${actual}" ]; then
+    ok "sha256 агента: ${actual}${expected:+ — совпадает с отпечатком сервера}"
+    printf '  Сверьте с отпечатком в разделе «АТС → Агенты» веб-интерфейса.\n'
+  fi
+  case "${URL}" in
+    http://*) warn "Агент скачан по http без TLS: подмену по дороге сверка не поймает \
+(отпечаток пришёл тем же путём). Для станции в чужой сети используйте https." ;;
+  esac
+}
+
 do_install() {
   step "Проверка станции"
   find_python
@@ -725,6 +758,7 @@ do_install() {
         "Повторите установку; если повторяется — проверьте, не режет ли ответ \
 прокси на пути к серверу."
   fi
+  verify_sha256 "${TMP_DIR}/asrhub-agent.py"
   install -m 0755 "${TMP_DIR}/asrhub-agent.py" "${AGENT_FILE}"
   ok "Агент установлен: ${AGENT_FILE}"
   save_installer

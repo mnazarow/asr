@@ -3680,6 +3680,114 @@ _p(P(
 ))
 
 _p(P(
+    key="backup_include_uploads",
+    label="Класть в копию исходные записи",
+    group="queue",
+    type="bool",
+    default=False,
+    description=(
+        "Добавлять ли в полную копию каталог исходных записей (uploads) — сами "
+        "аудиофайлы разговоров. По умолчанию копия их не содержит: в ней база с "
+        "расшифровками и настройки. Восстановленный без записей сервер "
+        "показывает расшифровки и аналитику, но не играет звук и не может "
+        "перераспознать."
+    ),
+    recommendation=(
+        "Включайте, если записи больше нигде не хранятся (АТС их не держит) и "
+        "место под копии это позволяет: записи — самая большая часть данных. "
+        "Если записи лежат на АТС или в хранилище, копировать их второй раз незачем."
+    ),
+    examples=[
+        Ex("Без записей", False, "Записи хранятся на АТС"),
+        Ex("С записями", True, "Сервер — единственное место хранения"),
+    ],
+    see_also=["backup_include_results", "backup_kind"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="backup_password",
+    label="Пароль шифрования копий",
+    group="queue",
+    type="str",
+    default="",
+    description=(
+        "Пароль, которым шифруется копия, уходящая с сервера командой «после "
+        "копии» (AES-256, openssl enc с PBKDF2). Копии в каталоге копий остаются "
+        "открытыми — их восстанавливает раздел «Копии»; зашифрованная копия, "
+        "присланная обратно («Загрузить копию»), расшифровывается этим же "
+        "паролем. Пусто — наружу уходит открытый архив."
+    ),
+    recommendation=(
+        "Задайте, если копии выносятся в облако или на чужое хранилище: в копии — "
+        "расшифровки разговоров и персональные данные. Храните пароль отдельно "
+        "от копий: без него зашифрованная копия не восстанавливается."
+    ),
+    examples=[
+        Ex("Без шифрования", "", "Копии не покидают свою сеть"),
+        Ex("Длинная фраза", "длинная-фраза-из-пяти-слов", "Не короче 16 знаков"),
+    ],
+    advanced=True,
+    see_also=["backup_post_command"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="backup_post_command",
+    label="Команда «после копии»",
+    group="queue",
+    type="str",
+    default="",
+    description=(
+        "Программа, которая запускается после каждой копии, — например, выгрузка "
+        "в хранилище: `rclone copy {file} remote:asrhub`. `{file}` заменяется "
+        "путём копии (если задан пароль копий — путём зашифрованного файла, "
+        "который удаляется после команды); без `{file}` путь дописывается в "
+        "конец. Команда запускается без оболочки, в фоне; итог — в журнале "
+        "событий и в разделе «Копии».\n\n"
+        "Задаётся только в файле настроек или переменной окружения "
+        "ASRHUB_BACKUP_POST_COMMAND: из интерфейса запуск программы на сервере "
+        "не настраивается."
+    ),
+    recommendation=(
+        "Копия, лежащая на том же диске, что и база, от потери диска не спасает. "
+        "Выносите хотя бы одну копию в сутки на другую машину."
+    ),
+    examples=[
+        Ex("Не выносить", "", ""),
+        Ex("rclone", "rclone copy {file} backup:asrhub", "Любое облако rclone"),
+        Ex("scp", "scp -q {file} backup@10.0.0.30:/srv/asrhub/", "Своя машина"),
+    ],
+    advanced=True,
+    see_also=["backup_password", "backup_post_timeout_s"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="backup_post_timeout_s",
+    label="Срок команды «после копии»",
+    group="queue",
+    type="int",
+    default=1800,
+    minimum=60,
+    maximum=86400,
+    step=60,
+    unit="с",
+    description=(
+        "Сколько ждать команду «после копии». Не уложилась — останавливается, "
+        "и в разделе «Копии» вынос отмечается сбоем."
+    ),
+    recommendation=(
+        "Полчаса хватает на копию в несколько гигабайт по обычному каналу. Для "
+        "копий с записями и медленного канала поднимите."
+    ),
+    examples=[Ex("Обычно", 1800, ""), Ex("Копии с записями", 7200, "")],
+    advanced=True,
+    see_also=["backup_post_command"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
     key="backup_interval_hours",
     label="Копия чаще, чем раз в сутки",
     group="queue",
@@ -4298,6 +4406,36 @@ _p(P(
         Ex("Сервер открыт в интернет", False, "Системе сбора понадобится ключ"),
     ],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="metrics_allowed_networks",
+    label="Сети, которым отдаются метрики",
+    group="monitoring",
+    type="str",
+    default="",
+    description=(
+        "Адреса и сети через запятую, с которых можно забирать метрики, пробы и "
+        "сводное состояние (/api/metrics, /api/monitoring/*). Действует и при "
+        "метриках без ключа, и при входе ключом. Пусто — с любого адреса.\n\n"
+        "Адрес клиента за обратным прокси берётся из X-Forwarded-For, только если "
+        "соединение пришло от доверенного прокси (см. «Доверенные обратные "
+        "прокси»). Для сборщика с ключом заведите ключ с ролью «только метрики»: "
+        "ему закрыто всё, кроме метрик."
+    ),
+    recommendation=(
+        "Укажите сеть сборщика (Prometheus, Zabbix) — тогда метрики можно оставить "
+        "без ключа, не открывая их всей сети. Проверки живости оркестратора "
+        "(/api/monitoring/live, /ready) тоже под этим списком: добавьте и адрес "
+        "узла, с которого они приходят."
+    ),
+    examples=[
+        Ex("С любого адреса", "", "Как раньше"),
+        Ex("Сеть мониторинга", "10.20.0.0/24, 127.0.0.1", "Сборщик и сам сервер"),
+    ],
+    advanced=True,
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    see_also=["monitoring_public", "trusted_proxies"],
 ))
 
 _p(P(
@@ -6643,6 +6781,36 @@ _p(P(
 ))
 
 _p(P(
+    key="audit_syslog",
+    label="Копия журнала доступа в syslog",
+    group="access",
+    type="str",
+    default="",
+    description=(
+        "Куда отправлять копию каждой строки журнала доступа: udp://узел:514, "
+        "tcp://узел:601 или путь к сокету (/dev/log). Пусто — не отправлять.\n\n"
+        "Журнал в базе защищён цепочкой хешей: правку строки и вырезанные строки "
+        "показывает проверка в разделе «Журнал доступа». Отрезанный хвост и замену "
+        "базы целиком цепочка не видит — для этого и нужна копия там, куда у "
+        "администратора сервера доступа нет. Строка уходит записью JSON с меткой "
+        "asrhub-audit, категория authpriv."
+    ),
+    recommendation=(
+        "Укажите центральный сборщик журналов (rsyslog, Graylog, SIEM), если журнал "
+        "доступа нужен для проверок. UDP теряет строки при перегрузке сети — для "
+        "проверок надёжнее tcp://."
+    ),
+    examples=[
+        Ex("Не отправлять", "", ""),
+        Ex("Центральный rsyslog", "tcp://10.0.0.20:601", "Надёжная доставка"),
+        Ex("Локальный syslog", "/dev/log", "Дальше — по правилам rsyslog"),
+    ],
+    advanced=True,
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+    see_also=["audit_enabled"],
+))
+
+_p(P(
     key="audit_reads",
     label="Записывать выдачу записей и выгрузки",
     group="access",
@@ -8729,10 +8897,97 @@ _p(P(
            "CSV в cp1251 с точкой с запятой тоже читается"),
         Ex("Выгрузка из 1С по REST", "http://1c.local/hs/hr/employees",
            "Ответ JSON: список объектов с полями фамилия/имя/отдел"),
+        Ex("Каталог LDAP", "ldap", "Active Directory: тот же каталог, что для входа; "
+           "учётная запись — employees_ldap_bind_dn"),
         Ex("Не настроено", "", "Справочник ведётся руками через раздел «Сотрудники»"),
     ],
     see_also=["employees_sync_enabled", "employees_sync_hours",
-              "employees_deactivate_missing"],
+              "employees_deactivate_missing", "employees_auth_header",
+              "employees_ldap_bind_dn"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="employees_auth_header",
+    label="Заголовок авторизации портала",
+    group="employees",
+    type="str",
+    default="",
+    description=(
+        "Заголовок, с которым сервер скачивает справочник по адресу выгрузки, если "
+        "портал требует входа: «Authorization: Bearer …», «Authorization: Basic …» или "
+        "свой («X-Api-Key: …»). Уходит только на сам адрес из настройки — при "
+        "перенаправлении на другой узел и на адрес, присланный в запросе, не "
+        "передаётся. В ответах интерфейса не показывается."
+    ),
+    recommendation=(
+        "Заведите на портале отдельный токен только на чтение выгрузки: он лежит в "
+        "настройках сервера и уезжает в копии вместе с ними."
+    ),
+    examples=[
+        Ex("Без авторизации", "", "Файл открыт во внутренней сети"),
+        Ex("Токен", "Authorization: Bearer eyJ…", "REST-выгрузка 1С или портала"),
+    ],
+    advanced=True,
+    see_also=["employees_url"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="employees_ldap_bind_dn",
+    label="Учётная запись каталога для справочника",
+    group="employees",
+    type="str",
+    default="",
+    description=(
+        "Под каким именем сервер читает каталог LDAP, когда адрес выгрузки — «ldap»: "
+        "служебная учётная запись с правом чтения пользователей (адрес каталога, база "
+        "поиска и сертификат — те же, что для входа через каталог)."
+    ),
+    recommendation=(
+        "Отдельная учётная запись без прав входа: svc-asrhub@example.ru или "
+        "CN=svc-asrhub,OU=Service,DC=example,DC=ru."
+    ),
+    examples=[Ex("Не задано", "", ""),
+              Ex("Служебная запись", "svc-asrhub@example.ru", "Active Directory")],
+    advanced=True,
+    see_also=["employees_url", "employees_ldap_password", "employees_ldap_filter"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="employees_ldap_password",
+    label="Пароль учётной записи справочника",
+    group="employees",
+    type="str",
+    default="",
+    description="Пароль служебной учётной записи каталога. В ответах не показывается.",
+    recommendation="Длинный случайный пароль; срок действия — без истечения или с напоминанием.",
+    examples=[Ex("Не задан", "", "")],
+    advanced=True,
+    see_also=["employees_ldap_bind_dn"],
+    impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
+))
+
+_p(P(
+    key="employees_ldap_filter",
+    label="Отбор сотрудников в каталоге",
+    group="employees",
+    type="str",
+    default="",
+    description=(
+        "Фильтр LDAP, которым отбираются сотрудники. Пусто — пользователи с "
+        "внутренним или рабочим телефоном: "
+        "(&(objectCategory=person)(objectClass=user)(|(ipPhone=*)(telephoneNumber=*)))."
+    ),
+    recommendation=(
+        "Сузьте до подразделений, звонки которых распознаются: "
+        "(&(objectClass=user)(memberOf=CN=Колл-центр,OU=Groups,DC=example,DC=ru))."
+    ),
+    examples=[Ex("По умолчанию", "", "все с телефоном"),
+              Ex("Одна группа", "(&(objectClass=user)(memberOf=CN=CC,DC=ex,DC=ru))", "")],
+    advanced=True,
+    see_also=["employees_ldap_bind_dn"],
     impact={"quality": "neutral", "speed": "neutral", "memory": "neutral"},
 ))
 
@@ -9003,6 +9258,13 @@ def _проверить_правила(value: object) -> list[str]:
 
 
 #: Проверки значений сверх типа — по ключу параметра.
+def _проверить_syslog(значение: Any) -> list[str]:
+    """Адрес копии журнала доступа: udp://, tcp:// или путь к сокету."""
+    from ..audit import проверить_адрес_syslog  # noqa: PLC0415
+
+    return проверить_адрес_syslog(значение)
+
+
 def _проверить_сети(значение: Any) -> list[str]:
     """Список адресов и сетей через запятую — каждая запись разбирается."""
     import ipaddress  # noqa: PLC0415
@@ -9186,6 +9448,8 @@ _ПРОВЕРКИ = {"content_categories": _проверить_категори�
              "monitoring_targets": _проверить_приёмники,
              "monitoring_rules": _проверить_правила,
              "trusted_proxies": _проверить_сети,
+             "metrics_allowed_networks": _проверить_сети,
+             "audit_syslog": _проверить_syslog,
              "telephony_contexts": _проверить_контексты,
              "telephony_stations": _проверить_станции,
              "telephony_owner_map": _проверить_карту_владельцев,

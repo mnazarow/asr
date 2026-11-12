@@ -35,6 +35,8 @@ KV_DIGEST = "maintenance.digest_at"
 KV_BACKUP_FAILED = "maintenance.backup_failed_at"
 #: Суточная уборка базы и файлов без задания.
 KV_SWEEP = "maintenance.sweep_at"
+#: Суточная сверка «станция ↔ архив» (`telephony.reconcile`).
+KV_RECONCILE = "maintenance.reconcile_at"
 
 #: После сбоя копии по расписанию — пауза до следующей попытки, секунд.
 #: Отметку «копия снята» ставим только после успеха, и без паузы упавшая
@@ -650,6 +652,7 @@ def _справочник(db: Any, settings: Any) -> dict[str, Any] | None:
     if not settings.get("employees_sync_enabled"):
         return None
     адрес = str(settings.get("employees_url") or "").strip()
+    из_каталога = адрес.lower() in ("ldap", "ldap:")
     if not адрес:
         # Расписание включено, а адрес не задан — это не ошибка захода, но
         # и молчать нельзя: человек включил обновление и ждёт его.
@@ -662,7 +665,10 @@ def _справочник(db: Any, settings: Any) -> dict[str, Any] | None:
 
     try:
         итог = справочник_сотрудников.импорт(
-            db, url=адрес, source="справочник",
+            db, url="" if из_каталога else адрес, source="справочник",
+            данные=(справочник_сотрудников.из_каталога(settings) if из_каталога else None),
+            тип="csv" if из_каталога else "",
+            заголовок=str(settings.get("employees_auth_header") or ""),
             deactivate_missing=bool(settings.get("employees_deactivate_missing", True)))
     except Exception as exc:                                 # noqa: BLE001
         log.warning("Справочник сотрудников не обновлён: %s", exc)
@@ -682,6 +688,21 @@ def _справочник(db: Any, settings: Any) -> dict[str, Any] | None:
         log.warning("Справочник: %d карточек не отмечены уволенными — выгрузка "
                     "похожа на неполную", заблокировано)
     return итог
+
+
+def _тревога(settings: Any) -> Any:
+    """Отправка тревоги на `alert_url` — тем же видом, что встроенные тревоги."""
+    адрес = str(settings.get("alert_url") or "").strip()
+    if not адрес:
+        return None
+
+    def отправить(вид: str, данные: dict[str, Any]) -> None:
+        тело = {"event": вид, "text": "Тревога: " + str(данные.get("summary") or ""),
+                **данные}
+        send_json(тело, адрес, what="тревога",
+                  allow_internal=bool(settings.get("webhook_allow_internal")))
+
+    return отправить
 
 
 def run_scheduled(db: Any, settings: Any, analytics: Any,
@@ -785,6 +806,20 @@ def run_scheduled(db: Any, settings: Any, analytics: Any,
             сделано["orphan_files"] = подмести_файлы(db, settings)
         except Exception as exc:                             # noqa: BLE001
             log.warning("Уборка файлов без задания не прошла: %s", exc)
+        try:
+            сделано["optimize"] = db.optimize()
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Статистика планировщика не обновлена: %s", exc)
+    # Сверка «станция ↔ архив» за вчера — раз в сутки, при включённом заборе.
+    if settings.get("telephony_enabled", False) and _пора(db, KV_RECONCILE, 24.0):
+        db.set_kv(KV_RECONCILE, time.time())
+        try:
+            from .telephony import reconcile  # noqa: PLC0415
+
+            сделано["reconcile"] = reconcile.сверить_все(db, settings,
+                                                         тревога=_тревога(settings))
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Сверка станций с архивом не прошла: %s", exc)
 
     адрес = str(settings.get("digest_url") or "").strip()
     интервал = float(settings.get("digest_interval_hours") or 0)
@@ -869,7 +904,6 @@ def подмести_файлы(db: Any, settings: Any, *, сейчас: float |
     загрузки = Path(settings.paths.uploads)
     результаты = Path(settings.paths.results)
     карантин = Path(settings.paths.data) / "orphans"
-    файлы, каталоги, номера = db.job_file_refs()
 
     def своё(путь: Path) -> str:
         try:
@@ -877,6 +911,10 @@ def подмести_файлы(db: Any, settings: Any, *, сейчас: float |
         except OSError:
             return str(путь)
 
+    # От файлов на диске к базе, а не наоборот: раньше уборка читала все
+    # задания и делала `resolve()` на каждый путь — на большом архиве это
+    # минуты. Теперь свежие файлы отсеиваются по времени изменения, а для
+    # остальных — запрос по индексу (см. `Database.file_referenced`).
     кандидаты: list[tuple[str, Path]] = []
     всего = 0
     for вид, корень in (("uploads", загрузки), ("results", результаты)):
@@ -884,21 +922,23 @@ def подмести_файлы(db: Any, settings: Any, *, сейчас: float |
             continue
         for путь in корень.iterdir():
             всего += 1
-            if вид == "uploads":
-                имя = путь.name
-                основа = имя.replace(".redacted", "", 1) if ".redacted" in имя else имя
-                if своё(путь) in файлы or своё(путь.with_name(основа)) in файлы:
-                    continue
-            else:
-                номер = путь.name[:-5] if путь.name.endswith(".prev") else путь.name
-                if номер in номера or своё(путь) in каталоги:
-                    continue
             try:
                 возраст = момент - путь.stat().st_mtime
             except OSError:
                 continue
             if возраст < ВОЗРАСТ_СИРОТЫ_С:
                 continue
+            if вид == "uploads":
+                имя = путь.name
+                основа = путь.with_name(имя.replace(".redacted", "", 1)) \
+                    if ".redacted" in имя else путь
+                if db.file_referenced([str(путь), своё(путь), str(основа), своё(основа)],
+                                      основа.name):
+                    continue
+            else:
+                номер = путь.name[:-5] if путь.name.endswith(".prev") else путь.name
+                if db.results_referenced(номер, [str(путь), своё(путь)]):
+                    continue
             кандидаты.append((вид, путь))
 
     итог: dict[str, Any] = {"orphans": len(кандидаты), "moved": 0, "expired": 0,

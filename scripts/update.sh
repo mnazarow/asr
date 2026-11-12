@@ -325,6 +325,37 @@ else
 fi
 
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then
+  # Воспроизводимость: установленные версии базовых зависимостей против
+  # файла ограничений выпуска (requirements/constraints.txt) — что
+  # разошлось с проверенным набором.
+  CONSTRAINTS="${SOURCE_DIR}/requirements/constraints.txt"
+  [[ -f "${CONSTRAINTS}" ]] || CONSTRAINTS="${PREFIX}/requirements/constraints.txt"
+  if [[ -f "${CONSTRAINTS}" && -x "${VPY}" ]]; then
+    DRIFT="$("${VPY}" - "${CONSTRAINTS}" 2>/dev/null <<'PYEOF' || true
+import re, sys
+from importlib import metadata
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.split("#", 1)[0].strip()
+    m = re.match(r"([A-Za-z0-9_.\-]+)==(\S+)", line)
+    if not m:
+        continue
+    name, want = m.groups()
+    try:
+        have = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        have = "не установлен"
+    if have != want:
+        print(f"{name}: установлено {have}, проверено с {want}")
+PYEOF
+)"
+    if [[ -n "${DRIFT}" ]]; then
+      warn "Зависимости расходятся с проверенным набором выпуска:"
+      printf '    %s\n' "${DRIFT//$'\n'/$'\n'    }"
+      hint "Поставить ровно проверенные версии: '${VPY}' -m pip install -r '${PREFIX}/requirements/base.txt' -c '${CONSTRAINTS}'"
+    else
+      info "Базовые зависимости совпадают с проверенным набором выпуска."
+    fi
+  fi
   info "Режим проверки — изменения не вносились."
   # Отдельный код, а не единица: «карта недоступна» и «скрипт не отработал» —
   # разные новости, и задача в cron должна их различать.

@@ -86,7 +86,7 @@ def разобрать_пояс(имя: str) -> tzinfo | None:
 #: Поля станции, которые нельзя показывать не администратору: по ним
 #: строится вход в телефонию организации, а не понимание своей работы.
 ЗАКРЫТЫЕ = ("host", "port", "username", "secret", "cdr_file",
-            "recordings_dir", "filename")
+            "recordings_dir", "filename", "tls", "ca_file", "auth", "queue_log")
 
 #: Поля-секреты: не показываются никому и в ответах заменяются пометкой.
 СЕКРЕТНЫЕ = ("secret",)
@@ -137,6 +137,14 @@ class Станция:
     port: int = 5038
     username: str = ""
     secret: str = ""
+    #: AMI по TLS (порт 5039, `tlsenable` в manager.conf) и центр, которым
+    #: подписан сертификат станции; вход по MD5 через Challenge.
+    tls: bool = False
+    ca_file: str = ""
+    auth: str = "plain"
+    #: Журнал очередей Asterisk (`/var/log/asterisk/queue_log`), если сервер
+    #: его видит: ожидание, брошенные в очереди, пропуски операторов.
+    queue_log: str = ""
 
     # Файлы
     cdr_file: str = ""
@@ -210,6 +218,8 @@ class Станция:
             данные.update({
                 "host": self.host, "port": self.port, "username": self.username,
                 "secret": "***" if self.secret else "",
+                "tls": self.tls, "ca_file": self.ca_file, "auth": self.auth,
+                "queue_log": self.queue_log,
                 "cdr_file": self.cdr_file, "recordings_dir": self.recordings_dir,
                 "filename": self.filename, "owner_map": dict(self.owner_map),
             })
@@ -293,9 +303,13 @@ def _станция_из(данные: dict[str, Any], номер: int) -> Ст�
         enabled=_признак(данные.get("enabled"), True),
         source=источник,
         host=str(данные.get("host") or "127.0.0.1").strip(),
-        port=число("port", 5038),
+        port=число("port", 5039 if _признак(данные.get("tls"), False) else 5038),
         username=str(данные.get("username") or "").strip(),
         secret=str(данные.get("secret") or ""),
+        tls=_признак(данные.get("tls"), False),
+        ca_file=str(данные.get("ca_file") or "").strip(),
+        auth="md5" if str(данные.get("auth") or "").strip().lower() == "md5" else "plain",
+        queue_log=str(данные.get("queue_log") or "").strip(),
         cdr_file=str(данные.get("cdr_file") or "").strip(),
         recordings_dir=str(данные.get("recordings_dir") or "").strip(),
         filename=str(данные.get("filename") or "").strip(),
@@ -477,6 +491,12 @@ def проверить_набор(сырые: Any) -> list[str]:
             ошибки.append(f"{кто}: не задан журнал звонков")
         if источник == "folder" and not str(данные.get("recordings_dir") or "").strip():
             ошибки.append(f"{кто}: не задан каталог записей")
+        способ = str(данные.get("auth") or "plain").strip().lower()
+        if способ not in ("plain", "md5"):
+            ошибки.append(f"{кто}: способ входа в AMI — plain или md5, а не «{способ}»")
+        файл_центра = str(данные.get("ca_file") or "").strip()
+        if файл_центра and not Path(файл_центра).is_absolute():
+            ошибки.append(f"{кто}: центр сертификации AMI — абсолютный путь к файлу")
         for поле in ("host", "username", "secret"):
             # Перевод строки в учётных данных AMI дописывал к входу второе
             # действие — в обход списка разрешённых (см. `AMIClient.action`).

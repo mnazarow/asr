@@ -357,6 +357,20 @@ def хеш_ключа(ключ: str) -> str:
     return "sha256:" + hashlib.sha256(str(ключ).encode("utf-8")).hexdigest()
 
 
+def запись_ключа(ключ: str, сведения: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Как ключ лежит в файле настроек: хеш вместо ключа, превью и начало.
+
+    Превью — для списка ключей, начало (16 знаков из 35) — для отзыва по нему
+    (`DELETE /api/keys/{первые знаки}`); остальные 19 знаков — больше 110 бит.
+    """
+    ключ = str(ключ)
+    return хеш_ключа(ключ), {
+        "preview": f"{ключ[:6]}…{ключ[-4:]}" if len(ключ) > 12 else "***",
+        "prefix": ключ[:16],
+        **{к: з for к, з in dict(сведения or {}).items() if к not in ("preview", "prefix")},
+    }
+
+
 class КлючиДоступа(dict):
     """Ключи доступа: ищутся и по самому ключу, и по его хешу.
 
@@ -378,6 +392,20 @@ class КлючиДоступа(dict):
     def get(self, ключ: Any, default: Any = None) -> Any:  # noqa: A003
         запись = self._найти(ключ)
         return default if запись is None else запись
+
+    def __getitem__(self, ключ: Any) -> Any:
+        запись = self._найти(ключ)
+        if запись is None:
+            raise KeyError(ключ)
+        return запись
+
+    def pop(self, ключ: Any, *default: Any) -> Any:  # noqa: A003
+        имя = self.имя_в_словаре(ключ) if isinstance(ключ, str) and ключ else None
+        if имя is None:
+            if default:
+                return default[0]
+            raise KeyError(ключ)
+        return dict.pop(self, имя)
 
     def __contains__(self, ключ: Any) -> bool:
         return self._найти(ключ) is not None
@@ -418,6 +446,24 @@ class Settings:
     def __post_init__(self) -> None:
         if not isinstance(self.api_keys, КлючиДоступа):
             self.api_keys = КлючиДоступа(self.api_keys or {})
+
+    def перевести_ключи(self) -> int:
+        """Прежние ключи открытым текстом — в хеш (в памяти). Сколько переведено.
+
+        Ключи, выпущенные до перехода на хеши, и ключ первого запуска лежали в файле
+        настроек как есть, а файл уезжает в копии и заявки поддержки. Ключ
+        из окружения (ASRHUB_API_KEY) в файл не пишется вовсе и остаётся как
+        есть. Запись в файл — `persist_api_keys`: она же сохраняет ключи,
+        дописанные соседним сервером (`api_keys_file`).
+        """
+        переведено = 0
+        for ключ in [к for к in list(dict.keys(self.api_keys))
+                     if not str(к).startswith("sha256:") and к not in self.api_keys_env]:
+            сведения = dict.pop(self.api_keys, ключ)
+            хеш, запись = запись_ключа(ключ, сведения)
+            dict.__setitem__(self.api_keys, хеш, запись)
+            переведено += 1
+        return переведено
 
     # --- доступ ---------------------------------------------------------
 
@@ -561,11 +607,19 @@ class Settings:
     SECRET_KEYS = ("webhook_secret", "webhook_url", "digest_url", "hf_token",
                    "llm_api_key", "telephony_secret", "tracker_url",
                    "crm_url", "crm_token", "employees_url", "alert_url",
-                   "qc_sip_password", "qc_webhook_url")
+                   "qc_sip_password", "qc_webhook_url", "backup_password",
+                   "backup_post_command", "employees_auth_header",
+                   "employees_ldap_password")
+
+    #: Параметры, которые задаются только в файле настроек или окружении,
+    #: а не из интерфейса: команда «после копии» — это запуск программы на
+    #: сервере, и права администратора приложения не должны давать оболочку.
+    ТОЛЬКО_ИЗ_ФАЙЛА = ("backup_post_command",)
 
     #: Секреты, которые не отдаются и администратору (см. `to_dict`).
     СЕКРЕТЫ_ВСЕГДА = ("webhook_secret", "hf_token", "llm_api_key", "telephony_secret",
-                      "crm_token", "crm_url", "qc_sip_password")
+                      "crm_token", "crm_url", "qc_sip_password", "backup_password",
+                      "employees_auth_header", "employees_ldap_password")
 
     #: Что не уносится в параметры задания. Параметры задания — снимок
     #: настроек на момент постановки, и отдаются они владельцу задания:
@@ -1038,7 +1092,7 @@ _ЗАМОК_СОХРАНЕНИЯ = threading.Lock()
 
 
 #: Роли ключа доступа.
-_РОЛИ = ("admin", "user", "readonly")
+_РОЛИ = ("admin", "user", "readonly", "metrics")
 
 
 def _ключи_доступа(записи: dict[Any, Any], файл: str,
@@ -1525,13 +1579,18 @@ def load(config_path: str | os.PathLike[str] | None = None,
         except OSError as exc:
             log.warning("Не удалось прочитать ключ доступа из %s: %s", keyfile, exc)
 
+        # Ключ первого запуска в файле настроек — хешем, как и выпущенные
+        # позже: сам ключ живёт только в api-key.txt (права 0600).
         if existing.startswith("ah_") and len(existing) >= 12:
-            settings.api_keys[existing] = {
-                "role": "admin", "name": "создан автоматически при первом запуске"}
+            хеш, запись = запись_ключа(existing, {
+                "role": "admin", "name": "создан автоматически при первом запуске"})
+            settings.api_keys[хеш] = запись
             return settings
 
         key = "ah_" + secrets.token_urlsafe(24)
-        settings.api_keys[key] = {"role": "admin", "name": "создан автоматически при первом запуске"}
+        хеш, запись = запись_ключа(key, {"role": "admin",
+                                         "name": "создан автоматически при первом запуске"})
+        settings.api_keys[хеш] = запись
         try:
             # Файл создаётся сразу с нужными правами: если выставлять их после
             # записи, остаётся окно, в котором ключ доступен на чтение всем.
@@ -1548,9 +1607,10 @@ def load(config_path: str | os.PathLike[str] | None = None,
             except OSError:
                 other = ""
             if other.startswith("ah_"):
-                settings.api_keys.pop(key, None)
-                settings.api_keys[other] = {
-                    "role": "admin", "name": "создан автоматически при первом запуске"}
+                settings.api_keys.pop(хеш, None)
+                хеш2, запись2 = запись_ключа(other, {
+                    "role": "admin", "name": "создан автоматически при первом запуске"})
+                settings.api_keys[хеш2] = запись2
                 return settings
         except OSError as exc:
             log.error("Не удалось сохранить ключ доступа в %s: %s", keyfile, exc)

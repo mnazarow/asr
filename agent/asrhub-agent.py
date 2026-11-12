@@ -107,7 +107,7 @@ from urllib import request as запросы_url
 #: взят: по ней в разделе «АТС» видно, что станцию забыли обновить. Долго
 #: стояла «3.0.1» при сервере 3.1.x — и раздел не мог сказать ничего;
 #: теперь она поднимается вместе с сервером, а проверка следит за этим.
-ВЕРСИЯ = "3.1.31"
+ВЕРСИЯ = "3.1.32"
 
 #: Минимальный Python. Названной величиной, а не литералом в сравнении:
 #: сравнение с литералом статические проверки считают устаревшим и
@@ -710,14 +710,19 @@ class Звонок:
                  "context", "disposition", "duration", "billsec", "started_at",
                  "answered", "userfield", "accountcode", "direction", "queue",
                  "agent", "recording", "lastapp", "lastdata", "последний_шанс",
-                 "linkedid", "sequence")
+                 "linkedid", "sequence", "recordingfile", "did")
 
     def __init__(self, uniqueid="", src="", dst="", clid="", channel="",
                  dstchannel="", context="", disposition="", duration=0,
                  billsec=0, started_at=0.0, answered=False, userfield="",
                  accountcode="", direction="", queue="", agent="",
                  recording="", lastapp="", lastdata="", последний_шанс="",
-                 linkedid="", sequence=0):
+                 linkedid="", sequence=0, recordingfile="", did=""):
+        #: FreePBX пишет в CDR имя файла записи (`recordingfile`) и набранный
+        #: городской номер (`did`): по первому запись находится сразу, без
+        #: перебора каталога, второй — номер линии, на которую звонили.
+        self.recordingfile = recordingfile
+        self.did = did
         self.uniqueid = uniqueid
         self.src = src
         self.dst = dst
@@ -777,6 +782,8 @@ class Звонок:
         if self.linkedid:
             поля["linkedid"] = self.linkedid
             поля["sequence"] = int(self.sequence or 0)
+        if self.did:
+            поля["did"] = self.did
         if пропущено:
             поля["skipped"] = пропущено
         # Имена файлов и поля из журнала бывают с байтами не из UTF-8 —
@@ -810,7 +817,13 @@ def звонок_из_полей(поля):
         lastdata=str(поля.get("lastdata") or "").strip(),
         linkedid=str(поля.get("linkedid") or "").strip()[:128],
         sequence=целое(поля.get("sequence")),
+        recordingfile=os.path.basename(str(поля.get("recordingfile") or "").strip())[:255],
+        did=str(поля.get("did") or "").strip()[:64],
     )
+    # cnum — номер звонящего без имени (FreePBX): надёжнее src, который
+    # иногда перезаписан правилами входящей маршрутизации.
+    if not звонок.src and str(поля.get("cnum") or "").strip():
+        звонок.src = str(поля.get("cnum")).strip()
     return звонок
 
 
@@ -1284,6 +1297,12 @@ class Записи:
         return найденный
 
     def _искать(self, звонок):
+        # FreePBX назвал файл сам (`recordingfile`): ищем его по имени в
+        # указателе — точнее любого подбора.
+        if getattr(звонок, "recordingfile", ""):
+            найденный = self._по_имени(звонок.recordingfile)
+            if найденный:
+                return найденный
         if self.шаблон:
             найденный = self._по_шаблону(звонок)
             if найденный:
@@ -1365,6 +1384,13 @@ class Записи:
         for _, найденный in sorted(подошли):
             if not self._занят(найденный, звонок):
                 return найденный
+        return None
+
+    def _по_имени(self, имя):
+        self.указатель()
+        for _, своё, кандидат in self._файлы:
+            if своё == имя:
+                return внутри(self.каталог, кандидат)
         return None
 
     def _по_идентификатору(self, звонок):
@@ -2290,6 +2316,22 @@ class ИсточникMySQL:
     #: ним сервер собирает ноги одного разговора. На старой схеме колонок
     #: нет, и запрос с ними упал бы: наличие проверяется один раз.
     ПОЛЯ_СВЯЗИ = ("linkedid", "sequence")
+    #: Колонки FreePBX: имя файла записи, набранный DID и номер звонящего.
+    ПОЛЯ_FREEPBX = ("recordingfile", "did", "cnum")
+
+    def _колонки_freepbx(self, таблица):
+        """Какие из колонок FreePBX есть в таблице (проверяется один раз)."""
+        if getattr(self, "_freepbx", None) is None:
+            есть = []
+            for колонка in self.ПОЛЯ_FREEPBX:
+                try:
+                    if колонка in self._выполнить(
+                            f"SHOW COLUMNS FROM `{таблица}` LIKE '{колонка}'"):
+                        есть.append(колонка)
+                except Exception as exc:  # noqa: BLE001 — без них журнал всё равно читается
+                    log.debug("Колонка %s не проверена: %s", колонка, exc)
+            self._freepbx = tuple(есть)
+        return self._freepbx
 
     def _поля_выборки(self, таблица):
         if getattr(self, "_связь_есть", None) is None:
@@ -2302,7 +2344,8 @@ class ИсточникMySQL:
             except Exception as exc:  # noqa: BLE001 — без связи ног, но с журналом
                 log.debug("Колонки linkedid не проверены: %s", exc)
                 self._связь_есть = False
-        return self.ПОЛЯ_ЗАПРОСА + (self.ПОЛЯ_СВЯЗИ if self._связь_есть else ())
+        return (self.ПОЛЯ_ЗАПРОСА + (self.ПОЛЯ_СВЯЗИ if self._связь_есть else ())
+                + self._колонки_freepbx(таблица))
 
     #: Насколько назад от последнего прочитанного начала звонка смотреть.
     #: calldate — время НАЧАЛА, а строку Asterisk пишет по ОКОНЧАНИИ звонка:
@@ -2358,8 +2401,10 @@ class ИсточникMySQL:
                 "REPLACE(REPLACE(lastdata, '\\t', ' '), '\\n', ' ') AS lastdata, "
                 "calldate AS start, duration, billsec, disposition, uniqueid, "
                 "userfield"
-                + (", linkedid, sequence " if поля_выборки != self.ПОЛЯ_ЗАПРОСА else " ")
-                + f"FROM `{таблица}`{где} ORDER BY calldate ASC, uniqueid ASC "
+                + (", linkedid, sequence" if self.ПОЛЯ_СВЯЗИ[0] in поля_выборки else "")
+                + "".join(f", REPLACE(REPLACE({к}, '\\t', ' '), '\\n', ' ') AS {к}"
+                          for к in self.ПОЛЯ_FREEPBX if к in поля_выборки)
+                + f" FROM `{таблица}`{где} ORDER BY calldate ASC, uniqueid ASC "
                 f"LIMIT {self.СТРАНИЦА}")
             вывод = self._выполнить(запрос)
             строк = 0
@@ -2955,6 +3000,16 @@ class Клиент:
 
     # --- адреса ------------------------------------------------------------
 
+    def скачать(self, путь, таймаут=None):
+        """Сырой ответ GET (байты) и заголовки — для обновления агента."""
+        запрос = запросы_url.Request(self.адрес + путь, method="GET",
+                                     headers=self._заголовки())
+        ответ = self._опенер.open(запрос, timeout=float(таймаут or self.таймаут))
+        try:
+            return ответ.read(), dict(ответ.headers.items())
+        finally:
+            ответ.close()
+
     def hello(self, сведения):
         тело = json.dumps(сведения, ensure_ascii=False).encode()
         return self._запрос("POST", "/api/telephony/agent/hello", тело,
@@ -3217,6 +3272,7 @@ class Агент:
         if not self.правила.get("enabled", True):
             log.warning("Агент выключен на сервере: звонки приниматься не "
                         "будут. Включите его в разделе «АТС» веб-интерфейса.")
+        self.проверить_версию(ответ)
         станция = str(ответ.get("station") or "")
         log.info("Сервер: %s, станция %s, предел записи %d МБ, отсев: короче "
                  "%d с, без ответа %s", self.клиент.адрес, станция,
@@ -3225,6 +3281,30 @@ class Агент:
                  "пропускать" if self.правила.get("skip_unanswered") else "брать")
         self._последний_hello = time.time()
         return ответ
+
+    def проверить_версию(self, ответ):
+        """Агент старее сервера: сказать в журнале, а с auto_update — обновиться.
+
+        Обновление — только со сверкой: sha256 скачанного текста должен
+        совпасть и с отпечатком из приветствия, и с заголовком ответа, а
+        сам текст — разобраться интерпретатором. Иначе остаётся прежний
+        агент, и в журнале — почему.
+        """
+        if not ответ.get("agent_outdated"):
+            return False
+        свежая = str(ответ.get("agent_version") or "")
+        if time.time() - getattr(self, "_напомнено_о_версии", 0.0) > 86400:
+            self._напомнено_о_версии = time.time()
+            log.warning("Агент %s старее сервера (%s). Обновите его той же командой "
+                        "установки или включите auto_update = yes в настройках агента.",
+                        ВЕРСИЯ, свежая or "?")
+        if not логическое(self.параметры.get("auto_update"), False) or self.пробно:
+            return False
+        try:
+            return обновить_себя(self.клиент, str(ответ.get("agent_sha256") or ""), свежая)
+        except Exception as сбой:                            # noqa: BLE001
+            log.error("Агент не обновлён: %s", сбой)
+            return False
 
     def проверить_часы(self, время_сервера):
         if not время_сервера:
@@ -3239,6 +3319,58 @@ class Агент:
         return расхождение
 
     # --- проход ------------------------------------------------------------
+
+    def очереди(self):
+        """Новые строки queue_log станции — на сервер (события очередей).
+
+        Позиция чтения — в состоянии агента; повёрнутый журнал читается с
+        начала. Сервер старее (404) — больше не пытаемся до перезапуска.
+        Пробный запуск журнал не отправляет.
+        """
+        путь = str(self.параметры.get("queue_log") or "")
+        if not путь or self.пробно or getattr(self, "_очереди_нет", False) \
+                or not self.agent_id or not os.path.isfile(путь):
+            return 0
+        место = self.состояние.данные.get("queue_log") or {}
+        try:
+            сведения = os.stat(путь)
+            позиция = int(место.get("offset") or 0)
+            if сведения.st_ino != int(место.get("inode") or 0) or сведения.st_size < позиция:
+                позиция = 0
+            with open(путь, "rb") as файл:
+                файл.seek(позиция)
+                кусок = файл.read(2 * 1024 * 1024)
+        except OSError as сбой:
+            log.warning("Журнал очередей %s не читается: %s", путь, сбой)
+            return 0
+        конец = кусок.rfind(b"\n")
+        if конец < 0:
+            return 0
+        строки = кусок[:конец + 1].decode("utf-8", "replace").splitlines()
+        отправлено = 0
+        for начало_порции in range(0, len(строки), 5000):
+            порция = строки[начало_порции:начало_порции + 5000]
+            тело = json.dumps({"agent_id": self.agent_id, "lines": порция},
+                              ensure_ascii=False).encode()
+            try:
+                self.клиент._запрос("POST", "/api/telephony/agent/queue_log", тело,
+                                    "application/json; charset=utf-8", len(тело),
+                                    что="журнал очередей", повторять=False)
+            except ОтказСервера as отказ:
+                if getattr(отказ, "статус", 0) == 404:
+                    self._очереди_нет = True
+                    log.info("Сервер не принимает журнал очередей (старая версия)")
+                    return отправлено
+                log.warning("Журнал очередей не отправлен: %s", отказ)
+                return отправлено
+            except Exception as сбой:                        # noqa: BLE001
+                log.warning("Журнал очередей не отправлен: %s", сбой)
+                return отправлено
+            отправлено += len(порция)
+        self.состояние.данные["queue_log"] = {"offset": позиция + конец + 1,
+                                              "inode": сведения.st_ino}
+        self.состояние.сохранить()
+        return отправлено
 
     def проход(self, режим="new", начало=None, конец=None):
         """Один заход по журналу. Возвращает свод: что отправлено и что нет.
@@ -3714,6 +3846,7 @@ class Агент:
         ответ = self.поздороваться()
         задание = str(ответ.get("command") or "")
         свод = self.проход(режим, начало, конец)
+        self.очереди()
         напечатать_свод(свод, режим)
         if задание and задание != "collect:stop":
             дополнительный = self.выполнить_задание(задание)
@@ -3768,6 +3901,7 @@ class Агент:
                             напечатать_свод(свод, следующее)
                 else:
                     свод = self.проход("new")
+                    self.очереди()
                     ещё = bool(свод.get("ещё"))
                     if свод["отправлено"] or свод["ошибок"]:
                         напечатать_свод(свод, "заход")
@@ -4111,6 +4245,37 @@ def самопроверка(параметры):
 # Настройки и командная строка
 # ---------------------------------------------------------------------------
 
+def обновить_себя(клиент, ожидаемый, версия=""):
+    """Скачать агента с сервера, сверить sha256 и перезапуститься новым."""
+    if not re.fullmatch(r"[0-9a-f]{64}", ожидаемый or ""):
+        raise RuntimeError("сервер не сообщил отпечаток агента — обновление без "
+                           "сверки не делается")
+    тело, заголовки = клиент.скачать("/api/telephony/agent/asrhub-agent.py",
+                                     таймаут=120)
+    фактический = hashlib.sha256(тело).hexdigest()
+    в_заголовке = ""
+    for имя, значение in заголовки.items():
+        if имя.lower() == "x-asrhub-sha256":
+            в_заголовке = значение.strip().lower()
+    if фактический != ожидаемый or (в_заголовке and в_заголовке != фактический):
+        raise RuntimeError("sha256 скачанного агента не совпал с отпечатком сервера "
+                           "— файл изменён по дороге; прежний агент оставлен")
+    compile(тело, "asrhub-agent.py", "exec")                # разбирается ли вообще
+    свой = os.path.realpath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)
+    if not os.access(os.path.dirname(свой), os.W_OK) or not os.access(свой, os.W_OK):
+        raise RuntimeError("нет прав на запись в " + свой)
+    новый = свой + ".new"
+    with open(новый, "wb") as файл:
+        файл.write(тело)
+    os.chmod(новый, os.stat(свой).st_mode & 0o7777)
+    os.replace(новый, свой)
+    log.warning("Агент обновлён до %s (sha256 %s…) — перезапуск", версия or "?",
+                фактический[:12])
+    logging.shutdown()
+    os.execv(sys.executable, [sys.executable, свой, *sys.argv[1:]])
+    return True  # pragma: no cover - execv не возвращается
+
+
 def прочитать_настройки(путь):
     """Секция [agent] из INI-файла. Отсутствие файла — не ошибка."""
     значения = {}
@@ -4183,6 +4348,9 @@ def собрать_аргументы():
     разбор.add_argument("--mysql-password")
     разбор.add_argument("--mysql-port")
     разбор.add_argument("--mysql-sock")
+    разбор.add_argument("--auto-update", dest="auto_update", action="store_true",
+                        default=None,
+                        help="обновляться с сервера, если агент устарел (со сверкой sha256)")
     разбор.add_argument("--min-duration", dest="min_duration_s", type=int,
                         help="не слать разговоры короче стольких секунд")
     разбор.add_argument("--skip-unanswered", dest="skip_unanswered",
@@ -4298,6 +4466,11 @@ def собрать_параметры(аргументы, настройки):
         "retries": целое(взять("retries", умолчание=5), 5),
         "interval": дробное(взять("interval", умолчание=60.0), 60.0),
         "insecure": логическое(взять("insecure"), False),
+        # Журнал очередей Asterisk: события ожидания и потерь — на сервер.
+        "queue_log": взять("queue_log", умолчание="/var/log/asterisk/queue_log"),
+        # Самообновление со сверкой sha256 (выключено по умолчанию: код на
+        # станции меняет только тот, кто её обслуживает).
+        "auto_update": логическое(взять("auto_update"), False),
         "cacert": взять("cacert", умолчание=""),
         "max_kbps": целое(взять("max_kbps", умолчание=0), 0),
         "settle_s": дробное(настройки.get("settle_s"), ВЫДЕРЖКА_ЗАПИСИ_С),

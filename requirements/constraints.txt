@@ -1,0 +1,21 @@
+# Версии базовых зависимостей, с которыми выпуск ASR Hub проверен (полный
+# набор проверок). Файл ограничений, а не требований: сам ничего не ставит,
+# а только фиксирует версии того, что ставит requirements/base.txt.
+#
+#   pip install -r requirements/base.txt -c requirements/constraints.txt
+#   bash scripts/install.sh --pinned          установка ровно этих версий
+#   bash scripts/update.sh --check            покажет расхождение с установкой
+#
+# Движки распознавания сюда не входят: их колёса зависят от видеокарты и
+# версии Python, и одна строка на всех была бы неверна для половины машин.
+fastapi==0.162.2
+uvicorn==0.54.0
+python-multipart==0.0.32
+pydantic==2.13.5
+PyYAML==6.0.3
+huggingface-hub==2.4.0
+soundfile==0.14.0
+python-docx==1.2.0
+openpyxl==3.1.5
+psutil==7.2.2
+tzdata==2026.6

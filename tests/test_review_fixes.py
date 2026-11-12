@@ -2439,8 +2439,8 @@ def test_finished_jobs_do_not_pile_up_in_the_concurrency_table():
     # И освобождение живёт в одном месте, а не в двух.
     источник = Path(__file__).resolve().parent.parent / "server" / "asrhub" / "job_queue.py"
     текст = источник.read_text(encoding="utf-8")
-    начало = текст.index("            finally:\n                # Освобождение")
-    assert "_release_slot(" in текст[начало:начало + 800], "копия освобождения вернулась"
+    начало = текст.index("            finally:\n                if self._заменён(index):")
+    assert "_release_slot(" in текст[начало:начало + 1400], "копия освобождения вернулась"
 
 
 def test_backups_keep_working_on_a_disk_that_is_almost_full(tmp_path: Path):
@@ -2514,7 +2514,9 @@ def test_a_cached_result_carries_every_counter_the_analytics_reads(tmp_path: Pat
     """
     источник = (Path(__file__).resolve().parent.parent / "server" / "asrhub"
                 / "job_queue.py").read_text(encoding="utf-8")
-    начало = источник.index("    def _clone_cached(")
+    # С 3.1.32 перенос живёт в `_заполнить_из_кеша`, общем для клона при
+    # загрузке и задания, дождавшегося идущего близнеца.
+    начало = источник.index("    def _заполнить_из_кеша(")
     тело = источник[начало:начало + 3200]
     for поле in ("words_count", "chars_count", "segments_count",
                  "speakers_count", "avg_confidence", "rtf"):

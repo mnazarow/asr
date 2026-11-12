@@ -19,6 +19,9 @@ export ASRHUB_KEY="$(cat /var/lib/asrhub/api-key.txt)"
 | `stream_microphone.py` | Распознавание на лету: звук кусками, текст по ходу речи |
 | `telephony_push_call.py` | Передать звонок с записью из своей интеграции, как диалплан: повторы, 409/429/503, проба |
 | `telephony_export_calls.py` | Выгрузить журнал звонков с АТС в CSV для сверки со своей статистикой |
+| `export_results.py` | Пакетная выгрузка результатов за период в каталог; повторный запуск докачивает только новое |
+| `retry_failed.py` | Причины отказов и повтор того, что повтором лечится (по одному, с другой моделью) |
+| `webhook_receiver.py` | Приёмник уведомлений с проверкой подписи `X-ASRHub-Signature-256` и свежести |
 
 Зависимости: `requests`, `websockets` для `live_events.py` и
 `websocket-client` для `stream_microphone.py` (в режиме микрофона — ещё

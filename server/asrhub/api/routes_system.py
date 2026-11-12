@@ -262,6 +262,13 @@ def update_settings(request: Request, values: dict[str, Any] = Body(...),
     """
     state = get_state(request)
     require_admin(principal)
+    из_файла = sorted(set(values) & set(state.settings.ТОЛЬКО_ИЗ_ФАЙЛА))
+    if из_файла:
+        raise error_response(ConfigError(
+            "Эти параметры задаются только в файле настроек или переменной "
+            "окружения: " + ", ".join(из_файла) + ".",
+            hint="Это запуск программы на сервере — права администратора "
+                 "приложения его не дают. Впишите параметр в asrhub.yaml."))
     # Приведение до проверки: интерфейс и внешние клиенты присылают то, что
     # ввёл человек, — «5» там, где каталог ждёт число, и 5 там, где строку.
     # Заглушки «***» вместо секретов означают «не менял» и значением не
@@ -558,25 +565,16 @@ def events(request: Request,
     заданий — по ним же строится живое обновление интерфейса.
     """
     state = get_state(request)
-    items = state.db.get_events(limit=limit if principal.is_admin else limit * 4)
     if principal.is_admin:
-        return {"items": items}
-
+        return {"items": state.db.get_events(limit=limit)}
     # Охват — тот же, что у списка заданий и у «Проблем»: свои и коллег по
-    # подразделению. По одному имени ключ группы не видел в ленте событий
-    # заданий, которые видел в списке.
-    own = {j["id"] for j in state.db.list_jobs(owner=scope_owner(principal),
-                                               limit=2000, light=True)}
-    # События без job_id — это ровно административные: создание и отзыв
-    # ключей, изменение настроек, загрузка моделей. Условие «нет job_id —
-    # значит можно» пропускало их всем, включая readonly, вместе с именами
-    # ключей и их ролями. Из общесистемных оставляем то, что и так видно
-    # по состоянию очереди.
-    public_kinds = {"queue_paused", "queue_resumed", "queue_cleared"}
-    mine = [e for e in items
-            if e.get("job_id") in own
-            or (not e.get("job_id") and e.get("kind") in public_kinds)]
-    return {"items": mine[:limit]}
+    # подразделению. События без job_id — это ровно административные:
+    # создание и отзыв ключей, изменение настроек, загрузка моделей. Из
+    # общесистемных оставляем то, что и так видно по состоянию очереди.
+    # Отбор — в SQL по владельцу (см. `Database.get_events_for`).
+    return {"items": state.db.get_events_for(
+        scope_owner(principal) or principal.name,
+        public_kinds=("queue_paused", "queue_resumed", "queue_cleared"), limit=limit)}
 
 
 @router.get("/usage", summary="Расход и квоты ключа")
@@ -656,11 +654,11 @@ def create_key(request: Request, name: str = Body(embed=True),
 
     state = get_state(request)
     require_admin(principal)
-    if role not in ("admin", "user", "readonly"):
+    if role not in ("admin", "user", "readonly", "metrics"):
         raise error_response(ConfigError(
             f"Недопустимая роль «{role}».",
             hint="Допустимые роли: admin — полный доступ, user — отправка заданий, "
-                 "readonly — только чтение."))
+                 "readonly — только чтение, metrics — только метрики и пробы."))
     # Имя ключа — это и есть его область: по нему ключ видит свои задания.
     # Два ключа без имени получали одно имя «ключ» и видели задания друг
     # друга — ровно то, от чего область и заводилась.

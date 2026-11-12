@@ -124,7 +124,7 @@ class АгентВыключен(ConfigError):
 ПОЛЯ_ЗВОНКА = (
     "src", "dst", "clid", "channel", "dstchannel", "context", "disposition",
     "direction", "queue", "agent", "duration", "billsec", "answered",
-    "started_at", "userfield", "accountcode", "linkedid", "sequence",
+    "started_at", "userfield", "accountcode", "linkedid", "sequence", "did",
 )
 
 
@@ -331,7 +331,46 @@ def hello(request: Request, данные: dict[str, Any] | None = None,
         "enabled": bool(запись.get("enabled", 1)),
         "min_duration_s": int(state.settings.get("telephony_min_duration_s") or 0),
         "skip_unanswered": bool(state.settings.get("telephony_skip_unanswered", True)),
+        # Версия агента на сервере и её отпечаток: агент старее — сам
+        # скажет об этом в журнале, а с auto_update скачает и сверит.
+        "agent_version": str(state.version),
+        "agent_outdated": устарел(str(данные.get("version") or ""), str(state.version)),
+        "agent_sha256": _отпечаток_агента(),
     }
+
+
+def _версия(текст: str) -> tuple[int, ...]:
+    части = re.findall(r"\d+", str(текст or ""))[:4]
+    return tuple(int(ч) for ч in части)
+
+
+def устарел(версия_агента: str, версия_сервера: str) -> bool:
+    """Агент старее сервера (сравнение по числам версии; пустая — не знаем)."""
+    у_агента, у_сервера = _версия(версия_агента), _версия(версия_сервера)
+    return bool(у_агента) and bool(у_сервера) and у_агента < у_сервера
+
+
+def _отпечаток_агента() -> str:
+    """sha256 исходного текста агента, который отдаёт этот сервер."""
+    import hashlib  # noqa: PLC0415
+
+    try:
+        return hashlib.sha256(_файл_агента("asrhub-agent.py").encode("utf-8")).hexdigest()
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
+def _с_отпечатком(текст: str, вид: str) -> Response:
+    """Код для станции — с sha256 в заголовке: установщик и агент сверяют.
+
+    Код ставится на станцию и работает там от asterisk или root: подмена
+    по дороге (прокси, http без TLS) — это выполнение чужого кода на АТС.
+    """
+    import hashlib  # noqa: PLC0415
+
+    данные = текст.encode("utf-8")
+    return Response(данные, media_type=вид,
+                    headers={"X-ASRHub-SHA256": hashlib.sha256(данные).hexdigest()})
 
 
 def _машина_агента(запись: dict[str, Any]) -> str:
@@ -367,6 +406,31 @@ def _дослать_можно(строка: dict[str, Any]) -> bool:
         return False
     пометка = str(строка.get("skipped") or "")
     return any(пометка.startswith(п) for п in ДОСЛАТЬ_МОЖНО)
+
+
+@router.post("/queue_log", summary="Строки журнала очередей со станции агента")
+def queue_log(request: Request, данные: dict[str, Any],
+              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Строки `queue_log` станции: `{"agent_id": …, "lines": ["…|…", …]}`.
+
+    Агент (или любой отправщик — `tail -F queue_log | …`) присылает строки
+    как есть; сервер разбирает события очередей и складывает их по станции
+    агента. Повтор тех же строк не задваивает событий.
+    """
+    require_write(principal)
+    state = get_state(request)
+    agent_id = _проверить_id(str(данные.get("agent_id") or ""))
+    _свой_агент(state, agent_id, principal)
+    строки = данные.get("lines") or []
+    if not isinstance(строки, list) or len(строки) > 20000:
+        raise error_response(ConfigError(
+            "Ожидается список строк lines, не больше 20 000 за запрос.",
+            hint="Присылайте журнал очередей порциями."))
+    from ..telephony import queue_log as журнал_очередей  # noqa: PLC0415
+
+    события = журнал_очередей.разобрать("\n".join(str(с)[:2000] for с in строки))
+    добавлено = state.db.queue_events_add(_агентская_станция(agent_id), события)
+    return {"received": len(строки), "events": len(события), "added": добавлено}
 
 
 @router.get("/command", summary="Задание для агента, если оно есть")
@@ -507,6 +571,8 @@ async def _принять(request: Request, state: Any, principal: Principal,
         звонок["linkedid"] = связь if re.fullmatch(r"[\w.\-]*\d+\.\d+", связь) else ""
     if "sequence" in звонок:
         звонок["sequence"] = int(_число(звонок.get("sequence")))
+    if "did" in звонок:
+        звонок["did"] = re.sub(r"[^0-9+]", "", str(звонок.get("did") or ""))[:32]
     звонок["answered"] = 1 if звонок.get("answered") else 0
     звонок["pbx_uid"] = uniqueid
     есть_файл = file is not None and bool((file.filename or "").strip())
@@ -665,8 +731,7 @@ def _файл_агента(имя: str) -> str:
 def исходник(request: Request,
              principal: Principal = Depends(authenticate)) -> Response:
     require_write(principal)
-    return Response(_файл_агента("asrhub-agent.py"),
-                    media_type="text/x-python; charset=utf-8")
+    return _с_отпечатком(_файл_агента("asrhub-agent.py"), "text/x-python; charset=utf-8")
 
 
 @router.get("/install.sh", summary="Установщик агента для станции")
@@ -685,7 +750,7 @@ def установщик(request: Request,
     # заведомо доступен тому, кто устанавливает.
     текст = текст.replace("@@SERVER_URL@@", адрес)
     текст = текст.replace("@@VERSION@@", str(state.version))
-    return Response(текст, media_type="text/x-shellscript; charset=utf-8")
+    return _с_отпечатком(текст, "text/x-shellscript; charset=utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +777,9 @@ def список_агентов(request: Request,
             агент["state"] = json.loads(агент.get("state") or "{}")
         except ValueError:
             агент["state"] = {}
-    return {"agents": агенты, "at": time.time(),
+        агент["outdated"] = устарел(str(агент.get("version") or ""), str(state.version))
+    return {"agents": агенты, "at": time.time(), "server_version": str(state.version),
+            "agent_sha256": _отпечаток_агента(),
             "window": {"since": None, "until": верх}}
 
 

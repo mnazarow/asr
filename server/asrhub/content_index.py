@@ -25,6 +25,12 @@ from .db import Database
 
 log = logging.getLogger("asrhub.content")
 
+#: Метка фонового поиска неразобранного: {"v": версия, "ts": до какого
+#: завершения разобрано всё, "full": когда был полный проход}.
+KV_МЕТКА_РАЗБОРА = "content:pending_mark"
+#: Как часто фоновый поиск всё-таки обходит весь архив.
+ПОЛНЫЙ_ПРОХОД_С = 1800.0
+
 #: Сколько живёт снимок корпусной частоты основ. Знаменатель TF-IDF меняется
 #: медленно: на архиве в десять тысяч записей сотня новых сдвигает вес слова в
 #: третьем знаке. Считать его на каждую запись — это лишний проход по таблице
@@ -359,8 +365,23 @@ class ContentIndex:
     def backfill_once(self, limit: int | None = None) -> int:
         """Разбирает порцию записей, у которых разбора нет или он устарел."""
         размер = limit or int(self.settings.get("content_backfill_batch") or 50)
-        ожидают = self.db.content_pending(content.VERSION, размер)
+        # Метка «до неё разобрано всё»: пока версия разбора та же, поиск идёт
+        # только по завершённым позже. Полный проход — при смене версии,
+        # после сброса разбора и раз в полчаса на всякий случай (запись,
+        # завершённая задним числом, или сбой разбора сразу после записи).
+        метка = self.db.get_kv(KV_МЕТКА_РАЗБОРА) or {}
+        сейчас = time.time()
+        полный = (not isinstance(метка, dict) or метка.get("v") != content.VERSION
+                  or сейчас - float(метка.get("full") or 0) > ПОЛНЫЙ_ПРОХОД_С)
+        ожидают = self.db.content_pending(
+            content.VERSION, размер,
+            finished_after=None if полный else float(метка.get("ts") or 0))
         if not ожидают:
+            if полный:
+                # Запас в минуту: запись, завершённая в эту самую секунду,
+                # могла ещё не попасть в выборку.
+                self.db.set_kv(KV_МЕТКА_РАЗБОРА, {"v": content.VERSION, "ts": сейчас - 60,
+                                                  "full": сейчас})
             return 0
         частоты, корпус = self.corpus_frequency()
         скрипт, оператор, мат = self._скрипт(), self._оператор(), self._мат()
@@ -445,6 +466,7 @@ class ContentIndex:
         # ожидающей разбора. Обнулять её, а не удалять строки: строка с
         # прошлым разбором остаётся видна в разделе, пока не посчитан новый.
         сброшено = self.db.execute("UPDATE content SET version=0")
+        self.db.del_kv(KV_МЕТКА_РАЗБОРА)
         self.forget_frequency()
         return {"recomputed": 0, "queued": int(сброшено)}
 
@@ -467,12 +489,23 @@ class ContentIndex:
             кеш = self._кеш_состояния = {}
         сейчас = time.monotonic()
         запись = кеш.get(ключ)
-        if запись is None or сейчас - запись[0] > 30.0:
-            запись = (сейчас, self.db.content_stats(content.VERSION, owner=owner),
-                      self.db.vocabulary_size(), self.db.content_window_size(owner=owner))
+
+        def посчитать() -> tuple[float, dict[str, int], int, int]:
+            return (time.monotonic(), self.db.content_stats(content.VERSION, owner=owner),
+                    self.db.vocabulary_size(), self.db.content_window_size(owner=owner))
+
+        if запись is None:
+            запись = посчитать()
             if len(кеш) > 256:
                 кеш.clear()
             кеш[ключ] = запись
+        elif сейчас - запись[0] > 30.0:
+            # Устаревшие счётчики пересчитываются в фоне, а опрос получает
+            # прежние: на большом архиве подсчёт — секунды (холодный кеш
+            # страниц — до восьми), и раздел замирал на каждом опросе.
+            # Сброс после разбора (`_кеш_состояния = {}`) по-прежнему даёт
+            # свежие числа сразу.
+            self._пересчитать_состояние(ключ, посчитать)
         _, сведения, словарь, корпус = запись
         набор = self.categories()
         return {
@@ -489,6 +522,24 @@ class ContentIndex:
             "backfilled": self.backfilled,
             "last_error": self.last_error,
         }
+
+    def _пересчитать_состояние(self, ключ: str, посчитать: Any) -> None:
+        идут = self.__dict__.setdefault("_идёт_состояние", set())
+        if ключ in идут:
+            return
+        идут.add(ключ)
+
+        def в_фоне() -> None:
+            try:
+                кеш = getattr(self, "_кеш_состояния", None)
+                if кеш is not None:
+                    кеш[ключ] = посчитать()
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Состояние разбора не пересчитано: %s", exc)
+            finally:
+                идут.discard(ключ)
+
+        threading.Thread(target=в_фоне, name="asrhub-content-status", daemon=True).start()
 
     # --- фоновый поток ----------------------------------------------------
 

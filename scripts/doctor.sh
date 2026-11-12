@@ -81,6 +81,19 @@ if [[ -n "${SERVICE_NAME}" ]]; then
   SERVICE_USER_NAME="$(installed_service_value "${SERVICE_NAME}" "${PREFIX}" user || true)"
 fi
 
+# Доступен ли путь на чтение пользователю службы (каталог — ещё и на обход).
+readable_by_service() {
+  local path="$1" test_op="-r"
+  [[ -d "${path}" ]] && test_op="-x"
+  if [[ -n "${SERVICE_USER_NAME}" && "${SERVICE_USER_NAME}" != "root" ]] && is_root \
+     && have runuser && id -u "${SERVICE_USER_NAME}" >/dev/null 2>&1; then
+    runuser -u "${SERVICE_USER_NAME}" -- test -r "${path}" 2>/dev/null \
+      && runuser -u "${SERVICE_USER_NAME}" -- test "${test_op}" "${path}" 2>/dev/null
+  else
+    [[ -r "${path}" ]] && test "${test_op}" "${path}"
+  fi
+}
+
 # Доступен ли путь на запись пользователю службы.
 writable_by_service() {
   local path="$1"
@@ -488,6 +501,51 @@ PYEOF
   else
     check "Ключи доступа" warn "в config.yaml не найдены" \
       "Первый ключ сервер создаёт сам при запуске — он в ${DATA_DIR}/api-key.txt"
+  fi
+fi
+
+# Пути станций АТС (журнал CDR, каталог записей): читает ли их пользователь
+# службы. Типичная поломка рядом с Asterisk — служба asrhub без группы
+# asterisk: забор «работает», но молча не видит ни одного звонка.
+STATION_PY="${PREFIX}/venv/bin/python"
+[[ -x "${STATION_PY}" ]] || STATION_PY="$(command -v python3 || true)"
+if [[ -n "${STATION_PY}" && -r "${DATA_DIR}/config.yaml" ]]; then
+  STATION_PATHS="$("${STATION_PY}" - "${DATA_DIR}/config.yaml" 2>/dev/null <<'PYEOF' || true
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+data = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+stations = data.get("telephony_stations") or []
+if isinstance(stations, dict):
+    stations = list(stations.values())
+for st in stations:
+    if not isinstance(st, dict) or st.get("enabled") is False:
+        continue
+    for key in ("cdr_file", "recordings_dir", "queue_log"):
+        value = str(st.get(key) or "").strip()
+        if value:
+            print(f"{st.get('name') or st.get('id') or '?'}|{key}|{value}")
+PYEOF
+)"
+  if [[ -n "${STATION_PATHS}" ]]; then
+    heading "Станции АТС"
+    while IFS='|' read -r st_name st_key st_path; do
+      [[ -n "${st_path}" ]] || continue
+      what="журнал звонков"; [[ "${st_key}" == "recordings_dir" ]] && what="каталог записей"
+      [[ "${st_key}" == "queue_log" ]] && what="журнал очередей"
+      if [[ ! -e "${st_path}" ]]; then
+        check "${st_name}: ${what}" warn "нет такого пути: ${st_path}" \
+          "Проверьте путь в разделе «АТС»; каталог филиала должен быть смонтирован."
+      elif readable_by_service "${st_path}"; then
+        check "${st_name}: ${what}" ok "читается${SERVICE_USER_NAME:+ пользователем ${SERVICE_USER_NAME}}"
+      else
+        st_group="$(stat -c %G "${st_path}" 2>/dev/null || echo asterisk)"
+        check "${st_name}: ${what}" fail "не читается${SERVICE_USER_NAME:+ пользователем ${SERVICE_USER_NAME}}: ${st_path}" \
+          "Добавьте службе группу владельца: bash '${SCRIPT_DIR}/service.sh' install --group ${st_group}"
+      fi
+    done <<< "${STATION_PATHS}"
   fi
 fi
 

@@ -32,6 +32,7 @@ from .engines import EngineRegistry
 from .errors import (
     ASRHubError,
     ConfigError,
+    EngineHung,
     JobCancelled,
     JobNotFound,
     OutOfMemoryError,
@@ -463,6 +464,37 @@ def _трассировка(error: ASRHubError) -> Any:
     return None
 
 
+#: Приёмники уведомлений, не отвечающие несколько заходов подряд:
+#: узел → [отказов подряд, пауза до]. Общие на процесс: очередь одна.
+_УЗЛЫ_УВЕДОМЛЕНИЙ: dict[str, list[float]] = {}
+_ЗАМОК_УЗЛОВ = threading.Lock()
+
+
+def узел_на_паузе(узел: str) -> float:
+    """До какого момента узел приёмника на паузе (0 — не на паузе)."""
+    with _ЗАМОК_УЗЛОВ:
+        запись = _УЗЛЫ_УВЕДОМЛЕНИЙ.get(узел)
+        return запись[1] if запись and запись[1] > time.time() else 0.0
+
+
+def узел_ответил(узел: str, удачно: bool, *, порог: int = 3) -> None:
+    """Счёт заходов подряд без ответа; с порогового — пауза узла целиком."""
+    with _ЗАМОК_УЗЛОВ:
+        if удачно:
+            _УЗЛЫ_УВЕДОМЛЕНИЙ.pop(узел, None)
+            return
+        запись = _УЗЛЫ_УВЕДОМЛЕНИЙ.setdefault(узел, [0.0, 0.0])
+        запись[0] += 1
+        if запись[0] >= порог:
+            пауза = min(1800.0, 60.0 * 2 ** (запись[0] - порог))
+            запись[1] = time.time() + пауза
+            log.warning("Приёмник уведомлений %s не отвечает %d заходов подряд — "
+                        "пауза %.0f с", узел, int(запись[0]), пауза)
+        if len(_УЗЛЫ_УВЕДОМЛЕНИЙ) > 1024:
+            for старый in list(_УЗЛЫ_УВЕДОМЛЕНИЙ)[:512]:
+                _УЗЛЫ_УВЕДОМЛЕНИЙ.pop(старый, None)
+
+
 @dataclass
 class WorkerState:
     index: int
@@ -472,6 +504,10 @@ class WorkerState:
     stage: str = ""
     progress: float = 0.0
     busy: bool = False
+    #: Предел задания (job_timeout_s) и последний доклад движка — для сторожа
+    #: зависших (`JobQueue._сторож_зависших`).
+    срок_с: float = 0.0
+    доклад: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -807,8 +843,14 @@ class JobQueue:
                owner: str = "anonymous", api_key_name: str = "", priority: int | None = None,
                group_id: str | None = None, source: str = "api",
                tags: str = "", deadline: float | None = None,
-               reference_text: str = "", webhook_url: str = "") -> dict[str, Any]:
-        """Ставит файл в очередь. Возвращает описание задания."""
+               reference_text: str = "", webhook_url: str = "",
+               duration_s: float | None = None) -> dict[str, Any]:
+        """Ставит файл в очередь. Возвращает описание задания.
+
+        `duration_s` — длительность, уже измеренная вызывающим (загрузка
+        меряет её для квоты): без неё ffprobe запускался на тот же файл
+        второй раз.
+        """
         # Адрес уведомления приходит двумя путями: отдельным аргументом и
         # полем webhook_url внутри настроек задания. Проверялся только
         # первый, поэтому запрет на внутреннюю сеть обходился одной строкой
@@ -833,11 +875,13 @@ class JobQueue:
         spec = get_model(str(settings.get("model") or ""))
         params_digest = settings_digest(settings, weights=self._отпечаток_весов(spec))
 
-        duration = 0.0
-        try:
-            duration = probe(path).duration_s
-        except ASRHubError as exc:
-            log.info("Не удалось определить длительность «%s»: %s", filename, exc.message)
+        duration = float(duration_s or 0.0)
+        if duration <= 0:
+            try:
+                duration = probe(path).duration_s
+            except ASRHubError as exc:
+                log.info("Не удалось определить длительность «%s»: %s", filename,
+                         exc.message)
 
         # Кеш результатов по содержимому и настройкам — только среди своих
         # заданий. Общий на всех кеш говорил Бобу, что такую же запись уже
@@ -1015,6 +1059,17 @@ class JobQueue:
             "status": STATUS_COMPLETED,
             "cached_from": cached["id"],
         })
+        self._заполнить_из_кеша(job_id, cached, filename=filename,
+                                reference_text=reference_text)
+        return job_id
+
+    def _заполнить_из_кеша(self, job_id: str, cached: dict[str, Any], *,
+                           filename: str, reference_text: str = "") -> None:
+        """Переносит готовый результат `cached` в задание `job_id`.
+
+        Общая часть клона при загрузке и задания, дождавшегося своего
+        близнеца в очереди (см. `_взять_у_близнеца`).
+        """
         # Копируем каталог результатов, а не ссылаемся на чужой: иначе
         # удаление любого из двух заданий уничтожало результаты второго.
         result_path = self._copy_results(
@@ -1084,7 +1139,47 @@ class JobQueue:
             except Exception as exc:                         # noqa: BLE001
                 log.debug("Клон %s не поставлен на смысловой разбор: %s", job_id, exc)
         log.info("Задание %s: результат взят из кеша (%s)", job_id, cached["id"])
-        return job_id
+
+    def _взять_у_близнеца(self, job: dict[str, Any], merged: dict[str, Any]) -> bool:
+        """Задание, ждавшее идущего близнеца, берёт его готовый результат.
+
+        Две одинаковые записи с одинаковыми настройками, присланные почти
+        одновременно (повтор забора с АТС, двойная загрузка), раньше
+        распознавались обе: кеш при приёме находит только завершённые
+        задания, а первое ещё шло. Теперь выборка очереди не берёт задание,
+        у которого идёт близнец (`Database.ждут_близнеца`), а когда тот
+        готов — второе получает копию его результата вместо прогона модели.
+        Близнец упал или отменён — второе задание распознаётся как обычно.
+        """
+        if not merged.get("deduplicate_jobs", True):
+            return False
+        отпечаток = (job.get("params") or {}).get("_hash")
+        if not job.get("file_hash") or not отпечаток:
+            return False
+        cached = self._find_cached(str(job["file_hash"]), str(отпечаток),
+                                   owner=str(job.get("owner") or "anonymous"))
+        if cached is None or cached["id"] == job["id"]:
+            return False
+        job_id = job["id"]
+        self._заполнить_из_кеша(job_id, cached, filename=str(job.get("filename") or job_id),
+                                reference_text=str(job.get("reference_text") or ""))
+        self.db.update_job(job_id, cached_from=cached["id"], instance_id=None,
+                           heartbeat_at=None, error_code=None, error_message=None,
+                           error_hint=None, **self._уведомление_ждёт(job))
+        RUNTIME.inc("asrhub_cached_jobs_total")
+        self._emit("job.cached", {"id": job_id, "source": cached["id"]})
+        if self.content_index is not None:
+            try:
+                self.content_index.on_job_completed(
+                    job_id, self.db.get_job(job_id) or {},
+                    self.db.get_segments(str(cached["id"])))
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Задание %s не разобрано сразу: %s", job_id, exc)
+        if job.get("webhook_url"):
+            self._send_webhook(job_id)
+        if merged.get("delete_source_after"):
+            self._удалить_исходник(self.get(job_id))
+        return True
 
     # --- управление -----------------------------------------------------
 
@@ -1473,52 +1568,38 @@ class JobQueue:
         # Флаг паузы — общий для всех серверов над базой; читается вне
         # общей блокировки очереди, она нужна идущим заданиям.
         приостановлена = self._пауза_из_базы()
+        предел = int(self.settings.get("max_concurrent_jobs") or 2)
+        if приостановлена or worker_index >= предел:
+            return None
         with self._lock:
-            if приостановлена or worker_index >= int(
-                    self.settings.get("max_concurrent_jobs") or 2):
+            if len(self._running) >= предел:
                 return None
+            идущие = list(self._running)
+        per_model_limit = int(self.settings.get("max_concurrent_per_model") or 0)
+        policy = str(self.settings.get("scheduling_policy") or "priority_fifo")
+        # Кандидаты читаются вне общего замка очереди: он нужен идущим
+        # заданиям (прогресс, отмена, учёт слотов), а запрос к базе раз в
+        # секунду на каждый простаивающий воркер держал его зря. Под замком
+        # остаются только выбор и занятие слота; гонку с соседним воркером
+        # закрывает отсев по `_running` под замком и атомарный захват в базе.
+        candidates = self._кандидаты(policy, per_model_limit)
+        candidates = [c for c in candidates if c["id"] not in идущие]
+        if candidates:
+            # Задание, у которого прямо сейчас распознаётся близнец (та же
+            # запись, те же настройки, тот же владелец), ждёт его, а не
+            # гоняет модель второй раз: см. `_взять_у_близнеца`. Близнец
+            # может идти и на соседнем сервере — поэтому проверка по базе,
+            # а не только по своим слотам.
+            try:
+                ждут = self.db.ждут_близнеца([c["id"] for c in candidates], идущие)
+            except Exception as exc:                         # noqa: BLE001
+                log.debug("Близнецы в очереди не проверены: %s", exc)
+                ждут = set()
+            candidates = [c for c in candidates if c["id"] not in ждут]
+        with self._lock:
             active = len(self._running)
-            if active >= int(self.settings.get("max_concurrent_jobs") or 2):
+            if active >= предел:
                 return None
-            per_model_limit = int(self.settings.get("max_concurrent_per_model") or 0)
-
-            policy = str(self.settings.get("scheduling_policy") or "priority_fifo")
-            # Порядок предварительной выборки должен соответствовать политике,
-            # иначе она работает на случайной верхушке очереди: срочное
-            # задание с низким приоритетом не будет выбрано, пока не
-            # разгребётся всё, что стоит выше.
-            preselect = {
-                "shortest_first": "media_duration_s ASC",
-                # «По сроку» выбирает предварительно ПО СРОКУ, а не по
-                # времени создания. Раньше стояло `created_at ASC`, и
-                # срочное задание, поставленное последним, в окно выборки
-                # не попадало: на очереди из шестисот заданий при окне в
-                # пятьсот политика «по сроку» молча вырождалась в «по
-                # очереди» — то есть не работала ровно в том случае, ради
-                # которого её включают.
-                "deadline": "deadline ASC",
-                "fair_share": "created_at ASC",
-            }.get(policy, "priority DESC")
-            window = int(self.settings.get("scheduling_window") or 500)
-            if policy == "fair_share":
-                # По нескольку старших заданий на владельца, а не верх общей
-                # очереди: иначе окно целиком состоит из заданий того, кто
-                # поставил больше всех (см. `fair_share_candidates`).
-                candidates = self.db.fair_share_candidates(
-                    per_owner=max(3, per_model_limit + 2), ready_before=now(),
-                    owners=max(1, window))
-            else:
-                candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
-                                               limit=window, order=preselect, light=True,
-                                               ready_before=now())
-                if policy == "priority_fifo" and self._старение_с() > 0:
-                    # Состарившееся задание с низким приоритетом может не
-                    # попасть в окно «по приоритету» — добираем старейшие.
-                    есть = {c["id"] for c in candidates}
-                    candidates += [c for c in self.db.list_jobs(
-                        status=[STATUS_QUEUED, STATUS_RETRY], limit=min(window, 100),
-                        order="created_at ASC", light=True, ready_before=now())
-                        if c["id"] not in есть]
             candidates = [c for c in candidates if c["id"] not in self._running]
             if per_model_limit > 0:
                 candidates = [c for c in candidates
@@ -1593,6 +1674,45 @@ class JobQueue:
             self._release_slot(chosen["id"], model)
             return None
         return job
+
+    def _кандидаты(self, policy: str, per_model_limit: int) -> list[dict[str, Any]]:
+        """Окно ждущих заданий для выбора — в порядке, который требует политика."""
+        # Порядок предварительной выборки должен соответствовать политике,
+        # иначе она работает на случайной верхушке очереди: срочное
+        # задание с низким приоритетом не будет выбрано, пока не
+        # разгребётся всё, что стоит выше.
+        preselect = {
+            "shortest_first": "media_duration_s ASC",
+            # «По сроку» выбирает предварительно ПО СРОКУ, а не по
+            # времени создания. Раньше стояло `created_at ASC`, и
+            # срочное задание, поставленное последним, в окно выборки
+            # не попадало: на очереди из шестисот заданий при окне в
+            # пятьсот политика «по сроку» молча вырождалась в «по
+            # очереди» — то есть не работала ровно в том случае, ради
+            # которого её включают.
+            "deadline": "deadline ASC",
+            "fair_share": "created_at ASC",
+        }.get(policy, "priority DESC")
+        window = int(self.settings.get("scheduling_window") or 500)
+        if policy == "fair_share":
+            # По нескольку старших заданий на владельца, а не верх общей
+            # очереди: иначе окно целиком состоит из заданий того, кто
+            # поставил больше всех (см. `fair_share_candidates`).
+            return self.db.fair_share_candidates(
+                per_owner=max(3, per_model_limit + 2), ready_before=now(),
+                owners=max(1, window))
+        candidates = self.db.list_jobs(status=[STATUS_QUEUED, STATUS_RETRY],
+                                       limit=window, order=preselect, light=True,
+                                       ready_before=now())
+        if policy == "priority_fifo" and self._старение_с() > 0:
+            # Состарившееся задание с низким приоритетом может не
+            # попасть в окно «по приоритету» — добираем старейшие.
+            есть = {c["id"] for c in candidates}
+            candidates += [c for c in self.db.list_jobs(
+                status=[STATUS_QUEUED, STATUS_RETRY], limit=min(window, 100),
+                order="created_at ASC", light=True, ready_before=now())
+                if c["id"] not in есть]
+        return candidates
 
     def _note_concurrency(self) -> None:
         """Отмечает нынешнюю занятость у каждого идущего задания.
@@ -1700,9 +1820,17 @@ class JobQueue:
 
     # --- рабочий цикл -----------------------------------------------------
 
+    def _заменён(self, index: int) -> bool:
+        """Поток воркера заменён сторожем зависших — ему пора уйти."""
+        return self._потоки.get(index) not in (None, threading.current_thread())
+
     def _worker_loop(self, index: int) -> None:
         while not self._stop.is_set():
             with self._lock:
+                if self._заменён(index):
+                    log.warning("Воркер %d: поток, снятый сторожем, вернулся из движка "
+                                "и завершается", index)
+                    return
                 if index in self._retiring:
                     self._retiring.discard(index)
                     # Убираем только себя: соседи по номерам живы.
@@ -1743,6 +1871,10 @@ class JobQueue:
                 # берёт только чужие экземпляры, а свои — лишь при старте.
                 self._fail_unexpected(job, exc)
             finally:
+                if self._заменён(index):
+                    # Задание и слот уже сняты сторожем зависших, слот отдан
+                    # новому потоку — второй раз освобождать нечего.
+                    return  # noqa: B012
                 # Освобождение — одной функцией, а не второй копией здесь.
                 # Копия и разошлась: она снимала слот и счётчик модели, но не
                 # снимала отметку одновременности, и та копилась по записи на
@@ -1776,6 +1908,7 @@ class JobQueue:
         outdir = paths.results / job_id
         timeout = max(0, S.integer(merged, "job_timeout_s", 0))
         started = time.time()
+        state.срок_с, state.доклад = float(timeout), time.monotonic()
         записано: dict[str, Any] = {"при": 0.0, "стадия": None}
 
         def progress(value: float, stage: str) -> None:
@@ -1785,6 +1918,7 @@ class JobQueue:
             value = max(float(value), state.progress)
             state.progress = value
             state.stage = stage
+            state.доклад = time.monotonic()
             # В базу — не чаще раза в секунду (смена стадии — всегда): в
             # режиме журнала отката на сетевом хранилище запись на каждый
             # кусок звука — это fsync на каждый кусок. Отметку жизни ставит
@@ -1900,6 +2034,13 @@ class JobQueue:
         # задания): убрать в конце можно только его — см. ниже.
         отложенный = _отпечаток_каталога(self._прежний_путь(job_id))
         try:
+            if self._взять_у_близнеца(job, merged):
+                cleanup_workdir(workdir)
+                return
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Результат близнеца для %s не взят: %s", job_id, exc,
+                        extra={"job_id": job_id})
+        try:
             outcome = process_job(
                 Path(job["file_path"]), merged, self.registry,
                 workdir=workdir, outdir=outdir,
@@ -1928,6 +2069,24 @@ class JobQueue:
         elapsed -= ждали_модель
         job["queue_time_s"] = float(job.get("queue_time_s") or 0.0) + ждали_модель
         accuracy = outcome.stats.get("accuracy") or {}
+        # Здоровье распознавания — тут же, по тем же сегментам: галлюцинации
+        # Whisper, невозможный темп, повторы, известные фразы, разметка
+        # говорящих. Считается всегда, а не только при включённом разборе
+        # содержания: это признак самого распознавания, и сбой внутри не
+        # должен трогать результат. Пишется вместе с «готово».
+        признаки: dict[str, Any] = {}
+        try:
+            from . import quality  # noqa: PLC0415
+
+            признаки = quality.for_job(quality.assess(
+                outcome.segments,
+                expected_speakers=int(
+                    self.settings.get("quality_expected_speakers") or 0)
+                if self.settings is not None else 0))
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("Признаки качества для %s не посчитаны: %s", job_id, exc,
+                        extra={"job_id": job_id})
+        модель_задания, движок_задания = str(job.get("model")), str(job.get("engine"))
         # Реплики и отметка «готово» — одной транзакцией и одним условием
         # (см. `Database.finish_job`). Прежде реплики писались первыми, а при
         # провале отметки стирались без проверки, чьё задание: «оживший»
@@ -1987,6 +2146,15 @@ class JobQueue:
             calibration=outcome.stats.get("calibration") or None,
             **metrics_mod.job_fields(accuracy),
             **audio_profile.for_job(outcome.stats.get("audio_profile") or {}),
+            **признаки,
+            # Показатели и события — той же транзакцией (см. `finish_job`).
+            metrics=[(имя, float(значение or 0.0), модель_задания, движок_задания)
+                     for имя, значение in (
+                         ("rtf", outcome.rtf), ("processing_time_s", elapsed),
+                         ("queue_time_s", float(job.get("queue_time_s") or 0.0)),
+                         ("confidence", outcome.stats.get("avg_confidence") or 0.0))],
+            events=[*(("warning", str(w)) for w in outcome.warnings),
+                    ("completed", f"Готово за {elapsed:.1f} с, RTF {outcome.rtf:.3f}")],
         )
         if not finished:
             # Задание успели отменить или удалить, пока оно считалось, или
@@ -2006,24 +2174,6 @@ class JobQueue:
             return
         with self._lock:
             self._cancelled.discard(job_id)
-
-        # Здоровье распознавания — тут же, по тем же сегментам: галлюцинации
-        # Whisper, невозможный темп, повторы, известные фразы, разметка
-        # говорящих. Считается всегда, а не только при включённом разборе
-        # содержания: это признак самого распознавания, и сбой внутри не
-        # должен трогать результат.
-        try:
-            from . import quality  # noqa: PLC0415
-
-            оценка = quality.assess(
-                outcome.segments,
-                expected_speakers=int(
-                    self.settings.get("quality_expected_speakers") or 0)
-                if self.settings is not None else 0)
-            self.db.update_job(job_id, **quality.for_job(оценка))
-        except Exception as exc:                             # noqa: BLE001
-            log.warning("Признаки качества для %s не посчитаны: %s", job_id, exc,
-                        extra={"job_id": job_id})
 
         # Контрольный прогон второй моделью: расхождение с исходной
         # расшифровкой — в таблицу согласия моделей. Само задание — обычное,
@@ -2073,16 +2223,8 @@ class JobQueue:
                 processing_s=elapsed, words=int(outcome.stats.get("words") or 0),
                 rtf=outcome.rtf, confidence=outcome.stats.get("avg_confidence"),
                 wer=accuracy.get("wer"))
-            for name, value in (("rtf", outcome.rtf),
-                                ("processing_time_s", elapsed),
-                                ("queue_time_s", float(job.get("queue_time_s") or 0.0)),
-                                ("confidence", outcome.stats.get("avg_confidence") or 0.0)):
-                self.db.add_metric(name, value, job_id=job_id, model=str(job.get("model")),
-                                   engine=str(job.get("engine")))
-            for warning in outcome.warnings:
-                self.db.add_event(job_id, "warning", warning)
         except Exception as exc:                             # noqa: BLE001
-            log.warning("Задание %s готово, но статистика и события не записаны: %s",
+            log.warning("Задание %s готово, но статистика модели не записана: %s",
                         job_id, exc, extra={"job_id": job_id})
 
         log.info("Задание %s: готово за %.1f с, RTF %.3f", job_id, elapsed, outcome.rtf,
@@ -2095,15 +2237,7 @@ class JobQueue:
             log.info("Задание %s: текст расшифровки: %s", job_id, outcome.text,
                      extra={"job_id": job_id})
         # Дальше — только уведомление, и оно тоже не должно ронять готовое
-        # задание: сбой здесь уходил в общий обработчик, а тот пытался
-        # записать «ошибка» поверх «готово», не мог и не писал ничего —
-        # даже в журнал событий задания.
-        try:
-            self.db.add_event(job_id, "completed",
-                              f"Готово за {elapsed:.1f} с, RTF {outcome.rtf:.3f}")
-        except Exception as exc:                             # noqa: BLE001
-            log.warning("Событие «готово» для %s не записано: %s", job_id, exc,
-                        extra={"job_id": job_id})
+        # задание. Событие «готово» записано вместе с отметкой (`finish_job`).
         self._emit("job.completed", {"id": job_id, "rtf": outcome.rtf,
                                      "duration_s": elapsed})
         self._send_webhook(job_id)
@@ -2663,14 +2797,15 @@ class JobQueue:
                         extra={"job_id": job_id})
 
     def _отложить_уведомление(self, job: dict[str, Any], причина: str, *,
-                              без_попытки: bool = False) -> None:
+                              без_попытки: bool = False, до: float | None = None) -> None:
         """Неудачный заход доставки — на следующую паузу, после последней — «failed»."""
         job_id = str(job["id"])
-        строка = self.db.get_job(job_id) or {}
-        попыток = int(строка.get("webhook_attempts") or 0) + (0 if без_попытки else 1)
         if без_попытки:
-            self.db.update_job(job_id, webhook_status="pending", webhook_next_at=now())
+            self.db.update_job(job_id, webhook_status="pending",
+                               webhook_next_at=до if до else now())
             return
+        строка = self.db.get_job(job_id) or {}
+        попыток = int(строка.get("webhook_attempts") or 0) + 1
         if попыток > len(ПАУЗЫ_УВЕДОМЛЕНИЯ):
             self.db.update_job(job_id, webhook_status="failed", webhook_attempts=попыток,
                                webhook_next_at=None)
@@ -2801,6 +2936,16 @@ class JobQueue:
             return
         opener = открыватель_наружу(allow_internal)
 
+        узел = urllib.parse.urlsplit(target).netloc.lower()
+        пауза_до = узел_на_паузе(узел)
+        if пауза_до:
+            # Узел не отвечает несколько заходов подряд: уведомления к нему
+            # ждут паузы, не занимая пул доставки. Раньше каждое ждало свои
+            # попытки по 15 с, и один мёртвый приёмник держал все потоки —
+            # уведомления исправным приёмникам стояли за ним.
+            self._отложить_уведомление(job, "приёмник на паузе", без_попытки=True,
+                                       до=пауза_до)
+            return
         attempts = ПОПЫТОК_ЗА_ЗАХОД
         причина = ""
         for attempt in range(attempts):
@@ -2827,6 +2972,7 @@ class JobQueue:
                         self.db.update_job(job["id"], webhook_status=f"ok:{response.status}",
                                            webhook_next_at=None)
                         RUNTIME.inc("asrhub_webhooks_total", {"result": "ok"})
+                        узел_ответил(узел, True)
                         return
                     причина = f"ответ {response.status}"
             except ConfigError as exc:
@@ -2852,7 +2998,21 @@ class JobQueue:
                              job["id"], extra={"job_id": job["id"]})
                     self._отложить_уведомление(job, "остановка", без_попытки=True)
                     return
+                if узел_на_паузе(узел):
+                    # Пока ждали, соседний поток поставил узел на паузу.
+                    break
+        узел_ответил(узел, False, порог=JobQueue.ОТКАЗОВ_ДО_ПАУЗЫ_УЗЛА)
         self._отложить_уведомление(job, причина or "нет ответа")
+
+    #: Сколько заходов подряд без ответа ставит узел приёмника на паузу.
+    ОТКАЗОВ_ДО_ПАУЗЫ_УЗЛА = 3
+
+    def _узел_на_паузе(self, узел: str) -> float:
+        """До какого момента узел приёмника на паузе (0 — не на паузе)."""
+        return узел_на_паузе(узел)
+
+    def _узел_ответил(self, узел: str, удачно: bool) -> None:
+        узел_ответил(узел, удачно, порог=self.ОТКАЗОВ_ДО_ПАУЗЫ_УЗЛА)
 
     def _owner_of(self, job_id: str) -> str:
         """Владелец задания для адресной рассылки событий.
@@ -3041,8 +3201,8 @@ class JobQueue:
                 # запросы по указателям, а цена пропуска — задание, висящее
                 # «выполняется» до перезапуска, и результат, не дошедший до
                 # заказчика.
-                for шаг in (self._сверить_свои, self._поднять_умерших,
-                            self._дослать_уведомления):
+                for шаг in (self._сверить_свои, self._сторож_зависших,
+                            self._поднять_умерших, self._дослать_уведомления):
                     try:
                         шаг()
                     except Exception as exc:            # noqa: BLE001
@@ -3146,6 +3306,75 @@ class JobQueue:
         if возвращено:
             self._wake.set()
         return возвращено
+
+    #: Сколько ждать сверх предела задания, прежде чем снять зависшее.
+    ЗАПАС_ЗАВИСАНИЯ_С = 120.0
+
+    def _сторож_зависших(self) -> int:
+        """Снимает задание, движок которого не отвечает дольше предела.
+
+        Предел задания (`job_timeout_s`) проверяется на докладах движка о
+        ходе работы. Движок, зависший внутри своей библиотеки (драйвер
+        видеокарты, бесконечный цикл декодера), не докладывает ничего — и
+        задание висело «выполняется» вечно, занимая слот, а очередь за ним
+        стояла. Теперь задание, у которого вышел предел с запасом и давно не
+        было доклада, отмечается неудачным, слот отдаётся новому потоку
+        воркера, а экземпляр модели забывается (следующее задание загрузит
+        свой — у зависшего держится замок). Сам зависший поток прервать
+        нельзя: если он когда-нибудь вернётся, он молча завершится.
+        """
+        if self._stop.is_set():
+            return 0
+        сейчас, миг = time.time(), time.monotonic()
+        with self._lock:
+            состояния = list(self._states.items())
+        снято = 0
+        for index, state in состояния:
+            if not state.busy or not state.job_id or state.срок_с <= 0:
+                continue
+            запас = max(self.ЗАПАС_ЗАВИСАНИЯ_С, state.срок_с * 0.25)
+            if сейчас - state.started_at < state.срок_с + запас \
+                    or миг - state.доклад < запас:
+                continue
+            try:
+                if self._снять_зависшее(index, state):
+                    снято += 1
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Зависшее задание %s не снято: %s", state.job_id, exc)
+        return снято
+
+    def _снять_зависшее(self, index: int, state: WorkerState) -> bool:
+        job_id, model = str(state.job_id), str(state.model or "")
+        job = self.db.get_job(job_id) or {"id": job_id}
+        ошибка = EngineHung(int(state.срок_с), миг_доклада=time.monotonic() - state.доклад)
+        снято = self.db.update_job_if_status(
+            job_id, [STATUS_RUNNING], expected_instance=INSTANCE_ID,
+            status=STATUS_FAILED, finished_at=now(), stage="движок не отвечает",
+            error_code=ошибка.code, error_message=ошибка.message, error_hint=ошибка.hint,
+            instance_id=None, heartbeat_at=None, **self._уведомление_ждёт(job))
+        log.error("Воркер %d: движок не отвечает по заданию %s дольше предела %.0f с — "
+                  "задание снято, поток заменён", index, job_id, state.срок_с,
+                  extra={"job_id": job_id, "model": model})
+        with self._lock:
+            self._cancelled.add(job_id)
+            self._states[index] = WorkerState(index=index)
+            self._поднять_воркера(index)
+        self._release_slot(job_id, model)
+        try:
+            self.registry.забыть_занятые(model)
+        except Exception as exc:                             # noqa: BLE001
+            log.debug("Экземпляр модели %s не забыт: %s", model, exc)
+        if снято:
+            RUNTIME.inc("asrhub_jobs_total", {"status": "failed"})
+            try:
+                self.db.add_event(job_id, "failed", ошибка.message)
+            except Exception:                                # noqa: BLE001
+                pass
+            self._emit("job.failed", {"id": job_id, "error": ошибка.to_dict()})
+            if job.get("webhook_url"):
+                self._send_webhook(job_id)
+        self._wake.set()
+        return снято
 
     def _поднять_умерших(self) -> int:
         """Поднимает заново поток воркера, умерший не по команде.

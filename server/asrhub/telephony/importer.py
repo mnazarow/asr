@@ -28,6 +28,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sqlite3
@@ -36,6 +37,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +76,44 @@ log = get_logger("telephony")
 #: в архиве не было, и порция из двадцати звонков терялась для архива разом.
 _СБОИ_ХРАНЕНИЯ = (StorageError, sqlite3.Error, OSError)
 
+
+
+def обойти_свежее(корень: Path, свежее: float) -> Iterator[Path]:
+    """Файлы дерева записей — без перебора старых каталогов.
+
+    Источник «каталог записей» обходил всё дерево (`rglob`) на каждом
+    заходе, хотя глубина просмотра — неделя: на архиве за пять лет это
+    сотни тысяч `stat` раз в минуту. Каталог, в котором с начала окна не
+    появлялось и не исчезало файлов (время изменения каталога старше окна),
+    и в котором нет подкаталогов (`st_nlink == 2` на ext4 и xfs), не
+    читается вовсе: всё в нём старше окна. Каталоги с подкаталогами
+    читаются — свежие даты лежат внутри. `свежее` 0 — обходить всё.
+    """
+    стек = [корень]
+    while стек:
+        текущий = стек.pop()
+        try:
+            сведения = os.stat(текущий)
+        except OSError:
+            continue
+        старый = свежее > 0 and сведения.st_mtime < свежее
+        if старый and сведения.st_nlink == 2 and текущий != корень:
+            continue
+        try:
+            записи = sorted(os.scandir(текущий), key=lambda з: з.name)
+        except OSError:
+            continue
+        подкаталоги: list[Path] = []
+        for запись in записи:
+            try:
+                каталог_ли = запись.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if каталог_ли:
+                подкаталоги.append(Path(запись.path))
+            elif not старый:
+                yield Path(запись.path)
+        стек.extend(reversed(подкаталоги))
 
 class ОчередьОтказала(Exception):
     """Очередь распознавания не приняла задание — заход пора заканчивать.
@@ -375,7 +415,10 @@ class Импортёр:
         если_мс = lambda: round((time.perf_counter() - начало) * 1000, 1)  # noqa: E731
         if станция.source == "ami":
             итог = проверить(станция.host or "127.0.0.1", станция.port or 5038,
-                             станция.username, станция.secret)
+                             станция.username, станция.secret,
+                             tls=bool(getattr(станция, "tls", False)),
+                             ca_file=str(getattr(станция, "ca_file", "") or ""),
+                             auth=str(getattr(станция, "auth", "") or "plain"))
             итог.update({"source": "ami", "station": станция.id})
             return итог
         if станция.source == "dialplan":
@@ -561,7 +604,29 @@ class Импортёр:
             # а промах по свежему звонку пересобирает его и так.
             if self._указатель is not None and self._указатель.устарел():
                 self._указатель = None
-            return self._scan(limit=limit, всё=всё, окно=окно)
+            итог = self._scan(limit=limit, всё=всё, окно=окно)
+            self._очереди()
+            return итог
+
+    def _очереди(self) -> int:
+        """Приращение журнала очередей станции (`queue_log`), если он задан."""
+        путь = self.станция.путь("queue_log") if hasattr(self.станция, "queue_log") else None
+        if путь is None or not путь.is_file():
+            return 0
+        from . import queue_log as журнал_очередей  # noqa: PLC0415
+
+        ключ = f"telephony:queue_log:{self.id}"
+        место = self.db.get_kv(ключ) or {}
+        try:
+            события, позиция, inode = журнал_очередей.прочитать_приращение(
+                путь, int(место.get("offset") or 0), int(место.get("inode") or 0))
+        except OSError as exc:
+            log.warning("Станция «%s»: журнал очередей %s не читается: %s",
+                        self.станция.name, путь, exc)
+            return 0
+        добавлено = self.db.queue_events_add(self.id, события)
+        self.db.set_kv(ключ, {"offset": позиция, "inode": inode, "at": time.time()})
+        return добавлено
 
     def _каталог_указатель(self, каталог: Path) -> УказательЗаписей:
         if self._указатель is None or self._указатель.каталог != каталог:
@@ -1068,15 +1133,24 @@ class Импортёр:
         # оставляло сокет и сессию на станции висеть навсегда — а сессий у
         # AMI ограниченное число.
         подпись = (self.станция.host or "127.0.0.1", int(self.станция.port or 5038),
-                   self.станция.username, self.станция.secret)
+                   self.станция.username, self.станция.secret,
+                   bool(getattr(self.станция, "tls", False)),
+                   str(getattr(self.станция, "ca_file", "") or ""),
+                   str(getattr(self.станция, "auth", "") or "plain"))
         if self._ami is not None and self._подпись_ami != подпись:
             log.info("Настройки AMI изменились — соединение открывается заново")
             self._закрыть_ami()
         клиент = self._ami
         if клиент is None:
-            клиент = AMIClient(*подпись)
+            клиент = AMIClient(*подпись[:4], tls=подпись[4], ca_file=подпись[5],
+                               auth=подпись[6])
             try:
                 клиент.connect()
+                # Сокет вычитывается всё время, а не пять секунд в минуту:
+                # иначе загруженная станция рвёт сессию, которую не читают.
+                фон = getattr(клиент, "читать_в_фоне", None)
+                if callable(фон):
+                    фон()
             except AMIError:
                 if self._ami_оборвана is None:
                     self._ami_оборвана = time.time()
@@ -1285,7 +1359,7 @@ class Импортёр:
         свежее = 0.0 if всё else \
             time.time() - float(self.станция.lookback_days or 7) * 86400
         звонки: list[Звонок] = []
-        for путь in sorted(каталог.rglob("*")):
+        for путь in обойти_свежее(каталог, свежее):
             if len(звонки) >= limit:
                 break
             try:

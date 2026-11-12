@@ -174,13 +174,23 @@ async def _прочитать(request: Request) -> tuple[dict[str, Any], UploadF
     форма = None
     if вид in ("multipart/form-data", "application/x-www-form-urlencoded"):
         форма = await request.form(max_files=2, max_fields=200)
+        дорожки: dict[str, UploadFile] = {}
         for имя, значение in форма.multi_items():
             if isinstance(значение, UploadFile):
-                if файл is None and (значение.filename or "").strip():
+                if not (значение.filename or "").strip():
+                    continue
+                # Раздельные дорожки MixMonitor r()/t(): клиент и оператор.
+                if имя in ("file_in", "file_out"):
+                    дорожки[имя] = значение
+                elif файл is None:
                     файл = значение
                 continue
             if имя != "api_key":
                 поля[имя] = значение
+        if len(дорожки) == 2:
+            # Обе стороны — в одном запросе: сводятся в стерео при приёме
+            # (`_сохранить_дорожки`), смешанный файл тогда не нужен.
+            поля["_дорожки"] = дорожки
     elif вид == "application/json":
         try:
             данные = json.loads((await request.body()) or b"{}")
@@ -202,6 +212,30 @@ async def _прочитать(request: Request) -> tuple[dict[str, Any], UploadF
             поля.update({к: з for к, з in parse_qsl(текст, keep_blank_values=False)
                          if к != "api_key"})
     return поля, файл, форма
+
+
+def _сохранить_дорожки(state: Any, дорожки: dict[str, UploadFile]) -> tuple[Path, int]:
+    """Две дорожки MixMonitor r()/t() → одна стереозапись в каталоге загрузок.
+
+    Левый канал — клиент (r(), что пришло в канал), правый — оператор (t(),
+    что ушло из канала). Так «кто говорит» известен точно, без разделения
+    по голосам: разговор разбирается по каналам, как стерео от станции.
+    """
+    from ..phone_compat import _merge_to_stereo  # noqa: PLC0415
+
+    части: list[Path] = []
+    try:
+        for имя in ("file_in", "file_out"):
+            загрузка = дорожки[имя]
+            расширение = Д.проверить_расширение(Path(str(загрузка.filename)).name)
+            путь, _ = _сохранить(state, загрузка, расширение)
+            части.append(путь)
+        цель = Path(state.settings.paths.uploads) / f"{new_id('up')}.wav"
+        _merge_to_stereo(части[0], части[1], цель)
+        return цель, цель.stat().st_size
+    finally:
+        for часть in части:
+            часть.unlink(missing_ok=True)
 
 
 def _сохранить(state: Any, файл: UploadFile, расширение: str) -> tuple[Path, int]:
@@ -253,7 +287,7 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
     наладке диалплана это единственное место, где видно, что станция
     прислала и что ей ответили.
     """
-    поля, лишние = Д.разобрать_поля(сырые)
+    поля, лишние = Д.разобрать_поля({к: з for к, з in сырые.items() if к != "_дорожки"})
     проба = Д.да(поля.get("dry_run"))
     отметка: dict[str, Any] = {
         "ip": адрес, "key": principal.name, "station": "",
@@ -337,7 +371,22 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
 
         путь: Path | None = None
         готов = False
-        if загрузка is not None:
+        дорожки = сырые.get("_дорожки") if isinstance(сырые.get("_дорожки"), dict) else None
+        не_записывать = str(поля.get("record") or "").strip() in ("0", "no", "нет", "false")
+        if не_записывать:
+            # «Не записывать этот звонок» — сервисный код в разговоре. Звонок
+            # остаётся в журнале, а запись не принимается и не хранится.
+            загрузка, дорожки = None, None
+            поля.pop("recording", None)
+        if дорожки and not проба:
+            сохранённый, размер = _сохранить_дорожки(state, дорожки)
+            путь = сохранённый
+            готов = True
+            отметка["bytes"] = размер
+            отметка["mode"] = "tracks"
+            тело["bytes"] = размер
+            тело["tracks"] = True
+        elif загрузка is not None:
             расширение = Д.проверить_расширение(Path(str(загрузка.filename)).name)
             готов = True
             if not проба:
@@ -404,6 +453,23 @@ def _принять(state: Any, principal: Principal, сырые: dict[str, Any]
                 # Для станции это не отказ — повторять ей нечего.
                 почему = "очередь отказала"
         строка = _строка(state, ключ) or {}
+        if почему is not None and не_записывать and not строка.get("job_id"):
+            почему = "не записывать: попросили в разговоре"
+            state.db.save_call(ключ, skipped=почему, recording="")
+        elif почему is not None and поля.get("recording_rejected") \
+                and not строка.get("job_id") and путь is None:
+            # Сценарий отправки шлёт звонок без записи, которую сервер не
+            # принял (413 или 415), а копию с записью держит в failed/:
+            # пометка говорит, где искать, и позволяет дослать запись.
+            код = re.sub(r"[^0-9]", "", str(поля.get("recording_rejected")))[:3] or "?"
+            почему = f"сервер не принял запись (код {код}): копия звонка — в failed/ станции"
+            state.db.save_call(ключ, skipped=почему)
+        метка = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_.:+-]", "", str(поля.get("tag") or ""))[:64]
+        if метка and строка.get("job_id"):
+            задание = state.db.get_job(str(строка["job_id"])) or {}
+            метки = [м for м in str(задание.get("tags") or "").split(",") if м]
+            if метка not in метки:
+                state.db.update_job(str(строка["job_id"]), tags=",".join([*метки, метка]))
         if почему is None:
             тело.update({"result": "queued", "job_id": строка.get("job_id")})
             Д.журнал.отметить(**отметка, result="queued", job_id=строка.get("job_id"))
@@ -462,6 +528,14 @@ _ПОЛЯ_ОПИСАНИЯ = {
     "duration": {"type": "integer", "description": "длительность звонка, с"},
     "started_at": {"type": "string", "description": "секунды эпохи или ГГГГ-ММ-ДД ЧЧ:ММ:СС"},
     "userfield": {"type": "string", "description": "метка для поиска"},
+    "tag": {"type": "string", "description": "метка звонка — в метки задания"},
+    "record": {"type": "string", "description": "0 — не записывать этот звонок"},
+    "recording_rejected": {"type": "string",
+                           "description": "код, с которым сервер не принял запись"},
+    "file_in": {"type": "string", "format": "binary",
+                "description": "дорожка клиента (MixMonitor r())"},
+    "file_out": {"type": "string", "format": "binary",
+                 "description": "дорожка оператора (MixMonitor t())"},
     "dry_run": {"type": "string", "description": "1 — проба без записи в архив"},
 }
 
@@ -649,6 +723,10 @@ def config(request: Request,
            key_in: str = Query("header", description="Ключ в заголовке или в адресе"),
            trunk: str = Query("provider", description="Имя транка в примерах"),
            internal_len: int = Query(3, description="Длина внутреннего номера в примерах"),
+           # Строкой, а не bool: страница шлёт «tracks=» пустым, когда флажок
+           # снят, и bool-параметр отвечал на это 422 — раздел не собирал файлы.
+           tracks: str = Query("", max_length=8, description="Писать стороны раздельно: "
+                                                             "MixMonitor r()/t() (1/yes/true)"),
            principal: Principal = Depends(authenticate)) -> dict[str, Any]:
     require_write(principal)
     state = get_state(request)
@@ -656,7 +734,7 @@ def config(request: Request,
         п = К.параметры(driver=driver, mode=mode, station=station,
                         url=url or _адрес_сервера(request, state), base=base,
                         format=format, key_in=key_in, trunk=trunk,
-                        internal_len=internal_len)
+                        internal_len=internal_len, tracks=tracks)
     except ValueError as exc:
         raise error_response(ConfigError(f"Параметры настройки: {exc}.")) from exc
     return К.собрать(п, версия=str(state.version))

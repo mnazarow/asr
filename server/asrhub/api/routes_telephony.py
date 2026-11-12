@@ -185,7 +185,69 @@ def status(request: Request,
     # нужна раскрытию числа в список звонков: список открывают позже, и
     # звонки, начавшиеся после этого ответа, в него попасть не должны.
     свод["window"] = {"since": None, "until": верх}
+    # Итог суточной сверки «станция ↔ архив» — администратору.
+    if principal.is_admin:
+        from ..telephony.reconcile import KV_СВЕРКА  # noqa: PLC0415
+
+        свод["reconcile"] = get_state(request).db.get_kv(KV_СВЕРКА)
     return свод
+
+
+@router.post("/reconcile", summary="Сверить станции с архивом за вчера")
+def reconcile(request: Request,
+              principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Суточная сверка — сейчас, не дожидаясь обслуживания (только администратору)."""
+    require_admin(principal)
+    from ..telephony import reconcile as сверка  # noqa: PLC0415
+
+    state = get_state(request)
+    итоги = сверка.сверить_все(state.db, state.settings)
+    return {"items": итоги, "ok": all(и.get("ok", True) for и in итоги)}
+
+
+@router.get("/conversations", summary="Разговоры: ноги одного linkedid — одной строкой")
+def conversations(request: Request,
+                  period: str = Query(default="week", pattern="^(day|week|month|quarter|year)$"),
+                  station: str = Query(default="", max_length=64),
+                  transferred: bool = Query(default=False,
+                                            description="только разговоры с переводом"),
+                  limit: int = Query(default=200, ge=1, le=2000),
+                  principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Кто участвовал, сколько было переводов, сколько длился разговор целиком.
+
+    Охват — как у остальных разделов телефонии: свои звонки и подразделения.
+    """
+    дней = {"day": 1, "week": 7, "month": 30, "quarter": 91, "year": 365}[period]
+    верх = time.time()
+    начало = верх - дней * 86400
+    итог = get_state(request).db.conversations(
+        owner=scope_owner(principal), station=station, since=начало, until=верх,
+        limit=limit, only_transferred=transferred)
+    итог.update({"period": period, "station": station,
+                 "window": {"since": начало, "until": верх}})
+    return итог
+
+
+@router.get("/queues", summary="Очереди: ожидание, брошенные, уровень обслуживания")
+def queues(request: Request, period: str = Query(default="week",
+                                                 pattern="^(day|week|month|quarter|year)$"),
+           station: str = Query(default="", max_length=64),
+           threshold_s: float = Query(default=20.0, ge=1, le=600),
+           principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Свод событий `queue_log` за период: по очередям и по операторам.
+
+    Только администратору: в событиях — номера звонков и добавочные.
+    """
+    require_admin(principal)
+    from ..telephony import queue_log as журнал_очередей  # noqa: PLC0415
+
+    дней = {"day": 1, "week": 7, "month": 30, "quarter": 91, "year": 365}[period]
+    начало = time.time() - дней * 86400
+    события = get_state(request).db.queue_events(station=station, since=начало)
+    итог = журнал_очередей.свод(события, порог_с=threshold_s)
+    итог.update({"period": period, "station": station, "events": len(события),
+                 "window": {"since": начало, "until": time.time()}})
+    return итог
 
 
 @router.get("/stations", summary="Список станций")
@@ -377,6 +439,8 @@ def overview(request: Request,
         "window": {"since": начало, "until": верх},
         "enabled": свод["enabled"], "running": свод["running"],
         "configured": свод["configured"], "stations": свод["stations"],
+        # Итог суточной сверки «станция ↔ архив» (раздел «АТС»).
+        "reconcile": db.get_kv("telephony:reconcile") if principal.is_admin else None,
         "calls": db.call_counts(owner=владелец, station=station),
         "period_calls": _свести_период(свои),
         "by_station": по_станциям,

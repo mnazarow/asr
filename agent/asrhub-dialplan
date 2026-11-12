@@ -57,6 +57,11 @@ ASRHUB_CACERT=""
 ASRHUB_INSECURE="no"
 # Сколько суток хранить отвергнутые сервером звонки (failed/); 0 — вечно.
 ASRHUB_FAILED_DAYS=30
+# Предохранитель: сервер не ответил ни на одну попытку — следующие ASRHUB_DOWN_S
+# секунд новые звонки сразу ложатся в pending/, без процесса повторов на
+# каждый отбой; досылку ведёт --resend (одна проба за заход).
+# 0 — предохранитель выключен.
+ASRHUB_DOWN_S=${ASRHUB_DOWN_S:-300}
 
 if [ -r "$CONF" ]; then
     # shellcheck disable=SC1090
@@ -104,7 +109,27 @@ safe_value() {
     return 0
 }
 
-KNOWN_FIELDS=" uniqueid linkedid sequence src dst clid agent direction queue context channel dstchannel disposition dialstatus answered duration billsec started_at userfield accountcode station ready "
+KNOWN_FIELDS=" uniqueid linkedid sequence src dst clid agent direction queue context channel dstchannel disposition dialstatus answered duration billsec started_at userfield accountcode station ready tag record "
+
+# --- предохранитель ----------------------------------------------------------
+#
+# Сервер лежит — каждый отбой запускал фоновый sh на несколько минут повторов,
+# и в час пик их набиралась сотня. Отметка «сервер недоступен до T» в каталоге
+# очереди: пока она жива, новый звонок сразу кладётся в pending/.
+
+down_mark() { printf '%s' "$ASRHUB_SPOOL/.down_until"; }
+
+server_down() {
+    [ -f "$(down_mark)" ] || return 1
+    until=$(cat "$(down_mark)" 2>/dev/null | tr -cd '0-9')
+    [ -n "$until" ] && [ "$(date +%s)" -lt "$until" ]
+}
+
+mark_down() {
+    printf '%s\n' "$(( $(date +%s) + ${ASRHUB_DOWN_S:-300} ))" >"$(down_mark)" 2>/dev/null
+}
+
+mark_up() { rm -f "$(down_mark)" 2>/dev/null; }
 
 # --- очередь повтора ---------------------------------------------------------
 #
@@ -163,7 +188,7 @@ write_call() {
             *) log "аргумент без «=» пропущен"; continue ;;
         esac
         [ -n "$value" ] || continue
-        if [ "$key" != "file" ]; then
+        if [ "$key" != "file" ] && [ "$key" != "file_in" ] && [ "$key" != "file_out" ]; then
             case "$KNOWN_FIELDS" in
                 *" $key "*) ;;
                 *) log "поле «$key» неизвестно — пропущено"; continue ;;
@@ -229,6 +254,8 @@ post_once() {
     answer="$callfile.answer"
     set --
     file=""
+    file_in=""
+    file_out=""
     ready=0
     talked=""
     while IFS= read -r line; do
@@ -236,6 +263,9 @@ post_once() {
         value=${line#*=}
         case "$key" in
             file) file=$value ;;
+            file_in) file_in=$value ;;
+            file_out) file_out=$value ;;
+            rejected) set -- "$@" --form-string "recording_rejected=$value" ;;
             ready) ready=1 ;;
             *) set -- "$@" --form-string "$key=$value" ;;
         esac
@@ -263,14 +293,31 @@ post_once() {
     if [ "$dry" = 1 ]; then
         set -- "$@" --form-string "dry_run=1"
     fi
-    if [ -n "$file" ] && [ "$with_file" = 1 ]; then
+    # Раздельные дорожки MixMonitor r()/t(): клиент и оператор отдельно —
+    # сервер сводит их в стерео и знает «кто говорит» без разделения по
+    # голосам. Шлются вместо смешанного файла, если обе на месте.
+    tracks=0
+    if [ -n "$file_in" ] && [ -n "$file_out" ] && [ "$with_file" = 1 ] \
+            && [ "$ASRHUB_SEND_MODE" != "path" ]; then
+        case "$file_in" in /*) ;; *) file_in="$ASRHUB_RECORDINGS/$file_in" ;; esac
+        case "$file_out" in /*) ;; *) file_out="$ASRHUB_RECORDINGS/$file_out" ;; esac
         if [ "$ready" != 1 ] && [ "$dry" != 1 ]; then
+            wait_file "$file_in" "$ASRHUB_WAIT_S" >/dev/null 2>&1
+            wait_file "$file_out" 5 >/dev/null 2>&1
+        fi
+        if [ -f "$file_in" ] && [ -f "$file_out" ]; then
+            set -- "$@" -F "file_in=@$file_in" -F "file_out=@$file_out"
+            tracks=1
+        fi
+    fi
+    if [ -n "$file" ] && [ "$with_file" = 1 ]; then
+        if [ "$ready" != 1 ] && [ "$dry" != 1 ] && [ "$tracks" = 0 ]; then
             limit=$ASRHUB_WAIT_S
             [ "$talked" = no ] && limit=5
             wait_file "$file" "$limit" ||
                 log "$(basename "$callfile"): записи $file нет — звонок уйдёт без неё"
         fi
-        if [ -f "$file" ]; then
+        if [ "$tracks" = 0 ] && [ -f "$file" ]; then
             if [ "$ASRHUB_SEND_MODE" = "path" ]; then
                 set -- "$@" --form-string "recording=$file" --form-string "ready=1"
             else
@@ -327,12 +374,19 @@ deliver() {
             200|202)
                 log "$name: принят, ответ $code: $(summary "$callfile.answer")"
                 rm -f "$callfile" "$callfile.answer"
+                mark_up
                 return 0 ;;
             413|415)
                 if [ "$with_file" = 1 ]; then
                     # Запись не принята (велика или не тот формат) — звонок
-                    # всё равно нужен в журнале: шлём его ещё раз без записи.
-                    log "$name: запись отвергнута ($code: $(summary "$callfile.answer")) — шлём без неё"
+                    # всё равно нужен в журнале: шлём его ещё раз без записи,
+                    # с пометкой «сервер не принял запись», а копию звонка с
+                    # записью оставляем в failed/: после правки предела её
+                    # дошлёт --resend-failed (сервер примет запись к звонку).
+                    log "$name: запись отвергнута ($code: $(summary "$callfile.answer")) — шлём без неё, копия в failed/"
+                    cp "$callfile" "$ASRHUB_SPOOL/failed/$(basename "$callfile")" 2>/dev/null
+                    cp "$callfile.answer" "$ASRHUB_SPOOL/failed/$(basename "$callfile").answer" 2>/dev/null
+                    printf 'rejected=%s\n' "$code" >>"$callfile"
                     with_file=0
                     continue
                 fi
@@ -353,6 +407,8 @@ deliver() {
         attempt=$((attempt + 1))
     done
     log "$name: не отправлен за $attempt попыток — в очереди повтора"
+    # Не ответил ни разу — предохранитель: следующие звонки сразу в pending/.
+    [ "$last_code" = 000 ] && [ "${ASRHUB_DOWN_S:-0}" -gt 0 ] 2>/dev/null && mark_down
     rm -f "$callfile.answer"
     mv "$callfile" "$ASRHUB_SPOOL/pending/" 2>/dev/null
     return 1
@@ -364,6 +420,13 @@ send_mode() {
     configured
     choose_spool || { log "нет каталога для очереди — звонок не записан"; exit 0; }
     callfile=$(write_call "$@") || exit 0
+    if server_down; then
+        # Сервер недавно не отвечал: звонок сразу ждёт досылки, без процесса
+        # повторов на каждый отбой. Запись дождётся --resend.
+        mv "$callfile" "$ASRHUB_SPOOL/pending/" 2>/dev/null
+        log "$(basename "$callfile" .call): сервер недоступен (предохранитель) — в очереди повтора"
+        exit 0
+    fi
     if [ "${ASRHUB_FOREGROUND:-0}" = 1 ]; then
         deliver "$callfile" "$ASRHUB_RETRIES"
         exit $?
@@ -439,6 +502,10 @@ pulse() {
 status_mode() {
     configured
     printf 'Сервер: %s\nСтанция: %s\n' "$ASRHUB_URL" "${ASRHUB_STATION:-(единственная)}"
+    if server_down; then
+        printf 'Предохранитель: сервер недоступен до %s — новые звонки сразу в pending/\n' \
+            "$(date -d "@$(cat "$(down_mark)")" '+%H:%M:%S' 2>/dev/null || cat "$(down_mark)")"
+    fi
     for spool in "$ASRHUB_SPOOL" "$FALLBACK_SPOOL"; do
         [ -n "$spool" ] && [ -d "$spool" ] || continue
         printf '\nОчередь %s:\n' "$spool"

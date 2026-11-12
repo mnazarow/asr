@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **241**, операций: **269**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **246**, операций: **274**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -127,6 +127,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/analytics/export` | Выгрузка аналитики в таблицу | любой действующий ключ |
 | `GET` | `/api/analytics/{section}` | Отдельный раздел аналитики | любой ключ; выборка сужается до его заданий |
 | `GET` | `/api/audit` | Журнал доступа: кто, когда и что сделал | ключ с ролью **admin** |
+| `GET` | `/api/audit/verify` | Проверка целостности журнала доступа | ключ с ролью **admin** |
 | `POST` | `/api/auth/login` | Вход по логину и паролю | без ключа: это и есть вход |
 | `POST` | `/api/auth/logout` | Выход | без ключа: это и есть вход |
 | `GET` | `/api/auth/me` | Кто я | любой действующий ключ |
@@ -313,9 +314,9 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/qc/stoplist` | Список «не звонить» | ключ с ролью **admin** |
 | `POST` | `/api/qc/stoplist` | Внести номер в список «не звонить» | ключ с ролью **admin** |
 | `DELETE` | `/api/qc/stoplist/{number}` | Убрать номер из списка «не звонить» | ключ с ролью **admin** |
-| `GET` | `/api/qc/summary` | Оценки клиентов за период | ключ с ролью **admin** |
-| `GET` | `/api/qc/surveys` | Журнал опросов | ключ с ролью **admin** |
-| `GET` | `/api/qc/surveys/export` | Выгрузка опросов в CSV | ключ с ролью **admin** |
+| `GET` | `/api/qc/summary` | Оценки клиентов за период | любой действующий ключ |
+| `GET` | `/api/qc/surveys` | Журнал опросов | любой действующий ключ |
+| `GET` | `/api/qc/surveys/export` | Выгрузка опросов в CSV или Excel | любой действующий ключ |
 | `POST` | `/api/qc/surveys/{survey_id}/cancel` | Отменить ждущий опрос | ключ с ролью **admin** |
 | `POST` | `/api/qc/test-call` | Пробный звонок с опросом | ключ с ролью **admin** |
 | `POST` | `/api/qc/tts` | Прослушать фразу голосом опроса | ключ с ролью **admin** |
@@ -350,6 +351,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/telephony/agent/command` | Задание для агента, если оно есть | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/telephony/agent/hello` | Агент сообщает о себе и получает задание | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/install.sh` | Установщик агента для станции | ключ с правом записи (**admin** или **user**) |
+| `POST` | `/api/telephony/agent/queue_log` | Строки журнала очередей со станции агента | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agents` | Агенты, поставленные на станции | ключ с ролью **admin** |
 | `DELETE` | `/api/telephony/agents/{agent_id}` | Убрать агента | ключ с ролью **admin** |
 | `POST` | `/api/telephony/agents/{agent_id}/command` | Задание агенту | ключ с ролью **admin** |
@@ -358,6 +360,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/telephony/calls` | Журнал импортированных звонков | любой ключ; выборка сужается до его заданий |
 | `GET` | `/api/telephony/collect` | Ход сбора архива | ключ с ролью **admin** |
 | `POST` | `/api/telephony/collect` | Собрать весь архив станции или его часть | ключ с ролью **admin** |
+| `GET` | `/api/telephony/conversations` | Разговоры: ноги одного linkedid — одной строкой | любой действующий ключ |
 | `POST` | `/api/telephony/diagnose` | Почему со станции не приходят звонки | ключ с ролью **admin** |
 | `GET` | `/api/telephony/dialplan/asrhub-dialplan` | Сценарий отправки звонков для станции | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/telephony/dialplan/call` | Звонок из диалплана Asterisk | ключ с правом записи (**admin** или **user**) |
@@ -368,6 +371,8 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `GET` | `/api/telephony/dialplan/status` | Приём из диалплана: станции, счётчики, журнал | ключ с ролью **admin** |
 | `GET` | `/api/telephony/dimensions` | Очереди и операторы для отбора | любой ключ; выборка сужается до его заданий |
 | `GET` | `/api/telephony/overview` | Всё для раздела «АТС» одним ответом | любой действующий ключ |
+| `GET` | `/api/telephony/queues` | Очереди: ожидание, брошенные, уровень обслуживания | ключ с ролью **admin** |
+| `POST` | `/api/telephony/reconcile` | Сверить станции с архивом за вчера | ключ с ролью **admin** |
 | `POST` | `/api/telephony/rewind` | Забыть позицию чтения журнала | ключ с ролью **admin** |
 | `POST` | `/api/telephony/scan` | Заход за новыми звонками прямо сейчас | ключ с ролью **admin** |
 | `GET` | `/api/telephony/stations` | Список станций | любой действующий ключ |
@@ -417,7 +422,7 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `limit` | в адресе | integer | `50` | — |
 | `offset` | в адресе | integer | `0` | — |
 | `order` | в адресе | string | `created_at DESC` | — |
-| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent), по здоровью распознавания (suspect, hallucination, speakers_mismatch), по звуку на входе (bad_audio, noisy, clipped) или по ответу языковой модели (llm_unresolved, llm_actions, llm_missing, llm_failed, llm_done, outcome:<исход>, reason:<причина>) |
+| `content` | в адресе | string | — | Отбор по содержанию разговора (negative, positive, downturn, recovered, alerts, open_commitments, interruptions, silence, script_failed, money, monologue, mixed, dead_air, frustrated, repeat, profanity, profanity_agent), по здоровью распознавания (suspect, hallucination, speakers_mismatch), по звуку на входе (bad_audio, noisy, clipped) или по ответу языковой модели (llm_unresolved, llm_actions, llm_missing, llm_failed, llm_done, outcome:<исход>, reason:<причина>) или по оценке клиента из опроса (qc:low, qc:mid, qc:high, qc:any, qc:none) |
 | `light` | в адресе | boolean | `False` | Только поля для таблицы, без текста и сегментов |
 
 **Пример**
@@ -958,7 +963,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:2455",
+  "instance": "vm:21336-b2cc0e",
   "instances": [],
   "workers": [
     {
@@ -1558,7 +1563,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794444496.3932054,
+    "generated_at": 1794451954.1133611,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1725,8 +1730,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.31",
-  "uptime_s": 1.7,
+  "version": "3.1.32",
+  "uptime_s": 4.4,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1806,8 +1811,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.31",
-  "uptime_s": 1.8,
+  "version": "3.1.32",
+  "uptime_s": 4.5,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1816,8 +1821,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 7.2,
-    "disk_free_gb": 24.8,
+    "ram_available_gb": 7.1,
+    "disk_free_gb": 24.0,
     "gpus": [],
     "accelerator": "cpu",
     "cuda_version": "",
@@ -2566,8 +2571,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793839696.4559433,
-    "until": 1794444496.4559433
+    "since": 1793847154.1937199,
+    "until": 1794451954.1937199
   }
 }
 ```
@@ -2959,7 +2964,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 7.2,
+    "free_gb": 7.1,
     "reserve_gb": 4.0,
     "budget_gb": 3.0,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
@@ -3673,6 +3678,29 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 **Доступ:** ключ с правом записи (**admin** или **user**).
 
 
+### `POST /api/telephony/agent/queue_log`
+
+Строки журнала очередей со станции агента.
+
+Строки `queue_log` станции: `{"agent_id": …, "lines": ["…|…", …]}`.
+
+Агент (или любой отправщик — `tail -F queue_log | …`) присылает строки
+как есть; сервер разбирает события очередей и складывает их по станции
+агента. Повтор тех же строк не задваивает событий.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+**Тело запроса** — JSON:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": true,
+  "title": "Данные"
+}
+```
+
 ### `GET /api/telephony/agents`
 
 Агенты, поставленные на станции.
@@ -3822,6 +3850,24 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 }
 ```
 
+### `GET /api/telephony/conversations`
+
+Разговоры: ноги одного linkedid — одной строкой.
+
+Кто участвовал, сколько было переводов, сколько длился разговор целиком.
+
+Охват — как у остальных разделов телефонии: свои звонки и подразделения.
+
+**Доступ:** любой действующий ключ.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+| `station` | в адресе | string | — | — |
+| `transferred` | в адресе | boolean | `False` | только разговоры с переводом |
+| `limit` | в адресе | integer | `200` | — |
+
 ### `POST /api/telephony/diagnose`
 
 Почему со станции не приходят звонки.
@@ -3933,6 +3979,7 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 | `key_in` | в адресе | string | `header` | Ключ в заголовке или в адресе |
 | `trunk` | в адресе | string | `provider` | Имя транка в примерах |
 | `internal_len` | в адресе | integer | `3` | Длина внутреннего номера в примерах |
+| `tracks` | в адресе | boolean | `False` | Писать стороны раздельно: MixMonitor r()/t() |
 
 ### `DELETE /api/telephony/dialplan/key/{station_id}`
 
@@ -4018,6 +4065,32 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 | `period` | в адресе | string | `week` | — |
 | `station` | в адресе | string | — | — |
 | `bucket` | в адресе | string | — | — |
+
+### `GET /api/telephony/queues`
+
+Очереди: ожидание, брошенные, уровень обслуживания.
+
+Свод событий `queue_log` за период: по очередям и по операторам.
+
+Только администратору: в событиях — номера звонков и добавочные.
+
+**Доступ:** ключ с ролью **admin**.
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `period` | в адресе | string | `week` | — |
+| `station` | в адресе | string | — | — |
+| `threshold_s` | в адресе | number | `20.0` | — |
+
+### `POST /api/telephony/reconcile`
+
+Сверить станции с архивом за вчера.
+
+Суточная сверка — сейчас, не дожидаясь обслуживания (только администратору).
+
+**Доступ:** ключ с ролью **admin**.
+
 
 ### `POST /api/telephony/rewind`
 
@@ -4558,6 +4631,20 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/review?status=pendi
 | `query` | в адресе | string | — | — |
 | `failed_only` | в адресе | boolean | `False` | — |
 
+### `GET /api/audit/verify`
+
+Проверка целостности журнала доступа.
+
+Проверяет цепочку хешей журнала доступа.
+
+Каждая строка несёт sha256 от хеша предыдущей и своих полей: правка
+строки или удалённые посреди журнала строки рвут цепочку, и ответ
+называет первую несошедшуюся (`broken_id`). Строки, записанные до
+появления цепочки, хеша не имеют и считаются отдельно (`legacy`). Только администратору.
+
+**Доступ:** ключ с ролью **admin**.
+
+
 ## Обратная запись в CRM
 
 Проверка того, что уйдёт в Bitrix24 или amoCRM: адрес, заголовки и тело запроса. По умолчанию ничего не отправляется — комментарий, попавший не в ту карточку, из ленты уже не убрать.
@@ -4967,14 +5054,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 1.8,
+  "uptime_s": 4.5,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 2 с",
+        "detail": "работает 5 с",
         "hint": ""
       },
       {
@@ -5009,7 +5096,7 @@ curl http://сервер:8080/api/monitoring/health
       {
         "name": "disk",
         "status": "ok",
-        "detail": "свободно 24.8 ГБ",
+        "detail": "свободно 24.0 ГБ",
         "hint": ""
 …
 ```
@@ -5745,8 +5832,9 @@ NPS (`content_nps_shift`), если опросов достаточно; при�
 
 Сколько опросов, какая доля дозвона и ответа, средняя оценка — всего,
 по группам, по добавочным и по вопросам с распределением нажатий.
+Не администратору — по звонкам своего подразделения.
 
-**Доступ:** ключ с ролью **admin**.
+**Доступ:** любой действующий ключ.
 
 
 | Параметр | Где | Тип | По умолчанию | Описание |
@@ -5758,7 +5846,7 @@ NPS (`content_nps_shift`), если опросов достаточно; при�
 
 Журнал опросов.
 
-**Доступ:** ключ с ролью **admin**.
+**Доступ:** любой действующий ключ.
 
 
 | Параметр | Где | Тип | По умолчанию | Описание |
@@ -5773,12 +5861,13 @@ NPS (`content_nps_shift`), если опросов достаточно; при�
 
 ### `GET /api/qc/surveys/export`
 
-Выгрузка опросов в CSV.
+Выгрузка опросов в CSV или Excel.
 
 Тот же отбор, что у журнала, — все строки, по колонке на каждый
-вопрос группы. CSV для Excel: разделитель «;», UTF-8 с BOM.
+вопрос группы. CSV для Excel: разделитель «;», UTF-8 с BOM. XLSX — книга
+из двух листов: журнал опросов и отчёт (оценки по группам и добавочным).
 
-**Доступ:** ключ с ролью **admin**.
+**Доступ:** любой действующий ключ.
 
 
 | Параметр | Где | Тип | По умолчанию | Описание |
@@ -5788,6 +5877,7 @@ NPS (`content_nps_shift`), если опросов достаточно; при�
 | `ext` | в адресе | string | — | Добавочный номер |
 | `search` | в адресе | string | — | Часть номера клиента |
 | `since_days` | в адресе | integer | `30` | — |
+| `fmt` | в адресе | string | `csv` | csv или xlsx (книга с листом отчёта) |
 
 ### `POST /api/qc/surveys/{survey_id}/cancel`
 

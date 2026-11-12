@@ -55,6 +55,9 @@ PROFILE=""
 ENGINES=""
 MODELS=""
 CREATE_SERVICE=1
+# Базовые зависимости ровно тех версий, с которыми выпуск проверен
+# (requirements/constraints.txt): воспроизводимая установка.
+PINNED=0
 SERVICE_USER=""
 OFFLINE=0
 FORCE=0
@@ -133,6 +136,8 @@ usage() {
 
 Служба и права
   --no-service          Не создавать службу автозапуска
+  --pinned              Базовые зависимости — ровно проверенных версий
+                        (requirements/constraints.txt)
   --user ИМЯ            Пользователь, от которого работает служба (должен
                         существовать; без ключа заводится системный asrhub)
   --name ИМЯ            Имя службы — для второй установки на той же машине
@@ -222,6 +227,7 @@ while [[ $# -gt 0 ]]; do
     --no-gpu-driver) GPU_DRIVER="none"; shift ;;
     --force-gpu-driver) ASRHUB_FORCE_GPU_DRIVER=1; export ASRHUB_FORCE_GPU_DRIVER; shift ;;
     --no-service)  CREATE_SERVICE=0; shift ;;
+    --pinned)      PINNED=1; shift ;;
     --offline)     OFFLINE=1; shift ;;
     --force)       FORCE=1; shift ;;
     --reset-config) RESET_CONFIG=1; shift ;;
@@ -1640,7 +1646,13 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
   step "Установка зависимостей сервера"
   # Без базовых зависимостей сервер не запустится вовсе — здесь не
   # предупреждение, а остановка с откатом. Но причину называем до неё.
-  pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt"
+  BASE_FLAGS=()
+  if [[ "${PINNED}" -eq 1 && -f "${PREFIX}/requirements/constraints.txt" ]]; then
+    BASE_FLAGS=(-c "${PREFIX}/requirements/constraints.txt")
+    info "Версии базовых зависимостей — из requirements/constraints.txt (--pinned)."
+  fi
+  pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt" \
+    ${BASE_FLAGS[@]+"${BASE_FLAGS[@]}"}
   ok "Базовые зависимости установлены"
 
   # PyTorch ставим отдельно: у него свой индекс под каждый ускоритель

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from bisect import bisect_right
@@ -95,6 +96,10 @@ class Analytics:
         #: по другому, то есть ровно тот дефект, ради которого заморозка и
         #: делалась, возвращался бы под нагрузкой и через раз.
         self._местное = threading.local()
+        #: Готовые сводные отчёты: (период, владелец) → (момент, поколение
+        #: заданий, отчёт). См. `full_report`.
+        self._готовые: dict[tuple[str, str], tuple[float, int, dict[str, Any]]] = {}
+        self._замок_готовых = threading.Lock()
 
     @property
     def _выборки(self) -> dict[tuple[Any, ...], list[dict[str, Any]]] | None:
@@ -1819,8 +1824,28 @@ class Analytics:
         здесь их два десятка подряд, и общий кеш убирает два десятка
         одинаковых проходов по архиву.
         """
+        # Готовый отчёт живёт полминуты, пока задания не менялись (заведение,
+        # удаление, смена статуса — см. `Database.поколение_заданий`): раздел
+        # «Аналитика» открывают несколько человек, а на большом архиве сборка
+        # — секунды. Прогресс идущих заданий отчёт не меняет и кеш не сбивает.
+        ключ = (str(period), repr(sorted(owner) if isinstance(owner, list) else owner))
+        поколение = int(getattr(self.db, "поколение_заданий", 0) or 0)
+        сейчас = time.monotonic()
+        with self._замок_готовых:
+            готовый = self._готовые.get(ключ)
+        if готовый and сейчас - готовый[0] < self.СРОК_ГОТОВОГО_ОТЧЁТА_С \
+                and готовый[1] == поколение:
+            return copy.deepcopy(готовый[2])
         with self._общая_выборка():
-            return self._full_report(period, owner)
+            отчёт = self._full_report(period, owner)
+        with self._замок_готовых:
+            if len(self._готовые) > 64:
+                self._готовые.clear()
+            self._готовые[ключ] = (сейчас, поколение, copy.deepcopy(отчёт))
+        return отчёт
+
+    #: Сколько секунд отдавать готовый сводный отчёт без пересборки.
+    СРОК_ГОТОВОГО_ОТЧЁТА_С = 30.0
 
     def _full_report(self, period: str, owner: str | None) -> dict[str, Any]:
         отчёт = self._разрезы(period, owner)

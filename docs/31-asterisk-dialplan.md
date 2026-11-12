@@ -133,12 +133,34 @@ exten => s,1,NoOp(ASR Hub: запись ${UNIQUEID}, ${ARG1}, ${ARG2})
  same => n,Set(ASRHUB_TAG=${ARG4})
  same => n,Set(ASRHUB_STARTED=${EPOCH})
  same => n,Set(ASRHUB_REL=asrhub/${STRFTIME(${EPOCH},,%Y/%m/%d)}/${UNIQUEID}.wav)
+ ; «Не записывать»: согласие не дано (см. asrhub-norec) — звонок уйдёт в
+ ; журнал без записи.
+ same => n,GotoIf($["${ASRHUB_RECORD}" = "0"]?handler)
  ; b — писать только соединённый разговор: без гудков, музыки ожидания и
  ; голосового меню. Каталоги по датам MixMonitor создаёт сам.
  same => n,MixMonitor(${ASRHUB_BASE}/${ASRHUB_REL},b)
  ; Передача — в обработчике отбоя: к нему уже известны длительность и исход.
- same => n,Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
+ same => n(handler),Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
  same => n(done),Return()
+
+; ---------------------------------------------------------------------------
+; «Не записывать этот звонок»: вызовите до asrhub-record (например, в голосовом
+; меню «нажмите 1, если не согласны на запись»), а посреди разговора —
+; чтобы остановить уже идущую запись. Звонок попадёт в журнал ASR Hub без
+; записи с пометкой «не записывать», запись (если началась) не отправится.
+;   same => n,Gosub(asrhub-norec,s,1)
+; ---------------------------------------------------------------------------
+[asrhub-norec]
+exten => s,1,Set(__ASRHUB_RECORD=0)
+ same => n,ExecIf($["${ASRHUB_UID}" != ""]?StopMixMonitor())
+ same => n,Return()
+
+; Метка звонка для поиска и меток задания (номер сделки, тема): из голосового
+; меню или по заголовку SIP — до или во время разговора.
+;   same => n,Gosub(asrhub-tag,s,1(<метка>))
+[asrhub-tag]
+exten => s,1,Set(__ASRHUB_TAG2=${FILTER(0-9A-Za-z_.-,${ARG1})})
+ same => n,Return()
 
 ; ---------------------------------------------------------------------------
 ; Обработчик отбоя: передать звонок сценарию отправки. Сценарий сразу уходит
@@ -163,7 +185,7 @@ exten => s,1,NoOp(ASR Hub: отправка ${ASRHUB_UID})
  same => n,Set(ASRHUB_AGENT=${CHANNEL(endpoint)})
  same => n,ExecIf($["${ASRHUB_DIRECTION}" = "in"]?Set(ASRHUB_AGENT=${CUT(CUT(DIALEDPEERNAME,/,2),-,1)}))
  same => n,ExecIf($["${MEMBERINTERFACE}" != ""]?Set(ASRHUB_AGENT=${CUT(CUT(MEMBERINTERFACE,/,2),@,1)}))
- same => n,System(${ASRHUB_SEND} uniqueid=${FILTER(--.0-9A-Za-z_,${ASRHUB_UID})} linkedid=${FILTER(--.0-9A-Za-z_,${CDR(linkedid)})} sequence=${FILTER(0-9,${CDR(sequence)})} direction=${FILTER(a-z,${ASRHUB_DIRECTION})} src=${FILTER(0-9+,${CALLERID(num)})} dst=${FILTER(0-9+,${ASRHUB_DST})} agent=${FILTER(0-9A-Za-z_.,${ASRHUB_AGENT})} queue=${FILTER(0-9A-Za-z_.,${ASRHUB_QUEUE})} userfield=${FILTER(0-9A-Za-z_.,${ASRHUB_TAG})} started_at=${FILTER(0-9,${ASRHUB_STARTED})} duration=${FILTER(0-9,${CDR(duration)})} billsec=${FILTER(0-9,${CDR(billsec)})} disposition=${FILTER(A-Z,${CDR(disposition)})} file=${ASRHUB_BASE}/${ASRHUB_REL})
+ same => n,System(${ASRHUB_SEND} uniqueid=${FILTER(--.0-9A-Za-z_,${ASRHUB_UID})} linkedid=${FILTER(--.0-9A-Za-z_,${CDR(linkedid)})} sequence=${FILTER(0-9,${CDR(sequence)})} direction=${FILTER(a-z,${ASRHUB_DIRECTION})} src=${FILTER(0-9+,${CALLERID(num)})} dst=${FILTER(0-9+,${ASRHUB_DST})} agent=${FILTER(0-9A-Za-z_.,${ASRHUB_AGENT})} queue=${FILTER(0-9A-Za-z_.,${ASRHUB_QUEUE})} userfield=${FILTER(0-9A-Za-z_.,${ASRHUB_TAG})} started_at=${FILTER(0-9,${ASRHUB_STARTED})} duration=${FILTER(0-9,${CDR(duration)})} billsec=${FILTER(0-9,${CDR(billsec)})} disposition=${FILTER(A-Z,${CDR(disposition)})} record=${FILTER(0-9,${ASRHUB_RECORD})} tag=${FILTER(0-9A-Za-z_.,${ASRHUB_TAG2})} file=${ASRHUB_BASE}/${ASRHUB_REL})
  same => n,Return()
 ```
 
@@ -259,12 +281,34 @@ exten => s,1,NoOp(ASR Hub: запись ${UNIQUEID}, ${ARG1}, ${ARG2})
  same => n,Set(ASRHUB_TAG=${ARG4})
  same => n,Set(ASRHUB_STARTED=${EPOCH})
  same => n,Set(ASRHUB_REL=asrhub/${STRFTIME(${EPOCH},,%Y/%m/%d)}/${UNIQUEID}.wav)
+ ; «Не записывать»: согласие не дано (см. asrhub-norec) — звонок уйдёт в
+ ; журнал без записи.
+ same => n,GotoIf($["${ASRHUB_RECORD}" = "0"]?handler)
  ; b — писать только соединённый разговор: без гудков, музыки ожидания и
  ; голосового меню. Каталоги по датам MixMonitor создаёт сам.
  same => n,MixMonitor(${ASRHUB_BASE}/${ASRHUB_REL},b)
  ; Передача — в обработчике отбоя: к нему уже известны длительность и исход.
- same => n,Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
+ same => n(handler),Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
  same => n(done),Return()
+
+; ---------------------------------------------------------------------------
+; «Не записывать этот звонок»: вызовите до asrhub-record (например, в голосовом
+; меню «нажмите 1, если не согласны на запись»), а посреди разговора —
+; чтобы остановить уже идущую запись. Звонок попадёт в журнал ASR Hub без
+; записи с пометкой «не записывать», запись (если началась) не отправится.
+;   same => n,Gosub(asrhub-norec,s,1)
+; ---------------------------------------------------------------------------
+[asrhub-norec]
+exten => s,1,Set(__ASRHUB_RECORD=0)
+ same => n,ExecIf($["${ASRHUB_UID}" != ""]?StopMixMonitor())
+ same => n,Return()
+
+; Метка звонка для поиска и меток задания (номер сделки, тема): из голосового
+; меню или по заголовку SIP — до или во время разговора.
+;   same => n,Gosub(asrhub-tag,s,1(<метка>))
+[asrhub-tag]
+exten => s,1,Set(__ASRHUB_TAG2=${FILTER(0-9A-Za-z_.-,${ARG1})})
+ same => n,Return()
 
 ; ---------------------------------------------------------------------------
 ; Обработчик отбоя: передать звонок сценарию отправки. Сценарий сразу уходит
@@ -289,7 +333,7 @@ exten => s,1,NoOp(ASR Hub: отправка ${ASRHUB_UID})
  same => n,Set(ASRHUB_AGENT=${CHANNEL(peername)})
  same => n,ExecIf($["${ASRHUB_DIRECTION}" = "in"]?Set(ASRHUB_AGENT=${CUT(CUT(DIALEDPEERNAME,/,2),-,1)}))
  same => n,ExecIf($["${MEMBERINTERFACE}" != ""]?Set(ASRHUB_AGENT=${CUT(CUT(MEMBERINTERFACE,/,2),@,1)}))
- same => n,System(${ASRHUB_SEND} uniqueid=${FILTER(--.0-9A-Za-z_,${ASRHUB_UID})} linkedid=${FILTER(--.0-9A-Za-z_,${CDR(linkedid)})} sequence=${FILTER(0-9,${CDR(sequence)})} direction=${FILTER(a-z,${ASRHUB_DIRECTION})} src=${FILTER(0-9+,${CALLERID(num)})} dst=${FILTER(0-9+,${ASRHUB_DST})} agent=${FILTER(0-9A-Za-z_.,${ASRHUB_AGENT})} queue=${FILTER(0-9A-Za-z_.,${ASRHUB_QUEUE})} userfield=${FILTER(0-9A-Za-z_.,${ASRHUB_TAG})} started_at=${FILTER(0-9,${ASRHUB_STARTED})} duration=${FILTER(0-9,${CDR(duration)})} billsec=${FILTER(0-9,${CDR(billsec)})} disposition=${FILTER(A-Z,${CDR(disposition)})} file=${ASRHUB_BASE}/${ASRHUB_REL})
+ same => n,System(${ASRHUB_SEND} uniqueid=${FILTER(--.0-9A-Za-z_,${ASRHUB_UID})} linkedid=${FILTER(--.0-9A-Za-z_,${CDR(linkedid)})} sequence=${FILTER(0-9,${CDR(sequence)})} direction=${FILTER(a-z,${ASRHUB_DIRECTION})} src=${FILTER(0-9+,${CALLERID(num)})} dst=${FILTER(0-9+,${ASRHUB_DST})} agent=${FILTER(0-9A-Za-z_.,${ASRHUB_AGENT})} queue=${FILTER(0-9A-Za-z_.,${ASRHUB_QUEUE})} userfield=${FILTER(0-9A-Za-z_.,${ASRHUB_TAG})} started_at=${FILTER(0-9,${ASRHUB_STARTED})} duration=${FILTER(0-9,${CDR(duration)})} billsec=${FILTER(0-9,${CDR(billsec)})} disposition=${FILTER(A-Z,${CDR(disposition)})} record=${FILTER(0-9,${ASRHUB_RECORD})} tag=${FILTER(0-9A-Za-z_.,${ASRHUB_TAG2})} file=${ASRHUB_BASE}/${ASRHUB_REL})
  same => n,Return()
 ```
 
@@ -387,12 +431,34 @@ exten => s,1,NoOp(ASR Hub: запись ${UNIQUEID}, ${ARG1}, ${ARG2})
  same => n,Set(ASRHUB_TAG=${ARG4})
  same => n,Set(ASRHUB_STARTED=${EPOCH})
  same => n,Set(ASRHUB_REL=asrhub/${STRFTIME(${EPOCH},,%Y/%m/%d)}/${UNIQUEID}.wav)
+ ; «Не записывать»: согласие не дано (см. asrhub-norec) — звонок уйдёт в
+ ; журнал без записи.
+ same => n,GotoIf($["${ASRHUB_RECORD}" = "0"]?handler)
  ; b — писать только соединённый разговор: без гудков, музыки ожидания и
  ; голосового меню. Каталоги по датам MixMonitor создаёт сам.
  same => n,MixMonitor(${ASRHUB_BASE}/${ASRHUB_REL},b)
  ; Передача — в обработчике отбоя: к нему уже известны длительность и исход.
- same => n,Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
+ same => n(handler),Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
  same => n(done),Return()
+
+; ---------------------------------------------------------------------------
+; «Не записывать этот звонок»: вызовите до asrhub-record (например, в голосовом
+; меню «нажмите 1, если не согласны на запись»), а посреди разговора —
+; чтобы остановить уже идущую запись. Звонок попадёт в журнал ASR Hub без
+; записи с пометкой «не записывать», запись (если началась) не отправится.
+;   same => n,Gosub(asrhub-norec,s,1)
+; ---------------------------------------------------------------------------
+[asrhub-norec]
+exten => s,1,Set(__ASRHUB_RECORD=0)
+ same => n,ExecIf($["${ASRHUB_UID}" != ""]?StopMixMonitor())
+ same => n,Return()
+
+; Метка звонка для поиска и меток задания (номер сделки, тема): из голосового
+; меню или по заголовку SIP — до или во время разговора.
+;   same => n,Gosub(asrhub-tag,s,1(<метка>))
+[asrhub-tag]
+exten => s,1,Set(__ASRHUB_TAG2=${FILTER(0-9A-Za-z_.-,${ARG1})})
+ same => n,Return()
 
 ; ---------------------------------------------------------------------------
 ; Обработчик отбоя: сообщить серверу о звонке функцией CURL(). Оболочки здесь
@@ -417,7 +483,7 @@ exten => s,1,NoOp(ASR Hub: передача ${ASRHUB_UID})
  same => n,Set(CURLOPT(httpheader)=X-API-Key: ${ASRHUB_KEY})
  ; Любой свой заголовок снимает Content-Type по умолчанию — возвращаем.
  same => n,Set(CURLOPT(httpheader)=Content-Type: application/x-www-form-urlencoded)
- same => n,Set(ASRHUB_ANSWER=${CURL(${ASRHUB_URL},uniqueid=${URIENCODE(${ASRHUB_UID})}&direction=${ASRHUB_DIRECTION}&src=${URIENCODE(${CALLERID(num)})}&dst=${URIENCODE(${ASRHUB_DST})}&agent=${URIENCODE(${ASRHUB_AGENT})}&queue=${URIENCODE(${ASRHUB_QUEUE})}&userfield=${URIENCODE(${ASRHUB_TAG})}&started_at=${ASRHUB_STARTED}&duration=${CDR(duration)}&billsec=${CDR(billsec)}&disposition=${URIENCODE(${CDR(disposition)})}&recording=${URIENCODE(${ASRHUB_REL})})})
+ same => n,Set(ASRHUB_ANSWER=${CURL(${ASRHUB_URL},uniqueid=${URIENCODE(${ASRHUB_UID})}&direction=${ASRHUB_DIRECTION}&src=${URIENCODE(${CALLERID(num)})}&dst=${URIENCODE(${ASRHUB_DST})}&agent=${URIENCODE(${ASRHUB_AGENT})}&queue=${URIENCODE(${ASRHUB_QUEUE})}&userfield=${URIENCODE(${ASRHUB_TAG})}&started_at=${ASRHUB_STARTED}&duration=${CDR(duration)}&billsec=${CDR(billsec)}&disposition=${URIENCODE(${CDR(disposition)})}&record=${ASRHUB_RECORD}&tag=${URIENCODE(${ASRHUB_TAG2})}&recording=${URIENCODE(${ASRHUB_REL})})})
  same => n,NoOp(ASR Hub ответил: ${ASRHUB_ANSWER})
  same => n,Return()
 ```
@@ -602,10 +668,24 @@ curl -sS -H 'X-API-Key: ah_ВАШ_КЛЮЧ' \
 | `ASRHUB_LOG` | `/var/log/asterisk/asrhub-dialplan.log` | журнал сценария |
 | `ASRHUB_CACERT` | — | свой корневой сертификат для https |
 | `ASRHUB_INSECURE` | `no` | `yes` — не проверять сертификат (только для наладки) |
+| `ASRHUB_DOWN_S` | 300 | предохранитель: сколько секунд после отправки, на которую сервер не ответил ни разу, новые звонки сразу ложатся в `pending/`; 0 — выключен |
 
 Звонок сначала записывается в файл очереди — синхронно, до ухода в фон: так он не пропадёт, даже если сервер лежит, а процесс убьют. Запись считается закрытой, когда её размер две секунды не меняется. Нет записи за `ASRHUB_WAIT_S` — звонок уходит без неё и остаётся в журнале телефонии с причиной «нет записи». У несоединённого звонка (`disposition` не `ANSWERED`, `DIALSTATUS` не `ANSWER`, `answered=0` или `billsec=0`) запись ждётся пять секунд: MixMonitor с опцией `b` для него файла не создаёт, и раньше каждый неотвеченный звонок появлялся в журнале через две минуты.
 
-Если сервер не принял запись (413 — велика, 415 — не тот формат), звонок уходит без неё. Запись можно дослать позже тем же `uniqueid` — сервер примет её к звонку, который лёг без записи с пометкой «нет записи», «сервер не принял запись», «запись не читается» или «не дождались записи».
+Если сервер не принял запись (413 — велика, 415 — не тот формат), звонок уходит без неё с пометкой «сервер не принял запись (код N)», а копия звонка вместе с записью остаётся в `failed/`. Поднимите предел (`max_upload_mb`) или поправьте формат — `--resend-failed` дошлёт запись тем же `uniqueid`, и сервер примет её к уже лежащему звонку. Так же досылается запись к звонку с пометкой «нет записи», «запись не читается» или «не дождались записи».
+
+**Предохранитель «сервер недоступен».** Если сервер не ответил ни на одну попытку (нет соединения), сценарий ставит метку `.down_until` в каталоге очереди: следующие `ASRHUB_DOWN_S` секунд новые звонки сразу ложатся в `pending/`, без пяти повторов с паузами на каждый отбой. Без метки час простоя сервера на станции в двести звонков — это двести фоновых процессов, каждый по пять минут. Досылку ведёт `--resend` из cron: одна проба за заход; первый же ответ сервера снимает метку. `--status` показывает, до какого времени она стоит.
+
+**Стороны раздельно.** Флажок «Стороны раздельно» в разделе «АТС» → «Диалплан» (только при отправке файлом) добавляет к `MixMonitor` опции `r()` и `t()`: кроме общей смеси пишутся две дорожки — что станция слышит (клиент) и что отдаёт в канал (оператор). Обработчик отбоя передаёт их полями `file_in` и `file_out`; сервер сводит их в стерео (клиент слева, оператор справа), и разбор по ролям идёт по каналам, а не по голосу. Дорожек нет или одна не дописалась — уходит смесь, как без флажка.
+
+**«Не записывать» и метка звонка.** В созданном файле есть две подпрограммы:
+
+| Подпрограмма | Когда звать | Что получится |
+|---|---|---|
+| `Gosub(asrhub-norec,s,1)` | до `asrhub-record` (клиент не согласен на запись в голосовом меню) или посреди разговора | запись не начинается или останавливается; звонок ложится в журнал без записи с пометкой «не записывать: попросили в разговоре», поле `record=0` |
+| `Gosub(asrhub-tag,s,1(<метка>))` | до или во время разговора: номер сделки из голосового меню, заголовок SIP | поле `tag` — метка задания и строка для поиска в «Результатах» |
+
+Код в разговоре («*7 — не записывать») подпрограммы не вешают: это `applicationmap` в `features.conf`, который зовёт ту же `asrhub-norec`.
 
 **Ответы, после которых сценарий повторяет:** 408, 409 (тот же звонок ещё принимается другим запросом), 425, 429 (предел частоты или квота), 5xx — в том числе 503 с `Retry-After`, когда забор записей или сама станция выключены на время обслуживания. Такие звонки остаются в `pending/` и досылаются `--resend` сами. Прочие отказы (неверный ключ, станция закреплена за другим ключом) — окончательные: звонок уходит в `failed/` вместе с ответом сервера.
 

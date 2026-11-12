@@ -451,8 +451,16 @@ def test_всё_только_администратору_и_пароль_не_�
     app, _ = приложение(data_dir, monkeypatch)
     обычный = {"X-API-Key": "ah_user"}
     with TestClient(app) as клиент:
+        # Отчёты опросов (журнал, свод, выгрузка) с 3.1.32 открыты и не
+        # администратору — в охвате его заданий (руководителю — по
+        # подразделению; см. test_review_60). Настройки, телефон, голос и
+        # список «не звонить» — только администратору.
+        for адрес in ("/api/qc/surveys", "/api/qc/summary", "/api/qc/surveys/export"):
+            ответ = клиент.get(адрес, headers=обычный)
+            assert ответ.status_code == 200, (адрес, ответ.status_code)
+            assert клиент.get(адрес).status_code == 401
+        assert клиент.get("/api/qc/surveys", headers=обычный).json()["total"] == 0
         for метод, адрес, тело in (("get", "/api/qc/status", None), ("get", "/api/qc/groups", None),
-                                   ("get", "/api/qc/surveys", None), ("get", "/api/qc/summary", None),
                                    ("get", "/api/qc/stoplist", None),
                                    ("post", "/api/qc/test-call", {"number": "1", "group": "x"}),
                                    ("post", "/api/qc/tts", {"text": "x"}),

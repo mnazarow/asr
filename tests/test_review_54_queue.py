@@ -413,8 +413,10 @@ def test_справедливое_разделение_при_одном_вор�
     порядок: list[str] = []
     monkeypatch.setattr(jq, "process_job", подмена(
         hook=lambda в: порядок.append(Path(в["source"]).name)))
+    # Записи разной длины: одинаковые файлы одного владельца с 3.1.32 ждут
+    # идущего близнеца и берут его результат, а не идут в модель.
     for н in range(5):
-        _поставить(state, _загрузка(state, f"alice{н}.wav"), owner="alice")
+        _поставить(state, _загрузка(state, f"alice{н}.wav", 1.0 + н / 10), owner="alice")
     _поставить(state, _загрузка(state, "bob.wav"), owner="bob")
     state.queue.start()
     assert ждать(lambda: len(порядок) == 6, 60)

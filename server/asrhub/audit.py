@@ -350,3 +350,83 @@ class Писатель:
             except queue.Full:
                 pass
         return True
+
+
+class ПриёмникSyslog:
+    """Копия каждой строки журнала доступа — во внешний syslog.
+
+    Цепочка хешей в базе показывает правку и вырезанные строки, но не
+    отрезанный хвост и не замену базы целиком: для этого нужна копия там,
+    куда у администратора сервера рук нет. Адрес берётся из настройки
+    `audit_syslog` на каждой строке — смена настройки действует сразу.
+
+    Формы адреса: `udp://узел:514`, `tcp://узел:601`, путь к сокету
+    (`/dev/log`). Строка уходит одной записью JSON с меткой `asrhub-audit`.
+    """
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+        self._адрес = ""
+        self._обработчик: logging.Handler | None = None
+        self._замок = threading.Lock()
+
+    def _получить(self) -> logging.Handler | None:
+        адрес = str(self.settings.get("audit_syslog") or "").strip()
+        with self._замок:
+            if адрес == self._адрес:
+                return self._обработчик
+            if self._обработчик is not None:
+                try:
+                    self._обработчик.close()
+                except Exception:                            # noqa: BLE001
+                    pass
+            self._адрес, self._обработчик = адрес, создать_syslog(адрес) if адрес else None
+            return self._обработчик
+
+    def __call__(self, поля: dict[str, Any]) -> None:
+        обработчик = self._получить()
+        if обработчик is None:
+            return
+        import json  # noqa: PLC0415
+
+        запись = logging.LogRecord(
+            "asrhub-audit", logging.INFO, __file__, 0,
+            "asrhub-audit: %s", (json.dumps(поля, ensure_ascii=False, default=str),), None)
+        обработчик.emit(запись)
+
+
+def создать_syslog(адрес: str) -> logging.Handler:
+    """Обработчик syslog по адресу настройки `audit_syslog`."""
+    import socket  # noqa: PLC0415
+    from logging.handlers import SysLogHandler  # noqa: PLC0415
+
+    адрес = адрес.strip()
+    if адрес.startswith(("udp://", "tcp://")):
+        схема, остаток = адрес.split("://", 1)
+        узел, _, порт = остаток.rpartition(":")
+        if not узел:
+            узел, порт = остаток, "514"
+        обработчик = SysLogHandler(
+            address=(узел.strip("[]"), int(порт or 514)),
+            facility=SysLogHandler.LOG_AUTHPRIV,
+            socktype=socket.SOCK_STREAM if схема == "tcp" else socket.SOCK_DGRAM)
+    else:
+        обработчик = SysLogHandler(address=адрес, facility=SysLogHandler.LOG_AUTHPRIV)
+    обработчик.setFormatter(logging.Formatter("%(message)s"))
+    return обработчик
+
+
+def проверить_адрес_syslog(значение: Any) -> list[str]:
+    """Проверка настройки `audit_syslog` для каталога параметров."""
+    адрес = str(значение or "").strip()
+    if not адрес:
+        return []
+    if адрес.startswith(("udp://", "tcp://")):
+        остаток = адрес.split("://", 1)[1]
+        узел, _, порт = остаток.rpartition(":")
+        if not узел or not порт.isdigit() or not 0 < int(порт) < 65536:
+            return [f"«{адрес}»: ожидается udp://узел:порт или tcp://узел:порт"]
+        return []
+    if адрес.startswith("/"):
+        return []
+    return [f"«{адрес}»: ожидается udp://узел:514, tcp://узел:601 или путь к сокету"]

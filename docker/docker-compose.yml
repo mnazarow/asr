@@ -46,6 +46,17 @@ services:
       - "${ASRHUB_HOST:-0.0.0.0}:${ASRHUB_PORT:-8080}:8080"
     volumes:
       - "${ASRHUB_DATA:-./data}:/data"
+      # Телефония: АТС на этой же машине. Журнал звонков, записи и журнал
+      # очередей — только на чтение; в разделе «АТС» укажите пути внутри
+      # контейнера (/var/log/asterisk/cdr-csv/Master.csv, /var/spool/asterisk/monitor,
+      # /var/log/asterisk/queue_log). Права — через группу asterisk (group_add ниже).
+      # - "/var/log/asterisk/cdr-csv:/var/log/asterisk/cdr-csv:ro"
+      # - "/var/spool/asterisk/monitor:/var/spool/asterisk/monitor:ro"
+      # - "/var/log/asterisk/queue_log:/var/log/asterisk/queue_log:ro"
+    # Числовой gid группы asterisk на хосте (getent group asterisk): процесс в
+    # контейнере получает её, не становясь root, и читает журнал и записи.
+    # group_add:
+    #   - "${ASRHUB_ASTERISK_GID:-990}"
     environment:
       ASRHUB_DATA_DIR: /data
       ASRHUB_SERVER_PORT: 8080

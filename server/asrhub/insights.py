@@ -1593,6 +1593,12 @@ class Insights:
         from .llm import insight as по_модели  # noqa: PLC0415
 
         модель = по_модели.оценка_операторов(self.db, since=начало or 0.0, owner=owner, by=by)
+        # Оценка клиента из опроса контроля качества — рядом с показателями
+        # разговоров: «клиент поставил 2 из 5» говорит больше, чем балл модели.
+        try:
+            опросы = self.db.qc_by(by, since=начало, owner=owner)
+        except Exception:                                    # noqa: BLE001
+            опросы = {}
         люди = []
         for пункт in разрез["items"]:
             ключ = str(пункт.get("key") or пункт.get("group_key") or "—")
@@ -1605,6 +1611,9 @@ class Insights:
                 "llm_resolved_share": своё_модели.get("resolved_share"),
                 "llm_score": своё_модели.get("score"),
                 "llm_undated_share": своё_модели.get("undated_share"),
+                "qc_surveys": (опросы.get(ключ) or {}).get("surveys") or 0,
+                "qc_score_pct": (опросы.get(ключ) or {}).get("avg_pct"),
+                "qc_low": (опросы.get(ключ) or {}).get("low") or 0,
                 "calls": свои_звонки.get("count"),
                 "talk_s": свои_звонки.get("talk_s"),
                 "avg_call_s": свои_звонки.get("avg_s"),

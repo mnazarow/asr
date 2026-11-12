@@ -32,6 +32,7 @@ import re
 import socket
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, tzinfo
@@ -106,6 +107,8 @@ class Звонок:
     #: строки CDR — пустые, если источник их не знает.
     linkedid: str = ""
     sequence: int = 0
+    #: Набранный городской номер (DID) — FreePBX и агент его знают.
+    did: str = ""
     raw: dict[str, str] = field(default_factory=dict)
     #: Смещение конца строки журнала CDR, из которой взят звонок (−1 — не из
     #: журнала). По нему позиция чтения двигается за каждым обработанным
@@ -127,6 +130,7 @@ class Звонок:
             "recording": self.recording, "direction": self.direction,
             "queue": self.queue, "agent": self.agent,
             "linkedid": self.linkedid, "sequence": self.sequence,
+            "did": self.did,
         }
         return данные
 
@@ -151,6 +155,7 @@ class Звонок:
         звонок.answered = bool(строка.get("answered"))
         звонок.linkedid = str(строка.get("linkedid") or "")
         звонок.sequence = int(строка.get("sequence") or 0)
+        звонок.did = str(строка.get("did") or "")
         # Идентификатор — тот, что дала станция, а не ключ архива: по нему
         # ищется файл записи, и «golovnoy:1789.5» в имени файла не встретится
         # никогда. Ключ архива собирается заново тем, кто будет сохранять.
@@ -686,12 +691,31 @@ class AMIClient:
 
     def __init__(self, host: str, port: int = 5038, username: str = "",
                  secret: str = "", *, timeout: float = ТАЙМАУТ,
-                 события: str = "cdr"):
+                 события: str = "cdr", tls: bool = False, ca_file: str = "",
+                 auth: str = "plain"):
         self.host = host
-        self.port = int(port or 5038)
+        self.tls = bool(tls)
+        #: С TLS у AMI свой порт — 5039 (`tlsbindport` в manager.conf).
+        self.port = int(port or (5039 if self.tls else 5038))
         self.username = username
         self.secret = secret
         self.timeout = float(timeout or ТАЙМАУТ)
+        #: Сертификат центра, которым подписан сертификат станции; пусто —
+        #: системные. Без проверки сертификата TLS защищает только от
+        #: подслушивания, а не от подмены станции.
+        self.ca_file = str(ca_file or "")
+        #: «md5» — вход через Challenge: пароль по сети не идёт, идёт MD5 от
+        #: вызова станции и пароля. «plain» — пароль открытым текстом (как
+        #: всегда; без TLS его видно в сети).
+        self.auth = "md5" if str(auth or "").lower() == "md5" else "plain"
+        self._номер_действия = 0
+        #: Фоновое чтение (`читать_в_фоне`): события и ответы складываются в
+        #: очереди, а держатель берёт их оттуда.
+        self._фон: threading.Thread | None = None
+        self._события_фона: deque[dict[str, str]] = deque(maxlen=self.ЖДУТ_ПРЕДЕЛ)
+        self._ответы_фона: deque[dict[str, str]] = deque(maxlen=64)
+        self._есть_в_фоне = threading.Condition()
+        self._ошибка_фона: AMIError | None = None
         #: Какие классы событий просить у АТС при входе. Забору нужны только
         #: `Cdr`: поток читается пять секунд раз в минуту, и на загруженной
         #: станции события каналов, очередей и набора номера забивали буфер
@@ -716,15 +740,41 @@ class AMIClient:
     def connect(self) -> str:
         """Открывает соединение и входит. Возвращает приветствие АТС."""
         try:
-            self._sock = socket.create_connection((self.host, self.port), self.timeout)
+            сокет = socket.create_connection((self.host, self.port), self.timeout)
+            _держать_живым(сокет)
+            if self.tls:
+                import ssl  # noqa: PLC0415
+
+                контекст = ssl.create_default_context(cafile=self.ca_file or None)
+                сокет = контекст.wrap_socket(сокет, server_hostname=self.host)
+            self._sock = сокет
             self._sock.settimeout(self.timeout)
         except OSError as exc:
+            if self.tls and "CERTIFICATE" in str(exc).upper():
+                raise AMIError(
+                    f"Сертификат АТС {self.host}:{self.port} не прошёл проверку: {exc}",
+                    hint="Укажите центр сертификации станции (ca_file) или выпустите "
+                         "сертификат на имя, по которому сервер обращается к станции.") from exc
             raise AMIError(f"АТС {self.host}:{self.port} недоступна: {exc}") from exc
-        _держать_живым(self._sock)
         self.последний_приём = time.monotonic()
         self.banner = (self._строка() or "").strip()
-        ответ = self.action("Login", Username=self.username, Secret=self.secret,
-                            Events=self.события)
+        if self.auth == "md5":
+            import hashlib  # noqa: PLC0415
+
+            вызов = self.action("Challenge", AuthType="MD5")
+            if str(вызов.get("Response", "")).lower() != "success" or not вызов.get("Challenge"):
+                self.close()
+                raise AMIError("АТС не выдала вызов для входа по MD5: "
+                               + str(вызов.get("Message") or "нет ответа"),
+                               hint="Вход по MD5 есть во всех Asterisk с AMI; проверьте, "
+                                    "что это AMI, а не другой порт.")
+            ключ = hashlib.md5((вызов["Challenge"] + self.secret).encode("utf-8"),
+                               usedforsecurity=False).hexdigest()
+            ответ = self.action("Login", AuthType="MD5", Username=self.username, Key=ключ,
+                                Events=self.события)
+        else:
+            ответ = self.action("Login", Username=self.username, Secret=self.secret,
+                                Events=self.события)
         if str(ответ.get("Response", "")).lower() != "success":
             self.close()
             raise AMIError(
@@ -735,6 +785,8 @@ class AMIClient:
 
     def close(self) -> None:
         сокет, self._sock = self._sock, None
+        with self._есть_в_фоне:
+            self._есть_в_фоне.notify_all()
         if сокет is None:
             return
         try:
@@ -810,7 +862,57 @@ class AMIClient:
         """
         if self._ждут:
             return self._ждут.pop(0)
+        if self._фон is not None:
+            return self._из_фона(self._события_фона, timeout)
         return self._пакет_из_потока(timeout)
+
+    # --- фоновое чтение -----------------------------------------------------
+
+    def читать_в_фоне(self) -> None:
+        """Отдельный поток читает сокет всё время, а не только во время захода.
+
+        Забор читает станцию пять секунд раз в минуту; на загруженной
+        станции за остальные пятьдесят пять секунд буфер сокета
+        переполняется, и Asterisk рвёт сессию, которую не читают («manager
+        session … not responding»). Фоновый поток держит сокет вычитанным;
+        события копятся в очереди с пределом (старые вытесняются), ответы на
+        действия — отдельно, по `ActionID`.
+        """
+        if self._фон is not None and self._фон.is_alive():
+            return
+        self._фон = threading.Thread(target=self._цикл_фона, name="asrhub-ami-reader",
+                                     daemon=True)
+        self._фон.start()
+
+    def _цикл_фона(self) -> None:
+        while self._sock is not None:
+            try:
+                пакет = self._пакет_из_потока(1.0)
+            except AMIError as exc:
+                with self._есть_в_фоне:
+                    self._ошибка_фона = exc
+                    self._есть_в_фоне.notify_all()
+                return
+            if not пакет:
+                continue
+            with self._есть_в_фоне:
+                (self._ответы_фона if "Response" in пакет else self._события_фона).append(пакет)
+                self._есть_в_фоне.notify_all()
+
+    def _из_фона(self, очередь: deque[dict[str, str]],
+                 timeout: float | None) -> dict[str, str]:
+        крайний = time.monotonic() + (self.timeout if timeout is None else timeout)
+        with self._есть_в_фоне:
+            while not очередь:
+                if self._ошибка_фона is not None:
+                    raise self._ошибка_фона
+                if self._sock is None:
+                    raise AMIError("Соединение с АТС закрыто.")
+                осталось = крайний - time.monotonic()
+                if осталось <= 0:
+                    return {}
+                self._есть_в_фоне.wait(осталось)
+            return очередь.popleft()
 
     def _пакет_из_потока(self, timeout: float | None = None) -> dict[str, str]:
         if timeout is not None and self._sock is not None:
@@ -847,7 +949,8 @@ class AMIClient:
         «x⏎⏎Action: Originate…» дописывал к входу второе действие в обход
         этого списка.
         """
-        разрешено = {"login", "logoff", "ping", "coresettings", "corestatus", "events"}
+        разрешено = {"login", "logoff", "ping", "coresettings", "corestatus", "events",
+                     "challenge"}
         if name.lower() not in разрешено:
             raise AMIError(f"Действие «{name}» не разрешено этим клиентом.")
         for ключ, значение in поля.items():
@@ -860,7 +963,12 @@ class AMIClient:
         сокет = self._sock
         if сокет is None:
             raise AMIError("Нет соединения с АТС.")
-        строки = [f"Action: {name}"]
+        # Свой ActionID на каждое действие: ответ узнаётся по нему. Без него
+        # запоздалый ответ на прошлый Ping (станция задумалась дольше
+        # тайм-аута) принимался за ответ на следующее действие.
+        self._номер_действия += 1
+        номер = f"asrhub-{id(self) & 0xffff:x}-{self._номер_действия}"
+        строки = [f"Action: {name}", f"ActionID: {номер}"]
         строки += [f"{к}: {з}" for к, з in поля.items() if з is not None]
         пакет = ("\r\n".join(строки) + "\r\n\r\n").encode("utf-8")
         try:
@@ -873,11 +981,18 @@ class AMIClient:
         # пришедшие за время ожидания ответа, — а AMI их больше не пришлёт.
         крайний = time.time() + self.timeout
         while time.time() < крайний:
-            ответ = self._пакет_из_потока()
+            if self._фон is not None:
+                ответ = self._из_фона(self._ответы_фона, max(0.0, крайний - time.time()))
+            else:
+                ответ = self._пакет_из_потока()
             if not ответ:
                 continue
             if "Response" in ответ:
-                return ответ
+                чей = ответ.get("ActionID")
+                if чей is None or чей == номер:
+                    return ответ
+                log.debug("AMI: запоздалый ответ на действие %s пропущен", чей)
+                continue
             if len(self._ждут) < self.ЖДУТ_ПРЕДЕЛ:
                 self._ждут.append(ответ)
         raise AMIError(f"АТС не ответила на действие «{name}» за {self.timeout:g} с.")
@@ -920,10 +1035,12 @@ class AMIClient:
 
 
 def проверить(host: str, port: int, username: str, secret: str,
-              *, timeout: float = ТАЙМАУТ) -> dict[str, Any]:
+              *, timeout: float = ТАЙМАУТ, tls: bool = False, ca_file: str = "",
+              auth: str = "plain") -> dict[str, Any]:
     """Короткая проверка связи: вход, версия, права — и сразу выход."""
     начало = time.perf_counter()
-    клиент = AMIClient(host, port, username, secret, timeout=timeout, события="off")
+    клиент = AMIClient(host, port, username, secret, timeout=timeout, события="off",
+                       tls=tls, ca_file=ca_file, auth=auth)
     try:
         приветствие = клиент.connect()
         настройки = клиент.настройки()

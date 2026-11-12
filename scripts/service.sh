@@ -3,6 +3,7 @@
 # Управление службой ASR Hub: systemd на Linux, launchd на macOS.
 #
 #   bash scripts/service.sh install --prefix /opt/asrhub --data /var/lib/asrhub
+#   bash scripts/service.sh install --user asrhub --group asterisk   (рядом с АТС)
 #   bash scripts/service.sh {start|stop|restart|status|logs|uninstall}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +29,9 @@ DATA_DIR=""
 PORT=""
 HOST=""
 SERVICE_USER=""
+# Дополнительные группы пользователя службы (--group asterisk): читать
+# журнал звонков и записи станции на той же машине, не открывая их всем.
+SERVICE_GROUPS=""
 SERVICE_NAME=""
 FOLLOW=0
 LINES=100
@@ -40,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --port)   PORT="${2:?}"; shift 2 ;;
     --host)   HOST="${2:?}"; shift 2 ;;
     --user)   SERVICE_USER="${2:?}"; shift 2 ;;
+    --group)  SERVICE_GROUPS="${SERVICE_GROUPS:+${SERVICE_GROUPS} }${2:?}"; shift 2 ;;
     --name)   SERVICE_NAME="${2:?}"; shift 2 ;;
     --follow|-f) FOLLOW=1; shift ;;
     --lines|-n) LINES="${2:?}"; shift 2 ;;
@@ -224,6 +229,22 @@ install_systemd() {
 
   # Порт ниже 1024 пользователю службы не открыть без права на привязку:
   # сервер падал при старте, а разбор причины звал права на каталог данных.
+  # Группы — из ключей, а без них — из уже стоящего юнита: переустановка
+  # ради смены порта не должна отнимать у службы доступ к записям станции.
+  local groups="${SERVICE_GROUPS}"
+  if [[ -z "${groups}" && "${user_mode}" -eq 0 && -r "${unit_path}" ]]; then
+    groups="$(sed -n 's/^SupplementaryGroups=//p' "${unit_path}" | head -1)"
+  fi
+  local group_block=""
+  if [[ -n "${groups}" && "${user_mode}" -eq 0 ]]; then
+    for g in ${groups}; do
+      getent group "${g}" >/dev/null 2>&1 \
+        || warn "Группы «${g}» на этой машине нет — systemd не запустит службу с ней."
+    done
+    group_block="# Доступ к журналу звонков и записям станции (service.sh --group).
+SupplementaryGroups=${groups}
+"
+  fi
   local caps_block=""
   if [[ "${PORT}" =~ ^[0-9]+$ ]] && (( 10#${PORT} < 1024 )) \
      && [[ "${user_mode}" -eq 0 && -n "${run_user}" && "${run_user}" != "root" ]]; then
@@ -264,7 +285,7 @@ StartLimitIntervalSec=120
 [Service]
 Type=simple
 ${run_user:+User=${run_user}}
-WorkingDirectory=${WORKDIR_Q}
+${group_block}WorkingDirectory=${WORKDIR_Q}
 Environment="ASRHUB_DATA_DIR=${DATA_DIR}"
 Environment="PYTHONUNBUFFERED=1"
 Environment="HF_HOME=${DATA_DIR}/models"

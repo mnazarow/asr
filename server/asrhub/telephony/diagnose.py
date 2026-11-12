@@ -327,7 +327,10 @@ def _журнал_ami(импортёр: Any, проверки: list[dict[str, An
     # Все события, а не только Cdr, как у забора: разбору нужно отличить
     # «станция молчит вовсе» от «станция шлёт события, но не о звонках».
     клиент = AMIClient(станция.host or "127.0.0.1", станция.port or 5038,
-                       станция.username, станция.secret, события="on")
+                       станция.username, станция.secret, события="on",
+                       tls=bool(getattr(станция, "tls", False)),
+                       ca_file=str(getattr(станция, "ca_file", "") or ""),
+                       auth=str(getattr(станция, "auth", "") or "plain"))
     try:
         приветствие = клиент.connect()
     except AMIError as exc:

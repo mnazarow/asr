@@ -28,9 +28,15 @@ def список_копий(request: Request,
     require_admin(principal)
     state = get_state(request)
     try:
-        return backup.свод(state.settings)
+        итог = backup.свод(state.settings)
     except ASRHubError as exc:
         raise error_response(exc) from exc
+    # Итог последнего выноса копии с сервера (команда «после копии»).
+    try:
+        итог["export"] = state.db.get_kv(backup.KV_ВЫНОС)
+    except Exception:                                        # noqa: BLE001
+        итог["export"] = None
+    return итог
 
 
 @router.post("", summary="Снять копию прямо сейчас")

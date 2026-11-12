@@ -460,6 +460,17 @@ def test_негодные_параметры_настройки(клиент):
     assert ответ.status_code == 200 and ответ.json()["driver"] == "sip"
     # Адрес по умолчанию — тот, по которому пришёл запрос.
     assert ответ.json()["endpoint"] == f"http://testserver{АДРЕС}"
+    # Страница шлёт «tracks=» пустым при снятом флажке: bool-параметр отвечал
+    # 422, и раздел «Asterisk: диалплан» не показывал ни одного файла.
+    for значение, раздельно in (("", False), ("1", True), ("yes", True), ("0", False)):
+        ответ = клиент.get("/api/telephony/dialplan/config", headers=СТАНЦИЯ,
+                           params={"station": "main", "tracks": значение})
+        assert ответ.status_code == 200, (значение, ответ.text)
+        текст = {ф["id"]: ф for ф in ответ.json()["files"]}["dialplan"]["text"]
+        assert ("ASRHUB_REL_IN" in текст) is раздельно, значение
+    ответ = клиент.get("/api/telephony/dialplan/config", headers=СТАНЦИЯ,
+                       params={"station": "main", "mode": "path", "tracks": "1"})
+    assert ответ.status_code == 400
 
 
 def test_сценарий_отдаётся_с_подстановками(клиент):
@@ -559,8 +570,11 @@ def test_сценарий_копит_очередь_повтора_и_досыл
     запись = каталог / "asrhub" / "1793000000.42.wav"
     запись.write_bytes(wav())
     # Сервер недоступен: звонок остаётся в очереди повтора.
+    # Предохранитель (3.1.32) здесь выключен: следующий звонок должен дойти
+    # до сервера и получить отказ по ключу, а не встать в очередь повтора.
     итог = запустить(tmp_path, "http://127.0.0.1:9", "ready=1",
-                     "uniqueid=1793000000.42", "billsec=30", f"file={запись}")
+                     "uniqueid=1793000000.42", "billsec=30", f"file={запись}",
+                     ASRHUB_DOWN_S="0")
     assert итог.returncode != 0
     assert len(list((tmp_path / "spool" / "pending").glob("*.call"))) == 1
     # Неверный ключ — отказ окончательный: в failed/ вместе с ответом сервера.

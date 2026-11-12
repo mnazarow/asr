@@ -76,6 +76,9 @@ class Параметры:
     key_in: str = "header"
     trunk: str = "provider"
     internal_len: int = 3
+    #: Писать стороны раздельно: MixMonitor r()/t() — клиент и оператор в
+    #: своих файлах. Сервер сводит их в стерео и знает «кто говорит» точно.
+    tracks: bool = False
 
 
 def параметры(**сырые: Any) -> Параметры:
@@ -124,6 +127,9 @@ def параметры(**сырые: Any) -> Параметры:
     if not 2 <= длина <= 6:
         raise ValueError("длина внутреннего номера — число от 2 до 6")
     п.internal_len = длина
+    п.tracks = str(сырые.get("tracks") or "").strip().lower() in ("1", "true", "yes", "on")
+    if п.tracks and п.mode != "upload":
+        raise ValueError("раздельные дорожки — только при отправке файлом (upload)")
     return п
 
 
@@ -191,13 +197,48 @@ exten => s,1,NoOp(ASR Hub: запись ${{UNIQUEID}}, ${{ARG1}}, ${{ARG2}})
  same => n,Set(ASRHUB_TAG=${{ARG4}})
  same => n,Set(ASRHUB_STARTED=${{EPOCH}})
  same => n,Set(ASRHUB_REL={ПОДКАТАЛОГ}/${{STRFTIME(${{EPOCH}},,%Y/%m/%d)}}/${{UNIQUEID}}.{п.format})
- ; b — писать только соединённый разговор: без гудков, музыки ожидания и
- ; голосового меню. Каталоги по датам MixMonitor создаёт сам.
- same => n,MixMonitor(${{ASRHUB_BASE}}/${{ASRHUB_REL}},b)
- ; Передача — в обработчике отбоя: к нему уже известны длительность и исход.
- same => n,Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
+ ; «Не записывать»: согласие не дано (см. asrhub-norec) — звонок уйдёт в
+ ; журнал без записи.
+ same => n,GotoIf($["${{ASRHUB_RECORD}}" = "0"]?handler)
+{_мониктор(п)} ; Передача — в обработчике отбоя: к нему уже известны длительность и исход.
+ same => n(handler),Set(CHANNEL(hangup_handler_push)=asrhub-hangup,s,1)
  same => n(done),Return()
+
+; ---------------------------------------------------------------------------
+; «Не записывать этот звонок»: вызовите до asrhub-record (например, в голосовом
+; меню «нажмите 1, если не согласны на запись»), а посреди разговора —
+; чтобы остановить уже идущую запись. Звонок попадёт в журнал ASR Hub без
+; записи с пометкой «не записывать», запись (если началась) не отправится.
+;   same => n,Gosub(asrhub-norec,s,1)
+; ---------------------------------------------------------------------------
+[asrhub-norec]
+exten => s,1,Set(__ASRHUB_RECORD=0)
+ same => n,ExecIf($["${{ASRHUB_UID}}" != ""]?StopMixMonitor())
+ same => n,Return()
+
+; Метка звонка для поиска и меток задания (номер сделки, тема): из голосового
+; меню или по заголовку SIP — до или во время разговора.
+;   same => n,Gosub(asrhub-tag,s,1(<метка>))
+[asrhub-tag]
+exten => s,1,Set(__ASRHUB_TAG2=${{FILTER(0-9A-Za-z_.-,${{ARG1}})}})
+ same => n,Return()
 """
+
+
+def _мониктор(п: Параметры) -> str:
+    """Строки MixMonitor: одной смесью или ещё и сторонами раздельно."""
+    if not п.tracks:
+        return (" ; b — писать только соединённый разговор: без гудков, музыки ожидания и\n"
+                " ; голосового меню. Каталоги по датам MixMonitor создаёт сам.\n"
+                " same => n,MixMonitor(${ASRHUB_BASE}/${ASRHUB_REL},b)\n")
+    основа = f"{ПОДКАТАЛОГ}/${{STRFTIME(${{EPOCH}},,%Y/%m/%d)}}/${{UNIQUEID}}"
+    return (f" same => n,Set(ASRHUB_REL_IN={основа}-in.{п.format})\n"
+            f" same => n,Set(ASRHUB_REL_OUT={основа}-out.{п.format})\n"
+            " ; b — только соединённый разговор; r() — что слышит станция (клиент),\n"
+            " ; t() — что станция отдаёт в канал (оператор). Смесь пишется тоже:\n"
+            " ; её слушают в карточке, если стороны потеряются.\n"
+            " same => n,MixMonitor(${ASRHUB_BASE}/${ASRHUB_REL},b"
+            "r(${ASRHUB_BASE}/${ASRHUB_REL_IN})t(${ASRHUB_BASE}/${ASRHUB_REL_OUT}))\n")
 
 
 def _отбой_файлом(п: Параметры) -> str:
@@ -218,9 +259,15 @@ def _отбой_файлом(п: Параметры) -> str:
 ; ---------------------------------------------------------------------------
 [asrhub-hangup]
 exten => s,1,NoOp(ASR Hub: отправка ${{ASRHUB_UID}})
-{_агент(п)} same => n,System(${{ASRHUB_SEND}} uniqueid=${{FILTER(--.0-9A-Za-z_,${{ASRHUB_UID}})}} linkedid=${{FILTER(--.0-9A-Za-z_,${{CDR(linkedid)}})}} sequence=${{FILTER(0-9,${{CDR(sequence)}})}} direction=${{FILTER(a-z,${{ASRHUB_DIRECTION}})}} src=${{FILTER(0-9+,${{CALLERID(num)}})}} dst=${{FILTER(0-9+,${{ASRHUB_DST}})}} agent=${{FILTER(0-9A-Za-z_.,${{ASRHUB_AGENT}})}} queue=${{FILTER(0-9A-Za-z_.,${{ASRHUB_QUEUE}})}} userfield=${{FILTER(0-9A-Za-z_.,${{ASRHUB_TAG}})}} started_at=${{FILTER(0-9,${{ASRHUB_STARTED}})}} duration=${{FILTER(0-9,${{CDR(duration)}})}} billsec=${{FILTER(0-9,${{CDR(billsec)}})}} disposition=${{FILTER(A-Z,${{CDR(disposition)}})}} file=${{ASRHUB_BASE}}/${{ASRHUB_REL}})
+{_агент(п)} same => n,System(${{ASRHUB_SEND}} uniqueid=${{FILTER(--.0-9A-Za-z_,${{ASRHUB_UID}})}} linkedid=${{FILTER(--.0-9A-Za-z_,${{CDR(linkedid)}})}} sequence=${{FILTER(0-9,${{CDR(sequence)}})}} direction=${{FILTER(a-z,${{ASRHUB_DIRECTION}})}} src=${{FILTER(0-9+,${{CALLERID(num)}})}} dst=${{FILTER(0-9+,${{ASRHUB_DST}})}} agent=${{FILTER(0-9A-Za-z_.,${{ASRHUB_AGENT}})}} queue=${{FILTER(0-9A-Za-z_.,${{ASRHUB_QUEUE}})}} userfield=${{FILTER(0-9A-Za-z_.,${{ASRHUB_TAG}})}} started_at=${{FILTER(0-9,${{ASRHUB_STARTED}})}} duration=${{FILTER(0-9,${{CDR(duration)}})}} billsec=${{FILTER(0-9,${{CDR(billsec)}})}} disposition=${{FILTER(A-Z,${{CDR(disposition)}})}} record=${{FILTER(0-9,${{ASRHUB_RECORD}})}} tag=${{FILTER(0-9A-Za-z_.,${{ASRHUB_TAG2}})}} file=${{ASRHUB_BASE}}/${{ASRHUB_REL}}{_дорожки_в_отбой(п)})
  same => n,Return()
 """
+
+
+def _дорожки_в_отбой(п: Параметры) -> str:
+    if not п.tracks:
+        return ""
+    return " file_in=${ASRHUB_BASE}/${ASRHUB_REL_IN} file_out=${ASRHUB_BASE}/${ASRHUB_REL_OUT}"
 
 
 def _отбой_путём(п: Параметры) -> str:
@@ -245,7 +292,7 @@ def _отбой_путём(п: Параметры) -> str:
 exten => s,1,NoOp(ASR Hub: передача ${{ASRHUB_UID}})
 {_агент(п)} same => n,Set(CURLOPT(conntimeout)=3)
  same => n,Set(CURLOPT(httptimeout)=10)
-{заголовок} same => n,Set(ASRHUB_ANSWER=${{CURL(${{ASRHUB_URL}},uniqueid=${{URIENCODE(${{ASRHUB_UID}})}}&direction=${{ASRHUB_DIRECTION}}&src=${{URIENCODE(${{CALLERID(num)}})}}&dst=${{URIENCODE(${{ASRHUB_DST}})}}&agent=${{URIENCODE(${{ASRHUB_AGENT}})}}&queue=${{URIENCODE(${{ASRHUB_QUEUE}})}}&userfield=${{URIENCODE(${{ASRHUB_TAG}})}}&started_at=${{ASRHUB_STARTED}}&duration=${{CDR(duration)}}&billsec=${{CDR(billsec)}}&disposition=${{URIENCODE(${{CDR(disposition)}})}}&recording=${{URIENCODE(${{ASRHUB_REL}})}})}})
+{заголовок} same => n,Set(ASRHUB_ANSWER=${{CURL(${{ASRHUB_URL}},uniqueid=${{URIENCODE(${{ASRHUB_UID}})}}&direction=${{ASRHUB_DIRECTION}}&src=${{URIENCODE(${{CALLERID(num)}})}}&dst=${{URIENCODE(${{ASRHUB_DST}})}}&agent=${{URIENCODE(${{ASRHUB_AGENT}})}}&queue=${{URIENCODE(${{ASRHUB_QUEUE}})}}&userfield=${{URIENCODE(${{ASRHUB_TAG}})}}&started_at=${{ASRHUB_STARTED}}&duration=${{CDR(duration)}}&billsec=${{CDR(billsec)}}&disposition=${{URIENCODE(${{CDR(disposition)}})}}&record=${{ASRHUB_RECORD}}&tag=${{URIENCODE(${{ASRHUB_TAG2}})}}&recording=${{URIENCODE(${{ASRHUB_REL}})}})}})
  same => n,NoOp(ASR Hub ответил: ${{ASRHUB_ANSWER}})
  same => n,Return()
 """

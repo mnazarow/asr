@@ -445,3 +445,23 @@ def read_audit(request: Request,
     итог["limit"] = limit
     итог["offset"] = offset
     return итог
+
+
+@audit_router.get("/verify", summary="Проверка целостности журнала доступа")
+def verify_audit(request: Request,
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Проверяет цепочку хешей журнала доступа.
+
+    Каждая строка несёт sha256 от хеша предыдущей и своих полей: правка
+    строки или удалённые посреди журнала строки рвут цепочку, и ответ
+    называет первую несошедшуюся (`broken_id`). Строки, записанные до
+    появления цепочки, хеша не имеют и считаются отдельно (`legacy`). Только администратору.
+    """
+    require_admin(principal)
+    state = get_state(request)
+    писатель = getattr(state, "audit_writer", None)
+    if писатель is not None:
+        писатель.flush(timeout=5.0)
+    итог = state.db.audit_verify()
+    итог["syslog"] = bool(str(state.settings.get("audit_syslog") or "").strip())
+    return итог
