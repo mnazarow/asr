@@ -30,6 +30,16 @@ class ASRHubError(Exception):
         self.cause = cause
         super().__init__(self.message)
 
+    def with_hint(self, hint: str) -> ASRHubError:
+        """Та же ошибка с другой подсказкой — для цепочки `raise X(...).with_hint(...)`.
+
+        Раньше метод приклеивался к классу присваиванием в конце модуля:
+        работало, но проверка типов (mypy) его не видела и считала все
+        девять вызовов ошибкой. Теперь — обычный метод.
+        """
+        self.hint = hint
+        return self
+
     def to_dict(self) -> dict[str, Any]:
         data = {
             "code": self.code,
@@ -750,11 +760,3 @@ def classify_exception(exc: BaseException, *, engine: str = "", model: str = "")
     return EngineError(
         f"Непредвиденная ошибка движка: {type(exc).__name__}: "
         f"{без_путей(str(exc))}", cause=exc)
-
-
-def _with_hint(self: ASRHubError, hint: str) -> ASRHubError:
-    self.hint = hint
-    return self
-
-
-ASRHubError.with_hint = _with_hint  # type: ignore[attr-defined]

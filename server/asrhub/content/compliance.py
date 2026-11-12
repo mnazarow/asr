@@ -297,7 +297,7 @@ def _время(сегмент: dict[str, Any], край: str) -> float:
 def _вес(пункт: dict[str, Any]) -> float:
     """Вес пункта; единица по умолчанию, отрицательный и негодный — единица."""
     try:
-        вес = float(пункт.get("weight") if пункт.get("weight") is not None else 1)
+        вес = float(пункт.get("weight") if пункт.get("weight") is not None else 1)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 1.0
     return вес if вес > 0 else 1.0

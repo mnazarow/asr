@@ -1784,7 +1784,7 @@ def mean_ru_wer(spec: ModelSpec) -> float | None:
 def recommended_ru(limit: int = 5) -> list[ModelSpec]:
     """Модели, пригодные для русского языка, по возрастанию среднего WER."""
     ranked = [m for m in MODELS if m.ru_quality in (Q.EXCELLENT, Q.GOOD)]
-    ranked.sort(key=lambda m: (mean_ru_wer(m) if mean_ru_wer(m) is not None else 99.0))
+    ranked.sort(key=lambda m: mean_ru_wer(m) or 99.0)
     return ranked[:limit]
 
 

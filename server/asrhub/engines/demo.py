@@ -98,7 +98,8 @@ class DemoEngine(Engine):
                 text=text + ".",
                 speaker=(_SPEAKERS[idx % speaker_count]
                          if settings.get("diarization_enabled") else None),
-                confidence=round(sum(w["confidence"] for w in word_items) / len(word_items), 4),
+                confidence=round(sum(float(w["confidence"]) for w in word_items)  # type: ignore[arg-type,misc]
+                                 / len(word_items), 4),
                 no_speech_prob=round(rnd.uniform(0.001, 0.08), 4),
                 compression_ratio=round(rnd.uniform(1.3, 2.1), 3),
                 temperature=0.0,

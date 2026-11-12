@@ -28,14 +28,14 @@ def _users_command(settings: object, args: object) -> int:
                 sys.stdout.write("Учётных записей нет.\n")
                 return 0
             width = max(len(a.username) for a in rows)
-            for account in rows:
+            for строка in rows:
                 marks = []
-                if not account.enabled:
+                if not строка.enabled:
                     marks.append("отключена")
-                if account.must_change_password:
+                if строка.must_change_password:
                     marks.append("пароль не сменён")
                 sys.stdout.write(
-                    f"{account.username.ljust(width)}  {account.role:<9}"
+                    f"{строка.username.ljust(width)}  {строка.role:<9}"
                     f"{('  ' + ', '.join(marks)) if marks else ''}\n")
             return 0
 

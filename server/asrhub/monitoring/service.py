@@ -366,7 +366,7 @@ class MonitoringService:
         """
         settings = getattr(self.state, "settings", None)
         адрес = str((settings.get("alert_url") if settings else "") or "").strip()
-        if not адрес:
+        if not адрес or settings is None:
             return
         from ..job_queue import check_outbound_url  # noqa: PLC0415
 

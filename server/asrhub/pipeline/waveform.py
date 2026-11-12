@@ -62,14 +62,14 @@ def _envelope(samples: Any, sample_rate: int, interval_s: float) -> list[dict[st
         pass
 
     # Запасной путь без numpy: медленнее, но результат тот же.
-    values = list(samples)
+    values: list[Any] = list(samples)
     for start in range(0, len(values), step):
-        segment = values[start:start + step]
-        if not segment:
+        кусок = values[start:start + step]
+        if not кусок:
             continue
         points.append({
             "time": round(start / sample_rate, 3),
-            "amplitude": round(sum(abs(v) for v in segment) / len(segment), 6),
+            "amplitude": round(sum(abs(v) for v in кусок) / len(кусок), 6),
         })
     return points
 
@@ -118,7 +118,7 @@ def _огибающая_файла(path: Path, interval_s: float,
                     continue
                 а, б = max(с, начало) - начало, min(по, конец) - начало
                 кусок = abs_блок[а:б]
-                сумма += float(sum(кусок)) if модули is not None else float(кусок.sum())
+                сумма += float(sum(кусок)) if модули is not None else float(кусок.sum())  # type: ignore[union-attr]
             кривые[говорящий].append({"time": время, "amplitude": round(сумма / размер, 6)})
     return rate, кривые
 

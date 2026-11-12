@@ -84,7 +84,10 @@ class ПриёмAudioSocket:
 
     @property
     def адрес(self) -> tuple[str, int] | None:
-        return self._сервер.server_address[:2] if self._сервер is not None else None
+        if self._сервер is None:
+            return None
+        узел, порт = self._сервер.server_address[:2]
+        return str(узел), int(порт)
 
     def start(self) -> bool:
         порт = int(self.settings.get("audiosocket_port") or 0)

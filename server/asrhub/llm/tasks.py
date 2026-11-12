@@ -791,7 +791,7 @@ def _скоркарта_из(вопросы: list[dict[str, Any]], ответы:
                  "answer": ответ_модели or "н/п",
                  "quote": цитата((о or {}).get("quote"), f"вопрос «{в.get('id')}»")}
         if пояснять:
-            пункт["why"] = _строка((о or {}).get("why"), 300) or None
+            пункт["why"] = _строка((о or {}).get("why"), 300) or None  # type: ignore[assignment]
         готово.append(пункт)
     return готово
 
@@ -885,7 +885,7 @@ def _по_частям(client: LLMClient, система: str, части: list[
                      "quote": (цитата(решающий[1].get("quote"), f"вопрос «{ид}»", решающий[2])
                                if решающий else "")}
             if пояснять:
-                пункт["why"] = (_строка(решающий[1].get("why"), 300) or None) if решающий else None
+                пункт["why"] = (_строка(решающий[1].get("why"), 300) or None) if решающий else None  # type: ignore[assignment]
             итог["scorecard"].append(пункт)
     if поля:
         итог["fields"] = значения

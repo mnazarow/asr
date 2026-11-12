@@ -32,6 +32,12 @@ jobs:
         run: >-
           pip install "ruff>=0.5" && ruff check server tests agent/asrhub-agent.py examples
           docs/generate.py docs/generate_api_full.py docs/assemble.py docs/make_screenshots.py
+      - name: проверка типов (храповик)
+        # Весь проект mypy пока не проходит (около 280 замечаний); модули из
+        # tests/mypy-clean.txt — проходят и обязаны проходить дальше.
+        run: |
+          pip install "mypy>=1.10" -r requirements/base.txt
+          python -m mypy --ignore-missing-imports --follow-imports=silent $(grep -v '^#' tests/mypy-clean.txt)
       - name: синтаксис интерфейса
         run: |
           for f in server/asrhub/web/*.js; do node --check "$f"; done

@@ -319,7 +319,7 @@ def _ядер() -> int:
 
         # Постоянная часть сведений об оборудовании — из кеша процесса:
         # ядра и квота между заданиями не меняются.
-        return max(1, int(_постоянное(".").cpu_cores_available()))
+        return max(1, int(_постоянное(".").cpu_cores_available))
     except Exception:                                       # noqa: BLE001
         try:
             return max(1, len(os.sched_getaffinity(0)))     # type: ignore[attr-defined]

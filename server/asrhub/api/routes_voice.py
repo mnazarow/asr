@@ -66,9 +66,9 @@ def _отделы(сотрудники: list[dict[str, Any]],
         for о in отделы.values():
             о["prev_completed"] = 0
         for с in база:
-            о = отделы.get(str(с.get("agent_department") or ""))
-            if о is not None:
-                о["prev_completed"] += int(с.get("completed") or 0)
+            отдел = отделы.get(str(с.get("agent_department") or ""))
+            if отдел is not None:
+                отдел["prev_completed"] += int(с.get("completed") or 0)
     строки = []
     for о in отделы.values():
         строки.append({

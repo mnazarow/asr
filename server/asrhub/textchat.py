@@ -116,8 +116,8 @@ def разобрать(payload: Any) -> tuple[list[dict[str, Any]], str]:
                 if not текст:
                     continue
                 сырые.append({
-                    "speaker": _сторона(кусок.get("speaker") or кусок.get("author")
-                                        or кусок.get("from") or кусок.get("role")),
+                    "speaker": _сторона(str(кусок.get("speaker") or кусок.get("author")
+                                            or кусок.get("from") or кусок.get("role") or "")),
                     "text": текст,
                     # Время, если его прислали, сохраняется как есть — но в
                     # показатели не идёт: оно про переписку, а не про речь.

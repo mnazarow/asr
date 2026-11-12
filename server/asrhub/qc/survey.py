@@ -337,7 +337,7 @@ def разобрать_группы(значение: Any) -> list[Группа]
             включена = включена.strip().lower() not in ("0", "false", "no", "off", "нет", "")
         группа = Группа(
             name=имя, enabled=bool(включена),
-            extensions=", ".join(str(ч) for ч in запись.get("extensions"))
+            extensions=", ".join(str(ч) for ч in запись.get("extensions") or ())
             if isinstance(запись.get("extensions"), (list, tuple))
             else str(запись.get("extensions") or "").strip(),
             direction=направление,
@@ -1438,7 +1438,7 @@ class КонтрольКачества:
             "counts": счёт,
             "waiting": счёт.get(ЖДЁТ, 0),
             "calling": len([п for п in self._идут.values() if п.is_alive()]),
-            "next_due": (ближайший or {})["t"] if ближайший else None,
+            "next_due": ближайший["t"] if ближайший else None,
             "stoplist": int((self.db.query_one(
                 "SELECT COUNT(*) AS n FROM qc_stoplist") or {"n": 0})["n"]),
             "last_error": self.последняя_ошибка,

@@ -33,6 +33,10 @@
     Не обращаться к индексу пакетов: pip берёт пакеты только из каталога
     -Wheels. Без -Wheels установка остановится с подсказкой.
 
+.PARAMETER Hashes
+    Файл требований с хешами (scripts\lib\wheel_hashes.py по каталогу колёс):
+    базовые зависимости ставятся только с совпавшим SHA-256.
+
 .PARAMETER Wheels
     Каталог с заранее скачанными колёсами (pip download -d КАТАЛОГ …).
     С -Offline — единственный источник пакетов, без него — дополнительный.
@@ -62,6 +66,9 @@ param(
     [switch]$NoService,
     # Базовые зависимости ровно проверенных версий (requirements\constraints.txt).
     [switch]$Pinned,
+    # Базовые зависимости — только с совпавшими хешами (файл от scripts\wheels.sh
+    # или scripts\lib\wheel_hashes.py): pip install --require-hashes.
+    [string]$Hashes = '',
     [switch]$NoGpuDriver,
     [ValidateSet('', 'none', 'mfa', 'whisperx')][string]$Alignment = '',
     [switch]$Interactive,
@@ -492,6 +499,13 @@ if (-not $Offline -and $Mode -eq 'native') {
         Write-Hint 'Машина без сети — колёса заранее (pip download -d КАТАЛОГ), затем -Offline -Wheels КАТАЛОГ.'
     }
 }
+if ($Hashes) {
+    if (-not (Test-Path -LiteralPath $Hashes -PathType Leaf)) {
+        Write-Err "Файл хешей не найден: $Hashes"
+        exit 2
+    }
+    $Hashes = (Resolve-Path -LiteralPath $Hashes).Path
+}
 if ($Offline -and $Mode -eq 'native') {
     if (-not $Wheels) {
         Write-Err 'Ключ -Offline без -Wheels: pip ставит только из каталога колёс, а он не задан.'
@@ -921,8 +935,14 @@ if ($Mode -eq 'docker') {
     Invoke-WithRetry -Attempts 3 -Description 'базовые зависимости' -Action {
         $ограничения = Join-Path $Prefix 'requirements\constraints.txt'
         $закрепить = if ($Pinned -and (Test-Path $ограничения)) { @('-c', $ограничения) } else { @() }
-        Invoke-Checked -Command $venvPip -Arguments (@('install') + $pipFlags +
-            @('-r', (Join-Path $Prefix 'requirements\base.txt')) + $закрепить)
+        if ($Hashes) {
+            # Ровно пакеты из файла и только с совпавшим SHA-256.
+            Invoke-Checked -Command $venvPip -Arguments (@('install') + $pipFlags +
+                @('--require-hashes', '-r', $Hashes))
+        } else {
+            Invoke-Checked -Command $venvPip -Arguments (@('install') + $pipFlags +
+                @('-r', (Join-Path $Prefix 'requirements\base.txt')) + $закрепить)
+        }
     } | Out-Null
     Write-Ok 'Базовые зависимости установлены'
 

@@ -233,7 +233,7 @@ ADMIN_ROUTES = {
 #: Ключу только на чтение здесь делать нечего, и сервер отвечает ему 403.
 WRITE_GET_ROUTES = {
     "/api/telephony/agent/asrhub-agent.py", "/api/telephony/agent/install.sh",
-    "/api/telephony/agent/command",
+    "/api/telephony/agent/command", "/api/telephony/agent/chunk",
     "/api/telephony/dialplan/config", "/api/telephony/dialplan/asrhub-dialplan",
 }
 #: Вход и выход ключа не требуют вовсе: это и есть способ его получить.

@@ -992,7 +992,7 @@ def прежние_базы(settings: Any) -> list[dict[str, Any]]:
             continue
         итог.append({"name": путь.name, "size": сведения.st_size,
                      "created_at": сведения.st_mtime})
-    итог.sort(key=lambda з: з["created_at"], reverse=True)
+    итог.sort(key=lambda з: float(з["created_at"]), reverse=True)  # type: ignore[arg-type]
     return итог
 
 

@@ -87,7 +87,7 @@ def snr_надёжен(профиль: dict[str, Any] | None) -> bool:
     шум: ровный сигнал давал «отношение речи к шуму −0 дБ» и попадал в
     «плохой звук».
     """
-    return bool(профиль) and str(профиль.get("method") or "vad") == "vad"
+    return профиль is not None and bool(профиль) and str(профиль.get("method") or "vad") == "vad"
 
 
 def is_bad(профиль: dict[str, Any] | None) -> bool:

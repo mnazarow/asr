@@ -487,7 +487,7 @@ def _detect_ten(path: Path, opts: dict[str, Any]) -> list[SpeechSegment] | None:
 
             arr = (np.asarray(samples, dtype="float32") * 32767).astype("int16")
         except ModuleNotFoundError:
-            arr = [int(v * 32767) for v in samples]
+            arr = [int(v * 32767) for v in samples]  # type: ignore[assignment]
         for offset in range(0, len(arr) - hop, hop):
             _, flag = vad.process(arr[offset:offset + hop])
             flags.append(bool(flag))

@@ -1183,8 +1183,7 @@ def применить_словарь(тексты: list[str], glossary: dict[st
             итог = json.loads(готово.stdout or "[]")
             if isinstance(итог, list) and len(итог) == len(тексты):
                 return ([str(т) for т, _ in итог], sum(int(н) for _, н in итог), заметка)
-        причина = (готово.stderr or "").strip().splitlines()[-1:] or ["отказ процесса"]
-        причина = причина[0][:200]
+        причина = ((готово.stderr or "").strip().splitlines()[-1:] or ["отказ процесса"])[0][:200]
     except subprocess.TimeoutExpired:
         причина = f"не уложились в {предел:g} с"
     except (OSError, ValueError, TypeError) as exc:

@@ -336,7 +336,7 @@ async def импорт(request: Request,
     state = get_state(request)
     тип_тела = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
 
-    данные: bytes | None = None
+    данные: bytes | str | None = None
     тело: dict[str, Any] = {}
     if тип_тела == "multipart/form-data":
         форма = await request.form()

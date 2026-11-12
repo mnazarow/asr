@@ -2013,7 +2013,7 @@ def _apply_renames() -> None:
         if spec.name not in RENAMED:
             continue
         new_name, factor = RENAMED[spec.name]
-        unit = {1024 ** 2: "Б", 1024 ** 3: "Б"}.get(factor, spec.unit)
+        unit = "Б" if factor in (1024 ** 2, 1024 ** 3) else spec.unit
         METRICS[index] = MetricSpec(
             **{**spec.__dict__, "name": new_name, "unit": unit,
                "threshold": _rescale(spec.threshold, factor)})

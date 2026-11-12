@@ -1575,7 +1575,8 @@ class Analytics:
     #: От скольких прогонов среднее расхождение что-то значит.
     МИН_ПРОГОНОВ = 5
 
-    def agreement(self, period: str = "week", owner: str | None = None) -> dict[str, Any]:
+    def agreement(self, period: str = "week",
+                  owner: str | list[str] | None = None) -> dict[str, Any]:
         """Согласие моделей по контрольным прогонам: расхождение двух
         расшифровок одной записи — по дням, по парам моделей и против
         предыдущего такого же периода.

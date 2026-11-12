@@ -427,7 +427,7 @@ def опросы_клиентов(db: Any, settings: Any, *, since: float, until
             "delta": (round(sum(оценки) / len(оценки) - среднее_без, 1)
                       if среднее_без is not None else None),
         })
-    драйверы.sort(key=lambda д: (д["delta"] if д["delta"] is not None else 0.0))
+    драйверы.sort(key=lambda д: (д["delta"] if д["delta"] is not None else 0.0))  # type: ignore[arg-type,return-value]
     return {"surveys": len(строки), "average": round(средняя, 1) if средняя is not None else None,
             "calibration": сверка, "drivers": драйверы[:30],
             "note": ("Связь — не причина: признак, рядом с которым оценка ниже, "

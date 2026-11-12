@@ -121,7 +121,7 @@ def keywords(текст: str, *, document_frequency: dict[str, int] | None = Non
             вес = tf
         out.append({"stem": основа, "word": формы.get(основа, основа),
                     "count": n, "weight": round(вес, 5)})
-    out.sort(key=lambda з: (-з["weight"], -з["count"], з["word"]))
+    out.sort(key=lambda з: (-з["weight"], -з["count"], з["word"]))  # type: ignore[operator]
     return out[:limit]
 
 

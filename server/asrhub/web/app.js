@@ -450,6 +450,94 @@ function act(name, ...args) {
   return ` data-act="${esc(name)}" data-args="${esc(JSON.stringify(args))}"`;
 }
 
+/**
+ * Разметка, которая экранирует сама: html`<b>${имя}</b>`.
+ *
+ * Каждый `${…}` в таком шаблоне проходит через esc(); забытый esc() больше
+ * не превращает имя файла или реплику в разметку. Готовая разметка — только
+ * обёрнутая: вложенный html`…`, raw(…) для того, что собрал сам код
+ * (statusChip, act), или массив из них. null, undefined и false дают пустоту
+ * — удобно для `${условие && html`…`}` (но не 0: число печатается, так что
+ * для чисел — `${n ? html`…` : ''}`). Итог — объект Разметка: в innerHTML и
+ * в обычный шаблон он попадает строкой (toString).
+ */
+class Разметка {
+  constructor(текст) { this.текст = текст; }
+
+  toString() { return this.текст; }
+}
+
+/** Готовая разметка без экранирования — только то, что собрал сам код. */
+function raw(текст) {
+  if (текст instanceof Разметка) return текст;
+  return new Разметка(String(текст === null || текст === undefined ? '' : текст));
+}
+
+function вставкаРазметки(значение) {
+  if (значение instanceof Разметка) return значение.текст;
+  if (Array.isArray(значение)) return значение.map(вставкаРазметки).join('');
+  if (значение === null || значение === undefined || значение === false) return '';
+  return esc(значение);
+}
+
+function html(части, ...значения) {
+  let итог = части[0];
+  for (let н = 0; н < значения.length; н += 1) {
+    итог += вставкаРазметки(значения[н]) + части[н + 1];
+  }
+  return new Разметка(итог);
+}
+
+/**
+ * Мягкое обновление строк таблицы: `пары` — [ключ, разметка строки] по порядку.
+ *
+ * Строка с той же разметкой остаётся тем же элементом — с фокусом,
+ * выделением текста и наведением; меняются только изменившиеся строки, а
+ * порядок выправляется перестановкой. Раньше таблица «Очереди» каждые
+ * четыре секунды собиралась заново целиком: сбивался фокус, пропадало
+ * выделение, мигала полоса прокрутки. Фокус в заменённой строке
+ * возвращается на ту же кнопку (`data-action`). Итог — сколько строк
+ * заменено или добавлено.
+ */
+const РАЗМЕТКА_СТРОК = new WeakMap();
+function обновитьСтроки(тело, пары) {
+  const были = new Map();
+  for (const строка of [...тело.children]) {
+    if (строка.dataset && строка.dataset.key) были.set(строка.dataset.key, строка);
+  }
+  const фокус = document.activeElement;
+  let вернутьФокус = null;
+  let заменено = 0;
+  const нужные = пары.map(([ключ, разметка]) => {
+    const текст = String(разметка);
+    const прежняя = были.get(String(ключ));
+    были.delete(String(ключ));
+    if (прежняя && РАЗМЕТКА_СТРОК.get(прежняя) === текст) return прежняя;
+    const шаблон = document.createElement('template');
+    шаблон.innerHTML = `<table><tbody>${текст.trim()}</tbody></table>`;
+    const новая = шаблон.content.querySelector('tr');
+    новая.dataset.key = String(ключ);
+    РАЗМЕТКА_СТРОК.set(новая, текст);
+    if (прежняя && фокус && прежняя.contains(фокус)) {
+      вернутьФокус = { строка: новая, действие: (фокус.dataset && фокус.dataset.action) || '' };
+    }
+    if (прежняя) прежняя.replaceWith(новая);
+    заменено += 1;
+    return новая;
+  });
+  for (const лишняя of были.values()) лишняя.remove();
+  нужные.forEach((строка, н) => {
+    if (тело.children[н] !== строка) тело.insertBefore(строка, тело.children[н] || null);
+  });
+  if (вернутьФокус) {
+    const кнопка = вернутьФокус.действие
+      ? вернутьФокус.строка.querySelector(`[data-action="${вернутьФокус.действие}"]`)
+      : вернутьФокус.строка.querySelector('button');
+    if (кнопка) кнопка.focus({ preventScroll: true });
+  }
+  return заменено;
+}
+
 document.addEventListener('click', (ev) => {
   const цель = ev.target && ev.target.closest ? ev.target.closest('[data-act]') : null;
   if (!цель) return;
@@ -4255,6 +4343,19 @@ RENDERERS.queue = {
       // фокус клавиатуры, замена innerHTML его теряет — до кнопок дальних
       // строк было просто не добраться: Tab возвращался в начало страницы.
       // Запоминаем, на чём стоял фокус, и возвращаем его на то же место.
+      const тело = host.querySelector('table > tbody');
+      if (тело && data.items.length && host.dataset.filter === `${filter}|${search}`) {
+        // Та же выборка: строки — мягко, на месте (см. `обновитьСтроки`).
+        обновитьСтроки(тело, data.items.map((job) => [job.id, this.row(job)]));
+        const хвост = qs('#q-tail', host);
+        if (хвост) хвост.innerHTML = this.хвост(data);
+        const устарело = qs('#q-stale', host);
+        if (устарело) устарело.remove();
+        const ещёМягко = qs('#q-more', host);
+        if (ещёМягко) ещёМягко.onclick = () => { this.предел += 120; this.loadTable(); };
+        return;
+      }
+      host.dataset.filter = `${filter}|${search}`;
       const focused = document.activeElement;
       const restore = host.contains(focused)
         ? { row: focused.closest('tr') ? focused.closest('tr').dataset.jobId : '',
@@ -4268,9 +4369,10 @@ RENDERERS.queue = {
           <th class="num">Приор.</th><th class="num">Длит.</th>
           <th>Состояние</th><th style="width:150px">Прогресс</th>
           <th class="num">RTF</th><th>Создано</th><th style="width:210px">Действия</th>
-        </tr></thead><tbody>
-        ${data.items.map((job) => this.row(job)).join('')}
-      </tbody></table>${this.хвост(data)}` : '<div class="empty">Нет заданий по выбранному фильтру</div>';
+        </tr></thead><tbody></tbody></table>
+        <div id="q-tail">${this.хвост(data)}</div>` : '<div class="empty">Нет заданий по выбранному фильтру</div>';
+      const телоНовое = host.querySelector('table > tbody');
+      if (телоНовое) обновитьСтроки(телоНовое, data.items.map((job) => [job.id, this.row(job)]));
       const ещё = qs('#q-more', host);
       if (ещё) ещё.onclick = () => { this.предел += 120; this.loadTable(); };
 
@@ -4313,42 +4415,40 @@ RENDERERS.queue = {
 
   row(job) {
     const active = ['queued', 'running', 'retry', 'paused'].includes(job.status);
-    // data-job-id и data-action нужны, чтобы вернуть фокус на ту же кнопку
-    // после автообновления таблицы.
-    return `<tr class="queue-row ${job.status}" data-job-id="${esc(job.id)}">
-      <td>${job.status === 'running' ? '▶' : job.status === 'failed' ? '✕'
-            : job.status === 'completed' ? '✓' : EMPTY_STATUSES.includes(job.status) ? '∅' : '·'}</td>
-      <td><div class="truncate" style="max-width:230px" title="${esc(job.filename)}">
-        ${esc(job.filename)}</div>
-        <div class="small faint mono">${esc(job.id.slice(0, 16))}</div></td>
-      <td class="small dim">${esc(job.model || '—')}</td>
+    // Шаблон html`…` экранирует подстановки сам (имя файла, модель, этап);
+    // готовая разметка — только через raw(). data-job-id и data-action
+    // нужны, чтобы вернуть фокус на ту же кнопку после обновления строки.
+    const кнопка = (действие, заголовок, знак, опасно = false) => html`<button
+        class="ghost sm${опасно ? ' danger' : ''}" title="${заголовок}"
+        data-action="${действие}" ${raw(act('jobAction', job.id, действие))}>${знак}</button>`;
+    const значок = job.status === 'running' ? '▶' : job.status === 'failed' ? '✕'
+      : job.status === 'completed' ? '✓' : EMPTY_STATUSES.includes(job.status) ? '∅' : '·';
+    return html`<tr class="queue-row ${job.status}" data-job-id="${job.id}">
+      <td>${значок}</td>
+      <td><div class="truncate" style="max-width:230px" title="${job.filename}">
+        ${job.filename}</div>
+        <div class="small faint mono">${String(job.id).slice(0, 16)}</div></td>
+      <td class="small dim">${job.model || '—'}</td>
       <td class="num">${job.priority}</td>
       <td class="num">${fmtDur(job.media_duration_s)}</td>
-      <td>${statusChip(job.status)}${job.retries
-        ? ` <span class="chip warn">повтор ${job.retries}</span>` : ''}</td>
+      <td>${raw(statusChip(job.status))}${job.retries
+        ? html` <span class="chip warn">повтор ${job.retries}</span>` : ''}</td>
       <td>
-        <div class="progress" data-progress="${esc(job.id)}">
+        <div class="progress" data-progress="${job.id}">
           <span style="width:${((job.progress || 0) * 100).toFixed(1)}%"></span></div>
-        <div class="small faint" data-stage="${esc(job.id)}">${esc(job.stage || '')}</div>
+        <div class="small faint" data-stage="${job.id}">${job.stage || ''}</div>
       </td>
       <td class="num">${job.rtf ? num(job.rtf, 3) : '—'}</td>
       <td class="small faint nowrap">${fmtAgo(job.created_at)}</td>
       <td><div class="row" style="gap:3px">
-        ${active ? `<button class="ghost sm" title="Поднять наверх"
-            data-action="top" ${act('jobAction', job.id, 'top')}>▲</button>
-          <button class="ghost sm" title="Опустить"
-            data-action="bottom" ${act('jobAction', job.id, 'bottom')}>▼</button>` : ''}
-        ${job.status === 'queued' ? `<button class="ghost sm" title="Приостановить"
-            data-action="pause" ${act('jobAction', job.id, 'pause')}>⏸</button>` : ''}
-        ${job.status === 'paused' ? `<button class="ghost sm" title="Возобновить"
-            data-action="resume" ${act('jobAction', job.id, 'resume')}>▶</button>` : ''}
-        ${active ? `<button class="ghost sm danger" title="Отменить"
-            data-action="cancel" ${act('jobAction', job.id, 'cancel')}>✕</button>` : ''}
-        ${job.status === 'failed' || EMPTY_STATUSES.includes(job.status)
-          ? `<button class="ghost sm" title="Повторить"
-            data-action="retry" ${act('jobAction', job.id, 'retry')}>↻</button>` : ''}
+        ${active && [кнопка('top', 'Поднять наверх', '▲'), кнопка('bottom', 'Опустить', '▼')]}
+        ${job.status === 'queued' && кнопка('pause', 'Приостановить', '⏸')}
+        ${job.status === 'paused' && кнопка('resume', 'Возобновить', '▶')}
+        ${active && кнопка('cancel', 'Отменить', '✕', true)}
+        ${(job.status === 'failed' || EMPTY_STATUSES.includes(job.status))
+          && кнопка('retry', 'Повторить', '↻')}
         <button class="ghost sm" data-action="open"
-          ${act('openJob', job.id)}>Открыть</button>
+          ${raw(act('openJob', job.id))}>Открыть</button>
       </div></td>
     </tr>`;
   },

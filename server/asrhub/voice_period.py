@@ -1107,7 +1107,7 @@ def списки(db: Any, отчёт: Отчёт) -> dict[str, Any]:
                                                    "records_with_actions": 0}
     трекеры = []
     for ключ, т in сейчас["trackers"].items():
-        б = база["trackers"].get(ключ, {})
+        б = база["trackers"].get(ключ, {})  # type: ignore[union-attr]
         трекеры.append({**т, "share": _доля(т["fired"], т["checked"]),
                         "prev_fired": int(б.get("fired") or 0),
                         "prev_checked": int(б.get("checked") or 0),
@@ -1117,7 +1117,7 @@ def списки(db: Any, отчёт: Отчёт) -> dict[str, Any]:
     трекеры.sort(key=lambda т: (-т["fired"], т["label"]))
     пункты = []
     for ключ, п in сейчас["scorecard"].items():
-        б = база["scorecard"].get(ключ, {})
+        б = база["scorecard"].get(ключ, {})  # type: ignore[union-attr]
         оценено, оценено_было = п["yes"] + п["no"], int(б.get("yes") or 0) + int(б.get("no") or 0)
         пункты.append({**п, "pass_share": _доля(п["yes"], оценено),
                        "prev_pass_share": _доля(int(б.get("yes") or 0), оценено_было),

@@ -89,7 +89,7 @@ def _insights(request: Request) -> Insights:
     return свод
 
 
-def _с_окном(свод: Insights, period: str, ответ: dict[str, Any]) -> dict[str, Any]:
+def _с_окном(свод: Insights, period: str, ответ: Any) -> Any:
     """Дописывает в ответ свода границы окна, по которому он посчитан.
 
     Число раскрывается в список отдельным запросом (`GET /api/drill`), и
@@ -773,7 +773,7 @@ def discover_topics(request: Request, period: str = ПЕРИОД,
         найденные, по_векторам = semantic.кучки(состояние.db, клиент_модели, owner=владелец,
                                                 since=начало, порог=threshold,
                                                 минимум=min_size)
-        записи = [(str(н), {}) for н in range(по_векторам)]
+        записи: list[tuple[str, dict[str, Any]]] = [(str(н), {}) for н in range(по_векторам)]
     else:
         записи = состояние.db.terms_matrix(since=начало, owner=владелец)
         частоты, корпус = индекс.corpus_frequency()

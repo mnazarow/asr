@@ -183,7 +183,7 @@ def reply(system: str, user: str) -> str:
     # Основной вызов.
     чистый = re.sub(r"^[^:\n]{1,30}: ", "", разговор, flags=re.M)
     предложения = [п.strip() for п in _ПРЕДЛОЖЕНИЕ.findall(чистый) if len(п.strip()) > 3]
-    ответ: dict = {}
+    ответ = {}
     if '"summary"' in (user or ""):
         ответ["summary"] = " ".join(предложения[:3])[:700] or "Разговор без содержания."
         нижний = чистый.lower()

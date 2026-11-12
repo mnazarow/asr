@@ -465,7 +465,7 @@ def normalize(категории: Any) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             штраф = 0.0
         try:
-            вес = float(сырое.get("weight") if сырое.get("weight") is not None else 1)
+            вес = float(сырое.get("weight") if сырое.get("weight") is not None else 1)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             вес = 1.0
         out.append({
@@ -667,7 +667,7 @@ def apply(segments: list[dict[str, Any]], categories: list[Compiled] | list[dict
         итог = rules.evaluate(категория.tree, текст)
         if not итог.matched and not everything:
             continue
-        примеры = []
+        примеры: list[Any] = []
         первое = None
         for совпадение in sorted(итог.hits, key=lambda h: h.start):
             местный = текст.segment[совпадение.start] if текст.segment else 0

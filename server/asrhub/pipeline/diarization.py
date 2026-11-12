@@ -160,7 +160,7 @@ def _из_хаба(Pipeline: Any, model_name: str, token: str) -> Any:
     try:
         параметры = inspect.signature(Pipeline.from_pretrained).parameters
     except (TypeError, ValueError):
-        параметры = {}
+        параметры = {}  # type: ignore[assignment]
     if "token" in параметры or not параметры:
         try:
             return Pipeline.from_pretrained(model_name, token=token)

@@ -155,8 +155,8 @@ class TransformersEngine(Engine):
             text = str(raw.get("text", "")).strip()
             if text:
                 segments.append(Segment(
-                    start=слова[0]["start"] if слова else 0.0,
-                    end=слова[-1]["end"] if слова else info.duration_s,
+                    start=float(слова[0]["start"]) if слова else 0.0,  # type: ignore[arg-type]
+                    end=float(слова[-1]["end"]) if слова else info.duration_s,  # type: ignore[arg-type]
                     text=text, language=language,
                     words=слова if settings.get("word_timestamps", True) else []))
         elif chunks:

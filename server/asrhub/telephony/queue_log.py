@@ -34,7 +34,7 @@ from typing import Any
 ПОРЦИЯ_БАЙТ = 4 * 1024 * 1024
 
 
-def _число(значение: str) -> float:
+def _число(значение: Any) -> float:
     try:
         return float(значение)
     except (TypeError, ValueError):

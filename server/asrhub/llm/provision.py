@@ -249,7 +249,7 @@ def свободно_под_веса() -> tuple[float, str]:
 def _не_root() -> bool:
     """Нужен ли sudo. На системах без понятия «root» (Windows) — нет."""
     получить = getattr(os, "geteuid", None)
-    return bool(получить) and получить() != 0
+    return получить is not None and получить() != 0
 
 
 def sudo_работает() -> tuple[bool, str]:
@@ -792,7 +792,7 @@ class Установщик:
         б = бюджет(info, запас(self.settings))
         self._записать(б["note"])
         for имя in модели:
-            справка = КАТАЛОГ_ПО_ИМЕНИ.get(имя)
+            справка = КАТАЛОГ_ПО_ИМЕНИ.get(имя) or {}
             if справка and float(справка["vram_gb"]) > б["budget_gb"]:
                 self._записать(
                     f"Предупреждение: {имя} просит около {справка['vram_gb']:g} ГБ "

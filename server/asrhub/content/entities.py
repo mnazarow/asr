@@ -180,7 +180,7 @@ def money(текст: str) -> list[dict[str, Any]]:
     # В порядке, в каком суммы прозвучали: цифрами и словами — одним списком.
     for сумма, (начало, _) in zip(найдено, занято, strict=False):
         сумма.setdefault("_at", начало)
-    найдено.sort(key=lambda с: с["_at"])
+    найдено.sort(key=lambda с: с["_at"])  # type: ignore[arg-type,return-value]
     for сумма in найдено:
         del сумма["_at"]
     return найдено

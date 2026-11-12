@@ -431,7 +431,7 @@ def callback_body(request: PhoneRequest, job: dict[str, Any],
         "sentiment": "neutral",
         "waveforms": waveforms,
         "formatted_dialogue": dialogue,
-        "transcription": " ".join(item["dialogue"] for item in dialogue),
+        "transcription": " ".join(str(item["dialogue"]) for item in dialogue),
         "status": status,
         "error_message": None if пустой else _failure_text(job),
     }

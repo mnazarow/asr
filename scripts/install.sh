@@ -58,6 +58,9 @@ CREATE_SERVICE=1
 # Базовые зависимости ровно тех версий, с которыми выпуск проверен
 # (requirements/constraints.txt): воспроизводимая установка.
 PINNED=0
+# Файл требований с хешами (scripts/wheels.sh): pip ставит только файлы
+# с совпавшим SHA-256 (--require-hashes).
+HASHES_FILE=""
 SERVICE_USER=""
 OFFLINE=0
 FORCE=0
@@ -138,6 +141,8 @@ usage() {
   --no-service          Не создавать службу автозапуска
   --pinned              Базовые зависимости — ровно проверенных версий
                         (requirements/constraints.txt)
+  --hashes ФАЙЛ         Базовые зависимости — только с совпавшими хешами
+                        (файл от scripts/wheels.sh; обычно с --offline --wheels)
   --user ИМЯ            Пользователь, от которого работает служба (должен
                         существовать; без ключа заводится системный asrhub)
   --name ИМЯ            Имя службы — для второй установки на той же машине
@@ -228,6 +233,10 @@ while [[ $# -gt 0 ]]; do
     --force-gpu-driver) ASRHUB_FORCE_GPU_DRIVER=1; export ASRHUB_FORCE_GPU_DRIVER; shift ;;
     --no-service)  CREATE_SERVICE=0; shift ;;
     --pinned)      PINNED=1; shift ;;
+    --hashes)
+      [[ -r "${2:?нужен файл хешей: --hashes КАТАЛОГ/requirements-hashes.txt}" ]] \
+        || { printf 'Файл хешей не читается: %s\n' "$2" >&2; exit 2; }
+      HASHES_FILE="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
     --offline)     OFFLINE=1; shift ;;
     --force)       FORCE=1; shift ;;
     --reset-config) RESET_CONFIG=1; shift ;;
@@ -1651,8 +1660,15 @@ export ASRHUB_REQUIREMENTS_DIR="${PREFIX}/requirements"
     BASE_FLAGS=(-c "${PREFIX}/requirements/constraints.txt")
     info "Версии базовых зависимостей — из requirements/constraints.txt (--pinned)."
   fi
-  pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt" \
-    ${BASE_FLAGS[@]+"${BASE_FLAGS[@]}"}
+  if [[ -n "${HASHES_FILE}" ]]; then
+    # Ровно пакеты из файла и только с совпавшим SHA-256: подменённое
+    # колесо pip отвергнет. Файл собирает scripts/wheels.sh.
+    info "Базовые зависимости — по файлу хешей ${HASHES_FILE} (--require-hashes)."
+    pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" --require-hashes -r "${HASHES_FILE}"
+  else
+    pip_install "${VPIP}" 3 "${PIP_FLAGS[@]}" -r "${PREFIX}/requirements/base.txt" \
+      ${BASE_FLAGS[@]+"${BASE_FLAGS[@]}"}
+  fi
   ok "Базовые зависимости установлены"
 
   # PyTorch ставим отдельно: у него свой индекс под каждый ускоритель

@@ -112,7 +112,7 @@ class Runtime:
 
     def inc(self, name: str, labels: dict[str, str] | None = None, value: float = 1) -> None:
         with self._lock:
-            self.counters[self._key(name, labels)] += value
+            self.counters[self._key(name, labels)] += value  # type: ignore[assignment]
 
     def set(self, name: str, value: float, labels: dict[str, str] | None = None) -> None:
         with self._lock:
@@ -1178,7 +1178,7 @@ def describe(samples: list[Sample], settings: Any = None) -> list[dict[str, Any]
                 "type": spec.type, "group": spec.group, "label": spec.label,
                 "unit": spec.unit, "description": spec.description,
                 "recommendation": spec.recommendation, "normal": spec.normal,
-                "threshold": (порог(spec, settings).to_dict()
+                "threshold": (порог(spec, settings).to_dict()  # type: ignore[union-attr]
                               if spec.threshold else None),
             })
         result.append(entry)

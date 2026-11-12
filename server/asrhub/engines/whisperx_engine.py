@@ -174,7 +174,7 @@ class WhisperXEngine(Engine):
                 try:
                     параметры = inspect.signature(конвейер).parameters
                 except (TypeError, ValueError):
-                    параметры = {}
+                    параметры = {}  # type: ignore[assignment]
 
                 def загрузить() -> Any:
                     if "use_auth_token" in параметры and "token" not in параметры:

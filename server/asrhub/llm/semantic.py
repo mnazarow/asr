@@ -165,16 +165,16 @@ def кучки(db: Any, client: Any, *, owner: Any = None, since: float | None =
             близость = sum(x * y for x, y in zip(вектор_н, центр, strict=True))
             if близость > лучшая:
                 лучший, лучшая = н, близость
-        слова = {с for с in (str(строка["text"] or "").lower().replace(",", " ").split())
-                 if len(с) >= 5}
+        слова_строки = {с for с in (str(строка["text"] or "").lower().replace(",", " ").split())
+                        if len(с) >= 5}
         if лучший >= 0 and лучшая >= порог:
             тема = вожаки[лучший][1]
             тема.jobs.append(str(строка["job_id"]))
-            for с in слова:
+            for с in слова_строки:
                 вожаки[лучший][2][с] = вожаки[лучший][2].get(с, 0) + 1
         elif len(вожаки) < темы_модуль.МАКС_ВОЖАКОВ:
             вожаки.append((вектор_н, темы_модуль.Тема(jobs=[str(строка["job_id"])]),
-                           dict.fromkeys(слова, 1)))
+                           dict.fromkeys(слова_строки, 1)))
     темы = []
     for _, тема, слова in вожаки:
         if тема.size < темы_модуль.максимум_минимума(минимум):

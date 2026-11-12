@@ -10011,7 +10011,7 @@ def validate_value(key: str, value: object) -> tuple[bool, str]:
             # OverflowError, которую не ловили.
             if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
                 return False, f"«{spec.label}»: ожидается целое число"
-            iv = int(value)  # type: ignore[arg-type]
+            iv = int(value)  # type: ignore[arg-type,call-overload]
             if spec.minimum is not None and iv < spec.minimum:
                 return False, f"«{spec.label}»: минимум {int(spec.minimum)}"
             if spec.maximum is not None and iv > spec.maximum:

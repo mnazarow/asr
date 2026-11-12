@@ -54,6 +54,7 @@ from ..errors import (
     ConfigError,
     FileTooLarge,
     ForbiddenError,
+    RequestTooLarge,
     StorageError,
     UnsupportedFormat,
 )
@@ -388,7 +389,8 @@ def _включён(state: Any, agent_id: str, запись: dict[str, Any]) -> 
     Вопрос о звонках у выключенного агента раньше отвечал как обычно, и
     агент шёл слать то, что сервер всё равно не примет.
     """
-    if not int(запись.get("enabled") if запись.get("enabled") is not None else 1):
+    включён = запись.get("enabled")
+    if not int(включён if включён is not None else 1):
         raise error_response(АгентВыключен(
             f"Агент «{agent_id}» выключен на сервере.",
             hint="Включите его в разделе «АТС»."))
@@ -431,6 +433,175 @@ def queue_log(request: Request, данные: dict[str, Any],
     события = журнал_очередей.разобрать("\n".join(str(с)[:2000] for с in строки))
     добавлено = state.db.queue_events_add(_агентская_станция(agent_id), события)
     return {"received": len(строки), "events": len(события), "added": добавлено}
+
+
+#: Предел одной части записи: части по 8 МБ проходят любой прокси.
+ЧАСТЬ_ДО_МБ = 16
+#: Сколько хранить недокачанную запись: агент дошлёт её следующим заходом.
+ЧАСТИ_ХРАНИТЬ_С = 2 * 86400
+_ИД_ЗАГРУЗКИ = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
+_ЗАМОК_ЧАСТЕЙ = threading.Lock()
+
+
+class ЧастьНеСМеста(ASRHubError):
+    """Часть записи не с того байта: агент спросит принятое и продолжит."""
+
+    code = "upload_offset_mismatch"
+    http_status = 409
+
+
+def _каталог_частей(state: Any) -> Path:
+    каталог = Path(state.settings.paths.uploads) / "parts"
+    каталог.mkdir(parents=True, exist_ok=True)
+    return каталог
+
+
+def _часть(state: Any, agent_id: str, upload_id: str) -> tuple[Path, Path]:
+    """Файлы недокачанной записи — свои у каждого агента."""
+    if not _ИД_ЗАГРУЗКИ.match(upload_id or ""):
+        raise error_response(ConfigError("Недопустимый идентификатор загрузки.",
+                                         hint="Латиница, цифры, «._-», 8–128 знаков."))
+    каталог = _каталог_частей(state)
+    имя = hashlib.sha256(f"{agent_id}\0{upload_id}".encode()).hexdigest()[:40]
+    return каталог / f"{имя}.part", каталог / f"{имя}.json"
+
+
+def _подмести_части(каталог: Path) -> None:
+    срок = time.time() - ЧАСТИ_ХРАНИТЬ_С
+    for путь in каталог.glob("*"):
+        try:
+            if путь.stat().st_mtime < срок:
+                путь.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+@router.get("/chunk", summary="Сколько байт записи уже принято (докачка частями)")
+def chunk_status(request: Request, upload_id: str = Query(...), agent_id: str = Query(...),
+                 principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    require_write(principal)
+    state = get_state(request)
+    agent_id = _проверить_id(agent_id)
+    _свой_агент(state, agent_id, principal)
+    часть, сведения = _часть(state, agent_id, upload_id)
+    принято = часть.stat().st_size if часть.is_file() else 0
+    return {"upload_id": upload_id, "received": принято,
+            "total": (json.loads(сведения.read_text()) if сведения.is_file() else {}).get("total")}
+
+
+@router.post("/chunk", summary="Часть записи от агента (докачка с места обрыва)")
+async def chunk(request: Request, upload_id: str = Query(...), agent_id: str = Query(...),
+                offset: int = Query(..., ge=0), total: int = Query(..., ge=1),
+                sha256: str = Query(..., pattern="^[0-9a-fA-F]{64}$"),
+                principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Часть записи телом запроса: `offset` — с какого байта, `total` — весь размер.
+
+    Записи больше предела прокси перед сервером (nginx `client_max_body_size`)
+    раньше не доезжали вовсе: звонок уходил без записи. Теперь агент шлёт
+    большую запись частями, а после обрыва спрашивает, сколько принято
+    (`GET /chunk`), и продолжает с того места. Часть не с того места — 409
+    с принятым размером. Звонок потом ссылается на загрузку полем
+    `upload_id` в `meta` вместо файла.
+    """
+    require_write(principal)
+    state = get_state(request)
+    agent_id = _проверить_id(agent_id)
+    await asyncio.to_thread(_свой_агент, state, agent_id, principal)
+    предел = int(float(state.settings.get("max_upload_mb") or 2048) * 1024 * 1024)
+    if total > предел:
+        ошибка = FileTooLarge(total / 1048576, предел // 1048576)
+        ошибка.message = f"Запись больше предела в {предел // 1048576} МБ."
+        raise error_response(ошибка)
+    часть, сведения = _часть(state, agent_id, upload_id)
+    куски: list[bytes] = []
+    длина = 0
+    async for кусок in request.stream():
+        длина += len(кусок)
+        if длина > ЧАСТЬ_ДО_МБ * 1024 * 1024:
+            raise error_response(RequestTooLarge(длина / 1048576, ЧАСТЬ_ДО_МБ))
+        куски.append(кусок)
+    данные = b"".join(куски)
+    сумма = sha256.lower()
+
+    def записать() -> int:
+        with _ЗАМОК_ЧАСТЕЙ:
+            return _дописать(часть, сведения, данные, offset, total, сумма,
+                             agent_id, principal.name)
+
+    принято = await asyncio.to_thread(записать)
+    return {"upload_id": upload_id, "received": принято, "total": total,
+            "complete": принято == total}
+
+
+def _дописать(часть: Path, сведения: Path, данные: bytes, offset: int, total: int,
+              сумма: str, agent_id: str, владелец: str) -> int:
+    """Часть — в конец недокачанной записи; итог — сколько принято."""
+    if offset == 0 and not часть.exists():
+        _подмести_части(часть.parent)
+    if сведения.is_file():
+        try:
+            прежние = json.loads(сведения.read_text())
+        except ValueError:
+            прежние = {}
+        if (прежние.get("total"), прежние.get("sha256")) != (total, сумма):
+            # Под тем же идентификатором — другая запись (файл на станции
+            # переписан): старое начало ей не годится.
+            часть.unlink(missing_ok=True)
+    elif часть.exists():
+        часть.unlink(missing_ok=True)
+    принято = часть.stat().st_size if часть.is_file() else 0
+    if offset != принято:
+        ошибка = ЧастьНеСМеста(
+            f"Часть с байта {offset}, а принято {принято}.",
+            hint="Агент спросит принятое (GET /chunk) и продолжит с него.")
+        ошибка.details = {"received": принято}
+        raise error_response(ошибка)
+    if принято + len(данные) > total:
+        raise error_response(ConfigError("Части длиннее объявленного размера записи."))
+    with часть.open("ab") as выход:
+        выход.write(данные)
+    сведения.write_text(json.dumps({"total": total, "sha256": сумма,
+                                    "agent_id": agent_id, "owner": владелец}))
+    return принято + len(данные)
+
+
+def _убрать_загрузку(state: Any, agent_id: str, upload_id: str) -> None:
+    """Докачанная запись не понадобилась (звонок уже в архиве) — убрать."""
+    if not upload_id:
+        return
+    try:
+        for путь in _часть(state, agent_id, upload_id):
+            путь.unlink(missing_ok=True)
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
+def _собрать_загрузку(state: Any, upload_id: str, agent_id: str,
+                      расширение: str) -> tuple[Path, int, str]:
+    """Докачанная запись → файл загрузки: (путь, размер, sha256)."""
+    часть, сведения = _часть(state, agent_id, upload_id)
+    размер = часть.stat().st_size if часть.is_file() else 0
+    try:
+        о_загрузке = json.loads(сведения.read_text()) if сведения.is_file() else {}
+    except ValueError:
+        о_загрузке = {}
+    if not размер or размер != int(о_загрузке.get("total") or -1):
+        # 409 того же вида, что у части не с того места: агент спросит
+        # принятое и дошлёт остаток (или всю запись, если её подмели).
+        ошибка = ЧастьНеСМеста(
+            f"Запись {upload_id} докачана не целиком: {размер} из "
+            f"{о_загрузке.get('total') or '?'} байт.",
+            hint="Агент дошлёт остаток и пришлёт звонок ещё раз.")
+        ошибка.details = {"received": размер}
+        raise error_response(ошибка)
+    сумма = hashlib.sha256()
+    with часть.open("rb") as вход:
+        for кусок in iter(lambda: вход.read(1 << 20), b""):
+            сумма.update(кусок)
+    цель = Path(state.settings.paths.uploads) / f"{new_id('pbx')}{расширение}"
+    часть.replace(цель)
+    сведения.unlink(missing_ok=True)
+    return цель, размер, сумма.hexdigest()
 
 
 @router.get("/command", summary="Задание для агента, если оно есть")
@@ -551,85 +722,9 @@ def _звонок_до_записи(state: Any, principal: Principal, meta: str)
             "uniqueid": uniqueid, "станция": станция, "ключ": f"{станция}:{uniqueid}"}
 
 
-async def _принять(request: Request, state: Any, principal: Principal,
-                   поля: dict[str, Any], file: UploadFile | None, agent_id: str,
-                   запись_агента: dict[str, Any], uniqueid: str, станция: str,
-                   ключ: str) -> dict[str, Any]:
-    """Сам приём звонка — под занятым ключом (см. `_ПРИНИМАЮТСЯ`).
-
-    Всё, что ходит в базу и запускает ffprobe, — в потоке (см. `call`).
-    """
-    from ..telephony.asterisk import нога_лучше  # noqa: PLC0415
-    from .routes_jobs import _probe_duration, check_quota, под_квотой  # noqa: PLC0415
-
-    звонок = {к: поля.get(к) for к in ПОЛЯ_ЗВОНКА if к in поля}
-    звонок["duration"] = int(_число(звонок.get("duration")))
-    звонок["billsec"] = int(_число(звонок.get("billsec")))
-    звонок["started_at"] = _число(звонок.get("started_at"))
-    if "linkedid" in звонок:
-        связь = str(звонок.get("linkedid") or "").strip()[:128]
-        звонок["linkedid"] = связь if re.fullmatch(r"[\w.\-]*\d+\.\d+", связь) else ""
-    if "sequence" in звонок:
-        звонок["sequence"] = int(_число(звонок.get("sequence")))
-    if "did" in звонок:
-        звонок["did"] = re.sub(r"[^0-9+]", "", str(звонок.get("did") or ""))[:32]
-    звонок["answered"] = 1 if звонок.get("answered") else 0
-    звонок["pbx_uid"] = uniqueid
-    есть_файл = file is not None and bool((file.filename or "").strip())
-
-    прежний = await asyncio.to_thread(state.db.call_get, ключ)
-    if прежний is not None:
-        # Звонок уже в архиве. Asterisk 12+ пишет на один звонок несколько
-        # строк CDR, и пришедшая позже бывает той самой — отвеченной. Раньше
-        # она отбрасывалась как «уже импортирован», приняв тело целиком.
-        лучше = нога_лучше(звонок, прежний)
-        if прежний.get("job_id") or not (есть_файл and (лучше or _дослать_можно(прежний))):
-            if лучше:
-                пометка = str(прежний.get("skipped") or "") if прежний.get("job_id") \
-                    else str(поля.get("skipped") or прежний.get("skipped") or "")
-                await asyncio.to_thread(functools.partial(
-                    state.db.save_call, ключ, job_id=None, skipped=пометка, owner=None,
-                    station=станция, **звонок))
-            if file is not None:
-                await file.close()
-            return {"ok": True, "skipped": "уже импортирован", "uniqueid": uniqueid,
-                    **({"updated": True} if лучше else {})}
-
-    if not есть_файл:
-        # Звонок без записи — тоже звонок: он нужен в журнале, в счётчиках
-        # и в разрезах. Просто распознавать нечего.
-        def без_записи() -> None:
-            state.db.save_call(ключ, job_id=None,
-                               skipped=str(поля.get("skipped") or "нет записи"),
-                               owner=principal.name, station=станция, **звонок)
-            state.db.agent_count(agent_id, calls=1)
-
-        await asyncio.to_thread(без_записи)
-        if file is not None:
-            await file.close()
-        return {"ok": True, "skipped": "нет записи", "uniqueid": uniqueid}
-    assert file is not None
-
-    имя = Path(str(file.filename)).name
-    расширение = Path(имя).suffix.lower()
-    if расширение not in ЗВУК:
-        # 415, а не 400: агент по этому коду понимает, что дело в ЗАПИСИ, и
-        # шлёт звонок ещё раз без неё — звонок остаётся в журнале.
-        await file.close()
-        ошибка = UnsupportedFormat(имя)
-        ошибка.message = f"«{имя}»: такие записи сервер не принимает."
-        ошибка.hint = "Ожидаются " + ", ".join(sorted(ЗВУК)) + "."
-        raise error_response(ошибка)
-    # Суточная квота по числу заданий — до приёма файла, как у обычной
-    # загрузки и у /process-call: незачем принимать сотню мегабайт, чтобы
-    # затем отказать. Отказ — 429 с Retry-After: агент повторит позже.
-    # Раньше этот путь квоту не проверял вовсе: ключ с quota_jobs_per_day=2
-    # сам заводил агента через /hello и ставил задания без счёта.
-    try:
-        await asyncio.to_thread(check_quota, request, principal)
-    except BaseException:
-        await file.close()
-        raise
+async def _принять_поток(state: Any, file: UploadFile, расширение: str,
+                         agent_id: str) -> tuple[Path, int, str]:
+    """Запись из тела запроса — в файл загрузки: (путь, размер, sha256)."""
     предел = int(state.settings.get("max_upload_mb") or 2048)
     цель = state.settings.paths.uploads / f"{new_id('pbx')}{расширение}"
     размер = 0
@@ -659,8 +754,104 @@ async def _принять(request: Request, state: Any, principal: Principal,
     finally:
         await file.close()
 
+    return цель, размер, сумма.hexdigest()
+
+
+async def _принять(request: Request, state: Any, principal: Principal,
+                   поля: dict[str, Any], file: UploadFile | None, agent_id: str,
+                   запись_агента: dict[str, Any], uniqueid: str, станция: str,
+                   ключ: str) -> dict[str, Any]:
+    """Сам приём звонка — под занятым ключом (см. `_ПРИНИМАЮТСЯ`).
+
+    Всё, что ходит в базу и запускает ffprobe, — в потоке (см. `call`).
+    """
+    from ..telephony.asterisk import нога_лучше  # noqa: PLC0415
+    from .routes_jobs import _probe_duration, check_quota, под_квотой  # noqa: PLC0415
+
+    звонок = {к: поля.get(к) for к in ПОЛЯ_ЗВОНКА if к in поля}
+    звонок["duration"] = int(_число(звонок.get("duration")))
+    звонок["billsec"] = int(_число(звонок.get("billsec")))
+    звонок["started_at"] = _число(звонок.get("started_at"))
+    if "linkedid" in звонок:
+        связь = str(звонок.get("linkedid") or "").strip()[:128]
+        звонок["linkedid"] = связь if re.fullmatch(r"[\w.\-]*\d+\.\d+", связь) else ""
+    if "sequence" in звонок:
+        звонок["sequence"] = int(_число(звонок.get("sequence")))
+    if "did" in звонок:
+        звонок["did"] = re.sub(r"[^0-9+]", "", str(звонок.get("did") or ""))[:32]
+    звонок["answered"] = 1 if звонок.get("answered") else 0
+    звонок["pbx_uid"] = uniqueid
+    загрузка = str(поля.get("upload_id") or "").strip()
+    есть_файл = (file is not None and bool((file.filename or "").strip())) or bool(загрузка)
+
+    прежний = await asyncio.to_thread(state.db.call_get, ключ)
+    if прежний is not None:
+        # Звонок уже в архиве. Asterisk 12+ пишет на один звонок несколько
+        # строк CDR, и пришедшая позже бывает той самой — отвеченной. Раньше
+        # она отбрасывалась как «уже импортирован», приняв тело целиком.
+        лучше = нога_лучше(звонок, прежний)
+        if прежний.get("job_id") or not (есть_файл and (лучше or _дослать_можно(прежний))):
+            if лучше:
+                пометка = str(прежний.get("skipped") or "") if прежний.get("job_id") \
+                    else str(поля.get("skipped") or прежний.get("skipped") or "")
+                await asyncio.to_thread(functools.partial(
+                    state.db.save_call, ключ, job_id=None, skipped=пометка, owner=None,
+                    station=станция, **звонок))
+            if file is not None:
+                await file.close()
+            await asyncio.to_thread(_убрать_загрузку, state, agent_id, загрузка)
+            return {"ok": True, "skipped": "уже импортирован", "uniqueid": uniqueid,
+                    **({"updated": True} if лучше else {})}
+
+    if not есть_файл:
+        # Звонок без записи — тоже звонок: он нужен в журнале, в счётчиках
+        # и в разрезах. Просто распознавать нечего.
+        def без_записи() -> None:
+            state.db.save_call(ключ, job_id=None,
+                               skipped=str(поля.get("skipped") or "нет записи"),
+                               owner=principal.name, station=станция, **звонок)
+            state.db.agent_count(agent_id, calls=1)
+
+        await asyncio.to_thread(без_записи)
+        if file is not None:
+            await file.close()
+        return {"ok": True, "skipped": "нет записи", "uniqueid": uniqueid}
+    имя = Path(str(file.filename if file is not None and not загрузка
+                   else поля.get("upload_name") or "запись.wav")).name
+    расширение = Path(имя).suffix.lower()
+    if расширение not in ЗВУК:
+        # 415, а не 400: агент по этому коду понимает, что дело в ЗАПИСИ, и
+        # шлёт звонок ещё раз без неё — звонок остаётся в журнале.
+        if file is not None:
+            await file.close()
+        await asyncio.to_thread(_убрать_загрузку, state, agent_id, загрузка)
+        ошибка = UnsupportedFormat(имя)
+        ошибка.message = f"«{имя}»: такие записи сервер не принимает."
+        ошибка.hint = "Ожидаются " + ", ".join(sorted(ЗВУК)) + "."
+        raise error_response(ошибка)
+    # Суточная квота по числу заданий — до приёма файла, как у обычной
+    # загрузки и у /process-call: незачем принимать сотню мегабайт, чтобы
+    # затем отказать. Отказ — 429 с Retry-After: агент повторит позже.
+    # Раньше этот путь квоту не проверял вовсе: ключ с quota_jobs_per_day=2
+    # сам заводил агента через /hello и ставил задания без счёта.
+    try:
+        await asyncio.to_thread(check_quota, request, principal)
+    except BaseException:
+        if file is not None:
+            await file.close()
+        raise
+    if загрузка:
+        # Запись докачана частями (`POST /chunk`): собрать и сверить сумму.
+        if file is not None:
+            await file.close()
+        цель, размер, получено = await asyncio.to_thread(
+            _собрать_загрузку, state, загрузка, agent_id, расширение)
+    else:
+        assert file is not None
+        цель, размер, получено = await _принять_поток(state, file, расширение, agent_id)
+
     ожидалось = str(поля.get("sha256") or "").strip().lower()
-    if ожидалось and ожидалось != сумма.hexdigest():
+    if ожидалось and ожидалось != получено:
         # Запись доехала не той, что ушла: обрыв, который прокси выдал за
         # конец тела, или порча по дороге. Повтор агента пришлёт её заново.
         цель.unlink(missing_ok=True)

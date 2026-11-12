@@ -372,7 +372,7 @@ def _клиент(сегменты: list[dict[str, Any]], оператор: str 
             время[кто] = время.get(кто, 0.0) + max(
                 0.0, float(с.get("end") or с.get("end_s") or 0.0)
                 - float(с.get("start") or с.get("start_s") or 0.0))
-    return max(время, key=время.get) if время else None
+    return max(время, key=lambda к: время[к]) if время else None
 
 
 #: Пары «не + глагол» после тревожного слова, которые его отрицают:

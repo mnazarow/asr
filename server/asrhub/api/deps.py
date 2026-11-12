@@ -105,6 +105,11 @@ class AppState:
     events: Any = None
     #: Пул потоков диктовки (`app._в_потоке_диктовки`).
     stream_pool: Any = None
+    #: Слои, заводимые при первом обращении: раскрытие чисел, тренды и
+    #: установщик языковой модели (их ставят свои маршруты).
+    drill: Any = None
+    trends: Any = None
+    llm_setup: Any = None
     _rate: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     #: Замок к окнам частоты. Проверка ключа — обычная (не async)
     #: зависимость, а такие FastAPI выполняет в пуле потоков: два запроса
@@ -290,7 +295,7 @@ def участник_записи(state: AppState, account: Any) -> Principal:
 def ключ_действует(state: AppState, token: str) -> bool:
     """Жив ли ключ: не отозван и не отключён — проверка без базы."""
     info = state.settings.api_keys.get(token) if token else None
-    return bool(info) and info.get("enabled") is not False
+    return info is not None and bool(info) and info.get("enabled") is not False
 
 
 def token_from(x_api_key: str | None, authorization: str | None,

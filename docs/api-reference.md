@@ -2,7 +2,7 @@
 
 Полный справочник по всем маршрутам сервера: что принимает каждый, что возвращает, какой нужен ключ и как выглядит настоящий ответ.
 
-Всего маршрутов: **248**, операций: **276**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
+Всего маршрутов: **249**, операций: **278**. Справочник собран из схемы OpenAPI работающего сервера, а примеры ответов сняты с него же, поэтому расходиться с действительностью им негде.
 
 
 Программный интерфейс ASR Hub — обычный HTTP с телом в JSON. Отдельного
@@ -349,6 +349,8 @@ websocat "ws://сервер:8080/ws?ticket=${TICKET}"
 | `POST` | `/api/telephony/agent/ask` | Какие из этих звонков серверу ещё нужны | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/asrhub-agent.py` | Исходный текст агента | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/telephony/agent/call` | Звонок с записью от агента | ключ с правом записи (**admin** или **user**) |
+| `GET` | `/api/telephony/agent/chunk` | Сколько байт записи уже принято (докачка частями) | ключ с правом записи (**admin** или **user**) |
+| `POST` | `/api/telephony/agent/chunk` | Часть записи от агента (докачка с места обрыва) | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/command` | Задание для агента, если оно есть | ключ с правом записи (**admin** или **user**) |
 | `POST` | `/api/telephony/agent/hello` | Агент сообщает о себе и получает задание | ключ с правом записи (**admin** или **user**) |
 | `GET` | `/api/telephony/agent/install.sh` | Установщик агента для станции | ключ с правом записи (**admin** или **user**) |
@@ -965,7 +967,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/queue
 ```json
 {
   "paused": false,
-  "instance": "vm:6778-672861",
+  "instance": "vm:9895-2cfef0",
   "instances": [],
   "workers": [
     {
@@ -1565,7 +1567,7 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/analytics?period=we
 {
   "overview": {
     "period": "week",
-    "generated_at": 1794459378.3783739,
+    "generated_at": 1794465643.8868542,
     "jobs": {
       "total": 0,
       "completed": 0,
@@ -1732,8 +1734,8 @@ curl http://сервер:8080/api/health
 ```json
 {
   "status": "ok",
-  "version": "3.1.34",
-  "uptime_s": 1.2,
+  "version": "3.1.35",
+  "uptime_s": 2.0,
   "queue_paused": false,
   "catalog_date": "2026-08-31",
   "utc_offset_s": 10800,
@@ -1813,8 +1815,8 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
 
 ```json
 {
-  "version": "3.1.34",
-  "uptime_s": 1.3,
+  "version": "3.1.35",
+  "uptime_s": 2.0,
   "hardware": {
     "os_name": "Linux",
     "os_version": "6.18.44-fc-v378",
@@ -1823,7 +1825,7 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/system
     "cpu_cores_physical": 2,
     "cpu_cores_logical": 2,
     "ram_total_gb": 7.8,
-    "ram_available_gb": 6.1,
+    "ram_available_gb": 6.3,
     "disk_free_gb": 22.9,
     "gpus": [],
     "accelerator": "cpu",
@@ -2573,8 +2575,8 @@ curl -H 'X-API-Key: $КЛЮЧ' 'http://сервер:8080/api/content/llm?period=
   "scorecard": [],
   "action_items": [],
   "window": {
-    "since": 1793854578.4729216,
-    "until": 1794459378.4729216
+    "since": 1793860843.9644542,
+    "until": 1794465643.9644542
   }
 }
 ```
@@ -2966,9 +2968,9 @@ curl -H 'X-API-Key: $КЛЮЧ' http://сервер:8080/api/llm/models
     "kind": "cpu",
     "device": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "total_gb": 7.8,
-    "free_gb": 6.1,
+    "free_gb": 6.3,
     "reserve_gb": 4.0,
-    "budget_gb": 2.3,
+    "budget_gb": 2.4,
     "note": "Видеокарта не найдена: модель пойдёт на процессоре, это минуты на запись, а не секунды."
   },
   "models": [
@@ -3632,6 +3634,42 @@ call_exists, save_call и queue.submit (хеш файла, ffprobe до мину
 
 **Доступ:** ключ с правом записи (**admin** или **user**).
 
+
+### `GET /api/telephony/agent/chunk`
+
+Сколько байт записи уже принято (докачка частями).
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `upload_id` | в адресе | string | обязателен | — |
+| `agent_id` | в адресе | string | обязателен | — |
+
+### `POST /api/telephony/agent/chunk`
+
+Часть записи от агента (докачка с места обрыва).
+
+Часть записи телом запроса: `offset` — с какого байта, `total` — весь размер.
+
+Записи больше предела прокси перед сервером (nginx `client_max_body_size`)
+раньше не доезжали вовсе: звонок уходил без записи. Теперь агент шлёт
+большую запись частями, а после обрыва спрашивает, сколько принято
+(`GET /chunk`), и продолжает с того места. Часть не с того места — 409
+с принятым размером. Звонок потом ссылается на загрузку полем
+`upload_id` в `meta` вместо файла.
+
+**Доступ:** ключ с правом записи (**admin** или **user**).
+
+
+| Параметр | Где | Тип | По умолчанию | Описание |
+|---|---|---|---|---|
+| `upload_id` | в адресе | string | обязателен | — |
+| `agent_id` | в адресе | string | обязателен | — |
+| `offset` | в адресе | integer | обязателен | — |
+| `total` | в адресе | integer | обязателен | — |
+| `sha256` | в адресе | string | обязателен | — |
 
 ### `GET /api/telephony/agent/command`
 
@@ -5064,14 +5102,14 @@ curl http://сервер:8080/api/monitoring/health
 ```json
 {
   "status": "ok",
-  "uptime_s": 1.4,
+  "uptime_s": 2.1,
   "liveness": {
     "status": "ok",
     "checks": [
       {
         "name": "process",
         "status": "ok",
-        "detail": "работает 1 с",
+        "detail": "работает 2 с",
         "hint": ""
       },
       {
