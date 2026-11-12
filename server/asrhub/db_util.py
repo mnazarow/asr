@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
@@ -43,6 +44,10 @@ def now() -> float:
     return time.time()
 
 
+def new_id(prefix: str = "job") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
 def _экранировать_like(значение: str) -> str:
     """Обезвреживает образцы LIKE: обратная косая, процент, подчёркивание."""
     return (str(значение or "").replace("\\", "\\\\")
@@ -71,6 +76,11 @@ class ОсноваБазы:
 
         @staticmethod
         def _цифры_номера(запрос: str) -> str: ...
+
+        def _content_where(self, since: float | None, until: float | None,
+                           owner: str | list[str] | None, extra: str = "",
+                           agent: tuple[str, str] | None = None
+                           ) -> tuple[str, list[Any]]: ...
 
         CONTENT_GROUPS: dict[str, str]
         AGENT_DIMENSIONS: dict[str, str]

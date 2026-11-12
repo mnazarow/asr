@@ -2558,8 +2558,11 @@ def test_a_broken_janitor_step_does_not_flood_the_log(tmp_path: Path, caplog):
 
     очередь.registry = Реестр()
 
-    прежний = JQ.SAMPLE_PERIOD_S
-    JQ.SAMPLE_PERIOD_S = 0.03
+    # Служебный цикл — в примеси обслуживания (`job_queue_upkeep`, 3.1.41).
+    from asrhub import job_queue_upkeep as обслуживание
+
+    прежний = обслуживание.SAMPLE_PERIOD_S
+    обслуживание.SAMPLE_PERIOD_S = 0.03
     try:
         with caplog.at_level("INFO", logger="asrhub.queue"):
             поток = threading.Thread(target=очередь._janitor_loop, daemon=True)
@@ -2568,7 +2571,7 @@ def test_a_broken_janitor_step_does_not_flood_the_log(tmp_path: Path, caplog):
             очередь._stop.set()
             поток.join(timeout=3)
     finally:
-        JQ.SAMPLE_PERIOD_S = прежний
+        обслуживание.SAMPLE_PERIOD_S = прежний
 
     записи = [r.getMessage() for r in caplog.records]
     сбои = [r for r in записи if "дал сбой" in r]

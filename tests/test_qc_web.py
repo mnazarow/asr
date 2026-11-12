@@ -161,3 +161,34 @@ def test_короткие_номера_образец_голоса_и_запис
     с.click("#qc-voice-del")
     с.wait_for_function("() => !document.querySelector('#qc-voice-del')")
     вкладка.чисто()
+
+
+def test_разметка_записи_для_модели_автоответчика(вкладка, сервер):
+    """Заход 69: «это человек / автоответчик» в журнале и карточка модели."""
+    import time
+    import wave
+
+    хранилище = сервер[1]
+    каталог = хранилище.app.state.hub.qc.каталог_записей_опросов()
+    каталог.mkdir(parents=True, exist_ok=True)
+    путь = каталог / "amd-ui.wav"
+    with wave.open(str(путь), "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(8000)
+        wav.writeframes(b"\x00\x00" * 2 * 8000 * 3)
+    хранилище.db.execute(
+        "INSERT INTO qc_surveys (id, number, created_at, status, recording, group_name) "
+        "VALUES ('amd-ui', '+79995556677', ?, 'автоответчик', ?, 'Продажи')",
+        (time.time(), str(путь)))
+    с = вкладка.открыть("qc")
+    с.wait_for_selector("#qc-amd .card-head")
+    assert "Размечено: человек 0, автоответчик 0" in с.inner_text("#qc-amd")
+    с.locator('[data-qc-amd="amd-ui"][data-label="человек"]').click()
+    с.wait_for_selector('[data-qc-amd="amd-ui"] b')
+    assert с.inner_text('[data-qc-amd="amd-ui"] b') == "человек"
+    с.wait_for_function("() => document.querySelector('#qc-amd').innerText.includes('человек 1')")
+    # Повторный щелчок по метке снимает её.
+    с.locator('[data-qc-amd="amd-ui"][data-label=""]').click()
+    с.wait_for_function("() => !document.querySelector('[data-qc-amd=\"amd-ui\"] b')")
+    вкладка.чисто()

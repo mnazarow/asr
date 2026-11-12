@@ -11861,6 +11861,7 @@ RENDERERS.qc = {
       <div id="qc-groups"><div class="empty">Читаю группы…</div></div>
       <div id="qc-summary"></div>
       <div id="qc-journal"></div>
+      <div id="qc-amd"></div>
       <div id="qc-stoplist"></div>`;
     qsa('#qc-days button').forEach((к) => к.addEventListener('click', () => {
       state.qcDays = Number(к.dataset.days);
@@ -11970,7 +11971,10 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
       state.qcStop = стоп;
       this.drawSummary();
       this.drawJournal();
-      if (!this._толькоОтчёт) this.drawStoplist();
+      if (!this._толькоОтчёт) {
+        this.drawStoplist();
+        this.loadAmd();
+      }
       // Пока есть идущие звонки, журнал обновляется сам.
       clearTimeout(this._таймер);
       if ((журнал.items || []).some((з) => з.status === 'звонит') && state.view === 'qc') {
@@ -12504,6 +12508,46 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
             <td class="num"><b>${оценка(з)}</b></td><td>${полоска(з)}</td></tr>`)}`}</tbody></table></div>`) : ''}`;
   },
 
+  /** Модель автоответчика: сколько размечено, обучена ли и насколько точна. */
+  async loadAmd() {
+    const место = qs('#qc-amd');
+    if (!место) return;
+    let д;
+    try { д = await API.get('/api/qc/amd'); } catch (err) {
+      if (err && err.silent) return;
+      место.innerHTML = '';
+      return;
+    }
+    const м = д.model;
+    const ч = д.labels['человек'] || 0;
+    const а = д.labels['автоответчик'] || 0;
+    const хватает = ч + а >= д.min_total && Math.min(ч, а) >= д.min_per_label;
+    место.innerHTML = card('Автоответчик моделью',
+      'учится на записях опросов, размеченных в журнале: «это человек / автоответчик»',
+      html`<div class="small" style="padding:4px 2px">
+        Размечено: человек ${num(ч, 0)}, автоответчик ${num(а, 0)}${хватает ? ''
+          : html` <span class="faint">— для обучения нужно хотя бы ${д.min_total}, не меньше
+            ${д.min_per_label} каждого вида</span>`}.
+        ${м ? html`<div style="margin-top:6px">Модель обучена ${fmtTime(м.trained_at)} на
+          ${num(м.samples, 0)} записях; точность перекрёстной проверкой —
+          <b>${м.accuracy === null || м.accuracy === undefined ? '—' : pct(м.accuracy, 0)}</b>.
+          ${д.enabled ? 'Работает, когда распознавание автоответчика (qc_amd) включено.'
+            : html`<span class="faint">Сейчас не работает: включите qc_amd и qc_amd_model.</span>`}</div>`
+          : html`<div class="faint" style="margin-top:6px">Модели нет: автоответчик узнаётся
+            правилами (длина реплики, гудок голосовой почты).</div>`}</div>`,
+      хватает ? '<button class="ghost sm" id="qc-amd-train">Обучить</button>' : '');
+    const кнопка = qs('#qc-amd-train');
+    if (кнопка) {
+      кнопка.onclick = (е) => занятьКнопку(е.currentTarget, async () => {
+        try {
+          const итог = await API.post('/api/qc/amd/train');
+          toast(`Модель обучена: точность ${pct(итог.model.accuracy, 0)}`, 'ok');
+          await this.loadAmd();
+        } catch (err) { fail(err); }
+      });
+    }
+  },
+
   drawJournal() {
     const ж = state.qcJournal || {};
     const записи = ж.items || [];
@@ -12518,6 +12562,13 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
       })}${з.answers.filter((о) => о.kind === 'comment' && о.comment)
         .map((о) => html`<div class="small dim" title="${о.text}">«${о.comment}»</div>`)}`
       : html`<span class="faint">—</span>`);
+    // Разметка записи для модели автоответчика: текущая метка — жирным,
+    // щелчок по ней снимает разметку.
+    const метки = (з) => html`<div class="small faint" style="margin-top:2px">это ${
+      ['человек', 'автоответчик'].map((м, н) => html`${н ? ' / ' : ''}<a href="#" data-qc-amd="${з.id}"
+        data-label="${з.amd_label === м ? '' : м}" title="${з.amd_label === м
+          ? 'Снять разметку' : 'Разметить запись для модели автоответчика'}">${з.amd_label === м
+          ? html`<b>${м}</b>` : м}</a>`)}</div>`;
     const строка = (з) => {
       const [подпись, вид] = QC_СОСТОЯНИЯ[з.status] || [з.status, ''];
       return html`<tr><td class="small">${fmtTime(з.created_at)}</td>
@@ -12532,7 +12583,8 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
             <td class="num">${num(з.attempts || 0, 0)}</td>
             <td class="small">${з.job_id ? html`<a href="#" data-qc-job="${з.job_id}">разговор</a>` : ''}
               ${з.has_recording ? html`<a href="#" data-qc-audio="${з.id}">запись</a>` : ''}
-              ${з.status === 'ждёт' && !this._толькоОтчёт ? html`<a href="#" data-qc-cancel="${з.id}">отменить</a>` : ''}</td></tr>`;
+              ${з.status === 'ждёт' && !this._толькоОтчёт ? html`<a href="#" data-qc-cancel="${з.id}">отменить</a>` : ''}
+              ${!this._толькоОтчёт && (з.has_recording || з.amd_label) ? метки(з) : ''}</td></tr>`;
     };
     qs('#qc-journal').innerHTML = card('Журнал опросов',
       `кому звонили и что ответили; показано ${записи.length} из ${num(ж.total || 0, 0)}`,
@@ -12561,6 +12613,14 @@ exten =&gt; _X.,1,NoOp(Опрос качества: \${EXTEN})
       ев.preventDefault();
       скачатьФайл(`/api/qc/surveys/${encodeURIComponent(ссылка.dataset.qcAudio)}/audio`,
         `qc-${ссылка.dataset.qcAudio}.wav`);
+    }));
+    qsa('[data-qc-amd]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
+      ев.preventDefault();
+      try {
+        await API.put(`/api/qc/surveys/${encodeURIComponent(ссылка.dataset.qcAmd)}/amd_label`,
+          { label: ссылка.dataset.label });
+        await this.loadReport();
+      } catch (err) { fail(err); }
     }));
     qsa('[data-qc-cancel]').forEach((ссылка) => ссылка.addEventListener('click', async (ев) => {
       ев.preventDefault();

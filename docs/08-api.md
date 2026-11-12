@@ -754,8 +754,12 @@ POST   /api/qc/check                  регистрация телефона н
 POST   /api/qc/test-call              пробный звонок с опросом
 GET    /api/qc/surveys                журнал опросов
 GET    /api/qc/surveys/export         журнал опросов в CSV (тот же отбор, все строки)
+GET    /api/qc/surveys/{id}/audio     запись опроса (qc_record): WAV, слева клиент
+PUT    /api/qc/surveys/{id}/amd_label разметить запись для модели автоответчика
 POST   /api/qc/surveys/{id}/cancel    отменить ждущий опрос
 GET    /api/qc/summary                оценки за период
+GET    /api/qc/amd                    модель автоответчика: разметка, обученная модель
+POST   /api/qc/amd/train              обучить модель автоответчика на разметке
 GET    /api/qc/stoplist               список «не звонить»
 POST   /api/qc/stoplist               внести номер
 DELETE /api/qc/stoplist/{number}      убрать номер

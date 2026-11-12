@@ -191,7 +191,6 @@ def test_отметки_экземпляров(tmp_path: Path):
 
 
 def test_сервер_отмечается_и_снимает_отметку_при_остановке(data_dir: Path, monkeypatch):
-    from asrhub import job_queue
     from asrhub.api import create_app
     from asrhub.config import load
     from asrhub.instance import INSTANCE_ID
@@ -199,7 +198,8 @@ def test_сервер_отмечается_и_снимает_отметку_пр
 
     monkeypatch.setenv("ASRHUB_ENGINE", "demo")
     monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
-    monkeypatch.setattr(job_queue, "HEARTBEAT_S", 0.2)
+    # Отметка жизни — в примеси обслуживания (`job_queue_upkeep`, 3.1.41).
+    monkeypatch.setattr("asrhub.job_queue_upkeep.HEARTBEAT_S", 0.2)
     приложение = create_app(load(), start_queue=True)
     база = приложение.state.hub.db
     ключ = f"instance:{INSTANCE_ID}"

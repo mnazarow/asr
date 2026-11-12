@@ -17,15 +17,16 @@ import shutil
 import sqlite3
 import threading
 import time
-import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .db_audit import ПроверкаБазы
 from .db_content import СодержаниеБазы
 from .db_llm import ЯзыковаяМодельБазы
+from .db_people import ЛюдиБазы
 from .db_telephony import ТелефонияБазы
 from .db_util import (
     SERIES_MAX_BUCKETS,
@@ -33,6 +34,7 @@ from .db_util import (
     УКАЗАТЕЛЬ_ОКНА,
     УКАЗАТЕЛЬ_ОТВЕТОВ,
     _экранировать_like,
+    new_id,
     now,
 )
 from .errors import ConfigError, StorageError
@@ -41,7 +43,7 @@ from .logging_setup import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 
 #: Сколько заданий убирать по сроку хранения за один заход служебного цикла.
@@ -1194,6 +1196,18 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_bridge_events_ts ON bridge_events(ts)",
+    # Версия 41: разметка записей опросов «человек» или «автоответчик» для
+    # модели автоответчика (`qc.amd_model`). Признаки хранятся с меткой:
+    # запись опроса уходит по сроку, а обучать можно и после.
+    """
+    CREATE TABLE IF NOT EXISTS qc_amd_labels (
+        survey_id  TEXT PRIMARY KEY,
+        label      TEXT NOT NULL,
+        features   TEXT NOT NULL,
+        labeled_by TEXT DEFAULT '',
+        labeled_at REAL
+    )
+    """,
     # Версия 33: добавочный по заданию без чтения строки звонка — им
     # подписываются таблицы «Голосовой аналитики» и разрез по добавочным.
     "CREATE INDEX IF NOT EXISTS idx_calls_job_agent ON calls(job_id, agent)",
@@ -1218,10 +1232,6 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_jobs_webhook ON jobs(webhook_status, webhook_next_at) "
     "WHERE webhook_status IN ('pending', 'sending')",
 ]
-
-
-def new_id(prefix: str = "job") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
 def _ожидаемые_колонки() -> dict[str, dict[str, str]]:
@@ -1364,7 +1374,7 @@ def _порядок_заданий(order: str, соединение: bool) -> st
     return f"{основа}, {п}id {направление}"
 
 
-class Database(ТелефонияБазы, СодержаниеБазы, ЯзыковаяМодельБазы):
+class Database(ТелефонияБазы, СодержаниеБазы, ЯзыковаяМодельБазы, ЛюдиБазы, ПроверкаБазы):
     """Тонкая обёртка над SQLite с пулом соединений по потокам."""
 
     def __init__(self, path: Path | str, *, journal_mode: str | None = None):
@@ -2742,6 +2752,30 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
             f"UPDATE calls SET {ОБЕЗЛИЧИТЬ_ЗВОНОК} WHERE {условие} "
             "AND (job_id IS NULL OR job_id NOT IN (SELECT id FROM jobs))", args)
 
+    def qc_amd_label(self, survey_id: str, метка: str, признаки: list[list[float]], *,
+                     кто: str = "") -> None:
+        """Разметка записи опроса для модели автоответчика; пустая метка — убрать."""
+        if not метка:
+            self.execute("DELETE FROM qc_amd_labels WHERE survey_id=?", (str(survey_id),))
+            return
+        self.execute(
+            "INSERT INTO qc_amd_labels (survey_id, label, features, labeled_by, labeled_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(survey_id) DO UPDATE SET label=excluded.label, "
+            "features=excluded.features, labeled_by=excluded.labeled_by, "
+            "labeled_at=excluded.labeled_at",
+            (str(survey_id), метка, json.dumps(признаки), str(кто or ""), now()))
+
+    def qc_amd_labels(self) -> list[tuple[list[list[float]], str]]:
+        """Все размеченные записи: (признаки на каждом окне, метка)."""
+        итог: list[tuple[list[list[float]], str]] = []
+        for с in self.query("SELECT label, features FROM qc_amd_labels"):
+            try:
+                окна = json.loads(с["features"])
+                итог.append(([[float(x) for x in окно] for окно in окна], str(с["label"])))
+            except (ValueError, TypeError):
+                continue
+        return итог
+
     def erase_qc(self, запрос: str) -> int:
         """Опросы контроля качества по номеру клиента — по требованию субъекта.
 
@@ -2752,12 +2786,15 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
         цифры = self._цифры_номера(запрос)
         if not цифры or len(цифры) < 5:
             return 0
-        # Запись опроса — голос субъекта: уходит вместе со строкой.
+        # Запись опроса — голос субъекта: уходит вместе со строкой. Разметка
+        # для модели автоответчика (только числа) — тоже: она про его опрос.
         for строка in self.query(
                 "SELECT recording FROM qc_surveys WHERE instr(number, ?) > 0 "
                 "AND COALESCE(recording,'')<>''", (цифры,)):
             with contextlib.suppress(OSError):
                 Path(строка["recording"]).unlink(missing_ok=True)
+        self.execute("DELETE FROM qc_amd_labels WHERE survey_id IN (SELECT id FROM qc_surveys "
+                     "WHERE instr(number, ?) > 0 AND status NOT IN ('ждёт','звонит'))", (цифры,))
         return self.execute(
             "DELETE FROM qc_surveys WHERE instr(number, ?) > 0 AND status NOT IN ('ждёт','звонит')",
             (цифры,)) + self.execute(
@@ -4133,799 +4170,6 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
         except (TypeError, ValueError):
             return default
 
-    # --- сотрудники -------------------------------------------------------
-
-    #: Поля карточки сотрудника, которые приходят снаружи. Список закрытый:
-    #: он же — белый список колонок для записи, и через него нельзя
-    #: дописать в таблицу ничего постороннего.
-    ПОЛЯ_СОТРУДНИКА = (
-        "external_id", "source", "active", "active_until",
-        "last_name", "first_name", "middle_name", "position", "department",
-        "phone_work", "phone_ext", "phone_mobile", "email", "suppliers",
-        "note", "owner",
-    )
-
-    def employee_save(self, данные: dict[str, Any], *,
-                      id: str | None = None) -> dict[str, Any]:       # noqa: A002
-        """Заводит или обновляет карточку сотрудника; возвращает её целиком.
-
-        Ключ поиска — сначала явный `id`, потом пара «источник и внешний
-        ключ». Вторая нужна импорту: справочник отдаёт одних и тех же людей
-        каждый раз, и без неё повторный импорт заводил бы отдел заново.
-        """
-        поля = {к: данные.get(к) for к in self.ПОЛЯ_СОТРУДНИКА if к in данные}
-        поля.setdefault("source", "ручной")
-        if "active" in поля:
-            поля["active"] = 1 if поля["active"] else 0
-        существующий = None
-        if id:
-            существующий = self.employee_get(str(id))
-        if существующий is None and поля.get("external_id"):
-            найден = self.query_one(
-                "SELECT * FROM employees WHERE source=? AND external_id=?",
-                (str(поля.get("source") or "ручной"), str(поля["external_id"])))
-            существующий = dict(найден) if найден is not None else None
-            существующий = dict(существующий) if существующий else None
-        мгновение = now()
-        if существующий is None:
-            новый = new_id("emp")
-            колонки = ["id", *поля.keys(), "created_at", "updated_at"]
-            значения = [новый, *поля.values(), мгновение, мгновение]
-            self.execute(
-                f"INSERT INTO employees ({', '.join(колонки)}) "
-                f"VALUES ({', '.join('?' * len(колонки))})", значения)
-            return self.employee_get(новый) or {}
-        if not поля:
-            return существующий
-        назначения = ", ".join(f"{к}=?" for к in поля)
-        self.execute(f"UPDATE employees SET {назначения}, updated_at=? WHERE id=?",
-                     [*поля.values(), мгновение, существующий["id"]])
-        return self.employee_get(str(существующий["id"])) or {}
-
-    def employee_get(self, id: str) -> dict[str, Any] | None:         # noqa: A002
-        row = self.query_one("SELECT * FROM employees WHERE id=?", (str(id),))
-        return dict(row) if row else None
-
-    def employee_by_key(self, source: str, external_id: str) -> dict[str, Any] | None:
-        """Карточка по паре «источник и внешний ключ» — так её узнаёт импорт."""
-        if not external_id:
-            return None
-        row = self.query_one(
-            "SELECT * FROM employees WHERE source=? AND external_id=?",
-            (str(source or "ручной"), str(external_id)))
-        return dict(row) if row else None
-
-    def employee_by_ext(self, номер: str) -> dict[str, Any] | None:
-        """Сотрудник по внутреннему номеру — так звонок узнаёт оператора."""
-        номер = str(номер or "").strip()
-        if not номер:
-            return None
-        row = self.query_one(
-            "SELECT * FROM employees WHERE phone_ext=? "
-            "ORDER BY active DESC, updated_at DESC, id DESC", (номер,))
-        return dict(row) if row else None
-
-    #: Внутренние номера, чья главная карточка — в этом отделе (один `?`).
-    #:
-    #: Номер бывает у двоих: общий номер отдела, номер, переданный новому
-    #: человеку при старой карточке уволенного. Отчёты подписывают номер
-    #: одним человеком — работающим раньше уволенного, свежей карточкой
-    #: раньше старой, при равенстве — последней заведённой
-    #: (`employees_by_ext`), — и отдел номера — отдел этого человека.
-    #: Отбор по отделу обязан смотреть туда же. Прежнее «есть карточка с
-    #: этим номером в отделе» относило номер сразу к двум отделам: таблица
-    #: «По отделам» показывала его разговоры у одного, а отбор и список под
-    #: числом — у обоих, подписанные чужим отделом. Подзапрос не зависит от
-    #: строки звонка: база считает его один раз на запрос.
-    ДОБАВОЧНЫЕ_ОТДЕЛА = (
-        "SELECT e.phone_ext FROM employees e WHERE e.department = ? "
-        "AND COALESCE(e.phone_ext,'') <> '' AND NOT EXISTS ("
-        "SELECT 1 FROM employees b WHERE b.phone_ext = e.phone_ext AND b.id <> e.id AND ("
-        "COALESCE(b.active,0) > COALESCE(e.active,0) OR (COALESCE(b.active,0) = COALESCE(e.active,0) "
-        "AND (COALESCE(b.updated_at,0) > COALESCE(e.updated_at,0) "
-        "OR (COALESCE(b.updated_at,0) = COALESCE(e.updated_at,0) AND b.id > e.id)))))")
-    #: Разговор отдела: у задания строка звонка с добавочным отдела.
-    ОТДЕЛ_ЗАДАНИЯ = ("EXISTS (SELECT 1 FROM calls cl WHERE cl.job_id = j.id "
-                     f"AND cl.agent IN ({ДОБАВОЧНЫЕ_ОТДЕЛА}))")
-    #: Звонок отдела: оператор звонка — добавочный отдела.
-    ОТДЕЛ_ЗВОНКА = f"cl.agent IN ({ДОБАВОЧНЫЕ_ОТДЕЛА})"
-
-    def employees_by_ext(self, номера: Any) -> dict[str, dict[str, Any]]:
-        """Сотрудники по внутренним номерам — разом, для таблиц отчётов.
-
-        Отчёт показывает сотни строк, и спрашивать справочник по строке —
-        сотни запросов. Здесь один запрос на пятьсот номеров. На номер,
-        который делят двое, — тот же выбор, что у `employee_by_ext`:
-        работающий раньше уволенного, свежая карточка раньше старой.
-        """
-        список = sorted({str(н).strip() for н in (номера or []) if str(н or "").strip()})
-        итог: dict[str, dict[str, Any]] = {}
-        for начало in range(0, len(список), 500):
-            кусок = список[начало:начало + 500]
-            строки = self.query(
-                "SELECT phone_ext, last_name, first_name, middle_name, department, "
-                "       position, active FROM employees "
-                f"WHERE phone_ext IN ({','.join('?' for _ in кусок)}) "
-                # Последней пишется лучшая — она и остаётся в словаре. Порядок
-                # полный, до ключа карточки: при равном времени правки выбор
-                # не должен зависеть от того, как база отдала строки, — по
-                # нему же отбор «отдел» относит номер к отделу
-                # (`ДОБАВОЧНЫЕ_ОТДЕЛА`).
-                "ORDER BY active ASC, updated_at ASC, id ASC", кусок)
-            for r in строки:
-                имя = " ".join(str(r[поле] or "").strip() for поле in
-                               ("last_name", "first_name", "middle_name")).strip()
-                итог[str(r["phone_ext"])] = {
-                    "name": " ".join(имя.split()), "department": str(r["department"] or ""),
-                    "position": str(r["position"] or ""), "active": bool(r["active"])}
-        return итог
-
-    def agents_for_jobs(self, ids: Any) -> dict[str, str]:
-        """Добавочный оператора по заданию — из журнала звонков, разом.
-
-        Строка звонка у задания одна (у разговора частями — у каждой части
-        своя); если их всё же две, берётся первая с непустым оператором.
-        Ищется по указателю `idx_calls_job_agent` без чтения строк звонков.
-        """
-        список = sorted({str(i) for i in (ids or []) if i})
-        итог: dict[str, str] = {}
-        for начало in range(0, len(список), 500):
-            кусок = список[начало:начало + 500]
-            for r in self.query(
-                    "SELECT job_id, agent FROM calls "
-                    f"WHERE job_id IN ({','.join('?' for _ in кусок)}) "
-                    "AND COALESCE(agent,'') <> ''", кусок):
-                итог.setdefault(str(r["job_id"]), str(r["agent"]))
-        return итог
-
-    def employee_list(self, *, query: str = "", department: str = "",
-                      active: bool | None = None, source: str = "",
-                      limit: int = 500, offset: int = 0) -> dict[str, Any]:
-        условия: list[str] = []
-        параметры: list[Any] = []
-        if query:
-            # «_» и «%» — буквы запроса («ivan_petrov@…»), а не образцы LIKE.
-            искомое = f"%{_экранировать_like(query.strip().lower())}%"
-            условия.append(
-                "(LOWER(last_name) LIKE ? ESCAPE '\\' OR LOWER(first_name) LIKE ? ESCAPE '\\' OR "
-                " LOWER(middle_name) LIKE ? ESCAPE '\\' OR LOWER(position) LIKE ? ESCAPE '\\' OR "
-                " LOWER(department) LIKE ? ESCAPE '\\' OR LOWER(email) LIKE ? ESCAPE '\\' OR "
-                " phone_ext LIKE ? ESCAPE '\\' OR phone_mobile LIKE ? ESCAPE '\\' OR "
-                " phone_work LIKE ? ESCAPE '\\')")
-            параметры.extend([искомое] * 9)
-        if department:
-            условия.append("department=?")
-            параметры.append(department)
-        if source:
-            условия.append("source=?")
-            параметры.append(source)
-        if active is not None:
-            условия.append("active=?")
-            параметры.append(1 if active else 0)
-        где = (" WHERE " + " AND ".join(условия)) if условия else ""
-        всего = self.query_one(f"SELECT COUNT(*) AS n FROM employees{где}", параметры)
-        rows = self.query(
-            f"SELECT * FROM employees{где} ORDER BY active DESC, last_name, first_name, id "
-            f"LIMIT ? OFFSET ?", [*параметры, max(1, int(limit)), max(0, int(offset))])
-        return {"total": int(всего["n"]) if всего else 0,
-                "items": [dict(r) for r in rows]}
-
-    def employee_delete(self, id: str) -> bool:                       # noqa: A002
-        return self.execute("DELETE FROM employees WHERE id=?", (str(id),)) > 0
-
-    def employee_departments(self) -> list[dict[str, Any]]:
-        rows = self.query(
-            "SELECT department, COUNT(*) AS n, "
-            "       SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) AS active "
-            "FROM employees GROUP BY department ORDER BY n DESC")
-        return [dict(r) for r in rows]
-
-    #: Сколько имён в каждом перечне «что изменилось» отдаёт импорт.
-    ИМЁН_В_ИТОГЕ_ИМПОРТА = 50
-
-    def employees_import(self, записи: list[dict[str, Any]], *, source: str,
-                         deactivate_missing: bool = True,
-                         dry_run: bool = False,
-                         предел_увольнений: tuple[float, int] | None = None
-                         ) -> dict[str, Any]:
-        """Разом заводит выгрузку справочника. Возвращает, что изменилось.
-
-        Пропавших из выгрузки не удаляем, а помечаем неработающими: по ним
-        есть звонки, и удаление превратило бы половину архива в разговоры
-        неизвестно с кем. Это же и честнее: человек уволился, а разговоры
-        остались.
-
-        `dry_run` — посчитать то же самое, ничего не записав: так работает
-        предпросмотр импорта. Перечни `changes` — кого добавить, у кого
-        какие поля поменять, кого отметить уволенным (по полсотни имён).
-        """
-        было = {str(r["external_id"]): dict(r) for r in self.query(
-            "SELECT * FROM employees WHERE source=?", (source,)) if r["external_id"]}
-        добавлено = обновлено = без_изменений = сменились = 0
-        пришли: set[str] = set()
-        предел = self.ИМЁН_В_ИТОГЕ_ИМПОРТА
-        перечни: dict[str, list[dict[str, Any]]] = {
-            "added": [], "updated": [], "deactivated": [], "replaced": []}
-        # Предохранитель (`предел_увольнений` — доля и порог «без вопросов»):
-        # оборванная или кривая выгрузка «увольняла» остаток штата молча.
-        заблокировано = 0
-        if deactivate_missing and предел_увольнений is not None:
-            ключи = {str(з.get("external_id") or "").strip() for з in записи} - {""}
-            работают = [к for к, п in было.items() if int(п.get("active") or 0)]
-            пропадут = sum(1 for к in работают if к not in ключи)
-            доля, без_вопросов = предел_увольнений
-            if пропадут > max(int(без_вопросов), доля * len(работают)):
-                deactivate_missing = False
-                заблокировано = пропадут
-
-        def имя_части(карточка: dict[str, Any], поле: str) -> str:
-            return str(карточка.get(поле) or "").strip().lower().replace("ё", "е")
-
-        def другой_человек(прежний: dict[str, Any], данные: dict[str, Any]) -> bool:
-            """Тот же ключ-номер, но фамилия И имя другие — на месте новый человек.
-
-            Ключ карточки — внутренний номер, а номер уволенного отдают
-            тому, кто сел на его место. Импорт находил карточку по номеру и
-            переписывал её: прежний человек исчезал из справочника, его
-            примечание переезжало к новому, а сверка приписывала новому
-            звонки прежнего. Смена одной фамилии (замужество) или
-            исправленное имя — тот же человек; обе сразу — другой.
-            """
-            return all(имя_части(прежний, п) and имя_части(данные, п)
-                       and имя_части(прежний, п) != имя_части(данные, п)
-                       for п in ("last_name", "first_name"))
-
-        def кто(карточка: dict[str, Any]) -> dict[str, Any]:
-            return {"name": " ".join(str(карточка.get(п) or "").strip() for п in
-                                     ("last_name", "first_name", "middle_name")).strip(),
-                    "phone_ext": str(карточка.get("phone_ext") or ""),
-                    "department": str(карточка.get("department") or "")}
-
-        for запись in записи:
-            данные = {к: з for к, з in запись.items() if к in self.ПОЛЯ_СОТРУДНИКА}
-            данные["source"] = source
-            ключ = str(данные.get("external_id") or "").strip()
-            if not ключ:
-                continue
-            пришли.add(ключ)
-            прежний = было.get(ключ)
-            if прежний is None:
-                if not dry_run:
-                    self.employee_save(данные)
-                добавлено += 1
-                if len(перечни["added"]) < предел:
-                    перечни["added"].append(кто(данные))
-                continue
-            if другой_человек(прежний, данные):
-                # Прежнюю карточку не трогаем по содержанию: она уходит в
-                # неработающие с датой и с ключом, которого импорт больше не
-                # встретит, а новый человек получает свою карточку.
-                if not dry_run:
-                    self.execute(
-                        "UPDATE employees SET active=0, external_id=?, active_until=CASE "
-                        "WHEN COALESCE(active_until,'')='' THEN ? ELSE active_until END, "
-                        "updated_at=? WHERE id=?",
-                        (f"{ключ}~{прежний['id']}",
-                         time.strftime("%Y-%m-%d"), now(), прежний["id"]))
-                    self.employee_save(данные)
-                сменились += 1
-                добавлено += 1
-                if len(перечни["replaced"]) < предел:
-                    перечни["replaced"].append({**кто(данные), "previous": кто(прежний)["name"]})
-                continue
-            различия = {к: з for к, з in данные.items()
-                        if str(прежний.get(к) or "") != str(з or "")}
-            if not различия:
-                без_изменений += 1
-                continue
-            if not dry_run:
-                self.employee_save(данные, id=str(прежний["id"]))
-            обновлено += 1
-            if len(перечни["updated"]) < предел:
-                перечни["updated"].append({**кто(данные), "fields": sorted(различия)})
-        уволено = 0
-        if deactivate_missing:
-            for ключ, прежний in было.items():
-                if ключ not in пришли and int(прежний.get("active") or 0):
-                    if not dry_run:
-                        self.execute("UPDATE employees SET active=0, updated_at=? WHERE id=?",
-                                     (now(), прежний["id"]))
-                    уволено += 1
-                    if len(перечни["deactivated"]) < предел:
-                        перечни["deactivated"].append(кто(прежний))
-        return {"added": добавлено, "updated": обновлено, "unchanged": без_изменений,
-                "deactivated": уволено, "replaced": сменились, "received": len(пришли),
-                "deactivation_blocked": заблокировано, "changes": перечни}
-
-    # --- агенты на станциях ------------------------------------------------
-
-    ПОЛЯ_АГЕНТА = ("name", "host", "station", "version", "asterisk", "os",
-                   "source", "state", "enabled", "owner")
-
-    def agent_save(self, id: str, данные: dict[str, Any] | None = None,  # noqa: A002
-                   *, seen: bool = True) -> dict[str, Any]:
-        """Заводит или обновляет агента, приславшего о себе весть."""
-        поля = {к: з for к, з in (данные or {}).items() if к in self.ПОЛЯ_АГЕНТА}
-        if "enabled" in поля:
-            поля["enabled"] = 1 if поля["enabled"] else 0
-        мгновение = now()
-        прежний = self.agent_get(id)
-        if прежний is None:
-            колонки = ["id", *поля.keys(), "first_seen", "last_seen"]
-            значения = [str(id), *поля.values(), мгновение, мгновение]
-            self.execute(
-                f"INSERT INTO agents ({', '.join(колонки)}) "
-                f"VALUES ({', '.join('?' * len(колонки))})", значения)
-            return self.agent_get(id) or {}
-        назначения = [f"{к}=?" for к in поля]
-        параметры = list(поля.values())
-        if seen:
-            назначения.append("last_seen=?")
-            параметры.append(мгновение)
-        if назначения:
-            self.execute(f"UPDATE agents SET {', '.join(назначения)} WHERE id=?",
-                         [*параметры, str(id)])
-        return self.agent_get(id) or {}
-
-    def agent_get(self, id: str) -> dict[str, Any] | None:            # noqa: A002
-        row = self.query_one("SELECT * FROM agents WHERE id=?", (str(id),))
-        return dict(row) if row else None
-
-    def agent_list(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.query(
-            "SELECT * FROM agents ORDER BY last_seen DESC")]
-
-    def agent_delete(self, id: str) -> bool:                          # noqa: A002
-        return self.execute("DELETE FROM agents WHERE id=?", (str(id),)) > 0
-
-    def agent_count(self, id: str, *, calls: int = 0, files: int = 0,  # noqa: A002
-                    size: int = 0, errors: int = 0, error: str = "") -> None:
-        """Счётчики агента. Пишутся одним запросом: их шлют часто."""
-        self.execute(
-            "UPDATE agents SET calls_sent=calls_sent+?, files_sent=files_sent+?, "
-            "bytes_sent=bytes_sent+?, errors=errors+?, "
-            "last_error=CASE WHEN ?<>'' THEN ? ELSE last_error END, last_seen=? "
-            "WHERE id=?",
-            (int(calls), int(files), int(size), int(errors), error, error, now(), str(id)))
-
-    def agent_command_set(self, id: str, команда: str) -> bool:       # noqa: A002
-        return self.execute("UPDATE agents SET command=?, command_at=? WHERE id=?",
-                            (команда, now(), str(id))) > 0
-
-    def agent_command_take(self, id: str) -> str:                     # noqa: A002
-        """Отдаёт команду агенту и тут же её снимает — чтобы не повторялась.
-
-        Чтение и снятие — одним действием под замком записи. Раньше это
-        были два шага, и между ними успевал вклиниться второй заход того же
-        агента: агент опрашивает сервер по расписанию, а сеть иногда
-        задваивает запрос — обе стороны читали «собрать всё» и обе его
-        выполняли. Сбор архива запускался дважды, шёл по журналу с одной
-        позиции и грузил станцию вдвое. Проба на восьми одновременных
-        обращениях ловила повтор примерно в каждом двадцатом заходе.
-        """
-        with self.write() as conn:
-            строка = conn.execute(
-                "SELECT command FROM agents WHERE id=?", (str(id),)).fetchone()
-            команда = str((строка["command"] if строка else "") or "")
-            if команда:
-                conn.execute("UPDATE agents SET command='' WHERE id=?", (str(id),))
-        return команда
-
-    # --- обратная запись в CRM ----------------------------------------------
-
-    #: Состояния обратной записи по заданию. Пусто — ещё не решали.
-    CRM_ЖДЁТ_МОДЕЛЬ = "ждёт модель"
-    CRM_ОТПРАВЛЯЕТСЯ = "отправляется"
-    CRM_ОТПРАВЛЕНО = "отправлено"
-    CRM_БЕЗ_СДЕЛКИ = "без сделки"
-
-    def crm_claim(self, job_id: str) -> bool:
-        """Занимает отправку примечания по заданию; False — уже отправляли.
-
-        Одним UPDATE с условием: два пути, дошедшие до отправки разом
-        (разбор модели закончился, пока шла досылка по сроку, или два
-        сервера на общей базе), не отправят примечание дважды — дубль в
-        чужой ленте заметнее и неприятнее пропуска.
-        """
-        return self.execute(
-            "UPDATE jobs SET crm_status=?, crm_at=? WHERE id=? "
-            "AND COALESCE(crm_status,'') IN ('', ?, ?)",
-            (self.CRM_ОТПРАВЛЯЕТСЯ, now(), str(job_id),
-             self.CRM_ЖДЁТ_МОДЕЛЬ, self.CRM_БЕЗ_СДЕЛКИ)) > 0
-
-    def crm_mark(self, job_id: str, status: str, *, только_если: str | None = None) -> bool:
-        """Ставит состояние обратной записи. `updated_at` задания не трогает:
-        отметка о CRM — не правка записи, и списки «недавно изменённых» от
-        неё не должны перестраиваться."""
-        if только_если is None:
-            return self.execute("UPDATE jobs SET crm_status=?, crm_at=? WHERE id=?",
-                                (str(status)[:300], now(), str(job_id))) > 0
-        return self.execute(
-            "UPDATE jobs SET crm_status=?, crm_at=? WHERE id=? AND COALESCE(crm_status,'')=?",
-            (str(status)[:300], now(), str(job_id), только_если)) > 0
-
-    def crm_waiting(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Задания, чьё примечание ждёт смыслового разбора, — со строкой очереди."""
-        строки = self.query(
-            "SELECT j.id AS id, j.crm_at AS crm_at, q.state AS llm_state "
-            "FROM jobs j LEFT JOIN llm_queue q ON q.job_id=j.id "
-            "WHERE j.crm_status=? ORDER BY j.crm_at LIMIT ?",
-            (self.CRM_ЖДЁТ_МОДЕЛЬ, max(1, int(limit))))
-        return [dict(с) for с in строки]
-
-    # --- контроль качества работы оператора -----------------------------
-
-    def qa_assign(self, job_id: str, *, assigned_to: str = "",
-                  assigned_by: str = "", due_at: float | None = None,
-                  agent: str = "", auto_score: float | None = None,
-                  reason: str = "") -> int | None:
-        """Ставит запись на проверку человеком. None — уже стоит.
-
-        Повторное назначение той же записи не заводит вторую строку: две
-        проверки одного разговора дают два балла, и дальше начинается спор о
-        том, какой из них настоящий.
-
-        Проверка «уже стоит» — в том же выражении, что и вставка, внутри
-        одной транзакции записи. Раньше она шла отдельным чтением до неё, и
-        два сервера над общей базой (или часовой набор и кнопка в одну
-        секунду) заводили по проверке каждый.
-        """
-        with self.write() as conn:
-            курсор = conn.execute(
-                "INSERT INTO qa_reviews (job_id, agent, assigned_to, assigned_by, "
-                "assigned_at, due_at, status, auto_score, reason) "
-                "SELECT ?,?,?,?,?,?,'pending',?,? "
-                "WHERE EXISTS (SELECT 1 FROM jobs WHERE id=?) "
-                "AND NOT EXISTS (SELECT 1 FROM qa_reviews "
-                "                WHERE job_id=? AND status='pending')",
-                (str(job_id), str(agent or ""), str(assigned_to or ""),
-                 str(assigned_by or ""), now(), due_at,
-                 auto_score, str(reason or ""), str(job_id), str(job_id)))
-            return int(курсор.lastrowid or 0) if курсор.rowcount else None
-
-    def qa_submit(self, review_id: int, *, reviewer: str, score: float | None,
-                  agree: bool | None = None, items: Any = None,
-                  comment: str = "", scorecard: dict[str, str] | None = None) -> bool:
-        """Записывает исход проверки. False — такой проверки нет или она закрыта.
-
-        Чтение и запись — одной транзакцией, а запись — только пока проверка
-        открыта. Два проверяющих, отправивших оценку в одну секунду, прежде
-        оба получали «принято», и вторая оценка молча затирала первую.
-        """
-        with self.write() as conn:
-            строка = conn.execute(
-                "SELECT auto_score FROM qa_reviews WHERE id=? AND status='pending'",
-                (int(review_id),)).fetchone()
-            if строка is None:
-                return False
-            авто = строка["auto_score"]
-            # Согласие считается само, когда о нём не сказали: расхождение
-            # больше десяти баллов из ста — это уже другая оценка, а не
-            # округление. Спрашивать об этом человека отдельно значит
-            # получать пустое поле в половине проверок.
-            своё = agree
-            if своё is None and авто is not None and score is not None:
-                своё = abs(float(авто) - float(score)) <= 10.0
-            курсор = conn.execute(
-                "UPDATE qa_reviews SET status='done', reviewer=?, reviewed_at=?, "
-                "score=?, agree=?, items=?, comment=?, scorecard=? "
-                "WHERE id=? AND status='pending'",
-                (str(reviewer or ""), now(),
-                 None if score is None else float(score),
-                 None if своё is None else int(bool(своё)),
-                 json.dumps(items, ensure_ascii=False) if items is not None else None,
-                 str(comment or ""),
-                 json.dumps(scorecard, ensure_ascii=False) if scorecard else None,
-                 int(review_id)))
-            return bool(курсор.rowcount)
-
-    def qa_for_job(self, job_id: str) -> dict[str, Any] | None:
-        """Последняя проверка качества по записи — для карточки задания.
-
-        Очередь «Контроль качества» вела в карточку записи, а оценить там
-        было нечем: закрыть проверку можно было только запросом
-        PUT /api/qa/{id}. Карточка теперь знает, стоит ли запись на проверке.
-        """
-        строка = self.query_one(
-            "SELECT id, status, agent, assigned_to, assigned_by, assigned_at, due_at, "
-            "reviewer, reviewed_at, auto_score, score, agree, comment, reason, scorecard "
-            "FROM qa_reviews WHERE job_id=? ORDER BY id DESC LIMIT 1", (str(job_id),))
-        if строка is None:
-            return None
-        запись = dict(строка)
-        if запись.get("agree") is not None:
-            запись["agree"] = bool(запись["agree"])
-        try:
-            запись["scorecard"] = json.loads(запись["scorecard"]) if запись.get("scorecard") else None
-        except (TypeError, ValueError):
-            запись["scorecard"] = None
-        return запись
-
-    def qa_get(self, review_id: int) -> dict[str, Any] | None:
-        """Одна проверка вместе с владельцем записи — для проверки прав."""
-        строка = self.query_one(
-            "SELECT q.*, j.owner AS job_owner FROM qa_reviews q "
-            "LEFT JOIN jobs j ON j.id = q.job_id WHERE q.id=?", (int(review_id),))
-        return dict(строка) if строка else None
-
-    def qa_list(self, *, status: str = "", assigned_to: str = "",
-                agent: str = "", limit: int = 100,
-                owner: str | list[str] | None = None) -> list[dict[str, Any]]:
-        """Проверки с отбором; свежие первыми.
-
-        `owner` — разрез по владельцу записи, как у соседних отчётов: без
-        него ключ «только чтение» видел проверки всех — с именем файла, а в
-        колл-центре это номер клиента, — и с оператором.
-        """
-        условия: list[str] = []
-        args: list[Any] = []
-        for поле, значение in (("status", status), ("assigned_to", assigned_to),
-                               ("agent", agent)):
-            if значение:
-                условия.append(f"q.{поле}=?")
-                args.append(str(значение))
-        своё, своё_args = self._owner_clause(owner, "j")
-        if своё:
-            условия.append(своё)
-            args.extend(своё_args)
-        где = f" WHERE {' AND '.join(условия)}" if условия else ""
-        строки = self.query(
-            "SELECT q.*, j.filename AS filename, j.media_duration_s AS duration_s "
-            f"FROM qa_reviews q LEFT JOIN jobs j ON j.id = q.job_id{где} "
-            "ORDER BY q.assigned_at DESC, q.id DESC LIMIT ?",
-            [*args, max(1, min(1000, int(limit)))])
-        готово: list[dict[str, Any]] = []
-        for строка in строки:
-            запись = dict(строка)
-            if запись.get("items"):
-                try:
-                    запись["items"] = json.loads(запись["items"])
-                except (TypeError, ValueError):
-                    запись["items"] = None
-            готово.append(запись)
-        return готово
-
-    def qa_stats(self, *, since: float = 0.0,
-                 owner: str | list[str] | None = None) -> dict[str, Any]:
-        """Калибровка проверяющих: расходятся ли они с автоматом и между собой.
-
-        Главное число здесь — не средний балл, а СДВИГ: насколько
-        проверяющий систематически строже или мягче автомата. Средний балл
-        говорит о записях, сдвиг — о самом проверяющем, и именно он отвечает
-        на вопрос «можно ли сравнивать оценки двух руководителей».
-
-        Доля согласия считается по проверкам, где согласие вообще известно:
-        проверка без балла согласия не выражает, и деление на неё занижало
-        долю.
-        """
-        своё, своё_args = self._owner_clause(owner, "j")
-        откуда = "FROM qa_reviews q LEFT JOIN jobs j ON j.id = q.job_id"
-        условие = "q.status='done'" + (" AND q.reviewed_at>=?" if since else "")
-        args: list[Any] = [float(since)] if since else []
-        if своё:
-            условие += f" AND {своё}"
-            args.extend(своё_args)
-        общее = self.query_one(
-            "SELECT COUNT(*) AS n,"
-            "       SUM(CASE WHEN q.agree=1 THEN 1 ELSE 0 END) AS agreed,"
-            "       SUM(CASE WHEN q.agree IS NOT NULL THEN 1 ELSE 0 END) AS rated,"
-            "       AVG(q.score) AS avg_score,"
-            "       AVG(q.score - q.auto_score) AS bias,"
-            "       AVG(ABS(q.score - q.auto_score)) AS spread "
-            f"{откуда} WHERE {условие}", args)
-        по_людям = self.query(
-            "SELECT q.reviewer AS reviewer, COUNT(*) AS n, AVG(q.score) AS avg_score,"
-            "       AVG(q.score - q.auto_score) AS bias,"
-            "       AVG(ABS(q.score - q.auto_score)) AS spread,"
-            "       SUM(CASE WHEN q.agree=1 THEN 1 ELSE 0 END) AS agreed,"
-            "       SUM(CASE WHEN q.agree IS NOT NULL THEN 1 ELSE 0 END) AS rated "
-            f"{откуда} WHERE {условие} AND COALESCE(q.reviewer,'')<>'' "
-            "GROUP BY q.reviewer ORDER BY n DESC LIMIT 50", args)
-        всего = int((общее["n"] if общее else 0) or 0)
-        оценено = int((общее["rated"] if общее else 0) or 0)
-        ждут_условие = "q.status='pending'" + (f" AND {своё}" if своё else "")
-        # Согласие человека и модели по каждому вопросу скоркарты: где
-        # модель спорит с проверяющими, вопрос надо переформулировать или не
-        # доверять ему.
-        по_вопросам: dict[str, dict[str, Any]] = {}
-        for строка in self.query(
-                "SELECT q.scorecard AS human, l.scorecard AS model "
-                f"{откуда} JOIN llm_results l ON l.job_id = q.job_id "
-                f"WHERE {условие} AND q.scorecard IS NOT NULL AND l.scorecard IS NOT NULL",
-                args):
-            try:
-                человек = json.loads(строка["human"] or "{}")
-                модель = {str(о.get("id")): о.get("answer")
-                          for о in json.loads(строка["model"] or "[]") if isinstance(о, dict)}
-            except (TypeError, ValueError, AttributeError):
-                continue
-            if not isinstance(человек, dict):
-                continue
-            for ид, ответ in человек.items():
-                if ид not in модель or ответ not in ("да", "нет", "н/п"):
-                    continue
-                пункт = по_вопросам.setdefault(str(ид), {"id": str(ид), "n": 0, "agree": 0,
-                                                         "model_yes_human_no": 0,
-                                                         "model_no_human_yes": 0})
-                пункт["n"] += 1
-                if модель[ид] == ответ:
-                    пункт["agree"] += 1
-                elif модель[ид] == "да" and ответ == "нет":
-                    пункт["model_yes_human_no"] += 1
-                elif модель[ид] == "нет" and ответ == "да":
-                    пункт["model_no_human_yes"] += 1
-        согласие_модели = [{**п, "agree_share": round(п["agree"] / п["n"], 3)}
-                           for п in sorted(по_вопросам.values(), key=lambda п: п["id"])]
-        return {
-            "scorecard": согласие_модели,
-            "done": всего,
-            "pending": int((self.query_one(
-                f"SELECT COUNT(*) AS n {откуда} WHERE {ждут_условие}", своё_args
-            ) or {"n": 0})["n"] or 0),
-            "agree_share": (round(float(общее["agreed"] or 0) / оценено, 3)
-                            if оценено and общее else None),
-            "avg_score": (round(float(общее["avg_score"]), 1)
-                          if общее and общее["avg_score"] is not None else None),
-            "bias": (round(float(общее["bias"]), 1)
-                     if общее and общее["bias"] is not None else None),
-            "spread": (round(float(общее["spread"]), 1)
-                       if общее and общее["spread"] is not None else None),
-            "reviewers": [
-                {"reviewer": str(с["reviewer"]), "n": int(с["n"] or 0),
-                 "avg_score": (round(float(с["avg_score"]), 1)
-                               if с["avg_score"] is not None else None),
-                 "bias": round(float(с["bias"]), 1) if с["bias"] is not None else None,
-                 "spread": (round(float(с["spread"]), 1)
-                            if с["spread"] is not None else None),
-                 "agree_share": (round(float(с["agreed"] or 0) / int(с["rated"]), 3)
-                                 if с["rated"] else None)}
-                for с in по_людям],
-        }
-
-    def qa_candidates(self, *, since: float = 0.0, limit: int = 50,
-                      worst: bool = False,
-                      owner: str | list[str] | None = None) -> list[dict[str, Any]]:
-        """Записи, которые можно поставить на проверку.
-
-        `worst=True` — самые слабые по баллу автомата; иначе случайные. Оба
-        набора нужны вместе, и это не прихоть: только случайные дают честную
-        картину по всем операторам, только слабые — быстро находят, кого
-        учить. Один без другого превращает контроль качества либо в лотерею,
-        либо в травлю одних и тех же людей.
-        """
-        условие, args = self._content_where(since or None, None, owner)
-        порядок = ("c.agent_score ASC" if worst
-                   else "RANDOM()")
-        строки = self.query(
-            "SELECT j.id AS job_id, j.filename AS filename, "
-            "       j.media_duration_s AS duration_s, c.agent_score AS auto_score, "
-            "       c.agent_speaker AS agent_speaker, "
-            "       (SELECT cl.agent FROM calls cl WHERE cl.job_id = j.id) AS agent "
-            "FROM jobs j JOIN content c ON c.job_id = j.id "
-            f"WHERE {условие} AND c.agent_score IS NOT NULL "
-            "  AND NOT EXISTS (SELECT 1 FROM qa_reviews q WHERE q.job_id = j.id) "
-            f"ORDER BY {порядок} LIMIT ?",
-            [*args, max(1, int(limit))])
-        return [dict(с) for с in строки]
-
-    # --- журнал доступа -------------------------------------------------
-
-    def audit_add(self, *, action: str, actor: str = "", actor_id: str = "",
-                  kind: str = "", role: str = "", method: str = "",
-                  path: str = "", status: int = 0, ip: str = "") -> None:
-        """Заносит действие в журнал доступа.
-
-        Ошибка записи здесь не должна ронять сам запрос: журнал — это
-        свидетельство, а не часть работы. Сервер, вставший из-за того, что не
-        смог записать «посмотрел список записей», хуже отсутствующего
-        журнала.
-        """
-        поля = {"ts": now(), "actor": str(actor or "")[:128],
-                "actor_id": str(actor_id or "")[:64], "kind": str(kind or "")[:16],
-                "role": str(role or "")[:32], "action": str(action or "")[:200],
-                "method": str(method or "")[:8], "path": str(path or "")[:500],
-                "status": int(status or 0), "ip": str(ip or "")[:64]}
-        try:
-            with self.write() as conn:
-                прежняя = conn.execute(
-                    "SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
-                поля["hash"] = хеш_строки_журнала(
-                    str(прежняя[0] or "") if прежняя else "", поля)
-                conn.execute(
-                    "INSERT INTO audit (ts, actor, actor_id, kind, role, action, "
-                    "method, path, status, ip, hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    tuple(поля[к] for к in (*ПОЛЯ_ЖУРНАЛА, "hash")))
-        except Exception as exc:                            # noqa: BLE001
-            log.warning("Журнал доступа не записан: %s", exc)
-            return
-        приёмник = self.audit_sink
-        if приёмник is not None:
-            try:
-                приёмник(поля)
-            except Exception as exc:                        # noqa: BLE001
-                log.debug("Строка журнала не отправлена во внешний приёмник: %s", exc)
-
-    #: Внешний приёмник строк журнала доступа (syslog) — ставит сервер.
-    audit_sink: Any = None
-
-    def audit_verify(self, *, limit: int = 1_000_000) -> dict[str, Any]:
-        """Проверяет цепочку хешей журнала доступа.
-
-        Первая оставшаяся строка — опора (строки старше срока хранения
-        убраны уборкой, их хешей нет). Строки без хеша — записанные до
-        появления цепочки — пропускаются и цепочку не рвут, если идут до первой
-        строки с хешем. Возвращает число проверенных строк и первую
-        несошедшуюся — по ней видно, где журнал правили или вырезали.
-        """
-        проверено = 0
-        прежний: str | None = None
-        без_хеша = 0
-        for строка in self.query(
-                "SELECT id, hash, " + ", ".join(ПОЛЯ_ЖУРНАЛА)
-                + " FROM audit ORDER BY id LIMIT ?", (max(1, int(limit)),)):
-            запись = dict(строка)
-            хеш = str(запись.get("hash") or "")
-            if not хеш:
-                if прежний is not None:
-                    return {"ok": False, "checked": проверено, "broken_id": запись["id"],
-                            "reason": "строка без хеша посреди цепочки"}
-                без_хеша += 1
-                continue
-            if прежний is not None and хеш_строки_журнала(прежний, запись) != хеш:
-                return {"ok": False, "checked": проверено, "broken_id": запись["id"],
-                        "reason": "хеш не сходится: строку правили, или перед ней "
-                                  "удалены строки"}
-            прежний = хеш
-            проверено += 1
-        return {"ok": True, "checked": проверено, "legacy": без_хеша,
-                "last_hash": прежний or ""}
-
-    def audit_list(self, *, limit: int = 200, offset: int = 0,
-                   since: float = 0.0, until: float = 0.0,
-                   actor: str = "", query: str = "",
-                   failed_only: bool = False) -> dict[str, Any]:
-        """Строки журнала доступа с отбором и общим числом.
-
-        Общее число нужно вместе со страницей: раздел показывает «показаны
-        200 из 14 512», и без второго числа человек не знает, видит он весь
-        журнал или его начало.
-        """
-        условия: list[str] = []
-        args: list[Any] = []
-        if since:
-            условия.append("ts>=?")
-            args.append(float(since))
-        if until:
-            условия.append("ts<?")
-            args.append(float(until))
-        if actor:
-            условия.append("actor=?")
-            args.append(str(actor))
-        if query:
-            # «_» и «%» в запросе — буквы, а не образцы LIKE.
-            условия.append("(action LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' "
-                           "OR ip LIKE ? ESCAPE '\\')")
-            args.extend([f"%{_экранировать_like(str(query))}%"] * 3)
-        if failed_only:
-            # Отказы — то, ради чего журнал открывают чаще всего: чужой
-            # подбор пароля и попытки дотянуться туда, куда не положено.
-            условия.append("status>=400")
-        где = f" WHERE {' AND '.join(условия)}" if условия else ""
-        всего = self.query_one(f"SELECT COUNT(*) AS n FROM audit{где}", args)
-        строки = self.query(
-            f"SELECT * FROM audit{где} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
-            [*args, max(1, min(2000, int(limit))), max(0, int(offset))])
-        return {"total": int((всего["n"] if всего else 0) or 0),
-                "items": [dict(с) for с in строки]}
-
-    def audit_actors(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Кто вообще есть в журнале — для выпадающего списка отбора."""
-        строки = self.query(
-            "SELECT actor, COUNT(*) AS n, MAX(ts) AS last FROM audit "
-            "WHERE COALESCE(actor,'')<>'' GROUP BY actor "
-            "ORDER BY n DESC LIMIT ?", (max(1, int(limit)),))
-        return [dict(с) for с in строки]
-
     # --- обслуживание ---------------------------------------------------
 
     def cleanup(self, *, results_days: int = 30, metrics_days: int = 180,
@@ -5382,21 +4626,6 @@ def _значение_не_того_вида(exc: sqlite3.Error) -> None:
             "Значение поля не того вида: ожидались текст, число или «да/нет».",
             hint="Проверьте тело запроса: вложенные объекты и списки в этих "
                  "полях не принимаются.") from exc
-
-
-#: Поля строки журнала доступа, входящие в хеш, — в этом порядке.
-ПОЛЯ_ЖУРНАЛА = ("ts", "actor", "actor_id", "kind", "role", "action", "method",
-                "path", "status", "ip")
-
-
-def хеш_строки_журнала(прежний: str, поля: dict[str, Any]) -> str:
-    """sha256 от хеша предыдущей строки и полей этой — звено цепочки журнала."""
-    import hashlib  # noqa: PLC0415
-
-    тело = json.dumps([прежний, *[поля.get(к) if к != "ts" else round(float(поля.get(к) or 0), 6)
-                                  for к in ПОЛЯ_ЖУРНАЛА]],
-                      ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(тело.encode("utf-8")).hexdigest()
 
 
 def _serialize_json_fields(fields: dict[str, Any]) -> None:

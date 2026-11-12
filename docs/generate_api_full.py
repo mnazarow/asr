@@ -214,6 +214,9 @@ ADMIN_ROUTES = {
     ("/api/qc/status", "get"), ("/api/qc/groups", "get"), ("/api/qc/groups", "put"),
     ("/api/qc/tts", "post"), ("/api/qc/check", "post"), ("/api/qc/test-call", "post"),
     ("/api/qc/surveys/{survey_id}/cancel", "post"),
+    # Модель автоответчика: разметка записей опросов и обучение (3.1.41).
+    ("/api/qc/surveys/{survey_id}/amd_label", "put"),
+    ("/api/qc/amd", "get"), ("/api/qc/amd/train", "post"),
     ("/api/qc/stoplist", "get"), ("/api/qc/stoplist", "post"),
     ("/api/qc/stoplist/{number}", "delete"),
     ("/api/qc/audio", "get"), ("/api/qc/audio", "post"),

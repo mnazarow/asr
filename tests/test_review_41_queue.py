@@ -194,7 +194,8 @@ def живая(data_dir: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("ASRHUB_MODEL", "demo-simulator")
     monkeypatch.setenv("ASRHUB_ENGINE", "demo")
-    monkeypatch.setattr(job_queue, "HEARTBEAT_S", 0.1)
+    # Отметка жизни — в примеси обслуживания (`job_queue_upkeep`, 3.1.41).
+    monkeypatch.setattr("asrhub.job_queue_upkeep.HEARTBEAT_S", 0.1)
     управление = {"начал": threading.Event(), "прогресс": True}
 
     def process_job(source, merged, registry, *, progress=None, cancelled=None, **_):

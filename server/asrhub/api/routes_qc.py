@@ -414,8 +414,10 @@ async def surveys(request: Request, principal: Principal = Depends(authenticate)
         # Задание исходного разговора берётся из архива звонков на момент
         # чтения: опрос заводится раньше, чем запись доходит до распознавания.
         строки = state.db.query(
-            f"SELECT s.*, COALESCE(c.job_id, s.job_id) AS call_job_id "  # noqa: S608
+            f"SELECT s.*, COALESCE(c.job_id, s.job_id) AS call_job_id, "  # noqa: S608
+            f"COALESCE(m.label, '') AS amd_label "
             f"FROM qc_surveys s LEFT JOIN calls c ON c.uniqueid = s.call_key "
+            f"LEFT JOIN qc_amd_labels m ON m.survey_id = s.id "
             f"WHERE {где} ORDER BY s.created_at DESC LIMIT ? OFFSET ?",
             (*параметры, limit, offset))
         записи = [опросы.опрос_наружу(с) for с in строки]
@@ -571,6 +573,88 @@ async def survey_audio(survey_id: str, request: Request,
         raise error_response(JobNotFound(survey_id).with_hint(
             "Запись этого опроса не сохранялась (qc_record) или уже удалена."))
     return FileResponse(путь, media_type="audio/wav", filename=f"qc-{survey_id}.wav")
+
+
+@router.put("/surveys/{survey_id}/amd_label",
+            summary="Разметить запись опроса для модели автоответчика")
+async def survey_amd_label(survey_id: str, request: Request,
+                           principal: Principal = Depends(authenticate),
+                           данные: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Метка записи опроса: `{"label": "человек" | "автоответчик" | ""}`.
+
+    Признаки первых секунд звука клиента считаются из записи сейчас и
+    хранятся с меткой: запись уйдёт по сроку `qc_record_days`, а обучать
+    модель можно и после. Пустая метка убирает разметку. Только администратору.
+    """
+    from ..qc import amd_model  # noqa: PLC0415
+
+    require_admin(principal)
+    state = get_state(request)
+    метка = str(данные.get("label") or "").strip()
+    if метка and метка not in amd_model.МЕТКИ:
+        raise error_response(ConfigError(
+            f"Неизвестная метка «{метка}».", hint="Метки: «человек», «автоответчик» или пусто."))
+    строка = state.db.query_one("SELECT recording FROM qc_surveys WHERE id=?", (survey_id,))
+    if строка is None:
+        raise error_response(JobNotFound(survey_id))
+    признаки: list[list[float]] = []
+    if метка:
+        путь = Path(str(строка["recording"] or ""))
+        каталог = state.qc.каталог_записей_опросов().resolve()
+        if not строка["recording"] or not путь.is_file() or каталог not in путь.resolve().parents:
+            raise error_response(JobNotFound(survey_id).with_hint(
+                "Разметить можно только опрос с записью (qc_record): признаки берутся из неё."))
+        try:
+            признаки = await asyncio.to_thread(
+                lambda: amd_model.признаки_по_окнам(amd_model.звук_клиента_из_wav(путь)))
+        except (OSError, ValueError, EOFError) as exc:
+            raise error_response(ConfigError(f"Запись опроса не читается: {exc}")) from exc
+    await asyncio.to_thread(state.db.qc_amd_label, survey_id, метка, признаки,
+                            кто=principal.name)
+    # Наружу — признаки на полном окне: то, что видно глазами.
+    return {"id": survey_id, "label": метка,
+            "features": dict(zip(amd_model.ПРИЗНАКИ, признаки[-1], strict=False))
+            if признаки else {}}
+
+
+@router.get("/amd", summary="Модель автоответчика: разметка и обученная модель")
+async def amd_status(request: Request,
+                     principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Сколько записей размечено каждого вида, сколько нужно для обучения и
+    обученная модель — когда, на скольких записях, с какой точностью."""
+    from ..qc import amd_model  # noqa: PLC0415
+
+    require_admin(principal)
+    state = get_state(request)
+    размечено = await asyncio.to_thread(state.db.qc_amd_labels)
+    модель = amd_model.загрузить(Path(state.settings.paths.data))
+    return {"labels": {м: sum(1 for _, метка in размечено if метка == м)
+                       for м in amd_model.МЕТКИ},
+            "min_total": amd_model.МИН_ВСЕГО, "min_per_label": amd_model.МИН_В_КЛАССЕ,
+            "features": list(amd_model.ПРИЗНАКИ),
+            "model": модель.наружу() if модель else None,
+            "enabled": bool(state.settings.get("qc_amd", False))
+            and bool(state.settings.get("qc_amd_model", True))}
+
+
+@router.post("/amd/train", summary="Обучить модель автоответчика по разметке")
+async def amd_train(request: Request,
+                    principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+    """Обучает модель по всей разметке и кладёт её в каталог данных; телефон
+    опросов подхватывает её со следующего звонка. Мало разметки — 400."""
+    from ..qc import amd_model  # noqa: PLC0415
+
+    require_admin(principal)
+    state = get_state(request)
+    размечено = await asyncio.to_thread(state.db.qc_amd_labels)
+    try:
+        модель = await asyncio.to_thread(amd_model.обучить, размечено)
+    except ValueError as exc:
+        raise error_response(ConfigError(
+            str(exc), hint="Разметьте ещё записи опросов в журнале: «человек» или «автоответчик».")
+        ) from exc
+    await asyncio.to_thread(amd_model.сохранить, модель, Path(state.settings.paths.data))
+    return {"model": модель.наружу()}
 
 
 @router.post("/surveys/{survey_id}/cancel", summary="Отменить ждущий опрос")

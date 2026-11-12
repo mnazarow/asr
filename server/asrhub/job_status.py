@@ -1,9 +1,13 @@
-"""Состояния задания очереди — одним местом.
+"""Состояния задания очереди и состояние воркера — одним местом.
 
 Вынесено из `job_queue.py`: состояния нужны и уведомлениям, и
 обслуживанию, и отчётам; `job_queue` по-прежнему отдаёт эти имена.
 """
 from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -24,3 +28,31 @@ ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING, STATUS_RETRY, STATUS_PAUSED)
 EMPTY_STATUSES = (STATUS_NO_SPEECH, STATUS_SHORT)
 #: Все конечные состояния: дальше задание само никуда не двинется.
 FINISHED_STATUSES = (STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, *EMPTY_STATUSES)
+
+
+@dataclass
+class WorkerState:
+    index: int
+    job_id: str | None = None
+    model: str = ""
+    started_at: float = 0.0
+    stage: str = ""
+    progress: float = 0.0
+    busy: bool = False
+    #: Предел задания (job_timeout_s) и последний доклад движка — для сторожа
+    #: зависших (`JobQueue._сторож_зависших`).
+    срок_с: float = 0.0
+    доклад: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "index": self.index,
+            "busy": self.busy,
+            "job_id": self.job_id,
+            "model": self.model,
+            "stage": self.stage,
+            "progress": round(self.progress, 3),
+        }
+        if self.busy and self.started_at:
+            data["elapsed_s"] = round(time.time() - self.started_at, 1)
+        return data
