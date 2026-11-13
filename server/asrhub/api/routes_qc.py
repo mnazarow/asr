@@ -225,8 +225,8 @@ async def audio_upload(request: Request, file: UploadFile = File(...),
         raise error_response(exc) from exc
     finally:
         временный.unlink(missing_ok=True)
-    state.db.add_event(None, "settings_changed",
-                       f"Контроль качества: загружена аудиозапись «{имя}»")
+    await asyncio.to_thread(state.db.add_event, None, "settings_changed",
+                            f"Контроль качества: загружена аудиозапись «{имя}»")
     log.info("Контроль качества: %s загрузил аудиозапись «%s» (%.0f с)",
              principal.name, имя, секунд)
     return {"name": имя, "bytes": размер, "seconds": round(секунд, 1),
@@ -263,8 +263,8 @@ async def audio_delete(name: str, request: Request,
             f"Запись «{name}» используется в группе «{заняты[0]['groups'][0]}».",
             hint="Уберите запись из группы, сохраните группы и удалите её."))
     файл.unlink()
-    state.db.add_event(None, "settings_changed",
-                       f"Контроль качества: удалена аудиозапись «{name}»")
+    await asyncio.to_thread(state.db.add_event, None, "settings_changed",
+                            f"Контроль качества: удалена аудиозапись «{name}»")
     return {"deleted": True, "name": name}
 
 
@@ -321,8 +321,8 @@ async def voice_sample_upload(request: Request, file: UploadFile = File(...),
         raise error_response(exc) from exc
     finally:
         временный.unlink(missing_ok=True)
-    state.db.add_event(None, "settings_changed",
-                       f"Контроль качества: загружен образец голоса «{имя}»")
+    await asyncio.to_thread(state.db.add_event, None, "settings_changed",
+                            f"Контроль качества: загружен образец голоса «{имя}»")
     log.info("Контроль качества: %s загрузил образец голоса «%s»", principal.name, имя)
     return await asyncio.to_thread(_образец, служба)
 
@@ -347,7 +347,8 @@ async def voice_sample_delete(request: Request,
     state, служба = _служба(request, principal)
     был = await asyncio.to_thread(tts.убрать_образец, служба.каталог_звука())
     if был:
-        state.db.add_event(None, "settings_changed", "Контроль качества: образец голоса убран")
+        await asyncio.to_thread(state.db.add_event, None, "settings_changed",
+                                "Контроль качества: образец голоса убран")
     return {"deleted": был, **await asyncio.to_thread(_образец, служба)}
 
 
@@ -563,8 +564,8 @@ async def survey_audio(survey_id: str, request: Request,
                        principal: Principal = Depends(authenticate)) -> FileResponse:
     """Запись опроса при `qc_record` — в том же охвате, что журнал."""
     state, владельцы = _читатель(request, principal)
-    строка = state.db.query_one("SELECT owner, recording FROM qc_surveys WHERE id=?",
-                                (survey_id,))
+    строка = await asyncio.to_thread(
+        state.db.query_one, "SELECT owner, recording FROM qc_surveys WHERE id=?", (survey_id,))
     if строка is None or (владельцы is not None and строка["owner"] not in владельцы):
         raise error_response(JobNotFound(survey_id))
     путь = Path(str(строка["recording"] or ""))
@@ -586,6 +587,8 @@ async def survey_amd_label(survey_id: str, request: Request,
     хранятся с меткой: запись уйдёт по сроку `qc_record_days`, а обучать
     модель можно и после. Пустая метка убирает разметку. Только администратору.
     """
+    import wave  # noqa: PLC0415
+
     from ..qc import amd_model  # noqa: PLC0415
 
     require_admin(principal)
@@ -594,7 +597,8 @@ async def survey_amd_label(survey_id: str, request: Request,
     if метка and метка not in amd_model.МЕТКИ:
         raise error_response(ConfigError(
             f"Неизвестная метка «{метка}».", hint="Метки: «человек», «автоответчик» или пусто."))
-    строка = state.db.query_one("SELECT recording FROM qc_surveys WHERE id=?", (survey_id,))
+    строка = await asyncio.to_thread(
+        state.db.query_one, "SELECT recording FROM qc_surveys WHERE id=?", (survey_id,))
     if строка is None:
         raise error_response(JobNotFound(survey_id))
     признаки: list[list[float]] = []
@@ -607,7 +611,7 @@ async def survey_amd_label(survey_id: str, request: Request,
         try:
             признаки = await asyncio.to_thread(
                 lambda: amd_model.признаки_по_окнам(amd_model.звук_клиента_из_wav(путь)))
-        except (OSError, ValueError, EOFError) as exc:
+        except (OSError, ValueError, EOFError, wave.Error) as exc:
             raise error_response(ConfigError(f"Запись опроса не читается: {exc}")) from exc
     await asyncio.to_thread(state.db.qc_amd_label, survey_id, метка, признаки,
                             кто=principal.name)

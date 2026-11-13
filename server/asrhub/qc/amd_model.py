@@ -109,15 +109,27 @@ def признаки_по_окнам(pcm: bytes) -> list[list[float]]:
     return итог
 
 
-def звук_клиента_из_wav(путь: Path) -> bytes:
-    """Левый канал записи опроса (клиент) — моно PCM 16 бит."""
+def звук_клиента_из_wav(путь: Path, *, с: float | None = None) -> bytes:
+    """Левый канал записи опроса (клиент) — моно PCM 16 бит, от момента `с`.
+
+    Запись идёт от ответа, а телефон начинает слушать после паузы
+    (`survey.ПАУЗА_ПОСЛЕ_ОТВЕТА_С`): признаки размеченной записи считаются с
+    того же места, с которого их увидит звонок. С начала записи «тишина до
+    первой реплики» выходила на длину паузы больше, чем у живого звонка, а
+    окно в две секунды захватывало другой кусок звука.
+    """
     import wave  # noqa: PLC0415
 
+    if с is None:
+        from .survey import ПАУЗА_ПОСЛЕ_ОТВЕТА_С  # noqa: PLC0415
+
+        с = ПАУЗА_ПОСЛЕ_ОТВЕТА_С
     with wave.open(str(путь), "rb") as wav:
-        каналов, ширина = wav.getnchannels(), wav.getsampwidth()
-        данные = wav.readframes(int(ОКНО_С * wav.getframerate()) + 1)
-    if ширина != 2:
-        raise ValueError("запись опроса — не 16 бит")
+        каналов, ширина, частота = wav.getnchannels(), wav.getsampwidth(), wav.getframerate()
+        if ширина != 2 or частота * 2 != БАЙТ_В_С:
+            raise ValueError("запись опроса — не 16 бит 8 кГц")
+        wav.setpos(min(wav.getnframes(), int(max(0.0, с) * частота)))
+        данные = wav.readframes(int(ОКНО_С * частота) + 1)
     if каналов == 1:
         return данные
     шаг = 2 * каналов
@@ -159,10 +171,22 @@ class Модель:
     def из_словаря(cls, д: dict[str, Any]) -> Модель:
         if list(д.get("features") or []) != list(ПРИЗНАКИ):
             raise ValueError("модель обучена на другом наборе признаков")
-        return cls(среднее=[float(x) for x in д["mean"]], разброс=[float(x) for x in д["std"]],
-                   веса=[float(x) for x in д["weights"]], сдвиг=float(д["bias"]),
+        среднее = [float(x) for x in д["mean"]]
+        разброс = [float(x) for x in д["std"]]
+        веса = [float(x) for x in д["weights"]]
+        сдвиг = float(д["bias"])
+        # Файл правят и руками: короткий список молча отбросил бы признаки
+        # (zip по короткому), нулевой разброс — деление на ноль посреди звонка.
+        if not (len(среднее) == len(разброс) == len(веса) == len(ПРИЗНАКИ)):
+            raise ValueError("в модели не столько чисел, сколько признаков")
+        if not all(math.isfinite(x) for x in (*среднее, *разброс, *веса, сдвиг)) \
+                or any(р == 0 for р in разброс):
+            raise ValueError("в модели не числа или нулевой разброс")
+        точность = д.get("accuracy")
+        return cls(среднее=среднее, разброс=разброс, веса=веса, сдвиг=сдвиг,
                    обучена=float(д.get("trained_at") or 0), образцов=int(д.get("samples") or 0),
-                   точность=д.get("accuracy"), по_классам=dict(д.get("by_label") or {}))
+                   точность=float(точность) if точность is not None else None,
+                   по_классам=dict(д.get("by_label") or {}))
 
 
 def _обучить(образцы: list[tuple[list[float], int]], *, шагов: int | None = None,

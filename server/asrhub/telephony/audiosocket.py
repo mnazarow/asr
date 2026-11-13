@@ -18,6 +18,7 @@ Asterisk 16.6+ умеет отдавать звук канала по TCP при
 from __future__ import annotations
 
 import array
+import contextlib
 import socket
 import socketserver
 import struct
@@ -28,6 +29,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .. import settings_access as S
 from ..logging_setup import get_logger
 
 log = get_logger("telephony")
@@ -148,6 +150,22 @@ class ПриёмAudioSocket:
                 if длина > ПРЕДЕЛ_КАДРА:
                     break
                 if вид == ВИД_ИД:
+                    if сессия is not None:
+                        # Второй идентификатор в том же соединении: прежняя
+                        # сессия осталась бы открытой — с моделью и буфером.
+                        continue
+                    предел = S.integer(self.settings, "stream_max_sessions", 16) or 16
+                    with self._замок:
+                        занято = len(self._идут)
+                    if занято >= предел:
+                        # Тот же предел, что у диктовки: каждое соединение —
+                        # сессия распознавания, и без предела порт, открытый
+                        # сети станции, занимал бы модель без счёта.
+                        log.warning("AudioSocket: разговоров уже %s (stream_max_sessions) — "
+                                    "соединение с %s не принято", занято, откуда[0])
+                        with contextlib.suppress(OSError):
+                            сокет.sendall(кадр(ВИД_ОШИБКА, b"\x01"))
+                        break
                     ид = str(uuid.UUID(bytes=данные)) if len(данные) == 16 else данные.hex()
                     настройки = self.settings.merged({})
                     модель = str(self.settings.get("audiosocket_model") or "").strip()
@@ -170,11 +188,17 @@ class ПриёмAudioSocket:
                     log.warning("AudioSocket %s: станция сообщила об ошибке %s", ид or "?",
                                 данные.hex())
                     break
+        except Exception as exc:                            # noqa: BLE001
+            # Отказ распознавания (нет модели, сбой движка) — строкой в журнал
+            # сервера, а не трассировкой socketserver в stderr.
+            log.warning("AudioSocket %s: разговор прерван: %s", ид or "?", exc)
         finally:
             if сессия is not None:
                 try:
                     for событие in сессия.finish():
                         self._разослать(ид, событие, запись)
+                except Exception as exc:                    # noqa: BLE001
+                    log.debug("AudioSocket %s: сессия не завершилась штатно: %s", ид, exc)
                 finally:
                     сессия.close()
                 self._итог(ид, запись)

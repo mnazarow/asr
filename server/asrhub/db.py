@@ -1565,6 +1565,12 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
                     pass
                 _значение_не_того_вида(exc)
                 raise StorageError(f"Ошибка записи в базу: {exc}") from exc
+            except OverflowError as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise _число_не_помещается(exc) from exc
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
@@ -1575,6 +1581,8 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
         try:
             return list(self.conn.execute(sql, params))
+        except OverflowError as exc:
+            raise _число_не_помещается(exc) from exc
         except sqlite3.Error as exc:
             _значение_не_того_вида(exc)
             # Текст запроса — в журнал сервера, а не в ответ: ответ видит
@@ -1635,6 +1643,8 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
         conn.set_progress_handler(lambda: 1 if time.monotonic() > срок else 0, 5000)
         try:
             return list(conn.execute(sql, params))
+        except OverflowError as exc:
+            raise _число_не_помещается(exc) from exc
         except sqlite3.OperationalError as exc:
             if "interrupt" in str(exc).lower():
                 raise QueryTimeout(sql[:120]) from exc
@@ -3665,6 +3675,16 @@ class Database(ТелефонияБазы, СодержаниеБазы, Язы�
                 pass
             self._local.conn = None
         self._closed = True
+
+
+def _число_не_помещается(exc: OverflowError) -> ConfigError:
+    """Целое вне 64 бит из запроса — это 400, а не внутренняя ошибка.
+
+    `PUT /api/qa/99999999999999999999` доходил до SQLite числом, которое в
+    его INTEGER не помещается, и отвечал 500 «OverflowError».
+    """
+    return ConfigError("Число в запросе слишком велико.",
+                       hint=f"Целые значения — в пределах 64 бит ({exc}).")
 
 
 def _значение_не_того_вида(exc: sqlite3.Error) -> None:

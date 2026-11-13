@@ -445,8 +445,6 @@ def cel(request: Request, данные: dict[str, Any],
     перевода — граница отрезков участников в разговоре с переводом; повтор
     тех же строк не задваивает событий.
     """
-    import csv  # noqa: PLC0415
-
     require_write(principal)
     state = get_state(request)
     agent_id = _проверить_id(str(данные.get("agent_id") or ""))
@@ -459,8 +457,8 @@ def cel(request: Request, данные: dict[str, Any],
     from ..telephony import transfers as события_перевода  # noqa: PLC0415
 
     переводы, мосты = события_перевода.разделить([п for п in (
-        события_перевода.из_строки_cel(поля) for поля in csv.reader(
-            str(с)[:4000] for с in строки)) if п is not None])
+        события_перевода.из_строки_cel(события_перевода.поля_cel(str(с)))
+        for с in строки) if п is not None])
     станция = _агентская_станция(agent_id)
     добавлено = state.db.call_transfers_add(станция, переводы)
     мостов = state.db.bridge_events_add(станция, мосты)
